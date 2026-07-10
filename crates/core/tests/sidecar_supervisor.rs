@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use muniment_core::sidecar::{
-    JsonRpcId, JsonRpcTransport, JsonRpcTransportError, RestartPolicy, SidecarConfig,
+    JsonRpcId, JsonRpcTransport, JsonRpcTransportError, RestartPolicy, SidecarConfig, SidecarError,
     SidecarStatus, SidecarSupervisor,
 };
 use serde_json::{json, Value};
@@ -406,4 +406,67 @@ fn json_rpc_call_obeys_timeout() {
         Err(JsonRpcTransportError::Timeout)
     ));
     supervisor.shutdown().unwrap();
+}
+
+#[test]
+fn json_rpc_restart_discards_previous_generation_frames() {
+    let marker = temp_marker("json-rpc-stale");
+    let _ = std::fs::remove_dir(&marker);
+    let marker_arg = marker.to_string_lossy().into_owned();
+    let mut supervisor =
+        SidecarSupervisor::spawn(config(&["json-rpc-stale-once", &marker_arg]), |_| Ok(()))
+            .unwrap();
+    let io = supervisor.io();
+    let until = Instant::now() + Duration::from_secs(2);
+    loop {
+        match io.stderr.read_line_timeout(Duration::from_millis(100)) {
+            Ok(Some(line)) if line == "replacement-ready" => break,
+            Ok(_) | Err(SidecarError::Disconnected) => {}
+            Err(error) => panic!("could not read replacement readiness: {error}"),
+        }
+        assert!(Instant::now() < until, "replacement did not become ready");
+    }
+
+    let transport = JsonRpcTransport::new(io);
+    let mut notifications = Vec::new();
+    let result: u64 = transport
+        .call_with_notifications(
+            "count",
+            Some(json!({"count": 1})),
+            JsonRpcId::String("current".into()),
+            Duration::from_secs(2),
+            |notification| notifications.push(notification.method),
+        )
+        .unwrap();
+    assert_eq!(result, 1);
+    assert_eq!(notifications, vec!["count.progress"]);
+
+    supervisor.shutdown().unwrap();
+    let _ = std::fs::remove_dir(marker);
+}
+
+#[test]
+fn json_rpc_call_interrupted_by_restart_returns_bounded_error() {
+    let marker = temp_marker("json-rpc-crash-call");
+    let _ = std::fs::remove_dir(&marker);
+    let marker_arg = marker.to_string_lossy().into_owned();
+    let mut supervisor =
+        SidecarSupervisor::spawn(config(&["json-rpc-crash-call-once", &marker_arg]), |_| {
+            Ok(())
+        })
+        .unwrap();
+    wait_for(&supervisor, SidecarStatus::Healthy);
+    let transport = JsonRpcTransport::new(supervisor.io());
+    let started = Instant::now();
+    let error = transport
+        .call::<Value, Value>("round_trip", None, Duration::from_secs(2))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        JsonRpcTransportError::Timeout | JsonRpcTransportError::Disconnected
+    ));
+    assert!(started.elapsed() < Duration::from_secs(3));
+
+    supervisor.shutdown().unwrap();
+    let _ = std::fs::remove_dir(marker);
 }

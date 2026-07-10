@@ -260,7 +260,11 @@ impl JsonRpcTransport {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let request = JsonRpcRequest::new(method, params, id.clone());
         let line = serde_json::to_string(&request).map_err(JsonRpcTransportError::Serialize)?;
-        self.io.stdin.write_line(&line).map_err(map_sidecar_error)?;
+        let generation = self
+            .io
+            .stdin
+            .write_line_in_generation(&line)
+            .map_err(map_sidecar_error)?;
         let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -270,7 +274,7 @@ impl JsonRpcTransport {
             let line = self
                 .io
                 .stdout
-                .read_line_timeout(remaining)
+                .read_line_timeout_for_generation(generation, remaining)
                 .map_err(map_sidecar_error)?
                 .ok_or(JsonRpcTransportError::Timeout)?;
             match decode_frame(&line, id.clone())? {
@@ -426,38 +430,117 @@ impl fmt::Display for SidecarError {
 
 impl std::error::Error for SidecarError {}
 
+struct WriterState {
+    generation: u64,
+    writer: Option<BufWriter<ChildStdin>>,
+}
+
 #[derive(Clone)]
-pub struct LineWriter(Arc<Mutex<Option<BufWriter<ChildStdin>>>>);
+pub struct LineWriter(Arc<Mutex<WriterState>>);
 
 impl LineWriter {
     pub fn write_line(&self, line: &str) -> Result<(), SidecarError> {
+        self.write_line_in_generation(line).map(|_| ())
+    }
+
+    fn write_line_in_generation(&self, line: &str) -> Result<u64, SidecarError> {
         let mut guard = self.0.lock().unwrap();
-        let writer = guard.as_mut().ok_or(SidecarError::Disconnected)?;
+        let generation = guard.generation;
+        let writer = guard.writer.as_mut().ok_or(SidecarError::Disconnected)?;
         writer
             .write_all(line.as_bytes())
             .map_err(SidecarError::Io)?;
         writer.write_all(b"\n").map_err(SidecarError::Io)?;
-        writer.flush().map_err(SidecarError::Io)
+        writer.flush().map_err(SidecarError::Io)?;
+        Ok(generation)
     }
 }
 
+struct LineReceiver {
+    receiver: mpsc::Receiver<(u64, String)>,
+    pending: VecDeque<(u64, String)>,
+    generation: Arc<AtomicU64>,
+}
+
 #[derive(Clone)]
-pub struct LineReader(Arc<Mutex<mpsc::Receiver<String>>>);
+pub struct LineReader(Arc<Mutex<LineReceiver>>);
 
 impl LineReader {
     pub fn read_line(&self) -> Result<String, SidecarError> {
-        self.0
-            .lock()
-            .unwrap()
+        let mut guard = self.0.lock().unwrap();
+        if let Some((_, line)) = guard.pending.pop_front() {
+            return Ok(line);
+        }
+        guard
+            .receiver
             .recv()
+            .map(|(_, line)| line)
             .map_err(|_| SidecarError::Disconnected)
     }
 
     pub fn read_line_timeout(&self, timeout: Duration) -> Result<Option<String>, SidecarError> {
-        match self.0.lock().unwrap().recv_timeout(timeout) {
-            Ok(line) => Ok(Some(line)),
+        let mut guard = self.0.lock().unwrap();
+        if let Some((_, line)) = guard.pending.pop_front() {
+            return Ok(Some(line));
+        }
+        match guard.receiver.recv_timeout(timeout) {
+            Ok((_, line)) => Ok(Some(line)),
             Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(SidecarError::Disconnected),
+        }
+    }
+
+    fn read_line_timeout_for_generation(
+        &self,
+        generation: u64,
+        timeout: Duration,
+    ) -> Result<Option<String>, SidecarError> {
+        self.read_for_generation(generation, Some(timeout))
+    }
+
+    fn read_for_generation(
+        &self,
+        generation: u64,
+        timeout: Option<Duration>,
+    ) -> Result<Option<String>, SidecarError> {
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let mut guard = self.0.lock().unwrap();
+        loop {
+            if guard.generation.load(Ordering::Acquire) != generation {
+                return Err(SidecarError::Disconnected);
+            }
+            guard.pending.retain(|(seen, _)| *seen >= generation);
+            if let Some(index) = guard
+                .pending
+                .iter()
+                .position(|(seen, _)| *seen == generation)
+            {
+                return Ok(guard.pending.remove(index).map(|(_, line)| line));
+            }
+            let received = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Ok(None);
+                    }
+                    match guard.receiver.recv_timeout(remaining) {
+                        Ok(line) => line,
+                        Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            return Err(SidecarError::Disconnected)
+                        }
+                    }
+                }
+                None => guard
+                    .receiver
+                    .recv()
+                    .map_err(|_| SidecarError::Disconnected)?,
+            };
+            match received {
+                (seen, line) if seen == generation => return Ok(Some(line)),
+                (seen, _) if seen < generation => continue,
+                future => guard.pending.push_back(future),
+            }
         }
     }
 }
@@ -495,11 +578,23 @@ impl SidecarSupervisor {
         }
         let (stdout_tx, stdout_rx) = mpsc::channel();
         let (stderr_tx, stderr_rx) = mpsc::channel();
-        let stdin = LineWriter(Arc::new(Mutex::new(None)));
+        let generation = Arc::new(AtomicU64::new(0));
+        let stdin = LineWriter(Arc::new(Mutex::new(WriterState {
+            generation: 0,
+            writer: None,
+        })));
         let io = SidecarIo {
             stdin: stdin.clone(),
-            stdout: LineReader(Arc::new(Mutex::new(stdout_rx))),
-            stderr: LineReader(Arc::new(Mutex::new(stderr_rx))),
+            stdout: LineReader(Arc::new(Mutex::new(LineReceiver {
+                receiver: stdout_rx,
+                pending: VecDeque::new(),
+                generation: generation.clone(),
+            }))),
+            stderr: LineReader(Arc::new(Mutex::new(LineReceiver {
+                receiver: stderr_rx,
+                pending: VecDeque::new(),
+                generation: generation.clone(),
+            }))),
         };
         let status = Arc::new(Mutex::new(SidecarStatus::Starting));
         let (command, commands) = mpsc::channel();
@@ -513,6 +608,7 @@ impl SidecarSupervisor {
                 worker_io,
                 stdout_tx,
                 stderr_tx,
+                generation,
                 commands,
                 probe,
             )
@@ -557,8 +653,9 @@ fn supervise(
     config: SidecarConfig,
     status: Arc<Mutex<SidecarStatus>>,
     io: SidecarIo,
-    stdout_tx: mpsc::Sender<String>,
-    stderr_tx: mpsc::Sender<String>,
+    stdout_tx: mpsc::Sender<(u64, String)>,
+    stderr_tx: mpsc::Sender<(u64, String)>,
+    generation: Arc<AtomicU64>,
     commands: mpsc::Receiver<SupervisorCommand>,
     probe: Arc<HealthProbe>,
 ) {
@@ -584,7 +681,14 @@ fn supervise(
                 return;
             }
         }
-        let mut child = match spawn_child(&config, &io, stdout_tx.clone(), stderr_tx.clone()) {
+        let child_generation = generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let mut child = match spawn_child(
+            &config,
+            &io,
+            stdout_tx.clone(),
+            stderr_tx.clone(),
+            child_generation,
+        ) {
             Ok(child) => child,
             Err(_) => {
                 if !allow_restart(&config.restart, &mut restarts) {
@@ -641,7 +745,7 @@ fn supervise(
             }
         };
         if restart {
-            *io.stdin.0.lock().unwrap() = None;
+            io.stdin.0.lock().unwrap().writer = None;
             if !allow_restart(&config.restart, &mut restarts) {
                 set_status(&status, SidecarStatus::Failed);
                 return;
@@ -654,8 +758,9 @@ fn supervise(
 fn spawn_child(
     config: &SidecarConfig,
     io: &SidecarIo,
-    out: mpsc::Sender<String>,
-    err: mpsc::Sender<String>,
+    out: mpsc::Sender<(u64, String)>,
+    err: mpsc::Sender<(u64, String)>,
+    generation: u64,
 ) -> Result<Child, std::io::Error> {
     let mut child = Command::new(&config.program)
         .args(&config.args)
@@ -664,19 +769,23 @@ fn spawn_child(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    *io.stdin.0.lock().unwrap() = child.stdin.take().map(BufWriter::new);
-    pipe_lines(child.stdout.take().unwrap(), out);
-    pipe_error_lines(child.stderr.take().unwrap(), err);
+    {
+        let mut stdin = io.stdin.0.lock().unwrap();
+        stdin.generation = generation;
+        stdin.writer = child.stdin.take().map(BufWriter::new);
+    }
+    pipe_lines(child.stdout.take().unwrap(), out, generation);
+    pipe_error_lines(child.stderr.take().unwrap(), err, generation);
     Ok(child)
 }
 
-fn pipe_lines(pipe: ChildStdout, tx: mpsc::Sender<String>) {
-    thread::spawn(move || forward_lines(pipe, tx));
+fn pipe_lines(pipe: ChildStdout, tx: mpsc::Sender<(u64, String)>, generation: u64) {
+    thread::spawn(move || forward_lines(pipe, tx, generation));
 }
-fn pipe_error_lines(pipe: ChildStderr, tx: mpsc::Sender<String>) {
-    thread::spawn(move || forward_lines(pipe, tx));
+fn pipe_error_lines(pipe: ChildStderr, tx: mpsc::Sender<(u64, String)>, generation: u64) {
+    thread::spawn(move || forward_lines(pipe, tx, generation));
 }
-fn forward_lines(pipe: impl std::io::Read, tx: mpsc::Sender<String>) {
+fn forward_lines(pipe: impl std::io::Read, tx: mpsc::Sender<(u64, String)>, generation: u64) {
     for line in BufReader::new(pipe).lines() {
         match line {
             Ok(line) => {
@@ -684,7 +793,7 @@ fn forward_lines(pipe: impl std::io::Read, tx: mpsc::Sender<String>) {
                 if line.is_empty() {
                     continue;
                 }
-                if tx.send(line.to_owned()).is_err() {
+                if tx.send((generation, line.to_owned())).is_err() {
                     break;
                 }
             }
@@ -709,7 +818,7 @@ fn allow_restart(policy: &RestartPolicy, history: &mut VecDeque<Instant>) -> boo
 }
 
 fn stop_child(child: &mut Child, io: &SidecarIo, deadline: Duration, poll: Duration) {
-    *io.stdin.0.lock().unwrap() = None;
+    io.stdin.0.lock().unwrap().writer = None;
     let until = Instant::now() + deadline;
     while Instant::now() < until {
         if child.try_wait().ok().flatten().is_some() {

@@ -8,6 +8,32 @@ fn main() {
     match args.next().as_deref() {
         Some("echo") => echo(),
         Some("json-rpc") => json_rpc(args.next()),
+        Some("json-rpc-stale-once") => {
+            let marker = args.next().unwrap();
+            if fs::create_dir(&marker).is_ok() {
+                println!(
+                    "{}",
+                    serde_json::json!({"jsonrpc": "2.0", "result": "stale", "id": "previous"})
+                );
+                println!(
+                    "{}",
+                    serde_json::json!({"jsonrpc": "2.0", "method": "stale.progress", "params": {"value": "stale"}})
+                );
+                io::stdout().flush().unwrap();
+                std::process::exit(19);
+            }
+            eprintln!("replacement-ready");
+            io::stderr().flush().unwrap();
+            json_rpc(None);
+        }
+        Some("json-rpc-crash-call-once") => {
+            let marker = args.next().unwrap();
+            if fs::create_dir(&marker).is_ok() {
+                let _ = io::stdin().lock().lines().next();
+                std::process::exit(20);
+            }
+            json_rpc(None);
+        }
         Some("crash") => std::process::exit(17),
         Some("once") => {
             let marker = args.next().unwrap();
