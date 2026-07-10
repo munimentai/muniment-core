@@ -35,6 +35,32 @@ fn main() {
             json_rpc(None);
         }
         Some("crash") => std::process::exit(17),
+        Some("stderr-spam") => {
+            let count: usize = args.next().unwrap().parse().unwrap();
+            for index in 0..count {
+                eprintln!("stderr-{index}");
+            }
+            io::stderr().flush().unwrap();
+            println!("stderr-done");
+            io::stdout().flush().unwrap();
+            echo();
+        }
+        Some("stderr-generation") => {
+            let marker = args.next().unwrap();
+            if fs::create_dir(&marker).is_ok() {
+                eprintln!("old-generation");
+                io::stderr().flush().unwrap();
+                std::process::exit(21);
+            }
+            eprintln!("new-generation");
+            io::stderr().flush().unwrap();
+            echo();
+        }
+        Some("stderr-hang") => {
+            eprintln!("health failure detail");
+            io::stderr().flush().unwrap();
+            echo();
+        }
         Some("once") => {
             let marker = args.next().unwrap();
             if fs::create_dir(&marker).is_ok() {

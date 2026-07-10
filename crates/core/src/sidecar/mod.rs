@@ -5,7 +5,7 @@ use std::fmt;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -13,6 +13,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 const JSON_RPC_VERSION: &str = "2.0";
+const DEFAULT_STDERR_CAPACITY: usize = 256;
+const STDERR_DIAGNOSTIC_LINES: usize = 20;
 
 /// A type-safe JSON-RPC version marker that always serializes as `"2.0"`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -382,6 +384,8 @@ pub struct SidecarConfig {
     pub restart: RestartPolicy,
     pub health_interval: Duration,
     pub shutdown_timeout: Duration,
+    /// Maximum number of recent stderr lines retained for reading and diagnostics.
+    pub stderr_capacity: usize,
     /// Frequency of exit and shutdown checks. Kept configurable for bounded tests.
     pub poll_interval: Duration,
 }
@@ -395,6 +399,7 @@ impl SidecarConfig {
             restart: RestartPolicy::default(),
             health_interval: Duration::from_secs(5),
             shutdown_timeout: Duration::from_secs(2),
+            stderr_capacity: DEFAULT_STDERR_CAPACITY,
             poll_interval: Duration::from_millis(20),
         }
     }
@@ -415,10 +420,17 @@ pub enum SidecarEventCause {
     ProcessExit {
         code: Option<i32>,
         signal: Option<i32>,
+        stderr_tail: Vec<String>,
     },
-    ProcessWaitError(String),
+    ProcessWaitError {
+        message: String,
+        stderr_tail: Vec<String>,
+    },
     SpawnError(String),
-    HealthProbeFailure(String),
+    HealthProbeFailure {
+        message: String,
+        stderr_tail: Vec<String>,
+    },
     Shutdown,
 }
 
@@ -485,12 +497,93 @@ struct LineReceiver {
     generation: Arc<AtomicU64>,
 }
 
+struct StderrState {
+    lines: VecDeque<String>,
+    first_sequence: u64,
+    next_sequence: u64,
+    read_sequence: u64,
+    generation: u64,
+}
+
+struct StderrRing {
+    state: Mutex<StderrState>,
+    available: Condvar,
+    capacity: usize,
+}
+
+impl StderrRing {
+    fn begin_generation(&self, generation: u64) {
+        let mut state = self.state.lock().unwrap();
+        state.lines.clear();
+        state.first_sequence = state.next_sequence;
+        state.read_sequence = state.next_sequence;
+        state.generation = generation;
+    }
+
+    fn push(&self, generation: u64, line: String) {
+        let mut state = self.state.lock().unwrap();
+        if self.capacity == 0 || state.generation != generation {
+            return;
+        }
+        if state.lines.len() == self.capacity {
+            state.lines.pop_front();
+            state.first_sequence += 1;
+        }
+        state.lines.push_back(line);
+        state.next_sequence += 1;
+        self.available.notify_all();
+    }
+
+    fn snapshot(&self) -> Vec<String> {
+        self.state.lock().unwrap().lines.iter().cloned().collect()
+    }
+
+    fn read(&self, timeout: Option<Duration>) -> Result<Option<String>, SidecarError> {
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let mut state = self.state.lock().unwrap();
+        loop {
+            state.read_sequence = state.read_sequence.max(state.first_sequence);
+            if state.read_sequence < state.next_sequence {
+                let index = (state.read_sequence - state.first_sequence) as usize;
+                state.read_sequence += 1;
+                return Ok(state.lines.get(index).cloned());
+            }
+            state = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Ok(None);
+                    }
+                    let (state, result) = self.available.wait_timeout(state, remaining).unwrap();
+                    if result.timed_out() {
+                        return Ok(None);
+                    }
+                    state
+                }
+                None => self.available.wait(state).unwrap(),
+            };
+        }
+    }
+}
+
 #[derive(Clone)]
-pub struct LineReader(Arc<Mutex<LineReceiver>>);
+pub struct LineReader(LineReaderInner);
+
+#[derive(Clone)]
+enum LineReaderInner {
+    Channel(Arc<Mutex<LineReceiver>>),
+    Stderr(Arc<StderrRing>),
+}
 
 impl LineReader {
     pub fn read_line(&self) -> Result<String, SidecarError> {
-        let mut guard = self.0.lock().unwrap();
+        if let LineReaderInner::Stderr(ring) = &self.0 {
+            return ring.read(None)?.ok_or(SidecarError::Disconnected);
+        }
+        let LineReaderInner::Channel(receiver) = &self.0 else {
+            unreachable!()
+        };
+        let mut guard = receiver.lock().unwrap();
         if let Some((_, line)) = guard.pending.pop_front() {
             return Ok(line);
         }
@@ -502,7 +595,13 @@ impl LineReader {
     }
 
     pub fn read_line_timeout(&self, timeout: Duration) -> Result<Option<String>, SidecarError> {
-        let mut guard = self.0.lock().unwrap();
+        if let LineReaderInner::Stderr(ring) = &self.0 {
+            return ring.read(Some(timeout));
+        }
+        let LineReaderInner::Channel(receiver) = &self.0 else {
+            unreachable!()
+        };
+        let mut guard = receiver.lock().unwrap();
         if let Some((_, line)) = guard.pending.pop_front() {
             return Ok(Some(line));
         }
@@ -527,7 +626,10 @@ impl LineReader {
         timeout: Option<Duration>,
     ) -> Result<Option<String>, SidecarError> {
         let deadline = timeout.map(|timeout| Instant::now() + timeout);
-        let mut guard = self.0.lock().unwrap();
+        let LineReaderInner::Channel(receiver) = &self.0 else {
+            return Err(SidecarError::Disconnected);
+        };
+        let mut guard = receiver.lock().unwrap();
         loop {
             if guard.generation.load(Ordering::Acquire) != generation {
                 return Err(SidecarError::Disconnected);
@@ -607,7 +709,17 @@ impl SidecarSupervisor {
             )));
         }
         let (stdout_tx, stdout_rx) = mpsc::channel();
-        let (stderr_tx, stderr_rx) = mpsc::channel();
+        let stderr = Arc::new(StderrRing {
+            state: Mutex::new(StderrState {
+                lines: VecDeque::new(),
+                first_sequence: 0,
+                next_sequence: 0,
+                read_sequence: 0,
+                generation: 0,
+            }),
+            available: Condvar::new(),
+            capacity: config.stderr_capacity,
+        });
         let generation = Arc::new(AtomicU64::new(0));
         let stdin = LineWriter(Arc::new(Mutex::new(WriterState {
             generation: 0,
@@ -615,16 +727,14 @@ impl SidecarSupervisor {
         })));
         let io = SidecarIo {
             stdin: stdin.clone(),
-            stdout: LineReader(Arc::new(Mutex::new(LineReceiver {
-                receiver: stdout_rx,
-                pending: VecDeque::new(),
-                generation: generation.clone(),
-            }))),
-            stderr: LineReader(Arc::new(Mutex::new(LineReceiver {
-                receiver: stderr_rx,
-                pending: VecDeque::new(),
-                generation: generation.clone(),
-            }))),
+            stdout: LineReader(LineReaderInner::Channel(Arc::new(Mutex::new(
+                LineReceiver {
+                    receiver: stdout_rx,
+                    pending: VecDeque::new(),
+                    generation: generation.clone(),
+                },
+            )))),
+            stderr: LineReader(LineReaderInner::Stderr(stderr.clone())),
         };
         let starting = SidecarEvent {
             status: SidecarStatus::Starting,
@@ -649,7 +759,7 @@ impl SidecarSupervisor {
                 worker_state,
                 worker_io,
                 stdout_tx,
-                stderr_tx,
+                stderr,
                 generation,
                 commands,
                 probe,
@@ -684,6 +794,14 @@ impl SidecarSupervisor {
         self.io.clone()
     }
 
+    /// Returns the retained stderr lines for the active child, oldest first.
+    pub fn recent_stderr(&self) -> Vec<String> {
+        let LineReaderInner::Stderr(ring) = &self.io.stderr.0 else {
+            unreachable!()
+        };
+        ring.snapshot()
+    }
+
     pub fn shutdown(&mut self) -> Result<(), SidecarError> {
         let Some(worker) = self.worker.take() else {
             return Err(SidecarError::AlreadyStopped);
@@ -709,7 +827,7 @@ fn supervise(
     state: Arc<Mutex<SupervisorState>>,
     io: SidecarIo,
     stdout_tx: mpsc::Sender<(u64, String)>,
-    stderr_tx: mpsc::Sender<(u64, String)>,
+    stderr: Arc<StderrRing>,
     generation: Arc<AtomicU64>,
     commands: mpsc::Receiver<SupervisorCommand>,
     probe: Arc<HealthProbe>,
@@ -745,7 +863,7 @@ fn supervise(
             &config,
             &io,
             stdout_tx.clone(),
-            stderr_tx.clone(),
+            stderr.clone(),
             child_generation,
         ) {
             Ok(child) => child,
@@ -807,8 +925,13 @@ fn supervise(
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             match child.try_wait() {
-                Ok(Some(exit)) => break process_exit_cause(exit),
-                Err(error) => break SidecarEventCause::ProcessWaitError(error.to_string()),
+                Ok(Some(exit)) => break process_exit_cause(exit, &stderr),
+                Err(error) => {
+                    break SidecarEventCause::ProcessWaitError {
+                        message: error.to_string(),
+                        stderr_tail: stderr_tail(&stderr),
+                    }
+                }
                 Ok(None) => {}
             }
             if Instant::now() >= next_probe {
@@ -820,7 +943,10 @@ fn supervise(
                         config.shutdown_timeout,
                         config.poll_interval,
                     );
-                    break SidecarEventCause::HealthProbeFailure(message);
+                    break SidecarEventCause::HealthProbeFailure {
+                        message,
+                        stderr_tail: stderr_tail(&stderr),
+                    };
                 }
                 consecutive_failures = 0;
             }
@@ -837,7 +963,7 @@ fn supervise(
     }
 }
 
-fn process_exit_cause(exit: std::process::ExitStatus) -> SidecarEventCause {
+fn process_exit_cause(exit: std::process::ExitStatus, stderr: &StderrRing) -> SidecarEventCause {
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
     SidecarEventCause::ProcessExit {
@@ -846,14 +972,20 @@ fn process_exit_cause(exit: std::process::ExitStatus) -> SidecarEventCause {
         signal: exit.signal(),
         #[cfg(not(unix))]
         signal: None,
+        stderr_tail: stderr_tail(stderr),
     }
+}
+
+fn stderr_tail(stderr: &StderrRing) -> Vec<String> {
+    let lines = stderr.snapshot();
+    lines[lines.len().saturating_sub(STDERR_DIAGNOSTIC_LINES)..].to_vec()
 }
 
 fn spawn_child(
     config: &SidecarConfig,
     io: &SidecarIo,
     out: mpsc::Sender<(u64, String)>,
-    err: mpsc::Sender<(u64, String)>,
+    err: Arc<StderrRing>,
     generation: u64,
 ) -> Result<Child, std::io::Error> {
     let mut child = Command::new(&config.program)
@@ -863,6 +995,7 @@ fn spawn_child(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    err.begin_generation(generation);
     {
         let mut stdin = io.stdin.0.lock().unwrap();
         stdin.generation = generation;
@@ -876,8 +1009,20 @@ fn spawn_child(
 fn pipe_lines(pipe: ChildStdout, tx: mpsc::Sender<(u64, String)>, generation: u64) {
     thread::spawn(move || forward_lines(pipe, tx, generation));
 }
-fn pipe_error_lines(pipe: ChildStderr, tx: mpsc::Sender<(u64, String)>, generation: u64) {
-    thread::spawn(move || forward_lines(pipe, tx, generation));
+fn pipe_error_lines(pipe: ChildStderr, ring: Arc<StderrRing>, generation: u64) {
+    thread::spawn(move || {
+        for line in BufReader::new(pipe).lines() {
+            match line {
+                Ok(line) => {
+                    let line = line.strip_suffix('\r').unwrap_or(&line);
+                    if !line.is_empty() {
+                        ring.push(generation, line.to_owned());
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
 }
 fn forward_lines(pipe: impl std::io::Read, tx: mpsc::Sender<(u64, String)>, generation: u64) {
     for line in BufReader::new(pipe).lines() {

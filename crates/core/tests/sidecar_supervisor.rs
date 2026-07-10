@@ -126,6 +126,83 @@ fn spawn_and_line_round_trip() {
 }
 
 #[test]
+fn stderr_is_bounded_and_reader_starts_at_oldest_retained_line() {
+    let mut cfg = config(&["stderr-spam", "100000"]);
+    cfg.stderr_capacity = 37;
+    let mut supervisor = SidecarSupervisor::spawn(cfg, |_| Ok(())).unwrap();
+    assert_eq!(
+        supervisor
+            .io()
+            .stdout
+            .read_line_timeout(Duration::from_secs(10))
+            .unwrap()
+            .as_deref(),
+        Some("stderr-done")
+    );
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let retained = supervisor.recent_stderr();
+        if retained.last().map(String::as_str) == Some("stderr-99999") {
+            assert_eq!(retained.len(), 37);
+            assert_eq!(retained.first().map(String::as_str), Some("stderr-99963"));
+            break;
+        }
+        assert!(Instant::now() < until, "stderr forwarding did not complete");
+        thread::yield_now();
+    }
+    assert_eq!(supervisor.io().stderr.read_line().unwrap(), "stderr-99963");
+    supervisor.shutdown().unwrap();
+}
+
+#[test]
+fn stderr_ring_is_cleared_when_a_replacement_starts() {
+    let marker = temp_marker("stderr-generation");
+    let _ = std::fs::remove_dir(&marker);
+    let marker_arg = marker.to_string_lossy().into_owned();
+    let mut supervisor =
+        SidecarSupervisor::spawn(config(&["stderr-generation", &marker_arg]), |_| Ok(())).unwrap();
+    let events = supervisor.subscribe();
+    loop {
+        let event = next_event(&events);
+        if event.status == SidecarStatus::Healthy && event.generation == Some(2) {
+            break;
+        }
+    }
+    assert_eq!(
+        supervisor
+            .io()
+            .stderr
+            .read_line_timeout(Duration::from_secs(2))
+            .unwrap()
+            .as_deref(),
+        Some("new-generation")
+    );
+    assert_eq!(supervisor.recent_stderr(), vec!["new-generation"]);
+    supervisor.shutdown().unwrap();
+    let _ = std::fs::remove_dir(marker);
+}
+
+#[test]
+fn health_restart_cause_includes_recent_stderr() {
+    let mut cfg = config(&["stderr-hang"]);
+    cfg.health_interval = Duration::from_millis(20);
+    let mut supervisor = SidecarSupervisor::spawn(cfg, |_| Err("unhealthy".into())).unwrap();
+    let events = supervisor.subscribe();
+    let restarting = loop {
+        let event = next_event(&events);
+        if event.status == SidecarStatus::Restarting {
+            break event;
+        }
+    };
+    assert!(matches!(
+        restarting.cause,
+        Some(SidecarEventCause::HealthProbeFailure { message, stderr_tail })
+            if message == "unhealthy" && stderr_tail == ["health failure detail"]
+    ));
+    supervisor.shutdown().unwrap();
+}
+
+#[test]
 fn crash_restarts_after_backoff() {
     let marker = temp_marker("restart");
     let _ = std::fs::remove_dir(&marker);
