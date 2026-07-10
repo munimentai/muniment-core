@@ -185,6 +185,26 @@ impl JsonRpcTransport {
         }
     }
 
+    /// Builds a supervisor health probe that calls `method` with no parameters.
+    ///
+    /// The returned closure shares this transport's call lock, so it cannot read
+    /// a response or notification belonging to an in-flight application call.
+    /// Waiting to acquire that lock is not included in `timeout`.
+    pub fn health_probe(
+        self: &Arc<Self>,
+        method: impl Into<String> + 'static,
+        timeout: Duration,
+    ) -> impl Fn(&SidecarIo) -> Result<(), String> + Send + Sync + 'static {
+        let transport = Arc::clone(self);
+        let method = method.into();
+        move |_| {
+            transport
+                .call::<Value, Value>(&method, None, timeout)
+                .map(|_| ())
+                .map_err(|error| format!("JSON-RPC health probe `{method}` failed: {error}"))
+        }
+    }
+
     /// Allocates an ID and performs one request/response exchange.
     pub fn call<P: Serialize, R: serde::de::DeserializeOwned>(
         &self,

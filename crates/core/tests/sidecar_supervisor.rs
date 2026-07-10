@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -134,6 +134,64 @@ fn failed_health_probe_restarts_the_child() {
     let _ = std::fs::remove_dir(marker);
 }
 
+fn spawn_with_json_rpc_probe(
+    cfg: SidecarConfig,
+) -> (SidecarSupervisor, Arc<OnceLock<Arc<JsonRpcTransport>>>) {
+    let transport = Arc::new(OnceLock::new());
+    let probe_transport = Arc::clone(&transport);
+    let supervisor = SidecarSupervisor::spawn(cfg, move |io| {
+        let transport = probe_transport.get_or_init(|| Arc::new(JsonRpcTransport::new(io.clone())));
+        transport.health_probe("ping", Duration::from_millis(100))(io)
+    })
+    .unwrap();
+    (supervisor, transport)
+}
+
+#[test]
+fn json_rpc_probe_keeps_supervisor_healthy_across_intervals() {
+    let mut cfg = config(&["json-rpc"]);
+    cfg.health_interval = Duration::from_millis(20);
+    let (mut supervisor, _) = spawn_with_json_rpc_probe(cfg);
+    wait_for(&supervisor, SidecarStatus::Healthy);
+    let stderr = supervisor.io().stderr;
+    for _ in 0..3 {
+        assert_eq!(
+            stderr
+                .read_line_timeout(Duration::from_secs(1))
+                .unwrap()
+                .as_deref(),
+            Some("ping")
+        );
+    }
+    assert_eq!(supervisor.status(), SidecarStatus::Healthy);
+    supervisor.shutdown().unwrap();
+}
+
+#[test]
+fn failed_json_rpc_probe_restarts_child_and_recovers() {
+    let marker = temp_marker("json-rpc-probe");
+    let _ = std::fs::remove_dir(&marker);
+    let marker_arg = marker.to_string_lossy().into_owned();
+    let mut cfg = config(&["json-rpc", &marker_arg]);
+    cfg.health_interval = Duration::from_millis(20);
+    let (mut supervisor, _) = spawn_with_json_rpc_probe(cfg);
+    let stderr = supervisor.io().stderr;
+    // The first child answers once, then times out. The replacement answers
+    // repeatedly because the marker directory already exists.
+    for _ in 0..3 {
+        assert_eq!(
+            stderr
+                .read_line_timeout(Duration::from_secs(2))
+                .unwrap()
+                .as_deref(),
+            Some("ping")
+        );
+    }
+    wait_for(&supervisor, SidecarStatus::Healthy);
+    supervisor.shutdown().unwrap();
+    let _ = std::fs::remove_dir(marker);
+}
+
 #[test]
 fn graceful_shutdown_leaves_no_child() {
     let pid_file = temp_marker("pid");
@@ -197,6 +255,37 @@ fn json_rpc_params_and_result_round_trip() {
         )
         .unwrap();
     assert_eq!(result, json!({"prompt": "hello", "count": 2}));
+    supervisor.shutdown().unwrap();
+}
+
+#[test]
+fn json_rpc_probe_serializes_with_in_flight_call() {
+    let mut supervisor = rpc_supervisor();
+    let io = supervisor.io();
+    let transport = Arc::new(JsonRpcTransport::new(io.clone()));
+    let call_transport = Arc::clone(&transport);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let call = thread::spawn(move || {
+        let result: String = call_transport
+            .call_with_notifications(
+                "delayed",
+                None::<Value>,
+                JsonRpcId::String("application".into()),
+                Duration::from_secs(1),
+                |notification| {
+                    assert_eq!(notification.method, "delayed.started");
+                    started_tx.send(()).unwrap();
+                },
+            )
+            .unwrap();
+        assert_eq!(result, "delayed");
+    });
+    started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let probe = transport.health_probe("ping", Duration::from_secs(1));
+    let probe_io = io.clone();
+    let probe = thread::spawn(move || probe(&probe_io));
+    call.join().unwrap();
+    probe.join().unwrap().unwrap();
     supervisor.shutdown().unwrap();
 }
 

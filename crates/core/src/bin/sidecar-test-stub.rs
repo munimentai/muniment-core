@@ -7,7 +7,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("echo") => echo(),
-        Some("json-rpc") => json_rpc(),
+        Some("json-rpc") => json_rpc(args.next()),
         Some("crash") => std::process::exit(17),
         Some("once") => {
             let marker = args.next().unwrap();
@@ -50,7 +50,11 @@ fn echo() {
     }
 }
 
-fn json_rpc() {
+fn json_rpc(ping_marker: Option<String>) {
+    let stop_answering_ping = ping_marker
+        .as_deref()
+        .is_some_and(|marker| fs::create_dir(marker).is_ok());
+    let mut answered_ping = false;
     for line in io::stdin().lock().lines() {
         let request: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
         if request.get("id").is_none() {
@@ -58,6 +62,27 @@ fn json_rpc() {
         }
         let id = request["id"].clone();
         match request["method"].as_str() {
+            Some("ping") if !stop_answering_ping || !answered_ping => {
+                answered_ping = true;
+                eprintln!("ping");
+                println!(
+                    "{}",
+                    serde_json::json!({"jsonrpc": "2.0", "result": "pong", "id": id})
+                );
+            }
+            Some("ping") => continue,
+            Some("delayed") => {
+                println!(
+                    "{}",
+                    serde_json::json!({"jsonrpc": "2.0", "method": "delayed.started"})
+                );
+                io::stdout().flush().unwrap();
+                thread::sleep(Duration::from_millis(100));
+                println!(
+                    "{}",
+                    serde_json::json!({"jsonrpc": "2.0", "result": "delayed", "id": id})
+                );
+            }
             Some("round_trip") => println!(
                 "{}",
                 serde_json::json!({
