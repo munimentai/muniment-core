@@ -409,6 +409,29 @@ pub enum SidecarStatus {
     Failed,
 }
 
+/// Why a sidecar lifecycle transition occurred.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidecarEventCause {
+    ProcessExit {
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
+    ProcessWaitError(String),
+    SpawnError(String),
+    HealthProbeFailure(String),
+    Shutdown,
+}
+
+/// An ordered sidecar status transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarEvent {
+    pub status: SidecarStatus,
+    pub cause: Option<SidecarEventCause>,
+    pub restart_attempt: Option<usize>,
+    pub backoff_delay: Option<Duration>,
+    pub generation: Option<u64>,
+}
+
 #[derive(Debug)]
 pub enum SidecarError {
     Spawn(std::io::Error),
@@ -555,10 +578,17 @@ pub struct SidecarIo {
 type HealthProbe = dyn Fn(&SidecarIo) -> Result<(), String> + Send + Sync + 'static;
 
 pub struct SidecarSupervisor {
-    status: Arc<Mutex<SidecarStatus>>,
+    state: Arc<Mutex<SupervisorState>>,
     io: SidecarIo,
     command: mpsc::Sender<SupervisorCommand>,
     worker: Option<JoinHandle<()>>,
+}
+
+struct SupervisorState {
+    status: SidecarStatus,
+    events: Vec<SidecarEvent>,
+    subscribers: Vec<mpsc::Sender<SidecarEvent>>,
+    closed: bool,
 }
 
 enum SupervisorCommand {
@@ -596,15 +626,27 @@ impl SidecarSupervisor {
                 generation: generation.clone(),
             }))),
         };
-        let status = Arc::new(Mutex::new(SidecarStatus::Starting));
+        let starting = SidecarEvent {
+            status: SidecarStatus::Starting,
+            cause: None,
+            restart_attempt: None,
+            backoff_delay: None,
+            generation: None,
+        };
+        let state = Arc::new(Mutex::new(SupervisorState {
+            status: SidecarStatus::Starting,
+            events: vec![starting],
+            subscribers: Vec::new(),
+            closed: false,
+        }));
         let (command, commands) = mpsc::channel();
-        let worker_status = status.clone();
+        let worker_state = state.clone();
         let worker_io = io.clone();
         let probe: Arc<HealthProbe> = Arc::new(health_probe);
         let worker = thread::spawn(move || {
             supervise(
                 config,
-                worker_status,
+                worker_state,
                 worker_io,
                 stdout_tx,
                 stderr_tx,
@@ -614,7 +656,7 @@ impl SidecarSupervisor {
             )
         });
         Ok(Self {
-            status,
+            state,
             io,
             command,
             worker: Some(worker),
@@ -622,7 +664,20 @@ impl SidecarSupervisor {
     }
 
     pub fn status(&self) -> SidecarStatus {
-        *self.status.lock().unwrap()
+        self.state.lock().unwrap().status
+    }
+
+    /// Subscribes to lifecycle transitions, replaying transitions already emitted.
+    pub fn subscribe(&self) -> mpsc::Receiver<SidecarEvent> {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = self.state.lock().unwrap();
+        for event in &state.events {
+            let _ = sender.send(event.clone());
+        }
+        if !state.closed {
+            state.subscribers.push(sender);
+        }
+        receiver
     }
 
     pub fn io(&self) -> SidecarIo {
@@ -651,7 +706,7 @@ impl Drop for SidecarSupervisor {
 
 fn supervise(
     config: SidecarConfig,
-    status: Arc<Mutex<SidecarStatus>>,
+    state: Arc<Mutex<SupervisorState>>,
     io: SidecarIo,
     stdout_tx: mpsc::Sender<(u64, String)>,
     stderr_tx: mpsc::Sender<(u64, String)>,
@@ -661,15 +716,9 @@ fn supervise(
 ) {
     let mut restarts = VecDeque::new();
     let mut consecutive_failures = 0u32;
+    let mut restart_cause = None;
+    let mut restart_attempt = None;
     loop {
-        set_status(
-            &status,
-            if consecutive_failures == 0 {
-                SidecarStatus::Starting
-            } else {
-                SidecarStatus::Restarting
-            },
-        );
         if consecutive_failures > 0 {
             let shift = consecutive_failures.saturating_sub(1).min(31);
             let delay = config
@@ -677,7 +726,17 @@ fn supervise(
                 .initial_backoff
                 .saturating_mul(1u32 << shift)
                 .min(config.restart.max_backoff);
-            if wait_or_shutdown(delay, &commands, &io, None, &config, &status) {
+            emit_event(
+                &state,
+                SidecarEvent {
+                    status: SidecarStatus::Restarting,
+                    cause: restart_cause.clone(),
+                    restart_attempt,
+                    backoff_delay: Some(delay),
+                    generation: None,
+                },
+            );
+            if wait_or_shutdown(delay, &commands, &io, None, &config, &state) {
                 return;
             }
         }
@@ -690,18 +749,31 @@ fn supervise(
             child_generation,
         ) {
             Ok(child) => child,
-            Err(_) => {
-                if !allow_restart(&config.restart, &mut restarts) {
-                    set_status(&status, SidecarStatus::Failed);
+            Err(error) => {
+                let cause = SidecarEventCause::SpawnError(error.to_string());
+                if let Some(attempt) = allow_restart(&config.restart, &mut restarts) {
+                    restart_attempt = Some(attempt);
+                    restart_cause = Some(cause);
+                } else {
+                    emit_terminal(&state, SidecarStatus::Failed, Some(cause));
                     return;
                 }
                 consecutive_failures = consecutive_failures.saturating_add(1);
                 continue;
             }
         };
-        set_status(&status, SidecarStatus::Healthy);
+        emit_event(
+            &state,
+            SidecarEvent {
+                status: SidecarStatus::Healthy,
+                cause: None,
+                restart_attempt: None,
+                backoff_delay: None,
+                generation: Some(child_generation),
+            },
+        );
         let mut next_probe = Instant::now() + config.health_interval;
-        let restart = loop {
+        let cause = loop {
             match commands.recv_timeout(config.poll_interval) {
                 Ok(SupervisorCommand::Shutdown(done)) => {
                     stop_child(
@@ -710,7 +782,11 @@ fn supervise(
                         config.shutdown_timeout,
                         config.poll_interval,
                     );
-                    set_status(&status, SidecarStatus::Stopped);
+                    emit_terminal(
+                        &state,
+                        SidecarStatus::Stopped,
+                        Some(SidecarEventCause::Shutdown),
+                    );
                     let _ = done.send(());
                     return;
                 }
@@ -721,37 +797,55 @@ fn supervise(
                         config.shutdown_timeout,
                         config.poll_interval,
                     );
-                    set_status(&status, SidecarStatus::Stopped);
+                    emit_terminal(
+                        &state,
+                        SidecarStatus::Stopped,
+                        Some(SidecarEventCause::Shutdown),
+                    );
                     return;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             match child.try_wait() {
-                Ok(Some(_)) | Err(_) => break true,
+                Ok(Some(exit)) => break process_exit_cause(exit),
+                Err(error) => break SidecarEventCause::ProcessWaitError(error.to_string()),
                 Ok(None) => {}
             }
             if Instant::now() >= next_probe {
                 next_probe = Instant::now() + config.health_interval;
-                if probe(&io).is_err() {
+                if let Err(message) = probe(&io) {
                     stop_child(
                         &mut child,
                         &io,
                         config.shutdown_timeout,
                         config.poll_interval,
                     );
-                    break true;
+                    break SidecarEventCause::HealthProbeFailure(message);
                 }
                 consecutive_failures = 0;
             }
         };
-        if restart {
-            io.stdin.0.lock().unwrap().writer = None;
-            if !allow_restart(&config.restart, &mut restarts) {
-                set_status(&status, SidecarStatus::Failed);
-                return;
-            }
-            consecutive_failures = consecutive_failures.saturating_add(1);
+        io.stdin.0.lock().unwrap().writer = None;
+        if let Some(attempt) = allow_restart(&config.restart, &mut restarts) {
+            restart_attempt = Some(attempt);
+            restart_cause = Some(cause);
+        } else {
+            emit_terminal(&state, SidecarStatus::Failed, Some(cause));
+            return;
         }
+        consecutive_failures = consecutive_failures.saturating_add(1);
+    }
+}
+
+fn process_exit_cause(exit: std::process::ExitStatus) -> SidecarEventCause {
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+    SidecarEventCause::ProcessExit {
+        code: exit.code(),
+        #[cfg(unix)]
+        signal: exit.signal(),
+        #[cfg(not(unix))]
+        signal: None,
     }
 }
 
@@ -802,7 +896,7 @@ fn forward_lines(pipe: impl std::io::Read, tx: mpsc::Sender<(u64, String)>, gene
     }
 }
 
-fn allow_restart(policy: &RestartPolicy, history: &mut VecDeque<Instant>) -> bool {
+fn allow_restart(policy: &RestartPolicy, history: &mut VecDeque<Instant>) -> Option<usize> {
     let now = Instant::now();
     while history
         .front()
@@ -811,10 +905,10 @@ fn allow_restart(policy: &RestartPolicy, history: &mut VecDeque<Instant>) -> boo
         history.pop_front();
     }
     if history.len() >= policy.max_restarts {
-        return false;
+        return None;
     }
     history.push_back(now);
-    true
+    Some(history.len())
 }
 
 fn stop_child(child: &mut Child, io: &SidecarIo, deadline: Duration, poll: Duration) {
@@ -836,27 +930,60 @@ fn wait_or_shutdown(
     io: &SidecarIo,
     child: Option<&mut Child>,
     config: &SidecarConfig,
-    status: &Arc<Mutex<SidecarStatus>>,
+    state: &Arc<Mutex<SupervisorState>>,
 ) -> bool {
     match commands.recv_timeout(delay) {
         Ok(SupervisorCommand::Shutdown(done)) => {
             if let Some(child) = child {
                 stop_child(child, io, config.shutdown_timeout, config.poll_interval);
             }
-            set_status(status, SidecarStatus::Stopped);
+            emit_terminal(
+                state,
+                SidecarStatus::Stopped,
+                Some(SidecarEventCause::Shutdown),
+            );
             let _ = done.send(());
             true
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            set_status(status, SidecarStatus::Stopped);
+            emit_terminal(
+                state,
+                SidecarStatus::Stopped,
+                Some(SidecarEventCause::Shutdown),
+            );
             true
         }
         Err(mpsc::RecvTimeoutError::Timeout) => false,
     }
 }
 
-fn set_status(status: &Arc<Mutex<SidecarStatus>>, value: SidecarStatus) {
-    *status.lock().unwrap() = value;
+fn emit_event(state: &Arc<Mutex<SupervisorState>>, event: SidecarEvent) {
+    let mut state = state.lock().unwrap();
+    state.status = event.status;
+    state.events.push(event.clone());
+    state
+        .subscribers
+        .retain(|sender| sender.send(event.clone()).is_ok());
+}
+
+fn emit_terminal(
+    state: &Arc<Mutex<SupervisorState>>,
+    status: SidecarStatus,
+    cause: Option<SidecarEventCause>,
+) {
+    emit_event(
+        state,
+        SidecarEvent {
+            status,
+            cause,
+            restart_attempt: None,
+            backoff_delay: None,
+            generation: None,
+        },
+    );
+    let mut state = state.lock().unwrap();
+    state.closed = true;
+    state.subscribers.clear();
 }
 
 #[cfg(test)]

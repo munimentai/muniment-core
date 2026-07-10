@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use muniment_core::sidecar::{
     JsonRpcId, JsonRpcTransport, JsonRpcTransportError, RestartPolicy, SidecarConfig, SidecarError,
-    SidecarStatus, SidecarSupervisor,
+    SidecarEvent, SidecarEventCause, SidecarStatus, SidecarSupervisor,
 };
 use serde_json::{json, Value};
 
@@ -41,6 +41,71 @@ fn wait_for(supervisor: &SidecarSupervisor, wanted: SidecarStatus) {
         "timed out waiting for {wanted:?}; current status is {:?}",
         supervisor.status()
     );
+}
+
+fn next_event(events: &std::sync::mpsc::Receiver<SidecarEvent>) -> SidecarEvent {
+    events.recv_timeout(Duration::from_secs(5)).unwrap()
+}
+
+#[test]
+fn subscribers_receive_the_full_ordered_lifecycle() {
+    let mut supervisor = SidecarSupervisor::spawn(config(&["echo"]), |_| Ok(())).unwrap();
+    let first = supervisor.subscribe();
+    let second = supervisor.subscribe();
+
+    for events in [&first, &second] {
+        assert_eq!(next_event(events).status, SidecarStatus::Starting);
+        let healthy = next_event(events);
+        assert_eq!(healthy.status, SidecarStatus::Healthy);
+        assert_eq!(healthy.generation, Some(1));
+    }
+
+    drop(first);
+    supervisor.shutdown().unwrap();
+    assert_eq!(next_event(&second).status, SidecarStatus::Stopped);
+    assert!(second.recv_timeout(Duration::from_millis(50)).is_err());
+}
+
+#[test]
+fn restart_events_include_exit_attempt_and_backoff() {
+    let marker = temp_marker("restart-events");
+    let _ = std::fs::remove_dir(&marker);
+    let marker_arg = marker.to_string_lossy().into_owned();
+    let mut supervisor =
+        SidecarSupervisor::spawn(config(&["once", &marker_arg]), |_| Ok(())).unwrap();
+    let events = supervisor.subscribe();
+    assert_eq!(next_event(&events).status, SidecarStatus::Starting);
+    assert_eq!(next_event(&events).status, SidecarStatus::Healthy);
+    let restarting = next_event(&events);
+    assert_eq!(restarting.status, SidecarStatus::Restarting);
+    assert!(matches!(
+        restarting.cause,
+        Some(SidecarEventCause::ProcessExit { .. })
+    ));
+    assert_eq!(restarting.restart_attempt, Some(1));
+    assert_eq!(restarting.backoff_delay, Some(Duration::from_millis(10)));
+    assert_eq!(next_event(&events).status, SidecarStatus::Healthy);
+    supervisor.shutdown().unwrap();
+    let _ = std::fs::remove_dir(marker);
+}
+
+#[test]
+fn failed_event_preserves_the_last_error() {
+    let mut cfg = config(&["crash"]);
+    cfg.restart.max_restarts = 1;
+    let supervisor = SidecarSupervisor::spawn(cfg, |_| Ok(())).unwrap();
+    let events = supervisor.subscribe();
+    let failed = loop {
+        let event = next_event(&events);
+        if event.status == SidecarStatus::Failed {
+            break event;
+        }
+    };
+    assert!(matches!(
+        failed.cause,
+        Some(SidecarEventCause::ProcessExit { .. })
+    ));
+    assert!(events.recv_timeout(Duration::from_millis(50)).is_err());
 }
 
 #[test]
