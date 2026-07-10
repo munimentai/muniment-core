@@ -1,0 +1,10 @@
+[package]
+name = "muniment-core"
+version = "0.0.1"
+edition = "2021"
+
+# Pure backend logic (sidecar lifecycle, RPC framing). Deliberately free of
+# Tauri and all other dependencies so `cargo test` compiles and runs on the
+# shared CI runner without the GUI toolchain a desktop-ci build VM provides.
+
+[dependencies]
