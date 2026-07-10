@@ -17,14 +17,19 @@ impl PkcePair {
     /// 64 random bytes → 86-char base64url verifier, inside the 43..=128
     /// bounds of RFC 7636 §4.1.
     pub fn generate() -> Result<Self, AuthError> {
-        Ok(Self::from_verifier(URL_SAFE_NO_PAD.encode(random_bytes::<64>()?)))
+        Ok(Self::from_verifier(
+            URL_SAFE_NO_PAD.encode(random_bytes::<64>()?),
+        ))
     }
 
     /// Derive the S256 challenge for a known verifier (used by tests and by
     /// the mock IdP to check the proof the way a real one would).
     pub fn from_verifier(verifier: String) -> Self {
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-        PkcePair { verifier, challenge }
+        PkcePair {
+            verifier,
+            challenge,
+        }
     }
 }
 
@@ -49,7 +54,10 @@ mod tests {
     fn s256_challenge_matches_rfc7636_appendix_b() {
         let pair =
             PkcePair::from_verifier("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk".to_string());
-        assert_eq!(pair.challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+        assert_eq!(
+            pair.challenge,
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
     }
 
     #[test]

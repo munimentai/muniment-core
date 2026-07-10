@@ -214,16 +214,14 @@ fn crash_restarts_after_backoff() {
     loop {
         if supervisor.status() == SidecarStatus::Healthy
             && io.stdin.write_line("after restart").is_ok()
-        {
-            if io
+            && io
                 .stdout
                 .read_line_timeout(Duration::from_millis(100))
                 .unwrap()
                 .as_deref()
                 == Some("after restart")
-            {
-                break;
-            }
+        {
+            break;
         }
         assert!(started.elapsed() < Duration::from_secs(5));
     }

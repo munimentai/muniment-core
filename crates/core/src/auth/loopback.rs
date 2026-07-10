@@ -181,8 +181,11 @@ mod tests {
 
     fn get(port: u16, target: &str) -> String {
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        write!(s, "GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
-            .unwrap();
+        write!(
+            s,
+            "GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
         let mut out = String::new();
         let _ = s.read_to_string(&mut out);
         out

@@ -822,6 +822,8 @@ impl Drop for SidecarSupervisor {
     }
 }
 
+// These independent handles make the supervisor's shared state and I/O dependencies explicit.
+#[allow(clippy::too_many_arguments)]
 fn supervise(
     config: SidecarConfig,
     state: Arc<Mutex<SupervisorState>>,

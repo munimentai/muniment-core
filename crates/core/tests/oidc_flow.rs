@@ -349,7 +349,7 @@ fn handle(stream: &mut TcpStream, issuer: &str, st: &MockState) {
                     let proof_ok = st.expected_challenge.lock().unwrap().as_deref()
                         == Some(PkcePair::from_verifier(verifier).challenge.as_str());
                     if form.get("code").map(String::as_str) != Some(AUTH_CODE)
-                        || form.get("redirect_uri").is_none()
+                        || !form.contains_key("redirect_uri")
                         || form.get("client_id").map(String::as_str) != Some(CLIENT_ID)
                         || !proof_ok
                     {
