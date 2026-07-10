@@ -53,6 +53,9 @@ fn echo() {
 fn json_rpc() {
     for line in io::stdin().lock().lines() {
         let request: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+        if request.get("id").is_none() {
+            continue;
+        }
         let id = request["id"].clone();
         match request["method"].as_str() {
             Some("round_trip") => println!(
@@ -84,6 +87,30 @@ fn json_rpc() {
                 "{}",
                 serde_json::json!({"jsonrpc": "2.0", "result": null, "id": "wrong"})
             ),
+            Some("count") => {
+                let count = request["params"]["count"].as_u64().unwrap();
+                for value in 0..count {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "count.progress",
+                            "params": {"value": value}
+                        })
+                    );
+                }
+                println!(
+                    "{}",
+                    serde_json::json!({"jsonrpc": "2.0", "result": count, "id": id})
+                );
+            }
+            Some("normalized") => {
+                print!("\r\n\r\n");
+                print!(
+                    "{}\r\n",
+                    serde_json::json!({"jsonrpc": "2.0", "result": "ok", "id": id})
+                );
+            }
             Some("timeout") => continue,
             _ => println!(
                 "{}",

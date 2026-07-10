@@ -201,6 +201,50 @@ fn json_rpc_params_and_result_round_trip() {
 }
 
 #[test]
+fn json_rpc_delivers_notifications_in_order_before_result() {
+    let mut supervisor = rpc_supervisor();
+    let transport = JsonRpcTransport::new(supervisor.io());
+    let mut values = Vec::new();
+    let result: u64 = transport
+        .call_with_notifications(
+            "count",
+            Some(json!({"count": 3})),
+            JsonRpcId::String("stream".into()),
+            Duration::from_secs(2),
+            |notification| {
+                assert_eq!(notification.method, "count.progress");
+                values.push(notification.params.unwrap()["value"].as_u64().unwrap());
+            },
+        )
+        .unwrap();
+    assert_eq!(values, vec![0, 1, 2]);
+    assert_eq!(result, 3);
+    supervisor.shutdown().unwrap();
+}
+
+#[test]
+fn json_rpc_plain_call_skips_notifications() {
+    let mut supervisor = rpc_supervisor();
+    let transport = JsonRpcTransport::new(supervisor.io());
+    let result: u64 = transport
+        .call("count", Some(json!({"count": 2})), Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(result, 2);
+    supervisor.shutdown().unwrap();
+}
+
+#[test]
+fn json_rpc_reader_drops_blank_lines_and_normalizes_crlf() {
+    let mut supervisor = rpc_supervisor();
+    let transport = JsonRpcTransport::new(supervisor.io());
+    let result: String = transport
+        .call::<Value, String>("normalized", None, Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(result, "ok");
+    supervisor.shutdown().unwrap();
+}
+
+#[test]
 fn json_rpc_error_response_is_inspectable() {
     let mut supervisor = rpc_supervisor();
     let transport = JsonRpcTransport::new(supervisor.io());

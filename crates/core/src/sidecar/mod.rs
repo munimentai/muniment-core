@@ -65,6 +65,25 @@ impl<P> JsonRpcRequest<P> {
     }
 }
 
+/// Typed JSON-RPC 2.0 notification envelope.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JsonRpcNotification<P> {
+    pub jsonrpc: JsonRpcVersion,
+    pub method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<P>,
+}
+
+impl<P> JsonRpcNotification<P> {
+    pub fn new(method: impl Into<String>, params: Option<P>) -> Self {
+        Self {
+            jsonrpc: JsonRpcVersion,
+            method: method.into(),
+            params,
+        }
+    }
+}
+
 /// Typed JSON-RPC 2.0 success response envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JsonRpcSuccess<R> {
@@ -185,6 +204,34 @@ impl JsonRpcTransport {
         id: JsonRpcId,
         timeout: Duration,
     ) -> Result<R, JsonRpcTransportError> {
+        self.call_with_notifications(method, params, id, timeout, |_| {})
+    }
+
+    /// Sends a notification, which has no request ID and expects no response.
+    pub fn notify<P: Serialize>(
+        &self,
+        method: impl Into<String>,
+        params: P,
+    ) -> Result<(), JsonRpcTransportError> {
+        let notification = JsonRpcNotification::new(method, Some(params));
+        let line =
+            serde_json::to_string(&notification).map_err(JsonRpcTransportError::Serialize)?;
+        self.io.stdin.write_line(&line).map_err(map_sidecar_error)
+    }
+
+    /// Performs a call while delivering preceding server notifications in order.
+    pub fn call_with_notifications<
+        P: Serialize,
+        R: serde::de::DeserializeOwned,
+        F: FnMut(JsonRpcNotification<Value>),
+    >(
+        &self,
+        method: impl Into<String>,
+        params: Option<P>,
+        id: JsonRpcId,
+        timeout: Duration,
+        mut on_notification: F,
+    ) -> Result<R, JsonRpcTransportError> {
         // Poisoning does not make the line handles unsafe; recover the guard so
         // an earlier caller panic cannot make subsequent calls panic too.
         let _call = self
@@ -194,13 +241,23 @@ impl JsonRpcTransport {
         let request = JsonRpcRequest::new(method, params, id.clone());
         let line = serde_json::to_string(&request).map_err(JsonRpcTransportError::Serialize)?;
         self.io.stdin.write_line(&line).map_err(map_sidecar_error)?;
-        let line = self
-            .io
-            .stdout
-            .read_line_timeout(timeout)
-            .map_err(map_sidecar_error)?
-            .ok_or(JsonRpcTransportError::Timeout)?;
-        decode_response(&line, id)
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(JsonRpcTransportError::Timeout);
+            }
+            let line = self
+                .io
+                .stdout
+                .read_line_timeout(remaining)
+                .map_err(map_sidecar_error)?
+                .ok_or(JsonRpcTransportError::Timeout)?;
+            match decode_frame(&line, id.clone())? {
+                JsonRpcFrame::Notification(notification) => on_notification(notification),
+                JsonRpcFrame::Response(result) => return Ok(result),
+            }
+        }
     }
 }
 
@@ -213,10 +270,15 @@ fn map_sidecar_error(error: SidecarError) -> JsonRpcTransportError {
     }
 }
 
-fn decode_response<R: serde::de::DeserializeOwned>(
+enum JsonRpcFrame<R> {
+    Notification(JsonRpcNotification<Value>),
+    Response(R),
+}
+
+fn decode_frame<R: serde::de::DeserializeOwned>(
     line: &str,
     expected_id: JsonRpcId,
-) -> Result<R, JsonRpcTransportError> {
+) -> Result<JsonRpcFrame<R>, JsonRpcTransportError> {
     let value: Value = serde_json::from_str(line).map_err(JsonRpcTransportError::MalformedJson)?;
     let object = value.as_object().ok_or_else(|| {
         JsonRpcTransportError::InvalidEnvelope("response must be an object".into())
@@ -225,6 +287,12 @@ fn decode_response<R: serde::de::DeserializeOwned>(
         return Err(JsonRpcTransportError::InvalidEnvelope(
             "jsonrpc must be \"2.0\"".into(),
         ));
+    }
+    if object.contains_key("method") && !object.contains_key("id") {
+        let notification = serde_json::from_value(value).map_err(|error| {
+            JsonRpcTransportError::InvalidEnvelope(format!("invalid notification: {error}"))
+        })?;
+        return Ok(JsonRpcFrame::Notification(notification));
     }
     let has_result = object.contains_key("result");
     let has_error = object.contains_key("error");
@@ -259,7 +327,7 @@ fn decode_response<R: serde::de::DeserializeOwned>(
     let response: JsonRpcSuccess<R> = serde_json::from_value(value).map_err(|error| {
         JsonRpcTransportError::InvalidEnvelope(format!("invalid success response: {error}"))
     })?;
-    Ok(response.result)
+    Ok(JsonRpcFrame::Response(response.result))
 }
 
 #[derive(Debug, Clone)]
@@ -592,7 +660,11 @@ fn forward_lines(pipe: impl std::io::Read, tx: mpsc::Sender<String>) {
     for line in BufReader::new(pipe).lines() {
         match line {
             Ok(line) => {
-                if tx.send(line).is_err() {
+                let line = line.strip_suffix('\r').unwrap_or(&line);
+                if line.is_empty() {
+                    continue;
+                }
+                if tx.send(line.to_owned()).is_err() {
                     break;
                 }
             }
@@ -656,4 +728,23 @@ fn wait_or_shutdown(
 
 fn set_status(status: &Arc<Mutex<SidecarStatus>>, value: SidecarStatus) {
     *status.lock().unwrap() = value;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn notification_envelope_has_no_id() {
+        let value = serde_json::to_value(JsonRpcNotification::new(
+            "cancel",
+            Some(json!({"request_id": 7})),
+        ))
+        .unwrap();
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert_eq!(value["method"], "cancel");
+        assert_eq!(value["params"], json!({"request_id": 7}));
+        assert!(!value.as_object().unwrap().contains_key("id"));
+    }
 }
