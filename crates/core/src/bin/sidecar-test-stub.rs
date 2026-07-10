@@ -5,7 +5,12 @@ use std::time::Duration;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
+    let first = args.next();
+    if first.as_deref() == Some("--model") {
+        llama_server_stub(args);
+        return;
+    }
+    match first.as_deref() {
         Some("echo") => echo(),
         Some("json-rpc") => json_rpc(args.next()),
         Some("json-rpc-stale-once") => {
@@ -93,6 +98,19 @@ fn main() {
         }
         _ => std::process::exit(2),
     }
+}
+
+fn llama_server_stub(args: impl Iterator<Item = String>) {
+    let args: Vec<_> = args.collect();
+    if let Ok(path) = std::env::var("LLAMA_STUB_ARGS") {
+        fs::write(path, args.join("\n")).unwrap();
+    }
+    if let Ok(marker) = std::env::var("LLAMA_STUB_EXIT_ONCE") {
+        if fs::create_dir(marker).is_ok() {
+            std::process::exit(23);
+        }
+    }
+    echo();
 }
 
 fn echo() {

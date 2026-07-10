@@ -7,4 +7,5 @@
 pub mod auth;
 pub mod cas;
 pub mod journal;
+pub mod llama;
 pub mod sidecar;
