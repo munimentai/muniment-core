@@ -1,5 +1,7 @@
 //! Durable, append-only per-run event journal.
 
+pub mod reducer;
+
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
