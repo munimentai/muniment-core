@@ -3,8 +3,22 @@ name = "muniment-core"
 version = "0.0.1"
 edition = "2021"
 
-# Pure backend logic (sidecar lifecycle, RPC framing). Deliberately free of
-# Tauri and all other dependencies so `cargo test` compiles and runs on the
-# shared CI runner without the GUI toolchain a desktop-ci build VM provides.
+# Pure backend logic (sidecar lifecycle, RPC framing, OIDC auth engine).
+# Deliberately free of Tauri and GUI dependencies so `cargo test` compiles
+# and runs on the shared CI runner without the GUI toolchain a desktop-ci
+# build VM provides. TLS is feature-gated for the same reason: the auth
+# tests speak plain HTTP to an in-process mock IdP, so the standalone crate
+# never compiles a TLS stack; the desktop crate enables `tls` to reach the
+# real HTTPS control plane.
+
+[features]
+# rustls (ring provider) via ureq — turned on by the desktop crate.
+tls = ["ureq/tls"]
 
 [dependencies]
+base64 = "0.22"
+getrandom = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+ureq = { version = "2", default-features = false, features = ["json"] }

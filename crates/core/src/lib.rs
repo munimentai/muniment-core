@@ -4,6 +4,8 @@
 //! here run on the shared CI runner, which has no display stack. The Pi
 //! sidecar process manager and its RPC transport build on these pieces.
 
+pub mod auth;
+
 /// Incremental splitter for JSONL RPC frames read from a child process's
 /// stdio. Feed raw bytes as they arrive; complete frames come back out and a
 /// trailing partial line stays buffered until its newline shows up. A
