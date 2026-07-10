@@ -5,6 +5,7 @@
 //! sidecar process manager and its RPC transport build on these pieces.
 
 pub mod auth;
+pub mod cas;
 
 /// Incremental splitter for JSONL RPC frames read from a child process's
 /// stdio. Feed raw bytes as they arrive; complete frames come back out and a

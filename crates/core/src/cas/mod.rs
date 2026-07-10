@@ -1,0 +1,183 @@
+//! Content-addressed local object storage.
+//!
+//! Objects are named by the lowercase hexadecimal SHA-256 digest of their
+//! bytes and stored as `objects/<first two hex characters>/<remaining hex>`.
+//! Writes first go to a unique temporary file in the store root, then are
+//! atomically renamed into place; an existing object makes `put` a no-op.
+
+use sha2::{Digest, Sha256};
+use std::fmt;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
+
+/// A validated lowercase hexadecimal SHA-256 digest.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ContentHash(String);
+
+impl ContentHash {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn for_bytes(bytes: &[u8]) -> Self {
+        Self(format!("{:x}", Sha256::digest(bytes)))
+    }
+}
+
+impl fmt::Display for ContentHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for ContentHash {
+    type Err = CasError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(CasError::InvalidHash(value.to_owned()))
+        }
+    }
+}
+
+/// Failures reading or validating the local object store.
+#[derive(Debug)]
+pub enum CasError {
+    Io(std::io::Error),
+    InvalidHash(String),
+    NotFound(ContentHash),
+    Corrupt {
+        expected: ContentHash,
+        actual: ContentHash,
+    },
+}
+
+impl fmt::Display for CasError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CasError::Io(error) => write!(f, "object store I/O error: {error}"),
+            CasError::InvalidHash(hash) => write!(f, "invalid SHA-256 content hash: {hash}"),
+            CasError::NotFound(hash) => write!(f, "object not found: {hash}"),
+            CasError::Corrupt { expected, actual } => {
+                write!(f, "object {expected} is corrupt (actual hash {actual})")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CasError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            CasError::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for CasError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+/// A content-addressed store rooted at a caller-selected directory.
+#[derive(Debug)]
+pub struct LocalCas {
+    root: PathBuf,
+}
+
+impl LocalCas {
+    pub fn open(root: &Path) -> Result<Self, CasError> {
+        fs::create_dir_all(root.join("objects"))?;
+        Ok(Self {
+            root: root.to_owned(),
+        })
+    }
+
+    pub fn put(&self, bytes: &[u8]) -> Result<ContentHash, CasError> {
+        let hash = ContentHash::for_bytes(bytes);
+        let destination = self.object_path(&hash);
+        if destination.is_file() {
+            return Ok(hash);
+        }
+
+        fs::create_dir_all(destination.parent().expect("object path has a parent"))?;
+        let (temporary, mut file) = self.create_temp_file()?;
+        let result = (|| -> Result<(), CasError> {
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temporary, &destination)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result?;
+        Ok(hash)
+    }
+
+    pub fn get(&self, hash: &ContentHash) -> Result<Option<Vec<u8>>, CasError> {
+        match fs::read(self.object_path(hash)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn has(&self, hash: &ContentHash) -> Result<bool, CasError> {
+        match fs::metadata(self.object_path(hash)) {
+            Ok(metadata) => Ok(metadata.is_file()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn verify(&self, hash: &ContentHash) -> Result<(), CasError> {
+        let bytes = self
+            .get(hash)?
+            .ok_or_else(|| CasError::NotFound(hash.clone()))?;
+        let actual = ContentHash::for_bytes(&bytes);
+        if actual == *hash {
+            Ok(())
+        } else {
+            Err(CasError::Corrupt {
+                expected: hash.clone(),
+                actual,
+            })
+        }
+    }
+
+    fn object_path(&self, hash: &ContentHash) -> PathBuf {
+        let value = hash.as_str();
+        self.root
+            .join("objects")
+            .join(&value[..2])
+            .join(&value[2..])
+    }
+
+    fn create_temp_file(&self) -> Result<(PathBuf, fs::File), CasError> {
+        loop {
+            let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+            let path = self
+                .root
+                .join(format!(".cas-tmp-{}-{sequence}", std::process::id()));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => return Ok((path, file)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+}
