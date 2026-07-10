@@ -6,10 +6,13 @@ use std::thread;
 use std::time::Duration;
 
 use muniment_core::llama::{
-    ChatCompletionRequest, ChatMessage, LlamaChatClient, LlamaChatError, LlamaHealthClient,
-    LlamaServerConfig, LoopbackHost,
+    verify_model_artifact, ChatCompletionRequest, ChatMessage, LlamaChatClient, LlamaChatError,
+    LlamaHealthClient, ModelVerificationError, ResidentModelDescriptor, RESIDENT_MODEL,
 };
-use muniment_core::sidecar::{ProbeOutcome, RestartPolicy, SidecarStatus, SidecarSupervisor};
+use muniment_core::sidecar::{
+    ProbeOutcome, RestartPolicy, SidecarConfig, SidecarStatus, SidecarSupervisor,
+};
+use sha2::{Digest, Sha256};
 
 fn fixture(responses: Vec<String>) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -70,7 +73,6 @@ fn chat_fixture(response: String) -> (String, mpsc::Receiver<String>, thread::Jo
 
 fn chat_request() -> ChatCompletionRequest {
     ChatCompletionRequest::new(
-        "local-model",
         vec![
             ChatMessage::system("private-system"),
             ChatMessage::user("private-user"),
@@ -84,27 +86,69 @@ fn temp_marker(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("muniment-llama-{name}-{}", std::process::id()))
 }
 
-#[test]
-fn launch_arguments_are_separate_and_always_loopback() {
-    let config = LlamaServerConfig::new("llama server", "models/a model.gguf", 32123);
-    let sidecar = config.sidecar_config();
-    assert_eq!(sidecar.program, "llama server");
-    assert_eq!(
-        sidecar.args,
-        [
-            "--model",
-            "models/a model.gguf",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "32123"
-        ]
-    );
-    assert_eq!(config.base_url(), "http://127.0.0.1:32123");
+fn temp_fixture(name: &str, contents: &[u8]) -> PathBuf {
+    let path = temp_marker(name);
+    std::fs::write(&path, contents).unwrap();
+    path
+}
 
-    let ipv6 = config.with_host(LoopbackHost::Ipv6);
-    assert_eq!(ipv6.sidecar_config().args[3], "::1");
-    assert_eq!(ipv6.base_url(), "http://[::1]:32123");
+fn fixture_descriptor(contents: &[u8]) -> ResidentModelDescriptor {
+    let digest = format!("{:x}", Sha256::digest(contents));
+    ResidentModelDescriptor {
+        filename: "fixture.gguf",
+        byte_size: contents.len() as u64,
+        sha256: Box::leak(digest.into_boxed_str()),
+        alias: "fixture",
+        context_tokens: 8,
+    }
+}
+
+#[test]
+fn artifact_verification_succeeds_and_covers_typed_redacted_failures() {
+    let contents = b"small model fixture";
+    let descriptor = fixture_descriptor(contents);
+    let valid = temp_fixture("valid", contents);
+    assert_eq!(verify_model_artifact(&valid, &descriptor), Ok(()));
+
+    let missing = temp_marker("secret-missing-path");
+    let wrong_size = temp_fixture("wrong-size-secret", b"short");
+    let wrong_digest = temp_fixture("wrong-digest-secret", b"different contents!");
+    let directory = temp_marker("directory-secret");
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir(&directory).unwrap();
+
+    let failures = [
+        (
+            verify_model_artifact(&missing, &descriptor),
+            ModelVerificationError::Missing,
+        ),
+        (
+            verify_model_artifact(&wrong_size, &descriptor),
+            ModelVerificationError::WrongSize {
+                expected: 19,
+                actual: 5,
+            },
+        ),
+        (
+            verify_model_artifact(&wrong_digest, &descriptor),
+            ModelVerificationError::DigestMismatch,
+        ),
+        (
+            verify_model_artifact(&directory, &descriptor),
+            ModelVerificationError::NotRegularFile,
+        ),
+    ];
+    for (actual, expected) in failures {
+        let error = actual.unwrap_err();
+        assert_eq!(error, expected);
+        assert!(!error.to_string().contains("secret"));
+        assert!(!error.to_string().contains("different contents"));
+    }
+
+    let _ = std::fs::remove_file(valid);
+    let _ = std::fs::remove_file(wrong_size);
+    let _ = std::fs::remove_file(wrong_digest);
+    let _ = std::fs::remove_dir(directory);
 }
 
 #[test]
@@ -138,7 +182,7 @@ fn chat_client_posts_typed_non_streaming_request_and_returns_usage() {
         .contains("content-type: application/json"));
     let json: serde_json::Value =
         serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-    assert_eq!(json["model"], "local-model");
+    assert_eq!(json["model"], RESIDENT_MODEL.alias);
     assert_eq!(json["messages"][0]["role"], "system");
     assert_eq!(json["messages"][1]["role"], "user");
     assert_eq!(json["max_tokens"], 42);
@@ -233,12 +277,8 @@ fn supervisor_restarts_stub_and_shutdown_cleans_up_child() {
     let health = LlamaHealthClient::new(url, Duration::from_secs(1)).unwrap();
     let marker = temp_marker("restart");
     let _ = std::fs::remove_dir(&marker);
-    let mut config = LlamaServerConfig::new(
-        env!("CARGO_BIN_EXE_sidecar-test-stub"),
-        "model with spaces.gguf",
-        1,
-    )
-    .sidecar_config();
+    let mut config = SidecarConfig::new(env!("CARGO_BIN_EXE_sidecar-test-stub"));
+    config.args = vec!["--model".into(), "model with spaces.gguf".into()];
     config.env.insert(
         "LLAMA_STUB_EXIT_ONCE".into(),
         marker.to_string_lossy().into_owned(),

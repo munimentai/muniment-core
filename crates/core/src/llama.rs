@@ -1,17 +1,100 @@
 //! Managed, loopback-only `llama-server` process and health boundary.
 
-use std::io::Read;
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::sidecar::{ProbeOutcome, SidecarConfig, SidecarError, SidecarSupervisor};
 
 const DEFAULT_HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_HEALTH_BODY_BYTES: u64 = 64 * 1024;
 const MAX_CHAT_BODY_BYTES: u64 = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidentModelDescriptor {
+    pub filename: &'static str,
+    pub byte_size: u64,
+    pub sha256: &'static str,
+    pub alias: &'static str,
+    pub context_tokens: u32,
+}
+
+pub const RESIDENT_MODEL: ResidentModelDescriptor = ResidentModelDescriptor {
+    filename: "gemma-3-4b-it-q4_0.gguf",
+    byte_size: 3_155_051_328,
+    sha256: "76aed0a8285b83102f18b5d60e53c70d09eb4e9917a20ce8956bd546452b56e2",
+    alias: "muniment-resident-gemma",
+    context_tokens: 131_072,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelVerificationError {
+    Missing,
+    NotRegularFile,
+    WrongSize { expected: u64, actual: u64 },
+    Unreadable,
+    DigestMismatch,
+}
+
+impl std::fmt::Display for ModelVerificationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => write!(f, "resident model artifact is missing"),
+            Self::NotRegularFile => write!(f, "resident model artifact is not a regular file"),
+            Self::WrongSize { expected, actual } => write!(
+                f,
+                "resident model artifact has wrong size (expected {expected} bytes, found {actual})"
+            ),
+            Self::Unreadable => write!(f, "resident model artifact cannot be read"),
+            Self::DigestMismatch => write!(f, "resident model artifact digest does not match"),
+        }
+    }
+}
+
+impl std::error::Error for ModelVerificationError {}
+
+/// Verifies an artifact in bounded memory. Exposed so acquisition code can check a
+/// staged file; the resident launch path always supplies [`RESIDENT_MODEL`].
+pub fn verify_model_artifact(
+    path: impl AsRef<std::path::Path>,
+    descriptor: &ResidentModelDescriptor,
+) -> Result<(), ModelVerificationError> {
+    let path = path.as_ref();
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ModelVerificationError::Missing
+        } else {
+            ModelVerificationError::Unreadable
+        }
+    })?;
+    if !metadata.is_file() {
+        return Err(ModelVerificationError::NotRegularFile);
+    }
+    if metadata.len() != descriptor.byte_size {
+        return Err(ModelVerificationError::WrongSize {
+            expected: descriptor.byte_size,
+            actual: metadata.len(),
+        });
+    }
+    let file = File::open(path).map_err(|_| ModelVerificationError::Unreadable)?;
+    let reader = BufReader::new(file);
+    let actual = hash_reader(reader)?;
+    if actual != descriptor.sha256 {
+        return Err(ModelVerificationError::DigestMismatch);
+    }
+    Ok(())
+}
+
+fn hash_reader(mut reader: impl Read) -> Result<String, ModelVerificationError> {
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut reader, &mut hasher).map_err(|_| ModelVerificationError::Unreadable)?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
@@ -46,21 +129,16 @@ pub enum ChatRole {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[non_exhaustive]
 pub struct ChatCompletionRequest {
-    pub model: String,
+    model: String,
     pub messages: Vec<ChatMessage>,
     pub max_tokens: u32,
     pub temperature: f32,
 }
 
 impl ChatCompletionRequest {
-    pub fn new(
-        model: impl Into<String>,
-        messages: Vec<ChatMessage>,
-        max_tokens: u32,
-        temperature: f32,
-    ) -> Self {
+    pub fn new(messages: Vec<ChatMessage>, max_tokens: u32, temperature: f32) -> Self {
         Self {
-            model: model.into(),
+            model: RESIDENT_MODEL.alias.into(),
             messages,
             max_tokens,
             temperature,
@@ -253,17 +331,73 @@ impl LlamaServerConfig {
         self.host.base_url(self.port)
     }
 
-    pub fn sidecar_config(&self) -> SidecarConfig {
+    pub fn sidecar_config(&self) -> Result<SidecarConfig, ModelVerificationError> {
+        verify_model_artifact(&self.model, &RESIDENT_MODEL)?;
+        Ok(self.build_sidecar_config())
+    }
+
+    fn build_sidecar_config(&self) -> SidecarConfig {
         let mut config = SidecarConfig::new(self.executable.to_string_lossy().into_owned());
         config.args = vec![
             "--model".into(),
             self.model.to_string_lossy().into_owned(),
+            "--alias".into(),
+            RESIDENT_MODEL.alias.into(),
+            "--ctx-size".into(),
+            RESIDENT_MODEL.context_tokens.to_string(),
             "--host".into(),
             self.host.argument().into(),
             "--port".into(),
             self.port.to_string(),
         ];
         config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Unreadable;
+
+    impl Read for Unreadable {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("secret"))
+        }
+    }
+
+    #[test]
+    fn artifact_read_failures_are_typed_and_redacted() {
+        let error = hash_reader(Unreadable).unwrap_err();
+        assert_eq!(error, ModelVerificationError::Unreadable);
+        assert_eq!(error.to_string(), "resident model artifact cannot be read");
+    }
+
+    #[test]
+    fn resident_launch_arguments_preserve_spaces_and_identity() {
+        let config = LlamaServerConfig::new("llama server", "models/a model.gguf", 32123);
+        let sidecar = config.build_sidecar_config();
+        assert_eq!(sidecar.program, "llama server");
+        assert_eq!(
+            sidecar.args,
+            [
+                "--model",
+                "models/a model.gguf",
+                "--alias",
+                RESIDENT_MODEL.alias,
+                "--ctx-size",
+                "131072",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "32123"
+            ]
+        );
+        assert_eq!(config.base_url(), "http://127.0.0.1:32123");
+
+        let ipv6 = config.with_host(LoopbackHost::Ipv6);
+        assert_eq!(ipv6.build_sidecar_config().args[7], "::1");
+        assert_eq!(ipv6.base_url(), "http://[::1]:32123");
     }
 }
 
@@ -395,13 +529,32 @@ pub struct LlamaServer {
     supervisor: SidecarSupervisor,
 }
 
+#[derive(Debug)]
+pub enum LlamaServerError {
+    Model(ModelVerificationError),
+    Sidecar(SidecarError),
+}
+
+impl std::fmt::Display for LlamaServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Model(error) => error.fmt(f),
+            Self::Sidecar(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for LlamaServerError {}
+
 impl LlamaServer {
-    pub fn spawn(config: LlamaServerConfig) -> Result<Self, SidecarError> {
+    pub fn spawn(config: LlamaServerConfig) -> Result<Self, LlamaServerError> {
         let base_url = config.base_url();
         let health = LlamaHealthClient::new(base_url.clone(), DEFAULT_HEALTH_TIMEOUT)
             .expect("typed llama configuration always produces a loopback URL");
         let probe = health.clone();
-        let supervisor = SidecarSupervisor::spawn(config.sidecar_config(), move |_| probe.probe())?;
+        let sidecar_config = config.sidecar_config().map_err(LlamaServerError::Model)?;
+        let supervisor = SidecarSupervisor::spawn(sidecar_config, move |_| probe.probe())
+            .map_err(LlamaServerError::Sidecar)?;
         Ok(Self {
             base_url,
             health,
