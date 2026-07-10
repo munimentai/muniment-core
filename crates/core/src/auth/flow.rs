@@ -9,7 +9,7 @@ use serde::Deserialize;
 use super::discovery::{discover, ProviderMetadata};
 use super::loopback::RedirectCatcher;
 use super::pkce::{random_state, PkcePair};
-use super::store::{TokenSet, TokenStore};
+use super::store::{status, AuthStatus, TokenSet, TokenStore};
 use super::urlenc;
 use super::AuthError;
 
@@ -89,7 +89,11 @@ pub fn build_authorization_url(
         .iter()
         .map(|(k, v)| format!("{k}={}", urlenc::encode(v)))
         .collect();
-    let sep = if meta.authorization_endpoint.contains('?') { '&' } else { '?' };
+    let sep = if meta.authorization_endpoint.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
     format!("{}{sep}{}", meta.authorization_endpoint, query.join("&"))
 }
 
@@ -111,7 +115,7 @@ pub fn exchange_code(
             ("code_verifier", code_verifier),
         ],
     )?;
-    Ok(token_set_from(resp, None, None))
+    Ok(token_set_from(resp, None, None, now_unix()))
 }
 
 /// Refresh grant (RFC 6749 §6). Carries the current refresh token and
@@ -120,6 +124,15 @@ pub fn refresh_tokens(
     token_endpoint: &str,
     client_id: &str,
     current: &TokenSet,
+) -> Result<TokenSet, AuthError> {
+    refresh_tokens_at(token_endpoint, client_id, current, now_unix())
+}
+
+fn refresh_tokens_at(
+    token_endpoint: &str,
+    client_id: &str,
+    current: &TokenSet,
+    now_unix: u64,
 ) -> Result<TokenSet, AuthError> {
     let refresh_token = current
         .refresh_token
@@ -137,7 +150,45 @@ pub fn refresh_tokens(
         resp,
         current.refresh_token.clone(),
         current.subject.clone(),
+        now_unix,
     ))
+}
+
+/// Return the current session status, renewing tokens when expiry is near.
+/// `now_unix` is supplied by the caller so expiry decisions are deterministic.
+pub fn ensure_fresh(
+    store: &dyn TokenStore,
+    cfg: &OidcConfig,
+    now_unix: u64,
+    skew: Duration,
+) -> Result<AuthStatus, AuthError> {
+    let Some(tokens) = store.load()? else {
+        return status(store);
+    };
+
+    let refresh_needed = tokens
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= now_unix.saturating_add(skew.as_secs()));
+    if !refresh_needed {
+        return status(store);
+    }
+    if tokens.refresh_token.is_none() {
+        store.clear()?;
+        return status(store);
+    }
+
+    let metadata = discover(&cfg.issuer)?;
+    match refresh_tokens_at(&metadata.token_endpoint, &cfg.client_id, &tokens, now_unix) {
+        Ok(refreshed) => {
+            store.save(&refreshed)?;
+            status(store)
+        }
+        Err(AuthError::Token(_)) => {
+            store.clear()?;
+            status(store)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// RFC 7009 revocation. Callers treat failures as best-effort by design.
@@ -147,11 +198,13 @@ pub fn revoke_token(
     token: &str,
     token_type_hint: &str,
 ) -> Result<(), AuthError> {
-    match ureq::post(revocation_endpoint).timeout(HTTP_TIMEOUT).send_form(&[
-        ("token", token),
-        ("token_type_hint", token_type_hint),
-        ("client_id", client_id),
-    ]) {
+    match ureq::post(revocation_endpoint)
+        .timeout(HTTP_TIMEOUT)
+        .send_form(&[
+            ("token", token),
+            ("token_type_hint", token_type_hint),
+            ("client_id", client_id),
+        ]) {
         Ok(_) => Ok(()),
         Err(ureq::Error::Status(code, _)) => Err(AuthError::Http(format!(
             "revocation endpoint returned {code}"
@@ -204,8 +257,9 @@ fn token_set_from(
     resp: TokenResponse,
     prev_refresh: Option<String>,
     prev_subject: Option<String>,
+    now_unix: u64,
 ) -> TokenSet {
-    let expires_at = resp.expires_in.map(|s| now_unix().saturating_add(s));
+    let expires_at = resp.expires_in.map(|s| now_unix.saturating_add(s));
     let subject = resp
         .id_token
         .as_deref()

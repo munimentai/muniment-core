@@ -21,8 +21,8 @@ pub mod urlenc;
 
 pub use discovery::{discover, ProviderMetadata};
 pub use flow::{
-    build_authorization_url, exchange_code, refresh_tokens, revoke_token, run_sign_in, sign_out,
-    OidcConfig,
+    build_authorization_url, ensure_fresh, exchange_code, refresh_tokens, revoke_token,
+    run_sign_in, sign_out, OidcConfig,
 };
 pub use loopback::RedirectCatcher;
 pub use pkce::{random_state, PkcePair};

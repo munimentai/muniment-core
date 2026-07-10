@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use muniment_core::auth::{
-    discover, refresh_tokens, run_sign_in, sign_out, status, urlenc, AuthError, InMemoryTokenStore,
-    OidcConfig, PkcePair, TokenSet, TokenStore,
+    discover, ensure_fresh, refresh_tokens, run_sign_in, sign_out, status, urlenc, AuthError,
+    InMemoryTokenStore, OidcConfig, PkcePair, TokenSet, TokenStore,
 };
 
 const CLIENT_ID: &str = "muniment-desktop";
@@ -78,7 +78,10 @@ impl MockIdp {
             let (endpoint, query) = auth_url.split_once('?').expect("authorization URL query");
             assert_eq!(endpoint, format!("{issuer}/authorize"));
             let params: HashMap<String, String> = urlenc::parse_query(query).into_iter().collect();
-            assert_eq!(params.get("response_type").map(String::as_str), Some("code"));
+            assert_eq!(
+                params.get("response_type").map(String::as_str),
+                Some("code")
+            );
             assert_eq!(params.get("client_id").map(String::as_str), Some(CLIENT_ID));
             assert_eq!(
                 params.get("code_challenge_method").map(String::as_str),
@@ -92,7 +95,10 @@ impl MockIdp {
 
             let mut cb = HashMap::new();
             cb.insert("code".to_string(), AUTH_CODE.to_string());
-            cb.insert("state".to_string(), params.get("state").expect("state").clone());
+            cb.insert(
+                "state".to_string(),
+                params.get("state").expect("state").clone(),
+            );
             mutate(&mut cb);
             std::thread::spawn(move || {
                 let qs = cb
@@ -115,7 +121,10 @@ fn full_sign_in_exchanges_the_code_for_tokens() {
     assert_eq!(tokens.access_token, "at-1");
     assert_eq!(tokens.refresh_token.as_deref(), Some("rt-1"));
     assert_eq!(tokens.subject.as_deref(), Some("user-123"));
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let expires_at = tokens.expires_at.unwrap();
     assert!((now + 3590..=now + 3610).contains(&expires_at));
 
@@ -213,6 +222,86 @@ fn refresh_without_a_stored_refresh_token_fails_cleanly() {
 }
 
 #[test]
+fn ensure_fresh_does_not_contact_the_provider_for_fresh_tokens() {
+    let idp = MockIdp::spawn();
+    let store = InMemoryTokenStore::new();
+    store
+        .save(&TokenSet {
+            access_token: "at-current".into(),
+            refresh_token: Some("rt-1".into()),
+            expires_at: Some(2_000),
+            subject: Some("user-123".into()),
+        })
+        .unwrap();
+
+    let result = ensure_fresh(&store, &idp.config(), 1_000, Duration::from_secs(60)).unwrap();
+    assert!(result.signed_in);
+    assert!(!idp.state.token_endpoint_hit.load(Ordering::SeqCst));
+}
+
+#[test]
+fn ensure_fresh_refreshes_and_persists_expired_tokens() {
+    let idp = MockIdp::spawn();
+    let store = InMemoryTokenStore::new();
+    store
+        .save(&TokenSet {
+            access_token: "at-expired".into(),
+            refresh_token: Some("rt-1".into()),
+            expires_at: Some(999),
+            subject: Some("user-123".into()),
+        })
+        .unwrap();
+
+    let result = ensure_fresh(&store, &idp.config(), 1_000, Duration::ZERO).unwrap();
+    assert!(result.signed_in);
+    let persisted = store.load().unwrap().unwrap();
+    assert_eq!(persisted.access_token, "at-2");
+    assert_eq!(persisted.refresh_token.as_deref(), Some("rt-2"));
+    assert_eq!(persisted.subject.as_deref(), Some("user-123"));
+    assert_eq!(persisted.expires_at, Some(4_600));
+}
+
+#[test]
+fn ensure_fresh_clears_a_session_when_refresh_is_rejected() {
+    let idp = MockIdp::spawn();
+    let store = InMemoryTokenStore::new();
+    store
+        .save(&TokenSet {
+            access_token: "at-expired".into(),
+            refresh_token: Some("rt-dead".into()),
+            expires_at: Some(999),
+            subject: Some("user-123".into()),
+        })
+        .unwrap();
+
+    let result = ensure_fresh(&store, &idp.config(), 1_000, Duration::ZERO).unwrap();
+    assert!(!result.signed_in);
+    assert!(store.load().unwrap().is_none());
+}
+
+#[test]
+fn ensure_fresh_preserves_tokens_on_a_network_failure() {
+    let store = InMemoryTokenStore::new();
+    store
+        .save(&TokenSet {
+            access_token: "at-expired".into(),
+            refresh_token: Some("rt-1".into()),
+            expires_at: Some(999),
+            subject: Some("user-123".into()),
+        })
+        .unwrap();
+    let cfg = OidcConfig {
+        issuer: "http://127.0.0.1:1".into(),
+        client_id: CLIENT_ID.into(),
+        scopes: String::new(),
+    };
+
+    let error = ensure_fresh(&store, &cfg, 1_000, Duration::ZERO).unwrap_err();
+    assert!(matches!(error, AuthError::Discovery(_)));
+    assert_eq!(store.load().unwrap().unwrap().access_token, "at-expired");
+}
+
+#[test]
 fn sign_out_revokes_the_refresh_token_and_clears_the_store() {
     let idp = MockIdp::spawn();
     let store = InMemoryTokenStore::new();
@@ -240,7 +329,9 @@ struct Request {
 }
 
 fn handle(stream: &mut TcpStream, issuer: &str, st: &MockState) {
-    let Some(req) = read_request(stream) else { return };
+    let Some(req) = read_request(stream) else {
+        return;
+    };
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/.well-known/openid-configuration") => {
             let body = format!(
@@ -262,7 +353,11 @@ fn handle(stream: &mut TcpStream, issuer: &str, st: &MockState) {
                         || form.get("client_id").map(String::as_str) != Some(CLIENT_ID)
                         || !proof_ok
                     {
-                        respond(stream, 400, r#"{"error":"invalid_grant","error_description":"code or PKCE verification failed"}"#);
+                        respond(
+                            stream,
+                            400,
+                            r#"{"error":"invalid_grant","error_description":"code or PKCE verification failed"}"#,
+                        );
                         return;
                     }
                     let id_token = fake_id_token();
