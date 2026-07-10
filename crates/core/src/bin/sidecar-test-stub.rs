@@ -110,6 +110,8 @@ fn json_rpc(ping_marker: Option<String>) {
     for line in io::stdin().lock().lines() {
         let request: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
         if request.get("id").is_none() {
+            eprintln!("{request}");
+            io::stderr().flush().unwrap();
             continue;
         }
         let id = request["id"].clone();
@@ -189,6 +191,24 @@ fn json_rpc(ping_marker: Option<String>) {
                 );
             }
             Some("timeout") => continue,
+            Some("late_success") => delayed_response(
+                id,
+                serde_json::json!({"jsonrpc": "2.0", "result": "late"}),
+                Duration::from_millis(100),
+            ),
+            Some("late_error") => delayed_response(
+                id,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32800, "message": "cancelled"}
+                }),
+                Duration::from_millis(100),
+            ),
+            Some("cancel_race") => delayed_response(
+                id,
+                serde_json::json!({"jsonrpc": "2.0", "result": "raced"}),
+                Duration::ZERO,
+            ),
             _ => println!(
                 "{}",
                 serde_json::json!({
@@ -200,4 +220,13 @@ fn json_rpc(ping_marker: Option<String>) {
         }
         io::stdout().flush().unwrap();
     }
+}
+
+fn delayed_response(id: serde_json::Value, mut response: serde_json::Value, delay: Duration) {
+    thread::spawn(move || {
+        thread::sleep(delay);
+        response["id"] = id;
+        println!("{response}");
+        io::stdout().flush().unwrap();
+    });
 }

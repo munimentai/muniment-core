@@ -5,8 +5,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use muniment_core::sidecar::{
-    JsonRpcId, JsonRpcTransport, JsonRpcTransportError, RestartPolicy, SidecarConfig, SidecarError,
-    SidecarEvent, SidecarEventCause, SidecarStatus, SidecarSupervisor,
+    JsonRpcCancellationToken, JsonRpcId, JsonRpcTransport, JsonRpcTransportError, RestartPolicy,
+    SidecarConfig, SidecarError, SidecarEvent, SidecarEventCause, SidecarStatus, SidecarSupervisor,
 };
 use serde_json::{json, Value};
 
@@ -545,6 +545,99 @@ fn json_rpc_call_obeys_timeout() {
         transport.call::<Value, Value>("timeout", None, Duration::from_millis(30)),
         Err(JsonRpcTransportError::Timeout)
     ));
+    supervisor.shutdown().unwrap();
+}
+
+#[test]
+fn json_rpc_discards_late_response_after_timeout() {
+    let mut supervisor = rpc_supervisor();
+    let transport = JsonRpcTransport::new(supervisor.io());
+    assert!(matches!(
+        transport.call::<Value, Value>("late_success", None, Duration::from_millis(20)),
+        Err(JsonRpcTransportError::Timeout)
+    ));
+    thread::sleep(Duration::from_millis(120));
+    let result: Value = transport
+        .call(
+            "round_trip",
+            Some(json!({"after": "timeout"})),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+    assert_eq!(result, json!({"after": "timeout"}));
+    supervisor.shutdown().unwrap();
+}
+
+#[test]
+fn json_rpc_cancellation_notifies_and_discards_late_error() {
+    let mut supervisor = rpc_supervisor();
+    let io = supervisor.io();
+    let transport =
+        Arc::new(JsonRpcTransport::new(io.clone()).with_cancel_method("muniment/cancelGeneration"));
+    let cancellation = JsonRpcCancellationToken::new();
+    let call_transport = Arc::clone(&transport);
+    let call_cancellation = cancellation.clone();
+    let call = thread::spawn(move || {
+        call_transport.call_with_id_and_cancellation::<Value, Value>(
+            "late_error",
+            None,
+            JsonRpcId::String("cancel-me".into()),
+            Duration::from_secs(1),
+            &call_cancellation,
+        )
+    });
+    thread::sleep(Duration::from_millis(20));
+    cancellation.cancel();
+    assert!(matches!(
+        call.join().unwrap(),
+        Err(JsonRpcTransportError::Cancelled)
+    ));
+    let cancel: Value = serde_json::from_str(
+        &io.stderr
+            .read_line_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cancel["method"], "muniment/cancelGeneration");
+    assert_eq!(cancel["params"]["id"], "cancel-me");
+    thread::sleep(Duration::from_millis(120));
+    let result: Value = transport
+        .call::<Value, Value>("round_trip", None, Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(result, Value::Null);
+    supervisor.shutdown().unwrap();
+}
+
+#[test]
+fn json_rpc_cancel_response_race_does_not_corrupt_follow_up() {
+    let mut supervisor = rpc_supervisor();
+    let transport = Arc::new(JsonRpcTransport::new(supervisor.io()).with_cancel_method("cancel"));
+    let cancellation = JsonRpcCancellationToken::new();
+    let call_transport = Arc::clone(&transport);
+    let call_cancellation = cancellation.clone();
+    let call = thread::spawn(move || {
+        call_transport.call_with_cancellation::<Value, String>(
+            "cancel_race",
+            None,
+            Duration::from_secs(1),
+            &call_cancellation,
+        )
+    });
+    cancellation.cancel();
+    match call.join().unwrap() {
+        Ok(result) => assert_eq!(result, "raced"),
+        Err(JsonRpcTransportError::Cancelled) => {}
+        Err(other) => panic!("unexpected race outcome: {other:?}"),
+    }
+    let result: Value = transport
+        .call(
+            "round_trip",
+            Some(json!({"after": "race"})),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+    assert_eq!(result, json!({"after": "race"}));
     supervisor.shutdown().unwrap();
 }
 
