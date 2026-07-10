@@ -1,10 +1,14 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use muniment_core::llama::{LlamaHealthClient, LlamaServerConfig, LoopbackHost};
+use muniment_core::llama::{
+    ChatCompletionRequest, ChatMessage, LlamaChatClient, LlamaChatError, LlamaHealthClient,
+    LlamaServerConfig, LoopbackHost,
+};
 use muniment_core::sidecar::{ProbeOutcome, RestartPolicy, SidecarStatus, SidecarSupervisor};
 
 fn fixture(responses: Vec<String>) -> (String, thread::JoinHandle<()>) {
@@ -26,6 +30,53 @@ fn response(status: &str, body: &str) -> String {
     format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
+    )
+}
+
+fn chat_fixture(response: String) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (sender, receiver) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+        loop {
+            let count = stream.read(&mut buffer).unwrap();
+            request.extend_from_slice(&buffer[..count]);
+            let headers_end = request.windows(4).position(|part| part == b"\r\n\r\n");
+            if let Some(end) = headers_end {
+                let headers = String::from_utf8_lossy(&request[..end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(str::parse::<usize>)
+                    })
+                    .transpose()
+                    .unwrap()
+                    .unwrap();
+                if request.len() >= end + 4 + content_length {
+                    break;
+                }
+            }
+        }
+        sender.send(String::from_utf8(request).unwrap()).unwrap();
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    (url, receiver, worker)
+}
+
+fn chat_request() -> ChatCompletionRequest {
+    ChatCompletionRequest::new(
+        "local-model",
+        vec![
+            ChatMessage::system("private-system"),
+            ChatMessage::user("private-user"),
+        ],
+        42,
+        0.25,
     )
 }
 
@@ -70,6 +121,79 @@ fn health_client_rejects_non_loopback_urls() {
             "{url}"
         );
     }
+}
+
+#[test]
+fn chat_client_posts_typed_non_streaming_request_and_returns_usage() {
+    let body = r#"{"choices":[{"message":{"role":"assistant","content":"answer"}}],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}}"#;
+    let (url, request, worker) = chat_fixture(response("200 OK", body));
+    let client = LlamaChatClient::new(url, Duration::from_secs(1)).unwrap();
+    let result = client.complete(&chat_request()).unwrap();
+    assert_eq!(result.text, "answer");
+    assert_eq!(result.usage.unwrap().total_tokens, Some(9));
+    let request = request.recv().unwrap();
+    assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
+    assert!(request
+        .to_ascii_lowercase()
+        .contains("content-type: application/json"));
+    let json: serde_json::Value =
+        serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(json["model"], "local-model");
+    assert_eq!(json["messages"][0]["role"], "system");
+    assert_eq!(json["messages"][1]["role"], "user");
+    assert_eq!(json["max_tokens"], 42);
+    assert_eq!(json["temperature"], 0.25);
+    assert_eq!(json["stream"], false);
+    worker.join().unwrap();
+}
+
+#[test]
+fn chat_errors_are_typed_bounded_and_redacted() {
+    let secret = "private-response-content";
+    for (wire, expected) in [
+        (response("500 Internal Server Error", secret), "HTTP 500"),
+        (response("200 OK", secret), "invalid JSON"),
+        (
+            response("200 OK", r#"{"choices":[]}"#),
+            "exactly one choice",
+        ),
+    ] {
+        let (url, request, worker) = chat_fixture(wire);
+        let error = LlamaChatClient::new(url, Duration::from_secs(1))
+            .unwrap()
+            .complete(&chat_request())
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(expected));
+        assert!(!message.contains(secret));
+        assert!(!message.contains("private-user"));
+        request.recv().unwrap();
+        worker.join().unwrap();
+    }
+
+    let (url, request, worker) = chat_fixture(response("200 OK", "123456789"));
+    let error = LlamaChatClient::new(url, Duration::from_secs(1))
+        .unwrap()
+        .with_max_response_bytes(8)
+        .complete(&chat_request())
+        .unwrap_err();
+    assert!(matches!(error, LlamaChatError::BodyTooLarge { limit: 8 }));
+    request.recv().unwrap();
+    worker.join().unwrap();
+}
+
+#[test]
+fn chat_maximum_response_limit_does_not_overflow() {
+    let body = r#"{"choices":[{"message":{"role":"assistant","content":"answer"}}]}"#;
+    let (url, request, worker) = chat_fixture(response("200 OK", body));
+    let result = LlamaChatClient::new(url, Duration::from_secs(1))
+        .unwrap()
+        .with_max_response_bytes(u64::MAX)
+        .complete(&chat_request())
+        .unwrap();
+    assert_eq!(result.text, "answer");
+    request.recv().unwrap();
+    worker.join().unwrap();
 }
 
 #[test]
