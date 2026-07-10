@@ -1,5 +1,6 @@
 use muniment_core::cas::{CasError, ContentHash, LocalCas};
-use std::fs;
+use std::fs::{self, FileTimes};
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -100,4 +101,63 @@ fn rejects_noncanonical_hashes() {
         "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"
     )
     .is_err());
+}
+
+#[test]
+fn streaming_put_and_open_round_trip_a_large_object() {
+    let root = TestDirectory::new();
+    let store = LocalCas::open(root.as_ref()).unwrap();
+    let bytes = vec![0x37; 3 * 1024 * 1024];
+
+    let hash = store.put_reader(&mut Cursor::new(&bytes)).unwrap();
+    let mut actual = Vec::new();
+    store
+        .open_object(&hash)
+        .unwrap()
+        .unwrap()
+        .read_to_end(&mut actual)
+        .unwrap();
+
+    assert_eq!(actual, bytes);
+}
+
+#[test]
+fn streaming_put_of_existing_content_does_not_replace_it() {
+    let root = TestDirectory::new();
+    let store = LocalCas::open(root.as_ref()).unwrap();
+    let hash = store.put(b"same streamed content").unwrap();
+    let path = object_path(root.as_ref(), &hash);
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+
+    assert_eq!(
+        store
+            .put_reader(&mut Cursor::new(b"same streamed content"))
+            .unwrap(),
+        hash
+    );
+    assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), modified);
+}
+
+#[test]
+fn opening_store_sweeps_only_stale_root_temp_files() {
+    let root = TestDirectory::new();
+    let stale = root.as_ref().join(".cas-tmp-crashed");
+    let fresh = root.as_ref().join(".cas-tmp-live");
+    let object_named_like_temp = root.as_ref().join("objects/.cas-tmp-object");
+    fs::create_dir(root.as_ref().join("objects")).unwrap();
+    fs::write(&stale, b"stale").unwrap();
+    fs::write(&fresh, b"fresh").unwrap();
+    fs::write(&object_named_like_temp, b"object").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&stale)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+        .unwrap();
+
+    LocalCas::open(root.as_ref()).unwrap();
+
+    assert!(!stale.exists());
+    assert!(fresh.exists());
+    assert!(object_named_like_temp.exists());
 }

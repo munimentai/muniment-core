@@ -3,17 +3,21 @@
 //! Objects are named by the lowercase hexadecimal SHA-256 digest of their
 //! bytes and stored as `objects/<first two hex characters>/<remaining hex>`.
 //! Writes first go to a unique temporary file in the store root, then are
-//! atomically renamed into place; an existing object makes `put` a no-op.
+//! atomically published into place; an existing object makes `put` a no-op.
 
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
+const COPY_BUFFER_SIZE: usize = 64 * 1024;
+const STALE_TEMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const TEMP_FILE_PREFIX: &str = ".cas-tmp-";
 
 /// A validated lowercase hexadecimal SHA-256 digest.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -22,10 +26,6 @@ pub struct ContentHash(String);
 impl ContentHash {
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-
-    fn for_bytes(bytes: &[u8]) -> Self {
-        Self(format!("{:x}", Sha256::digest(bytes)))
     }
 }
 
@@ -100,37 +100,66 @@ pub struct LocalCas {
 impl LocalCas {
     pub fn open(root: &Path) -> Result<Self, CasError> {
         fs::create_dir_all(root.join("objects"))?;
-        Ok(Self {
+        let store = Self {
             root: root.to_owned(),
-        })
+        };
+        store.sweep_stale_temp_files()?;
+        Ok(store)
     }
 
     pub fn put(&self, bytes: &[u8]) -> Result<ContentHash, CasError> {
-        let hash = ContentHash::for_bytes(bytes);
-        let destination = self.object_path(&hash);
-        if destination.is_file() {
-            return Ok(hash);
-        }
+        self.put_reader(&mut &*bytes)
+    }
 
-        fs::create_dir_all(destination.parent().expect("object path has a parent"))?;
+    /// Streams an object into the store while incrementally computing its hash.
+    pub fn put_reader(&self, reader: &mut impl Read) -> Result<ContentHash, CasError> {
         let (temporary, mut file) = self.create_temp_file()?;
-        let result = (|| -> Result<(), CasError> {
-            file.write_all(bytes)?;
+        let result = (|| -> Result<ContentHash, CasError> {
+            let mut hasher = Sha256::new();
+            let mut buffer = [0_u8; COPY_BUFFER_SIZE];
+            loop {
+                let count = reader.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..count]);
+                file.write_all(&buffer[..count])?;
+            }
             file.sync_all()?;
             drop(file);
-            fs::rename(&temporary, &destination)?;
-            Ok(())
+
+            let hash = ContentHash(format!("{:x}", hasher.finalize()));
+            let destination = self.object_path(&hash);
+            fs::create_dir_all(destination.parent().expect("object path has a parent"))?;
+
+            // A hard link publishes the complete file atomically without replacing a
+            // winner if another writer installed the same object concurrently.
+            match fs::hard_link(&temporary, &destination) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+            fs::remove_file(&temporary)?;
+            Ok(hash)
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
         }
-        result?;
-        Ok(hash)
+        result
     }
 
     pub fn get(&self, hash: &ContentHash) -> Result<Option<Vec<u8>>, CasError> {
         match fs::read(self.object_path(hash)) {
             Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Opens an object for constant-memory streaming reads.
+    pub fn open_object(&self, hash: &ContentHash) -> Result<Option<fs::File>, CasError> {
+        match fs::File::open(self.object_path(hash)) {
+            Ok(file) => Ok(Some(file)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
@@ -145,10 +174,19 @@ impl LocalCas {
     }
 
     pub fn verify(&self, hash: &ContentHash) -> Result<(), CasError> {
-        let bytes = self
-            .get(hash)?
+        let mut file = self
+            .open_object(hash)?
             .ok_or_else(|| CasError::NotFound(hash.clone()))?;
-        let actual = ContentHash::for_bytes(&bytes);
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; COPY_BUFFER_SIZE];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        let actual = ContentHash(format!("{:x}", hasher.finalize()));
         if actual == *hash {
             Ok(())
         } else {
@@ -170,14 +208,40 @@ impl LocalCas {
     fn create_temp_file(&self) -> Result<(PathBuf, fs::File), CasError> {
         loop {
             let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
-            let path = self
-                .root
-                .join(format!(".cas-tmp-{}-{sequence}", std::process::id()));
+            let path = self.root.join(format!(
+                "{TEMP_FILE_PREFIX}{}-{sequence}",
+                std::process::id()
+            ));
             match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(file) => return Ok((path, file)),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error.into()),
             }
         }
+    }
+
+    fn sweep_stale_temp_files(&self) -> Result<(), CasError> {
+        let now = SystemTime::now();
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(TEMP_FILE_PREFIX)
+                || !entry.file_type()?.is_file()
+            {
+                continue;
+            }
+            let modified = entry.metadata()?.modified()?;
+            if now.duration_since(modified).unwrap_or_default() < STALE_TEMP_AGE {
+                continue;
+            }
+            match fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
 }
