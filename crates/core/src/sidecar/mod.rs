@@ -5,7 +5,7 @@ use std::fmt;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -223,7 +223,7 @@ impl JsonRpcTransport {
     ///
     /// The returned closure shares this transport's call lock, so it cannot read
     /// a response or notification belonging to an in-flight application call.
-    /// Waiting to acquire that lock is not included in `timeout`.
+    /// If that lock is busy, the probe promptly reports healthy without sending.
     pub fn health_probe(
         self: &Arc<Self>,
         method: impl Into<String> + 'static,
@@ -232,8 +232,22 @@ impl JsonRpcTransport {
         let transport = Arc::clone(self);
         let method = method.into();
         move |_| {
+            let call = match transport.call_lock.try_lock() {
+                Ok(call) => call,
+                Err(TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(TryLockError::WouldBlock) => return Ok(()),
+            };
+            let id = JsonRpcId::Number(transport.next_id.fetch_add(1, Ordering::Relaxed));
             transport
-                .call::<Value, Value>(&method, None, timeout)
+                .call_inner_locked::<Value, Value>(
+                    &method,
+                    None,
+                    id,
+                    timeout,
+                    None,
+                    &mut |_| {},
+                    call,
+                )
                 .map(|_| ())
                 .map_err(|error| format!("JSON-RPC health probe `{method}` failed: {error}"))
         }
@@ -355,10 +369,32 @@ impl JsonRpcTransport {
     ) -> Result<R, JsonRpcTransportError> {
         // Poisoning does not make the line handles unsafe; recover the guard so
         // an earlier caller panic cannot make subsequent calls panic too.
-        let _call = self
+        let call_guard = self
             .call_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.call_inner_locked(
+            method,
+            params,
+            id,
+            timeout,
+            cancellation,
+            on_notification,
+            call_guard,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn call_inner_locked<P: Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        method: impl Into<String>,
+        params: Option<P>,
+        id: JsonRpcId,
+        timeout: Duration,
+        cancellation: Option<&JsonRpcCancellationToken>,
+        on_notification: &mut impl FnMut(JsonRpcNotification<Value>),
+        _call_guard: std::sync::MutexGuard<'_, ()>,
+    ) -> Result<R, JsonRpcTransportError> {
         let request = JsonRpcRequest::new(method, params, id.clone());
         let line = serde_json::to_string(&request).map_err(JsonRpcTransportError::Serialize)?;
         let generation = self

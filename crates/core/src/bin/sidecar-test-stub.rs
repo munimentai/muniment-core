@@ -126,12 +126,13 @@ fn json_rpc(ping_marker: Option<String>) {
             }
             Some("ping") => continue,
             Some("delayed") => {
+                let delay_ms = request["params"]["delay_ms"].as_u64().unwrap_or(100);
                 println!(
                     "{}",
                     serde_json::json!({"jsonrpc": "2.0", "method": "delayed.started"})
                 );
                 io::stdout().flush().unwrap();
-                thread::sleep(Duration::from_millis(100));
+                thread::sleep(Duration::from_millis(delay_ms));
                 println!(
                     "{}",
                     serde_json::json!({"jsonrpc": "2.0", "result": "delayed", "id": id})

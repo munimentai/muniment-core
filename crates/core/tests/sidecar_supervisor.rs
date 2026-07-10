@@ -399,17 +399,31 @@ fn json_rpc_params_and_result_round_trip() {
 }
 
 #[test]
-fn json_rpc_probe_serializes_with_in_flight_call() {
-    let mut supervisor = rpc_supervisor();
-    let io = supervisor.io();
-    let transport = Arc::new(JsonRpcTransport::new(io.clone()));
+fn json_rpc_probe_skips_in_flight_call_without_stealing_frames() {
+    let mut cfg = config(&["json-rpc"]);
+    cfg.health_interval = Duration::from_millis(20);
+    let (mut supervisor, transport) = spawn_with_json_rpc_probe(cfg);
+    let events = supervisor.subscribe();
+    wait_for(&supervisor, SidecarStatus::Healthy);
+    assert_eq!(
+        supervisor
+            .io()
+            .stderr
+            .read_line_timeout(Duration::from_secs(1))
+            .unwrap()
+            .as_deref(),
+        Some("ping")
+    );
+    assert_eq!(next_event(&events).status, SidecarStatus::Starting);
+    assert_eq!(next_event(&events).status, SidecarStatus::Healthy);
+    let transport = Arc::clone(transport.get().unwrap());
     let call_transport = Arc::clone(&transport);
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let call = thread::spawn(move || {
         let result: String = call_transport
             .call_with_notifications(
                 "delayed",
-                None::<Value>,
+                Some(json!({"delay_ms": 250})),
                 JsonRpcId::String("application".into()),
                 Duration::from_secs(1),
                 |notification| {
@@ -421,12 +435,52 @@ fn json_rpc_probe_serializes_with_in_flight_call() {
         assert_eq!(result, "delayed");
     });
     started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    let probe = transport.health_probe("ping", Duration::from_secs(1));
-    let probe_io = io.clone();
-    let probe = thread::spawn(move || probe(&probe_io));
     call.join().unwrap();
-    probe.join().unwrap().unwrap();
+    assert_eq!(supervisor.status(), SidecarStatus::Healthy);
+    assert!(
+        events.try_recv().is_err(),
+        "sidecar restarted during the call"
+    );
     supervisor.shutdown().unwrap();
+}
+
+#[test]
+fn shutdown_is_not_stalled_by_in_flight_json_rpc_call() {
+    let mut cfg = config(&["json-rpc"]);
+    cfg.health_interval = Duration::from_millis(20);
+    cfg.shutdown_timeout = Duration::from_millis(50);
+    let (mut supervisor, transport) = spawn_with_json_rpc_probe(cfg);
+    wait_for(&supervisor, SidecarStatus::Healthy);
+    assert_eq!(
+        supervisor
+            .io()
+            .stderr
+            .read_line_timeout(Duration::from_secs(1))
+            .unwrap()
+            .as_deref(),
+        Some("ping")
+    );
+    let transport = Arc::clone(transport.get().unwrap());
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let call = thread::spawn(move || {
+        transport.call_with_notifications::<_, String, _>(
+            "delayed",
+            Some(json!({"delay_ms": 500})),
+            JsonRpcId::String("application".into()),
+            Duration::from_secs(1),
+            |_| {
+                started_tx.send(()).unwrap();
+            },
+        )
+    });
+    started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let started = Instant::now();
+    supervisor.shutdown().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "shutdown waited for the application call"
+    );
+    assert!(call.join().unwrap().is_err());
 }
 
 #[test]
