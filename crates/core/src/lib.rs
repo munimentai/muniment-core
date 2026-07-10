@@ -6,4 +6,5 @@
 
 pub mod auth;
 pub mod cas;
+pub mod journal;
 pub mod sidecar;
