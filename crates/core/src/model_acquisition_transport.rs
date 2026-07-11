@@ -9,6 +9,9 @@ use crate::asr::acquisition::{
 use crate::llama::acquisition::{
     GemmaDownloadRequest, GemmaDownloadResponse, GemmaDownloadTransport, GemmaTransportError,
 };
+use crate::sidecar::pi_install::{
+    PiDownloadRequest, PiDownloadResponse, PiDownloadTransport, PiTransportError,
+};
 
 const MAX_REDIRECTS: usize = 5;
 const ALLOWED_HOSTS: &[&str] = &[
@@ -18,6 +21,8 @@ const ALLOWED_HOSTS: &[&str] = &[
     "cdn-lfs-eu-1.huggingface.co",
     "cas-bridge.xethub.hf.co",
     "cas-server.xethub.hf.co",
+    "github.com",
+    "release-assets.githubusercontent.com",
 ];
 
 pub type ModelResponseBody = Box<dyn Read + Send + Sync + 'static>;
@@ -137,6 +142,32 @@ impl AsrDownloadTransport for NativeModelAcquisitionTransport {
             TransportFailure::Transient => AsrTransportError::Transient,
             TransportFailure::Unavailable => AsrTransportError::Unavailable,
             TransportFailure::Rejected => AsrTransportError::Rejected,
+        })
+    }
+}
+
+impl PiDownloadTransport for NativeModelAcquisitionTransport {
+    type Body = ModelResponseBody;
+
+    fn download(
+        &mut self,
+        request: &PiDownloadRequest,
+    ) -> Result<PiDownloadResponse<Self::Body>, PiTransportError> {
+        self.request(
+            request.url(),
+            0,
+            request.connect_timeout,
+            request.read_timeout,
+            request.deadline,
+        )
+        .map(|response| PiDownloadResponse {
+            status: response.status,
+            body: response.body,
+        })
+        .map_err(|error| match error {
+            TransportFailure::Transient => PiTransportError::Transient,
+            TransportFailure::Unavailable => PiTransportError::Unavailable,
+            TransportFailure::Rejected => PiTransportError::Rejected,
         })
     }
 }

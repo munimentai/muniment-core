@@ -5,9 +5,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use muniment_core::sidecar::{
-    JsonRpcCancellationToken, JsonRpcId, JsonRpcTransport, JsonRpcTransportError, ProbeOutcome,
-    RestartPolicy, SidecarConfig, SidecarError, SidecarEvent, SidecarEventCause, SidecarStatus,
-    SidecarSupervisor,
+    JsonRpcCancellationToken, JsonRpcId, JsonRpcTransport, JsonRpcTransportError, PiRpcWiring,
+    ProbeOutcome, RestartPolicy, SidecarConfig, SidecarError, SidecarEvent, SidecarEventCause,
+    SidecarStatus, SidecarSupervisor,
 };
 use serde_json::{json, Value};
 
@@ -79,7 +79,14 @@ fn restart_events_include_exit_attempt_and_backoff() {
             .unwrap();
     let events = supervisor.subscribe();
     assert_eq!(next_event(&events).status, SidecarStatus::Starting);
-    let restarting = next_event(&events);
+    let restarting = loop {
+        let event = next_event(&events);
+        if event.status == SidecarStatus::Restarting {
+            break event;
+        }
+        assert_eq!(event.status, SidecarStatus::Healthy);
+        assert_eq!(event.generation, Some(1));
+    };
     assert_eq!(restarting.status, SidecarStatus::Restarting);
     assert!(matches!(
         restarting.cause,
@@ -494,6 +501,115 @@ fn json_rpc_probe_keeps_supervisor_healthy_across_intervals() {
     }
     assert_eq!(supervisor.status(), SidecarStatus::Healthy);
     supervisor.shutdown().unwrap();
+}
+
+#[test]
+fn pi_probe_routes_interleaved_frames_before_its_response() {
+    let mut cfg = config(&["pi-rpc-interleaved"]);
+    cfg.health_interval = Duration::from_secs(60);
+    let wiring = PiRpcWiring::new();
+    let mut supervisor =
+        SidecarSupervisor::spawn(cfg, wiring.readiness_probe(Duration::from_millis(100))).unwrap();
+
+    wait_for(&supervisor, SidecarStatus::Healthy);
+    let transport = wiring.transport().expect("probe initialized dispatcher");
+    let routed = transport.subscribe();
+
+    // Run a second probe after subscribing so both unrelated frames are
+    // deterministically observable and the correlated response remains last.
+    transport.health_probe(Duration::from_millis(100))(&supervisor.io()).unwrap();
+    assert_eq!(
+        routed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        json!({"type": "agent_start", "requestId": "unrelated"})
+    );
+    assert_eq!(
+        routed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        json!({
+            "type": "response",
+            "command": "get_state",
+            "success": true,
+            "id": "another-call"
+        })
+    );
+    assert!(routed.recv_timeout(Duration::from_millis(20)).is_err());
+    assert_eq!(supervisor.status(), SidecarStatus::Healthy);
+    supervisor.shutdown().unwrap();
+}
+
+#[test]
+fn pi_dispatcher_delivers_event_after_response_without_another_call() {
+    let mut cfg = config(&["pi-rpc-interleaved"]);
+    cfg.health_interval = Duration::from_secs(60);
+    let wiring = PiRpcWiring::new();
+    let mut supervisor =
+        SidecarSupervisor::spawn(cfg, wiring.readiness_probe(Duration::from_millis(100))).unwrap();
+    wait_for(&supervisor, SidecarStatus::Healthy);
+    let transport = wiring.transport().expect("probe initialized dispatcher");
+    let routed = transport.subscribe();
+
+    let response = transport
+        .call(json!({"type": "prompt"}), Duration::from_millis(100))
+        .unwrap();
+    assert_eq!(response["command"], "prompt");
+    assert_eq!(
+        routed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        json!({"type": "agent_start", "requestId": "unrelated"})
+    );
+    assert_eq!(
+        routed.recv_timeout(Duration::from_secs(1)).unwrap()["id"],
+        "another-call"
+    );
+    assert_eq!(
+        routed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        json!({"type": "message_update", "requestId": "after-response"})
+    );
+    supervisor.shutdown().unwrap();
+}
+
+#[test]
+fn pi_wiring_replaces_dispatcher_after_child_restart() {
+    let marker = temp_marker("pi-rpc-restart");
+    let _ = std::fs::remove_dir(&marker);
+    let marker_arg = marker.to_string_lossy().into_owned();
+    let mut cfg = config(&["pi-rpc-restart-once", &marker_arg]);
+    cfg.health_interval = Duration::from_secs(60);
+    let wiring = PiRpcWiring::new();
+    let mut supervisor =
+        SidecarSupervisor::spawn(cfg, wiring.readiness_probe(Duration::from_millis(100))).unwrap();
+
+    wait_for(&supervisor, SidecarStatus::Healthy);
+    let stale = wiring.transport().expect("first dispatcher installed");
+    assert!(stale
+        .call(json!({"type": "prompt"}), Duration::from_secs(1))
+        .is_err());
+
+    let events = supervisor.subscribe();
+    loop {
+        let event = events.recv_timeout(Duration::from_secs(2)).unwrap();
+        if event.status == SidecarStatus::Healthy && event.generation == Some(2) {
+            break;
+        }
+    }
+
+    let transport = wiring
+        .transport()
+        .expect("replacement dispatcher installed");
+    assert!(stale
+        .call(json!({"type": "get_state"}), Duration::from_millis(100))
+        .unwrap_err()
+        .contains("replaced child generation"));
+    let routed = transport.subscribe();
+    let response = transport
+        .call(json!({"type": "prompt"}), Duration::from_millis(100))
+        .unwrap();
+    assert_eq!(response["command"], "prompt");
+    assert_eq!(
+        routed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        json!({"type": "agent_start", "requestId": "unrelated"})
+    );
+
+    supervisor.shutdown().unwrap();
+    let _ = std::fs::remove_dir(marker);
 }
 
 #[test]

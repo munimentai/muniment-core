@@ -36,6 +36,10 @@ pub(super) struct WriterState {
 pub struct LineWriter(pub(super) Arc<Mutex<WriterState>>);
 
 impl LineWriter {
+    pub(super) fn generation(&self) -> u64 {
+        self.0.lock().unwrap().generation
+    }
+
     pub fn write_line(&self, line: &str) -> Result<(), SidecarError> {
         self.write_line_in_generation(line).map(|_| ())
     }
@@ -180,6 +184,11 @@ impl LineReader {
         timeout: Duration,
     ) -> Result<Option<String>, SidecarError> {
         self.read_for_generation(generation, Some(timeout))
+    }
+
+    pub(super) fn read_line_for_generation(&self, generation: u64) -> Result<String, SidecarError> {
+        self.read_for_generation(generation, None)?
+            .ok_or(SidecarError::Disconnected)
     }
 
     fn read_for_generation(
