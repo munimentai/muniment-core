@@ -149,9 +149,10 @@ requires CC BY 4.0 attribution and Apache/third-party notices.
 INT8 improves the CPU packaging proposition but does not prove acceptable
 latency, memory, or transcription quality. Failure of the validation gates
 reopens the artifact/recognizer decision rather than weakening the on-device
-privacy requirement. Acquisition, update/rollback, capture UI, VAD selection,
-bindings, native binaries, model weights, and application integration remain
-follow-up work and are not added by this ADR.
+privacy requirement. Acquisition, atomic publication, update/rollback,
+recovery, removal, and notice delivery are decided by [ADR
+0005](0005-asr-model-lifecycle.md). Capture UI, VAD selection, bindings, native
+binaries, model weights, and application integration remain follow-up work.
 
 ## Sources
 
