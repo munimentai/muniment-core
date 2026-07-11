@@ -10,4 +10,5 @@ pub mod cas;
 pub mod journal;
 pub mod llama;
 pub mod model_acquisition_transport;
+pub mod model_install;
 pub mod sidecar;

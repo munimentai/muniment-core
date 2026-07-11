@@ -162,6 +162,16 @@ impl GemmaRevisionLifecycle {
         boundary: &B,
     ) -> Result<PathBuf, GemmaLifecycleError> {
         let _lock = boundary.lock_exclusive(&self.root.join("install.lock"))?;
+        self.publish_lock_held(staged_directory, boundary)
+    }
+
+    /// Publishes a verified stage while the caller retains `install.lock`.
+    /// Coordinated installs use this entry point to avoid recursive locking.
+    pub fn publish_lock_held<B: GemmaLifecycleBoundary>(
+        &self,
+        staged_directory: &Path,
+        boundary: &B,
+    ) -> Result<PathBuf, GemmaLifecycleError> {
         if staged_directory.parent() != Some(self.root.join("staging").as_path()) {
             return Err(GemmaLifecycleError::InvalidStage);
         }
