@@ -1,5 +1,7 @@
 //! Managed, loopback-only `llama-server` process and health boundary.
 
+pub mod lifecycle;
+
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -36,6 +38,9 @@ pub const RESIDENT_MODEL: ResidentModelDescriptor = ResidentModelDescriptor {
     context_tokens: 131_072,
 };
 
+/// Immutable upstream revision carrying [`RESIDENT_MODEL`].
+pub const RESIDENT_MODEL_REVISION: &str = "15f73f5eee9c28f53afefef5723e29680c2fc78a";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelVerificationError {
     Missing,
@@ -69,7 +74,7 @@ pub fn verify_model_artifact(
     descriptor: &ResidentModelDescriptor,
 ) -> Result<(), ModelVerificationError> {
     let path = path.as_ref();
-    let metadata = std::fs::metadata(path).map_err(|error| {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             ModelVerificationError::Missing
         } else {
