@@ -1,6 +1,7 @@
 //! Managed, loopback-only `llama-server` process and health boundary.
 
 pub mod acquisition;
+pub mod install;
 pub mod lifecycle;
 
 use std::fs::File;
