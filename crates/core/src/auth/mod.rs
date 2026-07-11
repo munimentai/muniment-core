@@ -15,6 +15,7 @@
 pub mod discovery;
 pub mod flow;
 pub mod loopback;
+pub mod native_authorization;
 pub mod native_registration;
 pub mod pkce;
 pub mod store;
@@ -26,6 +27,11 @@ pub use flow::{
     run_sign_in, sign_out, OidcConfig,
 };
 pub use loopback::RedirectCatcher;
+pub use native_authorization::{
+    begin_native_authorization, AuthorizationTransport, NativeAuthorizationError,
+    NativeAuthorizationInput, NativeAuthorizationRequest, NativeAuthorizationResponse,
+    NativeAuthorizationResult, NativeDeviceProof, UreqAuthorizationTransport,
+};
 pub use native_registration::{
     register_installation, InstallationRecord, InstallationStore, NativeDeviceRegistrationRequest,
     NativeDeviceRegistrationResponse, NativeRegistrationError, RegistrationTransport,
