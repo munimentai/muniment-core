@@ -45,6 +45,19 @@ impl GemmaDownloadRequest {
     pub fn url(&self) -> &str {
         &self.url
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_transport_test(
+        url: String,
+        offset: u64,
+        limits: GemmaAcquisitionLimits,
+    ) -> Self {
+        Self {
+            url,
+            offset,
+            limits,
+        }
+    }
 }
 
 pub struct GemmaDownloadResponse<R> {

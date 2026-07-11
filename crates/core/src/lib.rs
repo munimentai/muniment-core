@@ -9,4 +9,5 @@ pub mod auth;
 pub mod cas;
 pub mod journal;
 pub mod llama;
+pub mod model_acquisition_transport;
 pub mod sidecar;

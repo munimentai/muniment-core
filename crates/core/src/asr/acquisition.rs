@@ -44,6 +44,20 @@ impl AsrDownloadRequest {
     pub fn url(&self) -> &str {
         &self.url
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_transport_test(
+        url: String,
+        offset: u64,
+        limits: AsrAcquisitionLimits,
+    ) -> Self {
+        Self {
+            url,
+            artifact_index: 0,
+            offset,
+            limits,
+        }
+    }
 }
 
 pub struct AsrDownloadResponse<R> {
