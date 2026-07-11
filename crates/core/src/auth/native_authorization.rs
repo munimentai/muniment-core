@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::native_registration::{InstallationStore, CLIENT_ID, CLIENT_ROLE};
+use super::{random_state, AuthError, PkcePair, RedirectCatcher};
 
 const AUTHORIZATION_PATH: &str = "/v1/auth/native/authorize";
 
@@ -86,6 +87,127 @@ pub struct NativeAuthorizationResponse {
 pub struct NativeAuthorizationResult {
     pub authorization_url: String,
     pub device_id: Uuid,
+}
+
+/// Values retained by the app for the later native token exchange.
+pub struct NativeAuthorizationCode {
+    pub authorization_code: String,
+    pub code_verifier: String,
+    pub device_id: Uuid,
+}
+
+impl fmt::Debug for NativeAuthorizationCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NativeAuthorizationCode")
+            .field("authorization_code", &"<redacted>")
+            .field("code_verifier", &"<redacted>")
+            .field("device_id", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrowserOpenError;
+
+impl fmt::Display for BrowserOpenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "could not open the system browser")
+    }
+}
+
+impl std::error::Error for BrowserOpenError {}
+
+pub trait BrowserOpener: Send + Sync {
+    fn open(&self, url: &str) -> Result<(), BrowserOpenError>;
+}
+
+impl<F> BrowserOpener for F
+where
+    F: Fn(&str) -> Result<(), BrowserOpenError> + Send + Sync,
+{
+    fn open(&self, url: &str) -> Result<(), BrowserOpenError> {
+        self(url)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeBrowserAuthorizationError {
+    Authorization(NativeAuthorizationError),
+    BrowserOpen,
+    StateMismatch,
+    ProviderDenied,
+    Timeout,
+    Callback,
+}
+
+impl fmt::Display for NativeBrowserAuthorizationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Authorization(error) => error.fmt(f),
+            Self::BrowserOpen => write!(f, "could not open the system browser"),
+            Self::StateMismatch => write!(f, "sign-in rejected: state mismatch"),
+            Self::ProviderDenied => write!(f, "sign-in was not completed by the provider"),
+            Self::Timeout => write!(f, "timed out waiting for the browser sign-in"),
+            Self::Callback => write!(f, "the browser callback was invalid"),
+        }
+    }
+}
+
+impl std::error::Error for NativeBrowserAuthorizationError {}
+
+/// Start native authorization and complete its external-browser loopback leg.
+pub fn run_native_browser_authorization(
+    store: &dyn InstallationStore,
+    transport: &dyn AuthorizationTransport,
+    browser: &dyn BrowserOpener,
+    base_url: &str,
+    org_id: Option<Uuid>,
+    now_unix_seconds: u64,
+    timeout: Duration,
+) -> Result<NativeAuthorizationCode, NativeBrowserAuthorizationError> {
+    // Bind first so the exact live redirect URI is sent to the server and no
+    // callback can race listener setup.
+    let catcher = RedirectCatcher::bind().map_err(map_callback_error)?;
+    let pkce = PkcePair::generate().map_err(map_callback_error)?;
+    let state = random_state().map_err(map_callback_error)?;
+    let mut proof_jti = [0_u8; 16];
+    getrandom::fill(&mut proof_jti).map_err(|_| NativeBrowserAuthorizationError::Callback)?;
+
+    let authorization = begin_native_authorization(
+        store,
+        transport,
+        base_url,
+        NativeAuthorizationInput {
+            redirect_uri: catcher.redirect_uri(),
+            code_challenge: pkce.challenge,
+            state: state.clone(),
+            org_id,
+        },
+        now_unix_seconds,
+        proof_jti,
+    )
+    .map_err(NativeBrowserAuthorizationError::Authorization)?;
+
+    browser
+        .open(&authorization.authorization_url)
+        .map_err(|_| NativeBrowserAuthorizationError::BrowserOpen)?;
+    let authorization_code = catcher
+        .wait_for_callback(&state, timeout)
+        .map_err(map_callback_error)?;
+    Ok(NativeAuthorizationCode {
+        authorization_code,
+        code_verifier: pkce.verifier,
+        device_id: authorization.device_id,
+    })
+}
+
+fn map_callback_error(error: AuthError) -> NativeBrowserAuthorizationError {
+    match error {
+        AuthError::StateMismatch => NativeBrowserAuthorizationError::StateMismatch,
+        AuthError::Denied(_) => NativeBrowserAuthorizationError::ProviderDenied,
+        AuthError::Timeout => NativeBrowserAuthorizationError::Timeout,
+        _ => NativeBrowserAuthorizationError::Callback,
+    }
 }
 
 pub trait AuthorizationTransport: Send + Sync {
