@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use muniment_core::llama::acquisition::{
-    acquire_gemma_stage, GemmaAcquisitionError, GemmaAcquisitionLimits, GemmaAcquisitionRuntime,
-    GemmaCancellation, GemmaDownloadRequest, GemmaDownloadResponse, GemmaDownloadTransport,
-    GemmaTransportError,
+    acquire_gemma_stage, remaining_stage_bytes, GemmaAcquisitionError, GemmaAcquisitionLimits,
+    GemmaAcquisitionRuntime, GemmaCancellation, GemmaDownloadRequest, GemmaDownloadResponse,
+    GemmaDownloadTransport, GemmaTransportError,
 };
 use muniment_core::llama::lifecycle::{GemmaNoticeDescriptor, GemmaRevisionDescriptor};
 use muniment_core::llama::ResidentModelDescriptor;
@@ -85,6 +85,36 @@ fn root() -> PathBuf {
 
 fn no_wait(_: Duration, _: &dyn GemmaCancellation) -> bool {
     true
+}
+
+#[test]
+fn accounts_for_absent_partial_and_verified_stages() {
+    let root = root();
+    assert_eq!(remaining_stage_bytes(&root, "install", &REVISION), Ok(3));
+    fs::create_dir(root.join("install")).unwrap();
+    fs::write(root.join("install/model.gguf.part"), b"a").unwrap();
+    assert_eq!(remaining_stage_bytes(&root, "install", &REVISION), Ok(2));
+    fs::write(root.join("install/model.gguf"), b"abc").unwrap();
+    assert_eq!(remaining_stage_bytes(&root, "install", &REVISION), Ok(0));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn accounting_rejects_oversized_and_non_regular_parts() {
+    let root = root();
+    fs::create_dir(root.join("install")).unwrap();
+    fs::write(root.join("install/model.gguf.part"), b"abcd").unwrap();
+    assert_eq!(
+        remaining_stage_bytes(&root, "install", &REVISION),
+        Err(GemmaAcquisitionError::TooLarge)
+    );
+    fs::remove_file(root.join("install/model.gguf.part")).unwrap();
+    fs::create_dir(root.join("install/model.gguf.part")).unwrap();
+    assert_eq!(
+        remaining_stage_bytes(&root, "install", &REVISION),
+        Err(GemmaAcquisitionError::InvalidStage)
+    );
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

@@ -165,6 +165,48 @@ impl std::fmt::Display for GemmaAcquisitionError {
 
 impl std::error::Error for GemmaAcquisitionError {}
 
+/// Returns the pinned model bytes not yet present in a resumable stage.
+pub fn remaining_stage_bytes(
+    staging_root: &Path,
+    install_id: &str,
+    descriptor: &GemmaRevisionDescriptor,
+) -> Result<u64, GemmaAcquisitionError> {
+    if !safe_component(install_id) {
+        return Err(GemmaAcquisitionError::InvalidStage);
+    }
+    require_directory(staging_root)?;
+    let stage = staging_root.join(install_id);
+    match fs::symlink_metadata(&stage) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return Err(GemmaAcquisitionError::InvalidStage),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(descriptor.model.byte_size)
+        }
+        Err(_) => return Err(GemmaAcquisitionError::Persistence),
+    }
+
+    let completed = stage.join(descriptor.model.filename);
+    match fs::symlink_metadata(&completed) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(GemmaAcquisitionError::InvalidStage)
+        }
+        Ok(_) if verify_model_artifact(&completed, descriptor.model).is_ok() => return Ok(0),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(GemmaAcquisitionError::Persistence),
+    }
+
+    let length = strict_part_length(
+        &stage.join(format!("{}.part", descriptor.model.filename)),
+        descriptor.model.byte_size,
+    )?;
+    descriptor
+        .model
+        .byte_size
+        .checked_sub(length)
+        .ok_or(GemmaAcquisitionError::TooLarge)
+}
+
 /// Downloads the target into `staging/<id>`, returning that directory only
 /// after the pinned bytes and notice form a publication-ready stage.
 pub fn acquire_gemma_stage<
@@ -478,6 +520,21 @@ fn part_length(path: &Path, maximum: u64) -> Result<u64, GemmaAcquisitionError> 
     if metadata.len() > maximum {
         remove_part(path)?;
         return Ok(0);
+    }
+    Ok(metadata.len())
+}
+
+fn strict_part_length(path: &Path, maximum: u64) -> Result<u64, GemmaAcquisitionError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(_) => return Err(GemmaAcquisitionError::Persistence),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(GemmaAcquisitionError::InvalidStage);
+    }
+    if metadata.len() > maximum {
+        return Err(GemmaAcquisitionError::TooLarge);
     }
     Ok(metadata.len())
 }

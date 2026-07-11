@@ -149,6 +149,65 @@ impl std::fmt::Display for AsrAcquisitionError {
 }
 impl std::error::Error for AsrAcquisitionError {}
 
+/// Returns the aggregate pinned bytes not yet present in a resumable stage.
+pub fn remaining_stage_bytes(
+    staging_root: &Path,
+    install_id: &str,
+    manifest: &AsrArtifactManifest,
+) -> Result<u64, AsrAcquisitionError> {
+    if !safe_component(install_id) {
+        return Err(AsrAcquisitionError::InvalidStage);
+    }
+    require_directory(staging_root)?;
+    let stage = staging_root.join(install_id);
+    match fs::symlink_metadata(&stage) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return Err(AsrAcquisitionError::InvalidStage),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return manifest
+                .artifacts
+                .iter()
+                .try_fold(0_u64, |total, artifact| {
+                    total
+                        .checked_add(artifact.byte_size)
+                        .ok_or(AsrAcquisitionError::TooLarge)
+                })
+        }
+        Err(_) => return Err(AsrAcquisitionError::Persistence),
+    }
+
+    manifest
+        .artifacts
+        .iter()
+        .try_fold(0_u64, |total, artifact| {
+            let completed = stage.join(artifact.filename);
+            let missing = match fs::symlink_metadata(&completed) {
+                Ok(metadata) if !metadata.file_type().is_file() => {
+                    return Err(AsrAcquisitionError::InvalidStage)
+                }
+                Ok(_) if verify_artifact(&completed, artifact).is_ok() => 0,
+                Ok(_) => artifact
+                    .byte_size
+                    .checked_sub(strict_part_length(
+                        &stage.join(format!("{}.part", artifact.filename)),
+                        artifact.byte_size,
+                    )?)
+                    .ok_or(AsrAcquisitionError::TooLarge)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => artifact
+                    .byte_size
+                    .checked_sub(strict_part_length(
+                        &stage.join(format!("{}.part", artifact.filename)),
+                        artifact.byte_size,
+                    )?)
+                    .ok_or(AsrAcquisitionError::TooLarge)?,
+                Err(_) => return Err(AsrAcquisitionError::Persistence),
+            };
+            total
+                .checked_add(missing)
+                .ok_or(AsrAcquisitionError::TooLarge)
+        })
+}
+
 /// Returns `staging/<id>` only after every pinned artifact verifies.
 pub fn acquire_parakeet_stage<T, C, K, W>(
     staging_root: &Path,
@@ -462,6 +521,21 @@ fn part_length(path: &Path, maximum: u64) -> Result<u64, AsrAcquisitionError> {
     if metadata.len() > maximum {
         remove_file(path)?;
         return Ok(0);
+    }
+    Ok(metadata.len())
+}
+
+fn strict_part_length(path: &Path, maximum: u64) -> Result<u64, AsrAcquisitionError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(_) => return Err(AsrAcquisitionError::Persistence),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(AsrAcquisitionError::InvalidStage);
+    }
+    if metadata.len() > maximum {
+        return Err(AsrAcquisitionError::TooLarge);
     }
     Ok(metadata.len())
 }

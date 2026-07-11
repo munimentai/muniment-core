@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use muniment_core::asr::acquisition::{
-    acquire_parakeet_stage, AsrAcquisitionError, AsrAcquisitionLimits, AsrAcquisitionRuntime,
-    AsrCancellation, AsrDownloadRequest, AsrDownloadResponse, AsrDownloadTransport,
-    AsrTransportError,
+    acquire_parakeet_stage, remaining_stage_bytes, AsrAcquisitionError, AsrAcquisitionLimits,
+    AsrAcquisitionRuntime, AsrCancellation, AsrDownloadRequest, AsrDownloadResponse,
+    AsrDownloadTransport, AsrTransportError,
 };
 use muniment_core::asr::{AsrArtifactDescriptor, AsrArtifactManifest};
 
@@ -98,6 +98,39 @@ fn root() -> PathBuf {
 }
 fn no_wait(_: Duration, _: &dyn AsrCancellation) -> bool {
     true
+}
+
+#[test]
+fn accounts_for_absent_mixed_and_verified_stages() {
+    let root = root();
+    assert_eq!(remaining_stage_bytes(&root, "install", &MANIFEST), Ok(6));
+    fs::create_dir(root.join("install")).unwrap();
+    fs::write(root.join("install/encoder"), b"a").unwrap();
+    fs::write(root.join("install/decoder.part"), b"b").unwrap();
+    assert_eq!(remaining_stage_bytes(&root, "install", &MANIFEST), Ok(4));
+    fs::write(root.join("install/decoder"), b"bc").unwrap();
+    fs::write(root.join("install/joiner"), b"d").unwrap();
+    fs::write(root.join("install/tokens"), b"ef").unwrap();
+    assert_eq!(remaining_stage_bytes(&root, "install", &MANIFEST), Ok(0));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn accounting_rejects_oversized_and_non_regular_parts() {
+    let root = root();
+    fs::create_dir(root.join("install")).unwrap();
+    fs::write(root.join("install/encoder.part"), b"aa").unwrap();
+    assert_eq!(
+        remaining_stage_bytes(&root, "install", &MANIFEST),
+        Err(AsrAcquisitionError::TooLarge)
+    );
+    fs::remove_file(root.join("install/encoder.part")).unwrap();
+    fs::create_dir(root.join("install/encoder.part")).unwrap();
+    assert_eq!(
+        remaining_stage_bytes(&root, "install", &MANIFEST),
+        Err(AsrAcquisitionError::InvalidStage)
+    );
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
