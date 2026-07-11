@@ -3,6 +3,7 @@
 mod io;
 mod jsonrpc;
 mod pi;
+pub mod pi_chat;
 pub mod pi_install;
 mod supervisor;
 

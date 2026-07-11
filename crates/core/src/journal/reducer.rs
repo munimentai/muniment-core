@@ -33,6 +33,32 @@ pub struct RunState {
     pub status: RunStatus,
 }
 
+/// The webview-facing chat projection. It is always rebuilt from journal
+/// events, so reopening a thread never repeats a gateway request.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ChatProjection {
+    pub prompt_accepted: bool,
+    pub text: String,
+    pub receipt: Option<Value>,
+    pub status: Option<RunStatus>,
+}
+
+pub fn project_chat(events: &[EventEnvelope]) -> Result<ChatProjection, ReduceError> {
+    let mut chat = ChatProjection::default();
+    for event in events {
+        match event.event_type.as_str() {
+            "model.prompt.accepted" => chat.prompt_accepted = true,
+            "model.stream.delta" => chat.text.push_str(&field(event, "text")?),
+            "run.completed" => {
+                chat.receipt = payload(event)?.get("receipt").cloned();
+            }
+            _ => {}
+        }
+    }
+    chat.status = Some(reduce(events)?.status);
+    Ok(chat)
+}
+
 impl RunState {
     pub fn is_terminal(&self) -> bool {
         matches!(

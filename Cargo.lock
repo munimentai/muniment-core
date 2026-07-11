@@ -1917,11 +1917,15 @@ dependencies = [
 name = "muniment-desktop"
 version = "0.0.1"
 dependencies = [
+ "chrono",
  "keyring",
  "muniment-core",
+ "serde",
  "serde_json",
  "tauri",
  "tauri-build",
+ "ureq",
+ "uuid",
 ]
 
 [[package]]

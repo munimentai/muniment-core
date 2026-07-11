@@ -223,6 +223,16 @@ impl RunJournal {
         })
         .collect()
     }
+
+    /// Run identities in first-recorded order. Callers still reconstruct all
+    /// visible state through `events`; this is only the durable history index.
+    pub fn run_ids(&self) -> Result<Vec<String>, JournalError> {
+        let mut statement = self.connection.prepare(
+            "SELECT run_id FROM events GROUP BY run_id ORDER BY MIN(recorded_at), MIN(rowid)",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
 }
 
 fn validate_envelope(e: &EventEnvelope) -> Result<(), JournalError> {

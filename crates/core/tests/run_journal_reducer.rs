@@ -1,5 +1,5 @@
 use muniment_core::journal::reducer::{
-    reduce, AttentionReason, ReduceError, RunReducer, RunStatus,
+    project_chat, reduce, AttentionReason, ReduceError, RunReducer, RunStatus,
 };
 use muniment_core::journal::{EventEnvelope, EventPayload, Provenance};
 use serde_json::{json, Value};
@@ -200,4 +200,91 @@ fn incremental_and_full_replay_are_identical() {
         incremental.apply(event).unwrap();
     }
     assert_eq!(incremental.finish().unwrap(), full);
+}
+
+#[test]
+fn chat_projection_replays_completed_and_failed_runs() {
+    let receipt = json!({
+        "route": "litellm",
+        "model": "openai/gpt-5",
+        "cost": "$0.01",
+        "time": "1.2s",
+        "capabilities": [{"name": "search", "version": "2"}]
+    });
+    let completed = stream(&[
+        ("run.started", json!({})),
+        ("model.prompt.accepted", json!({})),
+        ("model.stream.delta", json!({"text": "hel"})),
+        ("model.stream.delta", json!({"text": "lo"})),
+        ("run.completed", json!({"receipt": receipt.clone()})),
+    ]);
+
+    let first_replay = project_chat(&completed).unwrap();
+    let second_replay = project_chat(&completed).unwrap();
+    assert_eq!(first_replay, second_replay);
+    assert!(first_replay.prompt_accepted);
+    assert_eq!(first_replay.text, "hello");
+    assert_eq!(first_replay.receipt, Some(receipt));
+    assert_eq!(first_replay.status, Some(RunStatus::Completed));
+
+    let failed = stream(&[
+        ("run.started", json!({})),
+        ("model.prompt.accepted", json!({})),
+        ("model.stream.delta", json!({"text": "partial"})),
+        ("run.failed", json!({"reason": "runtime"})),
+    ]);
+    let projection = project_chat(&failed).unwrap();
+    assert_eq!(projection.text, "partial");
+    assert_eq!(projection.receipt, None);
+    assert_eq!(
+        projection.status,
+        Some(RunStatus::Failed {
+            reason: Some("runtime".into())
+        })
+    );
+}
+
+#[test]
+fn persisted_chat_events_exclude_request_secrets() {
+    let secrets = [
+        "the user's private prompt",
+        "sk-virtual-user-key",
+        "signed-access-token",
+    ];
+    let events = stream(&[
+        ("run.started", json!({})),
+        ("model.prompt.accepted", json!({})),
+        ("model.stream.delta", json!({"text": "safe response"})),
+        ("run.completed", json!({"receipt": {"route": "litellm"}})),
+    ]);
+
+    let persisted = serde_json::to_string(&events).unwrap();
+    for secret in secrets {
+        assert!(!persisted.contains(secret), "journal leaked {secret}");
+    }
+    assert_eq!(
+        events[1].payload,
+        EventPayload::Inline {
+            payload_json: json!({})
+        }
+    );
+}
+
+#[test]
+fn receipt_projection_preserves_absent_fields_as_unknown() {
+    let authoritative = json!({
+        "route": "litellm",
+        "capabilities": [{"name": "filesystem", "version": "1"}]
+    });
+    let events = stream(&[
+        ("run.started", json!({})),
+        ("model.prompt.accepted", json!({})),
+        ("run.completed", json!({"receipt": authoritative.clone()})),
+    ]);
+
+    let receipt = project_chat(&events).unwrap().receipt.unwrap();
+    assert_eq!(receipt, authoritative);
+    assert!(receipt.get("model").is_none());
+    assert!(receipt.get("cost").is_none());
+    assert!(receipt.get("time").is_none());
 }

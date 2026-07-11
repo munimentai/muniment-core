@@ -12,7 +12,6 @@ pub const PI_VERSION: &str = "0.73.1";
 
 type PendingCalls = Arc<Mutex<HashMap<String, mpsc::Sender<Result<Value, String>>>>>;
 type CurrentTransport = Arc<Mutex<Option<(u64, Arc<PiRpcTransport>)>>>;
-
 /// Builds the production Pi RPC launch contract for a verified, platform-native
 /// Pi executable. The executable contains its Node-compatible runtime; a system
 /// `node` installation is deliberately not part of this contract.
