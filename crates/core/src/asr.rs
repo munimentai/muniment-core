@@ -1,6 +1,7 @@
 //! Verification boundary for the pinned offline ASR model set.
 
 pub mod acquisition;
+pub mod install;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Write};
@@ -226,6 +227,16 @@ impl AsrRevisionLifecycle {
     }
 
     pub fn publish(
+        &self,
+        staged_directory: &Path,
+        boundary: &impl AsrLifecycleBoundary,
+    ) -> Result<PathBuf, AsrLifecycleError> {
+        self.publish_lock_held(staged_directory, boundary)
+    }
+
+    /// Publishes a verified stage while the caller retains `install.lock`.
+    /// Coordinated installs use this entry point to avoid recursive locking.
+    pub fn publish_lock_held(
         &self,
         staged_directory: &Path,
         boundary: &impl AsrLifecycleBoundary,
