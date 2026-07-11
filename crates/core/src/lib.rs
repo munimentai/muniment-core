@@ -4,6 +4,7 @@
 //! here run on the shared CI runner, which has no display stack. The Pi
 //! sidecar process manager and its RPC transport build on these pieces.
 
+pub mod asr;
 pub mod auth;
 pub mod cas;
 pub mod journal;
