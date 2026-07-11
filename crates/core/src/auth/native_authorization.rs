@@ -94,6 +94,7 @@ pub struct NativeAuthorizationCode {
     pub authorization_code: String,
     pub code_verifier: String,
     pub device_id: Uuid,
+    pub redirect_uri: String,
 }
 
 impl fmt::Debug for NativeAuthorizationCode {
@@ -102,6 +103,7 @@ impl fmt::Debug for NativeAuthorizationCode {
             .field("authorization_code", &"<redacted>")
             .field("code_verifier", &"<redacted>")
             .field("device_id", &"<redacted>")
+            .field("redirect_uri", &self.redirect_uri)
             .finish()
     }
 }
@@ -191,6 +193,7 @@ pub fn run_native_browser_authorization(
     browser
         .open(&authorization.authorization_url)
         .map_err(|_| NativeBrowserAuthorizationError::BrowserOpen)?;
+    let redirect_uri = catcher.redirect_uri();
     let authorization_code = catcher
         .wait_for_callback(&state, timeout)
         .map_err(map_callback_error)?;
@@ -198,6 +201,7 @@ pub fn run_native_browser_authorization(
         authorization_code,
         code_verifier: pkce.verifier,
         device_id: authorization.device_id,
+        redirect_uri,
     })
 }
 

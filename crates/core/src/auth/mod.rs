@@ -17,6 +17,7 @@ pub mod flow;
 pub mod loopback;
 pub mod native_authorization;
 pub mod native_registration;
+pub mod native_token;
 pub mod pkce;
 pub mod store;
 pub mod urlenc;
@@ -38,6 +39,10 @@ pub use native_registration::{
     register_installation, InstallationRecord, InstallationStore, NativeDeviceRegistrationRequest,
     NativeDeviceRegistrationResponse, NativeRegistrationError, RegistrationTransport,
     UreqRegistrationTransport,
+};
+pub use native_token::{
+    exchange_native_code, NativeCredentialStore, NativeCredentials, NativeTokenError,
+    NativeTokenRequest, NativeTokenResponse, TokenTransport, UreqTokenTransport,
 };
 pub use pkce::{random_state, PkcePair};
 pub use store::{status, AuthStatus, InMemoryTokenStore, TokenSet, TokenStore};
