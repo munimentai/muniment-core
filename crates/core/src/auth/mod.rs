@@ -15,6 +15,7 @@
 pub mod discovery;
 pub mod flow;
 pub mod loopback;
+pub mod native_registration;
 pub mod pkce;
 pub mod store;
 pub mod urlenc;
@@ -25,6 +26,11 @@ pub use flow::{
     run_sign_in, sign_out, OidcConfig,
 };
 pub use loopback::RedirectCatcher;
+pub use native_registration::{
+    register_installation, InstallationRecord, InstallationStore, NativeDeviceRegistrationRequest,
+    NativeDeviceRegistrationResponse, NativeRegistrationError, RegistrationTransport,
+    UreqRegistrationTransport,
+};
 pub use pkce::{random_state, PkcePair};
 pub use store::{status, AuthStatus, InMemoryTokenStore, TokenSet, TokenStore};
 
