@@ -1,5 +1,7 @@
 //! Verification boundary for the pinned offline ASR model set.
 
+pub mod acquisition;
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -396,7 +398,7 @@ fn safe_component(value: &str) -> bool {
         && !Path::new(value).is_absolute()
 }
 
-fn verify_artifact(
+pub(super) fn verify_artifact(
     path: &Path,
     descriptor: &AsrArtifactDescriptor,
 ) -> Result<(), AsrModelSetVerificationError> {
