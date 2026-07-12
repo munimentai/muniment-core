@@ -5,7 +5,7 @@
 //! each accepted prompt and discard unrelated frames.
 
 use serde::{Deserialize, Serialize};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -158,7 +158,7 @@ fn require_queue_ack(response: &Value, command: &str) -> Result<(), String> {
 /// before sending the prompt so no post-ack frame can be lost.
 pub struct PiRunAdapter {
     run_id: String,
-    frames: mpsc::Receiver<Value>,
+    frames: Mutex<mpsc::Receiver<Value>>,
 }
 
 impl PiRunAdapter {
@@ -177,7 +177,7 @@ impl PiRunAdapter {
         Ok((
             Self {
                 run_id: run_id.into(),
-                frames,
+                frames: Mutex::new(frames),
             },
             accepted,
         ))
@@ -219,6 +219,8 @@ impl PiRunAdapter {
     pub fn next(&self, timeout: Duration) -> Result<PiChatEvent, String> {
         let frame = self
             .frames
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .recv_timeout(timeout)
             .map_err(|error| match error {
                 mpsc::RecvTimeoutError::Timeout => "timed out waiting for Pi stream".to_string(),
@@ -237,7 +239,7 @@ mod tests {
         let (sender, frames) = mpsc::channel();
         let adapter = PiRunAdapter {
             run_id: "0190a100-0000-7000-8000-000000000001".into(),
-            frames,
+            frames: Mutex::new(frames),
         };
         drop(sender);
 
