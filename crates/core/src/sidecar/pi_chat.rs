@@ -67,6 +67,14 @@ pub struct CapabilityReceipt {
 pub enum PiChatEvent {
     PromptAccepted,
     TextDelta(String),
+    ToolStarted {
+        tool_call_id: String,
+        tool_name: String,
+    },
+    ToolFinished {
+        tool_call_id: String,
+        failed: bool,
+    },
     Completed,
     Cancelled,
     Failed,
@@ -95,6 +103,44 @@ pub fn parse_frame(frame: &Value) -> Result<PiChatEvent, &'static str> {
                     .ok_or("text delta is missing delta"),
                 _ => Ok(PiChatEvent::Interleaved),
             }
+        }
+        Some("tool_execution_start") => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct ToolStart {
+                tool_call_id: String,
+                tool_name: String,
+            }
+
+            let Ok(event) = serde_json::from_value::<ToolStart>(frame.clone()) else {
+                return Ok(PiChatEvent::Interleaved);
+            };
+            if event.tool_call_id.is_empty() || event.tool_name.is_empty() {
+                return Ok(PiChatEvent::Interleaved);
+            }
+            Ok(PiChatEvent::ToolStarted {
+                tool_call_id: event.tool_call_id,
+                tool_name: event.tool_name,
+            })
+        }
+        Some("tool_execution_end") => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct ToolEnd {
+                tool_call_id: String,
+                is_error: bool,
+            }
+
+            let Ok(event) = serde_json::from_value::<ToolEnd>(frame.clone()) else {
+                return Ok(PiChatEvent::Interleaved);
+            };
+            if event.tool_call_id.is_empty() {
+                return Ok(PiChatEvent::Interleaved);
+            }
+            Ok(PiChatEvent::ToolFinished {
+                tool_call_id: event.tool_call_id,
+                failed: event.is_error,
+            })
         }
         // Pi owns generation, not billing/routing provenance. Any similarly
         // named member is deliberately ignored; the control plane supplies it.

@@ -20,10 +20,10 @@ fn prompt_contract_and_interleaved_deltas_are_typed() {
         .unwrap(),
         PiChatEvent::PromptAccepted
     );
-    assert_eq!(
-        parse_frame(&json!({"type":"tool_execution_start"})).unwrap(),
-        PiChatEvent::Interleaved
-    );
+    assert!(matches!(
+        parse_frame(&json!({"type":"tool_execution_start"})),
+        Ok(PiChatEvent::Interleaved)
+    ));
     assert_eq!(
         parse_frame(&json!({"type":"message_update","assistantMessageEvent":{
             "type":"text_delta", "delta":"hello"
@@ -39,6 +39,46 @@ fn prompt_contract_and_interleaved_deltas_are_typed() {
         parse_frame(&json!({"type":"error","message":"secret upstream detail"})).unwrap(),
         PiChatEvent::Failed
     );
+}
+
+#[test]
+fn tool_execution_frames_are_typed_without_sensitive_contents() {
+    let started = parse_frame(&json!({
+        "type":"tool_execution_start",
+        "toolCallId":"call-1",
+        "toolName":"bash",
+        "args":{"command":"secret argument"}
+    }))
+    .unwrap();
+    assert_eq!(
+        started,
+        PiChatEvent::ToolStarted {
+            tool_call_id: "call-1".into(),
+            tool_name: "bash".into()
+        }
+    );
+
+    let finished = parse_frame(&json!({
+        "type":"tool_execution_end",
+        "toolCallId":"call-1",
+        "toolName":"bash",
+        "result":{"content":[{"type":"text","text":"secret result"}]},
+        "isError":true,
+        "error":"secret upstream error"
+    }))
+    .unwrap();
+    assert_eq!(
+        finished,
+        PiChatEvent::ToolFinished {
+            tool_call_id: "call-1".into(),
+            failed: true
+        }
+    );
+
+    let projected = format!("{started:?} {finished:?}");
+    for secret in ["secret argument", "secret result", "secret upstream error"] {
+        assert!(!projected.contains(secret));
+    }
 }
 
 #[test]

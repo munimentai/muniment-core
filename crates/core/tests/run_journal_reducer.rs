@@ -1,5 +1,6 @@
 use muniment_core::journal::reducer::{
-    project_chat, reduce, AttentionReason, ReduceError, RunReducer, RunStatus,
+    project_chat, reduce, AttentionReason, ReduceError, RunReducer, RunStatus, ToolActivity,
+    ToolActivityStatus,
 };
 use muniment_core::journal::{EventEnvelope, EventPayload, Provenance};
 use serde_json::{json, Value};
@@ -241,6 +242,74 @@ fn chat_projection_replays_completed_and_failed_runs() {
         Some(RunStatus::Failed {
             reason: Some("runtime".into())
         })
+    );
+}
+
+#[test]
+fn chat_projection_tracks_tool_activity_in_start_order() {
+    let cases = [
+        (
+            vec![
+                ("run.started", json!({})),
+                (
+                    "tool.effect.started",
+                    json!({"effect_id":"e1", "display_name":"Search"}),
+                ),
+            ],
+            ToolActivityStatus::Running,
+        ),
+        (
+            vec![
+                ("run.started", json!({})),
+                ("tool.effect.started", json!({"effect_id":"e1"})),
+                ("tool.effect.completed", json!({"effect_id":"e1"})),
+            ],
+            ToolActivityStatus::Completed,
+        ),
+        (
+            vec![
+                ("run.started", json!({})),
+                ("tool.effect.started", json!({"effect_id":"e1"})),
+                ("tool.effect.failed", json!({"effect_id":"e1"})),
+            ],
+            ToolActivityStatus::Failed,
+        ),
+    ];
+    for (events, status) in cases {
+        assert_eq!(
+            project_chat(&stream(&events)).unwrap().tool_activity[0].status,
+            status
+        );
+    }
+
+    let interleaved = stream(&[
+        ("run.started", json!({})),
+        (
+            "tool.effect.started",
+            json!({"effect_id":"first", "display_name":"Search"}),
+        ),
+        ("model.stream.delta", json!({"text":"between"})),
+        ("tool.effect.completed", json!({"effect_id":"first"})),
+        ("tool.effect.started", json!({"effect_id":"second"})),
+        ("model.stream.delta", json!({"text":" tools"})),
+        ("tool.effect.failed", json!({"effect_id":"second"})),
+    ]);
+    let projection = project_chat(&interleaved).unwrap();
+    assert_eq!(projection.text, "between tools");
+    assert_eq!(
+        projection.tool_activity,
+        vec![
+            ToolActivity {
+                effect_id: "first".into(),
+                display_name: Some("Search".into()),
+                status: ToolActivityStatus::Completed,
+            },
+            ToolActivity {
+                effect_id: "second".into(),
+                display_name: None,
+                status: ToolActivityStatus::Failed,
+            },
+        ]
     );
 }
 

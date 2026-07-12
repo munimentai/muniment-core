@@ -41,6 +41,21 @@ pub struct ChatProjection {
     pub text: String,
     pub receipt: Option<Value>,
     pub status: Option<RunStatus>,
+    pub tool_activity: Vec<ToolActivity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolActivity {
+    pub effect_id: String,
+    pub display_name: Option<String>,
+    pub status: ToolActivityStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolActivityStatus {
+    Running,
+    Completed,
+    Failed,
 }
 
 pub fn project_chat(events: &[EventEnvelope]) -> Result<ChatProjection, ReduceError> {
@@ -49,6 +64,26 @@ pub fn project_chat(events: &[EventEnvelope]) -> Result<ChatProjection, ReduceEr
         match event.event_type.as_str() {
             "model.prompt.accepted" => chat.prompt_accepted = true,
             "model.stream.delta" => chat.text.push_str(&field(event, "text")?),
+            "tool.effect.started" => chat.tool_activity.push(ToolActivity {
+                effect_id: field(event, "effect_id")?,
+                display_name: optional_field(event, "display_name")?,
+                status: ToolActivityStatus::Running,
+            }),
+            "tool.effect.completed" | "tool.effect.failed" => {
+                let effect_id = field(event, "effect_id")?;
+                if let Some(activity) = chat
+                    .tool_activity
+                    .iter_mut()
+                    .rev()
+                    .find(|activity| activity.effect_id == effect_id)
+                {
+                    activity.status = if event.event_type == "tool.effect.completed" {
+                        ToolActivityStatus::Completed
+                    } else {
+                        ToolActivityStatus::Failed
+                    };
+                }
+            }
             "run.completed" => {
                 chat.receipt = payload(event)?.get("receipt").cloned();
             }
