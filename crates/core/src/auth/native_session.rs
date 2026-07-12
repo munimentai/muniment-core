@@ -7,7 +7,11 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use super::native_registration::CLIENT_ROLE;
-use super::native_token::NativeCredentialStore;
+use super::native_token::{
+    refresh_native_credentials, NativeCredentialStore, NativeCredentials, NativeTokenError,
+    TokenTransport,
+};
+use super::AuthStatus;
 
 const SESSION_PATH: &str = "/v1/auth/native/session";
 
@@ -97,6 +101,64 @@ pub enum NativeSessionError {
     MalformedResponse(String),
 }
 
+/// Result of validating the production native session. Credentials remain in
+/// native Rust code; Tauri commands must return only `status`.
+pub struct FreshNativeSession {
+    pub status: AuthStatus,
+    credentials: Option<NativeCredentials>,
+}
+
+impl FreshNativeSession {
+    pub fn credentials(&self) -> Option<&NativeCredentials> {
+        self.credentials.as_ref()
+    }
+
+    pub fn into_credentials(self) -> Option<NativeCredentials> {
+        self.credentials
+    }
+}
+
+impl fmt::Debug for FreshNativeSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FreshNativeSession")
+            .field("status", &self.status)
+            .field(
+                "credentials",
+                &self.credentials.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum FreshNativeSessionError {
+    Credentials,
+    Randomness,
+    TokenRefresh,
+    SessionInspection,
+}
+
+impl fmt::Debug for FreshNativeSessionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl fmt::Display for FreshNativeSessionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Credentials => f.write_str("native credential persistence failed"),
+            Self::Randomness => {
+                f.write_str("native session refresh could not create a secure proof")
+            }
+            Self::TokenRefresh => f.write_str("native session refresh failed"),
+            Self::SessionInspection => f.write_str("native session validation failed"),
+        }
+    }
+}
+
+impl std::error::Error for FreshNativeSessionError {}
+
 impl fmt::Debug for NativeSessionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -183,6 +245,104 @@ pub fn inspect_native_session(
     )?;
     validate_response(&response, expected_device_id)?;
     Ok(response)
+}
+
+/// Read the coherent native record without network access.
+pub fn native_status(
+    store: &dyn NativeCredentialStore,
+) -> Result<AuthStatus, FreshNativeSessionError> {
+    let credentials = store
+        .load_credentials()
+        .map_err(|_| FreshNativeSessionError::Credentials)?;
+    Ok(status_from_credentials(credentials.as_ref()))
+}
+
+/// Refresh a near-expiry native access credential, atomically persist any
+/// rotation, and validate the authoritative server-side native session.
+pub fn ensure_fresh_native_session(
+    store: &dyn NativeCredentialStore,
+    token_transport: &dyn TokenTransport,
+    session_transport: &dyn SessionTransport,
+    base_url: &str,
+    now_unix_seconds: u64,
+    refresh_skew: Duration,
+) -> Result<FreshNativeSession, FreshNativeSessionError> {
+    let Some(mut credentials) = store
+        .load_credentials()
+        .map_err(|_| FreshNativeSessionError::Credentials)?
+    else {
+        return Ok(signed_out());
+    };
+
+    let refresh_at = now_unix_seconds.saturating_add(refresh_skew.as_secs());
+    if credentials
+        .tokens
+        .expires_at
+        .is_none_or(|expiry| expiry <= refresh_at)
+    {
+        if now_unix_seconds >= credentials.refresh_expires_at
+            || credentials
+                .tokens
+                .refresh_token
+                .as_ref()
+                .is_none_or(String::is_empty)
+        {
+            return Ok(signed_out());
+        }
+        let mut proof_jti = [0_u8; 16];
+        getrandom::fill(&mut proof_jti).map_err(|_| FreshNativeSessionError::Randomness)?;
+        credentials = match refresh_native_credentials(
+            store,
+            token_transport,
+            base_url,
+            now_unix_seconds,
+            proof_jti,
+        ) {
+            Ok(credentials) => credentials,
+            Err(NativeTokenError::CredentialsMissing | NativeTokenError::RefreshExpired) => {
+                return Ok(signed_out())
+            }
+            Err(_) => return Err(FreshNativeSessionError::TokenRefresh),
+        };
+    }
+
+    let session = inspect_native_session(store, session_transport, base_url)
+        .map_err(|_| FreshNativeSessionError::SessionInspection)?;
+    let status = AuthStatus {
+        signed_in: true,
+        subject: Some(session.session.user_id.to_string()),
+        expires_at: credentials.tokens.expires_at,
+    };
+    Ok(FreshNativeSession {
+        status,
+        credentials: Some(credentials),
+    })
+}
+
+fn status_from_credentials(credentials: Option<&NativeCredentials>) -> AuthStatus {
+    match credentials {
+        Some(credentials) if !credentials.tokens.access_token.is_empty() => AuthStatus {
+            signed_in: true,
+            subject: credentials.tokens.subject.clone(),
+            expires_at: credentials.tokens.expires_at,
+        },
+        _ => AuthStatus {
+            signed_in: false,
+            subject: None,
+            expires_at: None,
+        },
+    }
+}
+
+fn signed_out() -> FreshNativeSession {
+    FreshNativeSession {
+        status: AuthStatus {
+            signed_in: false,
+            subject: None,
+            expires_at: None,
+        },
+        credentials: None,
+    }
 }
 
 fn validate_response(

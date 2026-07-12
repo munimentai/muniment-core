@@ -47,9 +47,10 @@ pub use native_registration::{
     UreqRegistrationTransport,
 };
 pub use native_session::{
-    inspect_native_session, EntitlementSnapshotAlgorithm, NativeEntitlementSnapshot, NativeSession,
-    NativeSessionError, NativeSessionIdentity, NativeSessionRequest, NativeSessionRole,
-    SessionTransport, UreqSessionTransport,
+    ensure_fresh_native_session, inspect_native_session, native_status,
+    EntitlementSnapshotAlgorithm, FreshNativeSession, FreshNativeSessionError,
+    NativeEntitlementSnapshot, NativeSession, NativeSessionError, NativeSessionIdentity,
+    NativeSessionRequest, NativeSessionRole, SessionTransport, UreqSessionTransport,
 };
 pub use native_sign_in::{run_native_sign_in, NativeSignInError};
 pub use native_token::{

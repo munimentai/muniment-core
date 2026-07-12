@@ -1,11 +1,14 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use muniment_core::auth::{
-    inspect_native_session, InstallationRecord, NativeCredentialStore, NativeCredentials,
-    NativeSessionError, TokenSet, UreqSessionTransport,
+    ensure_fresh_native_session, inspect_native_session, native_status, InstallationRecord,
+    NativeCredentialStore, NativeCredentials, NativeSession, NativeSessionError,
+    NativeSessionRequest, NativeTokenError, NativeTokenRequest, NativeTokenResponse,
+    SessionTransport, TokenSet, TokenTransport, UreqSessionTransport,
 };
 use uuid::Uuid;
 
@@ -211,4 +214,210 @@ fn failures_and_debug_output_redact_all_secrets() {
         ),
         Err(NativeSessionError::Transport(_))
     ));
+}
+
+struct CountingTokenTransport {
+    calls: AtomicUsize,
+    response: Option<String>,
+    error: Option<NativeTokenError>,
+}
+
+impl TokenTransport for CountingTokenTransport {
+    fn exchange(
+        &self,
+        _: &str,
+        _: &NativeTokenRequest,
+    ) -> Result<NativeTokenResponse, NativeTokenError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
+        Ok(serde_json::from_str(self.response.as_deref().unwrap()).unwrap())
+    }
+}
+
+struct CountingSessionTransport {
+    calls: AtomicUsize,
+    result: Result<NativeSession, NativeSessionError>,
+}
+
+impl SessionTransport for CountingSessionTransport {
+    fn inspect(
+        &self,
+        _: &str,
+        _: &NativeSessionRequest,
+    ) -> Result<NativeSession, NativeSessionError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.result.clone()
+    }
+}
+
+fn session_result() -> NativeSession {
+    serde_json::from_str(&success()).unwrap()
+}
+
+fn token_response() -> String {
+    let challenge =
+        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, [12; 32]);
+    format!(
+        r#"{{"access_token":"rotated-access-secret","token_type":"Bearer","expires_in":900,"refresh_token":"rotated-refresh-secret","refresh_expires_in":86400,"session":{{"org_id":"20000000-0000-4000-8000-000000000002","user_id":"30000000-0000-4000-8000-000000000003","role":"user","device_id":"{DEVICE_ID}","client_role":"desktop"}},"entitlement_snapshot":{{"payload":{{"version":8}},"signature":"rotated-signature-secret","algorithm":"hmac-sha256"}},"device_challenge":"{challenge}"}}"#
+    )
+}
+
+fn orchestration_store(expires_at: u64, refresh_expires_at: u64) -> MemoryStore {
+    let store = store();
+    let mut credentials = store.load_credentials().unwrap().unwrap();
+    credentials.tokens.expires_at = Some(expires_at);
+    credentials.refresh_expires_at = refresh_expires_at;
+    credentials.installation.device_challenge =
+        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, [11; 32]);
+    store.save_credentials(&credentials).unwrap();
+    store
+}
+
+#[test]
+fn local_native_status_uses_only_the_coherent_record() {
+    let empty = MemoryStore::default();
+    assert!(!native_status(&empty).unwrap().signed_in);
+    let status = native_status(&orchestration_store(2_000, 4_000)).unwrap();
+    assert!(status.signed_in);
+    assert_eq!(status.subject.as_deref(), Some("user"));
+    assert_eq!(status.expires_at, Some(2_000));
+}
+
+#[test]
+fn fresh_credentials_skip_exchange_but_still_validate_the_session() {
+    let tokens = CountingTokenTransport {
+        calls: AtomicUsize::new(0),
+        response: None,
+        error: Some(NativeTokenError::Transport("token-secret".into())),
+    };
+    let sessions = CountingSessionTransport {
+        calls: AtomicUsize::new(0),
+        result: Ok(session_result()),
+    };
+    let result = ensure_fresh_native_session(
+        &orchestration_store(1_061, 4_000),
+        &tokens,
+        &sessions,
+        "http://localhost:3000",
+        1_000,
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    assert!(result.status.signed_in);
+    assert_eq!(
+        result.status.subject.as_deref(),
+        Some("30000000-0000-4000-8000-000000000003")
+    );
+    assert_eq!(tokens.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(sessions.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn near_expiry_refreshes_persists_rotation_then_inspects() {
+    let store = orchestration_store(1_060, 4_000);
+    let tokens = CountingTokenTransport {
+        calls: AtomicUsize::new(0),
+        response: Some(token_response()),
+        error: None,
+    };
+    let sessions = CountingSessionTransport {
+        calls: AtomicUsize::new(0),
+        result: Ok(session_result()),
+    };
+    let result = ensure_fresh_native_session(
+        &store,
+        &tokens,
+        &sessions,
+        "http://localhost:3000",
+        1_000,
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    assert_eq!(tokens.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(sessions.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(result.status.expires_at, Some(1_900));
+    let persisted = store.load_credentials().unwrap().unwrap();
+    assert_eq!(persisted.tokens.access_token, "rotated-access-secret");
+    assert_eq!(
+        persisted.tokens.refresh_token.as_deref(),
+        Some("rotated-refresh-secret")
+    );
+    assert_eq!(persisted.refresh_expires_at, 87_400);
+}
+
+#[test]
+fn signed_out_refresh_and_validation_failures_are_fail_closed_and_redacted() {
+    let tokens = CountingTokenTransport {
+        calls: AtomicUsize::new(0),
+        response: None,
+        error: Some(NativeTokenError::HttpStatus(401)),
+    };
+    let sessions = CountingSessionTransport {
+        calls: AtomicUsize::new(0),
+        result: Err(NativeSessionError::Transport("session-secret".into())),
+    };
+    for store in [MemoryStore::default(), orchestration_store(900, 1_000)] {
+        let result = ensure_fresh_native_session(
+            &store,
+            &tokens,
+            &sessions,
+            "http://localhost:3000",
+            1_000,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(!result.status.signed_in);
+    }
+    assert_eq!(tokens.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(sessions.calls.load(Ordering::SeqCst), 0);
+
+    let store = orchestration_store(1_060, 4_000);
+    let old_access = store
+        .load_credentials()
+        .unwrap()
+        .unwrap()
+        .tokens
+        .access_token;
+    let error = ensure_fresh_native_session(
+        &store,
+        &tokens,
+        &sessions,
+        "http://localhost:3000",
+        1_000,
+        Duration::from_secs(60),
+    )
+    .unwrap_err();
+    assert_eq!(
+        store
+            .load_credentials()
+            .unwrap()
+            .unwrap()
+            .tokens
+            .access_token,
+        old_access
+    );
+    assert!(!format!("{error:?} {error}").contains("secret"));
+
+    let fresh = orchestration_store(2_000, 4_000);
+    let error = ensure_fresh_native_session(
+        &fresh,
+        &tokens,
+        &sessions,
+        "http://localhost:3000",
+        1_000,
+        Duration::from_secs(60),
+    )
+    .unwrap_err();
+    assert_eq!(
+        fresh
+            .load_credentials()
+            .unwrap()
+            .unwrap()
+            .tokens
+            .access_token,
+        "access-secret"
+    );
+    assert!(!format!("{error:?} {error}").contains("secret"));
 }
