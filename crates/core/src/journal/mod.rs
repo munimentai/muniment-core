@@ -2,13 +2,15 @@
 
 pub mod reducer;
 
+use crate::cas::ContentHash;
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::path::Path;
+use std::str::FromStr;
 use std::time::Duration;
 use uuid::{Uuid, Version};
 
@@ -224,6 +226,22 @@ impl RunJournal {
         .collect()
     }
 
+    /// Atomically removes a run's events and returns their distinct CAS hashes.
+    pub fn delete_run(&mut self, run_id: &str) -> Result<HashSet<ContentHash>, JournalError> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let hashes = referenced_hashes_for_run(&tx, Some(run_id))?;
+        tx.execute("DELETE FROM events WHERE run_id=?1", [run_id])?;
+        tx.commit()?;
+        Ok(hashes)
+    }
+
+    /// Distinct CAS hashes referenced by all events currently in the journal.
+    pub fn referenced_hashes(&self) -> Result<HashSet<ContentHash>, JournalError> {
+        referenced_hashes_for_run(&self.connection, None)
+    }
+
     /// Run identities in first-recorded order. Callers still reconstruct all
     /// visible state through `events`; this is only the durable history index.
     pub fn run_ids(&self) -> Result<Vec<String>, JournalError> {
@@ -233,6 +251,35 @@ impl RunJournal {
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+}
+
+fn referenced_hashes_for_run(
+    connection: &Connection,
+    run_id: Option<&str>,
+) -> Result<HashSet<ContentHash>, JournalError> {
+    let (sql, parameters) = match run_id {
+        Some(run_id) => (
+            "SELECT envelope_json FROM events WHERE run_id=?1",
+            vec![run_id],
+        ),
+        None => ("SELECT envelope_json FROM events", vec![]),
+    };
+    let mut statement = connection.prepare(sql)?;
+    let rows = statement.query_map(rusqlite::params_from_iter(parameters), |row| {
+        row.get::<_, String>(0)
+    })?;
+    let mut hashes = HashSet::new();
+    for row in rows {
+        let raw = row?;
+        let event: EventEnvelope = serde_json::from_str(&raw)
+            .map_err(|e| JournalError::Corrupt(format!("invalid stored envelope JSON: {e}")))?;
+        if let EventPayload::Cas { payload_cas } = event.payload {
+            hashes.insert(ContentHash::from_str(&payload_cas.sha256).map_err(|error| {
+                JournalError::Corrupt(format!("invalid stored CAS reference: {error}"))
+            })?);
+        }
+    }
+    Ok(hashes)
 }
 
 fn validate_envelope(e: &EventEnvelope) -> Result<(), JournalError> {
