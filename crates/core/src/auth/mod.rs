@@ -17,6 +17,7 @@ pub mod flow;
 pub mod loopback;
 pub mod native_authorization;
 pub mod native_registration;
+pub mod native_session;
 pub mod native_token;
 pub mod pkce;
 pub mod store;
@@ -39,6 +40,11 @@ pub use native_registration::{
     register_installation, InstallationRecord, InstallationStore, NativeDeviceRegistrationRequest,
     NativeDeviceRegistrationResponse, NativeRegistrationError, RegistrationTransport,
     UreqRegistrationTransport,
+};
+pub use native_session::{
+    inspect_native_session, EntitlementSnapshotAlgorithm, NativeEntitlementSnapshot, NativeSession,
+    NativeSessionError, NativeSessionIdentity, NativeSessionRequest, NativeSessionRole,
+    SessionTransport, UreqSessionTransport,
 };
 pub use native_token::{
     exchange_native_code, refresh_native_credentials, NativeAuthorizationCodeTokenRequest,
