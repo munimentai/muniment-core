@@ -141,7 +141,7 @@ impl RegistrationTransport for UreqRegistrationTransport {
     }
 }
 
-/// Return the persisted installation, registering exactly once when none exists.
+/// Return a usable persisted installation, registering when it is missing or expired.
 pub fn register_installation(
     store: &dyn InstallationStore,
     transport: &dyn RegistrationTransport,
@@ -149,7 +149,12 @@ pub fn register_installation(
     now_unix_seconds: u64,
 ) -> Result<InstallationRecord, NativeRegistrationError> {
     if let Some(existing) = store.load()? {
-        return Ok(existing);
+        if !existing.registration_token.is_empty()
+            && !existing.device_challenge.is_empty()
+            && existing.registration_expires_at > now_unix_seconds
+        {
+            return Ok(existing);
+        }
     }
     validate_base_url(base_url)?;
 

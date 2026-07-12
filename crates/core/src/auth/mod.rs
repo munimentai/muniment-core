@@ -19,6 +19,7 @@ pub mod native_authorization;
 pub mod native_credentials_store;
 pub mod native_registration;
 pub mod native_session;
+pub mod native_sign_in;
 pub mod native_token;
 pub mod pkce;
 pub mod store;
@@ -50,6 +51,7 @@ pub use native_session::{
     NativeSessionError, NativeSessionIdentity, NativeSessionRequest, NativeSessionRole,
     SessionTransport, UreqSessionTransport,
 };
+pub use native_sign_in::{run_native_sign_in, NativeSignInError};
 pub use native_token::{
     exchange_native_code, refresh_native_credentials, NativeAuthorizationCodeTokenRequest,
     NativeCredentialStore, NativeCredentials, NativeRefreshTokenRequest, NativeTokenError,

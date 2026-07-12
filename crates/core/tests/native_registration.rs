@@ -122,10 +122,35 @@ fn sends_exact_contract_and_persists_then_reuses_installation() {
     assert!(!public_key.contains('='));
     assert_eq!(URL_SAFE_NO_PAD.decode(public_key).unwrap().len(), 32);
 
-    let reused = register_installation(&store, &transport, "not even a URL", 9_999).unwrap();
+    let reused = register_installation(&store, &transport, "not even a URL", 1_599).unwrap();
     assert_eq!(reused.device_id, first.device_id);
     assert_eq!(reused.private_key, first.private_key);
     assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn expired_installation_is_registered_again() {
+    let server = MockServer::spawn(201, SUCCESS);
+    let store = MemoryStore {
+        value: Mutex::new(Some(InstallationRecord {
+            private_key: [1; 32],
+            device_id: "10000000-0000-4000-8000-000000000001".parse().unwrap(),
+            registration_token: "old-registration".into(),
+            device_challenge: "old-challenge".into(),
+            registration_expires_at: 999,
+        })),
+        fail_save: false,
+    };
+    let replacement = register_installation(
+        &store,
+        &UreqRegistrationTransport::new(Duration::from_secs(2)),
+        &server.base_url,
+        1_000,
+    )
+    .unwrap();
+    assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+    assert_ne!(replacement.private_key, [1; 32]);
+    assert_eq!(replacement.registration_expires_at, 1_600);
 }
 
 #[test]
