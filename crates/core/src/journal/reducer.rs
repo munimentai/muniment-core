@@ -144,7 +144,7 @@ impl std::error::Error for ReduceError {}
 pub struct RunReducer {
     state: Option<RunState>,
     pending_gate: Option<PermissionGate>,
-    effect: Option<String>,
+    open_effects: Vec<String>,
 }
 
 impl Default for RunReducer {
@@ -158,7 +158,7 @@ impl RunReducer {
         Self {
             state: None,
             pending_gate: None,
-            effect: None,
+            open_effects: Vec::new(),
         }
     }
 
@@ -227,21 +227,20 @@ impl RunReducer {
             }
             "tool.effect.started" => {
                 self.require_active(event)?;
-                if self.effect.is_some() {
-                    return Err(invalid(event, "another effect has no recorded outcome"));
+                let effect_id = field(event, "effect_id")?;
+                if self.open_effects.contains(&effect_id) {
+                    return Err(invalid(event, "effect is already open"));
                 }
-                self.effect = Some(field(event, "effect_id")?);
+                self.open_effects.push(effect_id);
                 self.set_status(event, RunStatus::Active);
             }
             "tool.effect.completed" | "tool.effect.failed" => {
                 let effect_id = field(event, "effect_id")?;
-                match self.effect.take() {
-                    Some(id) if id == effect_id => self.set_status(event, RunStatus::Active),
-                    Some(id) => {
-                        self.effect = Some(id);
-                        return Err(invalid(event, "outcome does not match the started effect"));
-                    }
-                    None => return Err(invalid(event, "effect outcome has no matching start")),
+                if let Some(index) = self.open_effects.iter().position(|id| id == &effect_id) {
+                    self.open_effects.remove(index);
+                    self.set_status(event, RunStatus::Active);
+                } else {
+                    return Err(invalid(event, "effect outcome has no matching start"));
                 }
             }
             "run.completed" => self.terminal(event, RunStatus::Completed)?,
@@ -254,7 +253,7 @@ impl RunReducer {
             )?,
             "run.needs_attention" => {
                 self.pending_gate = None;
-                self.effect = None;
+                self.open_effects.clear();
                 self.set_status(
                     event,
                     RunStatus::NeedsAttention(AttentionReason::Recorded {
@@ -281,7 +280,8 @@ impl RunReducer {
                 event_type: "end-of-stream".into(),
                 detail: "empty journal".into(),
             })?;
-        if let Some(effect_id) = self.effect {
+        // Open effects retain start order; report the earliest dangling effect deterministically.
+        if let Some(effect_id) = self.open_effects.into_iter().next() {
             state.status =
                 RunStatus::NeedsAttention(AttentionReason::UnknownEffectOutcome { effect_id });
         }
@@ -305,7 +305,7 @@ impl RunReducer {
     }
     fn terminal(&mut self, event: &EventEnvelope, status: RunStatus) -> Result<(), ReduceError> {
         self.require_active(event)?;
-        if self.effect.is_some() {
+        if !self.open_effects.is_empty() {
             return Err(invalid(event, "effect outcome is unknown"));
         }
         self.set_status(event, status);

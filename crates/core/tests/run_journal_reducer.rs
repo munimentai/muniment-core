@@ -138,6 +138,107 @@ fn every_effect_crash_boundary_is_safe() {
 }
 
 #[test]
+fn concurrent_effects_can_finish_in_any_order() {
+    let events = stream(&[
+        ("run.started", json!({})),
+        ("tool.effect.started", json!({"effect_id":"A"})),
+        ("tool.effect.started", json!({"effect_id":"B"})),
+        ("tool.effect.completed", json!({"effect_id":"B"})),
+        ("tool.effect.failed", json!({"effect_id":"A"})),
+        ("run.completed", json!({})),
+    ]);
+
+    assert_eq!(reduce(&events).unwrap().status, RunStatus::Completed);
+}
+
+#[test]
+fn concurrent_effect_transitions_require_matching_open_effects() {
+    let duplicate_start = stream(&[
+        ("run.started", json!({})),
+        ("tool.effect.started", json!({"effect_id":"A"})),
+        ("tool.effect.started", json!({"effect_id":"A"})),
+    ]);
+    assert!(matches!(
+        reduce(&duplicate_start),
+        Err(ReduceError::InvalidTransition { .. })
+    ));
+
+    let unmatched_outcome = stream(&[
+        ("run.started", json!({})),
+        ("tool.effect.started", json!({"effect_id":"A"})),
+        ("tool.effect.completed", json!({"effect_id":"B"})),
+    ]);
+    assert!(matches!(
+        reduce(&unmatched_outcome),
+        Err(ReduceError::InvalidTransition { .. })
+    ));
+}
+
+#[test]
+fn terminal_events_require_all_concurrent_effects_to_close() {
+    for (terminal, expected) in [
+        ("run.completed", RunStatus::Completed),
+        ("run.cancelled", RunStatus::Cancelled),
+        ("run.failed", RunStatus::Failed { reason: None }),
+    ] {
+        let open = stream(&[
+            ("run.started", json!({})),
+            ("tool.effect.started", json!({"effect_id":"A"})),
+            ("tool.effect.started", json!({"effect_id":"B"})),
+            ("tool.effect.completed", json!({"effect_id":"B"})),
+            (terminal, json!({})),
+        ]);
+        assert!(matches!(
+            reduce(&open),
+            Err(ReduceError::InvalidTransition { .. })
+        ));
+
+        let closed = stream(&[
+            ("run.started", json!({})),
+            ("tool.effect.started", json!({"effect_id":"A"})),
+            ("tool.effect.started", json!({"effect_id":"B"})),
+            ("tool.effect.completed", json!({"effect_id":"B"})),
+            ("tool.effect.failed", json!({"effect_id":"A"})),
+            (terminal, json!({})),
+        ]);
+        assert_eq!(reduce(&closed).unwrap().status, expected);
+    }
+}
+
+#[test]
+fn dangling_concurrent_effects_report_the_earliest_start() {
+    let events = stream(&[
+        ("run.started", json!({})),
+        ("tool.effect.started", json!({"effect_id":"first"})),
+        ("tool.effect.started", json!({"effect_id":"second"})),
+    ]);
+
+    assert_eq!(
+        reduce(&events).unwrap().status,
+        RunStatus::NeedsAttention(AttentionReason::UnknownEffectOutcome {
+            effect_id: "first".into()
+        })
+    );
+}
+
+#[test]
+fn recorded_attention_clears_all_concurrent_effects() {
+    let events = stream(&[
+        ("run.started", json!({})),
+        ("tool.effect.started", json!({"effect_id":"A"})),
+        ("tool.effect.started", json!({"effect_id":"B"})),
+        ("run.needs_attention", json!({"reason":"operator review"})),
+    ]);
+
+    assert_eq!(
+        reduce(&events).unwrap().status,
+        RunStatus::NeedsAttention(AttentionReason::Recorded {
+            reason: "operator review".into()
+        })
+    );
+}
+
+#[test]
 fn ordering_terminal_and_forward_compatibility_fail_closed() {
     let mut gap = stream(&[("run.started", json!({})), ("future.harmless", json!({}))]);
     gap[1].run_seq = 3;
