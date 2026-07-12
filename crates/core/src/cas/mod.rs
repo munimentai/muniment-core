@@ -6,6 +6,7 @@
 //! atomically published into place; an existing object makes `put` a no-op.
 
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -173,6 +174,43 @@ impl LocalCas {
         }
     }
 
+    /// Lazily enumerates canonical object files, ignoring foreign entries.
+    pub fn object_hashes(&self) -> Result<ObjectHashes, CasError> {
+        Ok(ObjectHashes {
+            prefixes: fs::read_dir(self.root.join("objects"))?,
+            objects: None,
+            prefix: None,
+        })
+    }
+
+    /// Removes an object if present. Missing objects are a successful no-op.
+    pub fn remove(&self, hash: &ContentHash) -> Result<(), CasError> {
+        match fs::remove_file(self.object_path(hash)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Removes and reports every object absent from `keep`.
+    ///
+    /// The caller must serialize this operation with CAS puts and journal
+    /// appends so the keep-set remains valid for the duration of the sweep.
+    pub fn collect_unreferenced(
+        &self,
+        keep: &HashSet<ContentHash>,
+    ) -> Result<HashSet<ContentHash>, CasError> {
+        let mut removed = HashSet::new();
+        for hash in self.object_hashes()? {
+            let hash = hash?;
+            if !keep.contains(&hash) {
+                self.remove(&hash)?;
+                removed.insert(hash);
+            }
+        }
+        Ok(removed)
+    }
+
     pub fn verify(&self, hash: &ContentHash) -> Result<(), CasError> {
         let mut file = self
             .open_object(hash)?
@@ -243,5 +281,64 @@ impl LocalCas {
             }
         }
         Ok(())
+    }
+}
+
+/// Iterator over hashes stored at canonical CAS object paths.
+pub struct ObjectHashes {
+    prefixes: fs::ReadDir,
+    objects: Option<fs::ReadDir>,
+    prefix: Option<String>,
+}
+
+impl Iterator for ObjectHashes {
+    type Item = Result<ContentHash, CasError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(objects) = &mut self.objects {
+                match objects.next() {
+                    Some(Ok(entry)) => {
+                        let suffix = entry.file_name().to_string_lossy().into_owned();
+                        let value = format!("{}{}", self.prefix.as_deref().unwrap(), suffix);
+                        if entry
+                            .file_type()
+                            .map(|kind| kind.is_file())
+                            .unwrap_or(false)
+                        {
+                            if let Ok(hash) = ContentHash::from_str(&value) {
+                                return Some(Ok(hash));
+                            }
+                        }
+                        continue;
+                    }
+                    Some(Err(error)) => return Some(Err(error.into())),
+                    None => self.objects = None,
+                }
+            }
+
+            match self.prefixes.next() {
+                Some(Ok(entry)) => {
+                    let prefix = entry.file_name().to_string_lossy().into_owned();
+                    if prefix.len() != 2
+                        || !prefix
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                        || !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    match fs::read_dir(entry.path()) {
+                        Ok(objects) => {
+                            self.objects = Some(objects);
+                            self.prefix = Some(prefix);
+                        }
+                        Err(error) => return Some(Err(error.into())),
+                    }
+                }
+                Some(Err(error)) => return Some(Err(error.into())),
+                None => return None,
+            }
+        }
     }
 }

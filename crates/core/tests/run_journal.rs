@@ -1,4 +1,5 @@
 use chrono::{SecondsFormat, TimeZone, Utc};
+use muniment_core::cas::LocalCas;
 use muniment_core::journal::{
     reducer::{reduce, RunStatus},
     CasReference, Conflict, EventEnvelope, EventPayload, JournalError, Provenance, RunJournal,
@@ -284,6 +285,66 @@ fn delete_run_returns_cas_hashes_and_preserves_shared_references_and_other_runs(
         [1, 2]
     );
     assert_eq!(reduce(&untouched).unwrap().status, RunStatus::Active);
+}
+
+#[test]
+fn collection_after_run_deletion_preserves_objects_referenced_by_other_runs() {
+    const OTHER_RUN: &str = "0190a100-0000-7000-8000-000000000002";
+    let db = TestDb::new();
+    let cas_root = db.0.with_extension("cas");
+    let store = LocalCas::open(&cas_root).unwrap();
+    let shared = store.put(b"shared").unwrap();
+    let deleted_only = store.put(b"deleted only").unwrap();
+    let orphan = store.put(b"orphan").unwrap();
+    let mut journal = RunJournal::open(db.as_ref()).unwrap();
+
+    let mut first_shared = event_for(
+        RUN,
+        "0190a100-0000-7000-8000-000000000031",
+        1,
+        "future.event",
+    );
+    first_shared.payload = cas_payload(shared.as_str());
+    let mut first_only = event_for(
+        RUN,
+        "0190a100-0000-7000-8000-000000000032",
+        2,
+        "future.event",
+    );
+    first_only.payload = cas_payload(deleted_only.as_str());
+    journal
+        .append_batch(0, &[first_shared, first_only])
+        .unwrap();
+
+    let mut other_shared = event_for(
+        OTHER_RUN,
+        "0190a100-0000-7000-8000-000000000033",
+        1,
+        "future.event",
+    );
+    other_shared.payload = cas_payload(shared.as_str());
+    journal.append(0, &other_shared).unwrap();
+
+    assert_eq!(
+        store
+            .collect_unreferenced(&journal.referenced_hashes().unwrap())
+            .unwrap(),
+        HashSet::from([orphan])
+    );
+    store.verify(&shared).unwrap();
+    store.verify(&deleted_only).unwrap();
+
+    journal.delete_run(RUN).unwrap();
+    let keep = journal.referenced_hashes().unwrap();
+    assert_eq!(
+        store.collect_unreferenced(&keep).unwrap(),
+        HashSet::from([deleted_only.clone()])
+    );
+    assert!(!store.has(&deleted_only).unwrap());
+    assert!(store.has(&shared).unwrap());
+    store.verify(&shared).unwrap();
+    drop(store);
+    fs::remove_dir_all(cas_root).unwrap();
 }
 
 #[test]

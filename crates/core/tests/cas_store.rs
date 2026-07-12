@@ -1,4 +1,5 @@
 use muniment_core::cas::{CasError, ContentHash, LocalCas};
+use std::collections::HashSet;
 use std::fs::{self, FileTimes};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
@@ -160,4 +161,44 @@ fn opening_store_sweeps_only_stale_root_temp_files() {
     assert!(!stale.exists());
     assert!(fresh.exists());
     assert!(object_named_like_temp.exists());
+}
+
+#[test]
+fn enumeration_removal_and_collection_ignore_foreign_entries() {
+    let root = TestDirectory::new();
+    let store = LocalCas::open(root.as_ref()).unwrap();
+    let kept = store.put(b"kept").unwrap();
+    let removed = store.put(b"removed").unwrap();
+    let fresh_temp = root.as_ref().join(".cas-tmp-live");
+    let root_foreign = root.as_ref().join("notes.txt");
+    let objects_foreign = root.as_ref().join("objects/not-an-object");
+    let prefix_foreign = root.as_ref().join("objects/aa/not-a-hash");
+    fs::write(&fresh_temp, b"live").unwrap();
+    fs::write(&root_foreign, b"notes").unwrap();
+    fs::write(&objects_foreign, b"foreign").unwrap();
+    fs::create_dir_all(prefix_foreign.parent().unwrap()).unwrap();
+    fs::write(&prefix_foreign, b"foreign").unwrap();
+
+    let found = store
+        .object_hashes()
+        .unwrap()
+        .collect::<Result<HashSet<_>, _>>()
+        .unwrap();
+    assert_eq!(found, HashSet::from([kept.clone(), removed.clone()]));
+
+    assert_eq!(
+        store
+            .collect_unreferenced(&HashSet::from([kept.clone()]))
+            .unwrap(),
+        HashSet::from([removed.clone()])
+    );
+    assert!(store.has(&kept).unwrap());
+    store.verify(&kept).unwrap();
+    assert!(!store.has(&removed).unwrap());
+    assert_eq!(store.get(&removed).unwrap(), None);
+    store.remove(&removed).unwrap();
+    assert!(fresh_temp.exists());
+    assert!(root_foreign.exists());
+    assert!(objects_foreign.exists());
+    assert!(prefix_foreign.exists());
 }
