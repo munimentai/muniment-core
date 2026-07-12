@@ -67,7 +67,7 @@ fn store() -> MemoryStore {
 
 fn success() -> String {
     format!(
-        r#"{{"session":{{"org_id":"20000000-0000-4000-8000-000000000002","user_id":"30000000-0000-4000-8000-000000000003","role":"owner","device_id":"{DEVICE_ID}","client_role":"desktop"}},"entitlement_snapshot":{{"payload":{{"version":7,"groups":["staff"]}},"signature":"signature-secret","algorithm":"hmac-sha256"}}}}"#
+        r#"{{"session":{{"org_id":"20000000-0000-4000-8000-000000000002","user_id":"30000000-0000-4000-8000-000000000003","role":"owner","device_id":"{DEVICE_ID}","client_role":"desktop"}},"entitlement_snapshot":{{"payload":{{"version":7,"user_display_name":"Mikey","organization_display_name":"DNSFilter","groups":[{{"name":"data-team","models":["glm-5.2"],"connections":["warehouse"],"capabilities":["analysis"]}}]}},"signature":"signature-secret","algorithm":"hmac-sha256"}}}}"#
     )
 }
 
@@ -117,7 +117,11 @@ fn exact_authenticated_get_decodes_typed_contract() {
         result.session.user_id,
         Uuid::parse_str("30000000-0000-4000-8000-000000000003").unwrap()
     );
-    assert_eq!(result.entitlement_snapshot.payload["version"], 7);
+    assert_eq!(result.entitlement_snapshot.payload.snapshot_version, 7);
+    assert_eq!(
+        result.entitlement_snapshot.payload.groups[0].name,
+        "data-team"
+    );
     let request = server.request.lock().unwrap().clone().unwrap();
     assert!(request.starts_with("GET /v1/auth/native/session HTTP/1.1\r\n"));
     assert_eq!(
@@ -187,6 +191,25 @@ fn rejects_wrong_device_role_algorithm_and_schema_without_mutation() {
                 .access_token,
             "access-secret"
         );
+    }
+}
+
+#[test]
+fn rejects_malformed_required_entitlement_fields() {
+    for body in [
+        success().replace("\"version\":7", "\"version\":\"seven\""),
+        success().replace("\"models\":[\"glm-5.2\"]", "\"models\":null"),
+        success().replace("\"capabilities\":[\"analysis\"]", "\"capabilities\":[4]"),
+    ] {
+        let server = Server::spawn(200, body);
+        assert!(matches!(
+            inspect_native_session(
+                &store(),
+                &UreqSessionTransport::new(Duration::from_secs(2)),
+                &server.base_url
+            ),
+            Err(NativeSessionError::MalformedResponse(_))
+        ));
     }
 }
 
@@ -316,6 +339,24 @@ fn fresh_credentials_skip_exchange_but_still_validate_the_session() {
     );
     assert_eq!(tokens.calls.load(Ordering::SeqCst), 0);
     assert_eq!(sessions.calls.load(Ordering::SeqCst), 1);
+    let projection = result.entitlement_snapshot.unwrap();
+    assert_eq!(
+        projection.role,
+        muniment_core::auth::NativeSessionRole::Owner
+    );
+    assert_eq!(projection.groups[0].models, ["glm-5.2"]);
+    let json = serde_json::to_string(&projection).unwrap();
+    for forbidden in [
+        "signature",
+        "algorithm",
+        "access-secret",
+        "refresh-secret",
+        "challenge-secret",
+        "private_key",
+        "entitlement_snapshot",
+    ] {
+        assert!(!json.contains(forbidden), "projection leaked {forbidden}");
+    }
 }
 
 #[test]

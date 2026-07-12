@@ -48,7 +48,8 @@ pub use native_registration::{
 };
 pub use native_session::{
     ensure_fresh_native_session, inspect_native_session, native_status,
-    EntitlementSnapshotAlgorithm, FreshNativeSession, FreshNativeSessionError,
+    EntitlementSnapshotAlgorithm, EntitlementSnapshotView, FreshNativeSession,
+    FreshNativeSessionError, NativeEntitlementGroup, NativeEntitlementPayload,
     NativeEntitlementSnapshot, NativeSession, NativeSessionError, NativeSessionIdentity,
     NativeSessionRequest, NativeSessionRole, SessionTransport, UreqSessionTransport,
 };

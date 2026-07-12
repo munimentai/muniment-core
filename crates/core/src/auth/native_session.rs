@@ -3,7 +3,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::native_registration::CLIENT_ROLE;
@@ -34,12 +34,47 @@ impl fmt::Debug for NativeSessionRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NativeSessionRole {
     User,
     Admin,
     Owner,
+}
+
+/// The strictly typed, display-only portion of the signed entitlement payload.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeEntitlementPayload {
+    #[serde(rename = "version")]
+    pub snapshot_version: u64,
+    #[serde(default)]
+    pub user_display_name: Option<String>,
+    #[serde(default)]
+    pub organization_display_name: Option<String>,
+    pub groups: Vec<NativeEntitlementGroup>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeEntitlementGroup {
+    pub name: String,
+    pub models: Vec<String>,
+    pub connections: Vec<String>,
+    pub capabilities: Vec<String>,
+}
+
+/// Safe webview projection. The signed envelope and native credentials have no
+/// fields in this type and therefore cannot be serialized through it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EntitlementSnapshotView {
+    pub snapshot_version: u64,
+    pub org_id: Uuid,
+    pub user_id: Uuid,
+    pub role: NativeSessionRole,
+    pub user_display_name: Option<String>,
+    pub organization_display_name: Option<String>,
+    pub groups: Vec<NativeEntitlementGroup>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -51,7 +86,7 @@ pub enum EntitlementSnapshotAlgorithm {
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeEntitlementSnapshot {
-    pub payload: serde_json::Value,
+    pub payload: NativeEntitlementPayload,
     pub signature: String,
     pub algorithm: EntitlementSnapshotAlgorithm,
 }
@@ -102,9 +137,11 @@ pub enum NativeSessionError {
 }
 
 /// Result of validating the production native session. Credentials remain in
-/// native Rust code; Tauri commands must return only `status`.
+/// native Rust code; Tauri commands may return only the status or the safe
+/// entitlement projection.
 pub struct FreshNativeSession {
     pub status: AuthStatus,
+    pub entitlement_snapshot: Option<EntitlementSnapshotView>,
     credentials: Option<NativeCredentials>,
 }
 
@@ -122,6 +159,7 @@ impl fmt::Debug for FreshNativeSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FreshNativeSession")
             .field("status", &self.status)
+            .field("entitlement_snapshot", &self.entitlement_snapshot)
             .field(
                 "credentials",
                 &self.credentials.as_ref().map(|_| "<redacted>"),
@@ -313,8 +351,18 @@ pub fn ensure_fresh_native_session(
         subject: Some(session.session.user_id.to_string()),
         expires_at: credentials.tokens.expires_at,
     };
+    let payload = session.entitlement_snapshot.payload;
     Ok(FreshNativeSession {
         status,
+        entitlement_snapshot: Some(EntitlementSnapshotView {
+            snapshot_version: payload.snapshot_version,
+            org_id: session.session.org_id,
+            user_id: session.session.user_id,
+            role: session.session.role,
+            user_display_name: payload.user_display_name,
+            organization_display_name: payload.organization_display_name,
+            groups: payload.groups,
+        }),
         credentials: Some(credentials),
     })
 }
@@ -341,6 +389,7 @@ fn signed_out() -> FreshNativeSession {
             subject: None,
             expires_at: None,
         },
+        entitlement_snapshot: None,
         credentials: None,
     }
 }
@@ -352,7 +401,6 @@ fn validate_response(
     if response.session.device_id != expected_device_id
         || response.session.client_role != CLIENT_ROLE
         || response.entitlement_snapshot.signature.is_empty()
-        || !response.entitlement_snapshot.payload.is_object()
     {
         return Err(NativeSessionError::MalformedResponse(
             "session metadata did not match the contract".into(),
