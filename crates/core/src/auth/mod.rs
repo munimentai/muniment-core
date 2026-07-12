@@ -16,6 +16,7 @@ pub mod discovery;
 pub mod flow;
 pub mod loopback;
 pub mod native_authorization;
+pub mod native_credentials_store;
 pub mod native_registration;
 pub mod native_session;
 pub mod native_token;
@@ -35,6 +36,9 @@ pub use native_authorization::{
     NativeAuthorizationInput, NativeAuthorizationRequest, NativeAuthorizationResponse,
     NativeAuthorizationResult, NativeBrowserAuthorizationError, NativeDeviceProof,
     UreqAuthorizationTransport,
+};
+pub use native_credentials_store::{
+    CoherentNativeCredentialStore, NativeCredentialBackend, NativeCredentialKeys,
 };
 pub use native_registration::{
     register_installation, InstallationRecord, InstallationStore, NativeDeviceRegistrationRequest,
