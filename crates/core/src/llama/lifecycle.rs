@@ -15,6 +15,47 @@ use super::{
 
 const POINTER_HEADER: &str = "muniment-gemma-pointer-v1";
 
+/// The only startup detail persisted by activation. These categories are
+/// deliberately incapable of carrying paths, process output, or HTTP bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GemmaActivationFailure {
+    Start,
+    ExitedBeforeReady,
+    Readiness,
+}
+
+impl GemmaActivationFailure {
+    fn persisted(self) -> &'static str {
+        match self {
+            Self::Start => "start\n",
+            Self::ExitedBeforeReady => "exited-before-ready\n",
+            Self::Readiness => "readiness\n",
+        }
+    }
+}
+
+/// Injectable process and bounded-health boundary used by pure core.
+pub trait GemmaActivationBoundary {
+    type Server;
+
+    fn launch(&self, model: &Path) -> Result<Self::Server, GemmaActivationFailure>;
+    fn await_ready(&self, server: &mut Self::Server) -> Result<(), GemmaActivationFailure>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GemmaUnavailable {
+    CurrentInvalid,
+    PreviousInvalid,
+    RollbackActivationFailed,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum GemmaActivation<S> {
+    Active { revision: PathBuf, server: S },
+    RolledBack { revision: PathBuf, server: S },
+    Unavailable(GemmaUnavailable),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GemmaRevisionDescriptor {
     pub identity: &'static str,
@@ -237,6 +278,79 @@ impl GemmaRevisionLifecycle {
         }
     }
 
+    /// Activates the verified current revision. A failed bounded startup marks
+    /// that revision rejected, restores verified previous atomically, and
+    /// makes exactly one rollback activation attempt.
+    pub fn activate<B: GemmaLifecycleBoundary, A: GemmaActivationBoundary>(
+        &self,
+        persistence: &B,
+        activation: &A,
+    ) -> Result<GemmaActivation<A::Server>, GemmaLifecycleError> {
+        let _lock = persistence.lock_exclusive(&self.root.join("install.lock"))?;
+        let current = match self.resolve_pointer("current") {
+            Ok(pointer) => pointer,
+            Err(GemmaLifecycleError::Persistence(error)) => return Err(error.into()),
+            Err(_) => {
+                return Ok(GemmaActivation::Unavailable(
+                    GemmaUnavailable::CurrentInvalid,
+                ))
+            }
+        };
+        if self
+            .resolve_pointer("rejected")
+            .is_ok_and(|rejected| rejected.value == current.value)
+        {
+            return self.activate_previous(persistence, activation);
+        }
+        match activate_pointer(&current, activation) {
+            Ok(server) => Ok(GemmaActivation::Active {
+                revision: current.path,
+                server,
+            }),
+            Err(failure) => {
+                self.write_pointer("rejected", &current.value, persistence)?;
+                persistence.sync_directory(&self.root)?;
+                self.write_redacted_failure(failure, persistence)?;
+                self.activate_previous(persistence, activation)
+            }
+        }
+    }
+
+    fn activate_previous<B: GemmaLifecycleBoundary, A: GemmaActivationBoundary>(
+        &self,
+        persistence: &B,
+        activation: &A,
+    ) -> Result<GemmaActivation<A::Server>, GemmaLifecycleError> {
+        let previous = match self.resolve_pointer("previous") {
+            Ok(pointer) => pointer,
+            Err(GemmaLifecycleError::Persistence(error)) => return Err(error.into()),
+            Err(_) => {
+                return Ok(GemmaActivation::Unavailable(
+                    GemmaUnavailable::PreviousInvalid,
+                ))
+            }
+        };
+        self.write_pointer("current", &previous.value, persistence)?;
+        persistence.sync_directory(&self.root)?;
+        match activate_pointer(&previous, activation) {
+            Ok(server) => Ok(GemmaActivation::RolledBack {
+                revision: previous.path,
+                server,
+            }),
+            Err(_) => Ok(GemmaActivation::Unavailable(
+                GemmaUnavailable::RollbackActivationFailed,
+            )),
+        }
+    }
+
+    fn write_redacted_failure<B: GemmaLifecycleBoundary>(
+        &self,
+        failure: GemmaActivationFailure,
+        boundary: &B,
+    ) -> Result<(), GemmaLifecycleError> {
+        self.write_value("activation-failure", failure.persisted(), boundary)
+    }
+
     fn resolve_pointer(&self, name: &str) -> Result<ResolvedPointer, GemmaLifecycleError> {
         let pointer_path = self.root.join(name);
         let metadata = fs::symlink_metadata(&pointer_path).map_err(|error| match error.kind() {
@@ -271,10 +385,20 @@ impl GemmaRevisionLifecycle {
             .map_err(GemmaLifecycleError::RevisionInvalid)?;
         verify_notice(path.join(descriptor.notice.filename), descriptor.notice)
             .map_err(GemmaLifecycleError::RevisionInvalid)?;
-        Ok(ResolvedPointer { path, value })
+        let model = path.join(descriptor.model.filename);
+        Ok(ResolvedPointer { path, model, value })
     }
 
     fn write_pointer<B: GemmaLifecycleBoundary>(
+        &self,
+        name: &str,
+        value: &str,
+        boundary: &B,
+    ) -> Result<(), GemmaLifecycleError> {
+        self.write_value(name, value, boundary)
+    }
+
+    fn write_value<B: GemmaLifecycleBoundary>(
         &self,
         name: &str,
         value: &str,
@@ -306,8 +430,18 @@ impl GemmaRevisionLifecycle {
     }
 }
 
+fn activate_pointer<A: GemmaActivationBoundary>(
+    pointer: &ResolvedPointer,
+    activation: &A,
+) -> Result<A::Server, GemmaActivationFailure> {
+    let mut server = activation.launch(&pointer.model)?;
+    activation.await_ready(&mut server)?;
+    Ok(server)
+}
+
 struct ResolvedPointer {
     path: PathBuf,
+    model: PathBuf,
     value: String,
 }
 
