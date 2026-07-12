@@ -17,7 +17,14 @@ use super::TokenSet;
 const TOKEN_PATH: &str = "/v1/auth/native/token";
 
 #[derive(Clone, Serialize)]
-pub struct NativeTokenRequest {
+#[serde(untagged)]
+pub enum NativeTokenRequest {
+    AuthorizationCode(NativeAuthorizationCodeTokenRequest),
+    RefreshToken(NativeRefreshTokenRequest),
+}
+
+#[derive(Clone, Serialize)]
+pub struct NativeAuthorizationCodeTokenRequest {
     pub grant_type: String,
     pub code: String,
     pub redirect_uri: String,
@@ -27,17 +34,37 @@ pub struct NativeTokenRequest {
     pub device_proof: NativeDeviceProof,
 }
 
+#[derive(Clone, Serialize)]
+pub struct NativeRefreshTokenRequest {
+    pub grant_type: String,
+    pub refresh_token: String,
+    pub client_id: String,
+    pub device_id: Uuid,
+    pub device_proof: NativeDeviceProof,
+}
+
 impl fmt::Debug for NativeTokenRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("NativeTokenRequest")
-            .field("grant_type", &self.grant_type)
-            .field("code", &"<redacted>")
-            .field("redirect_uri", &self.redirect_uri)
-            .field("client_id", &self.client_id)
-            .field("code_verifier", &"<redacted>")
-            .field("device_id", &self.device_id)
-            .field("device_proof", &self.device_proof)
-            .finish()
+        match self {
+            Self::AuthorizationCode(request) => f
+                .debug_struct("NativeAuthorizationCodeTokenRequest")
+                .field("grant_type", &request.grant_type)
+                .field("code", &"<redacted>")
+                .field("redirect_uri", &request.redirect_uri)
+                .field("client_id", &request.client_id)
+                .field("code_verifier", &"<redacted>")
+                .field("device_id", &request.device_id)
+                .field("device_proof", &request.device_proof)
+                .finish(),
+            Self::RefreshToken(request) => f
+                .debug_struct("NativeRefreshTokenRequest")
+                .field("grant_type", &request.grant_type)
+                .field("refresh_token", &"<redacted>")
+                .field("client_id", &request.client_id)
+                .field("device_id", &request.device_id)
+                .field("device_proof", &request.device_proof)
+                .finish(),
+        }
     }
 }
 
@@ -52,6 +79,19 @@ pub struct NativeTokenResponse {
     session: NativeTokenSession,
     entitlement_snapshot: SignedEntitlementSnapshot,
     device_challenge: String,
+}
+
+impl fmt::Debug for NativeTokenResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NativeTokenResponse")
+            .field("access_token", &"<redacted>")
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field("refresh_token", &"<redacted>")
+            .field("refresh_expires_in", &self.refresh_expires_in)
+            .field("device_challenge", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Deserialize)]
@@ -123,6 +163,8 @@ pub trait TokenTransport: Send + Sync {
 pub enum NativeTokenError {
     Config(String),
     InstallationMissing,
+    CredentialsMissing,
+    RefreshExpired,
     DeviceMismatch,
     Transport(String),
     HttpStatus(u16),
@@ -135,6 +177,8 @@ impl fmt::Debug for NativeTokenError {
         match self {
             Self::Config(_) => f.write_str("Config(<redacted>)"),
             Self::InstallationMissing => f.write_str("InstallationMissing"),
+            Self::CredentialsMissing => f.write_str("CredentialsMissing"),
+            Self::RefreshExpired => f.write_str("RefreshExpired"),
             Self::DeviceMismatch => f.write_str("DeviceMismatch"),
             Self::Transport(_) => f.write_str("Transport(<redacted>)"),
             Self::HttpStatus(status) => f.debug_tuple("HttpStatus").field(status).finish(),
@@ -149,6 +193,8 @@ impl fmt::Display for NativeTokenError {
         match self {
             Self::Config(_) => write!(f, "native token configuration error"),
             Self::InstallationMissing => write!(f, "native installation is not registered"),
+            Self::CredentialsMissing => write!(f, "native session is signed out"),
+            Self::RefreshExpired => write!(f, "native refresh credential has expired"),
             Self::DeviceMismatch => write!(
                 f,
                 "native authorization device does not match the installation"
@@ -204,7 +250,7 @@ pub fn exchange_native_code(
 ) -> Result<NativeCredentials, NativeTokenError> {
     validate_base_url(base_url)?;
     validate_code(&code)?;
-    let mut installation = store
+    let installation = store
         .load_installation()
         .map_err(|_| NativeTokenError::Persistence("load failed".into()))?
         .ok_or(NativeTokenError::InstallationMissing)?;
@@ -213,28 +259,88 @@ pub fn exchange_native_code(
     }
     validate_challenge(&installation.device_challenge, None)?;
 
-    let issued_at = DateTime::<Utc>::from_timestamp(
-        i64::try_from(now_unix_seconds)
-            .map_err(|_| NativeTokenError::Config("clock is outside the supported range".into()))?,
-        0,
-    )
-    .ok_or_else(|| NativeTokenError::Config("clock is outside the supported range".into()))?
-    .to_rfc3339_opts(SecondsFormat::Secs, true);
-    let mut request = NativeTokenRequest {
+    let issued_at = issued_at(now_unix_seconds)?;
+    let unsigned = NativeAuthorizationCodeTokenRequest {
         grant_type: "authorization_code".into(),
         code: code.authorization_code,
         redirect_uri: code.redirect_uri,
         client_id: CLIENT_ID.into(),
         code_verifier: code.code_verifier,
         device_id: code.device_id,
-        device_proof: NativeDeviceProof {
-            challenge: installation.device_challenge.clone(),
-            issued_at,
-            jti: URL_SAFE_NO_PAD.encode(proof_jti),
-            signature: String::new(),
-        },
+        device_proof: make_proof(&installation, issued_at, proof_jti),
     };
-    let body = serde_json::to_value(&request)
+    let mut request = NativeTokenRequest::AuthorizationCode(unsigned);
+    sign_request(&mut request, &installation)?;
+
+    exchange_and_save(
+        store,
+        transport,
+        base_url,
+        installation,
+        request,
+        now_unix_seconds,
+    )
+}
+
+pub fn refresh_native_credentials(
+    store: &dyn NativeCredentialStore,
+    transport: &dyn TokenTransport,
+    base_url: &str,
+    now_unix_seconds: u64,
+    proof_jti: [u8; 16],
+) -> Result<NativeCredentials, NativeTokenError> {
+    validate_base_url(base_url)?;
+    let credentials = store
+        .load_credentials()
+        .map_err(|_| NativeTokenError::Persistence("load failed".into()))?
+        .ok_or(NativeTokenError::CredentialsMissing)?;
+    if now_unix_seconds >= credentials.refresh_expires_at {
+        return Err(NativeTokenError::RefreshExpired);
+    }
+    validate_challenge(&credentials.installation.device_challenge, None)?;
+    let refresh_token = credentials
+        .tokens
+        .refresh_token
+        .filter(|token| !token.is_empty())
+        .ok_or(NativeTokenError::CredentialsMissing)?;
+    let issued_at = issued_at(now_unix_seconds)?;
+    let installation = credentials.installation;
+    let mut request = NativeTokenRequest::RefreshToken(NativeRefreshTokenRequest {
+        grant_type: "refresh_token".into(),
+        refresh_token,
+        client_id: CLIENT_ID.into(),
+        device_id: installation.device_id,
+        device_proof: make_proof(&installation, issued_at, proof_jti),
+    });
+    sign_request(&mut request, &installation)?;
+    exchange_and_save(
+        store,
+        transport,
+        base_url,
+        installation,
+        request,
+        now_unix_seconds,
+    )
+}
+
+fn make_proof(
+    installation: &InstallationRecord,
+    issued_at: String,
+    proof_jti: [u8; 16],
+) -> NativeDeviceProof {
+    NativeDeviceProof {
+        challenge: installation.device_challenge.clone(),
+        issued_at,
+        jti: URL_SAFE_NO_PAD.encode(proof_jti),
+        signature: String::new(),
+    }
+}
+
+fn sign_request(
+    request: &mut NativeTokenRequest,
+    installation: &InstallationRecord,
+) -> Result<(), NativeTokenError> {
+    let body = serde_json::to_value(&*request)
         .map_err(|_| NativeTokenError::Config("request could not be encoded".into()))?;
     let unsigned = body
         .as_object()
@@ -247,16 +353,40 @@ pub fn exchange_native_code(
     let transcript = format!(
         "MUNIMENT-NATIVE-V1\nPOST\n{TOKEN_PATH}\n{}\n{}\n{}\n{}",
         hex_lower(&hash),
-        request.device_proof.challenge,
-        request.device_proof.issued_at,
-        request.device_proof.jti
+        proof(request).challenge,
+        proof(request).issued_at,
+        proof(request).jti
     );
-    request.device_proof.signature = URL_SAFE_NO_PAD.encode(
+    proof_mut(request).signature = URL_SAFE_NO_PAD.encode(
         SigningKey::from_bytes(&installation.private_key)
             .sign(transcript.as_bytes())
             .to_bytes(),
     );
+    Ok(())
+}
 
+fn proof(request: &NativeTokenRequest) -> &NativeDeviceProof {
+    match request {
+        NativeTokenRequest::AuthorizationCode(r) => &r.device_proof,
+        NativeTokenRequest::RefreshToken(r) => &r.device_proof,
+    }
+}
+
+fn proof_mut(request: &mut NativeTokenRequest) -> &mut NativeDeviceProof {
+    match request {
+        NativeTokenRequest::AuthorizationCode(r) => &mut r.device_proof,
+        NativeTokenRequest::RefreshToken(r) => &mut r.device_proof,
+    }
+}
+
+fn exchange_and_save(
+    store: &dyn NativeCredentialStore,
+    transport: &dyn TokenTransport,
+    base_url: &str,
+    mut installation: InstallationRecord,
+    request: NativeTokenRequest,
+    now_unix_seconds: u64,
+) -> Result<NativeCredentials, NativeTokenError> {
     let response = transport.exchange(
         &format!("{}{TOKEN_PATH}", base_url.trim_end_matches('/')),
         &request,
@@ -283,6 +413,16 @@ pub fn exchange_native_code(
         .save_credentials(&credentials)
         .map_err(|_| NativeTokenError::Persistence("save failed".into()))?;
     Ok(credentials)
+}
+
+fn issued_at(now_unix_seconds: u64) -> Result<String, NativeTokenError> {
+    DateTime::<Utc>::from_timestamp(
+        i64::try_from(now_unix_seconds)
+            .map_err(|_| NativeTokenError::Config("clock is outside the supported range".into()))?,
+        0,
+    )
+    .ok_or_else(|| NativeTokenError::Config("clock is outside the supported range".into()))
+    .map(|value| value.to_rfc3339_opts(SecondsFormat::Secs, true))
 }
 
 fn validate_response(
@@ -376,4 +516,42 @@ fn hex_lower(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 15) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refresh_contract_debug_redacts_request_and_response_secrets() {
+        let installation = InstallationRecord {
+            private_key: [1; 32],
+            device_id: Uuid::nil(),
+            registration_token: String::new(),
+            device_challenge: "challenge-secret".into(),
+            registration_expires_at: 0,
+        };
+        let request = NativeTokenRequest::RefreshToken(NativeRefreshTokenRequest {
+            grant_type: "refresh_token".into(),
+            refresh_token: "refresh-request-secret".into(),
+            client_id: CLIENT_ID.into(),
+            device_id: installation.device_id,
+            device_proof: make_proof(&installation, "1970-01-01T00:00:00Z".into(), [1; 16]),
+        });
+        let response: NativeTokenResponse = serde_json::from_str(
+            r#"{"access_token":"access-response-secret","token_type":"Bearer","expires_in":900,"refresh_token":"refresh-response-secret","refresh_expires_in":86400,"session":{"org_id":"20000000-0000-4000-8000-000000000002","user_id":"30000000-0000-4000-8000-000000000003","role":"user","device_id":"00000000-0000-0000-0000-000000000000","client_role":"desktop"},"entitlement_snapshot":{"payload":{"version":1},"signature":"snapshot-secret","algorithm":"hmac-sha256"},"device_challenge":"rotated-challenge-secret"}"#,
+        )
+        .unwrap();
+        let rendered = format!("{request:?} {response:?}");
+        for secret in [
+            "refresh-request-secret",
+            "challenge-secret",
+            "access-response-secret",
+            "refresh-response-secret",
+            "snapshot-secret",
+            "rotated-challenge-secret",
+        ] {
+            assert!(!rendered.contains(secret));
+        }
+    }
 }

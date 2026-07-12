@@ -41,7 +41,8 @@ pub use native_registration::{
     UreqRegistrationTransport,
 };
 pub use native_token::{
-    exchange_native_code, NativeCredentialStore, NativeCredentials, NativeTokenError,
+    exchange_native_code, refresh_native_credentials, NativeAuthorizationCodeTokenRequest,
+    NativeCredentialStore, NativeCredentials, NativeRefreshTokenRequest, NativeTokenError,
     NativeTokenRequest, NativeTokenResponse, TokenTransport, UreqTokenTransport,
 };
 pub use pkce::{random_state, PkcePair};

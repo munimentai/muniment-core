@@ -6,8 +6,8 @@ use std::time::Duration;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::{Signature, SigningKey, Verifier};
 use muniment_core::auth::{
-    exchange_native_code, InstallationRecord, NativeAuthorizationCode, NativeCredentialStore,
-    NativeCredentials, NativeTokenError, UreqTokenTransport,
+    exchange_native_code, refresh_native_credentials, InstallationRecord, NativeAuthorizationCode,
+    NativeCredentialStore, NativeCredentials, NativeTokenError, TokenSet, UreqTokenTransport,
 };
 use sha2::{Digest, Sha256};
 
@@ -120,6 +120,164 @@ fn store(fail_save: bool) -> MemoryStore {
         credentials: Mutex::new(None),
         fail_save,
     }
+}
+
+fn refresh_store(fail_save: bool) -> MemoryStore {
+    let installation = installation();
+    MemoryStore {
+        installation: Mutex::new(Some(installation.clone())),
+        credentials: Mutex::new(Some(NativeCredentials {
+            installation,
+            tokens: TokenSet {
+                access_token: "old-access-secret".into(),
+                refresh_token: Some("old-refresh-secret".into()),
+                expires_at: Some(900),
+                subject: Some("old-user".into()),
+            },
+            refresh_expires_at: 2_000,
+        })),
+        fail_save,
+    }
+}
+
+#[test]
+fn exact_refresh_is_bound_signed_and_rotated_coherently() {
+    let server = Server::spawn(200, success(&URL_SAFE_NO_PAD.encode([11; 32])));
+    let store = refresh_store(false);
+    let result = refresh_native_credentials(
+        &store,
+        &UreqTokenTransport::new(Duration::from_secs(2)),
+        &server.base_url,
+        1_000,
+        [13; 16],
+    )
+    .unwrap();
+    assert_eq!(result.tokens.access_token, "access-secret");
+    assert_eq!(
+        result.tokens.refresh_token.as_deref(),
+        Some("refresh-secret")
+    );
+    assert_eq!(result.tokens.expires_at, Some(1_900));
+    assert_eq!(result.refresh_expires_at, 87_400);
+    assert_eq!(
+        result.installation.device_challenge,
+        URL_SAFE_NO_PAD.encode([11; 32])
+    );
+
+    let (head, body) = server.request.lock().unwrap().clone().unwrap();
+    assert!(head.starts_with("POST /v1/auth/native/token HTTP/1.1"));
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json.as_object().unwrap().len(), 5);
+    assert_eq!(json["grant_type"], "refresh_token");
+    assert_eq!(json["refresh_token"], "old-refresh-secret");
+    assert_eq!(json["client_id"], "muniment-desktop");
+    assert_eq!(json["device_id"], installation().device_id.to_string());
+    let object = json.as_object().unwrap();
+    let unsigned = object
+        .iter()
+        .filter(|(k, _)| k.as_str() != "device_proof")
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    let hash = Sha256::digest(serde_json::to_vec(&unsigned).unwrap());
+    let proof = object["device_proof"].as_object().unwrap();
+    assert_eq!(proof["challenge"], installation().device_challenge);
+    let transcript = format!(
+        "MUNIMENT-NATIVE-V1\nPOST\n/v1/auth/native/token\n{}\n{}\n{}\n{}",
+        hex(&hash),
+        proof["challenge"].as_str().unwrap(),
+        proof["issued_at"].as_str().unwrap(),
+        proof["jti"].as_str().unwrap()
+    );
+    let signature = Signature::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(proof["signature"].as_str().unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    SigningKey::from_bytes(&installation().private_key)
+        .verifying_key()
+        .verify(transcript.as_bytes(), &signature)
+        .unwrap();
+}
+
+#[test]
+fn refresh_expiry_and_signed_out_state_make_no_request() {
+    let server = Server::spawn(200, success(&URL_SAFE_NO_PAD.encode([11; 32])));
+    let refresh_store = refresh_store(false);
+    assert_eq!(
+        refresh_native_credentials(
+            &refresh_store,
+            &UreqTokenTransport::new(Duration::from_secs(1)),
+            &server.base_url,
+            2_000,
+            [1; 16]
+        )
+        .unwrap_err(),
+        NativeTokenError::RefreshExpired
+    );
+    assert!(server.request.lock().unwrap().is_none());
+
+    let empty = store(false);
+    assert_eq!(
+        refresh_native_credentials(
+            &empty,
+            &UreqTokenTransport::new(Duration::from_secs(1)),
+            &server.base_url,
+            1_000,
+            [1; 16]
+        )
+        .unwrap_err(),
+        NativeTokenError::CredentialsMissing
+    );
+    assert!(server.request.lock().unwrap().is_none());
+}
+
+#[test]
+fn refresh_failures_preserve_the_complete_old_state_and_redact_secrets() {
+    for (status, body) in [
+        (400, r#"{"error_description":"response-secret"}"#.into()),
+        (200, "not-json-secret".into()),
+    ] {
+        let server = Server::spawn(status, body);
+        let store = refresh_store(false);
+        let error = refresh_native_credentials(
+            &store,
+            &UreqTokenTransport::new(Duration::from_secs(2)),
+            &server.base_url,
+            1_000,
+            [1; 16],
+        )
+        .unwrap_err();
+        let saved = store.load_credentials().unwrap().unwrap();
+        assert_eq!(
+            saved.tokens.refresh_token.as_deref(),
+            Some("old-refresh-secret")
+        );
+        assert_eq!(
+            saved.installation.device_challenge,
+            installation().device_challenge
+        );
+        assert!(!format!("{error:?} {error}").contains("secret"));
+    }
+    let server = Server::spawn(200, success(&URL_SAFE_NO_PAD.encode([11; 32])));
+    let store = refresh_store(true);
+    let error = refresh_native_credentials(
+        &store,
+        &UreqTokenTransport::new(Duration::from_secs(2)),
+        &server.base_url,
+        1_000,
+        [1; 16],
+    )
+    .unwrap_err();
+    let saved = store.load_credentials().unwrap().unwrap();
+    assert_eq!(saved.tokens.access_token, "old-access-secret");
+    assert_eq!(
+        saved.tokens.refresh_token.as_deref(),
+        Some("old-refresh-secret")
+    );
+    let rendered = format!("{error:?} {error} {:?}", saved);
+    assert!(!rendered.contains("old-access-secret"));
+    assert!(!rendered.contains("old-refresh-secret"));
 }
 
 #[test]
