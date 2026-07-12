@@ -110,6 +110,50 @@ pub fn cancel_command() -> Value {
     json!({"type": "abort"})
 }
 
+const EMPTY_QUEUE_MESSAGE: &str = "Pi queued message must not be empty";
+const QUEUE_COMMAND_FAILED: &str = "Pi queue command failed";
+
+macro_rules! queue_command {
+    ($name:ident, $kind:literal) => {
+        #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+        pub struct $name<'a> {
+            #[serde(rename = "type")]
+            kind: &'static str,
+            message: &'a str,
+        }
+
+        impl<'a> $name<'a> {
+            pub fn new(message: &'a str) -> Result<Self, &'static str> {
+                if message.trim().is_empty() {
+                    return Err(EMPTY_QUEUE_MESSAGE);
+                }
+                Ok(Self {
+                    kind: $kind,
+                    message,
+                })
+            }
+
+            pub fn into_value(self) -> Value {
+                serde_json::to_value(self).expect("Pi queue command is JSON serializable")
+            }
+        }
+    };
+}
+
+queue_command!(SteerCommand, "steer");
+queue_command!(FollowUpCommand, "follow_up");
+
+fn require_queue_ack(response: &Value, command: &str) -> Result<(), String> {
+    if response.get("type").and_then(Value::as_str) == Some("response")
+        && response.get("command").and_then(Value::as_str) == Some(command)
+        && response.get("success").and_then(Value::as_bool) == Some(true)
+    {
+        Ok(())
+    } else {
+        Err(QUEUE_COMMAND_FAILED.into())
+    }
+}
+
 /// Binds Pi's single active stream to a locally-owned run. Construct this
 /// before sending the prompt so no post-ack frame can be lost.
 pub struct PiRunAdapter {
@@ -143,6 +187,35 @@ impl PiRunAdapter {
         &self.run_id
     }
 
+    /// Queues a message for delivery during the active turn. Success only
+    /// confirms that Pi queued it; stream completion continues through `next`.
+    pub fn steer(
+        &self,
+        transport: &PiRpcTransport,
+        message: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let command = SteerCommand::new(message).map_err(str::to_owned)?;
+        let response = transport
+            .call(command.into_value(), timeout)
+            .map_err(|_| QUEUE_COMMAND_FAILED.to_string())?;
+        require_queue_ack(&response, "steer")
+    }
+
+    /// Queues a message for delivery after the active turn finishes.
+    pub fn follow_up(
+        &self,
+        transport: &PiRpcTransport,
+        message: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let command = FollowUpCommand::new(message).map_err(str::to_owned)?;
+        let response = transport
+            .call(command.into_value(), timeout)
+            .map_err(|_| QUEUE_COMMAND_FAILED.to_string())?;
+        require_queue_ack(&response, "follow_up")
+    }
+
     pub fn next(&self, timeout: Duration) -> Result<PiChatEvent, String> {
         let frame = self
             .frames
@@ -172,5 +245,25 @@ mod tests {
             adapter.next(Duration::from_millis(1)).unwrap_err(),
             "Pi process stream ended"
         );
+    }
+
+    #[test]
+    fn queue_acknowledgements_are_exact_and_non_sensitive() {
+        assert!(require_queue_ack(
+            &json!({"type":"response", "command":"steer", "success":true}),
+            "steer"
+        )
+        .is_ok());
+        for response in [
+            json!({"type":"response", "command":"follow_up", "success":true}),
+            json!({"type":"response", "command":"steer", "success":false, "message":"secret"}),
+            json!({"type":"agent_end"}),
+            json!({"command":"steer", "success":true}),
+        ] {
+            assert_eq!(
+                require_queue_ack(&response, "steer").unwrap_err(),
+                QUEUE_COMMAND_FAILED
+            );
+        }
     }
 }

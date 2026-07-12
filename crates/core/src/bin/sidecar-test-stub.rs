@@ -14,6 +14,7 @@ fn main() {
         Some("echo") => echo(),
         Some("json-rpc") => json_rpc(args.next()),
         Some("pi-rpc-interleaved") => pi_rpc_interleaved(),
+        Some("pi-chat-queue") => pi_chat_queue(),
         Some("pi-rpc-restart-once") => {
             let marker = args.next().unwrap();
             if fs::create_dir(marker).is_ok() {
@@ -115,6 +116,38 @@ fn main() {
             }
         }
         _ => std::process::exit(2),
+    }
+}
+
+fn pi_chat_queue() {
+    for line in io::stdin().lock().lines() {
+        let request: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+        let command = request["type"].as_str().unwrap();
+        if matches!(command, "steer" | "follow_up") {
+            println!("{}", serde_json::json!({"type":"tool_execution_start"}));
+        }
+        let response_command = if request["message"] == "mismatch" {
+            "other"
+        } else {
+            command
+        };
+        let success = request["message"] != "failed";
+        println!(
+            "{}",
+            serde_json::json!({
+                "type":"response", "command":response_command, "success":success,
+                "message":"private upstream detail", "id":request["id"]
+            })
+        );
+        if matches!(command, "steer" | "follow_up") {
+            println!(
+                "{}",
+                serde_json::json!({"type":"message_update", "assistantMessageEvent":{
+                    "type":"text_delta", "delta":"still streaming"
+                }})
+            );
+        }
+        io::stdout().flush().unwrap();
     }
 }
 
