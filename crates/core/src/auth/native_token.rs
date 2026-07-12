@@ -149,6 +149,7 @@ pub trait NativeCredentialStore: Send + Sync {
     fn load_installation(&self) -> Result<Option<InstallationRecord>, NativeTokenError>;
     fn save_credentials(&self, credentials: &NativeCredentials) -> Result<(), NativeTokenError>;
     fn load_credentials(&self) -> Result<Option<NativeCredentials>, NativeTokenError>;
+    fn clear_session(&self) -> Result<(), NativeTokenError>;
 }
 
 pub trait TokenTransport: Send + Sync {

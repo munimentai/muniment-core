@@ -135,6 +135,21 @@ impl<B: NativeCredentialBackend> NativeCredentialStore for CoherentNativeCredent
             })
             .map_err(NativeTokenError::Persistence)
     }
+
+    fn clear_session(&self) -> Result<(), NativeTokenError> {
+        let Some(record) = self.load_record().map_err(NativeTokenError::Persistence)? else {
+            return Ok(());
+        };
+        if record.session.is_none() {
+            return Ok(());
+        }
+        self.save_record(&NativeCredentialRecord {
+            version: RECORD_VERSION,
+            installation: record.installation,
+            session: None,
+        })
+        .map_err(NativeTokenError::Persistence)
+    }
 }
 
 #[cfg(test)]
@@ -239,6 +254,89 @@ mod tests {
         assert_eq!(loaded.installation.device_challenge, "rotated-challenge");
         assert_eq!(loaded.tokens.access_token, "access-secret");
         assert_eq!(loaded.refresh_expires_at, 9_000);
+    }
+
+    #[test]
+    fn clear_session_preserves_installation_and_unrelated_oidc_value() {
+        let backend = MemoryBackend::default();
+        backend
+            .values
+            .lock()
+            .unwrap()
+            .insert(OIDC_KEY.into(), serde_json::to_string(&tokens()).unwrap());
+        let store = CoherentNativeCredentialStore::new(backend.clone(), KEYS);
+        store
+            .save_credentials(&NativeCredentials {
+                installation: installation("rotated-challenge"),
+                tokens: tokens(),
+                refresh_expires_at: 9_000,
+            })
+            .unwrap();
+
+        store.clear_session().unwrap();
+
+        assert!(store.load_credentials().unwrap().is_none());
+        assert_eq!(
+            store.load_installation().unwrap().unwrap().device_challenge,
+            "rotated-challenge"
+        );
+        let values = backend.values.lock().unwrap();
+        assert!(values[KEYS.record].contains("\"session\":null"));
+        assert!(!values[KEYS.record].contains("access-secret"));
+        assert!(!values[KEYS.record].contains("refresh-secret"));
+        assert!(!values[KEYS.record].contains("9000"));
+        assert!(values.contains_key(OIDC_KEY));
+    }
+
+    #[test]
+    fn clear_session_is_idempotent_for_installation_only_and_missing_records() {
+        let backend = MemoryBackend::default();
+        let store = CoherentNativeCredentialStore::new(backend.clone(), KEYS);
+        store.clear_session().unwrap();
+        store.save(&installation("challenge")).unwrap();
+        let writes = backend.writes.lock().unwrap().len();
+
+        store.clear_session().unwrap();
+        store.clear_session().unwrap();
+
+        assert_eq!(backend.writes.lock().unwrap().len(), writes);
+        assert_eq!(
+            store.load_installation().unwrap().unwrap().device_challenge,
+            "challenge"
+        );
+    }
+
+    #[test]
+    fn failed_session_clear_keeps_credentials_and_returns_redacted_error() {
+        let backend = MemoryBackend::default();
+        let store = CoherentNativeCredentialStore::new(backend.clone(), KEYS);
+        store
+            .save_credentials(&NativeCredentials {
+                installation: installation("challenge"),
+                tokens: tokens(),
+                refresh_expires_at: 9_000,
+            })
+            .unwrap();
+        let failing_store = CoherentNativeCredentialStore::new(
+            MemoryBackend {
+                fail_writes: true,
+                ..backend.clone()
+            },
+            KEYS,
+        );
+
+        let error = failing_store.clear_session().unwrap_err();
+
+        assert_eq!(error.to_string(), "native credential persistence failed");
+        assert_eq!(
+            store
+                .load_credentials()
+                .unwrap()
+                .unwrap()
+                .tokens
+                .access_token,
+            "access-secret"
+        );
     }
 
     #[test]

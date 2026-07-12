@@ -40,6 +40,10 @@ impl NativeCredentialStore for MemoryStore {
     ) -> Result<Option<NativeCredentials>, muniment_core::auth::NativeTokenError> {
         Ok(self.0.lock().unwrap().clone())
     }
+    fn clear_session(&self) -> Result<(), muniment_core::auth::NativeTokenError> {
+        *self.0.lock().unwrap() = None;
+        Ok(())
+    }
 }
 
 fn store() -> MemoryStore {

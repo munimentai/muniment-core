@@ -48,6 +48,11 @@ impl NativeCredentialStore for Store {
     fn load_credentials(&self) -> Result<Option<NativeCredentials>, NativeTokenError> {
         Ok(self.credentials.lock().unwrap().clone())
     }
+
+    fn clear_session(&self) -> Result<(), NativeTokenError> {
+        *self.credentials.lock().unwrap() = None;
+        Ok(())
+    }
 }
 
 struct Registration(Arc<AtomicUsize>);
