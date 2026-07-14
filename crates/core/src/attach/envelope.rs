@@ -203,6 +203,7 @@ pub enum ErrorCode {
     IdempotencyKeyForbidden,
     IdempotencyConflict,
     PersistenceFailed,
+    InvalidCursor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,6 +370,8 @@ pub enum ErrorMessage {
     IdempotencyConflict,
     #[serde(rename = "The request could not be committed.")]
     PersistenceFailed,
+    #[serde(rename = "The stream cursor is invalid.")]
+    InvalidCursor,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -428,6 +431,10 @@ impl ProtocolError {
         error
     }
 
+    pub fn invalid_cursor() -> Self {
+        Self::simple(ErrorCode::InvalidCursor, ErrorMessage::InvalidCursor)
+    }
+
     fn simple(code: ErrorCode, message: ErrorMessage) -> Self {
         Self {
             code,
@@ -480,6 +487,7 @@ impl<'de> Deserialize<'de> for ProtocolError {
             (ErrorCode::IdempotencyKeyForbidden, None, None) => Self::idempotency_key_forbidden(),
             (ErrorCode::IdempotencyConflict, None, None) => Self::idempotency_conflict(),
             (ErrorCode::PersistenceFailed, None, None) => Self::persistence_failed(),
+            (ErrorCode::InvalidCursor, None, None) => Self::invalid_cursor(),
             _ => return Err(de::Error::custom("invalid error schema")),
         };
         if wire.message != expected.message || wire.retryable != expected.retryable {
