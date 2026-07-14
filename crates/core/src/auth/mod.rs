@@ -17,6 +17,7 @@ pub mod flow;
 pub mod loopback;
 pub mod native_authorization;
 pub mod native_credentials_store;
+pub mod native_devices;
 pub mod native_registration;
 pub mod native_revocation;
 pub mod native_session;
@@ -41,6 +42,11 @@ pub use native_authorization::{
 };
 pub use native_credentials_store::{
     CoherentNativeCredentialStore, NativeCredentialBackend, NativeCredentialKeys,
+};
+pub use native_devices::{
+    list_native_devices, NativeDevice, NativeDeviceList, NativeDeviceListError,
+    NativeDeviceListRequest, NativeDeviceListTransport, NativeDevicePlatform,
+    UreqNativeDeviceListTransport,
 };
 pub use native_registration::{
     register_installation, InstallationRecord, InstallationStore, NativeDeviceRegistrationRequest,
