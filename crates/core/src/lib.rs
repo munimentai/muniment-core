@@ -5,6 +5,7 @@
 //! sidecar process manager and its RPC transport build on these pieces.
 
 pub mod asr;
+pub mod attach;
 pub mod auth;
 pub mod cas;
 pub mod journal;
