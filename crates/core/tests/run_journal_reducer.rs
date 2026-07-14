@@ -1,6 +1,6 @@
 use muniment_core::journal::reducer::{
-    project_chat, reduce, AttentionReason, ReduceError, RunReducer, RunStatus, ToolActivity,
-    ToolActivityStatus,
+    project_chat, reduce, AttentionReason, ChatProjector, ReduceError, RunReducer, RunStatus,
+    ToolActivity, ToolActivityStatus,
 };
 use muniment_core::journal::{EventEnvelope, EventPayload, Provenance};
 use serde_json::{json, Value};
@@ -302,6 +302,53 @@ fn incremental_and_full_replay_are_identical() {
         incremental.apply(event).unwrap();
     }
     assert_eq!(incremental.finish().unwrap(), full);
+}
+
+#[test]
+fn incremental_chat_projection_matches_full_replay_after_every_prefix() {
+    let events = stream(&[
+        ("run.started", json!({})),
+        ("model.prompt.accepted", json!({})),
+        ("model.stream.delta", json!({"text":"hel"})),
+        (
+            "tool.effect.started",
+            json!({"effect_id":"search-1", "display_name":"Search"}),
+        ),
+        ("model.stream.delta", json!({"text":"lo"})),
+        ("tool.effect.completed", json!({"effect_id":"search-1"})),
+        ("tool.effect.started", json!({"effect_id":"write-1"})),
+        ("tool.effect.failed", json!({"effect_id":"write-1"})),
+        (
+            "run.completed",
+            json!({"receipt":{"route":"litellm", "cost":"$0.01"}}),
+        ),
+    ]);
+    let mut projector = ChatProjector::new();
+
+    for (index, event) in events.iter().enumerate() {
+        projector.apply(event).unwrap();
+        assert_eq!(
+            projector.projection().unwrap(),
+            project_chat(&events[..=index]).unwrap(),
+            "projection differed after event {}",
+            index + 1
+        );
+    }
+
+    for terminal in [
+        ("run.cancelled", json!({})),
+        ("run.failed", json!({"reason":"runtime"})),
+    ] {
+        let events = stream(&[("run.started", json!({})), terminal]);
+        let mut projector = ChatProjector::new();
+        for (index, event) in events.iter().enumerate() {
+            projector.apply(event).unwrap();
+            assert_eq!(
+                projector.projection().unwrap(),
+                project_chat(&events[..=index]).unwrap()
+            );
+        }
+    }
 }
 
 #[test]

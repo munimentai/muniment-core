@@ -33,8 +33,7 @@ pub struct RunState {
     pub status: RunStatus,
 }
 
-/// The webview-facing chat projection. It is always rebuilt from journal
-/// events, so reopening a thread never repeats a gateway request.
+/// The webview-facing chat projection derived from journal events.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ChatProjection {
     pub prompt_accepted: bool,
@@ -59,19 +58,38 @@ pub enum ToolActivityStatus {
 }
 
 pub fn project_chat(events: &[EventEnvelope]) -> Result<ChatProjection, ReduceError> {
-    let mut chat = ChatProjection::default();
+    let mut projector = ChatProjector::new();
     for event in events {
+        projector.apply(event)?;
+    }
+    projector.projection()
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ChatProjector {
+    chat: ChatProjection,
+    reducer: RunReducer,
+}
+
+impl ChatProjector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn apply(&mut self, event: &EventEnvelope) -> Result<(), ReduceError> {
+        self.reducer.apply(event)?;
         match event.event_type.as_str() {
-            "model.prompt.accepted" => chat.prompt_accepted = true,
-            "model.stream.delta" => chat.text.push_str(&field(event, "text")?),
-            "tool.effect.started" => chat.tool_activity.push(ToolActivity {
+            "model.prompt.accepted" => self.chat.prompt_accepted = true,
+            "model.stream.delta" => self.chat.text.push_str(&field(event, "text")?),
+            "tool.effect.started" => self.chat.tool_activity.push(ToolActivity {
                 effect_id: field(event, "effect_id")?,
                 display_name: optional_field(event, "display_name")?,
                 status: ToolActivityStatus::Running,
             }),
             "tool.effect.completed" | "tool.effect.failed" => {
                 let effect_id = field(event, "effect_id")?;
-                if let Some(activity) = chat
+                if let Some(activity) = self
+                    .chat
                     .tool_activity
                     .iter_mut()
                     .rev()
@@ -85,13 +103,18 @@ pub fn project_chat(events: &[EventEnvelope]) -> Result<ChatProjection, ReduceEr
                 }
             }
             "run.completed" => {
-                chat.receipt = payload(event)?.get("receipt").cloned();
+                self.chat.receipt = payload(event)?.get("receipt").cloned();
             }
             _ => {}
         }
+        Ok(())
     }
-    chat.status = Some(reduce(events)?.status);
-    Ok(chat)
+
+    pub fn projection(&self) -> Result<ChatProjection, ReduceError> {
+        let mut chat = self.chat.clone();
+        chat.status = Some(self.reducer.clone().finish()?.status);
+        Ok(chat)
+    }
 }
 
 impl RunState {
