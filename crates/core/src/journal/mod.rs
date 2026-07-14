@@ -1,6 +1,7 @@
 //! Durable, append-only per-run event journal.
 
 pub mod reducer;
+pub mod retention;
 
 use crate::cas::ContentHash;
 use chrono::{DateTime, SecondsFormat, Utc};
