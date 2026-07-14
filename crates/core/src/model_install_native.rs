@@ -10,6 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::asr::acquisition::{AsrAcquisitionClock, AsrCancellation, AsrRetryWait};
+use crate::asr::{AsrLifecycleBoundary, AsrPersistenceError};
 use crate::llama::acquisition::{GemmaAcquisitionClock, GemmaCancellation, GemmaRetryWait};
 use crate::llama::lifecycle::{GemmaLifecycleBoundary, GemmaPersistenceError};
 use crate::model_install::{
@@ -223,6 +224,34 @@ impl GemmaLifecycleBoundary for NativeGemmaLifecycleBoundary {
         destination: &Path,
     ) -> Result<(), GemmaPersistenceError> {
         fs::rename(temporary, destination).map_err(|_| GemmaPersistenceError::Failed)
+    }
+}
+
+/// Native durable filesystem operations for Parakeet publication.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NativeAsrLifecycleBoundary;
+impl AsrLifecycleBoundary for NativeAsrLifecycleBoundary {
+    fn sync_file(&self, path: &Path) -> Result<(), AsrPersistenceError> {
+        File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| AsrPersistenceError::Failed)
+    }
+
+    fn sync_directory(&self, path: &Path) -> Result<(), AsrPersistenceError> {
+        #[cfg(unix)]
+        File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| AsrPersistenceError::Failed)?;
+        let _ = path;
+        Ok(())
+    }
+
+    fn replace_pointer(
+        &self,
+        temporary: &Path,
+        destination: &Path,
+    ) -> Result<(), AsrPersistenceError> {
+        fs::rename(temporary, destination).map_err(|_| AsrPersistenceError::Failed)
     }
 }
 
