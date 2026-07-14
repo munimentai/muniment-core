@@ -18,6 +18,7 @@ pub mod loopback;
 pub mod native_authorization;
 pub mod native_credentials_store;
 pub mod native_registration;
+pub mod native_revocation;
 pub mod native_session;
 pub mod native_sign_in;
 pub mod native_token;
@@ -45,6 +46,11 @@ pub use native_registration::{
     register_installation, InstallationRecord, InstallationStore, NativeDeviceRegistrationRequest,
     NativeDeviceRegistrationResponse, NativeRegistrationError, RegistrationTransport,
     UreqRegistrationTransport,
+};
+pub use native_revocation::{
+    revoke_current_native_session, sign_out_native_session, NativeRevocationError,
+    NativeRevocationRequest, NativeRevocationResponse, RevocationTransport,
+    UreqRevocationTransport,
 };
 pub use native_session::{
     ensure_fresh_native_session, inspect_native_session, native_status,
