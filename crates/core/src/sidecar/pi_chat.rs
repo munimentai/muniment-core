@@ -75,11 +75,95 @@ pub enum PiChatEvent {
         tool_call_id: String,
         failed: bool,
     },
+    ExtensionUiRequest(ExtensionUiRequest),
     Completed,
     Cancelled,
     Failed,
     /// A valid Pi event for another part of the agent lifecycle.
     Interleaved,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtensionUiRequest {
+    pub id: String,
+    pub dialog: ExtensionUiDialog,
+    pub timeout: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExtensionUiDialog {
+    Select {
+        title: String,
+        options: Vec<String>,
+    },
+    Confirm {
+        title: String,
+        message: String,
+    },
+    Input {
+        title: String,
+        placeholder: Option<String>,
+    },
+    Editor {
+        title: String,
+        prefill: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExtensionUiAnswer {
+    Selection(String),
+    Confirmation(bool),
+    Input(String),
+    Editor(String),
+    Cancelled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtensionUiResponse {
+    id: String,
+    answer: ExtensionUiAnswer,
+}
+
+impl ExtensionUiResponse {
+    pub fn new(
+        request: &ExtensionUiRequest,
+        answer: ExtensionUiAnswer,
+    ) -> Result<Self, &'static str> {
+        let matches = match (&request.dialog, &answer) {
+            (_, ExtensionUiAnswer::Cancelled) => true,
+            (ExtensionUiDialog::Select { options, .. }, ExtensionUiAnswer::Selection(value)) => {
+                options.contains(value)
+            }
+            (ExtensionUiDialog::Confirm { .. }, ExtensionUiAnswer::Confirmation(_)) => true,
+            (ExtensionUiDialog::Input { .. }, ExtensionUiAnswer::Input(_)) => true,
+            (ExtensionUiDialog::Editor { .. }, ExtensionUiAnswer::Editor(_)) => true,
+            _ => false,
+        };
+        if !matches {
+            return Err("answer kind does not match extension UI request");
+        }
+        Ok(Self {
+            id: request.id.clone(),
+            answer,
+        })
+    }
+
+    pub fn into_value(self) -> Value {
+        match self.answer {
+            ExtensionUiAnswer::Selection(value)
+            | ExtensionUiAnswer::Input(value)
+            | ExtensionUiAnswer::Editor(value) => {
+                json!({"type": "extension_ui_response", "id": self.id, "value": value})
+            }
+            ExtensionUiAnswer::Confirmation(confirmed) => {
+                json!({"type": "extension_ui_response", "id": self.id, "confirmed": confirmed})
+            }
+            ExtensionUiAnswer::Cancelled => {
+                json!({"type": "extension_ui_response", "id": self.id, "cancelled": true})
+            }
+        }
+    }
 }
 
 /// Parse only the documented fields needed by the UI. Error details and raw
@@ -142,6 +226,7 @@ pub fn parse_frame(frame: &Value) -> Result<PiChatEvent, &'static str> {
                 failed: event.is_error,
             })
         }
+        Some("extension_ui_request") => parse_extension_ui_request(frame),
         // Pi owns generation, not billing/routing provenance. Any similarly
         // named member is deliberately ignored; the control plane supplies it.
         Some("agent_end") => Ok(PiChatEvent::Completed),
@@ -149,6 +234,88 @@ pub fn parse_frame(frame: &Value) -> Result<PiChatEvent, &'static str> {
         Some("error") => Ok(PiChatEvent::Failed),
         Some(_) => Ok(PiChatEvent::Interleaved),
         None => Err("Pi frame is missing type"),
+    }
+}
+
+fn parse_extension_ui_request(frame: &Value) -> Result<PiChatEvent, &'static str> {
+    let Some(method) = frame.get("method").and_then(Value::as_str) else {
+        return Ok(PiChatEvent::Interleaved);
+    };
+    if !matches!(method, "select" | "confirm" | "input" | "editor") {
+        return Ok(PiChatEvent::Interleaved);
+    }
+    let id = frame
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or("blocking extension UI request is missing id")?;
+    let title = frame
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|title| !title.trim().is_empty())
+        .ok_or("blocking extension UI request is missing title")?;
+    let timeout = match frame.get("timeout") {
+        Some(value) => Some(
+            value
+                .as_u64()
+                .ok_or("blocking extension UI request has invalid timeout")?,
+        ),
+        None => None,
+    };
+
+    let dialog = match method {
+        "select" => {
+            let options = frame
+                .get("options")
+                .and_then(Value::as_array)
+                .filter(|options| !options.is_empty())
+                .ok_or("select extension UI request has invalid options")?
+                .iter()
+                .map(|option| {
+                    option
+                        .as_str()
+                        .filter(|option| !option.is_empty())
+                        .map(str::to_owned)
+                        .ok_or("select extension UI request has invalid options")
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            ExtensionUiDialog::Select {
+                title: title.into(),
+                options,
+            }
+        }
+        "confirm" => ExtensionUiDialog::Confirm {
+            title: title.into(),
+            message: frame
+                .get("message")
+                .and_then(Value::as_str)
+                .ok_or("confirm extension UI request is missing message")?
+                .into(),
+        },
+        "input" => ExtensionUiDialog::Input {
+            title: title.into(),
+            placeholder: optional_string(frame, "placeholder")?,
+        },
+        "editor" => ExtensionUiDialog::Editor {
+            title: title.into(),
+            prefill: optional_string(frame, "prefill")?,
+        },
+        _ => unreachable!(),
+    };
+    Ok(PiChatEvent::ExtensionUiRequest(ExtensionUiRequest {
+        id: id.into(),
+        dialog,
+        timeout,
+    }))
+}
+
+fn optional_string(frame: &Value, field: &str) -> Result<Option<String>, &'static str> {
+    match frame.get(field) {
+        Some(value) => value
+            .as_str()
+            .map(|value| Some(value.to_owned()))
+            .ok_or("blocking extension UI request has invalid optional field"),
+        None => Ok(None),
     }
 }
 

@@ -1,6 +1,160 @@
 use muniment_core::sidecar::pi_chat::{
-    parse_frame, FollowUpCommand, PiChatEvent, PiRunAdapter, PromptCommand, SteerCommand,
+    parse_frame, ExtensionUiAnswer, ExtensionUiDialog, ExtensionUiRequest, ExtensionUiResponse,
+    FollowUpCommand, PiChatEvent, PiRunAdapter, PromptCommand, SteerCommand,
 };
+
+fn extension_request(frame: serde_json::Value) -> ExtensionUiRequest {
+    let PiChatEvent::ExtensionUiRequest(request) = parse_frame(&frame).unwrap() else {
+        panic!("expected extension UI request")
+    };
+    request
+}
+
+#[test]
+fn blocking_extension_ui_dialogs_are_typed() {
+    assert_eq!(
+        extension_request(json!({
+            "type":"extension_ui_request", "id":"select-1", "method":"select",
+            "title":"Allow command?", "options":["Allow", "Block"], "timeout":10000
+        })),
+        ExtensionUiRequest {
+            id: "select-1".into(),
+            dialog: ExtensionUiDialog::Select {
+                title: "Allow command?".into(),
+                options: vec!["Allow".into(), "Block".into()]
+            },
+            timeout: Some(10000)
+        }
+    );
+    assert_eq!(
+        extension_request(json!({
+            "type":"extension_ui_request", "id":"confirm-1", "method":"confirm",
+            "title":"Clear session?", "message":"All messages will be lost."
+        }))
+        .dialog,
+        ExtensionUiDialog::Confirm {
+            title: "Clear session?".into(),
+            message: "All messages will be lost.".into()
+        }
+    );
+    assert_eq!(
+        extension_request(json!({
+            "type":"extension_ui_request", "id":"input-1", "method":"input",
+            "title":"Enter a value", "placeholder":"type something..."
+        }))
+        .dialog,
+        ExtensionUiDialog::Input {
+            title: "Enter a value".into(),
+            placeholder: Some("type something...".into())
+        }
+    );
+    assert_eq!(
+        extension_request(json!({
+            "type":"extension_ui_request", "id":"editor-1", "method":"editor",
+            "title":"Edit text", "prefill":"Line 1\nLine 2"
+        }))
+        .dialog,
+        ExtensionUiDialog::Editor {
+            title: "Edit text".into(),
+            prefill: Some("Line 1\nLine 2".into())
+        }
+    );
+}
+
+#[test]
+fn malformed_dialogs_never_create_answerable_events() {
+    for frame in [
+        json!({"type":"extension_ui_request", "method":"select", "title":"Choose", "options":["A"]}),
+        json!({"type":"extension_ui_request", "id":"", "method":"confirm", "title":"Sure?", "message":"Really?"}),
+        json!({"type":"extension_ui_request", "id":"1", "method":"select", "title":"Choose", "options":[]}),
+        json!({"type":"extension_ui_request", "id":"1", "method":"select", "title":"Choose", "options":[1]}),
+        json!({"type":"extension_ui_request", "id":"1", "method":"confirm", "title":"Sure?"}),
+        json!({"type":"extension_ui_request", "id":"1", "method":"input", "title":"Value", "placeholder":false}),
+        json!({"type":"extension_ui_request", "id":"1", "method":"editor", "title":"Edit", "timeout":-1}),
+    ] {
+        assert!(!matches!(
+            parse_frame(&frame),
+            Ok(PiChatEvent::ExtensionUiRequest(_))
+        ));
+    }
+
+    for method in [
+        "notify",
+        "setStatus",
+        "setWidget",
+        "setTitle",
+        "set_editor_text",
+    ] {
+        assert_eq!(
+            parse_frame(&json!({"type":"extension_ui_request", "id":"ff-1", "method":method}))
+                .unwrap(),
+            PiChatEvent::Interleaved
+        );
+    }
+}
+
+#[test]
+fn extension_ui_responses_are_correlated_and_typed() {
+    let cases = [
+        (
+            extension_request(
+                json!({"type":"extension_ui_request", "id":"s", "method":"select", "title":"Pick", "options":["A"]}),
+            ),
+            ExtensionUiAnswer::Selection("A".into()),
+            json!({"type":"extension_ui_response", "id":"s", "value":"A"}),
+        ),
+        (
+            extension_request(
+                json!({"type":"extension_ui_request", "id":"c", "method":"confirm", "title":"Sure?", "message":"Really?"}),
+            ),
+            ExtensionUiAnswer::Confirmation(false),
+            json!({"type":"extension_ui_response", "id":"c", "confirmed":false}),
+        ),
+        (
+            extension_request(
+                json!({"type":"extension_ui_request", "id":"i", "method":"input", "title":"Value"}),
+            ),
+            ExtensionUiAnswer::Input("answer".into()),
+            json!({"type":"extension_ui_response", "id":"i", "value":"answer"}),
+        ),
+        (
+            extension_request(
+                json!({"type":"extension_ui_request", "id":"e", "method":"editor", "title":"Edit"}),
+            ),
+            ExtensionUiAnswer::Editor("lines".into()),
+            json!({"type":"extension_ui_response", "id":"e", "value":"lines"}),
+        ),
+    ];
+    for (request, answer, expected) in cases {
+        assert_eq!(
+            ExtensionUiResponse::new(&request, answer)
+                .unwrap()
+                .into_value(),
+            expected
+        );
+        assert_eq!(
+            ExtensionUiResponse::new(&request, ExtensionUiAnswer::Cancelled)
+                .unwrap()
+                .into_value(),
+            json!({"type":"extension_ui_response", "id":request.id, "cancelled":true})
+        );
+    }
+}
+
+#[test]
+fn extension_ui_responses_reject_mismatched_answers() {
+    let request = extension_request(json!({
+        "type":"extension_ui_request", "id":"confirm-1", "method":"confirm",
+        "title":"Sure?", "message":"Really?"
+    }));
+    assert!(ExtensionUiResponse::new(&request, ExtensionUiAnswer::Input("yes".into())).is_err());
+
+    let select = extension_request(json!({
+        "type":"extension_ui_request", "id":"select-1", "method":"select",
+        "title":"Pick", "options":["A"]
+    }));
+    assert!(ExtensionUiResponse::new(&select, ExtensionUiAnswer::Selection("B".into())).is_err());
+}
 use muniment_core::sidecar::{PiRpcWiring, SidecarConfig, SidecarStatus, SidecarSupervisor};
 use serde_json::json;
 use std::time::{Duration, Instant};
