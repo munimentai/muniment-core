@@ -204,6 +204,7 @@ pub enum ErrorCode {
     IdempotencyConflict,
     PersistenceFailed,
     InvalidCursor,
+    InvalidArtifactCursor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -372,6 +373,8 @@ pub enum ErrorMessage {
     PersistenceFailed,
     #[serde(rename = "The stream cursor is invalid.")]
     InvalidCursor,
+    #[serde(rename = "The artifact transfer cursor is invalid.")]
+    InvalidArtifactCursor,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -435,6 +438,13 @@ impl ProtocolError {
         Self::simple(ErrorCode::InvalidCursor, ErrorMessage::InvalidCursor)
     }
 
+    pub fn invalid_artifact_cursor() -> Self {
+        Self::simple(
+            ErrorCode::InvalidArtifactCursor,
+            ErrorMessage::InvalidArtifactCursor,
+        )
+    }
+
     fn simple(code: ErrorCode, message: ErrorMessage) -> Self {
         Self {
             code,
@@ -488,6 +498,7 @@ impl<'de> Deserialize<'de> for ProtocolError {
             (ErrorCode::IdempotencyConflict, None, None) => Self::idempotency_conflict(),
             (ErrorCode::PersistenceFailed, None, None) => Self::persistence_failed(),
             (ErrorCode::InvalidCursor, None, None) => Self::invalid_cursor(),
+            (ErrorCode::InvalidArtifactCursor, None, None) => Self::invalid_artifact_cursor(),
             _ => return Err(de::Error::custom("invalid error schema")),
         };
         if wire.message != expected.message || wire.retryable != expected.retryable {

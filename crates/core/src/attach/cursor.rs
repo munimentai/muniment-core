@@ -15,6 +15,7 @@ pub struct RunStreamWindow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamCloseCode {
     InvalidCursor,
+    InvalidArtifactCursor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
