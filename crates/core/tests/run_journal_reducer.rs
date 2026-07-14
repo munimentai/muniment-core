@@ -1,6 +1,6 @@
 use muniment_core::journal::reducer::{
-    project_chat, reduce, AttentionReason, ChatProjector, ReduceError, RunReducer, RunStatus,
-    ToolActivity, ToolActivityStatus,
+    project_chat, reduce, AttentionReason, ChatProjector, PermissionGate, PermissionRequest,
+    ReduceError, RunReducer, RunStatus, ToolActivity, ToolActivityStatus,
 };
 use muniment_core::journal::{EventEnvelope, EventPayload, Provenance};
 use serde_json::{json, Value};
@@ -58,10 +58,18 @@ fn golden_user_visible_states() {
         (
             vec![
                 ("run.started", json!({})),
-                ("permission.requested", json!({"gate_id":"g1"})),
+                (
+                    "permission.requested",
+                    json!({"gate_id":"g1","kind":"confirm","title":"Allow?","message":"Proceed?"}),
+                ),
             ],
-            RunStatus::PendingPermission(muniment_core::journal::reducer::PermissionGate {
+            RunStatus::PendingPermission(PermissionGate {
                 gate_id: "g1".into(),
+                request: PermissionRequest::Confirm {
+                    title: "Allow?".into(),
+                    message: "Proceed?".into(),
+                    timeout: None,
+                },
             }),
         ),
         (
@@ -87,7 +95,10 @@ fn golden_user_visible_states() {
 fn permission_gate_must_resolve_exactly_once() {
     let ok = stream(&[
         ("run.started", json!({})),
-        ("permission.requested", json!({"gate_id":"g"})),
+        (
+            "permission.requested",
+            json!({"gate_id":"g","kind":"confirm","title":"Allow?","message":"Proceed?"}),
+        ),
         ("permission.resolved", json!({"gate_id":"g"})),
     ]);
     assert_eq!(reduce(&ok).unwrap().status, RunStatus::Active);
@@ -98,7 +109,10 @@ fn permission_gate_must_resolve_exactly_once() {
         ]),
         stream(&[
             ("run.started", json!({})),
-            ("permission.requested", json!({"gate_id":"g"})),
+            (
+                "permission.requested",
+                json!({"gate_id":"g","kind":"confirm","title":"Allow?","message":"Proceed?"}),
+            ),
             ("permission.resolved", json!({"gate_id":"other"})),
         ]),
     ] {
@@ -107,6 +121,56 @@ fn permission_gate_must_resolve_exactly_once() {
             Err(ReduceError::InvalidTransition { .. })
         ));
     }
+}
+
+#[test]
+fn permission_dialog_details_replay_and_resolution_clears_projection() {
+    let requests = [
+        json!({"gate_id":"select","kind":"select","title":"Choose","options":["A","B"],"timeout":1000}),
+        json!({"gate_id":"confirm","kind":"confirm","title":"Allow?","message":"Proceed?"}),
+        json!({"gate_id":"input","kind":"input","title":"Value","placeholder":"Type here"}),
+        json!({"gate_id":"editor","kind":"editor","title":"Edit","prefill":"draft","timeout":2000}),
+    ];
+
+    for payload in requests {
+        let events = stream(&[
+            ("run.started", json!({})),
+            ("permission.requested", payload.clone()),
+        ]);
+        let projection = project_chat(&events).unwrap();
+        let gate = projection.pending_permission.clone().unwrap();
+        assert_eq!(serde_json::to_value(&gate).unwrap(), payload);
+        assert_eq!(projection.status, Some(RunStatus::PendingPermission(gate)));
+
+        let resolved = stream(&[
+            ("run.started", json!({})),
+            ("permission.requested", payload.clone()),
+            (
+                "permission.resolved",
+                json!({"gate_id": payload["gate_id"]}),
+            ),
+        ]);
+        assert_eq!(project_chat(&resolved).unwrap().pending_permission, None);
+    }
+}
+
+#[test]
+fn overlapping_permission_gates_remain_a_hard_error() {
+    let events = stream(&[
+        ("run.started", json!({})),
+        (
+            "permission.requested",
+            json!({"gate_id":"one","kind":"input","title":"First"}),
+        ),
+        (
+            "permission.requested",
+            json!({"gate_id":"two","kind":"input","title":"Second"}),
+        ),
+    ]);
+    assert!(matches!(
+        reduce(&events),
+        Err(ReduceError::InvalidTransition { .. })
+    ));
 }
 
 #[test]
@@ -277,7 +341,10 @@ fn ordering_terminal_and_forward_compatibility_fail_closed() {
     }
     let mut version = stream(&[
         ("run.started", json!({})),
-        ("permission.requested", json!({"gate_id":"g"})),
+        (
+            "permission.requested",
+            json!({"gate_id":"g","kind":"confirm","title":"Allow?","message":"Proceed?"}),
+        ),
     ]);
     version[1].event_version = 2;
     assert!(matches!(
@@ -290,7 +357,10 @@ fn ordering_terminal_and_forward_compatibility_fail_closed() {
 fn incremental_and_full_replay_are_identical() {
     let events = stream(&[
         ("run.started", json!({})),
-        ("permission.requested", json!({"gate_id":"g"})),
+        (
+            "permission.requested",
+            json!({"gate_id":"g","kind":"confirm","title":"Allow?","message":"Proceed?"}),
+        ),
         ("permission.resolved", json!({"gate_id":"g"})),
         ("tool.effect.started", json!({"effect_id":"e"})),
         ("tool.effect.completed", json!({"effect_id":"e"})),

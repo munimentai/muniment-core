@@ -1,12 +1,46 @@
 //! Pure reconstruction of user-visible run state from journal events.
 
 use super::{EventEnvelope, EventPayload};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionGate {
     pub gate_id: String,
+    #[serde(flatten)]
+    pub request: PermissionRequest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PermissionRequest {
+    Select {
+        title: String,
+        options: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout: Option<u64>,
+    },
+    Confirm {
+        title: String,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout: Option<u64>,
+    },
+    Input {
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        placeholder: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout: Option<u64>,
+    },
+    Editor {
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prefill: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout: Option<u64>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,6 +74,7 @@ pub struct ChatProjection {
     pub text: String,
     pub receipt: Option<Value>,
     pub status: Option<RunStatus>,
+    pub pending_permission: Option<PermissionGate>,
     pub tool_activity: Vec<ToolActivity>,
 }
 
@@ -112,7 +147,12 @@ impl ChatProjector {
 
     pub fn projection(&self) -> Result<ChatProjection, ReduceError> {
         let mut chat = self.chat.clone();
-        chat.status = Some(self.reducer.clone().finish()?.status);
+        let status = self.reducer.clone().finish()?.status;
+        chat.pending_permission = match &status {
+            RunStatus::PendingPermission(gate) => Some(gate.clone()),
+            _ => None,
+        };
+        chat.status = Some(status);
         Ok(chat)
     }
 }
@@ -231,9 +271,11 @@ impl RunReducer {
                 if self.pending_gate.is_some() {
                     return Err(invalid(event, "a permission gate is already pending"));
                 }
-                let gate = PermissionGate {
-                    gate_id: field(event, "gate_id")?,
-                };
+                let gate: PermissionGate = serde_json::from_value(payload(event)?.clone())
+                    .map_err(|_| invalid(event, "permission request payload is invalid"))?;
+                if gate.gate_id.is_empty() {
+                    return Err(invalid(event, "permission request gate id is empty"));
+                }
                 self.pending_gate = Some(gate.clone());
                 self.set_status(event, RunStatus::PendingPermission(gate));
             }
@@ -304,9 +346,11 @@ impl RunReducer {
                 detail: "empty journal".into(),
             })?;
         // Open effects retain start order; report the earliest dangling effect deterministically.
-        if let Some(effect_id) = self.open_effects.into_iter().next() {
-            state.status =
-                RunStatus::NeedsAttention(AttentionReason::UnknownEffectOutcome { effect_id });
+        if self.pending_gate.is_none() {
+            if let Some(effect_id) = self.open_effects.into_iter().next() {
+                state.status =
+                    RunStatus::NeedsAttention(AttentionReason::UnknownEffectOutcome { effect_id });
+            }
         }
         Ok(state)
     }
