@@ -39,6 +39,61 @@ fn response(status: &str, body: &str) -> String {
     )
 }
 
+struct RepeatingFixture {
+    url: String,
+    stop: mpsc::Sender<()>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl RepeatingFixture {
+    fn new(response: String) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (stop, stopped) = mpsc::channel();
+        let worker = thread::spawn(move || loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut request = [0; 1024];
+                    let count = stream.read(&mut request).unwrap();
+                    assert!(String::from_utf8_lossy(&request[..count]).starts_with("GET /health "));
+                    stream.write_all(response.as_bytes()).unwrap();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    match stopped.recv_timeout(Duration::from_millis(10)) {
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                Err(error) => panic!("health fixture failed: {error}"),
+            }
+        });
+        Self {
+            url,
+            stop,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for RepeatingFixture {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        let result = self.worker.take().unwrap().join();
+        if !thread::panicking() {
+            result.unwrap();
+        }
+    }
+}
+
+struct TempMarker(PathBuf);
+
+impl Drop for TempMarker {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn chat_fixture(response: String) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -457,15 +512,15 @@ fn unhealthy_and_malformed_responses_are_descriptive_without_body_content() {
 #[test]
 fn supervisor_restarts_stub_and_shutdown_cleans_up_child() {
     let ready = response("200 OK", r#"{"status":"ok"}"#);
-    let (url, worker) = fixture(vec![ready]);
-    let health = LlamaHealthClient::new(url, Duration::from_secs(1)).unwrap();
-    let marker = temp_marker("restart");
-    let _ = std::fs::remove_dir(&marker);
+    let fixture = RepeatingFixture::new(ready);
+    let health = LlamaHealthClient::new(&fixture.url, Duration::from_secs(1)).unwrap();
+    let marker = TempMarker(temp_marker("restart"));
+    let _ = std::fs::remove_dir_all(&marker.0);
     let mut config = SidecarConfig::new(env!("CARGO_BIN_EXE_sidecar-test-stub"));
     config.args = vec!["--model".into(), "model with spaces.gguf".into()];
     config.env.insert(
         "LLAMA_STUB_EXIT_ONCE".into(),
-        marker.to_string_lossy().into_owned(),
+        marker.0.to_string_lossy().into_owned(),
     );
     config.restart = RestartPolicy {
         max_restarts: 2,
@@ -492,6 +547,4 @@ fn supervisor_restarts_stub_and_shutdown_cleans_up_child() {
         events.recv_timeout(Duration::from_secs(1)).unwrap().status,
         SidecarStatus::Stopped
     );
-    worker.join().unwrap();
-    let _ = std::fs::remove_dir(marker);
 }
