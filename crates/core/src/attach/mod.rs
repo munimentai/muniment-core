@@ -3,9 +3,11 @@
 mod authorization;
 mod envelope;
 mod framing;
+mod idempotency;
 mod negotiation;
 
 pub use authorization::*;
 pub use envelope::*;
 pub use framing::*;
+pub use idempotency::*;
 pub use negotiation::*;

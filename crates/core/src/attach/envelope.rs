@@ -76,6 +76,20 @@ pub struct Request {
     pub body: Value,
 }
 
+impl Request {
+    /// Enforces the operation-level idempotency policy from ADR 0009.
+    pub fn validate_idempotency_key(&self) -> Result<(), ProtocolError> {
+        match (
+            self.operation.requires_idempotency_key(),
+            self.idempotency_key.is_some(),
+        ) {
+            (true, false) => Err(ProtocolError::idempotency_key_required()),
+            (false, true) => Err(ProtocolError::idempotency_key_forbidden()),
+            _ => Ok(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Response {
     pub protocol: Protocol,
@@ -185,6 +199,10 @@ pub enum ErrorCode {
     ProtocolIncompatible,
     PayloadTooLarge,
     MalformedFrame,
+    IdempotencyKeyRequired,
+    IdempotencyKeyForbidden,
+    IdempotencyConflict,
+    PersistenceFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,6 +233,37 @@ pub enum Operation {
     ArtifactWindow,
     #[serde(rename = "request.cancel")]
     RequestCancel,
+}
+
+impl Operation {
+    pub fn requires_idempotency_key(self) -> bool {
+        matches!(
+            self,
+            Self::RunStart
+                | Self::RunSteer
+                | Self::RunFollowUp
+                | Self::RunCancel
+                | Self::PermissionAnswer
+        )
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ThreadList => "thread.list",
+            Self::ThreadOpen => "thread.open",
+            Self::RunOpen => "run.open",
+            Self::RunStart => "run.start",
+            Self::RunStream => "run.stream",
+            Self::RunCursorAck => "run.cursor_ack",
+            Self::RunSteer => "run.steer",
+            Self::RunFollowUp => "run.follow_up",
+            Self::RunCancel => "run.cancel",
+            Self::PermissionAnswer => "permission.answer",
+            Self::ArtifactFetch => "artifact.fetch",
+            Self::ArtifactWindow => "artifact.window",
+            Self::RequestCancel => "request.cancel",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -312,6 +361,14 @@ pub enum ErrorMessage {
     PayloadTooLarge,
     #[serde(rename = "The frame is malformed.")]
     MalformedFrame,
+    #[serde(rename = "An idempotency key is required for this operation.")]
+    IdempotencyKeyRequired,
+    #[serde(rename = "An idempotency key is not valid for this operation.")]
+    IdempotencyKeyForbidden,
+    #[serde(rename = "The idempotency key was already used for a different request.")]
+    IdempotencyConflict,
+    #[serde(rename = "The request could not be committed.")]
+    PersistenceFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -342,6 +399,33 @@ impl ProtocolError {
 
     pub fn malformed_frame() -> Self {
         Self::simple(ErrorCode::MalformedFrame, ErrorMessage::MalformedFrame)
+    }
+
+    pub fn idempotency_key_required() -> Self {
+        Self::simple(
+            ErrorCode::IdempotencyKeyRequired,
+            ErrorMessage::IdempotencyKeyRequired,
+        )
+    }
+    pub fn idempotency_key_forbidden() -> Self {
+        Self::simple(
+            ErrorCode::IdempotencyKeyForbidden,
+            ErrorMessage::IdempotencyKeyForbidden,
+        )
+    }
+    pub fn idempotency_conflict() -> Self {
+        Self::simple(
+            ErrorCode::IdempotencyConflict,
+            ErrorMessage::IdempotencyConflict,
+        )
+    }
+    pub fn persistence_failed() -> Self {
+        let mut error = Self::simple(
+            ErrorCode::PersistenceFailed,
+            ErrorMessage::PersistenceFailed,
+        );
+        error.retryable = true;
+        error
     }
 
     fn simple(code: ErrorCode, message: ErrorMessage) -> Self {
@@ -392,6 +476,10 @@ impl<'de> Deserialize<'de> for ProtocolError {
             ) => Self::protocol_incompatible(supported, action),
             (ErrorCode::PayloadTooLarge, None, None) => Self::payload_too_large(),
             (ErrorCode::MalformedFrame, None, None) => Self::malformed_frame(),
+            (ErrorCode::IdempotencyKeyRequired, None, None) => Self::idempotency_key_required(),
+            (ErrorCode::IdempotencyKeyForbidden, None, None) => Self::idempotency_key_forbidden(),
+            (ErrorCode::IdempotencyConflict, None, None) => Self::idempotency_conflict(),
+            (ErrorCode::PersistenceFailed, None, None) => Self::persistence_failed(),
             _ => return Err(de::Error::custom("invalid error schema")),
         };
         if wire.message != expected.message || wire.retryable != expected.retryable {
