@@ -305,11 +305,17 @@ fn orchestration_store(expires_at: u64, refresh_expires_at: u64) -> MemoryStore 
 #[test]
 fn local_native_status_uses_only_the_coherent_record() {
     let empty = MemoryStore::default();
-    assert!(!native_status(&empty).unwrap().signed_in);
-    let status = native_status(&orchestration_store(2_000, 4_000)).unwrap();
+    assert!(!native_status(&empty, 1_000).unwrap().signed_in);
+
+    let status = native_status(&orchestration_store(500, 4_000), 1_000).unwrap();
     assert!(status.signed_in);
     assert_eq!(status.subject.as_deref(), Some("user"));
-    assert_eq!(status.expires_at, Some(2_000));
+    assert_eq!(status.expires_at, Some(500));
+
+    let status = native_status(&orchestration_store(2_000, 1_000), 1_000).unwrap();
+    assert!(!status.signed_in);
+    assert_eq!(status.subject, None);
+    assert_eq!(status.expires_at, None);
 }
 
 #[test]

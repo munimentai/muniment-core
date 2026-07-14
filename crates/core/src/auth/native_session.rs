@@ -288,11 +288,15 @@ pub fn inspect_native_session(
 /// Read the coherent native record without network access.
 pub fn native_status(
     store: &dyn NativeCredentialStore,
+    now_unix_seconds: u64,
 ) -> Result<AuthStatus, FreshNativeSessionError> {
     let credentials = store
         .load_credentials()
         .map_err(|_| FreshNativeSessionError::Credentials)?;
-    Ok(status_from_credentials(credentials.as_ref()))
+    Ok(status_from_credentials(
+        credentials.as_ref(),
+        now_unix_seconds,
+    ))
 }
 
 /// Refresh a near-expiry native access credential, atomically persist any
@@ -367,13 +371,21 @@ pub fn ensure_fresh_native_session(
     })
 }
 
-fn status_from_credentials(credentials: Option<&NativeCredentials>) -> AuthStatus {
+fn status_from_credentials(
+    credentials: Option<&NativeCredentials>,
+    now_unix_seconds: u64,
+) -> AuthStatus {
     match credentials {
-        Some(credentials) if !credentials.tokens.access_token.is_empty() => AuthStatus {
-            signed_in: true,
-            subject: credentials.tokens.subject.clone(),
-            expires_at: credentials.tokens.expires_at,
-        },
+        Some(credentials)
+            if !credentials.tokens.access_token.is_empty()
+                && now_unix_seconds < credentials.refresh_expires_at =>
+        {
+            AuthStatus {
+                signed_in: true,
+                subject: credentials.tokens.subject.clone(),
+                expires_at: credentials.tokens.expires_at,
+            }
+        }
         _ => AuthStatus {
             signed_in: false,
             subject: None,
