@@ -155,9 +155,41 @@ fn extension_ui_responses_reject_mismatched_answers() {
     }));
     assert!(ExtensionUiResponse::new(&select, ExtensionUiAnswer::Selection("B".into())).is_err());
 }
+use muniment_core::journal::reducer::reduce;
+use muniment_core::journal::{EventEnvelope, EventPayload, Provenance, RunJournal};
 use muniment_core::sidecar::{PiRpcWiring, SidecarConfig, SidecarStatus, SidecarSupervisor};
 use serde_json::json;
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "muniment-pi-chat-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
 
 #[test]
 fn prompt_contract_and_interleaved_deltas_are_typed() {
@@ -315,5 +347,118 @@ fn adapter_queues_messages_without_consuming_interleaved_stream_events() {
             expected
         );
     }
+    supervisor.shutdown().unwrap();
+}
+
+fn deferred_session_supervisor(
+    session_file: &std::path::Path,
+    cancel_marker: Option<&std::path::Path>,
+) -> (SidecarSupervisor, PiRpcWiring) {
+    let mut config = SidecarConfig::new(env!("CARGO_BIN_EXE_sidecar-test-stub"));
+    config.args = vec![
+        "pi-session-deferred".into(),
+        session_file.to_string_lossy().into_owned(),
+    ];
+    if let Some(marker) = cancel_marker {
+        config.args.push(marker.to_string_lossy().into_owned());
+    }
+    config.health_interval = Duration::from_secs(60);
+    let wiring = PiRpcWiring::new();
+    let supervisor =
+        SidecarSupervisor::spawn(config, wiring.readiness_probe(Duration::from_millis(100)))
+            .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while supervisor.status() != SidecarStatus::Healthy && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(supervisor.status(), SidecarStatus::Healthy);
+    (supervisor, wiring)
+}
+
+#[test]
+fn accepted_prompt_waits_for_session_file_and_preserves_stream_frames() {
+    let temp = TempDir::new();
+    let session_file = temp.path().join("session.jsonl");
+    let (mut supervisor, wiring) = deferred_session_supervisor(&session_file, None);
+    let transport = wiring.transport().unwrap();
+    let (adapter, _) =
+        PiRunAdapter::start("run-1", &transport, "prompt", Duration::from_millis(100)).unwrap();
+
+    let (locator, buffered) = adapter
+        .await_session_binding(&transport, temp.path(), Duration::from_secs(1))
+        .unwrap();
+
+    assert_eq!(locator.as_str(), "session.jsonl");
+    assert_eq!(buffered, vec![PiChatEvent::TextDelta("buffered".into())]);
+    assert!(session_file.is_file());
+
+    let journal_path = temp.path().join("journal.sqlite3");
+    let run_id = "0190a100-0000-7000-8000-000000000001";
+    let binding = EventEnvelope {
+        event_id: "0190a100-0000-7000-8000-000000000002".into(),
+        run_id: run_id.into(),
+        run_seq: 2,
+        event_type: "runtime.pi_session.bound".into(),
+        event_version: 1,
+        envelope_version: 1,
+        recorded_at: "2026-07-14T00:00:00Z".into(),
+        occurred_at: None,
+        correlation_id: None,
+        causation_id: None,
+        payload: EventPayload::Inline {
+            payload_json: json!({"run_id":run_id, "locator":locator.as_str()}),
+        },
+        provenance: Provenance {
+            source: "test".into(),
+            source_version: "1".into(),
+            actor_id: None,
+            device_id: None,
+            rpc_request_id: None,
+            capability_versions: None,
+            extra: BTreeMap::new(),
+        },
+        extra: BTreeMap::new(),
+    };
+    let mut started = binding.clone();
+    started.event_id = "0190a100-0000-7000-8000-000000000003".into();
+    started.run_seq = 1;
+    started.event_type = "run.started".into();
+    started.payload = EventPayload::Inline {
+        payload_json: json!({}),
+    };
+    RunJournal::open(&journal_path)
+        .unwrap()
+        .append_batch(0, &[started, binding])
+        .unwrap();
+    let replayed = RunJournal::open(&journal_path)
+        .unwrap()
+        .events(run_id)
+        .unwrap();
+    assert_eq!(
+        reduce(&replayed).unwrap().pi_session.unwrap().locator,
+        "session.jsonl"
+    );
+    supervisor.shutdown().unwrap();
+}
+
+#[test]
+fn invalid_session_state_cancels_accepted_agent_work() {
+    let owned_root = TempDir::new();
+    let outside_root = TempDir::new();
+    let marker = owned_root.path().join("cancelled");
+    let outside = outside_root.path().join("outside-session.jsonl");
+    fs::write(&outside, "{}\n").unwrap();
+    let (mut supervisor, wiring) = deferred_session_supervisor(&outside, Some(&marker));
+    let transport = wiring.transport().unwrap();
+    let (adapter, _) =
+        PiRunAdapter::start("run-1", &transport, "prompt", Duration::from_millis(100)).unwrap();
+
+    assert_eq!(
+        adapter
+            .await_session_binding(&transport, owned_root.path(), Duration::from_millis(100))
+            .unwrap_err(),
+        "Pi session binding failed"
+    );
+    assert_eq!(fs::read_to_string(marker).unwrap(), "cancelled");
     supervisor.shutdown().unwrap();
 }

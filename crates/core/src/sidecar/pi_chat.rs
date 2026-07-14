@@ -5,6 +5,7 @@
 //! each accepted prompt and discard unrelated frames.
 
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::sync::{mpsc, Mutex};
 use std::time::Duration;
 
@@ -398,6 +399,56 @@ impl PiRunAdapter {
 
     pub fn run_id(&self) -> &str {
         &self.run_id
+    }
+
+    /// Waits for Pi to materialize the persistent session after accepting a
+    /// prompt. Stream frames arriving while the file is being created are
+    /// returned in order. If the binding cannot be validated, the accepted
+    /// turn is cancelled and drained to a terminal event before returning.
+    pub fn await_session_binding(
+        &self,
+        transport: &PiRpcTransport,
+        session_root: &Path,
+        timeout: Duration,
+    ) -> Result<(super::PiSessionLocator, Vec<PiChatEvent>), String> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut buffered = Vec::new();
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let call_timeout = remaining.min(Duration::from_millis(100));
+            if let Ok(locator) = transport.session_locator(session_root, call_timeout) {
+                return Ok((locator, buffered));
+            }
+            match self.next(Duration::from_millis(10).min(remaining)) {
+                Ok(event) => buffered.push(event),
+                Err(error) if error == "timed out waiting for Pi stream" => {}
+                Err(_) => break,
+            }
+        }
+        let _ = self.cancel_and_drain(transport, Duration::from_secs(2));
+        Err("Pi session binding failed".into())
+    }
+
+    /// Cancels an already-submitted prompt and waits until Pi reports that no
+    /// agent work remains active.
+    pub fn cancel_and_drain(
+        &self,
+        transport: &PiRpcTransport,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        transport.call(cancel_command(), timeout.min(Duration::from_millis(500)))?;
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match self.next(remaining) {
+                Ok(PiChatEvent::Completed | PiChatEvent::Cancelled | PiChatEvent::Failed) => {
+                    return Ok(())
+                }
+                Ok(_) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err("Pi cancellation did not finish".into())
     }
 
     /// Queues a message for delivery during the active turn. Success only

@@ -15,6 +15,7 @@ fn main() {
         Some("json-rpc") => json_rpc(args.next()),
         Some("pi-rpc-interleaved") => pi_rpc_interleaved(),
         Some("pi-chat-queue") => pi_chat_queue(),
+        Some("pi-session-deferred") => pi_session_deferred(args.next().unwrap(), args.next()),
         Some("pi-rpc-restart-once") => {
             let marker = args.next().unwrap();
             if fs::create_dir(marker).is_ok() {
@@ -116,6 +117,58 @@ fn main() {
             }
         }
         _ => std::process::exit(2),
+    }
+}
+
+fn pi_session_deferred(session_file: String, cancel_marker: Option<String>) {
+    let mut prompt_accepted = false;
+    let mut state_calls = 0;
+    for line in io::stdin().lock().lines() {
+        let request: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+        let command = request["type"].as_str().unwrap();
+        match command {
+            "get_state" => {
+                state_calls += 1;
+                if prompt_accepted && state_calls >= 3 && cancel_marker.is_none() {
+                    fs::write(&session_file, "{}\n").unwrap();
+                }
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "type":"response", "command":"get_state", "success":true,
+                        "id":request["id"], "data":{"sessionFile":session_file}
+                    })
+                );
+                if prompt_accepted && state_calls == 2 {
+                    println!(
+                        "{}",
+                        serde_json::json!({"type":"message_update",
+                        "assistantMessageEvent":{"type":"text_delta", "delta":"buffered"}})
+                    );
+                }
+            }
+            "prompt" => {
+                prompt_accepted = true;
+                println!(
+                    "{}",
+                    serde_json::json!({"type":"response", "command":"prompt",
+                    "success":true, "id":request["id"]})
+                );
+            }
+            "abort" => {
+                if let Some(marker) = &cancel_marker {
+                    fs::write(marker, "cancelled").unwrap();
+                }
+                println!(
+                    "{}",
+                    serde_json::json!({"type":"response", "command":"abort",
+                    "success":true, "id":request["id"]})
+                );
+                println!("{}", serde_json::json!({"type":"cancelled"}));
+            }
+            _ => unreachable!(),
+        }
+        io::stdout().flush().unwrap();
     }
 }
 

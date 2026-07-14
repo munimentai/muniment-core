@@ -2,7 +2,7 @@ use muniment_core::journal::reducer::{
     project_chat, reduce, AttentionReason, ChatProjector, PermissionGate, PermissionRequest,
     ReduceError, RunReducer, RunStatus, ToolActivity, ToolActivityStatus,
 };
-use muniment_core::journal::{EventEnvelope, EventPayload, Provenance};
+use muniment_core::journal::{EventEnvelope, EventPayload, Provenance, RunJournal};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -372,6 +372,75 @@ fn incremental_and_full_replay_are_identical() {
         incremental.apply(event).unwrap();
     }
     assert_eq!(incremental.finish().unwrap(), full);
+}
+
+#[test]
+fn pi_session_binding_replays_and_rebinding_fails_closed() {
+    let bound = stream(&[
+        ("run.started", json!({})),
+        (
+            "runtime.pi_session.bound",
+            json!({"run_id": RUN, "locator": "session.jsonl"}),
+        ),
+    ]);
+    let state = reduce(&bound).unwrap();
+    assert_eq!(state.pi_session.unwrap().locator, "session.jsonl");
+
+    for payload in [
+        json!({"run_id": RUN, "locator": "other.jsonl"}),
+        json!({"run_id": RUN, "locator": "session.jsonl"}),
+    ] {
+        let mut duplicate = bound.clone();
+        duplicate.push(event(3, "runtime.pi_session.bound", payload));
+        assert!(matches!(
+            reduce(&duplicate),
+            Err(ReduceError::InvalidTransition { .. })
+        ));
+    }
+
+    for payload in [
+        json!({"run_id": "other", "locator": "session.jsonl"}),
+        json!({"run_id": RUN, "locator": "../session.jsonl"}),
+        json!({"run_id": RUN, "locator": "session.jsonl", "raw": []}),
+    ] {
+        assert!(matches!(
+            reduce(&stream(&[
+                ("run.started", json!({})),
+                ("runtime.pi_session.bound", payload)
+            ])),
+            Err(ReduceError::InvalidTransition { .. })
+        ));
+    }
+}
+
+#[test]
+fn pi_session_binding_survives_sqlite_reopen() {
+    let path = std::env::temp_dir().join(format!(
+        "muniment-binding-{}-{}.sqlite3",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let events = stream(&[
+        ("run.started", json!({})),
+        (
+            "runtime.pi_session.bound",
+            json!({"run_id": RUN, "locator": "session.jsonl"}),
+        ),
+    ]);
+    {
+        let mut journal = RunJournal::open(&path).unwrap();
+        journal.append_batch(0, &events).unwrap();
+    }
+    let mut reopened = RunJournal::open(&path).unwrap();
+    let state = reduce(&reopened.events(RUN).unwrap()).unwrap();
+    assert_eq!(state.pi_session.unwrap().locator, "session.jsonl");
+    drop(reopened);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
 }
 
 #[test]

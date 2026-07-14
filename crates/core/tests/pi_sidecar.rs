@@ -72,7 +72,9 @@ fn real_pinned_pi_reaches_ready_through_the_supervisor() {
     let executable = install_archive(Path::new(&archive), &root);
     assert_eq!(resolve_current(&root).unwrap(), executable);
 
-    let mut config = pi_sidecar_config(executable.to_string_lossy());
+    let sessions = root.join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    let mut config = pi_sidecar_config(executable.to_string_lossy(), &sessions, None).unwrap();
     config.health_interval = Duration::from_secs(60);
     let wiring = PiRpcWiring::new();
     let mut supervisor =

@@ -14,7 +14,8 @@ pub use jsonrpc::{
     JsonRpcVersion,
 };
 pub use pi::{
-    pi_readiness_probe, pi_sidecar_config, PiRpcTransport, PiRpcWiring, PI_NPM_PACKAGE, PI_VERSION,
+    pi_readiness_probe, pi_sidecar_config, validate_pi_session, PiRpcTransport, PiRpcWiring,
+    PiSessionLocator, PI_NPM_PACKAGE, PI_VERSION,
 };
 pub use supervisor::{
     ProbeOutcome, RestartPolicy, SidecarConfig, SidecarEvent, SidecarEventCause, SidecarStatus,

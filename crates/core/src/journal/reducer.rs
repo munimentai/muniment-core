@@ -65,6 +65,14 @@ pub struct RunState {
     pub run_id: String,
     pub last_seq: u64,
     pub status: RunStatus,
+    pub pi_session: Option<PiSessionBinding>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PiSessionBinding {
+    pub run_id: String,
+    pub locator: String,
 }
 
 /// The webview-facing chat projection derived from journal events.
@@ -208,6 +216,7 @@ pub struct RunReducer {
     state: Option<RunState>,
     pending_gate: Option<PermissionGate>,
     open_effects: Vec<String>,
+    pi_session: Option<PiSessionBinding>,
 }
 
 impl Default for RunReducer {
@@ -222,6 +231,7 @@ impl RunReducer {
             state: None,
             pending_gate: None,
             open_effects: Vec::new(),
+            pi_session: None,
         }
     }
 
@@ -263,6 +273,24 @@ impl RunReducer {
                 if self.state.is_some() {
                     return Err(invalid(event, "run may only start once"));
                 }
+                self.set_status(event, RunStatus::Active);
+            }
+            "runtime.pi_session.bound" => {
+                self.require_active(event)?;
+                if self.pi_session.is_some() {
+                    return Err(invalid(event, "Pi session may only be bound once"));
+                }
+                let binding: PiSessionBinding = serde_json::from_value(payload(event)?.clone())
+                    .map_err(|_| invalid(event, "Pi session binding payload is invalid"))?;
+                if binding.run_id != event.run_id
+                    || binding.locator.is_empty()
+                    || binding.locator.contains('/')
+                    || binding.locator.contains('\\')
+                    || !binding.locator.ends_with(".jsonl")
+                {
+                    return Err(invalid(event, "Pi session binding payload is invalid"));
+                }
+                self.pi_session = Some(binding);
                 self.set_status(event, RunStatus::Active);
             }
             "model.stream.delta" => self.require_executable(event, RunStatus::Streaming)?,
@@ -383,6 +411,7 @@ impl RunReducer {
             run_id: event.run_id.clone(),
             last_seq: event.run_seq,
             status,
+            pi_session: self.pi_session.clone(),
         });
     }
 }
@@ -426,7 +455,9 @@ fn invalid(event: &EventEnvelope, detail: &str) -> ReduceError {
     }
 }
 fn is_safety_event(t: &str) -> bool {
-    t.starts_with("permission.") || t.starts_with("tool.effect.")
+    t.starts_with("permission.")
+        || t.starts_with("tool.effect.")
+        || t.starts_with("runtime.pi_session.")
 }
 fn is_known_safety_event(t: &str) -> bool {
     matches!(
@@ -436,6 +467,7 @@ fn is_known_safety_event(t: &str) -> bool {
             | "tool.effect.started"
             | "tool.effect.completed"
             | "tool.effect.failed"
+            | "runtime.pi_session.bound"
     )
 }
 fn is_state_event(t: &str) -> bool {
@@ -443,4 +475,5 @@ fn is_state_event(t: &str) -> bool {
         || t.starts_with("model.")
         || t.starts_with("permission.")
         || t.starts_with("tool.")
+        || t.starts_with("runtime.pi_session.")
 }

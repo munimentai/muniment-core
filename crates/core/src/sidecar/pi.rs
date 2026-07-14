@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, TryLockError};
 use std::time::Duration;
@@ -15,14 +16,119 @@ type CurrentTransport = Arc<Mutex<Option<(u64, Arc<PiRpcTransport>)>>>;
 /// Builds the production Pi RPC launch contract for a verified, platform-native
 /// Pi executable. The executable contains its Node-compatible runtime; a system
 /// `node` installation is deliberately not part of this contract.
-pub fn pi_sidecar_config(program: impl Into<String>) -> SidecarConfig {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PiSessionLocator(String);
+
+impl PiSessionLocator {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn canonical_session_root(session_root: &Path) -> Result<PathBuf, String> {
+    let root = session_root
+        .canonicalize()
+        .map_err(|_| "Pi session directory is unavailable".to_string())?;
+    if !root
+        .metadata()
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+    {
+        return Err("Pi session directory is unavailable".into());
+    }
+    Ok(root)
+}
+
+/// Validate a Pi-owned session file without allowing a journal locator to
+/// escape Muniment's session directory. Errors deliberately omit paths.
+pub fn validate_pi_session(
+    session_root: &Path,
+    locator: &str,
+) -> Result<(PiSessionLocator, PathBuf), String> {
+    if locator.is_empty()
+        || locator.contains('/')
+        || locator.contains('\\')
+        || !locator.ends_with(".jsonl")
+    {
+        return Err("Pi session locator is invalid".into());
+    }
+    let root = canonical_session_root(session_root)?;
+    let path = root.join(locator);
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| "Pi session file is unavailable".to_string())?;
+    if !canonical.starts_with(&root)
+        || !canonical
+            .metadata()
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false)
+    {
+        return Err("Pi session file is unavailable".into());
+    }
+    Ok((PiSessionLocator(locator.to_owned()), canonical))
+}
+
+/// Builds either a new persistent Pi session or an explicit reopen. The
+/// session directory must already exist so ownership is established by the
+/// application before launch.
+pub fn pi_sidecar_config(
+    program: impl Into<String>,
+    session_root: &Path,
+    reopen: Option<&PiSessionLocator>,
+) -> Result<SidecarConfig, String> {
+    let root = canonical_session_root(session_root)?;
     let mut config = SidecarConfig::new(program);
-    config.args = vec!["--mode".into(), "rpc".into(), "--no-session".into()];
+    config.args = vec![
+        "--mode".into(),
+        "rpc".into(),
+        "--session-dir".into(),
+        root.to_string_lossy().into_owned(),
+    ];
+    if let Some(locator) = reopen {
+        let (_, path) = validate_pi_session(&root, locator.as_str())?;
+        config
+            .args
+            .extend(["--session".into(), path.to_string_lossy().into_owned()]);
+    }
     config.restart = RestartPolicy::default();
     config.health_interval = Duration::from_secs(15);
     config.startup_timeout = Duration::from_secs(30);
     config.shutdown_timeout = Duration::from_secs(2);
-    config
+    Ok(config)
+}
+
+impl PiRpcTransport {
+    /// Reads the pinned 0.73.1 state contract and turns its session file into a
+    /// root-relative, non-secret locator suitable for the journal.
+    pub fn session_locator(
+        &self,
+        session_root: &Path,
+        timeout: Duration,
+    ) -> Result<PiSessionLocator, String> {
+        let response = self.call(json!({"type": "get_state"}), timeout)?;
+        if response.get("type").and_then(Value::as_str) != Some("response")
+            || response.get("command").and_then(Value::as_str) != Some("get_state")
+            || response.get("success").and_then(Value::as_bool) != Some(true)
+        {
+            return Err("Pi session state is invalid".into());
+        }
+        let file = response
+            .pointer("/data/sessionFile")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Pi session state is invalid".to_string())?;
+        let name = Path::new(file)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "Pi session state is invalid".to_string())?;
+        let (locator, canonical) = validate_pi_session(session_root, name)?;
+        let reported = Path::new(file)
+            .canonicalize()
+            .map_err(|_| "Pi session file is unavailable".to_string())?;
+        if reported != canonical {
+            return Err("Pi session file is unavailable".into());
+        }
+        Ok(locator)
+    }
 }
 
 /// The sole stdout consumer for Pi's multiplexed JSONL protocol.
