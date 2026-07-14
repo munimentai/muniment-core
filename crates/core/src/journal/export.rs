@@ -105,8 +105,15 @@ pub fn export_runs(
         ));
     }
 
+    let coordination = journal.coordination.clone();
+    let _operation = coordination
+        .as_ref()
+        .map(|state| state.operation.lock().unwrap());
+    journal.refresh_after_compaction()?;
     let tx = journal
         .connection
+        .as_mut()
+        .expect("journal connection is always present outside compaction")
         .transaction_with_behavior(TransactionBehavior::Deferred)?;
     let mut runs = Vec::with_capacity(selected.len());
     let mut envelopes = Vec::new();

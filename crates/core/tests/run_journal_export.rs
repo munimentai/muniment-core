@@ -228,6 +228,29 @@ fn export_uses_one_sqlite_snapshot_during_concurrent_append() {
 }
 
 #[test]
+fn open_peer_export_refreshes_after_compaction_replacement() {
+    let fixture = Fixture::new();
+    let cas = LocalCas::open(&fixture.cas_root).unwrap();
+    let mut compactor = RunJournal::open(&fixture.db).unwrap();
+    compactor.append(0, &inline(1, 1)).unwrap();
+    let mut peer = RunJournal::open(&fixture.db).unwrap();
+
+    compactor.compact().unwrap();
+    compactor.append(0, &inline(2, 1)).unwrap();
+
+    let mut bytes = Vec::new();
+    export_runs(&mut peer, &cas, &[inline(2, 1).run_id], &mut bytes).unwrap();
+    let envelopes: Vec<EventEnvelope> = records(&bytes)
+        .iter()
+        .filter(|record| record.0 == b'E')
+        .map(|record| serde_json::from_slice(record.1).unwrap())
+        .collect();
+    assert_eq!(envelopes.len(), 1);
+    assert_eq!(envelopes[0].run_id, inline(2, 1).run_id);
+    assert_eq!(envelopes[0].run_seq, 1);
+}
+
+#[test]
 fn missing_runs_corrupt_objects_and_writer_failures_are_typed() {
     let fixture = Fixture::new();
     let cas = LocalCas::open(&fixture.cas_root).unwrap();

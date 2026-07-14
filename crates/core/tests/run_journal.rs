@@ -90,7 +90,7 @@ fn first_and_ordered_batch_append_survive_reopen() {
     journal.append(0, &event(1)).unwrap();
     journal.append_batch(1, &[event(2), event(3)]).unwrap();
     drop(journal);
-    let journal = RunJournal::open(db.as_ref()).unwrap();
+    let mut journal = RunJournal::open(db.as_ref()).unwrap();
     let found = journal.events(RUN).unwrap();
     assert_eq!(
         found.iter().map(|e| e.run_seq).collect::<Vec<_>>(),
@@ -113,7 +113,7 @@ fn durable_run_index_reopens_in_first_recorded_order() {
     journal.append(0, &second).unwrap();
     drop(journal);
 
-    let journal = RunJournal::open(db.as_ref()).unwrap();
+    let mut journal = RunJournal::open(db.as_ref()).unwrap();
     assert_eq!(journal.run_ids().unwrap(), [RUN, second_run]);
     let replayed = journal.events(RUN).unwrap();
     assert_eq!(replayed.len(), 1);
@@ -142,7 +142,7 @@ fn recorded_at_requires_canonical_whole_second_format() {
     journal.append(0, &canonical).unwrap();
     drop(journal);
 
-    let journal = RunJournal::open(db.as_ref()).unwrap();
+    let mut journal = RunJournal::open(db.as_ref()).unwrap();
     let found = journal.events(RUN).unwrap();
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].event_id, canonical.event_id);
