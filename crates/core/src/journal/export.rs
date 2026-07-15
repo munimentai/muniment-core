@@ -143,6 +143,18 @@ pub fn export_runs(
                     }
                 }
             }
+            if let EventPayload::Attachment { attachment } = &event.payload {
+                if let Some(existing) =
+                    objects.insert(attachment.sha256().to_string(), attachment.byte_length())
+                {
+                    if existing != attachment.byte_length() {
+                        return Err(ExportError::CorruptReference(format!(
+                            "{} has conflicting byte lengths",
+                            attachment.sha256()
+                        )));
+                    }
+                }
+            }
             envelopes.push(EnvelopeRow { canonical });
             count += 1;
         }

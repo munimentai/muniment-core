@@ -21,8 +21,19 @@ const STALE_TEMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const TEMP_FILE_PREFIX: &str = ".cas-tmp-";
 
 /// A validated lowercase hexadecimal SHA-256 digest.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(transparent)]
 pub struct ContentHash(String);
+
+impl<'de> serde::Deserialize<'de> for ContentHash {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
 
 impl ContentHash {
     pub fn as_str(&self) -> &str {

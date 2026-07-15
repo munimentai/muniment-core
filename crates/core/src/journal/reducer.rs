@@ -444,9 +444,11 @@ pub fn reduce(events: &[EventEnvelope]) -> Result<RunState, ReduceError> {
 fn payload(event: &EventEnvelope) -> Result<&Value, ReduceError> {
     match &event.payload {
         EventPayload::Inline { payload_json } => Ok(payload_json),
-        EventPayload::Cas { .. } => Err(ReduceError::MissingInlinePayload {
-            event_type: event.event_type.clone(),
-        }),
+        EventPayload::Cas { .. } | EventPayload::Attachment { .. } => {
+            Err(ReduceError::MissingInlinePayload {
+                event_type: event.event_type.clone(),
+            })
+        }
     }
 }
 fn field(event: &EventEnvelope, name: &'static str) -> Result<String, ReduceError> {

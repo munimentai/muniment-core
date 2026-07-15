@@ -5,6 +5,7 @@ pub mod export;
 pub mod reducer;
 pub mod retention;
 
+use crate::attachment::ChatAttachment;
 use crate::cas::ContentHash;
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -33,6 +34,7 @@ pub struct CasReference {
 pub enum EventPayload {
     Inline { payload_json: Value },
     Cas { payload_cas: CasReference },
+    Attachment { attachment: ChatAttachment },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -412,10 +414,16 @@ fn referenced_hashes_for_run(
         let raw = row?;
         let event: EventEnvelope = serde_json::from_str(&raw)
             .map_err(|e| JournalError::Corrupt(format!("invalid stored envelope JSON: {e}")))?;
-        if let EventPayload::Cas { payload_cas } = event.payload {
-            hashes.insert(ContentHash::from_str(&payload_cas.sha256).map_err(|error| {
-                JournalError::Corrupt(format!("invalid stored CAS reference: {error}"))
-            })?);
+        match event.payload {
+            EventPayload::Cas { payload_cas } => {
+                hashes.insert(ContentHash::from_str(&payload_cas.sha256).map_err(|error| {
+                    JournalError::Corrupt(format!("invalid stored CAS reference: {error}"))
+                })?);
+            }
+            EventPayload::Attachment { attachment } => {
+                hashes.insert(attachment.sha256().clone());
+            }
+            EventPayload::Inline { .. } => {}
         }
     }
     Ok(hashes)

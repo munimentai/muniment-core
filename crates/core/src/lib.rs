@@ -6,6 +6,7 @@
 
 pub mod asr;
 pub mod attach;
+pub mod attachment;
 pub mod auth;
 pub mod cas;
 pub mod journal;
