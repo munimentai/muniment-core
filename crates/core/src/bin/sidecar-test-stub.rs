@@ -10,6 +10,10 @@ fn main() {
         llama_server_stub(args);
         return;
     }
+    if first.as_deref() == Some("--mode") {
+        pi_resume(args.collect());
+        return;
+    }
     match first.as_deref() {
         Some("echo") => echo(),
         Some("json-rpc") => json_rpc(args.next()),
@@ -117,6 +121,46 @@ fn main() {
             }
         }
         _ => std::process::exit(2),
+    }
+}
+
+fn pi_resume(args: Vec<String>) {
+    if let Ok(path) = std::env::var("PI_RESUME_STUB_ARGS") {
+        fs::write(path, args.join("\n")).unwrap();
+    }
+    for line in io::stdin().lock().lines() {
+        let request: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+        match request["type"].as_str().unwrap() {
+            "get_state" => println!(
+                "{}",
+                serde_json::json!({"type":"response", "command":"get_state", "success":true, "id":request["id"]})
+            ),
+            "prompt" => {
+                if let Ok(path) = std::env::var("PI_RESUME_STUB_PROMPTS") {
+                    let mut prompts = fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .unwrap();
+                    writeln!(prompts, "{}", request["message"].as_str().unwrap()).unwrap();
+                }
+                println!(
+                    "{}",
+                    serde_json::json!({"type":"response", "command":"prompt", "success":true, "id":request["id"]})
+                );
+                println!(
+                    "{}",
+                    serde_json::json!({"type":"message_update", "assistantMessageEvent":{"type":"text_delta", "delta":" resumed"}})
+                );
+                println!("{}", serde_json::json!({"type":"agent_end"}));
+            }
+            "abort" => println!(
+                "{}",
+                serde_json::json!({"type":"response", "command":"abort", "success":true, "id":request["id"]})
+            ),
+            command => panic!("unexpected command: {command}"),
+        }
+        io::stdout().flush().unwrap();
     }
 }
 

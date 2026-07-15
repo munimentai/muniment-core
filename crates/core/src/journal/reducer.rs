@@ -66,6 +66,8 @@ pub struct RunState {
     pub last_seq: u64,
     pub status: RunStatus,
     pub pi_session: Option<PiSessionBinding>,
+    pub pending_permission: Option<PermissionGate>,
+    pub running_effects: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -262,7 +264,10 @@ impl RunReducer {
 
         let terminal = self.state.as_ref().is_some_and(RunState::is_terminal);
         if terminal
-            && event.event_type != "run.needs_attention"
+            && !matches!(
+                event.event_type.as_str(),
+                "run.needs_attention" | "run.resumed"
+            )
             && is_state_event(&event.event_type)
         {
             return Err(invalid(event, "event follows a terminal run state"));
@@ -345,8 +350,6 @@ impl RunReducer {
                 },
             )?,
             "run.needs_attention" => {
-                self.pending_gate = None;
-                self.open_effects.clear();
                 self.set_status(
                     event,
                     RunStatus::NeedsAttention(AttentionReason::Recorded {
@@ -354,6 +357,18 @@ impl RunReducer {
                             .unwrap_or_else(|| "unspecified".into()),
                     }),
                 );
+            }
+            "run.resumed" => {
+                if !matches!(
+                    self.state.as_ref().map(|state| &state.status),
+                    Some(RunStatus::NeedsAttention(_))
+                ) || self.pending_gate.is_some()
+                    || !self.open_effects.is_empty()
+                    || self.pi_session.is_none()
+                {
+                    return Err(invalid(event, "run is not safely resumable"));
+                }
+                self.set_status(event, RunStatus::Active);
             }
             _ => {
                 if self.state.is_none() {
@@ -374,7 +389,7 @@ impl RunReducer {
                 detail: "empty journal".into(),
             })?;
         // Open effects retain start order; report the earliest dangling effect deterministically.
-        if self.pending_gate.is_none() {
+        if self.pending_gate.is_none() && !matches!(state.status, RunStatus::NeedsAttention(_)) {
             if let Some(effect_id) = self.open_effects.into_iter().next() {
                 state.status =
                     RunStatus::NeedsAttention(AttentionReason::UnknownEffectOutcome { effect_id });
@@ -412,6 +427,8 @@ impl RunReducer {
             last_seq: event.run_seq,
             status,
             pi_session: self.pi_session.clone(),
+            pending_permission: self.pending_gate.clone(),
+            running_effects: self.open_effects.clone(),
         });
     }
 }
@@ -468,6 +485,7 @@ fn is_known_safety_event(t: &str) -> bool {
             | "tool.effect.completed"
             | "tool.effect.failed"
             | "runtime.pi_session.bound"
+            | "run.resumed"
     )
 }
 fn is_state_event(t: &str) -> bool {

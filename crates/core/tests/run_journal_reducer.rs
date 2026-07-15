@@ -303,6 +303,40 @@ fn recorded_attention_clears_all_concurrent_effects() {
 }
 
 #[test]
+fn explicit_resume_requires_a_bound_session_and_no_unresolved_effect() {
+    let safe = stream(&[
+        ("run.started", json!({})),
+        (
+            "runtime.pi_session.bound",
+            json!({"run_id":RUN,"locator":"session.jsonl"}),
+        ),
+        ("run.needs_attention", json!({"reason":"interrupted"})),
+        ("run.resumed", json!({})),
+        ("model.prompt.accepted", json!({})),
+        ("run.completed", json!({"receipt":{}})),
+    ]);
+    assert_eq!(reduce(&safe).unwrap().status, RunStatus::Completed);
+    assert!(safe
+        .windows(2)
+        .all(|pair| pair[1].run_seq == pair[0].run_seq + 1));
+
+    let unsafe_effect = stream(&[
+        ("run.started", json!({})),
+        (
+            "runtime.pi_session.bound",
+            json!({"run_id":RUN,"locator":"session.jsonl"}),
+        ),
+        ("tool.effect.started", json!({"effect_id":"effect-1"})),
+        ("run.needs_attention", json!({"reason":"interrupted"})),
+        ("run.resumed", json!({})),
+    ]);
+    assert!(matches!(
+        reduce(&unsafe_effect),
+        Err(ReduceError::InvalidTransition { .. })
+    ));
+}
+
+#[test]
 fn ordering_terminal_and_forward_compatibility_fail_closed() {
     let mut gap = stream(&[("run.started", json!({})), ("future.harmless", json!({}))]);
     gap[1].run_seq = 3;
