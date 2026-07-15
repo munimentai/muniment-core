@@ -5,7 +5,7 @@ use std::io::Read;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
 const DEVICES_PATH: &str = "/v1/auth/native/devices";
@@ -30,7 +30,7 @@ impl fmt::Debug for NativeDeviceListRequest {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NativeDevicePlatform {
     Ios,
@@ -39,7 +39,7 @@ pub enum NativeDevicePlatform {
 }
 
 /// Server-derived display metadata for one native installation.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeDevice {
     pub device_id: Uuid,
@@ -60,7 +60,7 @@ where
     Option::deserialize(deserializer)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeDeviceList {
     pub devices: Vec<NativeDevice>,
