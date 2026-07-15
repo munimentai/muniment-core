@@ -31,6 +31,62 @@ fn temp_marker(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("muniment-sidecar-{name}-{}", std::process::id()))
 }
 
+struct FileMarker(PathBuf);
+
+impl FileMarker {
+    fn new(name: &str) -> Self {
+        let path = temp_marker(name);
+        let _ = std::fs::remove_file(&path);
+        Self(path)
+    }
+}
+
+impl Drop for FileMarker {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+struct ProbeRelease(Option<std::sync::mpsc::Sender<()>>);
+
+impl Drop for ProbeRelease {
+    fn drop(&mut self) {
+        if let Some(release) = self.0.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+struct ProcessIdentity {
+    pid: u32,
+    start_time: String,
+}
+
+#[cfg(target_os = "linux")]
+impl ProcessIdentity {
+    fn read(pid: u32) -> std::io::Result<Self> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        let fields = stat
+            .rsplit_once(") ")
+            .map(|(_, fields)| fields)
+            .ok_or_else(|| std::io::Error::other("invalid /proc stat"))?;
+        let start_time = fields
+            .split_whitespace()
+            .nth(19)
+            .ok_or_else(|| std::io::Error::other("missing process start time"))?;
+        Ok(Self {
+            pid,
+            start_time: start_time.to_owned(),
+        })
+    }
+
+    fn still_exists(&self) -> bool {
+        Self::read(self.pid).is_ok_and(|current| current == *self)
+    }
+}
+
 fn wait_for(supervisor: &SidecarSupervisor, wanted: SidecarStatus) {
     let until = Instant::now() + Duration::from_secs(5);
     while Instant::now() < until {
@@ -360,12 +416,12 @@ fn hard_startup_probe_failure_uses_health_failure_path() {
 
 #[test]
 fn shutdown_during_loading_is_prompt_and_reaps_child() {
-    let pid_file = temp_marker("loading-pid");
-    let _ = std::fs::remove_file(&pid_file);
-    let pid_arg = pid_file.to_string_lossy().into_owned();
+    let pid_file = FileMarker::new("loading-pid");
+    let pid_arg = pid_file.0.to_string_lossy().into_owned();
     let mut cfg = config(&["pid", &pid_arg]);
     cfg.startup_timeout = Duration::from_secs(30);
     let (release_probe, blocked_probe) = std::sync::mpsc::channel();
+    let _release_probe = ProbeRelease(Some(release_probe));
     let blocked_probe = Arc::new(std::sync::Mutex::new(blocked_probe));
     let probe_started = Arc::new(AtomicUsize::new(0));
     let started_probe = Arc::clone(&probe_started);
@@ -378,7 +434,7 @@ fn shutdown_during_loading_is_prompt_and_reaps_child() {
     let events = supervisor.subscribe();
     assert_eq!(next_event(&events).status, SidecarStatus::Starting);
     let until = Instant::now() + Duration::from_secs(2);
-    while !pid_file.exists() {
+    while !pid_file.0.exists() {
         assert!(Instant::now() < until, "stub did not write its pid");
         thread::yield_now();
     }
@@ -386,15 +442,21 @@ fn shutdown_during_loading_is_prompt_and_reaps_child() {
         assert!(Instant::now() < until, "probe did not start");
         thread::yield_now();
     }
-    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    let pid: u32 = std::fs::read_to_string(&pid_file.0)
+        .unwrap()
+        .parse()
+        .unwrap();
+    #[cfg(target_os = "linux")]
+    let child_identity = ProcessIdentity::read(pid).unwrap();
     let started = Instant::now();
     supervisor.shutdown().unwrap();
     assert!(started.elapsed() < Duration::from_secs(1));
     assert_eq!(next_event(&events).status, SidecarStatus::Stopped);
     #[cfg(target_os = "linux")]
-    assert!(!PathBuf::from(format!("/proc/{pid}")).exists());
-    release_probe.send(()).unwrap();
-    let _ = std::fs::remove_file(pid_file);
+    assert!(
+        !child_identity.still_exists(),
+        "exact child {child_identity:?} still exists after shutdown returned"
+    );
 }
 
 #[test]
