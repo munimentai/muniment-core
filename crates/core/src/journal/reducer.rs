@@ -86,6 +86,17 @@ pub struct ChatProjection {
     pub status: Option<RunStatus>,
     pub pending_permission: Option<PermissionGate>,
     pub tool_activity: Vec<ToolActivity>,
+    pub attachments: Vec<ProjectedAttachment>,
+}
+
+/// Safe attachment metadata for display outside the journal/CAS boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectedAttachment {
+    pub display_name: String,
+    pub byte_length: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,6 +135,18 @@ impl ChatProjector {
     pub fn apply(&mut self, event: &EventEnvelope) -> Result<(), ReduceError> {
         self.reducer.apply(event)?;
         match event.event_type.as_str() {
+            "chat.attachment.ingested" => {
+                let EventPayload::Attachment { attachment } = &event.payload else {
+                    return Err(ReduceError::MissingAttachmentPayload {
+                        event_type: event.event_type.clone(),
+                    });
+                };
+                self.chat.attachments.push(ProjectedAttachment {
+                    display_name: attachment.display_name().to_owned(),
+                    byte_length: attachment.byte_length(),
+                    media_type: attachment.media_type().map(str::to_owned),
+                });
+            }
             "model.prompt.accepted" => self.chat.prompt_accepted = true,
             "model.stream.delta" => self.chat.text.push_str(&field(event, "text")?),
             "tool.effect.started" => self.chat.tool_activity.push(ToolActivity {
@@ -194,6 +217,9 @@ pub enum ReduceError {
         version: u32,
     },
     MissingInlinePayload {
+        event_type: String,
+    },
+    MissingAttachmentPayload {
         event_type: String,
     },
     MissingField {
@@ -279,6 +305,11 @@ impl RunReducer {
                     return Err(invalid(event, "run may only start once"));
                 }
                 self.set_status(event, RunStatus::Active);
+            }
+            "chat.attachment.ingested" => {
+                self.require_active(event)?;
+                let status = self.state.as_ref().unwrap().status.clone();
+                self.set_status(event, status);
             }
             "runtime.pi_session.bound" => {
                 self.require_active(event)?;
@@ -474,14 +505,16 @@ fn invalid(event: &EventEnvelope, detail: &str) -> ReduceError {
     }
 }
 fn is_safety_event(t: &str) -> bool {
-    t.starts_with("permission.")
+    t.starts_with("chat.attachment.")
+        || t.starts_with("permission.")
         || t.starts_with("tool.effect.")
         || t.starts_with("runtime.pi_session.")
 }
 fn is_known_safety_event(t: &str) -> bool {
     matches!(
         t,
-        "permission.requested"
+        "chat.attachment.ingested"
+            | "permission.requested"
             | "permission.resolved"
             | "tool.effect.started"
             | "tool.effect.completed"
@@ -491,7 +524,8 @@ fn is_known_safety_event(t: &str) -> bool {
     )
 }
 fn is_state_event(t: &str) -> bool {
-    t.starts_with("run.")
+    t.starts_with("chat.attachment.")
+        || t.starts_with("run.")
         || t.starts_with("model.")
         || t.starts_with("permission.")
         || t.starts_with("tool.")

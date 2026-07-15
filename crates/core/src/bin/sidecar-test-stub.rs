@@ -128,14 +128,36 @@ fn pi_resume(args: Vec<String>) {
     if let Ok(path) = std::env::var("PI_RESUME_STUB_ARGS") {
         fs::write(path, args.join("\n")).unwrap();
     }
+    let session_file = args
+        .windows(2)
+        .find(|pair| pair[0] == "--session")
+        .map(|pair| std::path::PathBuf::from(&pair[1]))
+        .or_else(|| {
+            args.windows(2)
+                .find(|pair| pair[0] == "--session-dir")
+                .map(|pair| {
+                    std::path::Path::new(&pair[1])
+                        .join(format!("stub-{}.jsonl", std::process::id()))
+                })
+        })
+        .unwrap();
     for line in io::stdin().lock().lines() {
         let request: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
         match request["type"].as_str().unwrap() {
             "get_state" => println!(
                 "{}",
-                serde_json::json!({"type":"response", "command":"get_state", "success":true, "id":request["id"]})
+                serde_json::json!({
+                    "type":"response", "command":"get_state", "success":true,
+                    "id":request["id"], "data":{"sessionFile":session_file}
+                })
             ),
             "prompt" => {
+                if !session_file.exists() {
+                    if let Some(parent) = session_file.parent() {
+                        fs::create_dir_all(parent).unwrap();
+                    }
+                    fs::write(&session_file, "{}\n").unwrap();
+                }
                 if let Ok(path) = std::env::var("PI_RESUME_STUB_PROMPTS") {
                     let mut prompts = fs::OpenOptions::new()
                         .create(true)
