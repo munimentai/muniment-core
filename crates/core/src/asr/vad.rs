@@ -56,6 +56,12 @@ impl std::fmt::Display for VadError {
 
 impl std::error::Error for VadError {}
 
+/// Narrow decision seam used by the pure-core dictation pipeline.
+pub trait VadDecisionSource {
+    fn detect(&mut self, samples: &[f32]) -> Result<VoiceActivity, VadError>;
+    fn discontinuity(&mut self);
+}
+
 trait VadBackend: Send {
     fn detect(&mut self, samples: &[f32]) -> VoiceActivity;
     fn reset(&mut self);
@@ -139,6 +145,16 @@ impl SileroVoiceActivityDetector {
 
     pub fn discontinuity(&mut self) {
         self.reset();
+    }
+}
+
+impl VadDecisionSource for SileroVoiceActivityDetector {
+    fn detect(&mut self, samples: &[f32]) -> Result<VoiceActivity, VadError> {
+        SileroVoiceActivityDetector::detect(self, VAD_SAMPLE_RATE, samples)
+    }
+
+    fn discontinuity(&mut self) {
+        SileroVoiceActivityDetector::discontinuity(self);
     }
 }
 

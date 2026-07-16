@@ -213,7 +213,7 @@ impl UtteranceSegmenter {
     }
 }
 
-fn validate_samples(samples: &[f32]) -> Result<(), UtteranceInputError> {
+pub(super) fn validate_samples(samples: &[f32]) -> Result<(), UtteranceInputError> {
     for sample in samples {
         if !sample.is_finite() {
             return Err(UtteranceInputError::NonFiniteSample);

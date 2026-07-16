@@ -3,12 +3,16 @@
 pub mod acquisition;
 pub mod capture;
 pub mod install;
+pub mod pipeline;
 mod recognizer;
 pub mod utterance;
 mod vad;
 
+pub use pipeline::{DictationPipeline, DictationPipelineError, DictationPipelinePushError};
 pub use recognizer::{OfflineParakeetRecognizer, OfflineRecognitionError};
-pub use vad::{SileroVoiceActivityDetector, VadError, VAD_FRAME_SIZE, VAD_SAMPLE_RATE};
+pub use vad::{
+    SileroVoiceActivityDetector, VadDecisionSource, VadError, VAD_FRAME_SIZE, VAD_SAMPLE_RATE,
+};
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Write};
