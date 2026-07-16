@@ -205,6 +205,9 @@ pub enum ErrorCode {
     PersistenceFailed,
     InvalidCursor,
     InvalidArtifactCursor,
+    InvalidRequest,
+    Unauthorized,
+    UnsupportedOperation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -375,6 +378,12 @@ pub enum ErrorMessage {
     InvalidCursor,
     #[serde(rename = "The artifact transfer cursor is invalid.")]
     InvalidArtifactCursor,
+    #[serde(rename = "The request is invalid.")]
+    InvalidRequest,
+    #[serde(rename = "The capability is not authorized.")]
+    Unauthorized,
+    #[serde(rename = "The operation is not supported.")]
+    UnsupportedOperation,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -445,6 +454,21 @@ impl ProtocolError {
         )
     }
 
+    pub fn invalid_request() -> Self {
+        Self::simple(ErrorCode::InvalidRequest, ErrorMessage::InvalidRequest)
+    }
+
+    pub fn unauthorized() -> Self {
+        Self::simple(ErrorCode::Unauthorized, ErrorMessage::Unauthorized)
+    }
+
+    pub fn unsupported_operation() -> Self {
+        Self::simple(
+            ErrorCode::UnsupportedOperation,
+            ErrorMessage::UnsupportedOperation,
+        )
+    }
+
     fn simple(code: ErrorCode, message: ErrorMessage) -> Self {
         Self {
             code,
@@ -499,6 +523,9 @@ impl<'de> Deserialize<'de> for ProtocolError {
             (ErrorCode::PersistenceFailed, None, None) => Self::persistence_failed(),
             (ErrorCode::InvalidCursor, None, None) => Self::invalid_cursor(),
             (ErrorCode::InvalidArtifactCursor, None, None) => Self::invalid_artifact_cursor(),
+            (ErrorCode::InvalidRequest, None, None) => Self::invalid_request(),
+            (ErrorCode::Unauthorized, None, None) => Self::unauthorized(),
+            (ErrorCode::UnsupportedOperation, None, None) => Self::unsupported_operation(),
             _ => return Err(de::Error::custom("invalid error schema")),
         };
         if wire.message != expected.message || wire.retryable != expected.retryable {

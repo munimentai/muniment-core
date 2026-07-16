@@ -234,6 +234,23 @@ impl<C: AuthorizationClock, G: AuthorizationTokenGenerator> AuthorizationState<C
         workspace: &str,
         required_scope: &str,
     ) -> Result<(), AuthorizationError> {
+        self.validate_request_with_scope(
+            capability,
+            binding,
+            profile,
+            workspace,
+            Some(required_scope),
+        )
+    }
+
+    pub fn validate_request_with_scope(
+        &mut self,
+        capability: &str,
+        binding: &ConnectionBinding,
+        profile: &str,
+        workspace: &str,
+        required_scope: Option<&str>,
+    ) -> Result<(), AuthorizationError> {
         let now = self.clock.now();
         let active = match &mut self.state {
             State::Active(active) => active,
@@ -253,7 +270,7 @@ impl<C: AuthorizationClock, G: AuthorizationTokenGenerator> AuthorizationState<C
         if workspace != active.approval.workspace {
             return Err(AuthorizationError::WrongWorkspace);
         }
-        if !active.approval.scopes.contains(required_scope) {
+        if required_scope.is_some_and(|scope| !active.approval.scopes.contains(scope)) {
             return Err(AuthorizationError::MissingScope);
         }
         if now > active.expires_at {
@@ -264,6 +281,24 @@ impl<C: AuthorizationClock, G: AuthorizationTokenGenerator> AuthorizationState<C
         }
         active.last_activity = now;
         Ok(())
+    }
+
+    /// Time remaining before an otherwise idle connection must be rechecked and closed.
+    pub fn remaining_lifetime(&self) -> Result<Duration, AuthorizationError> {
+        let now = self.clock.now();
+        let active = match &self.state {
+            State::Active(active) => active,
+            State::Revoked => return Err(AuthorizationError::Revoked),
+            _ => return Err(AuthorizationError::NotAuthorized),
+        };
+        if now > active.expires_at {
+            return Err(AuthorizationError::Expired);
+        }
+        let idle_expires_at = active.last_activity + CAPABILITY_IDLE_LIFETIME;
+        if now > idle_expires_at {
+            return Err(AuthorizationError::IdleExpired);
+        }
+        Ok(active.expires_at.min(idle_expires_at).saturating_sub(now))
     }
 
     /// Atomically invalidates all pairing and capability material. Idempotent.

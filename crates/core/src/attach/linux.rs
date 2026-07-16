@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 
 use super::{
     authorized, encode_frame, welcome, Approval, AuthorizationClock, AuthorizationError,
-    AuthorizationState, AuthorizationTokenGenerator, ConnectionBinding, ErrorEnvelope, Failure,
-    FirstMessage, NegotiationError, Protocol, ProtocolError, VersionRange, CHALLENGE_LIFETIME,
-    MAX_FRAME_LENGTH,
+    AuthorizationState, AuthorizationTokenGenerator, ConnectionBinding, Envelope, ErrorEnvelope,
+    Failure, FirstMessage, NegotiationError, Operation, Protocol, ProtocolError, Request, Response,
+    Success, VersionRange, CHALLENGE_LIFETIME, MAX_FRAME_LENGTH, MAX_TEXT_LENGTH,
 };
 
 const ATTACH_DIRECTORY: &[u8] = b"muniment\0";
@@ -345,6 +345,48 @@ pub struct AuthorizationSessionDependencies<R, C, G, W> {
     pub approvals: W,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadListRequest {
+    pub limit: u8,
+    pub cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RedactedThreadSummary {
+    pub thread_id: String,
+    pub title: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ThreadListPage {
+    pub threads: Vec<RedactedThreadSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Deterministic desktop data seam for the one operation served by this slice.
+pub trait ThreadListService {
+    fn list_threads(
+        &mut self,
+        workspace: &str,
+        request: ThreadListRequest,
+    ) -> Result<ThreadListPage, ProtocolError>;
+}
+
+impl<F> ThreadListService for F
+where
+    F: FnMut(&str, ThreadListRequest) -> Result<ThreadListPage, ProtocolError>,
+{
+    fn list_threads(
+        &mut self,
+        workspace: &str,
+        request: ThreadListRequest,
+    ) -> Result<ThreadListPage, ProtocolError> {
+        self(workspace, request)
+    }
+}
+
 impl std::error::Error for AttachSessionError {}
 
 /// Completes the single hello/welcome exchange allowed before authorization.
@@ -375,6 +417,8 @@ pub fn run_authenticated_session_with<R>(
 where
     R: FnMut(&mut [u8]) -> Result<(), ()>,
 {
+    let mut unavailable =
+        |_: &str, _: ThreadListRequest| Err(ProtocolError::unsupported_operation());
     run_authenticated_session_with_authorization(
         stream,
         credentials,
@@ -386,6 +430,7 @@ where
             tokens: SessionTokens,
             approvals: |_: &super::PairingChallenge, _: Duration| Some(ApprovalDecision::Deny),
         },
+        &mut unavailable,
     )
 }
 
@@ -406,18 +451,45 @@ impl AuthorizationTokenGenerator for SessionTokens {
 
 /// Negotiates and waits for a deterministic desktop approval decision.
 #[doc(hidden)]
-pub fn run_authenticated_session_with_authorization<R, C, G, W>(
-    mut stream: UnixStream,
+pub fn run_authenticated_session_with_authorization<R, C, G, W, S>(
+    stream: UnixStream,
     credentials: PeerCredentials,
     desktop_version: &str,
     timeout: Duration,
     dependencies: AuthorizationSessionDependencies<R, C, G, W>,
+    service: &mut S,
 ) -> Result<(), AttachSessionError>
 where
     R: FnMut(&mut [u8]) -> Result<(), ()>,
     C: AuthorizationClock + Clone,
     G: AuthorizationTokenGenerator,
     W: ApprovalWaiter,
+    S: ThreadListService,
+{
+    run_session(
+        stream,
+        credentials,
+        desktop_version,
+        timeout,
+        dependencies,
+        service,
+    )
+}
+
+fn run_session<R, C, G, W, S>(
+    mut stream: UnixStream,
+    credentials: PeerCredentials,
+    desktop_version: &str,
+    timeout: Duration,
+    dependencies: AuthorizationSessionDependencies<R, C, G, W>,
+    service: &mut S,
+) -> Result<(), AttachSessionError>
+where
+    R: FnMut(&mut [u8]) -> Result<(), ()>,
+    C: AuthorizationClock + Clone,
+    G: AuthorizationTokenGenerator,
+    W: ApprovalWaiter,
+    S: ThreadListService,
 {
     let AuthorizationSessionDependencies {
         mut fill_random,
@@ -476,7 +548,7 @@ where
             companion_identity: format!("{}:{}", credentials.uid, credentials.pid),
             companion_kind,
         };
-        let mut authorization = AuthorizationState::new(clock.clone(), tokens, binding);
+        let mut authorization = AuthorizationState::new(clock.clone(), tokens, binding.clone());
         let challenge_expires_at = clock.now() + CHALLENGE_LIFETIME;
         let challenge = authorization
             .issue_challenge()
@@ -518,7 +590,7 @@ where
         }
         let remaining = grant.expires_at.saturating_sub(clock.now()).as_secs();
         let mut workspace_scopes = std::collections::BTreeMap::new();
-        workspace_scopes.insert(grant.workspace, grant.scopes);
+        workspace_scopes.insert(grant.workspace.clone(), grant.scopes.clone());
         let response = authorized(
             capability.as_str(),
             remaining,
@@ -529,7 +601,17 @@ where
             &mut stream,
             &encode_frame(&response).map_err(|_| AttachSessionError::MalformedFrame)?,
             authorization_deadline,
-        )
+        )?;
+        serve_requests(
+            &mut stream,
+            timeout,
+            &binding,
+            &grant.profile,
+            &grant.workspace,
+            &mut authorization,
+            service,
+        )?;
+        Ok(())
     })();
     let _ = stream.shutdown(std::net::Shutdown::Both);
     result
@@ -562,6 +644,196 @@ fn read_before(
         }
     }
     Ok(())
+}
+
+fn serve_requests<C, G, S>(
+    stream: &mut UnixStream,
+    timeout: Duration,
+    binding: &ConnectionBinding,
+    profile: &str,
+    workspace: &str,
+    authorization: &mut AuthorizationState<C, G>,
+    service: &mut S,
+) -> Result<(), AttachSessionError>
+where
+    C: AuthorizationClock,
+    G: AuthorizationTokenGenerator,
+    S: ThreadListService,
+{
+    loop {
+        // Give an already-buffered request a chance to supply its correlation ID even when
+        // the grant has just expired. Validation below still prevents stale dispatch.
+        let (authorization_expired, idle_remaining) = match authorization.remaining_lifetime() {
+            Ok(remaining) => (false, remaining.max(Duration::from_millis(1))),
+            Err(_) => (true, Duration::from_millis(1)),
+        };
+        let idle_deadline = Instant::now()
+            .checked_add(idle_remaining)
+            .ok_or(AttachSessionError::Timeout)?;
+        let mut prefix = [0; 4];
+        match read_before(stream, &mut prefix, idle_deadline) {
+            Ok(()) => {}
+            Err(AttachSessionError::Closed) => return Ok(()),
+            Err(AttachSessionError::Timeout) => {
+                let deadline = Instant::now() + timeout;
+                write_protocol_error(stream, ProtocolError::unauthorized(), deadline);
+                return Err(AttachSessionError::Authorization);
+            }
+            Err(error) => return Err(error),
+        }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(AttachSessionError::Timeout)?
+            .min(idle_deadline);
+        let frame = match read_frame_after_prefix(stream, prefix, deadline) {
+            Ok(frame) => frame,
+            Err(error @ AttachSessionError::PayloadTooLarge) => {
+                write_protocol_error(stream, ProtocolError::payload_too_large(), deadline);
+                return Err(error);
+            }
+            Err(error @ AttachSessionError::Timeout) => return Err(error),
+            Err(error @ AttachSessionError::Closed) => return Err(error),
+            Err(error) => {
+                write_protocol_error(stream, ProtocolError::malformed_frame(), deadline);
+                return Err(error);
+            }
+        };
+        let request = match super::decode_frame::<Envelope>(&frame) {
+            Ok(Some((Envelope::Request(request), consumed))) if consumed == frame.len() => request,
+            _ => {
+                write_protocol_error(stream, ProtocolError::malformed_frame(), deadline);
+                return Err(AttachSessionError::MalformedFrame);
+            }
+        };
+        if authorization_expired {
+            write_request_error(
+                stream,
+                Some(request.request_id),
+                ProtocolError::unauthorized(),
+                deadline,
+            );
+            return Err(AttachSessionError::Authorization);
+        }
+        let required_scope = (request.operation == Operation::ThreadList).then_some("thread.read");
+        if authorization
+            .validate_request_with_scope(
+                &request.capability,
+                binding,
+                profile,
+                workspace,
+                required_scope,
+            )
+            .is_err()
+        {
+            write_request_error(
+                stream,
+                Some(request.request_id),
+                ProtocolError::unauthorized(),
+                deadline,
+            );
+            return Err(AttachSessionError::Authorization);
+        }
+        let request_id = request.request_id.clone();
+        match dispatch_request(request, workspace, service) {
+            Ok(body) => {
+                let response = Response {
+                    protocol: Protocol,
+                    request_id,
+                    ok: Success,
+                    body,
+                };
+                let frame =
+                    encode_frame(&response).map_err(|_| AttachSessionError::MalformedFrame)?;
+                write_before(stream, &frame, deadline)?;
+            }
+            Err(error) => write_request_error(stream, Some(request_id), error, deadline),
+        }
+    }
+}
+
+fn dispatch_request<S: ThreadListService>(
+    request: Request,
+    workspace: &str,
+    service: &mut S,
+) -> Result<serde_json::Value, ProtocolError> {
+    if request.operation != Operation::ThreadList {
+        return Err(ProtocolError::unsupported_operation());
+    }
+    request.validate_idempotency_key()?;
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body {
+        limit: u8,
+        #[serde(default)]
+        cursor: Option<String>,
+    }
+    let body: Body =
+        serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
+    if body.limit == 0
+        || body.limit > 100
+        || body
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.is_empty() || cursor.len() > MAX_TEXT_LENGTH)
+    {
+        return Err(ProtocolError::invalid_request());
+    }
+    let limit = body.limit;
+    let page = service.list_threads(
+        workspace,
+        ThreadListRequest {
+            limit,
+            cursor: body.cursor,
+        },
+    )?;
+    if page.threads.len() > usize::from(limit)
+        || page.threads.iter().any(|thread| {
+            thread.thread_id.is_empty()
+                || thread.thread_id.len() > MAX_TEXT_LENGTH
+                || thread.title.len() > MAX_TEXT_LENGTH
+                || thread.updated_at.is_empty()
+                || thread.updated_at.len() > MAX_TEXT_LENGTH
+        })
+        || page
+            .next_cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.is_empty() || cursor.len() > MAX_TEXT_LENGTH)
+    {
+        return Err(ProtocolError::persistence_failed());
+    }
+    serde_json::to_value(page).map_err(|_| ProtocolError::persistence_failed())
+}
+
+fn read_frame_after_prefix(
+    stream: &mut UnixStream,
+    prefix: [u8; 4],
+    deadline: Instant,
+) -> Result<Vec<u8>, AttachSessionError> {
+    let length = u32::from_be_bytes(prefix) as usize;
+    if length > MAX_FRAME_LENGTH {
+        return Err(AttachSessionError::PayloadTooLarge);
+    }
+    let mut frame = vec![0; length + 4];
+    frame[..4].copy_from_slice(&prefix);
+    read_before(stream, &mut frame[4..], deadline)?;
+    Ok(frame)
+}
+
+fn write_request_error(
+    stream: &mut UnixStream,
+    request_id: Option<super::Id>,
+    error: ProtocolError,
+    deadline: Instant,
+) {
+    let envelope = ErrorEnvelope {
+        protocol: Protocol,
+        request_id,
+        ok: Failure,
+        error,
+    };
+    if let Ok(frame) = encode_frame(&envelope) {
+        let _ = write_before(stream, &frame, deadline);
+    }
 }
 
 fn write_before(
