@@ -4,6 +4,7 @@ pub mod acquisition;
 pub mod capture;
 pub mod install;
 mod recognizer;
+pub mod utterance;
 
 pub use recognizer::{OfflineParakeetRecognizer, OfflineRecognitionError};
 
