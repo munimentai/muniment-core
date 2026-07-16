@@ -5,8 +5,10 @@ pub mod capture;
 pub mod install;
 mod recognizer;
 pub mod utterance;
+mod vad;
 
 pub use recognizer::{OfflineParakeetRecognizer, OfflineRecognitionError};
+pub use vad::{SileroVoiceActivityDetector, VadError, VAD_FRAME_SIZE, VAD_SAMPLE_RATE};
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Write};

@@ -434,18 +434,22 @@ fn shutdown_during_loading_is_prompt_and_reaps_child() {
     let events = supervisor.subscribe();
     assert_eq!(next_event(&events).status, SidecarStatus::Starting);
     let until = Instant::now() + Duration::from_secs(2);
-    while !pid_file.0.exists() {
+    let pid = loop {
+        if let Ok(pid) = std::fs::read_to_string(&pid_file.0)
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .parse::<u32>()
+        {
+            break pid;
+        }
         assert!(Instant::now() < until, "stub did not write its pid");
         thread::yield_now();
-    }
+    };
     while probe_started.load(Ordering::SeqCst) == 0 {
         assert!(Instant::now() < until, "probe did not start");
         thread::yield_now();
     }
-    let pid: u32 = std::fs::read_to_string(&pid_file.0)
-        .unwrap()
-        .parse()
-        .unwrap();
     #[cfg(target_os = "linux")]
     let child_identity = ProcessIdentity::read(pid).unwrap();
     let started = Instant::now();

@@ -51,6 +51,27 @@ the token-table values were reproduced by downloading that immutable URL and
 running `wc -c` and `sha256sum`. Future acquisition must verify size and digest
 before making the complete four-file set available to the recognizer.
 
+Voice activity detection uses sherpa-onnx's upstream-supported 16 kHz Silero
+model, `csukuangfj/vad` at immutable Hugging Face revision
+`af4fcfc9b8305246b1fe2ebcaf248975673166f1` (rather than the mutable GitHub
+`asr-models` release URL):
+
+| Filename | Byte size | SHA-256 |
+| --- | ---: | --- |
+| `silero_vad.onnx` | 1,807,522 | `a35ebf52fd3ce5f1469b2a36158dba761bc47b973ea3382b3186ca15b1f5af28` |
+
+Its immutable URL is
+`https://huggingface.co/csukuangfj/vad/resolve/af4fcfc9b8305246b1fe2ebcaf248975673166f1/silero_vad.onnx`.
+Silero is selected because sherpa-onnx v1.13.2 supports it directly through
+the already pinned `VoiceActivityDetector` API, documents 16 kHz operation,
+and recommends 512-sample windows; no second FFI or runtime is needed.
+
+The fixed production configuration is mono 16 kHz normalized float32 PCM,
+512 samples per call, threshold `0.5`, minimum speech `0.25 s`, minimum silence
+`0.5 s`, maximum speech `20 s`, a `30 s` internal result buffer, one CPU thread,
+CPU provider, and debug logging off. A discontinuity resets the detector and
+clears queued segments before more PCM is accepted.
+
 This is an **utterance-final/offline** recognizer, not streaming. The future
 capture layer supplies mono, 16 kHz PCM, converted at the boundary to normalized
 `float32` samples. VAD may delimit short utterances and make repeated offline
@@ -82,6 +103,12 @@ them. The release's bundled third-party notices and licenses (including ONNX
 Runtime) must be carried into the application's third-party notices. A release
 cannot ship until the generated notice inventory has been reviewed against the
 actual native bundle.
+
+Silero VAD is MIT-licensed. Distribution must retain its MIT copyright and
+permission notice and identify the pinned ONNX model and source project in the
+third-party notice inventory. The Hugging Face repository is a distribution
+location, not a replacement license grant; release review must match the model
+to the upstream Silero VAD notice.
 
 ### Integration and packaging boundary
 
@@ -151,8 +178,8 @@ latency, memory, or transcription quality. Failure of the validation gates
 reopens the artifact/recognizer decision rather than weakening the on-device
 privacy requirement. Acquisition, atomic publication, update/rollback,
 recovery, removal, and notice delivery are decided by [ADR
-0005](0005-asr-model-lifecycle.md). Capture UI, VAD selection, bindings, native
-binaries, model weights, and application integration remain follow-up work.
+0005](0005-asr-model-lifecycle.md). Capture UI, native binary/model packaging,
+and application integration remain follow-up work.
 
 ## Sources
 
@@ -160,6 +187,9 @@ binaries, model weights, and application integration remain follow-up work.
 - Immutable converted artifact: <https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/tree/2bda32ec70b097a55adaa07d9a7173915b43cc78>
 - sherpa-onnx v1.13.2 release: <https://github.com/k2-fsa/sherpa-onnx/releases/tag/v1.13.2>
 - Offline Parakeet model documentation: <https://k2-fsa.github.io/sherpa/onnx/pretrained_models/offline-transducer/nemo-transducer-models.html>
-- Offline microphone recognition: <https://k2-fsa.github.io/sherpa/onnx/tauri/vad-asr-mic.html>
+- Silero VAD integration: <https://k2-fsa.github.io/sherpa/onnx/vad/silero-vad.html>
+- VAD C API: <https://k2-fsa.github.io/sherpa/onnx/c-api/html/vad.html>
+- Immutable Silero artifact: <https://huggingface.co/csukuangfj/vad/tree/af4fcfc9b8305246b1fe2ebcaf248975673166f1>
+- Silero VAD license: <https://github.com/snakers4/silero-vad/blob/master/LICENSE>
 - CC BY 4.0: <https://creativecommons.org/licenses/by/4.0/legalcode>
 - Apache License 2.0: <https://github.com/k2-fsa/sherpa-onnx/blob/v1.13.2/LICENSE>
