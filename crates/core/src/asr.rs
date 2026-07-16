@@ -2,6 +2,9 @@
 
 pub mod acquisition;
 pub mod install;
+mod recognizer;
+
+pub use recognizer::{OfflineParakeetRecognizer, OfflineRecognitionError};
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Write};
