@@ -1,13 +1,19 @@
 #![cfg(target_os = "linux")]
 
 use muniment_core::attach::linux::{
-    AttachAcceptError, AttachFilesystem, AttachTransport, AttachTransportError, PeerCredentials,
+    run_authenticated_session_with, AttachAcceptError, AttachFilesystem, AttachTransport,
+    AttachTransportError, PeerCredentials,
+};
+use muniment_core::attach::{
+    decode_frame, encode_frame, Client, Hello, Protocol, VersionRange, Welcome,
 };
 use std::fs;
+use std::io::{Read, Write};
 use std::os::unix::fs::{symlink, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -50,6 +56,46 @@ fn publishes_authenticates_and_removes_a_private_socket() {
 
     drop(transport);
     assert!(!filesystem.endpoint_path().exists());
+}
+
+#[test]
+fn authenticated_pathname_peer_negotiates_then_closes() {
+    let runtime = TestDirectory::new();
+    let filesystem = AttachFilesystem::from_runtime_directory(&runtime.0).unwrap();
+    let transport = AttachTransport::bind(&filesystem).unwrap();
+    let mut client = UnixStream::connect(transport.local_path()).unwrap();
+    let hello = encode_frame(&Hello {
+        protocol: Protocol,
+        client: Client {
+            kind: "cli".into(),
+            version: "1.0.0".into(),
+        },
+        supported: VersionRange { min: 1, max: 1 },
+        client_nonce: "client-nonce".into(),
+    })
+    .unwrap();
+    for fragment in hello.chunks(3) {
+        client.write_all(fragment).unwrap();
+    }
+
+    // The session receives only the stream and credentials produced by authenticated accept.
+    let (server, peer) = transport.accept().unwrap();
+    assert_eq!(peer.uid, unsafe { libc::geteuid() });
+    run_authenticated_session_with(server, peer, "0.1.0", Duration::from_secs(1), |bytes| {
+        bytes.fill(7);
+        Ok(())
+    })
+    .unwrap();
+
+    let mut prefix = [0; 4];
+    client.read_exact(&mut prefix).unwrap();
+    let mut frame = vec![0; 4 + u32::from_be_bytes(prefix) as usize];
+    frame[..4].copy_from_slice(&prefix);
+    client.read_exact(&mut frame[4..]).unwrap();
+    let welcome: Welcome = decode_frame(&frame).unwrap().unwrap().0;
+    assert_eq!(welcome.selected, 1);
+    assert_eq!(welcome.desktop_version, "0.1.0");
+    assert_eq!(client.read(&mut [0]).unwrap(), 0);
 }
 
 #[test]

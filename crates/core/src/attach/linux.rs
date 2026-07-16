@@ -4,17 +4,25 @@ use std::env;
 use std::ffi::{CString, OsStr};
 use std::fmt;
 use std::fs::File;
-use std::io;
+use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use super::{
+    encode_frame, welcome, ErrorEnvelope, Failure, FirstMessage, FrameError, NegotiationError,
+    Protocol, ProtocolError, VersionRange, MAX_FRAME_LENGTH,
+};
 
 const ATTACH_DIRECTORY: &[u8] = b"muniment\0";
 const ENDPOINT_NAME: &str = "attach-v1.sock";
 const PRIVATE_MODE: libc::mode_t = 0o700;
 const SOCKET_MODE: libc::mode_t = 0o600;
+const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+const DESKTOP_PROTOCOL: VersionRange = VersionRange { min: 1, max: 1 };
 
 /// A verified, pinned filesystem boundary for the Linux attach endpoint.
 #[derive(Debug)]
@@ -268,6 +276,186 @@ pub struct PeerCredentials {
     pub pid: libc::pid_t,
     pub uid: libc::uid_t,
     pub gid: libc::gid_t,
+}
+
+/// Closed outcomes from the bounded, pre-authorization attach exchange.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachSessionError {
+    Closed,
+    Timeout,
+    MalformedFrame,
+    PayloadTooLarge,
+    ProtocolIncompatible,
+    Randomness,
+}
+
+impl fmt::Display for AttachSessionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Closed => "attach stream closed",
+            Self::Timeout => "attach hello timed out",
+            Self::MalformedFrame => "attach frame is malformed",
+            Self::PayloadTooLarge => "attach payload exceeds the allowed size",
+            Self::ProtocolIncompatible => "attach protocol is incompatible",
+            Self::Randomness => "attach session randomness is unavailable",
+        })
+    }
+}
+
+impl std::error::Error for AttachSessionError {}
+
+/// Completes the single hello/welcome exchange allowed before authorization.
+/// `credentials` must be the value returned alongside `stream` by [`AttachTransport::accept`].
+pub fn run_authenticated_session(
+    stream: UnixStream,
+    credentials: PeerCredentials,
+    desktop_version: &str,
+) -> Result<(), AttachSessionError> {
+    run_authenticated_session_with(
+        stream,
+        credentials,
+        desktop_version,
+        HELLO_TIMEOUT,
+        |bytes: &mut [u8]| getrandom::fill(bytes).map_err(|_| ()),
+    )
+}
+
+/// Testable form of [`run_authenticated_session`] with bounded timing and randomness seams.
+#[doc(hidden)]
+pub fn run_authenticated_session_with<R>(
+    mut stream: UnixStream,
+    _credentials: PeerCredentials,
+    desktop_version: &str,
+    timeout: Duration,
+    mut fill_random: R,
+) -> Result<(), AttachSessionError>
+where
+    R: FnMut(&mut [u8]) -> Result<(), ()>,
+{
+    let result = (|| {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(AttachSessionError::Timeout)?;
+        let mut prefix = [0u8; 4];
+        read_before(&mut stream, &mut prefix, deadline)?;
+        let length = u32::from_be_bytes(prefix) as usize;
+        if length > MAX_FRAME_LENGTH {
+            write_protocol_error(&mut stream, ProtocolError::payload_too_large(), deadline);
+            return Err(AttachSessionError::PayloadTooLarge);
+        }
+
+        let mut frame = Vec::with_capacity(4 + length);
+        frame.extend_from_slice(&prefix);
+        frame.resize(4 + length, 0);
+        read_before(&mut stream, &mut frame[4..], deadline)?;
+        let message = match super::decode_frame::<FirstMessage>(&frame) {
+            Ok(Some((message, _))) => message,
+            Err(FrameError::PayloadTooLarge) => {
+                write_protocol_error(&mut stream, ProtocolError::payload_too_large(), deadline);
+                return Err(AttachSessionError::PayloadTooLarge);
+            }
+            _ => {
+                write_protocol_error(&mut stream, ProtocolError::malformed_frame(), deadline);
+                return Err(AttachSessionError::MalformedFrame);
+            }
+        };
+
+        let selected = match super::negotiate_first(message, DESKTOP_PROTOCOL) {
+            Ok(selected) => selected,
+            Err(NegotiationError::Incompatible(error)) => {
+                write_protocol_error(&mut stream, error, deadline);
+                return Err(AttachSessionError::ProtocolIncompatible);
+            }
+            Err(_) => {
+                write_protocol_error(&mut stream, ProtocolError::malformed_frame(), deadline);
+                return Err(AttachSessionError::MalformedFrame);
+            }
+        };
+
+        let mut random = [0u8; 32];
+        fill_random(&mut random).map_err(|_| AttachSessionError::Randomness)?;
+        let server_nonce = hex(&random[..16]);
+        let approval_challenge = hex(&random[16..]);
+        let response = welcome(selected, desktop_version, server_nonce, approval_challenge);
+        let frame = encode_frame(&response).map_err(|_| AttachSessionError::MalformedFrame)?;
+        write_before(&mut stream, &frame, deadline)
+    })();
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    result
+}
+
+fn read_before(
+    stream: &mut UnixStream,
+    mut bytes: &mut [u8],
+    deadline: Instant,
+) -> Result<(), AttachSessionError> {
+    while !bytes.is_empty() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(AttachSessionError::Timeout)?;
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|_| AttachSessionError::Closed)?;
+        match stream.read(bytes) {
+            Ok(0) => return Err(AttachSessionError::Closed),
+            Ok(read) => bytes = &mut bytes[read..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(AttachSessionError::Timeout)
+            }
+            Err(_) => return Err(AttachSessionError::Closed),
+        }
+    }
+    Ok(())
+}
+
+fn write_before(
+    stream: &mut UnixStream,
+    bytes: &[u8],
+    deadline: Instant,
+) -> Result<(), AttachSessionError> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(AttachSessionError::Timeout)?;
+    stream
+        .set_write_timeout(Some(remaining))
+        .map_err(|_| AttachSessionError::Closed)?;
+    stream.write_all(bytes).map_err(|error| {
+        if matches!(
+            error.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        ) {
+            AttachSessionError::Timeout
+        } else {
+            AttachSessionError::Closed
+        }
+    })
+}
+
+fn write_protocol_error(stream: &mut UnixStream, error: ProtocolError, deadline: Instant) {
+    let envelope = ErrorEnvelope {
+        protocol: Protocol,
+        request_id: None,
+        ok: Failure,
+        error,
+    };
+    if let Ok(frame) = encode_frame(&envelope) {
+        let _ = write_before(stream, &frame, deadline);
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(DIGITS[(byte >> 4) as usize] as char);
+        encoded.push(DIGITS[(byte & 0xf) as usize] as char);
+    }
+    encoded
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
