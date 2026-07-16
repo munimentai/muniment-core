@@ -6,17 +6,17 @@ use sherpa_onnx::{SileroVadModelConfig, VadModelConfig, VoiceActivityDetector};
 
 use super::{
     utterance::VoiceActivity, verify_artifact, AsrArtifactDescriptor, AsrModelSetVerificationError,
+    PARAKEET_MODEL_MANIFEST,
 };
 
 pub const VAD_SAMPLE_RATE: u32 = 16_000;
 pub const VAD_FRAME_SIZE: usize = 512;
 const VAD_BUFFER_SECONDS: f32 = 30.0;
 
-pub const SILERO_VAD_ARTIFACT: AsrArtifactDescriptor = AsrArtifactDescriptor {
-    filename: "silero_vad.onnx",
-    byte_size: 1_807_522,
-    sha256: "a35ebf52fd3ce5f1469b2a36158dba761bc47b973ea3382b3186ca15b1f5af28",
-};
+pub const SILERO_VAD_ARTIFACT: AsrArtifactDescriptor = PARAKEET_MODEL_MANIFEST
+    .additional_artifact
+    .unwrap()
+    .artifact;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum VadError {

@@ -11,7 +11,7 @@ use muniment_core::asr::acquisition::{
 use muniment_core::asr::install::install_parakeet_revision;
 use muniment_core::asr::{
     AsrArtifactDescriptor, AsrArtifactManifest, AsrLifecycleBoundary, AsrPersistenceError,
-    AsrRevisionLifecycle,
+    AsrRevisionLifecycle, AsrSourcedArtifactDescriptor,
 };
 use muniment_core::model_install::{
     AvailableSpaceError, InstallLock, InstallLockError, InstallLockState, ModelInstallError,
@@ -44,6 +44,15 @@ static MANIFEST: AsrArtifactManifest = AsrArtifactManifest {
     identity: "fixture",
     revision: "revision",
     artifacts: &ARTIFACTS,
+    additional_artifact: Some(AsrSourcedArtifactDescriptor {
+        repository: "csukuangfj/vad",
+        revision: "vad-revision",
+        artifact: AsrArtifactDescriptor {
+            filename: "silero_vad.onnx",
+            byte_size: 2,
+            sha256: "8630c6c9af0730c3e9635a44c97bfb4ac4ff57c449951a60848ac666f5f2de0c",
+        },
+    }),
 };
 static MANIFESTS: [&AsrArtifactManifest; 1] = [&MANIFEST];
 
@@ -60,6 +69,13 @@ impl AsrDownloadTransport for Transport {
             1 => (206, Some((1, 1, 2)), b"c".to_vec()),
             2 => (200, None, b"def".to_vec()),
             3 => (206, Some((2, 3, 4)), b"ij".to_vec()),
+            4 => {
+                assert_eq!(
+                    request.url(),
+                    "https://huggingface.co/csukuangfj/vad/resolve/vad-revision/silero_vad.onnx"
+                );
+                (206, Some((1, 1, 2)), b"k".to_vec())
+            }
             _ => unreachable!(),
         };
         assert_eq!(request.offset, range.map_or(0, |value| value.0));
@@ -124,9 +140,10 @@ fn resumes_multiple_artifacts_and_publishes_under_one_coordinator_lock() {
     let stage = root.join("staging/install");
     fs::write(stage.join("decoder.part"), b"b").unwrap();
     fs::write(stage.join("tokens.part"), b"gh").unwrap();
+    fs::write(stage.join("silero_vad.onnx.part"), b"v").unwrap();
     let lifecycle = AsrRevisionLifecycle::new(root.clone(), &MANIFESTS, &MANIFEST).unwrap();
     let mut lock = Lock(0);
-    let mut available = [MARGIN + 7, MARGIN].into_iter();
+    let mut available = [MARGIN + 8, MARGIN].into_iter();
     let mut checks = Vec::new();
     let mut space = || -> Result<Option<u64>, AvailableSpaceError> {
         let value = available.next().unwrap();
@@ -153,16 +170,16 @@ fn resumes_multiple_artifacts_and_publishes_under_one_coordinator_lock() {
     .unwrap();
 
     assert_eq!(installed, root.join("revisions/revision"));
-    assert_eq!(checks, [MARGIN + 7, MARGIN]);
+    assert_eq!(checks, [MARGIN + 8, MARGIN]);
     assert_eq!(lock.0, 1);
-    for (artifact, contents) in ARTIFACTS
-        .iter()
-        .zip([b"a".as_slice(), b"bc", b"def", b"ghij"])
-    {
-        assert_eq!(
-            fs::read(installed.join(artifact.filename)).unwrap(),
-            contents
-        );
+    for (filename, contents) in [
+        ("encoder", b"a".as_slice()),
+        ("decoder", b"bc"),
+        ("joiner", b"def"),
+        ("tokens", b"ghij"),
+        ("silero_vad.onnx", b"vk"),
+    ] {
+        assert_eq!(fs::read(installed.join(filename)).unwrap(), contents);
     }
     fs::remove_dir_all(root).unwrap();
 }

@@ -12,7 +12,9 @@ use muniment_core::asr::acquisition::{
     AsrAcquisitionRuntime, AsrCancellation, AsrDownloadRequest, AsrDownloadResponse,
     AsrDownloadTransport, AsrTransportError,
 };
-use muniment_core::asr::{AsrArtifactDescriptor, AsrArtifactManifest};
+use muniment_core::asr::{
+    AsrArtifactDescriptor, AsrArtifactManifest, AsrSourcedArtifactDescriptor,
+};
 
 static ARTIFACTS: [AsrArtifactDescriptor; 4] = [
     AsrArtifactDescriptor {
@@ -40,6 +42,15 @@ static MANIFEST: AsrArtifactManifest = AsrArtifactManifest {
     identity: "fixture",
     revision: "0123456789abcdef",
     artifacts: &ARTIFACTS,
+    additional_artifact: Some(AsrSourcedArtifactDescriptor {
+        repository: "csukuangfj/vad",
+        revision: "vad-revision",
+        artifact: AsrArtifactDescriptor {
+            filename: "silero_vad.onnx",
+            byte_size: 2,
+            sha256: "8630c6c9af0730c3e9635a44c97bfb4ac4ff57c449951a60848ac666f5f2de0c",
+        },
+    }),
 };
 
 enum Reply {
@@ -48,7 +59,7 @@ enum Reply {
 }
 struct Transport {
     replies: VecDeque<Reply>,
-    requests: Vec<(usize, u64, Duration)>,
+    requests: Vec<(usize, u64, Duration, String)>,
 }
 impl Transport {
     fn new(replies: impl IntoIterator<Item = Reply>) -> Self {
@@ -64,15 +75,19 @@ impl AsrDownloadTransport for Transport {
         &mut self,
         request: &AsrDownloadRequest,
     ) -> Result<AsrDownloadResponse<Self::Body>, AsrTransportError> {
-        assert!(request.url().starts_with("https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/0123456789abcdef/"));
         self.requests.push((
             request.artifact_index,
             request.offset,
             request.limits.deadline,
+            request.url().to_owned(),
         ));
         match self.replies.pop_front().unwrap() {
             Reply::Bytes(bytes) => {
-                let expected = ARTIFACTS[request.artifact_index].byte_size;
+                let expected = if request.artifact_index < ARTIFACTS.len() {
+                    ARTIFACTS[request.artifact_index].byte_size
+                } else {
+                    MANIFEST.additional_artifact.unwrap().artifact.byte_size
+                };
                 let range =
                     (request.offset > 0).then_some((request.offset, expected - 1, expected));
                 Ok(AsrDownloadResponse {
@@ -103,14 +118,15 @@ fn no_wait(_: Duration, _: &dyn AsrCancellation) -> bool {
 #[test]
 fn accounts_for_absent_mixed_and_verified_stages() {
     let root = root();
-    assert_eq!(remaining_stage_bytes(&root, "install", &MANIFEST), Ok(6));
+    assert_eq!(remaining_stage_bytes(&root, "install", &MANIFEST), Ok(8));
     fs::create_dir(root.join("install")).unwrap();
     fs::write(root.join("install/encoder"), b"a").unwrap();
     fs::write(root.join("install/decoder.part"), b"b").unwrap();
-    assert_eq!(remaining_stage_bytes(&root, "install", &MANIFEST), Ok(4));
+    assert_eq!(remaining_stage_bytes(&root, "install", &MANIFEST), Ok(6));
     fs::write(root.join("install/decoder"), b"bc").unwrap();
     fs::write(root.join("install/joiner"), b"d").unwrap();
     fs::write(root.join("install/tokens"), b"ef").unwrap();
+    fs::write(root.join("install/silero_vad.onnx"), b"vk").unwrap();
     assert_eq!(remaining_stage_bytes(&root, "install", &MANIFEST), Ok(0));
     fs::remove_dir_all(root).unwrap();
 }
@@ -138,11 +154,13 @@ fn resumes_files_and_returns_only_the_verified_complete_set() {
     let root = root();
     fs::create_dir(root.join("install")).unwrap();
     fs::write(root.join("install/decoder.part"), b"b").unwrap();
+    fs::write(root.join("install/silero_vad.onnx.part"), b"v").unwrap();
     let mut transport = Transport::new([
         Reply::Bytes(b"a"),
         Reply::Bytes(b"c"),
         Reply::Bytes(b"d"),
         Reply::Bytes(b"ef"),
+        Reply::Bytes(b"k"),
     ]);
     let stage = acquire_parakeet_stage(
         &root,
@@ -161,14 +179,19 @@ fn resumes_files_and_returns_only_the_verified_complete_set() {
         transport
             .requests
             .iter()
-            .map(|&(index, offset, _)| (index, offset))
+            .map(|(index, offset, _, _)| (*index, *offset))
             .collect::<Vec<_>>(),
-        [(0, 0), (1, 1), (2, 0), (3, 0)]
+        [(0, 0), (1, 1), (2, 0), (3, 0), (4, 1)]
+    );
+    assert_eq!(
+        transport.requests.last().unwrap().3,
+        "https://huggingface.co/csukuangfj/vad/resolve/vad-revision/silero_vad.onnx"
     );
     assert_eq!(fs::read(stage.join("decoder")).unwrap(), b"bc");
     assert!(ARTIFACTS
         .iter()
         .all(|artifact| stage.join(artifact.filename).is_file()));
+    assert!(stage.join("silero_vad.onnx").is_file());
     assert!(!stage.join("decoder.part").exists());
     fs::remove_dir_all(root).unwrap();
 }
@@ -198,6 +221,33 @@ fn checksum_failure_does_not_expose_the_bad_artifact_as_complete() {
 }
 
 #[test]
+fn vad_checksum_failure_keeps_the_complete_stage_unpublished() {
+    let root = root();
+    fs::create_dir(root.join("install")).unwrap();
+    for (artifact, contents) in ARTIFACTS.iter().zip([b"a".as_slice(), b"bc", b"d", b"ef"]) {
+        fs::write(root.join("install").join(artifact.filename), contents).unwrap();
+    }
+    let mut transport = Transport::new([Reply::Bytes(b"xx")]);
+    assert!(matches!(
+        acquire_parakeet_stage(
+            &root,
+            "install",
+            &MANIFEST,
+            AsrAcquisitionLimits::default(),
+            &mut transport,
+            AsrAcquisitionRuntime {
+                clock: &|| Duration::ZERO,
+                retry_wait: &mut no_wait
+            },
+            &|| false
+        ),
+        Err(AsrAcquisitionError::Verification(_))
+    ));
+    assert!(!root.join("install/silero_vad.onnx").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn one_deadline_is_shared_across_files_and_retries() {
     let root = root();
     let now = Rc::new(Cell::new(Duration::ZERO));
@@ -214,6 +264,7 @@ fn one_deadline_is_shared_across_files_and_retries() {
         Reply::Bytes(b"bc"),
         Reply::Bytes(b"d"),
         Reply::Bytes(b"ef"),
+        Reply::Bytes(b"vk"),
     ]);
     acquire_parakeet_stage(
         &root,
@@ -239,6 +290,7 @@ fn one_deadline_is_shared_across_files_and_retries() {
             .collect::<Vec<_>>(),
         [
             Duration::from_secs(10),
+            Duration::from_secs(8),
             Duration::from_secs(8),
             Duration::from_secs(8),
             Duration::from_secs(8),

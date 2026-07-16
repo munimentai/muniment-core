@@ -315,6 +315,7 @@ mod tests {
             identity: "fixture",
             revision: "bad",
             artifacts: &FILES,
+            additional_artifact: None,
         };
         static MANIFESTS: [&AsrArtifactManifest; 1] = [&MANIFEST];
         let root = std::env::temp_dir().join(format!(

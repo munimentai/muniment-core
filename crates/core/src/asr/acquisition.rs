@@ -167,6 +167,12 @@ pub fn remaining_stage_bytes(
             return manifest
                 .artifacts
                 .iter()
+                .chain(
+                    manifest
+                        .additional_artifact
+                        .as_ref()
+                        .map(|additional| &additional.artifact),
+                )
                 .try_fold(0_u64, |total, artifact| {
                     total
                         .checked_add(artifact.byte_size)
@@ -179,6 +185,12 @@ pub fn remaining_stage_bytes(
     manifest
         .artifacts
         .iter()
+        .chain(
+            manifest
+                .additional_artifact
+                .as_ref()
+                .map(|additional| &additional.artifact),
+        )
         .try_fold(0_u64, |total, artifact| {
             let completed = stage.join(artifact.filename);
             let missing = match fs::symlink_metadata(&completed) {
@@ -245,7 +257,17 @@ where
         Err(_) => return Err(AsrAcquisitionError::Persistence),
     }
 
-    for (artifact_index, artifact) in manifest.artifacts.iter().enumerate() {
+    for (artifact_index, artifact) in manifest
+        .artifacts
+        .iter()
+        .chain(
+            manifest
+                .additional_artifact
+                .as_ref()
+                .map(|additional| &additional.artifact),
+        )
+        .enumerate()
+    {
         acquire_artifact(
             &stage,
             artifact_index,
@@ -305,7 +327,7 @@ where
             return finish_artifact(&part, &completed, artifact);
         }
         let request = AsrDownloadRequest {
-            url: source_url(manifest, artifact),
+            url: source_url(manifest, artifact_index, artifact),
             artifact_index,
             offset,
             limits: AsrAcquisitionLimits {
@@ -548,10 +570,22 @@ fn remove_file(path: &Path) -> Result<(), AsrAcquisitionError> {
     }
 }
 
-fn source_url(manifest: &AsrArtifactManifest, artifact: &AsrArtifactDescriptor) -> String {
+fn source_url(
+    manifest: &AsrArtifactManifest,
+    artifact_index: usize,
+    artifact: &AsrArtifactDescriptor,
+) -> String {
+    let (repository, revision) = if artifact_index == manifest.artifacts.len() {
+        let additional = manifest
+            .additional_artifact
+            .expect("additional artifact index comes from the compiled manifest");
+        (additional.repository, additional.revision)
+    } else {
+        (SOURCE_REPOSITORY, manifest.revision)
+    };
     format!(
-        "https://huggingface.co/{SOURCE_REPOSITORY}/resolve/{}/{}",
-        manifest.revision, artifact.filename
+        "https://huggingface.co/{repository}/resolve/{revision}/{}",
+        artifact.filename
     )
 }
 fn require_directory(path: &Path) -> Result<(), AsrAcquisitionError> {
