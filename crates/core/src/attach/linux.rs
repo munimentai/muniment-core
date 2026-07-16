@@ -13,8 +13,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::{
-    encode_frame, welcome, ErrorEnvelope, Failure, FirstMessage, FrameError, NegotiationError,
-    Protocol, ProtocolError, VersionRange, MAX_FRAME_LENGTH,
+    authorized, encode_frame, welcome, Approval, AuthorizationClock, AuthorizationError,
+    AuthorizationState, AuthorizationTokenGenerator, ConnectionBinding, ErrorEnvelope, Failure,
+    FirstMessage, NegotiationError, Protocol, ProtocolError, VersionRange, CHALLENGE_LIFETIME,
+    MAX_FRAME_LENGTH,
 };
 
 const ATTACH_DIRECTORY: &[u8] = b"muniment\0";
@@ -287,6 +289,7 @@ pub enum AttachSessionError {
     PayloadTooLarge,
     ProtocolIncompatible,
     Randomness,
+    Authorization,
 }
 
 impl fmt::Display for AttachSessionError {
@@ -298,8 +301,48 @@ impl fmt::Display for AttachSessionError {
             Self::PayloadTooLarge => "attach payload exceeds the allowed size",
             Self::ProtocolIncompatible => "attach protocol is incompatible",
             Self::Randomness => "attach session randomness is unavailable",
+            Self::Authorization => "attach authorization failed",
         })
     }
+}
+
+/// The result of the explicit, visible desktop approval prompt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    Approve(Approval),
+    Deny,
+}
+
+/// Bounded seam for receiving desktop approval actions.
+pub trait ApprovalWaiter {
+    /// Returns the next action available within `remaining`, or `None` when that
+    /// bound expires. Implementations must not wait longer than `remaining`.
+    fn wait(
+        &mut self,
+        challenge: &super::PairingChallenge,
+        remaining: Duration,
+    ) -> Option<ApprovalDecision>;
+}
+
+impl<F> ApprovalWaiter for F
+where
+    F: FnMut(&super::PairingChallenge, Duration) -> Option<ApprovalDecision>,
+{
+    fn wait(
+        &mut self,
+        challenge: &super::PairingChallenge,
+        remaining: Duration,
+    ) -> Option<ApprovalDecision> {
+        self(challenge, remaining)
+    }
+}
+
+/// Injectable dependencies for the authorization phase of a Linux session.
+pub struct AuthorizationSessionDependencies<R, C, G, W> {
+    pub fill_random: R,
+    pub clock: C,
+    pub tokens: G,
+    pub approvals: W,
 }
 
 impl std::error::Error for AttachSessionError {}
@@ -323,15 +366,65 @@ pub fn run_authenticated_session(
 /// Testable form of [`run_authenticated_session`] with bounded timing and randomness seams.
 #[doc(hidden)]
 pub fn run_authenticated_session_with<R>(
-    mut stream: UnixStream,
-    _credentials: PeerCredentials,
+    stream: UnixStream,
+    credentials: PeerCredentials,
     desktop_version: &str,
     timeout: Duration,
-    mut fill_random: R,
+    fill_random: R,
 ) -> Result<(), AttachSessionError>
 where
     R: FnMut(&mut [u8]) -> Result<(), ()>,
 {
+    run_authenticated_session_with_authorization(
+        stream,
+        credentials,
+        desktop_version,
+        timeout,
+        AuthorizationSessionDependencies {
+            fill_random,
+            clock: SessionClock(Instant::now()),
+            tokens: SessionTokens,
+            approvals: |_: &super::PairingChallenge, _: Duration| Some(ApprovalDecision::Deny),
+        },
+    )
+}
+
+#[derive(Clone)]
+struct SessionClock(Instant);
+impl AuthorizationClock for SessionClock {
+    fn now(&self) -> Duration {
+        self.0.elapsed()
+    }
+}
+
+struct SessionTokens;
+impl AuthorizationTokenGenerator for SessionTokens {
+    fn fill(&mut self, bytes: &mut [u8]) -> Result<(), super::AuthorizationRandomnessError> {
+        getrandom::fill(bytes).map_err(|_| super::AuthorizationRandomnessError)
+    }
+}
+
+/// Negotiates and waits for a deterministic desktop approval decision.
+#[doc(hidden)]
+pub fn run_authenticated_session_with_authorization<R, C, G, W>(
+    mut stream: UnixStream,
+    credentials: PeerCredentials,
+    desktop_version: &str,
+    timeout: Duration,
+    dependencies: AuthorizationSessionDependencies<R, C, G, W>,
+) -> Result<(), AttachSessionError>
+where
+    R: FnMut(&mut [u8]) -> Result<(), ()>,
+    C: AuthorizationClock + Clone,
+    G: AuthorizationTokenGenerator,
+    W: ApprovalWaiter,
+{
+    let AuthorizationSessionDependencies {
+        mut fill_random,
+        clock,
+        tokens,
+        mut approvals,
+    } = dependencies;
     let result = (|| {
         let deadline = Instant::now()
             .checked_add(timeout)
@@ -343,23 +436,24 @@ where
             write_protocol_error(&mut stream, ProtocolError::payload_too_large(), deadline);
             return Err(AttachSessionError::PayloadTooLarge);
         }
-
         let mut frame = Vec::with_capacity(4 + length);
         frame.extend_from_slice(&prefix);
         frame.resize(4 + length, 0);
         read_before(&mut stream, &mut frame[4..], deadline)?;
         let message = match super::decode_frame::<FirstMessage>(&frame) {
             Ok(Some((message, _))) => message,
-            Err(FrameError::PayloadTooLarge) => {
-                write_protocol_error(&mut stream, ProtocolError::payload_too_large(), deadline);
-                return Err(AttachSessionError::PayloadTooLarge);
-            }
             _ => {
                 write_protocol_error(&mut stream, ProtocolError::malformed_frame(), deadline);
                 return Err(AttachSessionError::MalformedFrame);
             }
         };
-
+        let (client_nonce, companion_kind) = match &message {
+            FirstMessage::Hello(hello) => (hello.client_nonce.clone(), hello.client.kind.clone()),
+            _ => {
+                write_protocol_error(&mut stream, ProtocolError::malformed_frame(), deadline);
+                return Err(AttachSessionError::MalformedFrame);
+            }
+        };
         let selected = match super::negotiate_first(message, DESKTOP_PROTOCOL) {
             Ok(selected) => selected,
             Err(NegotiationError::Incompatible(error)) => {
@@ -372,13 +466,70 @@ where
             }
         };
 
-        let mut random = [0u8; 32];
-        fill_random(&mut random).map_err(|_| AttachSessionError::Randomness)?;
-        let server_nonce = hex(&random[..16]);
-        let approval_challenge = hex(&random[16..]);
-        let response = welcome(selected, desktop_version, server_nonce, approval_challenge);
-        let frame = encode_frame(&response).map_err(|_| AttachSessionError::MalformedFrame)?;
-        write_before(&mut stream, &frame, deadline)
+        let mut nonce = [0u8; 16];
+        fill_random(&mut nonce).map_err(|_| AttachSessionError::Randomness)?;
+        let server_nonce = hex(&nonce);
+        let binding = ConnectionBinding {
+            connection_id: server_nonce.clone(),
+            client_nonce,
+            server_nonce: server_nonce.clone(),
+            companion_identity: format!("{}:{}", credentials.uid, credentials.pid),
+            companion_kind,
+        };
+        let mut authorization = AuthorizationState::new(clock.clone(), tokens, binding);
+        let challenge_expires_at = clock.now() + CHALLENGE_LIFETIME;
+        let challenge = authorization
+            .issue_challenge()
+            .map_err(|error| match error {
+                AuthorizationError::Randomness => AttachSessionError::Randomness,
+                _ => AttachSessionError::Authorization,
+            })?;
+        let authorization_deadline = Instant::now()
+            .checked_add(CHALLENGE_LIFETIME)
+            .ok_or(AttachSessionError::Timeout)?;
+        let response = welcome(selected, desktop_version, server_nonce, challenge.as_str());
+        write_before(
+            &mut stream,
+            &encode_frame(&response).map_err(|_| AttachSessionError::MalformedFrame)?,
+            deadline,
+        )?;
+
+        let remaining = challenge_expires_at.saturating_sub(clock.now());
+        let Some(ApprovalDecision::Approve(approval)) = approvals.wait(&challenge, remaining)
+        else {
+            return Ok(());
+        };
+        let (capability, grant) = authorization
+            .approve(&challenge, approval)
+            .map_err(|error| match error {
+                AuthorizationError::Randomness => AttachSessionError::Randomness,
+                AuthorizationError::ChallengeExpired => AttachSessionError::Timeout,
+                _ => AttachSessionError::Authorization,
+            })?;
+        // Reject one already-queued repeat action against the consumed challenge.
+        if let Some(ApprovalDecision::Approve(approval)) =
+            approvals.wait(&challenge, Duration::ZERO)
+        {
+            if authorization.approve(&challenge, approval)
+                != Err(AuthorizationError::ChallengeConsumed)
+            {
+                return Err(AttachSessionError::Authorization);
+            }
+        }
+        let remaining = grant.expires_at.saturating_sub(clock.now()).as_secs();
+        let mut workspace_scopes = std::collections::BTreeMap::new();
+        workspace_scopes.insert(grant.workspace, grant.scopes);
+        let response = authorized(
+            capability.as_str(),
+            remaining,
+            grant.idle_timeout.as_secs(),
+            workspace_scopes,
+        );
+        write_before(
+            &mut stream,
+            &encode_frame(&response).map_err(|_| AttachSessionError::MalformedFrame)?,
+            authorization_deadline,
+        )
     })();
     let _ = stream.shutdown(std::net::Shutdown::Both);
     result

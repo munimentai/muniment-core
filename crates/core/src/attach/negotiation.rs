@@ -1,4 +1,7 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use serde::{de, Deserialize, Deserializer, Serialize};
 
@@ -70,13 +73,49 @@ pub enum Authorization {
     PairingRequired,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Welcome {
     pub selected: u32,
     pub desktop_version: String,
     pub server_nonce: String,
     pub authorization: Authorization,
     pub approval_challenge: String,
+}
+
+impl fmt::Debug for Welcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Welcome")
+            .field("selected", &self.selected)
+            .field("desktop_version", &self.desktop_version)
+            .field("server_nonce", &self.server_nonce)
+            .field("authorization", &self.authorization)
+            .field("approval_challenge", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// The connection-bound grant emitted after desktop approval.
+///
+/// `expires_at` is the number of whole seconds remaining when this message is
+/// emitted, rather than an absolute or monotonic timestamp. Monotonic clock
+/// values are deliberately local to the authorization policy.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Authorized {
+    pub capability: String,
+    pub expires_at: u64,
+    pub idle_timeout_seconds: u64,
+    pub workspace_scopes: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl fmt::Debug for Authorized {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Authorized")
+            .field("capability", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .field("idle_timeout_seconds", &self.idle_timeout_seconds)
+            .field("workspace_scopes", &self.workspace_scopes)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -136,5 +175,19 @@ pub fn welcome(
         server_nonce: server_nonce.into(),
         authorization: Authorization::PairingRequired,
         approval_challenge: approval_challenge.into(),
+    }
+}
+
+pub fn authorized(
+    capability: impl Into<String>,
+    expires_at: u64,
+    idle_timeout_seconds: u64,
+    workspace_scopes: BTreeMap<String, BTreeSet<String>>,
+) -> Authorized {
+    Authorized {
+        capability: capability.into(),
+        expires_at,
+        idle_timeout_seconds,
+        workspace_scopes,
     }
 }

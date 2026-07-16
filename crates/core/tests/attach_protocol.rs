@@ -178,6 +178,40 @@ fn hello_welcome_and_version_overlap() {
 }
 
 #[test]
+fn authorized_round_trips_and_ignores_future_optional_fields() {
+    let message = authorized(
+        "connection-capability",
+        3600,
+        900,
+        [(
+            "workspace-1".into(),
+            ["thread.read".into()].into_iter().collect(),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let encoded = encode_frame(&message).unwrap();
+    let decoded = decode_frame::<Authorized>(&encoded).unwrap().unwrap().0;
+    assert_eq!(decoded, message);
+
+    let mut value = serde_json::to_value(&message).unwrap();
+    value["future_optional"] = json!(true);
+    assert_eq!(
+        serde_json::from_value::<Authorized>(value).unwrap(),
+        message
+    );
+}
+
+#[test]
+fn handshake_wire_debug_redacts_secrets() {
+    let welcome = welcome(1, "0.1.0", "server-nonce", "secret-challenge");
+    let authorized = authorized("secret-capability", 3600, 900, Default::default());
+
+    assert!(!format!("{welcome:?}").contains("secret-challenge"));
+    assert!(!format!("{authorized:?}").contains("secret-capability"));
+}
+
+#[test]
 fn hello_first_rejects_operation_shapes_but_allows_future_optional_fields() {
     let hybrid = json!({
         "protocol": PROTOCOL,
@@ -331,9 +365,13 @@ impl TestClock {
 
 struct TestTokens(u8);
 impl AuthorizationTokenGenerator for TestTokens {
-    fn fill(&mut self, bytes: &mut [u8]) {
+    fn fill(
+        &mut self,
+        bytes: &mut [u8],
+    ) -> Result<(), muniment_core::attach::AuthorizationRandomnessError> {
         self.0 += 1;
         bytes.fill(self.0);
+        Ok(())
     }
 }
 

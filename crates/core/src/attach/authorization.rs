@@ -15,8 +15,26 @@ pub trait AuthorizationClock {
 
 /// Supplies cryptographically random bytes in production and fixed bytes in tests.
 pub trait AuthorizationTokenGenerator {
-    fn fill(&mut self, bytes: &mut [u8]);
+    fn fill(&mut self, bytes: &mut [u8]) -> Result<(), AuthorizationRandomnessError>;
 }
+
+/// Redacted failure returned when authorization token randomness is unavailable.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct AuthorizationRandomnessError;
+
+impl fmt::Debug for AuthorizationRandomnessError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AuthorizationRandomnessError([REDACTED])")
+    }
+}
+
+impl fmt::Display for AuthorizationRandomnessError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("authorization randomness is unavailable")
+    }
+}
+
+impl std::error::Error for AuthorizationRandomnessError {}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct PairingChallenge(String);
@@ -74,6 +92,7 @@ pub struct AuthorizedGrant {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthorizationError {
+    Randomness,
     ChallengeAlreadyIssued,
     ChallengeMismatch,
     ChallengeConsumed,
@@ -92,6 +111,7 @@ pub enum AuthorizationError {
 impl fmt::Display for AuthorizationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::Randomness => "authorization randomness is unavailable",
             Self::ChallengeAlreadyIssued => "pairing challenge already issued",
             Self::ChallengeMismatch => "pairing challenge does not match",
             Self::ChallengeConsumed => "pairing challenge already consumed",
@@ -155,7 +175,9 @@ impl<C: AuthorizationClock, G: AuthorizationTokenGenerator> AuthorizationState<C
                 AuthorizationError::ChallengeAlreadyIssued
             });
         }
-        let token = PairingChallenge(generate_hex::<16>(&mut self.generator));
+        let token = PairingChallenge(
+            generate_hex::<16>(&mut self.generator).map_err(|_| AuthorizationError::Randomness)?,
+        );
         self.state = State::Pending(Pending {
             token: token.clone(),
             expires_at: self.clock.now() + CHALLENGE_LIFETIME,
@@ -184,7 +206,9 @@ impl<C: AuthorizationClock, G: AuthorizationTokenGenerator> AuthorizationState<C
 
         approval.lifetime = approval.lifetime.min(MAX_CAPABILITY_LIFETIME);
         let expires_at = now + approval.lifetime;
-        let token = Capability(generate_hex::<32>(&mut self.generator));
+        let token = Capability(
+            generate_hex::<32>(&mut self.generator).map_err(|_| AuthorizationError::Randomness)?,
+        );
         let grant = AuthorizedGrant {
             profile: approval.profile.clone(),
             workspace: approval.workspace.clone(),
@@ -248,13 +272,15 @@ impl<C: AuthorizationClock, G: AuthorizationTokenGenerator> AuthorizationState<C
     }
 }
 
-fn generate_hex<const N: usize>(generator: &mut impl AuthorizationTokenGenerator) -> String {
+fn generate_hex<const N: usize>(
+    generator: &mut impl AuthorizationTokenGenerator,
+) -> Result<String, AuthorizationRandomnessError> {
     let mut bytes = [0; N];
-    generator.fill(&mut bytes);
+    generator.fill(&mut bytes)?;
     let mut result = String::with_capacity(N * 2);
     for byte in bytes {
         use fmt::Write;
         write!(result, "{byte:02x}").expect("writing to String");
     }
-    result
+    Ok(result)
 }
