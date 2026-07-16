@@ -1,6 +1,7 @@
 //! Verification boundary for the pinned offline ASR model set.
 
 pub mod acquisition;
+pub mod capture;
 pub mod install;
 mod recognizer;
 
