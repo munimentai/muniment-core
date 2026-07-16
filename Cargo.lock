@@ -2013,6 +2013,7 @@ dependencies = [
  "flate2",
  "fs2",
  "getrandom 0.3.4",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

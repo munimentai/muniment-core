@@ -33,3 +33,6 @@ ureq = { version = "2", default-features = false, features = ["json"] }
 url = "2"
 uuid = { version = "1", features = ["serde"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
