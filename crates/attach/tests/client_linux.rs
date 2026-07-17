@@ -101,10 +101,10 @@ fn thread_list_uses_exact_envelope_and_accepts_fragmented_page() {
         assert_eq!(request["capability"], "33".repeat(32));
         assert_eq!(request["body"], serde_json::json!({"limit": 100}));
         assert!(request.get("idempotency_key").is_none());
-        let request_id = request["request_id"].as_str().unwrap();
+        let request_id = request["request_id"].as_str().unwrap().to_owned();
         let response = Response {
             protocol: Protocol,
-            request_id: Id::new(request_id).unwrap(),
+            request_id: Id::new(&request_id).unwrap(),
             ok: Success,
             body: serde_json::json!({
                 "threads": [{"thread_id":"opaque-1", "title":"First", "updated_at":"2026-07-17T00:00:00Z"}],
@@ -114,11 +114,33 @@ fn thread_list_uses_exact_envelope_and_accepts_fragmented_page() {
         for byte in encode_frame(&response).unwrap() {
             server.write_all(&[byte]).unwrap();
         }
+        let request = read_client_value(&mut server);
+        assert_eq!(
+            request["body"],
+            serde_json::json!({
+                "limit": 100,
+                "cursor": "private-cursor"
+            })
+        );
+        assert_ne!(request["request_id"], request_id);
+        let response = Response {
+            protocol: Protocol,
+            request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+            ok: Success,
+            body: serde_json::json!({"threads": []}),
+        };
+        for chunk in encode_frame(&response).unwrap().chunks(2) {
+            server.write_all(chunk).unwrap();
+        }
     });
     let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
-    let page = client.list_threads().unwrap();
+    let page = client.list_threads(None).unwrap();
     assert_eq!(page.threads[0].thread_id, "opaque-1");
     assert!(page.next_cursor.is_some());
+    assert!(!format!("{page:?}").contains("private-cursor"));
+    let page = client.list_threads(page.next_cursor.as_deref()).unwrap();
+    assert!(page.threads.is_empty());
+    assert!(page.next_cursor.is_none());
     worker.join().unwrap();
 }
 
@@ -164,7 +186,7 @@ fn thread_list_rejects_correlation_mismatch_and_maps_protocol_errors() {
             server.write_all(&bytes).unwrap();
         });
         let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
-        assert_eq!(client.list_threads(), Err(expected));
+        assert_eq!(client.list_threads(None), Err(expected));
         worker.join().unwrap();
     }
 }
@@ -194,7 +216,10 @@ fn thread_list_rejects_hybrid_success_and_error_envelopes() {
             server.write_all(&encode_frame(&hybrid).unwrap()).unwrap();
         });
         let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
-        assert_eq!(client.list_threads(), Err(ClientError::UnexpectedMessage));
+        assert_eq!(
+            client.list_threads(None),
+            Err(ClientError::UnexpectedMessage)
+        );
         worker.join().unwrap();
     }
 }
@@ -217,7 +242,7 @@ fn thread_list_timeout_is_absolute_and_client_debug_is_redacted() {
     assert!(!debug.contains(&"33".repeat(32)));
     assert!(!debug.contains("UnixStream"));
     let started = Instant::now();
-    assert_eq!(client.list_threads(), Err(ClientError::Timeout));
+    assert_eq!(client.list_threads(None), Err(ClientError::Timeout));
     assert!(started.elapsed() < Duration::from_millis(250));
     worker.join().unwrap();
 }

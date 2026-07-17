@@ -205,9 +205,26 @@ fn authorized_round_trips_and_ignores_future_optional_fields() {
 fn handshake_wire_debug_redacts_secrets() {
     let welcome = welcome(1, "0.1.0", "server-nonce", "secret-challenge");
     let authorized = authorized("secret-capability", 3600, 900, Default::default());
+    let request = Request {
+        protocol: Protocol,
+        request_id: id(1),
+        operation: Operation::ThreadList,
+        capability: "secret-capability".into(),
+        idempotency_key: None,
+        body: json!({"cursor": "secret-cursor"}),
+    };
+    let response = Response {
+        protocol: Protocol,
+        request_id: id(1),
+        ok: Success,
+        body: json!({"next_cursor": "secret-cursor"}),
+    };
 
     assert!(!format!("{welcome:?}").contains("secret-challenge"));
     assert!(!format!("{authorized:?}").contains("secret-capability"));
+    assert!(!format!("{request:?}").contains("secret-capability"));
+    assert!(!format!("{request:?}").contains("secret-cursor"));
+    assert!(!format!("{response:?}").contains("secret-cursor"));
 }
 
 #[test]

@@ -65,7 +65,7 @@ impl<'de> Deserialize<'de> for Id {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
     pub protocol: Protocol,
     pub request_id: Id,
@@ -74,6 +74,20 @@ pub struct Request {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<Id>,
     pub body: Value,
+}
+
+impl fmt::Debug for Request {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Request")
+            .field("protocol", &self.protocol)
+            .field("request_id", &self.request_id)
+            .field("operation", &self.operation)
+            .field("capability", &"[REDACTED]")
+            .field("idempotency_key", &self.idempotency_key)
+            .field("body", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl Request {
@@ -90,12 +104,24 @@ impl Request {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Response {
     pub protocol: Protocol,
     pub request_id: Id,
     pub ok: Success,
     pub body: Value,
+}
+
+impl fmt::Debug for Response {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Response")
+            .field("protocol", &self.protocol)
+            .field("request_id", &self.request_id)
+            .field("ok", &self.ok)
+            .field("body", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

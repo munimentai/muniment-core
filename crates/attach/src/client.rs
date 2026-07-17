@@ -56,12 +56,22 @@ pub struct RedactedThreadSummary {
     pub updated_at: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[derive(Clone, Eq, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ThreadListPage {
     pub threads: Vec<RedactedThreadSummary>,
     #[serde(default)]
     pub next_cursor: Option<String>,
+}
+
+impl fmt::Debug for ThreadListPage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ThreadListPage")
+            .field("threads", &self.threads)
+            .field("has_more", &self.next_cursor.is_some())
+            .finish()
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -104,15 +114,25 @@ mod linux {
             self.summary.clone()
         }
 
-        pub fn list_threads(&mut self) -> Result<ThreadListPage, ClientError> {
+        pub fn list_threads(
+            &mut self,
+            cursor: Option<&str>,
+        ) -> Result<ThreadListPage, ClientError> {
+            if cursor.is_some_and(|cursor| cursor.is_empty() || cursor.len() > MAX_TEXT_LENGTH) {
+                return Err(ClientError::UnexpectedMessage);
+            }
             let request_id = fresh_request_id()?;
+            let mut body = serde_json::json!({ "limit": THREAD_LIST_LIMIT });
+            if let Some(cursor) = cursor {
+                body["cursor"] = Value::String(cursor.into());
+            }
             let request = Request {
                 protocol: Protocol,
                 request_id: request_id.clone(),
                 operation: Operation::ThreadList,
                 capability: self.capability.clone(),
                 idempotency_key: None,
-                body: serde_json::json!({ "limit": THREAD_LIST_LIMIT }),
+                body,
             };
             let deadline = deadline(self.io_timeout);
             let bytes = encode_frame(&request).map_err(map_frame_error)?;
@@ -387,7 +407,7 @@ pub struct AuthorizedClient;
 
 #[cfg(not(target_os = "linux"))]
 impl AuthorizedClient {
-    pub fn list_threads(&mut self) -> Result<ThreadListPage, ClientError> {
+    pub fn list_threads(&mut self, _cursor: Option<&str>) -> Result<ThreadListPage, ClientError> {
         Err(ClientError::UnsupportedPlatform)
     }
 }
