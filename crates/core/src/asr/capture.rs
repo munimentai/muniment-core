@@ -24,7 +24,7 @@ pub struct PcmProducer {
     channel_offset: usize,
     resample_accumulator: u32,
     low_pass: Option<LowPassFilter>,
-    dropped_samples: Arc<AtomicU64>,
+    gap: Arc<GapState>,
 }
 
 /// Fixed-memory anti-alias filter used before reducing a device sample rate.
@@ -84,7 +84,29 @@ impl LowPassFilter {
 /// The consumer-owned half. Reading never occurs on the native audio thread.
 pub struct PcmConsumer {
     receiver: Receiver<f32>,
-    dropped_samples: Arc<AtomicU64>,
+    gap: Arc<GapState>,
+}
+
+/// A zero count permits enqueueing; a nonzero count both records drops and
+/// latches the producer closed until the consumer observes the gap.
+struct GapState(AtomicU64);
+
+impl GapState {
+    fn is_latched(&self) -> bool {
+        self.0.load(Ordering::Acquire) != 0
+    }
+
+    fn record_drop(&self) {
+        self.0.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn dropped_samples(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn take_dropped_samples(&self) -> u64 {
+        self.0.swap(0, Ordering::AcqRel)
+    }
 }
 
 pub fn bounded_pcm_channel(
@@ -102,7 +124,7 @@ pub fn bounded_pcm_channel(
         return Err(CaptureConfigError::ZeroCapacity);
     }
     let (sender, receiver) = mpsc::sync_channel(capacity_samples);
-    let dropped_samples = Arc::new(AtomicU64::new(0));
+    let gap = Arc::new(GapState(AtomicU64::new(0)));
     Ok((
         PcmProducer {
             sender,
@@ -112,12 +134,9 @@ pub fn bounded_pcm_channel(
             channel_offset: 0,
             resample_accumulator: 0,
             low_pass: (source_rate > SAMPLE_RATE).then(|| LowPassFilter::new(source_rate)),
-            dropped_samples: dropped_samples.clone(),
+            gap: gap.clone(),
         },
-        PcmConsumer {
-            receiver,
-            dropped_samples,
-        },
+        PcmConsumer { receiver, gap },
     ))
 }
 
@@ -167,10 +186,14 @@ impl PcmProducer {
             self.resample_accumulator += SAMPLE_RATE;
             while self.resample_accumulator >= self.source_rate {
                 self.resample_accumulator -= self.source_rate;
+                if self.gap.is_latched() {
+                    self.gap.record_drop();
+                    continue;
+                }
                 match self.sender.try_send(mono) {
                     Ok(()) => {}
                     Err(TrySendError::Full(_)) => {
-                        self.dropped_samples.fetch_add(1, Ordering::Relaxed);
+                        self.gap.record_drop();
                     }
                     Err(TrySendError::Disconnected(_)) => return,
                 }
@@ -191,6 +214,62 @@ impl PcmConsumer {
     }
 
     pub fn dropped_samples(&self) -> u64 {
-        self.dropped_samples.load(Ordering::Relaxed)
+        self.gap.dropped_samples()
+    }
+
+    /// Reports and resets drops since the previous observation.
+    pub fn take_dropped_samples(&self) -> u64 {
+        self.gap.take_dropped_samples()
+    }
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    #[test]
+    fn taking_drops_resets_the_overflow_counter() {
+        let (mut producer, consumer) = bounded_pcm_channel(1, SAMPLE_RATE, 1).unwrap();
+        producer.push_f32(&[0.1, 0.2, 0.3]);
+        assert_eq!(consumer.drain(), vec![0.1]);
+        assert_eq!(consumer.take_dropped_samples(), 2);
+        assert_eq!(consumer.take_dropped_samples(), 0);
+        producer.push_f32(&[0.4]);
+        assert_eq!(consumer.drain(), vec![0.4]);
+    }
+
+    #[test]
+    fn racing_drop_starts_a_new_gap_before_later_pcm_is_accepted() {
+        let (mut producer, consumer) = bounded_pcm_channel(1, SAMPLE_RATE, 1).unwrap();
+        producer.push_f32(&[0.1, 0.2]);
+        assert_eq!(consumer.drain(), vec![0.1]);
+
+        // Pause the producer after it observes the old latch, then reset the
+        // consumer side. Its late drop must atomically relatch a new gap.
+        let observed = Arc::new(Barrier::new(2));
+        let reset = Arc::new(Barrier::new(2));
+        let gap = producer.gap.clone();
+        let producer_thread = thread::spawn({
+            let observed = observed.clone();
+            let reset = reset.clone();
+            move || {
+                assert!(gap.is_latched());
+                observed.wait();
+                reset.wait();
+                gap.record_drop();
+            }
+        });
+        observed.wait();
+        assert_eq!(consumer.take_dropped_samples(), 1);
+        reset.wait();
+        producer_thread.join().unwrap();
+
+        producer.push_f32(&[0.3]);
+        assert!(consumer.drain().is_empty());
+        assert_eq!(consumer.take_dropped_samples(), 2);
+        producer.push_f32(&[0.4]);
+        assert_eq!(consumer.drain(), vec![0.4]);
     }
 }
