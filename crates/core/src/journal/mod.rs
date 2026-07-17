@@ -8,10 +8,13 @@ pub mod summaries;
 
 use crate::attachment::ChatAttachment;
 use crate::cas::ContentHash;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, SecondsFormat, Utc};
+use hmac::{Hmac, Mac};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::Sha256;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -119,6 +122,47 @@ pub struct RunJournal {
     pub(crate) generation: u64,
 }
 
+/// A bounded, sequence-ordered slice of one run. Callers must project these
+/// envelopes before crossing the journal boundary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunEventPage {
+    pub events: Vec<EventEnvelope>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug)]
+pub enum RunEventPageError {
+    InvalidLimit,
+    InvalidCursor,
+    NotFoundOrInaccessible,
+    Journal(JournalError),
+}
+
+impl From<JournalError> for RunEventPageError {
+    fn from(error: JournalError) -> Self {
+        Self::Journal(error)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunEventCursor {
+    version: u8,
+    run_id: String,
+    after_run_seq: u64,
+    authenticator: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThreadProjectionCursor {
+    version: u8,
+    run_id: String,
+    snapshot_seq: u64,
+    last_ordinal: i64,
+    authenticator: String,
+}
+
 pub(crate) struct JournalCoordination {
     pub(crate) operation: Mutex<()>,
     pub(crate) generation: std::sync::atomic::AtomicU64,
@@ -169,6 +213,45 @@ fn normalized_path(path: &Path) -> PathBuf {
 }
 
 impl RunJournal {
+    pub fn thread_projection_boundary(
+        &self,
+        workspace: &str,
+        run_id: &str,
+        cursor: Option<&str>,
+    ) -> Result<(u64, i64), RunEventPageError> {
+        if !self
+            .run_belongs_to_workspace(run_id, workspace)
+            .map_err(RunEventPageError::Journal)?
+        {
+            return Err(RunEventPageError::NotFoundOrInaccessible);
+        }
+        if let Some(cursor) = cursor {
+            return decode_thread_projection_cursor(cursor, run_id, &self.cursor_key);
+        }
+        let snapshot = self
+            .connection
+            .as_ref()
+            .expect("journal connection is always present outside compaction")
+            .query_row(
+                "SELECT MAX(run_seq) FROM events WHERE run_id=?1",
+                [run_id],
+                |row| row.get::<_, Option<u64>>(0),
+            )
+            .map_err(JournalError::from)
+            .map_err(RunEventPageError::Journal)?
+            .ok_or(RunEventPageError::NotFoundOrInaccessible)?;
+        Ok((snapshot, -1))
+    }
+
+    pub fn thread_projection_cursor(
+        &self,
+        run_id: &str,
+        snapshot_seq: u64,
+        last_ordinal: i64,
+    ) -> Result<String, RunEventPageError> {
+        encode_thread_projection_cursor(run_id, snapshot_seq, last_ordinal, &self.cursor_key)
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self, JournalError> {
         let path = path.as_ref();
         let file_path = (path != Path::new(":memory:") && !path.as_os_str().is_empty())
@@ -191,6 +274,37 @@ impl RunJournal {
                 "unsupported schema version {version}"
             )));
         }
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS run_workspaces( \
+             run_id TEXT PRIMARY KEY NOT NULL, workspace TEXT NOT NULL); \
+             CREATE INDEX IF NOT EXISTS run_workspaces_workspace_run \
+             ON run_workspaces(workspace, run_id); \
+             CREATE TABLE IF NOT EXISTS thread_projection_entries( \
+             run_id TEXT NOT NULL, ordinal INTEGER NOT NULL, run_seq INTEGER NOT NULL, \
+             kind TEXT NOT NULL, text TEXT, PRIMARY KEY(run_id, ordinal)); \
+             CREATE INDEX IF NOT EXISTS thread_projection_run_order \
+             ON thread_projection_entries(run_id, ordinal); \
+             CREATE TABLE IF NOT EXISTS thread_projection_history( \
+             run_id TEXT NOT NULL, ordinal INTEGER NOT NULL, valid_until_seq INTEGER NOT NULL, \
+             run_seq INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT, \
+             PRIMARY KEY(run_id, ordinal, valid_until_seq)); \
+             CREATE TABLE IF NOT EXISTS thread_projection_versions( \
+             run_id TEXT NOT NULL, ordinal INTEGER NOT NULL, valid_from_seq INTEGER NOT NULL, \
+             valid_until_seq INTEGER, run_seq INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT, \
+             PRIMARY KEY(run_id, ordinal, valid_from_seq)); \
+             CREATE INDEX IF NOT EXISTS thread_projection_versions_page \
+             ON thread_projection_versions(run_id, ordinal, valid_from_seq, valid_until_seq);",
+        )?;
+        // Journals created by the first projection implementation have only a
+        // current row. Treat that row as the initial version; new writes use
+        // interval versions from this point forward.
+        connection.execute(
+            "INSERT OR IGNORE INTO thread_projection_versions( \
+             run_id,ordinal,valid_from_seq,run_seq,kind,text) \
+             SELECT run_id,ordinal,run_seq,run_seq,kind,text \
+             FROM thread_projection_entries",
+            [],
+        )?;
         validate_database(&connection)?;
         let cursor_key = load_or_create_cursor_key(&connection)?;
         let generation = coordination.as_ref().map_or(0, |state| {
@@ -212,6 +326,53 @@ impl RunJournal {
         event: &EventEnvelope,
     ) -> Result<(), JournalError> {
         self.append_batch(expected_last_seq, std::slice::from_ref(event))
+    }
+
+    /// Atomically creates a run and records its authoritative workspace.
+    pub fn append_new_run(
+        &mut self,
+        workspace: &str,
+        event: &EventEnvelope,
+    ) -> Result<(), JournalError> {
+        if workspace.is_empty() || event.run_seq != 1 {
+            return Err(JournalError::InvalidEnvelope(
+                "new run workspace and sequence must be valid".into(),
+            ));
+        }
+        validate_envelope(event)?;
+        let canonical = canonical_envelope(event)?;
+        let coordination = self.coordination.clone();
+        let _operation = coordination
+            .as_ref()
+            .map(|state| state.operation.lock().unwrap());
+        self.refresh_after_compaction()?;
+        let tx = self
+            .connection
+            .as_mut()
+            .expect("journal connection is always present outside compaction")
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE run_id=?1)",
+            [&event.run_id],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return Err(JournalError::Conflict(Conflict::Sequence {
+                run_id: event.run_id.clone(),
+                run_seq: 1,
+            }));
+        }
+        tx.execute(
+            "INSERT INTO events(event_id,run_id,run_seq,event_type,event_version,envelope_version,recorded_at,envelope_json) VALUES(?1,?2,1,?3,?4,?5,?6,?7)",
+            params![event.event_id,event.run_id,event.event_type,event.event_version,event.envelope_version,event.recorded_at,canonical],
+        )?;
+        update_thread_projection(&tx, event)?;
+        tx.execute(
+            "INSERT INTO run_workspaces(run_id, workspace) VALUES(?1, ?2)",
+            params![event.run_id, workspace],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn append_batch(
@@ -293,9 +454,95 @@ impl RunJournal {
                 }
             }
             result?;
+            update_thread_projection(&tx, event)?;
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Records the authorization boundary that owns a run. A run can never be
+    /// rebound to another workspace.
+    pub fn bind_run_workspace(
+        &mut self,
+        run_id: &str,
+        workspace: &str,
+    ) -> Result<(), JournalError> {
+        if workspace.is_empty() {
+            return Err(JournalError::InvalidEnvelope(
+                "workspace must be non-empty".into(),
+            ));
+        }
+        let connection = self
+            .connection
+            .as_ref()
+            .expect("journal connection is always present outside compaction");
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE run_id=?1)",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(JournalError::InvalidEnvelope("run does not exist".into()));
+        }
+        connection.execute(
+            "INSERT INTO run_workspaces(run_id, workspace) VALUES(?1, ?2) \
+             ON CONFLICT(run_id) DO UPDATE SET workspace=excluded.workspace \
+             WHERE run_workspaces.workspace=excluded.workspace",
+            params![run_id, workspace],
+        )?;
+        let bound: Option<String> = connection
+            .query_row(
+                "SELECT workspace FROM run_workspaces WHERE run_id=?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if bound.as_deref() != Some(workspace) {
+            return Err(JournalError::Conflict(Conflict::EventId {
+                event_id: run_id.to_owned(),
+            }));
+        }
+        Ok(())
+    }
+
+    pub fn workspace_event_page(
+        &mut self,
+        workspace: &str,
+        run_id: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<RunEventPage, RunEventPageError> {
+        let owned: bool = self
+            .connection
+            .as_ref()
+            .expect("journal connection is always present outside compaction")
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM run_workspaces WHERE run_id=?1 AND workspace=?2)",
+                params![run_id, workspace],
+                |row| row.get(0),
+            )
+            .map_err(JournalError::from)
+            .map_err(RunEventPageError::Journal)?;
+        if !owned {
+            return Err(RunEventPageError::NotFoundOrInaccessible);
+        }
+        self.event_page(run_id, limit, cursor)
+    }
+
+    pub fn run_belongs_to_workspace(
+        &self,
+        run_id: &str,
+        workspace: &str,
+    ) -> Result<bool, JournalError> {
+        self.connection
+            .as_ref()
+            .expect("journal connection is always present outside compaction")
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM run_workspaces WHERE run_id=?1 AND workspace=?2)",
+                params![run_id, workspace],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     pub fn events(&mut self, run_id: &str) -> Result<Vec<EventEnvelope>, JournalError> {
@@ -318,6 +565,90 @@ impl RunJournal {
         .collect()
     }
 
+    /// Reads at most `limit` envelopes without loading the complete run.
+    pub fn event_page(
+        &mut self,
+        run_id: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<RunEventPage, RunEventPageError> {
+        const MAX_PAGE_SIZE: usize = 100;
+        if !(1..=MAX_PAGE_SIZE).contains(&limit) {
+            return Err(RunEventPageError::InvalidLimit);
+        }
+        let after = match cursor {
+            Some(value) => decode_run_event_cursor(value, run_id, &self.cursor_key)?,
+            None => 0,
+        };
+        let coordination = self.coordination.clone();
+        let _operation = coordination
+            .as_ref()
+            .map(|state| state.operation.lock().unwrap());
+        self.refresh_after_compaction()
+            .map_err(RunEventPageError::Journal)?;
+        let connection = self
+            .connection
+            .as_ref()
+            .expect("journal connection is always present outside compaction");
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE run_id=?1)",
+                [run_id],
+                |row| row.get(0),
+            )
+            .map_err(JournalError::from)
+            .map_err(RunEventPageError::Journal)?;
+        if !exists {
+            return Err(RunEventPageError::NotFoundOrInaccessible);
+        }
+        if after > 0 {
+            let boundary_exists: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE run_id=?1 AND run_seq=?2)",
+                    params![run_id, after],
+                    |row| row.get(0),
+                )
+                .map_err(JournalError::from)
+                .map_err(RunEventPageError::Journal)?;
+            if !boundary_exists {
+                return Err(RunEventPageError::InvalidCursor);
+            }
+        }
+        let mut statement = connection
+            .prepare("SELECT envelope_json FROM events WHERE run_id=?1 AND run_seq>?2 ORDER BY run_seq LIMIT ?3")
+            .map_err(JournalError::from)
+            .map_err(RunEventPageError::Journal)?;
+        let rows = statement
+            .query_map(params![run_id, after, (limit + 1) as u64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(JournalError::from)
+            .map_err(RunEventPageError::Journal)?;
+        let mut events = rows
+            .map(|row| {
+                let raw = row.map_err(JournalError::from)?;
+                serde_json::from_str::<EventEnvelope>(&raw).map_err(|error| {
+                    JournalError::Corrupt(format!("invalid stored envelope JSON: {error}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(RunEventPageError::Journal)?;
+        let has_more = events.len() > limit;
+        events.truncate(limit);
+        let next_cursor = if has_more {
+            events
+                .last()
+                .map(|event| encode_run_event_cursor(run_id, event.run_seq, &self.cursor_key))
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(RunEventPage {
+            events,
+            next_cursor,
+        })
+    }
+
     /// Atomically removes a run's events and returns their distinct CAS hashes.
     pub fn delete_run(&mut self, run_id: &str) -> Result<HashSet<ContentHash>, JournalError> {
         let coordination = self.coordination.clone();
@@ -332,6 +663,19 @@ impl RunJournal {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let hashes = referenced_hashes_for_run(&tx, Some(run_id))?;
         tx.execute("DELETE FROM events WHERE run_id=?1", [run_id])?;
+        tx.execute(
+            "DELETE FROM thread_projection_entries WHERE run_id=?1",
+            [run_id],
+        )?;
+        tx.execute(
+            "DELETE FROM thread_projection_history WHERE run_id=?1",
+            [run_id],
+        )?;
+        tx.execute(
+            "DELETE FROM thread_projection_versions WHERE run_id=?1",
+            [&run_id],
+        )?;
+        tx.execute("DELETE FROM run_workspaces WHERE run_id=?1", [run_id])?;
         tx.commit()?;
         Ok(hashes)
     }
@@ -387,6 +731,126 @@ impl RunJournal {
         }
         Ok(())
     }
+}
+
+fn run_event_cursor_mac(key: &[u8; 32], run_id: &str, sequence: u64) -> Hmac<Sha256> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts all key lengths");
+    mac.update(b"muniment-run-event-cursor-v1\0");
+    mac.update(run_id.as_bytes());
+    mac.update(&[0]);
+    mac.update(&sequence.to_be_bytes());
+    mac
+}
+
+fn thread_projection_cursor_mac(
+    key: &[u8; 32],
+    run_id: &str,
+    snapshot_seq: u64,
+    last_ordinal: i64,
+) -> Hmac<Sha256> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts all key lengths");
+    mac.update(b"muniment-thread-projection-cursor-v1\0");
+    mac.update(run_id.as_bytes());
+    mac.update(&[0]);
+    mac.update(&snapshot_seq.to_be_bytes());
+    mac.update(&last_ordinal.to_be_bytes());
+    mac
+}
+
+fn encode_thread_projection_cursor(
+    run_id: &str,
+    snapshot_seq: u64,
+    last_ordinal: i64,
+    key: &[u8; 32],
+) -> Result<String, RunEventPageError> {
+    let cursor = ThreadProjectionCursor {
+        version: 1,
+        run_id: run_id.to_owned(),
+        snapshot_seq,
+        last_ordinal,
+        authenticator: URL_SAFE_NO_PAD.encode(
+            thread_projection_cursor_mac(key, run_id, snapshot_seq, last_ordinal)
+                .finalize()
+                .into_bytes(),
+        ),
+    };
+    serde_json::to_vec(&cursor)
+        .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+        .map_err(|error| RunEventPageError::Journal(JournalError::Corrupt(error.to_string())))
+}
+
+fn decode_thread_projection_cursor(
+    value: &str,
+    run_id: &str,
+    key: &[u8; 32],
+) -> Result<(u64, i64), RunEventPageError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| RunEventPageError::InvalidCursor)?;
+    let cursor: ThreadProjectionCursor =
+        serde_json::from_slice(&bytes).map_err(|_| RunEventPageError::InvalidCursor)?;
+    if cursor.version != 1 || cursor.run_id != run_id || cursor.snapshot_seq == 0 {
+        return Err(RunEventPageError::InvalidCursor);
+    }
+    let authenticator = URL_SAFE_NO_PAD
+        .decode(&cursor.authenticator)
+        .map_err(|_| RunEventPageError::InvalidCursor)?;
+    if cursor.last_ordinal < 0 {
+        return Err(RunEventPageError::InvalidCursor);
+    }
+    thread_projection_cursor_mac(key, run_id, cursor.snapshot_seq, cursor.last_ordinal)
+        .verify_slice(&authenticator)
+        .map_err(|_| RunEventPageError::InvalidCursor)?;
+    Ok((cursor.snapshot_seq, cursor.last_ordinal))
+}
+
+fn encode_run_event_cursor(
+    run_id: &str,
+    sequence: u64,
+    key: &[u8; 32],
+) -> Result<String, RunEventPageError> {
+    let cursor = RunEventCursor {
+        version: 1,
+        run_id: run_id.to_owned(),
+        after_run_seq: sequence,
+        authenticator: URL_SAFE_NO_PAD.encode(
+            run_event_cursor_mac(key, run_id, sequence)
+                .finalize()
+                .into_bytes(),
+        ),
+    };
+    serde_json::to_vec(&cursor)
+        .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+        .map_err(|error| {
+            RunEventPageError::Journal(JournalError::Corrupt(format!(
+                "could not encode run-event cursor: {error}"
+            )))
+        })
+}
+
+fn decode_run_event_cursor(
+    encoded: &str,
+    run_id: &str,
+    key: &[u8; 32],
+) -> Result<u64, RunEventPageError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| RunEventPageError::InvalidCursor)?;
+    let cursor: RunEventCursor =
+        serde_json::from_slice(&bytes).map_err(|_| RunEventPageError::InvalidCursor)?;
+    let authenticator = URL_SAFE_NO_PAD
+        .decode(&cursor.authenticator)
+        .map_err(|_| RunEventPageError::InvalidCursor)?;
+    if cursor.version != 1
+        || cursor.run_id != run_id
+        || cursor.after_run_seq == 0
+        || run_event_cursor_mac(key, run_id, cursor.after_run_seq)
+            .verify_slice(&authenticator)
+            .is_err()
+    {
+        return Err(RunEventPageError::InvalidCursor);
+    }
+    Ok(cursor.after_run_seq)
 }
 
 fn load_or_create_cursor_key(connection: &Connection) -> Result<[u8; 32], JournalError> {
@@ -609,9 +1073,206 @@ CREATE TABLE events (
  UNIQUE(run_id, run_seq)
 ) STRICT;
 CREATE INDEX events_run_order ON events(run_id, run_seq);
+CREATE TABLE run_workspaces (
+ run_id TEXT PRIMARY KEY NOT NULL,
+ workspace TEXT NOT NULL
+) STRICT;
+CREATE INDEX run_workspaces_workspace_run ON run_workspaces(workspace, run_id);
+CREATE TABLE thread_projection_entries (
+ run_id TEXT NOT NULL,
+ ordinal INTEGER NOT NULL,
+ run_seq INTEGER NOT NULL,
+ kind TEXT NOT NULL,
+ text TEXT,
+ PRIMARY KEY(run_id, ordinal)
+) STRICT;
+CREATE INDEX thread_projection_run_order ON thread_projection_entries(run_id, ordinal);
+CREATE TABLE thread_projection_history (
+ run_id TEXT NOT NULL,
+ ordinal INTEGER NOT NULL,
+ valid_until_seq INTEGER NOT NULL,
+ run_seq INTEGER NOT NULL,
+ kind TEXT NOT NULL,
+ text TEXT,
+ PRIMARY KEY(run_id, ordinal, valid_until_seq)
+) STRICT;
+CREATE TABLE thread_projection_versions (
+ run_id TEXT NOT NULL,
+ ordinal INTEGER NOT NULL,
+ valid_from_seq INTEGER NOT NULL,
+ valid_until_seq INTEGER,
+ run_seq INTEGER NOT NULL,
+ kind TEXT NOT NULL,
+ text TEXT,
+ PRIMARY KEY(run_id, ordinal, valid_from_seq)
+) STRICT;
+CREATE INDEX thread_projection_versions_page
+ ON thread_projection_versions(run_id, ordinal, valid_from_seq, valid_until_seq);
 CREATE TABLE journal_metadata (
  key TEXT PRIMARY KEY NOT NULL,
  value BLOB NOT NULL
 ) STRICT;
 COMMIT;
 "#;
+
+// Mutable chunks are deliberately small: snapshot versioning can copy at most
+// this many bytes per appended byte, so projection storage remains linearly
+// bounded even for a stream made up of one-byte deltas.
+const PROJECTION_TEXT_CHUNK: usize = 64;
+
+fn update_thread_projection(
+    tx: &rusqlite::Transaction<'_>,
+    event: &EventEnvelope,
+) -> Result<(), JournalError> {
+    fn inline_text(event: &EventEnvelope, name: &str) -> Option<String> {
+        let EventPayload::Inline { payload_json } = &event.payload else {
+            return None;
+        };
+        payload_json.get(name)?.as_str().map(str::to_owned)
+    }
+    fn chunks(text: &str) -> Vec<String> {
+        if text.is_empty() {
+            return vec![String::new()];
+        }
+        let mut result = Vec::new();
+        let mut start = 0;
+        while start < text.len() {
+            let mut end = (start + PROJECTION_TEXT_CHUNK).min(text.len());
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            result.push(text[start..end].to_owned());
+            start = end;
+        }
+        result
+    }
+    let next_ordinal = || -> Result<i64, rusqlite::Error> {
+        tx.query_row(
+            "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM thread_projection_entries WHERE run_id=?1",
+            [&event.run_id],
+            |row| row.get(0),
+        )
+    };
+    let insert_chunks = |kind: &str, text: &str| -> Result<(), JournalError> {
+        let first_ordinal = next_ordinal()?;
+        for (offset, chunk) in chunks(text).into_iter().enumerate() {
+            let ordinal = first_ordinal + offset as i64;
+            tx.execute(
+                "INSERT INTO thread_projection_entries(run_id,ordinal,run_seq,kind,text) VALUES(?1,?2,?3,?4,?5)",
+                params![event.run_id, ordinal, event.run_seq, kind, chunk],
+            )?;
+            tx.execute(
+                "INSERT INTO thread_projection_versions(run_id,ordinal,valid_from_seq,run_seq,kind,text) VALUES(?1,?2,?3,?3,?4,?5)",
+                params![event.run_id, ordinal, event.run_seq, kind, chunk],
+            )?;
+        }
+        Ok(())
+    };
+    let archive = |kind: &str| -> Result<(), JournalError> {
+        tx.execute(
+            "UPDATE thread_projection_versions SET valid_until_seq=?1 \
+             WHERE run_id=?2 AND kind=?3 AND valid_until_seq IS NULL",
+            params![event.run_seq, event.run_id, kind],
+        )?;
+        Ok(())
+    };
+    match event.event_type.as_str() {
+        "user.prompt.submitted" => {
+            if let Some(text) = inline_text(event, "prompt") {
+                insert_chunks("user_message", &text)?;
+            }
+        }
+        "model.stream.delta" => {
+            let Some(mut text) = inline_text(event, "text") else {
+                return Ok(());
+            };
+            let last: Option<(i64, String)> = tx
+                .query_row(
+                    "SELECT ordinal, COALESCE(text,'') FROM thread_projection_entries WHERE run_id=?1 AND kind='assistant_message' ORDER BY ordinal DESC LIMIT 1",
+                    [&event.run_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let had_tail = last.is_some();
+            if let Some((ordinal, mut tail)) = last {
+                let available = PROJECTION_TEXT_CHUNK.saturating_sub(tail.len());
+                let mut take = available.min(text.len());
+                while !text.is_char_boundary(take) {
+                    take -= 1;
+                }
+                tail.push_str(&text[..take]);
+                tx.execute(
+                    "UPDATE thread_projection_versions SET valid_until_seq=?1 \
+                     WHERE run_id=?2 AND ordinal=?3 AND valid_until_seq IS NULL",
+                    params![event.run_seq, event.run_id, ordinal],
+                )?;
+                tx.execute(
+                    "UPDATE thread_projection_entries SET text=?1 WHERE run_id=?2 AND ordinal=?3",
+                    params![tail, event.run_id, ordinal],
+                )?;
+                tx.execute(
+                    "INSERT INTO thread_projection_versions(run_id,ordinal,valid_from_seq,run_seq,kind,text) \
+                     VALUES(?1,?2,?3,?3,'assistant_message',?4)",
+                    params![event.run_id, ordinal, event.run_seq, tail],
+                )?;
+                text.drain(..take);
+            }
+            if !text.is_empty() || !had_tail {
+                insert_chunks("assistant_message", &text)?;
+            }
+        }
+        "chat.attachment.ingested" => {
+            if let EventPayload::Attachment { attachment } = &event.payload {
+                insert_chunks("attachment", attachment.display_name())?;
+            }
+        }
+        "tool.effect.started" => {
+            let effect_id = inline_text(event, "effect_id").unwrap_or_default();
+            let display = inline_text(event, "display_name");
+            let ordinal = next_ordinal()?;
+            let kind = format!("tool_running:{effect_id}");
+            tx.execute(
+                "INSERT INTO thread_projection_entries(run_id,ordinal,run_seq,kind,text) VALUES(?1,?2,?3,?4,?5)",
+                params![event.run_id, ordinal, event.run_seq, kind, display],
+            )?;
+            tx.execute(
+                "INSERT INTO thread_projection_versions(run_id,ordinal,valid_from_seq,run_seq,kind,text) \
+                 VALUES(?1,?2,?3,?3,?4,?5)",
+                params![event.run_id, ordinal, event.run_seq, kind, display],
+            )?;
+        }
+        "tool.effect.completed" | "tool.effect.failed" => {
+            if let Some(effect_id) = inline_text(event, "effect_id") {
+                let old = format!("tool_running:{effect_id}");
+                let new = if event.event_type == "tool.effect.completed" {
+                    "tool_completed"
+                } else {
+                    "tool_failed"
+                };
+                archive(&old)?;
+                tx.execute(
+                    "UPDATE thread_projection_entries SET kind=?1 WHERE run_id=?2 AND kind=?3",
+                    params![new, event.run_id, old],
+                )?;
+                tx.execute(
+                    "INSERT INTO thread_projection_versions(run_id,ordinal,valid_from_seq,run_seq,kind,text) \
+                     SELECT run_id,ordinal,?1,?1,?2,text FROM thread_projection_entries \
+                     WHERE run_id=?3 AND kind=?2",
+                    params![event.run_seq, new, event.run_id],
+                )?;
+            }
+        }
+        "permission.requested" => {
+            let title = inline_text(event, "title").unwrap_or_default();
+            archive("permission_pending")?;
+            tx.execute("DELETE FROM thread_projection_entries WHERE run_id=?1 AND kind='permission_pending'", [&event.run_id])?;
+            insert_chunks("permission_pending", &title)?;
+        }
+        "permission.resolved" => {
+            archive("permission_pending")?;
+            tx.execute("DELETE FROM thread_projection_entries WHERE run_id=?1 AND kind='permission_pending'", [&event.run_id])?;
+        }
+        _ => {}
+    }
+    Ok(())
+}

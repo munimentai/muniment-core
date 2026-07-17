@@ -18,7 +18,7 @@ use super::{
     Failure, FirstMessage, NegotiationError, Operation, Protocol, ProtocolError, Request, Response,
     Success, VersionRange, CHALLENGE_LIFETIME, MAX_FRAME_LENGTH, MAX_TEXT_LENGTH,
 };
-use crate::journal::{summaries::RunSummaryListError, RunJournal};
+use crate::journal::{summaries::RunSummaryListError, RunEventPageError, RunJournal};
 
 const ATTACH_DIRECTORY: &[u8] = b"muniment\0";
 const ENDPOINT_NAME: &str = "attach-v1.sock";
@@ -26,6 +26,9 @@ const PRIVATE_MODE: libc::mode_t = 0o700;
 const SOCKET_MODE: libc::mode_t = 0o600;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const DESKTOP_PROTOCOL: VersionRange = VersionRange { min: 1, max: 1 };
+const MAX_THREAD_ID_LENGTH: usize = 36;
+const MAX_CURSOR_LENGTH: usize = 1024;
+const MAX_RESPONSE_BODY_LENGTH: usize = MAX_FRAME_LENGTH - 4096;
 
 /// A verified, pinned filesystem boundary for the Linux attach endpoint.
 #[derive(Debug)]
@@ -366,13 +369,44 @@ pub struct ThreadListPage {
     pub next_cursor: Option<String>,
 }
 
-/// Deterministic desktop data seam for the one operation served by this slice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadOpenRequest {
+    pub thread_id: String,
+    pub limit: u8,
+    pub cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RedactedThreadEntry {
+    pub run_seq: u64,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ThreadOpenPage {
+    pub thread_id: String,
+    pub entries: Vec<RedactedThreadEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Deterministic desktop data seam for the thread reads served by this slice.
 pub trait ThreadListService {
     fn list_threads(
         &mut self,
         workspace: &str,
         request: ThreadListRequest,
     ) -> Result<ThreadListPage, ProtocolError>;
+
+    fn open_thread(
+        &mut self,
+        _workspace: &str,
+        _request: ThreadOpenRequest,
+    ) -> Result<ThreadOpenPage, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
 }
 
 impl<F> ThreadListService for F
@@ -391,16 +425,21 @@ where
 impl ThreadListService for RunJournal {
     fn list_threads(
         &mut self,
-        _workspace: &str,
+        workspace: &str,
         request: ThreadListRequest,
     ) -> Result<ThreadListPage, ProtocolError> {
-        let page =
-            self.run_summaries(usize::from(request.limit), request.cursor.as_deref())
-                .map_err(|error| match error {
-                    RunSummaryListError::InvalidLimit { .. }
-                    | RunSummaryListError::InvalidCursor => ProtocolError::invalid_request(),
-                    RunSummaryListError::Journal(_) => ProtocolError::persistence_failed(),
-                })?;
+        let page = self
+            .workspace_run_summaries(
+                workspace,
+                usize::from(request.limit),
+                request.cursor.as_deref(),
+            )
+            .map_err(|error| match error {
+                RunSummaryListError::InvalidLimit { .. } | RunSummaryListError::InvalidCursor => {
+                    ProtocolError::invalid_request()
+                }
+                RunSummaryListError::Journal(_) => ProtocolError::persistence_failed(),
+            })?;
         Ok(ThreadListPage {
             threads: page
                 .summaries
@@ -412,6 +451,85 @@ impl ThreadListService for RunJournal {
                 })
                 .collect(),
             next_cursor: page.next_cursor,
+        })
+    }
+
+    fn open_thread(
+        &mut self,
+        workspace: &str,
+        request: ThreadOpenRequest,
+    ) -> Result<ThreadOpenPage, ProtocolError> {
+        let (snapshot_seq, last_ordinal) = self
+            .thread_projection_boundary(workspace, &request.thread_id, request.cursor.as_deref())
+            .map_err(|error| match error {
+                RunEventPageError::InvalidLimit => ProtocolError::invalid_request(),
+                RunEventPageError::InvalidCursor => ProtocolError::invalid_cursor(),
+                RunEventPageError::NotFoundOrInaccessible => ProtocolError::invalid_request(),
+                RunEventPageError::Journal(_) => ProtocolError::persistence_failed(),
+            })?;
+        let projected = self
+            .projected_thread_entries(
+                workspace,
+                &request.thread_id,
+                snapshot_seq,
+                last_ordinal,
+                usize::from(request.limit) + 1,
+            )
+            .map_err(|error| match error {
+                RunEventPageError::InvalidCursor => ProtocolError::invalid_cursor(),
+                RunEventPageError::NotFoundOrInaccessible => ProtocolError::invalid_request(),
+                _ => ProtocolError::persistence_failed(),
+            })?;
+        let mut expanded = projected
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.ordinal,
+                    RedactedThreadEntry {
+                        run_seq: entry.run_seq,
+                        kind: entry.kind,
+                        text: entry.text,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        if request.cursor.is_some() && expanded.is_empty() {
+            return Err(ProtocolError::invalid_cursor());
+        }
+        let has_more = expanded.len() > usize::from(request.limit);
+        expanded.truncate(usize::from(request.limit));
+        let mut entries = Vec::new();
+        let mut emitted_ordinal = last_ordinal;
+        for (ordinal, entry) in expanded.iter() {
+            let mut candidate = entries.clone();
+            candidate.push(entry.clone());
+            let candidate_page = ThreadOpenPage {
+                thread_id: request.thread_id.clone(),
+                entries: candidate,
+                next_cursor: Some("x".repeat(MAX_CURSOR_LENGTH)),
+            };
+            if serde_json::to_vec(&candidate_page)
+                .map_err(|_| ProtocolError::persistence_failed())?
+                .len()
+                > MAX_RESPONSE_BODY_LENGTH
+            {
+                break;
+            }
+            entries.push(entry.clone());
+            emitted_ordinal = *ordinal;
+        }
+        let next_cursor = if has_more || entries.len() < expanded.len() {
+            Some(
+                self.thread_projection_cursor(&request.thread_id, snapshot_seq, emitted_ordinal)
+                    .map_err(|_| ProtocolError::persistence_failed())?,
+            )
+        } else {
+            None
+        };
+        Ok(ThreadOpenPage {
+            thread_id: request.thread_id,
+            entries,
+            next_cursor,
         })
     }
 }
@@ -743,7 +861,11 @@ where
             );
             return Err(AttachSessionError::Authorization);
         }
-        let required_scope = (request.operation == Operation::ThreadList).then_some("thread.read");
+        let required_scope = matches!(
+            request.operation,
+            Operation::ThreadList | Operation::ThreadOpen
+        )
+        .then_some("thread.read");
         if authorization
             .validate_request_with_scope(
                 &request.capability,
@@ -785,10 +907,72 @@ fn dispatch_request<S: ThreadListService>(
     workspace: &str,
     service: &mut S,
 ) -> Result<serde_json::Value, ProtocolError> {
+    request.validate_idempotency_key()?;
+    if request.operation == Operation::ThreadOpen {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            thread_id: String,
+            limit: u8,
+            #[serde(default)]
+            cursor: Option<String>,
+        }
+        let body: Body =
+            serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
+        if body.thread_id.is_empty()
+            || body.thread_id.len() > MAX_THREAD_ID_LENGTH
+            || body.limit == 0
+            || body.limit > 100
+            || body
+                .cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.is_empty() || cursor.len() > MAX_CURSOR_LENGTH)
+        {
+            return Err(ProtocolError::invalid_request());
+        }
+        let limit = body.limit;
+        let requested_thread_id = body.thread_id.clone();
+        let page = service.open_thread(
+            workspace,
+            ThreadOpenRequest {
+                thread_id: body.thread_id,
+                limit,
+                cursor: body.cursor,
+            },
+        )?;
+        if page.entries.len() > usize::from(limit)
+            || page.thread_id != requested_thread_id
+            || page.thread_id.is_empty()
+            || page.thread_id.len() > MAX_TEXT_LENGTH
+            || page.entries.iter().any(|entry| {
+                entry.run_seq == 0
+                    || entry.kind.is_empty()
+                    || entry.kind.len() > MAX_TEXT_LENGTH
+                    || entry
+                        .text
+                        .as_ref()
+                        .is_some_and(|text| text.len() > MAX_TEXT_LENGTH)
+            })
+            || page
+                .next_cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.is_empty() || cursor.len() > MAX_TEXT_LENGTH)
+        {
+            return Err(ProtocolError::persistence_failed());
+        }
+        let value = serde_json::to_value(page).map_err(|_| ProtocolError::persistence_failed())?;
+        if serde_json::to_vec(&value)
+            .map_err(|_| ProtocolError::persistence_failed())?
+            .len()
+            > MAX_RESPONSE_BODY_LENGTH
+        {
+            return Err(ProtocolError::persistence_failed());
+        }
+        return Ok(value);
+    }
     if request.operation != Operation::ThreadList {
         return Err(ProtocolError::unsupported_operation());
     }
-    request.validate_idempotency_key()?;
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Body {

@@ -5,6 +5,75 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectedThreadEntry {
+    pub ordinal: i64,
+    pub run_seq: u64,
+    pub kind: String,
+    pub text: Option<String>,
+}
+
+impl super::RunJournal {
+    /// Replays a stable run snapshot one row at a time. This keeps reducer
+    /// state across storage boundaries without loading the journal envelopes.
+    pub fn projected_thread_entries(
+        &mut self,
+        workspace: &str,
+        run_id: &str,
+        snapshot_seq: u64,
+        last_ordinal: i64,
+        limit: usize,
+    ) -> Result<Vec<ProjectedThreadEntry>, super::RunEventPageError> {
+        let owned = self
+            .run_belongs_to_workspace(run_id, workspace)
+            .map_err(super::RunEventPageError::Journal)?;
+        if !owned {
+            return Err(super::RunEventPageError::NotFoundOrInaccessible);
+        }
+        let coordination = self.coordination.clone();
+        let _operation = coordination
+            .as_ref()
+            .map(|state| state.operation.lock().unwrap());
+        self.refresh_after_compaction()
+            .map_err(super::RunEventPageError::Journal)?;
+        let connection = self
+            .connection
+            .as_ref()
+            .expect("journal connection is always present outside compaction");
+        let mut statement = connection
+            .prepare(
+                "SELECT ordinal,run_seq,kind,text FROM thread_projection_versions INDEXED BY thread_projection_versions_page \
+                 WHERE run_id=?1 AND ordinal>?4 AND valid_from_seq<=?2 \
+                 AND (valid_until_seq IS NULL OR valid_until_seq>?2) \
+                 ORDER BY ordinal LIMIT ?3",
+            )
+            .map_err(super::JournalError::from)
+            .map_err(super::RunEventPageError::Journal)?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![run_id, snapshot_seq, limit, last_ordinal],
+                |row| {
+                    Ok(ProjectedThreadEntry {
+                        ordinal: row.get(0)?,
+                        run_seq: row.get(1)?,
+                        kind: row
+                            .get::<_, String>(2)?
+                            .split(':')
+                            .next()
+                            .unwrap_or_default()
+                            .to_owned(),
+                        text: row.get(3)?,
+                    })
+                },
+            )
+            .map_err(super::JournalError::from)
+            .map_err(super::RunEventPageError::Journal)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(super::JournalError::from)
+            .map_err(super::RunEventPageError::Journal)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionGate {
     pub gate_id: String,
@@ -119,6 +188,51 @@ pub fn project_chat(events: &[EventEnvelope]) -> Result<ChatProjection, ReduceEr
         projector.apply(event)?;
     }
     projector.projection()
+}
+
+/// Projects a bounded continuation fragment when the reducer state lives before
+/// the page boundary. Only independently displayable fields are emitted.
+pub fn project_chat_fragment(events: &[EventEnvelope]) -> Result<ChatProjection, ReduceError> {
+    let mut chat = ChatProjection::default();
+    for event in events {
+        match event.event_type.as_str() {
+            "chat.attachment.ingested" => {
+                let EventPayload::Attachment { attachment } = &event.payload else {
+                    return Err(ReduceError::MissingAttachmentPayload {
+                        event_type: event.event_type.clone(),
+                    });
+                };
+                chat.attachments.push(ProjectedAttachment {
+                    display_name: attachment.display_name().to_owned(),
+                    byte_length: attachment.byte_length(),
+                    media_type: attachment.media_type().map(str::to_owned),
+                });
+            }
+            "model.stream.delta" => chat.text.push_str(&field(event, "text")?),
+            "tool.effect.started" => chat.tool_activity.push(ToolActivity {
+                effect_id: field(event, "effect_id")?,
+                display_name: optional_field(event, "display_name")?,
+                status: ToolActivityStatus::Running,
+            }),
+            "tool.effect.completed" | "tool.effect.failed" => {
+                let effect_id = field(event, "effect_id")?;
+                if let Some(activity) = chat
+                    .tool_activity
+                    .iter_mut()
+                    .rev()
+                    .find(|activity| activity.effect_id == effect_id)
+                {
+                    activity.status = if event.event_type == "tool.effect.completed" {
+                        ToolActivityStatus::Completed
+                    } else {
+                        ToolActivityStatus::Failed
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(chat)
 }
 
 #[derive(Clone, Debug, Default)]

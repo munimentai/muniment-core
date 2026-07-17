@@ -81,6 +81,26 @@ impl RunJournal {
         limit: usize,
         cursor: Option<&str>,
     ) -> Result<RunSummaryPage, RunSummaryListError> {
+        self.run_summaries_inner(None, limit, cursor)
+    }
+
+    /// Lists only runs owned by `workspace`; filtering is part of the cursor
+    /// query so inaccessible runs cannot affect page size or continuation.
+    pub fn workspace_run_summaries(
+        &mut self,
+        workspace: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<RunSummaryPage, RunSummaryListError> {
+        self.run_summaries_inner(Some(workspace), limit, cursor)
+    }
+
+    fn run_summaries_inner(
+        &mut self,
+        workspace: Option<&str>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<RunSummaryPage, RunSummaryListError> {
         if !(1..=MAX_PAGE_SIZE).contains(&limit) {
             return Err(RunSummaryListError::InvalidLimit {
                 limit,
@@ -103,8 +123,10 @@ impl RunJournal {
 
         if let Some(boundary) = &boundary {
             let exists: bool = connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM events WHERE run_id=?1 GROUP BY run_id HAVING MAX(recorded_at)=?2)",
-                rusqlite::params![boundary.run_id, boundary.updated_at],
+                "SELECT EXISTS(SELECT 1 FROM events e \
+                 WHERE e.run_id=?1 AND (?3 IS NULL OR EXISTS(SELECT 1 FROM run_workspaces w WHERE w.run_id=e.run_id AND w.workspace=?3)) \
+                 GROUP BY e.run_id HAVING MAX(e.recorded_at)=?2)",
+                rusqlite::params![boundary.run_id, boundary.updated_at, workspace],
                 |row| row.get(0),
             )?;
             if !exists {
@@ -116,23 +138,31 @@ impl RunJournal {
         let mut keys = Vec::with_capacity(page_size);
         if let Some(boundary) = &boundary {
             let mut statement = connection.prepare(
-                "SELECT run_id, MAX(recorded_at) AS updated_at FROM events GROUP BY run_id \
+                "SELECT e.run_id, MAX(e.recorded_at) AS updated_at FROM events e \
+                 WHERE (?4 IS NULL OR EXISTS(SELECT 1 FROM run_workspaces w WHERE w.run_id=e.run_id AND w.workspace=?4)) GROUP BY e.run_id \
                  HAVING updated_at < ?1 OR (updated_at = ?1 AND run_id > ?2) \
                  ORDER BY updated_at DESC, run_id ASC LIMIT ?3",
             )?;
             let rows = statement.query_map(
-                rusqlite::params![boundary.updated_at, boundary.run_id, page_size as u64],
+                rusqlite::params![
+                    boundary.updated_at,
+                    boundary.run_id,
+                    page_size as u64,
+                    workspace
+                ],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )?;
             keys.extend(rows.collect::<Result<Vec<_>, _>>()?);
         } else {
             let mut statement = connection.prepare(
-                "SELECT run_id, MAX(recorded_at) AS updated_at FROM events GROUP BY run_id \
+                "SELECT e.run_id, MAX(e.recorded_at) AS updated_at FROM events e \
+                 WHERE (?2 IS NULL OR EXISTS(SELECT 1 FROM run_workspaces w WHERE w.run_id=e.run_id AND w.workspace=?2)) GROUP BY e.run_id \
                  ORDER BY updated_at DESC, run_id ASC LIMIT ?1",
             )?;
-            let rows = statement.query_map([page_size as u64], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
+            let rows = statement
+                .query_map(rusqlite::params![page_size as u64, workspace], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
             keys.extend(rows.collect::<Result<Vec<_>, _>>()?);
         }
 

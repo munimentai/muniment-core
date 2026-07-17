@@ -3,7 +3,7 @@
 use muniment_core::attach::linux::{
     run_authenticated_session_with, run_authenticated_session_with_authorization, ApprovalDecision,
     AttachSessionError, AuthorizationSessionDependencies, PeerCredentials, RedactedThreadSummary,
-    ThreadListPage, ThreadListRequest, ThreadListService,
+    ThreadListPage, ThreadListRequest, ThreadListService, ThreadOpenRequest,
 };
 use muniment_core::attach::{
     decode_frame, encode_frame, Approval, AuthorizationClock, AuthorizationTokenGenerator,
@@ -512,6 +512,18 @@ fn request(id: u128, operation: Operation, body: serde_json::Value) -> Vec<u8> {
     .unwrap()
 }
 
+fn request_with_idempotency(id: u128, operation: Operation, body: serde_json::Value) -> Vec<u8> {
+    encode_frame(&Request {
+        protocol: Protocol,
+        request_id: Id::new(format!("{id:032x}")).unwrap(),
+        operation,
+        capability: "02".repeat(32),
+        idempotency_key: Some(Id::new(format!("{:032x}", id + 1000)).unwrap()),
+        body,
+    })
+    .unwrap()
+}
+
 fn prompt(run_id: &str, title: &str, recorded_at: &str) -> EventEnvelope {
     EventEnvelope {
         event_id: run_id.replacen("a100", "a200", 1),
@@ -635,6 +647,7 @@ fn authorized_thread_list_pages_real_journal_summaries_without_payloads() {
     const RUN_A: &str = "0190a100-0000-7000-8000-000000000001";
     const RUN_B: &str = "0190a100-0000-7000-8000-000000000002";
     const RUN_C: &str = "0190a100-0000-7000-8000-000000000003";
+    const HIDDEN_RUN: &str = "0190a100-0000-7000-8000-000000000004";
     let mut journal = RunJournal::open(":memory:").unwrap();
     for (run_id, title, recorded_at) in [
         (RUN_A, "first", "2026-07-16T03:00:00Z"),
@@ -644,7 +657,14 @@ fn authorized_thread_list_pages_real_journal_summaries_without_payloads() {
         journal
             .append(0, &prompt(run_id, title, recorded_at))
             .unwrap();
+        journal.bind_run_workspace(run_id, "workspace-1").unwrap();
     }
+    journal
+        .append(0, &prompt(HIDDEN_RUN, "hidden", "2026-07-16T04:00:00Z"))
+        .unwrap();
+    journal
+        .bind_run_workspace(HIDDEN_RUN, "workspace-2")
+        .unwrap();
 
     let (mut client, server) = UnixStream::pair().unwrap();
     let client_thread = thread::spawn(move || {
@@ -707,6 +727,446 @@ fn authorized_thread_list_pages_real_journal_summaries_without_payloads() {
     let encoded = format!("{}{}", first.body, second.body);
     assert!(!encoded.contains("secret"));
     assert!(!encoded.contains("/home/user/private"));
+}
+
+#[test]
+fn authorized_thread_open_pages_a_redacted_journal_projection() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000001";
+    let mut journal = RunJournal::open(":memory:").unwrap();
+    let first = prompt(RUN, "hello", "2026-07-16T03:00:00Z");
+    let mut second = first.clone();
+    second.event_id = "0190a200-0000-7000-8000-000000000002".into();
+    second.run_seq = 2;
+    second.event_type = "model.stream.delta".into();
+    second.payload = EventPayload::Inline {
+        payload_json: json!({"text": "answer", "secret": "/home/user/private"}),
+    };
+    journal.append_batch(0, &[first, second]).unwrap();
+    journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let client_thread = thread::spawn(move || {
+        client.write_all(&hello(1, 1)).unwrap();
+        let _: Welcome = read_frame(&mut client);
+        let _: Authorized = read_frame(&mut client);
+        client
+            .write_all(&request(
+                40,
+                Operation::ThreadOpen,
+                json!({"thread_id": RUN, "limit": 1}),
+            ))
+            .unwrap();
+        let first: Response = read_frame(&mut client);
+        client
+            .write_all(&request(
+                41,
+                Operation::ThreadOpen,
+                json!({"thread_id": RUN, "limit": 1, "cursor": first.body["next_cursor"]}),
+            ))
+            .unwrap();
+        let second: Response = read_frame(&mut client);
+        client.shutdown(Shutdown::Write).unwrap();
+        (first, second)
+    });
+    assert_eq!(
+        run_authenticated_session_with_authorization(
+            server,
+            credentials(),
+            "0.1.0",
+            Duration::from_secs(1),
+            AuthorizationSessionDependencies {
+                fill_random: |bytes: &mut [u8]| {
+                    bytes.fill(9);
+                    Ok(())
+                },
+                clock: TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                tokens: TestTokens(1),
+                approvals: |_: &muniment_core::attach::PairingChallenge, _: Duration| Some(
+                    ApprovalDecision::Approve(approval())
+                ),
+            },
+            &mut journal
+        ),
+        Ok(())
+    );
+    let (first, second) = client_thread.join().unwrap();
+    assert_eq!(
+        first.body["entries"],
+        json!([{"run_seq": 1, "kind": "user_message", "text": "hello"}])
+    );
+    assert_eq!(
+        second.body["entries"],
+        json!([{"run_seq": 2, "kind": "assistant_message", "text": "answer"}])
+    );
+    assert!(!format!("{first:?}{second:?}").contains("/home"));
+}
+
+#[test]
+fn projected_pages_preserve_cross_boundary_state_and_ignore_unknown_events() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000001";
+    let mut events = Vec::new();
+    for (seq, kind, payload) in [
+        (1, "run.started", json!({})),
+        (2, "model.stream.delta", json!({"text":"hello "})),
+        (3, "future.event", json!({"private":"ignored"})),
+        (4, "model.stream.delta", json!({"text":"world"})),
+        (
+            5,
+            "tool.effect.started",
+            json!({"effect_id":"tool-1","display_name":"Search"}),
+        ),
+        (
+            6,
+            "permission.requested",
+            json!({"gate_id":"gate-1","kind":"confirm","title":"Allow?","message":"Proceed?"}),
+        ),
+        (7, "permission.resolved", json!({"gate_id":"gate-1"})),
+        (8, "tool.effect.completed", json!({"effect_id":"tool-1"})),
+    ] {
+        let mut event = prompt(RUN, "unused", "2026-07-16T03:00:00Z");
+        event.event_id = format!("0190a200-0000-7000-8000-{seq:012}");
+        event.run_seq = seq;
+        event.event_type = kind.into();
+        event.payload = EventPayload::Inline {
+            payload_json: payload,
+        };
+        events.push(event);
+    }
+    let mut attachment = prompt(RUN, "unused", "2026-07-16T03:00:00Z");
+    attachment.event_id = "0190a200-0000-7000-8000-000000000009".into();
+    attachment.run_seq = 9;
+    attachment.event_type = "chat.attachment.ingested".into();
+    attachment.payload = EventPayload::Attachment {
+        attachment: serde_json::from_value(json!({
+            "sha256": "00".repeat(32), "display_name": "notes.txt", "byte_length": 12,
+            "media_type": "text/plain"
+        }))
+        .unwrap(),
+    };
+    events.push(attachment);
+    let mut journal = RunJournal::open(":memory:").unwrap();
+    journal.append_batch(0, &events).unwrap();
+    journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+    let first = journal
+        .open_thread(
+            "workspace-1",
+            ThreadOpenRequest {
+                thread_id: RUN.into(),
+                limit: 1,
+                cursor: None,
+            },
+        )
+        .unwrap();
+    let second = journal
+        .open_thread(
+            "workspace-1",
+            ThreadOpenRequest {
+                thread_id: RUN.into(),
+                limit: 1,
+                cursor: first.next_cursor,
+            },
+        )
+        .unwrap();
+    assert_eq!(first.entries[0].text.as_deref(), Some("hello world"));
+    assert_eq!(second.entries[0].kind, "tool_completed");
+    assert_eq!(second.entries[0].text.as_deref(), Some("Search"));
+    let third = journal
+        .open_thread(
+            "workspace-1",
+            ThreadOpenRequest {
+                thread_id: RUN.into(),
+                limit: 1,
+                cursor: second.next_cursor,
+            },
+        )
+        .unwrap();
+    assert_eq!(third.entries[0].kind, "attachment");
+    assert_eq!(third.entries[0].text.as_deref(), Some("notes.txt"));
+    assert!(third.next_cursor.is_none());
+}
+
+#[test]
+fn large_escaped_projection_continues_losslessly_with_bounded_pages() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000001";
+    let fragment = "\\\"\n".repeat(400);
+    let expected = fragment.repeat(1000);
+    let mut events = Vec::with_capacity(1001);
+    for seq in 1..=1001 {
+        let mut event = prompt(RUN, "unused", "2026-07-16T03:00:00Z");
+        event.event_id = format!("0190a200-0000-7000-8000-{seq:012}");
+        event.run_seq = seq;
+        event.event_type = if seq == 1 {
+            "run.started"
+        } else {
+            "model.stream.delta"
+        }
+        .into();
+        event.payload = EventPayload::Inline {
+            payload_json: if seq == 1 {
+                json!({})
+            } else {
+                json!({"text": fragment})
+            },
+        };
+        events.push(event);
+    }
+    let mut journal = RunJournal::open(":memory:").unwrap();
+    journal.append_batch(0, &events).unwrap();
+    journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+    // The journal projection seam itself is bounded; page formation does not
+    // replay or retain all 1,001 source envelopes.
+    assert_eq!(
+        journal
+            .projected_thread_entries("workspace-1", RUN, 1001, -1, 3)
+            .unwrap()
+            .len(),
+        3
+    );
+    let mut cursor = None;
+    let mut found = String::new();
+    loop {
+        let page = journal
+            .open_thread(
+                "workspace-1",
+                ThreadOpenRequest {
+                    thread_id: RUN.into(),
+                    limit: 100,
+                    cursor,
+                },
+            )
+            .unwrap();
+        assert!(serde_json::to_vec(&page).unwrap().len() < MAX_FRAME_LENGTH);
+        for entry in page.entries {
+            found.push_str(entry.text.as_deref().unwrap_or(""));
+        }
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(found, expected);
+}
+
+#[test]
+fn thread_open_cursor_skips_removed_projection_ordinals_without_duplicates() {
+    const RUN: &str = "0190a250-0000-7000-8000-000000000001";
+    let mut events = Vec::new();
+    for (seq, kind, payload) in [
+        (1, "user.prompt.submitted", json!({"prompt":"first"})),
+        (
+            2,
+            "permission.requested",
+            json!({"gate_id":"gate-1","kind":"confirm","title":"Allow?","message":"Proceed?"}),
+        ),
+        (3, "user.prompt.submitted", json!({"prompt":"second"})),
+        (4, "permission.resolved", json!({"gate_id":"gate-1"})),
+    ] {
+        let mut event = prompt(RUN, "unused", "2026-07-16T03:00:00Z");
+        event.event_id = format!("0190a250-0000-7000-8000-{seq:012}");
+        event.run_seq = seq;
+        event.event_type = kind.into();
+        event.payload = EventPayload::Inline {
+            payload_json: payload,
+        };
+        events.push(event);
+    }
+    let mut journal = RunJournal::open(":memory:").unwrap();
+    journal.append_batch(0, &events).unwrap();
+    journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+
+    let mut cursor = None;
+    let mut found = Vec::new();
+    loop {
+        let page = journal
+            .open_thread(
+                "workspace-1",
+                ThreadOpenRequest {
+                    thread_id: RUN.into(),
+                    limit: 1,
+                    cursor,
+                },
+            )
+            .unwrap();
+        found.extend(page.entries.into_iter().map(|entry| entry.text));
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    assert_eq!(found, [Some("first".into()), Some("second".into())]);
+}
+
+#[test]
+fn thread_projection_cursor_keeps_its_snapshot_after_later_deltas() {
+    const RUN: &str = "0190a300-0000-7000-8000-000000000001";
+    let mut events = Vec::new();
+    for (seq, kind, payload) in [
+        (1, "run.started", json!({})),
+        (2, "user.prompt.submitted", json!({"prompt":"question"})),
+        (3, "model.stream.delta", json!({"text":"hello"})),
+    ] {
+        let mut event = prompt(RUN, "unused", "2026-07-16T03:00:00Z");
+        event.event_id = format!("0190a300-0000-7000-8000-{seq:012}");
+        event.run_seq = seq;
+        event.event_type = kind.into();
+        event.payload = EventPayload::Inline {
+            payload_json: payload,
+        };
+        events.push(event);
+    }
+    let mut journal = RunJournal::open(":memory:").unwrap();
+    journal.append_batch(0, &events).unwrap();
+    journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+    let first = journal
+        .open_thread(
+            "workspace-1",
+            ThreadOpenRequest {
+                thread_id: RUN.into(),
+                limit: 1,
+                cursor: None,
+            },
+        )
+        .unwrap();
+
+    let mut later = prompt(RUN, "unused", "2026-07-16T03:00:01Z");
+    later.event_id = "0190a300-0000-7000-8000-000000000004".into();
+    later.run_seq = 4;
+    later.event_type = "model.stream.delta".into();
+    later.payload = EventPayload::Inline {
+        payload_json: json!({"text":" world"}),
+    };
+    journal.append(3, &later).unwrap();
+
+    let second = journal
+        .open_thread(
+            "workspace-1",
+            ThreadOpenRequest {
+                thread_id: RUN.into(),
+                limit: 1,
+                cursor: first.next_cursor,
+            },
+        )
+        .unwrap();
+    assert_eq!(second.entries[0].text.as_deref(), Some("hello"));
+}
+
+#[test]
+fn thread_open_rejects_bad_cursor_missing_thread_and_oversized_body_values() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000001";
+    const OTHER_RUN: &str = "0190a100-0000-7000-8000-000000000002";
+    let mut journal = RunJournal::open(":memory:").unwrap();
+    journal
+        .append(0, &prompt(RUN, "hello", "2026-07-16T03:00:00Z"))
+        .unwrap();
+    journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+    journal
+        .append(0, &prompt(OTHER_RUN, "hidden", "2026-07-16T03:01:00Z"))
+        .unwrap();
+    journal
+        .bind_run_workspace(OTHER_RUN, "workspace-2")
+        .unwrap();
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello(1, 1)).unwrap();
+    client
+        .write_all(&request(
+            50,
+            Operation::ThreadOpen,
+            json!({"thread_id": RUN, "limit": 1, "cursor": "forged"}),
+        ))
+        .unwrap();
+    client
+        .write_all(&request(
+            51,
+            Operation::ThreadOpen,
+            json!({"thread_id": "0190a100-0000-7000-8000-000000000099", "limit": 1}),
+        ))
+        .unwrap();
+    client
+        .write_all(&request(
+            52,
+            Operation::ThreadOpen,
+            json!({"thread_id": RUN, "limit": 101}),
+        ))
+        .unwrap();
+    for (id, body) in [
+        (53, json!({"thread_id": "", "limit": 1})),
+        (54, json!({"thread_id": "x".repeat(37), "limit": 1})),
+        (55, json!({"thread_id": RUN, "limit": 1, "cursor": ""})),
+        (
+            56,
+            json!({"thread_id": RUN, "limit": 1, "cursor": "x".repeat(1025)}),
+        ),
+        (
+            57,
+            json!({"thread_id": RUN, "limit": 1, "workspace": "other"}),
+        ),
+    ] {
+        client
+            .write_all(&request(id, Operation::ThreadOpen, body))
+            .unwrap();
+    }
+    client
+        .write_all(&request_with_idempotency(
+            58,
+            Operation::ThreadOpen,
+            json!({"thread_id": RUN, "limit": 1}),
+        ))
+        .unwrap();
+    client
+        .write_all(&request(
+            59,
+            Operation::ThreadOpen,
+            json!({"thread_id": OTHER_RUN, "limit": 1}),
+        ))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(
+        dispatch_session(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            &mut journal
+        ),
+        Ok(())
+    );
+    let cursor: ErrorEnvelope = read_frame(&mut client);
+    let missing: ErrorEnvelope = read_frame(&mut client);
+    let oversized: ErrorEnvelope = read_frame(&mut client);
+    assert_eq!(cursor.error.code(), ErrorCode::InvalidCursor);
+    assert_eq!(missing.error.code(), ErrorCode::InvalidRequest);
+    assert_eq!(oversized.error.code(), ErrorCode::InvalidRequest);
+    for id in 53..=58 {
+        let hostile: ErrorEnvelope = read_frame(&mut client);
+        assert_eq!(
+            hostile.request_id,
+            Some(Id::new(format!("{id:032x}")).unwrap())
+        );
+        assert!(matches!(
+            hostile.error.code(),
+            ErrorCode::InvalidRequest | ErrorCode::IdempotencyKeyForbidden
+        ));
+        assert_eq!(
+            serde_json::to_value(hostile.error).unwrap().get("details"),
+            None
+        );
+    }
+    let other_workspace: ErrorEnvelope = read_frame(&mut client);
+    assert_eq!(other_workspace.error.code(), missing.error.code());
+    assert_eq!(
+        serde_json::to_value(other_workspace.error)
+            .unwrap()
+            .get("details"),
+        None
+    );
+    assert_eq!(
+        serde_json::to_value(cursor.error).unwrap().get("details"),
+        None
+    );
+    assert_eq!(
+        serde_json::to_value(missing.error).unwrap().get("details"),
+        None
+    );
 }
 
 #[test]
@@ -811,7 +1271,7 @@ fn authorization_is_rechecked_before_every_dispatch() {
 }
 
 #[test]
-fn unsupported_operation_fails_closed_without_dispatch() {
+fn thread_open_without_read_scope_fails_closed_without_dispatch() {
     let (mut client, server) = UnixStream::pair().unwrap();
     client.write_all(&hello(1, 1)).unwrap();
     client
@@ -831,14 +1291,14 @@ fn unsupported_operation_fails_closed_without_dispatch() {
             approved,
             &mut service
         ),
-        Ok(())
+        Err(AttachSessionError::Authorization)
     );
     let error: ErrorEnvelope = read_frame(&mut client);
     assert_eq!(
         error.request_id,
         Some(Id::new(format!("{:032x}", 30)).unwrap())
     );
-    assert_eq!(error.error.code(), ErrorCode::UnsupportedOperation);
+    assert_eq!(error.error.code(), ErrorCode::Unauthorized);
 }
 
 #[test]

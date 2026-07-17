@@ -84,6 +84,67 @@ fn cas_payload(hash: &str) -> EventPayload {
 }
 
 #[test]
+fn projection_late_pages_use_keyset_index_and_storage_stays_linear() {
+    const DELTAS: u64 = 10_000;
+    let db = TestDb::new();
+    let mut journal = RunJournal::open(&db).unwrap();
+    let mut events = Vec::with_capacity(DELTAS as usize + 1);
+    let mut started = event(1);
+    started.event_type = "run.started".into();
+    events.push(started);
+    for seq in 2..=DELTAS + 1 {
+        let mut delta = event(seq);
+        delta.event_type = "model.stream.delta".into();
+        delta.payload = EventPayload::Inline {
+            payload_json: json!({"text": "x"}),
+        };
+        events.push(delta);
+    }
+    journal.append_batch(0, &events).unwrap();
+    journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+
+    // A late page is addressed by ordinal rather than skipping all earlier rows.
+    let late = journal
+        .projected_thread_entries("workspace-1", RUN, DELTAS + 1, (DELTAS as i64 / 64) - 4, 3)
+        .unwrap();
+    assert_eq!(late.len(), 3);
+    drop(journal);
+
+    let connection = Connection::open(&db).unwrap();
+    let stored_text: u64 = connection
+        .query_row(
+            "SELECT COALESCE(SUM(length(text)),0) FROM thread_projection_versions WHERE run_id=?1",
+            [RUN],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        stored_text <= DELTAS * 64,
+        "projection text grew beyond its fixed chunk amplification: {stored_text}"
+    );
+
+    let plan = connection
+        .prepare(
+            "EXPLAIN QUERY PLAN SELECT run_seq,kind,text FROM thread_projection_versions \
+             INDEXED BY thread_projection_versions_page WHERE run_id=?1 AND ordinal>=?2 \
+             AND valid_from_seq<=?3 AND (valid_until_seq IS NULL OR valid_until_seq>?3) \
+             ORDER BY ordinal LIMIT ?4",
+        )
+        .unwrap()
+        .query_map(rusqlite::params![RUN, 150_u64, DELTAS + 1, 3_u64], |row| {
+            row.get::<_, String>(3)
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .join(" ");
+    assert!(plan.contains("thread_projection_versions_page"), "{plan}");
+    assert!(plan.contains("ordinal>?"), "{plan}");
+    assert!(!plan.contains("SCAN"), "{plan}");
+    assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+}
+
+#[test]
 fn first_and_ordered_batch_append_survive_reopen() {
     let db = TestDb::new();
     let mut journal = RunJournal::open(db.as_ref()).unwrap();
@@ -97,6 +158,107 @@ fn first_and_ordered_batch_append_survive_reopen() {
         [1, 2, 3]
     );
     assert_eq!(found[0].extra["future_field"], json!({"preserved": true}));
+}
+
+#[test]
+fn event_pages_are_bounded_ordered_and_cursor_is_run_bound() {
+    let mut journal = RunJournal::open(":memory:").unwrap();
+    journal
+        .append_batch(0, &[event(1), event(2), event(3)])
+        .unwrap();
+    let first = journal.event_page(RUN, 2, None).unwrap();
+    assert_eq!(
+        first
+            .events
+            .iter()
+            .map(|event| event.run_seq)
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+    let cursor = first.next_cursor.unwrap();
+    let second = journal.event_page(RUN, 2, Some(&cursor)).unwrap();
+    assert_eq!(
+        second
+            .events
+            .iter()
+            .map(|event| event.run_seq)
+            .collect::<Vec<_>>(),
+        [3]
+    );
+    assert!(second.next_cursor.is_none());
+    assert!(matches!(
+        journal.event_page(RUN, 1, Some("forged")),
+        Err(muniment_core::journal::RunEventPageError::InvalidCursor)
+    ));
+    assert!(matches!(
+        journal.event_page("0190a100-0000-7000-8000-000000000099", 1, Some(&cursor)),
+        Err(muniment_core::journal::RunEventPageError::InvalidCursor)
+    ));
+    assert!(matches!(
+        journal.event_page("0190a100-0000-7000-8000-000000000099", 1, None),
+        Err(muniment_core::journal::RunEventPageError::NotFoundOrInaccessible)
+    ));
+}
+
+#[test]
+fn workspace_event_pages_hide_runs_owned_by_another_workspace() {
+    let mut journal = RunJournal::open(":memory:").unwrap();
+    journal.append(0, &event(1)).unwrap();
+    journal.bind_run_workspace(RUN, "workspace-a").unwrap();
+
+    assert!(matches!(
+        journal.workspace_event_page("workspace-b", RUN, 1, None),
+        Err(muniment_core::journal::RunEventPageError::NotFoundOrInaccessible)
+    ));
+    assert!(matches!(
+        journal.workspace_event_page(
+            "workspace-b",
+            "0190a100-0000-7000-8000-000000000099",
+            1,
+            None
+        ),
+        Err(muniment_core::journal::RunEventPageError::NotFoundOrInaccessible)
+    ));
+    assert_eq!(
+        journal
+            .workspace_event_page("workspace-a", RUN, 1, None)
+            .unwrap()
+            .events
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn run_workspace_creation_and_deletion_are_lifecycle_safe() {
+    let mut journal = RunJournal::open(":memory:").unwrap();
+    assert!(journal.bind_run_workspace(RUN, "workspace-a").is_err());
+    journal.append_new_run("workspace-a", &event(1)).unwrap();
+    assert!(journal
+        .run_belongs_to_workspace(RUN, "workspace-a")
+        .unwrap());
+    journal.delete_run(RUN).unwrap();
+    assert!(!journal
+        .run_belongs_to_workspace(RUN, "workspace-a")
+        .unwrap());
+    journal.append_new_run("workspace-b", &event(1)).unwrap();
+    assert!(journal
+        .run_belongs_to_workspace(RUN, "workspace-b")
+        .unwrap());
+}
+
+#[test]
+fn account_actor_provenance_is_not_treated_as_workspace_evidence() {
+    let db = TestDb::new();
+    let mut journal = RunJournal::open(db.as_ref()).unwrap();
+    let mut first = event(1);
+    first.provenance.actor_id = Some("workspace-a".into());
+    journal.append(0, &first).unwrap();
+    drop(journal);
+    let journal = RunJournal::open(db.as_ref()).unwrap();
+    assert!(!journal
+        .run_belongs_to_workspace(RUN, "workspace-a")
+        .unwrap());
 }
 
 #[test]
