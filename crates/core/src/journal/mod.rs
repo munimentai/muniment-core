@@ -4,6 +4,7 @@ pub mod compaction;
 pub mod export;
 pub mod reducer;
 pub mod retention;
+pub mod summaries;
 
 use crate::attachment::ChatAttachment;
 use crate::cas::ContentHash;
@@ -112,6 +113,7 @@ impl From<rusqlite::Error> for JournalError {
 
 pub struct RunJournal {
     pub(crate) connection: Option<Connection>,
+    pub(crate) cursor_key: [u8; 32],
     pub(crate) path: Option<PathBuf>,
     pub(crate) coordination: Option<Arc<JournalCoordination>>,
     pub(crate) generation: u64,
@@ -190,12 +192,14 @@ impl RunJournal {
             )));
         }
         validate_database(&connection)?;
+        let cursor_key = load_or_create_cursor_key(&connection)?;
         let generation = coordination.as_ref().map_or(0, |state| {
             state.generation.load(std::sync::atomic::Ordering::Acquire)
         });
         drop(_operation);
         Ok(Self {
             connection: Some(connection),
+            cursor_key,
             path: file_path,
             generation,
             coordination,
@@ -385,6 +389,40 @@ impl RunJournal {
     }
 }
 
+fn load_or_create_cursor_key(connection: &Connection) -> Result<[u8; 32], JournalError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS journal_metadata (key TEXT PRIMARY KEY NOT NULL, value BLOB NOT NULL) STRICT;",
+    )?;
+    let existing = connection
+        .query_row(
+            "SELECT value FROM journal_metadata WHERE key='run_summary_cursor_key'",
+            [],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?;
+    let bytes = match existing {
+        Some(bytes) => bytes,
+        None => {
+            let mut key = [0_u8; 32];
+            getrandom::fill(&mut key).map_err(|error| {
+                JournalError::Corrupt(format!("cursor-key randomness failed: {error}"))
+            })?;
+            connection.execute(
+                "INSERT OR IGNORE INTO journal_metadata(key,value) VALUES('run_summary_cursor_key',?1)",
+                [&key[..]],
+            )?;
+            connection.query_row(
+                "SELECT value FROM journal_metadata WHERE key='run_summary_cursor_key'",
+                [],
+                |row| row.get(0),
+            )?
+        }
+    };
+    bytes
+        .try_into()
+        .map_err(|_| JournalError::Corrupt("invalid stored run-summary cursor key".to_owned()))
+}
+
 pub(crate) fn open_journal_connection(path: &Path) -> Result<Connection, JournalError> {
     let connection = Connection::open(path)?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
@@ -571,5 +609,9 @@ CREATE TABLE events (
  UNIQUE(run_id, run_seq)
 ) STRICT;
 CREATE INDEX events_run_order ON events(run_id, run_seq);
+CREATE TABLE journal_metadata (
+ key TEXT PRIMARY KEY NOT NULL,
+ value BLOB NOT NULL
+) STRICT;
 COMMIT;
 "#;

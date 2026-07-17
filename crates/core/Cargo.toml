@@ -19,6 +19,7 @@ tls = ["ureq/tls", "ureq/native-certs", "ureq/proxy-from-env"]
 base64 = "0.22"
 ed25519-dalek = "2"
 getrandom = "0.3"
+hmac = "0.12"
 chrono = { version = "0.4", default-features = false, features = ["serde", "std"] }
 flate2 = "1"
 fs2 = "0.4"
