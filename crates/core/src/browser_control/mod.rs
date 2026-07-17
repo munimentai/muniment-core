@@ -17,4 +17,5 @@ pub use linux_identity::{
 pub use linux_transport::{
     BrowserControlAcceptError, BrowserControlBindError, BrowserControlListener,
     BrowserControlProcessAuthorizer, BrowserControlStreamListener, LinuxBrowserProcessAuthorizer,
+    WebSocketHandshakeConfig, WebSocketHandshakeError,
 };
