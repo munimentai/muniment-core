@@ -2,6 +2,8 @@
 
 #[cfg(target_os = "linux")]
 mod linux_identity;
+#[cfg(target_os = "linux")]
+mod linux_transport;
 
 #[cfg(target_os = "linux")]
 pub use linux_identity::{
@@ -10,4 +12,9 @@ pub use linux_identity::{
     verify_browser_process_with_reader, AuthorizationError, AuthorizedBrowserProcess,
     BrowserProcessIdentity, LinuxProcReader, LinuxSocketDiagnostic, ProcReadError, ProcReader,
     ResolutionError, SocketDiagnostic, VerificationError,
+};
+#[cfg(target_os = "linux")]
+pub use linux_transport::{
+    BrowserControlAcceptError, BrowserControlBindError, BrowserControlListener,
+    BrowserControlProcessAuthorizer, BrowserControlStreamListener, LinuxBrowserProcessAuthorizer,
 };
