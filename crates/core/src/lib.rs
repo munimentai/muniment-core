@@ -8,6 +8,8 @@ pub mod asr;
 pub mod attach;
 pub mod attachment;
 pub mod auth;
+#[cfg(target_os = "linux")]
+pub mod browser_control;
 pub mod cas;
 pub mod journal;
 pub mod llama;
