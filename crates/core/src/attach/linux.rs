@@ -409,7 +409,7 @@ pub struct CompanionProvenance {
     pub peer_pid: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 pub struct RunStartAccepted {
     pub run_id: String,
     pub committed_seq: u64,
