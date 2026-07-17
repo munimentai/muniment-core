@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const WEBSOCKET_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const PAIRING_PROTOCOL: &str = "muniment-pairing";
 
 /// Exact policy and resource bounds for a WebSocket opening handshake.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,8 +101,14 @@ impl BrowserControlListener {
     pub fn accept_websocket(
         &self,
         config: &WebSocketHandshakeConfig,
+        pairing_authorizer: &impl BrowserControlPairingAuthorizer,
     ) -> Result<TcpStream, WebSocketHandshakeError> {
-        self.accept_websocket_with(&self.listener, &LinuxBrowserProcessAuthorizer, config)
+        self.accept_websocket_with(
+            &self.listener,
+            &LinuxBrowserProcessAuthorizer,
+            pairing_authorizer,
+            config,
+        )
     }
 
     /// Injected variant used to verify authorization and handshake ordering.
@@ -110,10 +117,11 @@ impl BrowserControlListener {
         &self,
         listener: &impl BrowserControlStreamListener,
         authorizer: &impl BrowserControlProcessAuthorizer,
+        pairing_authorizer: &impl BrowserControlPairingAuthorizer,
         config: &WebSocketHandshakeConfig,
     ) -> Result<TcpStream, WebSocketHandshakeError> {
         let mut stream = self.accept_with(listener, authorizer)?;
-        perform_websocket_handshake(&mut stream, config)?;
+        perform_websocket_handshake(&mut stream, config, pairing_authorizer)?;
         Ok(stream)
     }
 
@@ -139,6 +147,15 @@ impl BrowserControlListener {
         Ok(stream)
     }
 }
+
+/// Injected single-use pairing-token boundary. Implementations own expiry and revocation state.
+pub trait BrowserControlPairingAuthorizer {
+    fn authorize(&self, token: Option<&str>) -> Result<(), PairingAuthorizationError>;
+}
+
+/// Opaque pairing rejection; token material is never retained in transport errors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PairingAuthorizationError;
 
 /// Injected accepted-stream boundary.
 pub trait BrowserControlStreamListener {
@@ -224,6 +241,7 @@ pub enum WebSocketHandshakeError {
     HeaderCountExceeded,
     Malformed,
     PolicyRejected,
+    PairingRejected,
     Io,
 }
 
@@ -244,6 +262,7 @@ impl fmt::Display for WebSocketHandshakeError {
             Self::HeaderCountExceeded => "browser-control handshake had too many headers",
             Self::Malformed => "browser-control handshake was malformed",
             Self::PolicyRejected => "browser-control handshake was rejected",
+            Self::PairingRejected => "browser-control pairing was rejected",
             Self::Io => "browser-control handshake I/O failed",
         })
     }
@@ -254,6 +273,7 @@ impl std::error::Error for WebSocketHandshakeError {}
 fn perform_websocket_handshake(
     stream: &mut TcpStream,
     config: &WebSocketHandshakeConfig,
+    pairing_authorizer: &impl BrowserControlPairingAuthorizer,
 ) -> Result<(), WebSocketHandshakeError> {
     let deadline = Instant::now()
         .checked_add(config.read_deadline)
@@ -288,9 +308,12 @@ fn perform_websocket_handshake(
         }
     }
 
-    let accept = validate_handshake(&request, config)?;
+    let (accept, token) = validate_handshake(&request, config)?;
+    pairing_authorizer
+        .authorize(token)
+        .map_err(|_| WebSocketHandshakeError::PairingRejected)?;
     let response = format!(
-        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: {PAIRING_PROTOCOL}\r\n\r\n"
     );
     stream
         .write_all(response.as_bytes())
@@ -300,10 +323,10 @@ fn perform_websocket_handshake(
         .map_err(|_| WebSocketHandshakeError::Io)
 }
 
-fn validate_handshake(
-    request: &[u8],
+fn validate_handshake<'a>(
+    request: &'a [u8],
     config: &WebSocketHandshakeConfig,
-) -> Result<String, WebSocketHandshakeError> {
+) -> Result<(String, Option<&'a str>), WebSocketHandshakeError> {
     let text = std::str::from_utf8(request).map_err(|_| WebSocketHandshakeError::Malformed)?;
     let mut lines = text
         .strip_suffix("\r\n\r\n")
@@ -376,7 +399,32 @@ fn validate_handshake(
     let mut digest = Sha1::new();
     digest.update(key.as_bytes());
     digest.update(WEBSOCKET_GUID);
-    Ok(STANDARD.encode(digest.finalize()))
+    let token = pairing_token(&headers)?;
+    Ok((STANDARD.encode(digest.finalize()), token))
+}
+
+fn pairing_token<'a>(
+    headers: &[(String, &'a str)],
+) -> Result<Option<&'a str>, WebSocketHandshakeError> {
+    let mut values = headers
+        .iter()
+        .filter(|(name, _)| name == "sec-websocket-protocol")
+        .map(|(_, value)| *value);
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(WebSocketHandshakeError::Malformed);
+    }
+    let mut protocols = value.split(',').map(str::trim);
+    if protocols.next() != Some(PAIRING_PROTOCOL) {
+        return Err(WebSocketHandshakeError::PolicyRejected);
+    }
+    let token = protocols.next();
+    if protocols.next().is_some() {
+        return Err(WebSocketHandshakeError::PolicyRejected);
+    }
+    Ok(token)
 }
 
 fn is_token_byte(byte: u8) -> bool {
