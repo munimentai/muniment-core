@@ -91,6 +91,189 @@ fn read_client_value(server: &mut UnixStream) -> serde_json::Value {
 }
 
 #[test]
+fn run_start_uses_exact_envelope_fresh_ids_and_accepts_receipts() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        let mut seen = BTreeSet::new();
+        for (text, context) in [
+            ("first prompt", Some(serde_json::json!({"cwd": "/tmp"}))),
+            ("second prompt", None),
+        ] {
+            let request = read_client_value(&mut server);
+            let request_id = request["request_id"].as_str().unwrap().to_owned();
+            let idempotency_key = request["idempotency_key"].as_str().unwrap().to_owned();
+            let mut body = serde_json::json!({"text": text});
+            if let Some(context) = context {
+                body["context"] = context;
+            }
+            assert_eq!(
+                request,
+                serde_json::json!({
+                    "protocol": "muniment.attach/1",
+                    "request_id": request_id,
+                    "operation": "run.start",
+                    "capability": "33".repeat(32),
+                    "idempotency_key": idempotency_key,
+                    "body": body,
+                })
+            );
+            assert_eq!(request_id.as_bytes()[14], b'7');
+            assert_eq!(idempotency_key.as_bytes()[14], b'7');
+            assert_ne!(request_id, idempotency_key);
+            assert!(seen.insert(request_id.clone()));
+            assert!(seen.insert(idempotency_key));
+            server
+                .write_all(
+                    &encode_frame(&Response {
+                        protocol: Protocol,
+                        request_id: Id::new(request_id).unwrap(),
+                        ok: Success,
+                        body: serde_json::json!({
+                            "run_id": "01900000-0000-7000-8000-000000000001",
+                            "committed_seq": 2,
+                            "accepted_at": "2026-07-17T00:00:00Z"
+                        }),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    let accepted = client
+        .start_run("first prompt", Some(serde_json::json!({"cwd": "/tmp"})))
+        .unwrap();
+    assert_eq!(accepted.committed_seq, 2);
+    assert!(!format!("{accepted:?}").contains("first prompt"));
+    client.start_run("second prompt", None).unwrap();
+    worker.join().unwrap();
+}
+
+#[test]
+fn run_start_rejects_invalid_input_without_writing() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        server.set_read_timeout(Some(SHORT)).unwrap();
+        let mut byte = [0];
+        assert!(matches!(
+            server.read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    assert_eq!(
+        client.start_run(" \n\t", None),
+        Err(ClientError::UnexpectedMessage)
+    );
+    assert_eq!(
+        client.start_run(&"x".repeat(32 * 1024 + 1), None),
+        Err(ClientError::UnexpectedMessage)
+    );
+    assert_eq!(
+        client.start_run("prompt", Some(serde_json::json!("x".repeat(64 * 1024)))),
+        Err(ClientError::UnexpectedMessage)
+    );
+    worker.join().unwrap();
+}
+
+#[test]
+fn run_start_rejects_hostile_receipts_and_maps_errors() {
+    for (body, expected) in [
+        (
+            Some(
+                serde_json::json!({"run_id":"bad", "committed_seq":2, "accepted_at":"2026-07-17T00:00:00Z"}),
+            ),
+            ClientError::UnexpectedMessage,
+        ),
+        (
+            Some(
+                serde_json::json!({"run_id":"01900000-0000-7000-8000-000000000001", "committed_seq":0, "accepted_at":"2026-07-17T00:00:00Z"}),
+            ),
+            ClientError::UnexpectedMessage,
+        ),
+        (
+            Some(
+                serde_json::json!({"run_id":"01900000-0000-7000-8000-000000000001", "committed_seq":2, "accepted_at":"not a timestamp"}),
+            ),
+            ClientError::UnexpectedMessage,
+        ),
+        (
+            Some(
+                serde_json::json!({"run_id":"x".repeat(65), "committed_seq":2, "accepted_at":"2026-07-17T00:00:00Z"}),
+            ),
+            ClientError::UnexpectedMessage,
+        ),
+        (
+            Some(
+                serde_json::json!({"run_id":"01900000-0000-7000-8000-000000000001", "committed_seq":2, "accepted_at":"2026-07-17T00:00:00Z", "prompt":"leaked"}),
+            ),
+            ClientError::UnexpectedMessage,
+        ),
+        (None, ClientError::AuthorizationExpired),
+    ] {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            complete_pairing(&mut server);
+            let request = read_client_value(&mut server);
+            let request_id = Id::new(request["request_id"].as_str().unwrap()).unwrap();
+            let bytes = if let Some(body) = body {
+                encode_frame(&Response {
+                    protocol: Protocol,
+                    request_id,
+                    ok: Success,
+                    body,
+                })
+                .unwrap()
+            } else {
+                encode_frame(&ErrorEnvelope {
+                    protocol: Protocol,
+                    request_id: Some(request_id),
+                    ok: Failure,
+                    error: ProtocolError::unauthorized(),
+                })
+                .unwrap()
+            };
+            server.write_all(&bytes).unwrap();
+        });
+        let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+        assert_eq!(client.start_run("prompt", None), Err(expected));
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn run_start_rejects_correlation_mismatch() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        read_client_frame(&mut server);
+        server
+            .write_all(
+                &encode_frame(&Response {
+                    protocol: Protocol,
+                    request_id: Id::new("00000000-0000-0000-0000-000000000000").unwrap(),
+                    ok: Success,
+                    body: serde_json::json!({
+                        "run_id": "01900000-0000-7000-8000-000000000001",
+                        "committed_seq": 2,
+                        "accepted_at": "2026-07-17T00:00:00Z"
+                    }),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    assert_eq!(
+        client.start_run("prompt", None),
+        Err(ClientError::UnexpectedMessage)
+    );
+    worker.join().unwrap();
+}
+
+#[test]
 fn thread_list_uses_exact_envelope_and_accepts_fragmented_page() {
     let (client, mut server) = UnixStream::pair().unwrap();
     let worker = thread::spawn(move || {

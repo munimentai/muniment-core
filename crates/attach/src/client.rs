@@ -50,6 +50,14 @@ pub struct AuthorizationSummary {
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct RunStartAccepted {
+    pub run_id: String,
+    pub committed_seq: u64,
+    pub accepted_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RedactedThreadSummary {
     pub thread_id: String,
     pub title: String,
@@ -105,7 +113,9 @@ impl fmt::Debug for ThreadListPage {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{AuthorizationSummary, ClientError, ThreadListPage, ThreadOpenPage};
+    use super::{
+        AuthorizationSummary, ClientError, RunStartAccepted, ThreadListPage, ThreadOpenPage,
+    };
     use crate::{
         decode_frame, encode_frame, Authorized, Client, Envelope, ErrorCode, ErrorEnvelope,
         FrameError, Hello, Id, Operation, Protocol, Request, VersionRange, Welcome,
@@ -118,7 +128,7 @@ mod linux {
     use std::io::{self, Read, Write};
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     const IO_TIMEOUT: Duration = Duration::from_secs(5);
     const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -126,6 +136,8 @@ mod linux {
     const THREAD_OPEN_LIMIT: u8 = 100;
     const MAX_THREAD_ID_LENGTH: usize = 36;
     const MAX_CURSOR_LENGTH: usize = 1024;
+    const MAX_RUN_START_TEXT_LENGTH: usize = 32 * 1024;
+    const MAX_RUN_START_CONTEXT_LENGTH: usize = 64 * 1024;
 
     /// An authorization bound to the connection on which pairing completed.
     pub struct AuthorizedClient {
@@ -274,6 +286,133 @@ mod linux {
             }
             Ok(page)
         }
+
+        pub fn start_run(
+            &mut self,
+            text: &str,
+            context: Option<Value>,
+        ) -> Result<RunStartAccepted, ClientError> {
+            let context_length = context
+                .as_ref()
+                .map(|context| serde_json::to_vec(context).map(|bytes| bytes.len()))
+                .transpose()
+                .map_err(|_| ClientError::UnexpectedMessage)?
+                .unwrap_or(0);
+            if text.trim().is_empty()
+                || text.len() > MAX_RUN_START_TEXT_LENGTH
+                || context_length > MAX_RUN_START_CONTEXT_LENGTH
+            {
+                return Err(ClientError::UnexpectedMessage);
+            }
+
+            let request_id = fresh_request_id()?;
+            let idempotency_key = fresh_request_id()?;
+            let mut body = serde_json::json!({ "text": text });
+            if let Some(context) = context {
+                body["context"] = context;
+            }
+            let request = Request {
+                protocol: Protocol,
+                request_id: request_id.clone(),
+                operation: Operation::RunStart,
+                capability: self.capability.clone(),
+                idempotency_key: Some(idempotency_key),
+                body,
+            };
+            let deadline = deadline(self.io_timeout);
+            let bytes = encode_frame(&request).map_err(map_frame_error)?;
+            write_all_before(&mut self.stream, &bytes, deadline)?;
+            let value = read_value(&mut self.stream, deadline)?;
+            if value
+                .get("protocol")
+                .and_then(Value::as_str)
+                .is_some_and(|protocol| protocol != PROTOCOL)
+            {
+                return Err(ClientError::ProtocolIncompatible);
+            }
+            let response =
+                match serde_json::from_value(value).map_err(|_| ClientError::UnexpectedMessage)? {
+                    Envelope::Response(response) if response.request_id == request_id => response,
+                    Envelope::Error(error) if error.request_id.as_ref() == Some(&request_id) => {
+                        return Err(map_protocol_error(error.error.code()));
+                    }
+                    _ => return Err(ClientError::UnexpectedMessage),
+                };
+            let accepted: RunStartAccepted = serde_json::from_value(response.body)
+                .map_err(|_| ClientError::UnexpectedMessage)?;
+            if Id::new(accepted.run_id.clone()).is_err()
+                || accepted.committed_seq == 0
+                || accepted.accepted_at.is_empty()
+                || accepted.accepted_at.len() > MAX_TEXT_LENGTH
+                || !is_rfc3339(&accepted.accepted_at)
+            {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            Ok(accepted)
+        }
+    }
+
+    fn is_rfc3339(value: &str) -> bool {
+        let bytes = value.as_bytes();
+        if bytes.len() < 20
+            || bytes.get(4) != Some(&b'-')
+            || bytes.get(7) != Some(&b'-')
+            || !matches!(bytes.get(10), Some(b'T' | b't'))
+            || bytes.get(13) != Some(&b':')
+            || bytes.get(16) != Some(&b':')
+        {
+            return false;
+        }
+
+        let number = |start: usize, end: usize| {
+            bytes
+                .get(start..end)
+                .filter(|digits| digits.iter().all(u8::is_ascii_digit))
+                .and_then(|digits| std::str::from_utf8(digits).ok())
+                .and_then(|digits| digits.parse::<u32>().ok())
+        };
+        let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+            number(0, 4),
+            number(5, 7),
+            number(8, 10),
+            number(11, 13),
+            number(14, 16),
+            number(17, 19),
+        ) else {
+            return false;
+        };
+        let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let max_day = match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if leap_year => 29,
+            2 => 28,
+            _ => return false,
+        };
+        if day == 0 || day > max_day || hour > 23 || minute > 59 || second > 60 {
+            return false;
+        }
+
+        let mut zone = 19;
+        if bytes.get(zone) == Some(&b'.') {
+            zone += 1;
+            let fraction_start = zone;
+            while bytes.get(zone).is_some_and(u8::is_ascii_digit) {
+                zone += 1;
+            }
+            if zone == fraction_start {
+                return false;
+            }
+        }
+        match bytes.get(zone..) {
+            Some([b'Z' | b'z']) => true,
+            Some([b'+' | b'-', h1, h2, b':', m1, m2]) => {
+                [h1, h2, m1, m2].iter().all(|digit| digit.is_ascii_digit())
+                    && (h1 - b'0') * 10 + (h2 - b'0') <= 23
+                    && (m1 - b'0') * 10 + (m2 - b'0') <= 59
+            }
+            _ => false,
+        }
     }
 
     pub fn handshake(
@@ -357,14 +496,21 @@ mod linux {
     }
 
     fn fresh_request_id() -> Result<Id, ClientError> {
-        let nonce = fresh_nonce()?;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| ClientError::RandomnessUnavailable)?
+            .as_millis();
+        if timestamp > 0xffff_ffff_ffff {
+            return Err(ClientError::RandomnessUnavailable);
+        }
+        let mut bytes = random_bytes()?;
+        bytes[..6].copy_from_slice(&(timestamp as u64).to_be_bytes()[2..]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x70;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
         Id::new(format!(
-            "{}-{}-{}-{}-{}",
-            &nonce[0..8],
-            &nonce[8..12],
-            &nonce[12..16],
-            &nonce[16..20],
-            &nonce[20..32]
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
         ))
         .map_err(|_| ClientError::RandomnessUnavailable)
     }
@@ -379,16 +525,21 @@ mod linux {
     }
 
     fn fresh_nonce() -> Result<String, ClientError> {
-        let mut bytes = [0u8; 16];
-        File::open("/dev/urandom")
-            .and_then(|mut file| file.read_exact(&mut bytes))
-            .map_err(|_| ClientError::RandomnessUnavailable)?;
+        let bytes = random_bytes()?;
         let mut nonce = String::with_capacity(32);
         for byte in bytes {
             use std::fmt::Write as _;
             write!(&mut nonce, "{byte:02x}").expect("writing to String cannot fail");
         }
         Ok(nonce)
+    }
+
+    fn random_bytes() -> Result<[u8; 16], ClientError> {
+        let mut bytes = [0u8; 16];
+        File::open("/dev/urandom")
+            .and_then(|mut file| file.read_exact(&mut bytes))
+            .map_err(|_| ClientError::RandomnessUnavailable)?;
+        Ok(bytes)
     }
 
     fn is_hex_secret(value: &str, length: usize) -> bool {
@@ -518,6 +669,14 @@ impl AuthorizedClient {
         _thread_id: &str,
         _cursor: Option<&str>,
     ) -> Result<ThreadOpenPage, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+
+    pub fn start_run(
+        &mut self,
+        _text: &str,
+        _context: Option<serde_json::Value>,
+    ) -> Result<RunStartAccepted, ClientError> {
         Err(ClientError::UnsupportedPlatform)
     }
 }
