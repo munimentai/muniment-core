@@ -2,8 +2,9 @@
 
 use muniment_core::attach::linux::{
     run_authenticated_session_with, run_authenticated_session_with_authorization, ApprovalDecision,
-    AttachSessionError, AuthorizationSessionDependencies, PeerCredentials, RedactedThreadSummary,
-    ThreadListPage, ThreadListRequest, ThreadListService, ThreadOpenRequest,
+    AttachSessionError, AuthorizationSessionDependencies, CompanionProvenance, PeerCredentials,
+    RedactedThreadSummary, RunStartAccepted, RunStartRequest, ThreadListPage, ThreadListRequest,
+    ThreadListService, ThreadOpenRequest, MAX_RUN_START_CONTEXT_LENGTH, MAX_RUN_START_TEXT_LENGTH,
 };
 use muniment_core::attach::{
     decode_frame, encode_frame, Approval, AuthorizationClock, AuthorizationTokenGenerator,
@@ -100,6 +101,44 @@ fn unavailable_service(
     _: ThreadListRequest,
 ) -> Result<ThreadListPage, muniment_core::attach::ProtocolError> {
     panic!("request must not dispatch")
+}
+
+#[derive(Default)]
+struct StartService {
+    calls: Vec<(String, RunStartRequest, Id, Id, CompanionProvenance)>,
+    output: Option<RunStartAccepted>,
+}
+
+impl ThreadListService for StartService {
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, muniment_core::attach::ProtocolError> {
+        panic!("thread reads must not dispatch")
+    }
+
+    fn start_run(
+        &mut self,
+        workspace: &str,
+        request: RunStartRequest,
+        request_id: &Id,
+        idempotency_key: &Id,
+        provenance: CompanionProvenance,
+    ) -> Result<RunStartAccepted, muniment_core::attach::ProtocolError> {
+        self.calls.push((
+            workspace.into(),
+            request,
+            request_id.clone(),
+            idempotency_key.clone(),
+            provenance,
+        ));
+        Ok(self.output.clone().unwrap_or_else(|| RunStartAccepted {
+            run_id: "0190a100-0000-7000-8000-000000000001".into(),
+            committed_seq: 2,
+            accepted_at: "2026-07-17T00:00:00Z".into(),
+        }))
+    }
 }
 
 #[test]
@@ -1299,6 +1338,283 @@ fn thread_open_without_read_scope_fails_closed_without_dispatch() {
         Some(Id::new(format!("{:032x}", 30)).unwrap())
     );
     assert_eq!(error.error.code(), ErrorCode::Unauthorized);
+}
+
+#[test]
+fn authorized_run_start_dispatches_once_with_bounded_input_and_provenance() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello(1, 1)).unwrap();
+    client
+        .write_all(&request_with_idempotency(
+            70,
+            Operation::RunStart,
+            json!({"text": "Do the work", "context": {"selection": "safe"}}),
+        ))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut approved = approval();
+    approved.scopes.insert("run.write".into());
+    let mut service = StartService::default();
+    assert_eq!(
+        dispatch_session_with_approval(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            approved,
+            &mut service,
+        ),
+        Ok(())
+    );
+    let response: Response = read_frame(&mut client);
+    assert_eq!(
+        response.body,
+        json!({
+            "run_id": "0190a100-0000-7000-8000-000000000001",
+            "committed_seq": 2,
+            "accepted_at": "2026-07-17T00:00:00Z"
+        })
+    );
+    assert_eq!(service.calls.len(), 1);
+    let (workspace, body, request_id, key, provenance) = &service.calls[0];
+    assert_eq!(workspace, "workspace-1");
+    assert_eq!(body.text, "Do the work");
+    assert_eq!(body.context, Some(json!({"selection": "safe"})));
+    assert_eq!(request_id, &Id::new(format!("{:032x}", 70)).unwrap());
+    assert_eq!(key, &Id::new(format!("{:032x}", 1070)).unwrap());
+    assert_eq!(provenance.profile, "profile-1");
+    assert_eq!(provenance.companion_kind, "cli");
+    assert_eq!(provenance.companion_version, "1.0.0");
+    assert_eq!(provenance.peer_uid, unsafe { libc::geteuid() });
+}
+
+#[test]
+fn operations_outside_run_start_remain_unsupported_without_dispatch() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello(1, 1)).unwrap();
+    client
+        .write_all(&request(79, Operation::RunOpen, json!({})))
+        .unwrap();
+    client
+        .write_all(&request_with_idempotency(
+            80,
+            Operation::RunSteer,
+            json!({"text": "private steer"}),
+        ))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut approved = approval();
+    approved.scopes.insert("run.write".into());
+    let mut service = StartService::default();
+    assert_eq!(
+        dispatch_session_with_approval(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            approved,
+            &mut service,
+        ),
+        Ok(())
+    );
+    for id in [79, 80] {
+        let error: ErrorEnvelope = read_frame(&mut client);
+        assert_eq!(
+            error.request_id,
+            Some(Id::new(format!("{id:032x}")).unwrap())
+        );
+        assert_eq!(error.error.code(), ErrorCode::UnsupportedOperation);
+    }
+    assert!(service.calls.is_empty());
+}
+
+#[test]
+fn run_start_rejects_missing_scope_key_and_hostile_bodies_without_dispatch() {
+    let cases = [
+        (
+            false,
+            request_with_idempotency(71, Operation::RunStart, json!({"text": "secret prompt"})),
+        ),
+        (
+            true,
+            request(72, Operation::RunStart, json!({"text": "secret prompt"})),
+        ),
+        (
+            true,
+            request_with_idempotency(73, Operation::RunStart, json!({"text": ""})),
+        ),
+        (
+            true,
+            request_with_idempotency(
+                74,
+                Operation::RunStart,
+                json!({"text": "x", "actor_id": "forged"}),
+            ),
+        ),
+        (
+            true,
+            request_with_idempotency(
+                75,
+                Operation::RunStart,
+                json!({"text": "x".repeat(MAX_RUN_START_TEXT_LENGTH + 1)}),
+            ),
+        ),
+        (
+            true,
+            request_with_idempotency(
+                76,
+                Operation::RunStart,
+                json!({"text": "x", "context": vec!["x".repeat(40_000); MAX_RUN_START_CONTEXT_LENGTH / 40_000 + 1]}),
+            ),
+        ),
+    ];
+    for (has_scope, frame) in cases {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&hello(1, 1)).unwrap();
+        client.write_all(&frame).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut approved = approval();
+        if has_scope {
+            approved.scopes.insert("run.write".into());
+        }
+        let mut service = StartService::default();
+        let _ = dispatch_session_with_approval(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            approved,
+            &mut service,
+        );
+        let error: ErrorEnvelope = read_frame(&mut client);
+        assert!(matches!(
+            error.error.code(),
+            ErrorCode::Unauthorized | ErrorCode::IdempotencyKeyRequired | ErrorCode::InvalidRequest
+        ));
+        let encoded = serde_json::to_string(&error).unwrap();
+        assert!(!encoded.contains("secret prompt"));
+        assert!(!encoded.contains("forged"));
+        assert!(service.calls.is_empty());
+    }
+}
+
+#[test]
+fn malformed_run_start_service_output_is_a_redacted_closed_error() {
+    let valid_run_id = "0190a100-0000-7000-8000-000000000001";
+    let cases = [
+        RunStartAccepted {
+            run_id: "not-a-run-id".into(),
+            committed_seq: 2,
+            accepted_at: "2026-07-17T00:00:00Z".into(),
+        },
+        RunStartAccepted {
+            run_id: valid_run_id.into(),
+            committed_seq: 0,
+            accepted_at: "2026-07-17T00:00:00Z".into(),
+        },
+        RunStartAccepted {
+            run_id: valid_run_id.into(),
+            committed_seq: 2,
+            accepted_at: String::new(),
+        },
+        RunStartAccepted {
+            run_id: valid_run_id.into(),
+            committed_seq: 2,
+            accepted_at: "private malformed timestamp".into(),
+        },
+        RunStartAccepted {
+            run_id: valid_run_id.into(),
+            committed_seq: 2,
+            accepted_at: "private oversized timestamp".repeat(MAX_FRAME_LENGTH),
+        },
+    ];
+    let mut expected_error = None;
+    for (offset, output) in cases.into_iter().enumerate() {
+        let id = 81 + offset as u128;
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&hello(1, 1)).unwrap();
+        client
+            .write_all(&request_with_idempotency(
+                id,
+                Operation::RunStart,
+                json!({"text": "private prompt"}),
+            ))
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut approved = approval();
+        approved.scopes.insert("run.write".into());
+        let mut service = StartService {
+            output: Some(output),
+            ..Default::default()
+        };
+        assert_eq!(
+            dispatch_session_with_approval(
+                &mut client,
+                server,
+                TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                approved,
+                &mut service,
+            ),
+            Ok(())
+        );
+        let error: ErrorEnvelope = read_frame(&mut client);
+        assert_eq!(
+            error.request_id,
+            Some(Id::new(format!("{id:032x}")).unwrap())
+        );
+        assert_eq!(error.error.code(), ErrorCode::PersistenceFailed);
+        let encoded = serde_json::to_string(&error).unwrap();
+        assert!(!encoded.contains("private prompt"));
+        assert!(!encoded.contains("private malformed timestamp"));
+        assert!(!encoded.contains("private oversized timestamp"));
+        assert!(!encoded.contains("profile-1"));
+        assert!(!encoded.contains("1.0.0"));
+        let error_value = serde_json::to_value(error.error).unwrap();
+        assert_eq!(error_value.get("details"), None);
+        if let Some(expected) = &expected_error {
+            assert_eq!(&error_value, expected);
+        } else {
+            expected_error = Some(error_value);
+        }
+        assert_eq!(service.calls.len(), 1);
+    }
+}
+
+#[test]
+fn invalid_run_start_idempotency_key_is_terminal_without_dispatch() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello(1, 1)).unwrap();
+    client
+        .write_all(
+            &encode_frame(&json!({
+                "protocol": "muniment.attach/1",
+                "request_id": format!("{:032x}", 78),
+                "operation": "run.start",
+                "capability": "02".repeat(32),
+                "idempotency_key": "invalid secret key",
+                "body": {"text": "private prompt"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut approved = approval();
+    approved.scopes.insert("run.write".into());
+    let mut service = StartService::default();
+    assert_eq!(
+        dispatch_session_with_approval(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            approved,
+            &mut service,
+        ),
+        Err(AttachSessionError::MalformedFrame)
+    );
+    let error: ErrorEnvelope = read_frame(&mut client);
+    assert_eq!(error.request_id, None);
+    assert_eq!(error.error.code(), ErrorCode::MalformedFrame);
+    let encoded = serde_json::to_string(&error).unwrap();
+    assert!(!encoded.contains("private prompt"));
+    assert!(!encoded.contains("invalid secret key"));
+    assert!(service.calls.is_empty());
 }
 
 #[test]

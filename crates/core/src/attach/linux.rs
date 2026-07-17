@@ -29,6 +29,8 @@ const DESKTOP_PROTOCOL: VersionRange = VersionRange { min: 1, max: 1 };
 const MAX_THREAD_ID_LENGTH: usize = 36;
 const MAX_CURSOR_LENGTH: usize = 1024;
 const MAX_RESPONSE_BODY_LENGTH: usize = MAX_FRAME_LENGTH - 4096;
+pub const MAX_RUN_START_TEXT_LENGTH: usize = 32 * 1024;
+pub const MAX_RUN_START_CONTEXT_LENGTH: usize = 64 * 1024;
 
 /// A verified, pinned filesystem boundary for the Linux attach endpoint.
 #[derive(Debug)]
@@ -392,7 +394,29 @@ pub struct ThreadOpenPage {
     pub next_cursor: Option<String>,
 }
 
-/// Deterministic desktop data seam for the thread reads served by this slice.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunStartRequest {
+    pub text: String,
+    pub context: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompanionProvenance {
+    pub profile: String,
+    pub companion_kind: String,
+    pub companion_version: String,
+    pub peer_uid: u32,
+    pub peer_pid: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunStartAccepted {
+    pub run_id: String,
+    pub committed_seq: u64,
+    pub accepted_at: String,
+}
+
+/// Deterministic desktop service seam for authorized attach requests.
 pub trait ThreadListService {
     fn list_threads(
         &mut self,
@@ -405,6 +429,17 @@ pub trait ThreadListService {
         _workspace: &str,
         _request: ThreadOpenRequest,
     ) -> Result<ThreadOpenPage, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn start_run(
+        &mut self,
+        _workspace: &str,
+        _request: RunStartRequest,
+        _request_id: &super::Id,
+        _idempotency_key: &super::Id,
+        _provenance: CompanionProvenance,
+    ) -> Result<RunStartAccepted, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
 }
@@ -666,8 +701,12 @@ where
                 return Err(AttachSessionError::MalformedFrame);
             }
         };
-        let (client_nonce, companion_kind) = match &message {
-            FirstMessage::Hello(hello) => (hello.client_nonce.clone(), hello.client.kind.clone()),
+        let (client_nonce, companion_kind, companion_version) = match &message {
+            FirstMessage::Hello(hello) => (
+                hello.client_nonce.clone(),
+                hello.client.kind.clone(),
+                hello.client.version.clone(),
+            ),
             _ => {
                 write_protocol_error(&mut stream, ProtocolError::malformed_frame(), deadline);
                 return Err(AttachSessionError::MalformedFrame);
@@ -749,11 +788,18 @@ where
             &encode_frame(&response).map_err(|_| AttachSessionError::MalformedFrame)?,
             authorization_deadline,
         )?;
+        let provenance = CompanionProvenance {
+            profile: grant.profile.clone(),
+            companion_kind: binding.companion_kind.clone(),
+            companion_version,
+            peer_uid: credentials.uid,
+            peer_pid: credentials.pid as u32,
+        };
         serve_requests(
             &mut stream,
             timeout,
             &binding,
-            &grant.profile,
+            &provenance,
             &grant.workspace,
             &mut authorization,
             service,
@@ -797,7 +843,7 @@ fn serve_requests<C, G, S>(
     stream: &mut UnixStream,
     timeout: Duration,
     binding: &ConnectionBinding,
-    profile: &str,
+    provenance: &CompanionProvenance,
     workspace: &str,
     authorization: &mut AuthorizationState<C, G>,
     service: &mut S,
@@ -861,16 +907,16 @@ where
             );
             return Err(AttachSessionError::Authorization);
         }
-        let required_scope = matches!(
-            request.operation,
-            Operation::ThreadList | Operation::ThreadOpen
-        )
-        .then_some("thread.read");
+        let required_scope = match request.operation {
+            Operation::ThreadList | Operation::ThreadOpen => Some("thread.read"),
+            Operation::RunStart => Some("run.write"),
+            _ => None,
+        };
         if authorization
             .validate_request_with_scope(
                 &request.capability,
                 binding,
-                profile,
+                &provenance.profile,
                 workspace,
                 required_scope,
             )
@@ -885,7 +931,7 @@ where
             return Err(AttachSessionError::Authorization);
         }
         let request_id = request.request_id.clone();
-        match dispatch_request(request, workspace, service) {
+        match dispatch_request(request, workspace, provenance.clone(), service) {
             Ok(body) => {
                 let response = Response {
                     protocol: Protocol,
@@ -905,9 +951,61 @@ where
 fn dispatch_request<S: ThreadListService>(
     request: Request,
     workspace: &str,
+    provenance: CompanionProvenance,
     service: &mut S,
 ) -> Result<serde_json::Value, ProtocolError> {
     request.validate_idempotency_key()?;
+    if request.operation == Operation::RunStart {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            text: String,
+            #[serde(default)]
+            context: Option<serde_json::Value>,
+        }
+        let body: Body =
+            serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
+        let context_length = body
+            .context
+            .as_ref()
+            .map(|context| serde_json::to_vec(context).map(|bytes| bytes.len()))
+            .transpose()
+            .map_err(|_| ProtocolError::invalid_request())?
+            .unwrap_or(0);
+        if body.text.trim().is_empty()
+            || body.text.len() > MAX_RUN_START_TEXT_LENGTH
+            || context_length > MAX_RUN_START_CONTEXT_LENGTH
+        {
+            return Err(ProtocolError::invalid_request());
+        }
+        let idempotency_key = request
+            .idempotency_key
+            .as_ref()
+            .ok_or_else(ProtocolError::idempotency_key_required)?;
+        let accepted = service.start_run(
+            workspace,
+            RunStartRequest {
+                text: body.text,
+                context: body.context,
+            },
+            &request.request_id,
+            idempotency_key,
+            provenance,
+        )?;
+        if super::Id::new(accepted.run_id.clone()).is_err()
+            || accepted.committed_seq == 0
+            || accepted.accepted_at.is_empty()
+            || accepted.accepted_at.len() > MAX_TEXT_LENGTH
+            || chrono::DateTime::parse_from_rfc3339(&accepted.accepted_at).is_err()
+        {
+            return Err(ProtocolError::persistence_failed());
+        }
+        return Ok(serde_json::json!({
+            "run_id": accepted.run_id,
+            "committed_seq": accepted.committed_seq,
+            "accepted_at": accepted.accepted_at,
+        }));
+    }
     if request.operation == Operation::ThreadOpen {
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
