@@ -24,8 +24,8 @@ impl fmt::Display for ClientError {
         f.write_str(match self {
             Self::UnsupportedPlatform => "desktop attach is unsupported on this platform",
             Self::AuthorizationExpired => "desktop authorization is no longer valid",
-            Self::RequestRejected => "the desktop rejected the thread list request",
-            Self::DesktopFailed => "the desktop could not list threads",
+            Self::RequestRejected => "the desktop rejected the thread request",
+            Self::DesktopFailed => "the desktop could not read threads",
             Self::RuntimeDirectoryMissing => "XDG_RUNTIME_DIR is not set",
             Self::RuntimeDirectoryRelative => "XDG_RUNTIME_DIR must be an absolute path",
             Self::DesktopUnavailable => "the Muniment desktop attach service is unavailable",
@@ -64,6 +64,35 @@ pub struct ThreadListPage {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedactedThreadEntry {
+    pub run_seq: u64,
+    pub kind: String,
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+#[derive(Clone, Eq, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadOpenPage {
+    pub thread_id: String,
+    pub entries: Vec<RedactedThreadEntry>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+}
+
+impl fmt::Debug for ThreadOpenPage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ThreadOpenPage")
+            .field("thread_id", &self.thread_id)
+            .field("entries", &self.entries)
+            .field("has_more", &self.next_cursor.is_some())
+            .finish()
+    }
+}
+
 impl fmt::Debug for ThreadListPage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -76,7 +105,7 @@ impl fmt::Debug for ThreadListPage {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{AuthorizationSummary, ClientError, ThreadListPage};
+    use super::{AuthorizationSummary, ClientError, ThreadListPage, ThreadOpenPage};
     use crate::{
         decode_frame, encode_frame, Authorized, Client, Envelope, ErrorCode, ErrorEnvelope,
         FrameError, Hello, Id, Operation, Protocol, Request, VersionRange, Welcome,
@@ -94,6 +123,9 @@ mod linux {
     const IO_TIMEOUT: Duration = Duration::from_secs(5);
     const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
     const THREAD_LIST_LIMIT: u8 = 100;
+    const THREAD_OPEN_LIMIT: u8 = 100;
+    const MAX_THREAD_ID_LENGTH: usize = 36;
+    const MAX_CURSOR_LENGTH: usize = 1024;
 
     /// An authorization bound to the connection on which pairing completed.
     pub struct AuthorizedClient {
@@ -167,6 +199,76 @@ mod linux {
                     .next_cursor
                     .as_ref()
                     .is_some_and(|cursor| cursor.is_empty() || cursor.len() > MAX_TEXT_LENGTH)
+            {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            Ok(page)
+        }
+
+        pub fn open_thread(
+            &mut self,
+            thread_id: &str,
+            cursor: Option<&str>,
+        ) -> Result<ThreadOpenPage, ClientError> {
+            if thread_id.is_empty()
+                || thread_id.len() > MAX_THREAD_ID_LENGTH
+                || cursor
+                    .is_some_and(|cursor| cursor.is_empty() || cursor.len() > MAX_CURSOR_LENGTH)
+            {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            let request_id = fresh_request_id()?;
+            let mut body = serde_json::json!({
+                "thread_id": thread_id,
+                "limit": THREAD_OPEN_LIMIT
+            });
+            if let Some(cursor) = cursor {
+                body["cursor"] = Value::String(cursor.into());
+            }
+            let request = Request {
+                protocol: Protocol,
+                request_id: request_id.clone(),
+                operation: Operation::ThreadOpen,
+                capability: self.capability.clone(),
+                idempotency_key: None,
+                body,
+            };
+            let deadline = deadline(self.io_timeout);
+            let bytes = encode_frame(&request).map_err(map_frame_error)?;
+            write_all_before(&mut self.stream, &bytes, deadline)?;
+            let value = read_value(&mut self.stream, deadline)?;
+            if value
+                .get("protocol")
+                .and_then(Value::as_str)
+                .is_some_and(|protocol| protocol != PROTOCOL)
+            {
+                return Err(ClientError::ProtocolIncompatible);
+            }
+            let response =
+                match serde_json::from_value(value).map_err(|_| ClientError::UnexpectedMessage)? {
+                    Envelope::Response(response) if response.request_id == request_id => response,
+                    Envelope::Error(error) if error.request_id.as_ref() == Some(&request_id) => {
+                        return Err(map_protocol_error(error.error.code()));
+                    }
+                    _ => return Err(ClientError::UnexpectedMessage),
+                };
+            let page: ThreadOpenPage = serde_json::from_value(response.body)
+                .map_err(|_| ClientError::UnexpectedMessage)?;
+            if page.thread_id != thread_id
+                || page.entries.len() > usize::from(THREAD_OPEN_LIMIT)
+                || page.entries.iter().any(|entry| {
+                    entry.run_seq == 0
+                        || entry.kind.is_empty()
+                        || entry.kind.len() > MAX_TEXT_LENGTH
+                        || entry
+                            .text
+                            .as_ref()
+                            .is_some_and(|text| text.len() > MAX_TEXT_LENGTH)
+                })
+                || page
+                    .next_cursor
+                    .as_ref()
+                    .is_some_and(|cursor| cursor.is_empty() || cursor.len() > MAX_CURSOR_LENGTH)
             {
                 return Err(ClientError::UnexpectedMessage);
             }
@@ -408,6 +510,14 @@ pub struct AuthorizedClient;
 #[cfg(not(target_os = "linux"))]
 impl AuthorizedClient {
     pub fn list_threads(&mut self, _cursor: Option<&str>) -> Result<ThreadListPage, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+
+    pub fn open_thread(
+        &mut self,
+        _thread_id: &str,
+        _cursor: Option<&str>,
+    ) -> Result<ThreadOpenPage, ClientError> {
         Err(ClientError::UnsupportedPlatform)
     }
 }

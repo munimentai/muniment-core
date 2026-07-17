@@ -145,6 +145,94 @@ fn thread_list_uses_exact_envelope_and_accepts_fragmented_page() {
 }
 
 #[test]
+fn thread_open_uses_exact_envelope_and_accepts_fragmented_pages() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        let first = read_client_value(&mut server);
+        assert_eq!(first["operation"], "thread.open");
+        assert_eq!(first["capability"], "33".repeat(32));
+        assert_eq!(
+            first["body"],
+            serde_json::json!({"thread_id": "thread-1", "limit": 100})
+        );
+        assert!(first.get("idempotency_key").is_none());
+        let response = Response {
+            protocol: Protocol,
+            request_id: Id::new(first["request_id"].as_str().unwrap()).unwrap(),
+            ok: Success,
+            body: serde_json::json!({
+                "thread_id": "thread-1",
+                "entries": [{"run_seq": 1, "kind": "message", "text": "hello"}],
+                "next_cursor": "private-cursor"
+            }),
+        };
+        for byte in encode_frame(&response).unwrap() {
+            server.write_all(&[byte]).unwrap();
+        }
+        let second = read_client_value(&mut server);
+        assert_eq!(
+            second["body"],
+            serde_json::json!({
+                "thread_id": "thread-1", "limit": 100, "cursor": "private-cursor"
+            })
+        );
+        let response = Response {
+            protocol: Protocol,
+            request_id: Id::new(second["request_id"].as_str().unwrap()).unwrap(),
+            ok: Success,
+            body: serde_json::json!({"thread_id": "thread-1", "entries": []}),
+        };
+        for chunk in encode_frame(&response).unwrap().chunks(2) {
+            server.write_all(chunk).unwrap();
+        }
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    let first = client.open_thread("thread-1", None).unwrap();
+    assert_eq!(first.entries[0].text.as_deref(), Some("hello"));
+    assert!(!format!("{first:?}").contains("private-cursor"));
+    let second = client
+        .open_thread("thread-1", first.next_cursor.as_deref())
+        .unwrap();
+    assert!(second.entries.is_empty());
+    worker.join().unwrap();
+}
+
+#[test]
+fn thread_open_rejects_invalid_response_fields() {
+    for body in [
+        serde_json::json!({"thread_id": "other", "entries": []}),
+        serde_json::json!({"thread_id": "thread-1", "entries": [{"run_seq": 0, "kind": "message"}]}),
+        serde_json::json!({"thread_id": "thread-1", "entries": [{"run_seq": 1, "kind": ""}]}),
+        serde_json::json!({"thread_id": "thread-1", "entries": [], "next_cursor": ""}),
+        serde_json::json!({"thread_id": "thread-1", "entries": [], "capability": "secret"}),
+    ] {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            complete_pairing(&mut server);
+            let request = read_client_value(&mut server);
+            server
+                .write_all(
+                    &encode_frame(&Response {
+                        protocol: Protocol,
+                        request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+                        ok: Success,
+                        body,
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        });
+        let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+        assert_eq!(
+            client.open_thread("thread-1", None),
+            Err(ClientError::UnexpectedMessage)
+        );
+        worker.join().unwrap();
+    }
+}
+
+#[test]
 fn thread_list_rejects_correlation_mismatch_and_maps_protocol_errors() {
     for (error, expected) in [
         (None, ClientError::UnexpectedMessage),
