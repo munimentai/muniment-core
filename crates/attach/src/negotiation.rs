@@ -5,7 +5,7 @@ use std::{
 
 use serde::{de, Deserialize, Deserializer, Serialize};
 
-use super::{ErrorAction, Protocol, ProtocolError, VersionRange};
+use crate::{ErrorAction, Protocol, ProtocolError, VersionRange};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Client {

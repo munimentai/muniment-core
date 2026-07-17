@@ -77,7 +77,7 @@ fn validate_payload(payload: &[u8]) -> Result<(), FrameError> {
         match value {
             Value::String(s) => {
                 strings += 1;
-                if s.len() > super::MAX_TEXT_LENGTH {
+                if s.len() > crate::MAX_TEXT_LENGTH {
                     return Err(FrameError::StructureLimit);
                 }
             }
@@ -88,7 +88,7 @@ fn validate_payload(payload: &[u8]) -> Result<(), FrameError> {
             Value::Object(values) => {
                 entries += values.len();
                 strings += values.len();
-                if values.keys().any(|key| key.len() > super::MAX_TEXT_LENGTH) {
+                if values.keys().any(|key| key.len() > crate::MAX_TEXT_LENGTH) {
                     return Err(FrameError::StructureLimit);
                 }
                 stack.extend(values.values().map(|v| (v, depth + 1)));

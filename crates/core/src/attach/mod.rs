@@ -1,19 +1,14 @@
-//! Pure types and codecs for the `muniment.attach/1` companion protocol.
+//! Companion attach server support.
 
 mod artifact;
 mod authorization;
 mod cursor;
-mod envelope;
-mod framing;
 mod idempotency;
 #[cfg(target_os = "linux")]
 pub mod linux;
-mod negotiation;
 
 pub use artifact::*;
 pub use authorization::*;
 pub use cursor::*;
-pub use envelope::*;
-pub use framing::*;
 pub use idempotency::*;
-pub use negotiation::*;
+pub use muniment_attach::*;
