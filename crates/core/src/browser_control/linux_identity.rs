@@ -45,6 +45,24 @@ pub enum ResolutionError {
     ProcessIdentityChanged,
 }
 
+/// A bounded, redacted failure while authorizing a loopback browser connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthorizationError {
+    OwnerResolutionFailed,
+    ExecutableVerificationFailed,
+}
+
+impl fmt::Display for AuthorizationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::OwnerResolutionFailed => "browser connection owner could not be resolved",
+            Self::ExecutableVerificationFailed => "browser connection owner was not authorized",
+        })
+    }
+}
+
+impl std::error::Error for AuthorizationError {}
+
 impl fmt::Display for ResolutionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -342,6 +360,36 @@ fn netlink_contains_done(bytes: &[u8], sequence: u32) -> Result<bool, ProcReadEr
 }
 
 static NEXT_SEQUENCE: AtomicU32 = AtomicU32::new(1);
+
+/// Resolves and verifies the owner of an accepted loopback browser connection.
+pub fn authorize_browser_process(
+    local: SocketAddr,
+    peer: SocketAddr,
+    expected_executable: &Path,
+) -> Result<AuthorizedBrowserProcess, AuthorizationError> {
+    authorize_browser_process_with_readers(
+        local,
+        peer,
+        expected_executable,
+        &SocketDiagnostic,
+        &ProcReader,
+    )
+}
+
+/// Authorizes using injected socket-diagnostic and procfs boundaries.
+#[doc(hidden)]
+pub fn authorize_browser_process_with_readers(
+    local: SocketAddr,
+    peer: SocketAddr,
+    expected_executable: &Path,
+    diagnostic: &impl LinuxSocketDiagnostic,
+    procfs: &impl LinuxProcReader,
+) -> Result<AuthorizedBrowserProcess, AuthorizationError> {
+    let observed = resolve_browser_process_with_readers(local, peer, diagnostic, procfs)
+        .map_err(|_| AuthorizationError::OwnerResolutionFailed)?;
+    verify_browser_process_with_reader(observed, expected_executable, procfs)
+        .map_err(|_| AuthorizationError::ExecutableVerificationFailed)
+}
 
 /// Resolves an accepted numeric loopback TCP connection to its live process.
 pub fn resolve_browser_process(

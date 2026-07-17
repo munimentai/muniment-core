@@ -1,10 +1,10 @@
 #![cfg(target_os = "linux")]
 
 use muniment_core::browser_control::{
-    resolve_browser_process_with_readers, verify_browser_process,
-    verify_browser_process_with_reader, BrowserProcessIdentity, LinuxProcReader,
-    LinuxSocketDiagnostic, ProcReadError, ProcReader, ResolutionError, SocketDiagnostic,
-    VerificationError,
+    authorize_browser_process_with_readers, resolve_browser_process_with_readers,
+    verify_browser_process, verify_browser_process_with_reader, AuthorizationError,
+    BrowserProcessIdentity, LinuxProcReader, LinuxSocketDiagnostic, ProcReadError, ProcReader,
+    ResolutionError, SocketDiagnostic, VerificationError,
 };
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -523,4 +523,144 @@ fn rejects_an_owner_change_during_confirmation() {
         ),
         Err(ResolutionError::ProcessIdentityChanged)
     );
+}
+
+struct AuthorizationProc {
+    identity: BrowserProcessIdentity,
+    owners: usize,
+    starts: RefCell<VecDeque<Result<u64, ProcReadError>>>,
+    executable: PathBuf,
+}
+
+impl LinuxProcReader for AuthorizationProc {
+    fn start_identity(&self, _pid: u32) -> Result<u64, ProcReadError> {
+        self.starts.borrow_mut().pop_front().unwrap()
+    }
+
+    fn executable(&self, _pid: u32) -> Result<PathBuf, ProcReadError> {
+        Ok(self.executable.clone())
+    }
+
+    fn socket_owners(&self, _inode: u32) -> Result<Vec<BrowserProcessIdentity>, ProcReadError> {
+        Ok(vec![self.identity; self.owners])
+    }
+}
+
+fn authorization_proc(
+    starts: impl IntoIterator<Item = Result<u64, ProcReadError>>,
+    executable: PathBuf,
+) -> AuthorizationProc {
+    AuthorizationProc {
+        identity: BrowserProcessIdentity {
+            pid: 42,
+            start_identity: 77,
+        },
+        owners: 1,
+        starts: RefCell::new(starts.into_iter().collect()),
+        executable,
+    }
+}
+
+#[test]
+fn composition_authorizes_the_resolved_browser_executable() {
+    let (local, peer) = endpoints();
+    let executable = fs::canonicalize("/proc/self/exe").unwrap();
+    let procfs = authorization_proc([Ok(77), Ok(77), Ok(77)], executable.clone());
+
+    assert!(authorize_browser_process_with_readers(
+        local,
+        peer,
+        &executable,
+        &FakeDiagnostic {
+            matches: 1,
+            malformed: false,
+            done_flags: 2,
+        },
+        &procfs,
+    )
+    .is_ok());
+}
+
+#[test]
+fn composition_fails_closed_for_resolution_and_verification_failures() {
+    let (local, peer) = endpoints();
+    let executable = fs::canonicalize("/proc/self/exe").unwrap();
+    let directory = TestDirectory::new();
+    let wrong = directory.0.join("wrong-browser");
+    fs::write(&wrong, b"wrong").unwrap();
+    let diagnostic = FakeDiagnostic {
+        matches: 1,
+        malformed: false,
+        done_flags: 2,
+    };
+
+    for (procfs, expected) in [
+        (
+            authorization_proc([Ok(77), Ok(77), Ok(77)], wrong),
+            AuthorizationError::ExecutableVerificationFailed,
+        ),
+        (
+            authorization_proc([Ok(77), Ok(78)], executable.clone()),
+            AuthorizationError::ExecutableVerificationFailed,
+        ),
+    ] {
+        assert_eq!(
+            authorize_browser_process_with_readers(local, peer, &executable, &diagnostic, &procfs,),
+            Err(expected)
+        );
+    }
+
+    for (local, peer, matches) in [
+        (local, peer, 0),
+        (local, peer, 2),
+        ("192.0.2.1:41000".parse().unwrap(), peer, 1),
+        ("127.0.0.1:0".parse().unwrap(), peer, 1),
+    ] {
+        let procfs = authorization_proc([], executable.clone());
+        assert_eq!(
+            authorize_browser_process_with_readers(
+                local,
+                peer,
+                &executable,
+                &FakeDiagnostic {
+                    matches,
+                    malformed: false,
+                    done_flags: 2,
+                },
+                &procfs,
+            ),
+            Err(AuthorizationError::OwnerResolutionFailed)
+        );
+    }
+
+    for owners in [0, 2] {
+        let mut procfs = authorization_proc([], executable.clone());
+        procfs.owners = owners;
+        assert_eq!(
+            authorize_browser_process_with_readers(local, peer, &executable, &diagnostic, &procfs,),
+            Err(AuthorizationError::OwnerResolutionFailed)
+        );
+    }
+}
+
+#[test]
+fn composition_errors_are_bounded_and_redacted() {
+    for error in [
+        AuthorizationError::OwnerResolutionFailed,
+        AuthorizationError::ExecutableVerificationFailed,
+    ] {
+        let rendered = format!("{error:?}: {error}");
+        assert!(rendered.len() < 100);
+        for secret in [
+            "41000",
+            "41001",
+            "900",
+            "42",
+            "77",
+            "/secret/browser",
+            "permission denied",
+        ] {
+            assert!(!rendered.contains(secret));
+        }
+    }
 }
