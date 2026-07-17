@@ -1,0 +1,11 @@
+[package]
+name = "muniment-attach"
+version = "0.0.1"
+edition = "2021"
+
+[features]
+default = []
+client = []
+
+[lib]
+path = "src/lib.rs"
