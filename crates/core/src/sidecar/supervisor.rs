@@ -300,7 +300,7 @@ fn supervise(
             }
         }
         let child_generation = generation.fetch_add(1, Ordering::AcqRel) + 1;
-        let mut child = match spawn_child(
+        let (mut child, stderr_reader) = match spawn_child(
             &config,
             &io,
             stdout_tx.clone(),
@@ -375,7 +375,10 @@ fn supervise(
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             match child.try_wait() {
-                Ok(Some(exit)) => break process_exit_cause(exit, &stderr),
+                Ok(Some(exit)) => {
+                    let _ = stderr_reader.join();
+                    break process_exit_cause(exit, &stderr);
+                }
                 Err(error) => {
                     break SidecarEventCause::ProcessWaitError {
                         message: error.to_string(),
@@ -403,6 +406,7 @@ fn supervise(
                         config.shutdown_timeout,
                         config.poll_interval,
                     );
+                    let _ = stderr_reader.join();
                     break SidecarEventCause::StartupTimeout {
                         timeout: config.startup_timeout,
                         stderr_tail: stderr_tail(&stderr),
@@ -433,6 +437,7 @@ fn supervise(
                             config.shutdown_timeout,
                             config.poll_interval,
                         );
+                        let _ = stderr_reader.join();
                         break SidecarEventCause::HealthProbeFailure {
                             message: "probe reported loading after readiness".into(),
                             stderr_tail: stderr_tail(&stderr),
@@ -445,6 +450,7 @@ fn supervise(
                             config.shutdown_timeout,
                             config.poll_interval,
                         );
+                        let _ = stderr_reader.join();
                         break SidecarEventCause::HealthProbeFailure {
                             message,
                             stderr_tail: stderr_tail(&stderr),
@@ -460,6 +466,7 @@ fn supervise(
                     config.shutdown_timeout,
                     config.poll_interval,
                 );
+                let _ = stderr_reader.join();
                 break SidecarEventCause::StartupTimeout {
                     timeout: config.startup_timeout,
                     stderr_tail: stderr_tail(&stderr),
@@ -518,7 +525,7 @@ fn spawn_child(
     out: mpsc::Sender<(u64, String)>,
     err: Arc<StderrRing>,
     generation: u64,
-) -> Result<Child, std::io::Error> {
+) -> Result<(Child, JoinHandle<()>), std::io::Error> {
     let mut child = Command::new(&config.program)
         .args(&config.args)
         .envs(&config.env)
@@ -533,14 +540,14 @@ fn spawn_child(
         stdin.writer = child.stdin.take().map(BufWriter::new);
     }
     pipe_lines(child.stdout.take().unwrap(), out, generation);
-    pipe_error_lines(child.stderr.take().unwrap(), err, generation);
-    Ok(child)
+    let stderr_reader = pipe_error_lines(child.stderr.take().unwrap(), err, generation);
+    Ok((child, stderr_reader))
 }
 
 fn pipe_lines(pipe: ChildStdout, tx: mpsc::Sender<(u64, String)>, generation: u64) {
     thread::spawn(move || forward_lines(pipe, tx, generation));
 }
-fn pipe_error_lines(pipe: ChildStderr, ring: Arc<StderrRing>, generation: u64) {
+fn pipe_error_lines(pipe: ChildStderr, ring: Arc<StderrRing>, generation: u64) -> JoinHandle<()> {
     thread::spawn(move || {
         for line in BufReader::new(pipe).lines() {
             match line {
@@ -553,7 +560,7 @@ fn pipe_error_lines(pipe: ChildStderr, ring: Arc<StderrRing>, generation: u64) {
                 Err(_) => break,
             }
         }
-    });
+    })
 }
 fn forward_lines(pipe: impl std::io::Read, tx: mpsc::Sender<(u64, String)>, generation: u64) {
     for line in BufReader::new(pipe).lines() {
