@@ -4,6 +4,9 @@ use std::fmt;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClientError {
     UnsupportedPlatform,
+    AuthorizationExpired,
+    RequestRejected,
+    DesktopFailed,
     RuntimeDirectoryMissing,
     RuntimeDirectoryRelative,
     DesktopUnavailable,
@@ -20,6 +23,9 @@ impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::UnsupportedPlatform => "desktop attach is unsupported on this platform",
+            Self::AuthorizationExpired => "desktop authorization is no longer valid",
+            Self::RequestRejected => "the desktop rejected the thread list request",
+            Self::DesktopFailed => "the desktop could not list threads",
             Self::RuntimeDirectoryMissing => "XDG_RUNTIME_DIR is not set",
             Self::RuntimeDirectoryRelative => "XDG_RUNTIME_DIR must be an absolute path",
             Self::DesktopUnavailable => "the Muniment desktop attach service is unavailable",
@@ -42,12 +48,29 @@ pub struct AuthorizationSummary {
     pub idle_timeout_seconds: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedactedThreadSummary {
+    pub thread_id: String,
+    pub title: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadListPage {
+    pub threads: Vec<RedactedThreadSummary>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{AuthorizationSummary, ClientError};
+    use super::{AuthorizationSummary, ClientError, ThreadListPage};
     use crate::{
-        decode_frame, encode_frame, Authorized, Client, ErrorCode, ErrorEnvelope, FrameError,
-        Hello, Protocol, VersionRange, Welcome, MAX_FRAME_LENGTH, PROTOCOL,
+        decode_frame, encode_frame, Authorized, Client, Envelope, ErrorCode, ErrorEnvelope,
+        FrameError, Hello, Id, Operation, Protocol, Request, VersionRange, Welcome,
+        MAX_FRAME_LENGTH, MAX_TEXT_LENGTH, PROTOCOL,
     };
     use serde::de::DeserializeOwned;
     use serde_json::Value;
@@ -60,11 +83,81 @@ mod linux {
 
     const IO_TIMEOUT: Duration = Duration::from_secs(5);
     const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
+    const THREAD_LIST_LIMIT: u8 = 100;
+
+    /// An authorization bound to the connection on which pairing completed.
+    pub struct AuthorizedClient {
+        stream: UnixStream,
+        capability: String,
+        summary: AuthorizationSummary,
+        io_timeout: Duration,
+    }
+
+    impl std::fmt::Debug for AuthorizedClient {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("AuthorizedClient { .. }")
+        }
+    }
+
+    impl AuthorizedClient {
+        pub fn authorization_summary(&self) -> AuthorizationSummary {
+            self.summary.clone()
+        }
+
+        pub fn list_threads(&mut self) -> Result<ThreadListPage, ClientError> {
+            let request_id = fresh_request_id()?;
+            let request = Request {
+                protocol: Protocol,
+                request_id: request_id.clone(),
+                operation: Operation::ThreadList,
+                capability: self.capability.clone(),
+                idempotency_key: None,
+                body: serde_json::json!({ "limit": THREAD_LIST_LIMIT }),
+            };
+            let deadline = deadline(self.io_timeout);
+            let bytes = encode_frame(&request).map_err(map_frame_error)?;
+            write_all_before(&mut self.stream, &bytes, deadline)?;
+            let value = read_value(&mut self.stream, deadline)?;
+            if value
+                .get("protocol")
+                .and_then(Value::as_str)
+                .is_some_and(|protocol| protocol != PROTOCOL)
+            {
+                return Err(ClientError::ProtocolIncompatible);
+            }
+            let response =
+                match serde_json::from_value(value).map_err(|_| ClientError::UnexpectedMessage)? {
+                    Envelope::Response(response) if response.request_id == request_id => response,
+                    Envelope::Error(error) if error.request_id.as_ref() == Some(&request_id) => {
+                        return Err(map_protocol_error(error.error.code()));
+                    }
+                    _ => return Err(ClientError::UnexpectedMessage),
+                };
+            let page: ThreadListPage = serde_json::from_value(response.body)
+                .map_err(|_| ClientError::UnexpectedMessage)?;
+            if page.threads.len() > usize::from(THREAD_LIST_LIMIT)
+                || page.threads.iter().any(|thread| {
+                    thread.thread_id.is_empty()
+                        || thread.thread_id.len() > MAX_TEXT_LENGTH
+                        || thread.title.len() > MAX_TEXT_LENGTH
+                        || thread.updated_at.is_empty()
+                        || thread.updated_at.len() > MAX_TEXT_LENGTH
+                })
+                || page
+                    .next_cursor
+                    .as_ref()
+                    .is_some_and(|cursor| cursor.is_empty() || cursor.len() > MAX_TEXT_LENGTH)
+            {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            Ok(page)
+        }
+    }
 
     pub fn handshake(
         client_version: &str,
         pairing_pending: impl FnOnce(),
-    ) -> Result<AuthorizationSummary, ClientError> {
+    ) -> Result<AuthorizedClient, ClientError> {
         let endpoint = endpoint_from_environment()?;
         let stream = UnixStream::connect(endpoint).map_err(|_| ClientError::DesktopUnavailable)?;
         handshake_stream(
@@ -93,7 +186,7 @@ mod linux {
         io_timeout: Duration,
         approval_timeout: Duration,
         pairing_pending: impl FnOnce(),
-    ) -> Result<AuthorizationSummary, ClientError> {
+    ) -> Result<AuthorizedClient, ClientError> {
         let hello = Hello {
             protocol: Protocol,
             client: Client {
@@ -130,10 +223,37 @@ mod linux {
         {
             return Err(ClientError::UnexpectedMessage);
         }
-        Ok(AuthorizationSummary {
-            expires_in_seconds: authorized.expires_at,
-            idle_timeout_seconds: authorized.idle_timeout_seconds,
+        Ok(AuthorizedClient {
+            stream,
+            capability: authorized.capability,
+            summary: AuthorizationSummary {
+                expires_in_seconds: authorized.expires_at,
+                idle_timeout_seconds: authorized.idle_timeout_seconds,
+            },
+            io_timeout,
         })
+    }
+
+    fn fresh_request_id() -> Result<Id, ClientError> {
+        let nonce = fresh_nonce()?;
+        Id::new(format!(
+            "{}-{}-{}-{}-{}",
+            &nonce[0..8],
+            &nonce[8..12],
+            &nonce[12..16],
+            &nonce[16..20],
+            &nonce[20..32]
+        ))
+        .map_err(|_| ClientError::RandomnessUnavailable)
+    }
+
+    fn map_protocol_error(code: ErrorCode) -> ClientError {
+        match code {
+            ErrorCode::ProtocolIncompatible => ClientError::ProtocolIncompatible,
+            ErrorCode::Unauthorized => ClientError::AuthorizationExpired,
+            ErrorCode::PersistenceFailed => ClientError::DesktopFailed,
+            _ => ClientError::RequestRejected,
+        }
     }
 
     fn fresh_nonce() -> Result<String, ClientError> {
@@ -259,13 +379,24 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::handshake_stream;
+pub use linux::{handshake_stream, AuthorizedClient};
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
+pub struct AuthorizedClient;
+
+#[cfg(not(target_os = "linux"))]
+impl AuthorizedClient {
+    pub fn list_threads(&mut self) -> Result<ThreadListPage, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+}
 
 #[cfg(target_os = "linux")]
 pub fn handshake(
     client_version: &str,
     pairing_pending: impl FnOnce(),
-) -> Result<AuthorizationSummary, ClientError> {
+) -> Result<AuthorizedClient, ClientError> {
     linux::handshake(client_version, pairing_pending)
 }
 
@@ -273,6 +404,6 @@ pub fn handshake(
 pub fn handshake(
     _client_version: &str,
     _pairing_pending: impl FnOnce(),
-) -> Result<AuthorizationSummary, ClientError> {
+) -> Result<AuthorizedClient, ClientError> {
     Err(ClientError::UnsupportedPlatform)
 }

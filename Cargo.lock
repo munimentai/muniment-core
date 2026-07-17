@@ -2104,6 +2104,7 @@ name = "muniment-cli"
 version = "0.0.1"
 dependencies = [
  "muniment-attach",
+ "serde_json",
 ]
 
 [[package]]

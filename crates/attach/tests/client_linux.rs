@@ -2,7 +2,7 @@
 
 use muniment_attach::{
     authorized, encode_frame, handshake_stream, welcome, ClientError, ErrorAction, ErrorEnvelope,
-    Failure, Protocol, ProtocolError, VersionRange, MAX_FRAME_LENGTH,
+    Failure, Id, Protocol, ProtocolError, Response, Success, VersionRange, MAX_FRAME_LENGTH,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -55,12 +55,171 @@ fn pathname_socket_handles_fragmented_success_frames() {
     });
     let stream = UnixStream::connect(&path).unwrap();
     let mut prompted = false;
-    let summary = handshake_stream(stream, "0.0.1", SHORT, SHORT, || prompted = true).unwrap();
+    let client = handshake_stream(stream, "0.0.1", SHORT, SHORT, || prompted = true).unwrap();
+    let summary = client.authorization_summary();
     assert!(prompted);
     assert_eq!(summary.expires_in_seconds, 3600);
     assert_eq!(summary.idle_timeout_seconds, 900);
     server.join().unwrap();
     std::fs::remove_file(path).unwrap();
+}
+
+fn complete_pairing(server: &mut UnixStream) {
+    read_client_frame(server);
+    server
+        .write_all(&encode_frame(&welcome(1, "0.0.1", "11".repeat(16), "22".repeat(16))).unwrap())
+        .unwrap();
+    server
+        .write_all(
+            &encode_frame(&authorized(
+                "33".repeat(32),
+                3600,
+                900,
+                BTreeMap::from([("workspace".into(), BTreeSet::from(["thread.read".into()]))]),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+}
+
+fn read_client_value(server: &mut UnixStream) -> serde_json::Value {
+    let mut prefix = [0; 4];
+    server.read_exact(&mut prefix).unwrap();
+    let mut payload = vec![0; u32::from_be_bytes(prefix) as usize];
+    server.read_exact(&mut payload).unwrap();
+    serde_json::from_slice(&payload).unwrap()
+}
+
+#[test]
+fn thread_list_uses_exact_envelope_and_accepts_fragmented_page() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        let request = read_client_value(&mut server);
+        assert_eq!(request["protocol"], "muniment.attach/1");
+        assert_eq!(request["operation"], "thread.list");
+        assert_eq!(request["capability"], "33".repeat(32));
+        assert_eq!(request["body"], serde_json::json!({"limit": 100}));
+        assert!(request.get("idempotency_key").is_none());
+        let request_id = request["request_id"].as_str().unwrap();
+        let response = Response {
+            protocol: Protocol,
+            request_id: Id::new(request_id).unwrap(),
+            ok: Success,
+            body: serde_json::json!({
+                "threads": [{"thread_id":"opaque-1", "title":"First", "updated_at":"2026-07-17T00:00:00Z"}],
+                "next_cursor": "private-cursor"
+            }),
+        };
+        for byte in encode_frame(&response).unwrap() {
+            server.write_all(&[byte]).unwrap();
+        }
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    let page = client.list_threads().unwrap();
+    assert_eq!(page.threads[0].thread_id, "opaque-1");
+    assert!(page.next_cursor.is_some());
+    worker.join().unwrap();
+}
+
+#[test]
+fn thread_list_rejects_correlation_mismatch_and_maps_protocol_errors() {
+    for (error, expected) in [
+        (None, ClientError::UnexpectedMessage),
+        (
+            Some(ProtocolError::unauthorized()),
+            ClientError::AuthorizationExpired,
+        ),
+        (
+            Some(ProtocolError::persistence_failed()),
+            ClientError::DesktopFailed,
+        ),
+    ] {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            complete_pairing(&mut server);
+            let request = read_client_value(&mut server);
+            let request_id = if error.is_none() {
+                Id::new("00000000-0000-0000-0000-000000000000").unwrap()
+            } else {
+                Id::new(request["request_id"].as_str().unwrap()).unwrap()
+            };
+            let bytes = if let Some(error) = error {
+                encode_frame(&ErrorEnvelope {
+                    protocol: Protocol,
+                    request_id: Some(request_id),
+                    ok: Failure,
+                    error,
+                })
+                .unwrap()
+            } else {
+                encode_frame(&Response {
+                    protocol: Protocol,
+                    request_id,
+                    ok: Success,
+                    body: serde_json::json!({"threads": []}),
+                })
+                .unwrap()
+            };
+            server.write_all(&bytes).unwrap();
+        });
+        let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+        assert_eq!(client.list_threads(), Err(expected));
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn thread_list_rejects_hybrid_success_and_error_envelopes() {
+    for hybrid in [
+        serde_json::json!({
+            "protocol": "muniment.attach/1",
+            "ok": true,
+            "body": {"threads": []},
+            "error": {"code": "invalid_request", "message": "server-secret", "action": "retry"}
+        }),
+        serde_json::json!({
+            "protocol": "muniment.attach/1",
+            "ok": false,
+            "error": {"code": "invalid_request", "message": "server-secret", "action": "retry"},
+            "body": {"threads": []}
+        }),
+    ] {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            complete_pairing(&mut server);
+            let request = read_client_value(&mut server);
+            let mut hybrid = hybrid;
+            hybrid["request_id"] = request["request_id"].clone();
+            server.write_all(&encode_frame(&hybrid).unwrap()).unwrap();
+        });
+        let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+        assert_eq!(client.list_threads(), Err(ClientError::UnexpectedMessage));
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn thread_list_timeout_is_absolute_and_client_debug_is_redacted() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        read_client_frame(&mut server);
+        for byte in encode_frame(&serde_json::json!({"unused": true})).unwrap() {
+            if server.write_all(&[byte]).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(30));
+        }
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    let debug = format!("{client:?}");
+    assert!(!debug.contains(&"33".repeat(32)));
+    assert!(!debug.contains("UnixStream"));
+    let started = Instant::now();
+    assert_eq!(client.list_threads(), Err(ClientError::Timeout));
+    assert!(started.elapsed() < Duration::from_millis(250));
+    worker.join().unwrap();
 }
 
 #[test]
@@ -84,8 +243,8 @@ fn continuous_partial_progress_cannot_extend_receive_deadlines() {
         });
         let started = Instant::now();
         assert_eq!(
-            handshake_stream(client, "0.0.1", SHORT, SHORT, || {}),
-            Err(ClientError::Timeout)
+            handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap_err(),
+            ClientError::Timeout
         );
         assert!(started.elapsed() < Duration::from_millis(250));
         sender.join().unwrap();
@@ -133,8 +292,8 @@ fn hybrid_messages_are_rejected_at_both_handshake_stages() {
             server.write_all(&encode_frame(&hybrid).unwrap()).unwrap();
         });
         assert_eq!(
-            handshake_stream(client, "0.0.1", SHORT, SHORT, || {}),
-            Err(ClientError::UnexpectedMessage)
+            handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap_err(),
+            ClientError::UnexpectedMessage
         );
         sender.join().unwrap();
     }
@@ -148,16 +307,16 @@ fn timeout_and_early_close_are_distinct_and_redacted() {
         thread::sleep(Duration::from_millis(150));
     });
     assert_eq!(
-        handshake_stream(client, "0.0.1", SHORT, SHORT, || {}),
-        Err(ClientError::Timeout)
+        handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap_err(),
+        ClientError::Timeout
     );
     hold.join().unwrap();
 
     let (client, server) = UnixStream::pair().unwrap();
     server.shutdown(Shutdown::Write).unwrap();
     assert_eq!(
-        handshake_stream(client, "0.0.1", SHORT, SHORT, || {}),
-        Err(ClientError::ConnectionClosed)
+        handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap_err(),
+        ClientError::ConnectionClosed
     );
 }
 
@@ -183,8 +342,8 @@ fn malformed_and_oversized_frames_are_rejected_before_allocation() {
             server.write_all(&response).unwrap();
         });
         assert_eq!(
-            handshake_stream(client, "0.0.1", SHORT, SHORT, || {}),
-            Err(expected)
+            handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap_err(),
+            expected
         );
         sender.join().unwrap();
     }
@@ -211,8 +370,8 @@ fn incompatible_error_and_selected_version_are_rejected() {
             server.write_all(&response).unwrap();
         });
         assert_eq!(
-            handshake_stream(client, "0.0.1", SHORT, SHORT, || {}),
-            Err(ClientError::ProtocolIncompatible)
+            handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap_err(),
+            ClientError::ProtocolIncompatible
         );
         sender.join().unwrap();
     }
