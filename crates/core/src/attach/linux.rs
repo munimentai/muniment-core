@@ -18,6 +18,7 @@ use super::{
     Failure, FirstMessage, NegotiationError, Operation, Protocol, ProtocolError, Request, Response,
     Success, VersionRange, CHALLENGE_LIFETIME, MAX_FRAME_LENGTH, MAX_TEXT_LENGTH,
 };
+use crate::journal::{summaries::RunSummaryListError, RunJournal};
 
 const ATTACH_DIRECTORY: &[u8] = b"muniment\0";
 const ENDPOINT_NAME: &str = "attach-v1.sock";
@@ -384,6 +385,34 @@ where
         request: ThreadListRequest,
     ) -> Result<ThreadListPage, ProtocolError> {
         self(workspace, request)
+    }
+}
+
+impl ThreadListService for RunJournal {
+    fn list_threads(
+        &mut self,
+        _workspace: &str,
+        request: ThreadListRequest,
+    ) -> Result<ThreadListPage, ProtocolError> {
+        let page =
+            self.run_summaries(usize::from(request.limit), request.cursor.as_deref())
+                .map_err(|error| match error {
+                    RunSummaryListError::InvalidLimit { .. }
+                    | RunSummaryListError::InvalidCursor => ProtocolError::invalid_request(),
+                    RunSummaryListError::Journal(_) => ProtocolError::persistence_failed(),
+                })?;
+        Ok(ThreadListPage {
+            threads: page
+                .summaries
+                .into_iter()
+                .map(|summary| RedactedThreadSummary {
+                    thread_id: summary.run_id,
+                    title: summary.title,
+                    updated_at: summary.updated_at,
+                })
+                .collect(),
+            next_cursor: page.next_cursor,
+        })
     }
 }
 

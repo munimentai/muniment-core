@@ -3,16 +3,17 @@
 use muniment_core::attach::linux::{
     run_authenticated_session_with, run_authenticated_session_with_authorization, ApprovalDecision,
     AttachSessionError, AuthorizationSessionDependencies, PeerCredentials, RedactedThreadSummary,
-    ThreadListPage, ThreadListRequest,
+    ThreadListPage, ThreadListRequest, ThreadListService,
 };
 use muniment_core::attach::{
     decode_frame, encode_frame, Approval, AuthorizationClock, AuthorizationTokenGenerator,
     Authorized, ErrorAction, ErrorCode, ErrorEnvelope, Hello, Id, Operation, Protocol, Request,
     Response, VersionRange, Welcome, CHALLENGE_LIFETIME, MAX_FRAME_LENGTH, MAX_JSON_DEPTH,
 };
+use muniment_core::journal::{EventEnvelope, EventPayload, Provenance, RunJournal};
 use serde_json::json;
 use std::cell::Cell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
@@ -511,6 +512,34 @@ fn request(id: u128, operation: Operation, body: serde_json::Value) -> Vec<u8> {
     .unwrap()
 }
 
+fn prompt(run_id: &str, title: &str, recorded_at: &str) -> EventEnvelope {
+    EventEnvelope {
+        event_id: run_id.replacen("a100", "a200", 1),
+        run_id: run_id.into(),
+        run_seq: 1,
+        event_type: "user.prompt.submitted".into(),
+        event_version: 1,
+        envelope_version: 1,
+        recorded_at: recorded_at.into(),
+        occurred_at: None,
+        correlation_id: None,
+        causation_id: None,
+        payload: EventPayload::Inline {
+            payload_json: json!({"prompt": title, "secret": "/home/user/private"}),
+        },
+        provenance: Provenance {
+            source: "test".into(),
+            source_version: "1".into(),
+            actor_id: None,
+            device_id: None,
+            rpc_request_id: None,
+            capability_versions: None,
+            extra: BTreeMap::new(),
+        },
+        extra: BTreeMap::new(),
+    }
+}
+
 fn dispatch_session<S>(
     client: &mut UnixStream,
     server: UnixStream,
@@ -599,6 +628,125 @@ fn authorized_thread_list_is_bounded_paginated_and_correlated() {
     );
     assert_eq!(response.body["next_cursor"], "opaque-page-3");
     assert_eq!(calls.get(), 1);
+}
+
+#[test]
+fn authorized_thread_list_pages_real_journal_summaries_without_payloads() {
+    const RUN_A: &str = "0190a100-0000-7000-8000-000000000001";
+    const RUN_B: &str = "0190a100-0000-7000-8000-000000000002";
+    const RUN_C: &str = "0190a100-0000-7000-8000-000000000003";
+    let mut journal = RunJournal::open(":memory:").unwrap();
+    for (run_id, title, recorded_at) in [
+        (RUN_A, "first", "2026-07-16T03:00:00Z"),
+        (RUN_B, "second", "2026-07-16T02:00:00Z"),
+        (RUN_C, "third", "2026-07-16T01:00:00Z"),
+    ] {
+        journal
+            .append(0, &prompt(run_id, title, recorded_at))
+            .unwrap();
+    }
+
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let client_thread = thread::spawn(move || {
+        client.write_all(&hello(1, 1)).unwrap();
+        let _: Welcome = read_frame(&mut client);
+        let _: Authorized = read_frame(&mut client);
+        client
+            .write_all(&request(11, Operation::ThreadList, json!({"limit": 2})))
+            .unwrap();
+        let first: Response = read_frame(&mut client);
+        client
+            .write_all(&request(
+                12,
+                Operation::ThreadList,
+                json!({"limit": 2, "cursor": first.body["next_cursor"]}),
+            ))
+            .unwrap();
+        let second: Response = read_frame(&mut client);
+        client.shutdown(Shutdown::Write).unwrap();
+        (first, second)
+    });
+    let result = run_authenticated_session_with_authorization(
+        server,
+        credentials(),
+        "0.1.0",
+        Duration::from_secs(1),
+        AuthorizationSessionDependencies {
+            fill_random: |bytes: &mut [u8]| {
+                bytes.fill(9);
+                Ok(())
+            },
+            clock: TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            tokens: TestTokens(1),
+            approvals: |_: &muniment_core::attach::PairingChallenge, _: Duration| {
+                Some(ApprovalDecision::Approve(approval()))
+            },
+        },
+        &mut journal,
+    );
+    assert_eq!(result, Ok(()));
+    let (first, second) = client_thread.join().unwrap();
+    assert_eq!(
+        first.body,
+        json!({
+            "threads": [
+                {"thread_id": RUN_A, "title": "first", "updated_at": "2026-07-16T03:00:00Z"},
+                {"thread_id": RUN_B, "title": "second", "updated_at": "2026-07-16T02:00:00Z"}
+            ],
+            "next_cursor": first.body["next_cursor"]
+        })
+    );
+    assert_eq!(
+        second.body,
+        json!({
+            "threads": [
+                {"thread_id": RUN_C, "title": "third", "updated_at": "2026-07-16T01:00:00Z"}
+            ]
+        })
+    );
+    let encoded = format!("{}{}", first.body, second.body);
+    assert!(!encoded.contains("secret"));
+    assert!(!encoded.contains("/home/user/private"));
+}
+
+#[test]
+fn journal_thread_list_maps_cursor_and_storage_failures_without_details() {
+    let mut journal = RunJournal::open(":memory:").unwrap();
+    let cursor_error = journal
+        .list_threads(
+            "workspace-1",
+            ThreadListRequest {
+                limit: 1,
+                cursor: Some("forged".into()),
+            },
+        )
+        .unwrap_err();
+    assert_eq!(cursor_error.code(), ErrorCode::InvalidRequest);
+
+    let path = std::env::temp_dir().join(format!(
+        "muniment-thread-list-storage-failure-{}.sqlite3",
+        std::process::id()
+    ));
+    let mut journal = RunJournal::open(&path).unwrap();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE events")
+        .unwrap();
+    let storage_error = journal
+        .list_threads(
+            "workspace-1",
+            ThreadListRequest {
+                limit: 1,
+                cursor: None,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(storage_error.code(), ErrorCode::PersistenceFailed);
+    assert!(!serde_json::to_string(&storage_error)
+        .unwrap()
+        .contains("events"));
+    drop(journal);
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]
