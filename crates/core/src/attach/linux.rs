@@ -39,6 +39,7 @@ const MAX_CURSOR_LENGTH: usize = 1024;
 const MAX_RESPONSE_BODY_LENGTH: usize = MAX_FRAME_LENGTH - 4096;
 pub const MAX_RUN_START_TEXT_LENGTH: usize = 32 * 1024;
 pub const MAX_RUN_START_CONTEXT_LENGTH: usize = 64 * 1024;
+pub const MAX_PERMISSION_GATE_ID_LENGTH: usize = 256;
 
 /// A verified, pinned filesystem boundary for the Linux attach endpoint.
 #[derive(Debug)]
@@ -424,6 +425,29 @@ pub struct RunStartAccepted {
     pub accepted_at: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionDecision {
+    Allow,
+    Deny,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PermissionAnswerRequest {
+    pub run_id: String,
+    pub gate_id: String,
+    pub decision: PermissionDecision,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct PermissionAnswerAccepted {
+    pub run_id: String,
+    pub gate_id: String,
+    pub decision: PermissionDecision,
+    pub committed_seq: u64,
+    pub accepted_at: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunStreamPage {
     pub run_id: String,
@@ -457,6 +481,17 @@ pub trait ThreadListService {
         _idempotency_key: &super::Id,
         _provenance: CompanionProvenance,
     ) -> Result<RunStartAccepted, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn answer_permission(
+        &mut self,
+        _workspace: &str,
+        _request: PermissionAnswerRequest,
+        _request_id: &super::Id,
+        _idempotency_key: &super::Id,
+        _provenance: CompanionProvenance,
+    ) -> Result<PermissionAnswerAccepted, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
 
@@ -1015,7 +1050,7 @@ where
             | Operation::ThreadOpen
             | Operation::RunStream
             | Operation::RunCursorAck => Some("thread.read"),
-            Operation::RunStart => Some("run.write"),
+            Operation::RunStart | Operation::PermissionAnswer => Some("run.write"),
             _ => None,
         };
         if authorization
@@ -1383,6 +1418,53 @@ fn dispatch_request<S: ThreadListService>(
         }
         return Ok(response_only(serde_json::json!({
             "run_id": accepted.run_id,
+            "committed_seq": accepted.committed_seq,
+            "accepted_at": accepted.accepted_at,
+        })));
+    }
+    if request.operation == Operation::PermissionAnswer {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            run_id: String,
+            gate_id: String,
+            decision: PermissionDecision,
+        }
+        let body: Body =
+            serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
+        super::Id::new(body.run_id.clone()).map_err(|_| ProtocolError::invalid_request())?;
+        if body.gate_id.trim().is_empty() || body.gate_id.len() > MAX_PERMISSION_GATE_ID_LENGTH {
+            return Err(ProtocolError::invalid_request().into());
+        }
+        let idempotency_key = request
+            .idempotency_key
+            .as_ref()
+            .ok_or_else(ProtocolError::idempotency_key_required)?;
+        let accepted = service.answer_permission(
+            workspace,
+            PermissionAnswerRequest {
+                run_id: body.run_id,
+                gate_id: body.gate_id,
+                decision: body.decision,
+            },
+            &request.request_id,
+            idempotency_key,
+            provenance,
+        )?;
+        if super::Id::new(accepted.run_id.clone()).is_err()
+            || accepted.gate_id.trim().is_empty()
+            || accepted.gate_id.len() > MAX_PERMISSION_GATE_ID_LENGTH
+            || accepted.committed_seq == 0
+            || accepted.accepted_at.is_empty()
+            || accepted.accepted_at.len() > MAX_TEXT_LENGTH
+            || chrono::DateTime::parse_from_rfc3339(&accepted.accepted_at).is_err()
+        {
+            return Err(ProtocolError::persistence_failed().into());
+        }
+        return Ok(response_only(serde_json::json!({
+            "run_id": accepted.run_id,
+            "gate_id": accepted.gate_id,
+            "decision": accepted.decision,
             "committed_seq": accepted.committed_seq,
             "accepted_at": accepted.accepted_at,
         })));

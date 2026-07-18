@@ -3,8 +3,9 @@
 use muniment_core::attach::linux::{
     run_authenticated_session_with, run_authenticated_session_with_authorization, ApprovalDecision,
     AttachSessionError, AuthorizationSessionDependencies, CompanionProvenance, PeerCredentials,
-    RedactedThreadSummary, RunStartAccepted, RunStartRequest, RunStreamPage, ThreadListPage,
-    ThreadListRequest, ThreadListService, ThreadOpenRequest, MAX_RUN_START_CONTEXT_LENGTH,
+    PermissionAnswerAccepted, PermissionAnswerRequest, RedactedThreadSummary, RunStartAccepted,
+    RunStartRequest, RunStreamPage, ThreadListPage, ThreadListRequest, ThreadListService,
+    ThreadOpenRequest, MAX_PERMISSION_GATE_ID_LENGTH, MAX_RUN_START_CONTEXT_LENGTH,
     MAX_RUN_START_TEXT_LENGTH,
 };
 use muniment_core::attach::{
@@ -116,6 +117,49 @@ fn unavailable_service(
 struct StartService {
     calls: Vec<(String, RunStartRequest, Id, Id, CompanionProvenance)>,
     output: Option<RunStartAccepted>,
+}
+
+#[derive(Default)]
+struct PermissionService {
+    calls: Vec<(String, PermissionAnswerRequest, Id, Id, CompanionProvenance)>,
+    fail: bool,
+}
+
+impl ThreadListService for PermissionService {
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, muniment_core::attach::ProtocolError> {
+        panic!("thread reads must not dispatch")
+    }
+
+    fn answer_permission(
+        &mut self,
+        workspace: &str,
+        request: PermissionAnswerRequest,
+        request_id: &Id,
+        idempotency_key: &Id,
+        provenance: CompanionProvenance,
+    ) -> Result<PermissionAnswerAccepted, muniment_core::attach::ProtocolError> {
+        self.calls.push((
+            workspace.into(),
+            request.clone(),
+            request_id.clone(),
+            idempotency_key.clone(),
+            provenance,
+        ));
+        if self.fail {
+            return Err(muniment_core::attach::ProtocolError::persistence_failed());
+        }
+        Ok(PermissionAnswerAccepted {
+            run_id: request.run_id,
+            gate_id: request.gate_id,
+            decision: request.decision,
+            committed_seq: 9,
+            accepted_at: "2026-07-18T00:00:00Z".into(),
+        })
+    }
 }
 
 struct StreamService {
@@ -2706,6 +2750,154 @@ fn authorized_run_start_dispatches_once_with_bounded_input_and_provenance() {
     assert_eq!(provenance.companion_kind, "cli");
     assert_eq!(provenance.companion_version, "1.0.0");
     assert_eq!(provenance.peer_uid, unsafe { libc::geteuid() });
+}
+
+#[test]
+fn authorized_permission_answers_dispatch_allow_and_deny_once() {
+    for (offset, decision) in [(0, "allow"), (1, "deny")] {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&hello(1, 1)).unwrap();
+        client.write_all(&request_with_idempotency(
+            170 + offset,
+            Operation::PermissionAnswer,
+            json!({"run_id":"0190a100-0000-7000-8000-000000000001", "gate_id":"gate-private", "decision":decision}),
+        )).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut approved = approval();
+        approved.scopes.insert("run.write".into());
+        let mut service = PermissionService::default();
+        assert_eq!(
+            dispatch_session_with_approval(
+                &mut client,
+                server,
+                TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                approved,
+                &mut service
+            ),
+            Ok(())
+        );
+        let response: Response = read_frame(&mut client);
+        assert_eq!(response.body["decision"], decision);
+        assert_eq!(response.body["committed_seq"], 9);
+        assert_eq!(service.calls.len(), 1);
+        assert_eq!(service.calls[0].1.gate_id, "gate-private");
+        assert_eq!(service.calls[0].4.profile, "profile-1");
+    }
+}
+
+#[test]
+fn permission_answer_rejects_unauthorized_and_invalid_requests_without_dispatch() {
+    let cases = [
+        (
+            false,
+            request_with_idempotency(
+                180,
+                Operation::PermissionAnswer,
+                json!({"run_id":"0190a100-0000-7000-8000-000000000001","gate_id":"secret-gate","decision":"allow"}),
+            ),
+        ),
+        (
+            true,
+            request(
+                181,
+                Operation::PermissionAnswer,
+                json!({"run_id":"0190a100-0000-7000-8000-000000000001","gate_id":"secret-gate","decision":"allow"}),
+            ),
+        ),
+        (
+            true,
+            request_with_idempotency(
+                182,
+                Operation::PermissionAnswer,
+                json!({"run_id":"bad","gate_id":"secret-gate","decision":"allow"}),
+            ),
+        ),
+        (
+            true,
+            request_with_idempotency(
+                183,
+                Operation::PermissionAnswer,
+                json!({"run_id":"0190a100-0000-7000-8000-000000000001","gate_id":"","decision":"allow"}),
+            ),
+        ),
+        (
+            true,
+            request_with_idempotency(
+                184,
+                Operation::PermissionAnswer,
+                json!({"run_id":"0190a100-0000-7000-8000-000000000001","gate_id":"x".repeat(MAX_PERMISSION_GATE_ID_LENGTH + 1),"decision":"allow"}),
+            ),
+        ),
+        (
+            true,
+            request_with_idempotency(
+                185,
+                Operation::PermissionAnswer,
+                json!({"run_id":"0190a100-0000-7000-8000-000000000001","gate_id":"secret-gate","decision":"later"}),
+            ),
+        ),
+        (
+            true,
+            request_with_idempotency(
+                186,
+                Operation::PermissionAnswer,
+                json!({"run_id":"0190a100-0000-7000-8000-000000000001","gate_id":"secret-gate","decision":"deny","actor_id":"forged"}),
+            ),
+        ),
+    ];
+    for (has_scope, frame) in cases {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&hello(1, 1)).unwrap();
+        client.write_all(&frame).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut approved = approval();
+        if has_scope {
+            approved.scopes.insert("run.write".into());
+        }
+        let mut service = PermissionService::default();
+        let _ = dispatch_session_with_approval(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            approved,
+            &mut service,
+        );
+        let error: ErrorEnvelope = read_frame(&mut client);
+        let encoded = serde_json::to_string(&error).unwrap();
+        assert!(!encoded.contains("secret-gate"));
+        assert!(!encoded.contains("forged"));
+        assert!(service.calls.is_empty());
+    }
+}
+
+#[test]
+fn permission_answer_service_failure_is_redacted() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello(1, 1)).unwrap();
+    client.write_all(&request_with_idempotency(190, Operation::PermissionAnswer, json!({"run_id":"0190a100-0000-7000-8000-000000000001","gate_id":"secret-gate","decision":"deny"}))).unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut approved = approval();
+    approved.scopes.insert("run.write".into());
+    let mut service = PermissionService {
+        fail: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        dispatch_session_with_approval(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            approved,
+            &mut service
+        ),
+        Ok(())
+    );
+    let error: ErrorEnvelope = read_frame(&mut client);
+    assert_eq!(error.error.code(), ErrorCode::PersistenceFailed);
+    assert!(!serde_json::to_string(&error)
+        .unwrap()
+        .contains("secret-gate"));
+    assert_eq!(service.calls.len(), 1);
 }
 
 #[test]
