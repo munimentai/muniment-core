@@ -994,7 +994,7 @@ fn run_stream_resumes_in_order_without_duplicates_and_marks_only_exhausted_catch
 }
 
 #[test]
-fn run_stream_event_window_pauses_without_caught_up() {
+fn run_stream_event_window_ack_resumes_and_catches_up_once() {
     const RUN: &str = "0190a100-0000-7000-8000-000000000016";
     let events = (1..=(MAX_RUN_STREAM_WINDOW_EVENTS as u64 + 1))
         .map(|seq| stream_projection(RUN, seq, "safe.event".into()))
@@ -1039,30 +1039,459 @@ fn run_stream_event_window_pauses_without_caught_up() {
             json!({"run_id": RUN, "after_run_seq": 0}),
         ))
         .unwrap();
-    client.shutdown(Shutdown::Write).unwrap();
-    let _: Response = read_frame(&mut client);
+    let response: Response = read_frame(&mut client);
+    let subscription = response.body["subscription_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let mut sequences = Vec::new();
-    loop {
-        let mut prefix = [0; 4];
-        if client.read_exact(&mut prefix).is_err() {
-            break;
-        }
-        let mut frame = vec![0; 4 + u32::from_be_bytes(prefix) as usize];
-        frame[..4].copy_from_slice(&prefix);
-        client.read_exact(&mut frame[4..]).unwrap();
-        let (Envelope::Event(event), _) = decode_frame(&frame).unwrap().unwrap() else {
+    for _ in 0..MAX_RUN_STREAM_WINDOW_EVENTS {
+        let Envelope::Event(event) = read_frame::<Envelope>(&mut client) else {
             panic!("expected event")
         };
         assert_eq!(event.event, EventName::RunEvent);
         sequences.push(event.run_seq.unwrap());
     }
-    assert_eq!(server_thread.join().unwrap(), Ok(()));
     assert_eq!(sequences.len(), MAX_RUN_STREAM_WINDOW_EVENTS);
     assert_eq!(sequences.first(), Some(&1));
     assert_eq!(
         sequences.last(),
         Some(&(MAX_RUN_STREAM_WINDOW_EVENTS as u64))
     );
+
+    client
+        .write_all(&request(
+            48,
+            Operation::RunCursorAck,
+            json!({
+                "subscription_id": subscription,
+                "through_run_seq": MAX_RUN_STREAM_WINDOW_EVENTS,
+            }),
+        ))
+        .unwrap();
+    let ack: Response = read_frame(&mut client);
+    assert_eq!(ack.body["through_run_seq"], MAX_RUN_STREAM_WINDOW_EVENTS);
+    let Envelope::Event(last) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected resumed event")
+    };
+    assert_eq!(last.run_seq, Some(MAX_RUN_STREAM_WINDOW_EVENTS as u64 + 1));
+    let Envelope::Event(caught_up) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected caught-up event")
+    };
+    assert_eq!(caught_up.event, EventName::SubscriptionCaughtUp);
+
+    client
+        .write_all(&request(
+            49,
+            Operation::RunCursorAck,
+            json!({
+                "subscription_id": subscription,
+                "through_run_seq": MAX_RUN_STREAM_WINDOW_EVENTS,
+            }),
+        ))
+        .unwrap();
+    let duplicate: Response = read_frame(&mut client);
+    assert_eq!(
+        duplicate.body["through_run_seq"],
+        MAX_RUN_STREAM_WINDOW_EVENTS
+    );
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(server_thread.join().unwrap(), Ok(()));
+}
+
+fn assert_redacted_request_error(error: &ErrorEnvelope, request: u128, code: ErrorCode) {
+    assert_eq!(
+        error.request_id.as_ref().map(Id::as_str),
+        Some(format!("{request:032x}").as_str())
+    );
+    assert_eq!(error.error.code(), code);
+    assert_eq!(
+        serde_json::to_value(&error.error).unwrap().get("details"),
+        None
+    );
+}
+
+#[test]
+fn run_cursor_ack_rejections_are_correlated_redacted_and_stream_local() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000019";
+    let events = (1..=(MAX_RUN_STREAM_WINDOW_EVENTS as u64 + 1))
+        .map(|seq| stream_projection(RUN, seq, "safe.event".into()))
+        .collect();
+    let mut service = StreamService {
+        page: RunStreamPage {
+            run_id: RUN.into(),
+            first_available_run_seq: 1,
+            current_run_seq: MAX_RUN_STREAM_WINDOW_EVENTS as u64 + 1,
+            events,
+            exhausted: true,
+        },
+    };
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let server_thread = thread::spawn(move || {
+        run_authenticated_session_with_authorization(
+            server,
+            credentials(),
+            "0.1.0",
+            Duration::from_secs(2),
+            AuthorizationSessionDependencies {
+                fill_random: |bytes: &mut [u8]| {
+                    bytes.fill(9);
+                    Ok(())
+                },
+                clock: TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                tokens: TestTokens(1),
+                approvals: |_: &muniment_core::attach::PairingChallenge, _: Duration| {
+                    Some(ApprovalDecision::Approve(approval()))
+                },
+            },
+            &mut service,
+        )
+    });
+    client.write_all(&hello(1, 1)).unwrap();
+    let _: Welcome = read_frame(&mut client);
+    let _: Authorized = read_frame(&mut client);
+
+    client
+        .write_all(&request(
+            60,
+            Operation::RunCursorAck,
+            json!({"subscription_id": "0".repeat(32), "through_run_seq": 0}),
+        ))
+        .unwrap();
+    assert_redacted_request_error(&read_frame(&mut client), 60, ErrorCode::InvalidCursor);
+    for (request_id, body) in [
+        (
+            61,
+            json!({"subscription_id": "not-an-id", "through_run_seq": 0}),
+        ),
+        (62, json!({"subscription_id": "0".repeat(32)})),
+        (
+            63,
+            json!({"subscription_id": "0".repeat(32), "through_run_seq": "1"}),
+        ),
+        (
+            64,
+            json!({
+                "subscription_id": "0".repeat(32),
+                "through_run_seq": 0,
+                "workspace": "workspace-2",
+                "run_id": "0190a100-0000-7000-8000-000000000020"
+            }),
+        ),
+    ] {
+        client
+            .write_all(&request(request_id, Operation::RunCursorAck, body))
+            .unwrap();
+        assert_redacted_request_error(
+            &read_frame(&mut client),
+            request_id,
+            ErrorCode::InvalidRequest,
+        );
+    }
+
+    let mut subscriptions = Vec::new();
+    for request_id in [65, 66, 69] {
+        client
+            .write_all(&request(
+                request_id,
+                Operation::RunStream,
+                json!({"run_id": RUN, "after_run_seq": 0}),
+            ))
+            .unwrap();
+        let response: Response = read_frame(&mut client);
+        subscriptions.push(
+            response.body["subscription_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+        for expected in 1..=MAX_RUN_STREAM_WINDOW_EVENTS as u64 {
+            let Envelope::Event(event) = read_frame::<Envelope>(&mut client) else {
+                panic!("expected run event")
+            };
+            assert_eq!(
+                event.subscription_id.as_str(),
+                subscriptions.last().unwrap()
+            );
+            assert_eq!(event.run_seq, Some(expected));
+            assert_eq!(event.body["payload"]["withheld"], true);
+        }
+    }
+
+    client
+        .write_all(&request(
+            67,
+            Operation::RunCursorAck,
+            json!({
+                "subscription_id": subscriptions[0],
+                "through_run_seq": MAX_RUN_STREAM_WINDOW_EVENTS + 1,
+            }),
+        ))
+        .unwrap();
+    assert_redacted_request_error(&read_frame(&mut client), 67, ErrorCode::InvalidCursor);
+    let Envelope::Event(closed) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected stream close")
+    };
+    assert_eq!(closed.event, EventName::StreamClosed);
+    assert_eq!(closed.subscription_id.as_str(), subscriptions[0]);
+    assert_eq!(closed.run_id.as_ref().unwrap().as_str(), RUN);
+    assert_eq!(closed.run_seq, Some(MAX_RUN_STREAM_WINDOW_EVENTS as u64));
+    assert_eq!(
+        closed.body,
+        json!({"code": "invalid_cursor", "resumable": true})
+    );
+
+    client
+        .write_all(&request(
+            68,
+            Operation::RunCursorAck,
+            json!({
+                "subscription_id": subscriptions[1],
+                "through_run_seq": MAX_RUN_STREAM_WINDOW_EVENTS,
+            }),
+        ))
+        .unwrap();
+    let response: Response = read_frame(&mut client);
+    assert_eq!(response.request_id.as_str(), format!("{:032x}", 68));
+    let Envelope::Event(resumed) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected resumed event")
+    };
+    assert_eq!(resumed.subscription_id.as_str(), subscriptions[1]);
+    assert_eq!(
+        resumed.run_seq,
+        Some(MAX_RUN_STREAM_WINDOW_EVENTS as u64 + 1)
+    );
+    let Envelope::Event(caught_up) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected caught-up event")
+    };
+    assert_eq!(caught_up.event, EventName::SubscriptionCaughtUp);
+    assert_eq!(caught_up.subscription_id.as_str(), subscriptions[1]);
+
+    client
+        .write_all(&request(
+            70,
+            Operation::RunCursorAck,
+            json!({
+                "subscription_id": subscriptions[2],
+                "through_run_seq": MAX_RUN_STREAM_WINDOW_EVENTS - 1,
+            }),
+        ))
+        .unwrap();
+    let _: Response = read_frame(&mut client);
+    let Envelope::Event(resumed) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected resumed event")
+    };
+    assert_eq!(resumed.subscription_id.as_str(), subscriptions[2]);
+    assert_eq!(
+        resumed.run_seq,
+        Some(MAX_RUN_STREAM_WINDOW_EVENTS as u64 + 1)
+    );
+    let Envelope::Event(caught_up) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected caught-up event")
+    };
+    assert_eq!(caught_up.subscription_id.as_str(), subscriptions[2]);
+
+    client
+        .write_all(&request(
+            71,
+            Operation::RunCursorAck,
+            json!({
+                "subscription_id": subscriptions[2],
+                "through_run_seq": MAX_RUN_STREAM_WINDOW_EVENTS - 2,
+            }),
+        ))
+        .unwrap();
+    assert_redacted_request_error(&read_frame(&mut client), 71, ErrorCode::InvalidCursor);
+    let Envelope::Event(closed) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected stream close")
+    };
+    assert_eq!(closed.event, EventName::StreamClosed);
+    assert_eq!(closed.subscription_id.as_str(), subscriptions[2]);
+    assert_eq!(closed.body["code"], "invalid_cursor");
+
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(server_thread.join().unwrap(), Ok(()));
+}
+
+#[test]
+fn run_cursor_ack_subscription_ids_are_isolated_between_connections() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000021";
+    let page = RunStreamPage {
+        run_id: RUN.into(),
+        first_available_run_seq: 1,
+        current_run_seq: MAX_RUN_STREAM_WINDOW_EVENTS as u64 + 1,
+        events: (1..=(MAX_RUN_STREAM_WINDOW_EVENTS as u64 + 1))
+            .map(|seq| stream_projection(RUN, seq, "safe.event".into()))
+            .collect(),
+        exhausted: true,
+    };
+    let mut clients = Vec::new();
+    let mut threads = Vec::new();
+    for _ in 0..2 {
+        let mut service = StreamService { page: page.clone() };
+        let (mut client, server) = UnixStream::pair().unwrap();
+        threads.push(thread::spawn(move || {
+            run_authenticated_session_with_authorization(
+                server,
+                credentials(),
+                "0.1.0",
+                Duration::from_secs(2),
+                AuthorizationSessionDependencies {
+                    fill_random: |bytes: &mut [u8]| {
+                        bytes.fill(9);
+                        Ok(())
+                    },
+                    clock: TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                    tokens: TestTokens(1),
+                    approvals: |_: &muniment_core::attach::PairingChallenge, _: Duration| {
+                        Some(ApprovalDecision::Approve(approval()))
+                    },
+                },
+                &mut service,
+            )
+        }));
+        client.write_all(&hello(1, 1)).unwrap();
+        let _: Welcome = read_frame(&mut client);
+        let _: Authorized = read_frame(&mut client);
+        clients.push(client);
+    }
+
+    clients[0]
+        .write_all(&request(
+            72,
+            Operation::RunStream,
+            json!({"run_id": RUN, "after_run_seq": 0}),
+        ))
+        .unwrap();
+    let response: Response = read_frame(&mut clients[0]);
+    let foreign_subscription = response.body["subscription_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for _ in 0..MAX_RUN_STREAM_WINDOW_EVENTS {
+        let _: Envelope = read_frame(&mut clients[0]);
+    }
+
+    clients[1]
+        .write_all(&request(
+            73,
+            Operation::RunCursorAck,
+            json!({
+                "subscription_id": foreign_subscription,
+                "through_run_seq": MAX_RUN_STREAM_WINDOW_EVENTS,
+            }),
+        ))
+        .unwrap();
+    assert_redacted_request_error(&read_frame(&mut clients[1]), 73, ErrorCode::InvalidCursor);
+
+    clients[0]
+        .write_all(&request(
+            74,
+            Operation::RunCursorAck,
+            json!({
+                "subscription_id": foreign_subscription,
+                "through_run_seq": MAX_RUN_STREAM_WINDOW_EVENTS,
+            }),
+        ))
+        .unwrap();
+    let _: Response = read_frame(&mut clients[0]);
+    let Envelope::Event(resumed) = read_frame::<Envelope>(&mut clients[0]) else {
+        panic!("expected owner connection to resume")
+    };
+    assert_eq!(
+        resumed.run_seq,
+        Some(MAX_RUN_STREAM_WINDOW_EVENTS as u64 + 1)
+    );
+    assert_eq!(resumed.subscription_id.as_str(), foreign_subscription);
+    let Envelope::Event(caught_up) = read_frame::<Envelope>(&mut clients[0]) else {
+        panic!("expected owner connection caught-up event")
+    };
+    assert_eq!(caught_up.event, EventName::SubscriptionCaughtUp);
+    assert_eq!(caught_up.subscription_id.as_str(), foreign_subscription);
+
+    for client in &mut clients {
+        client.shutdown(Shutdown::Write).unwrap();
+    }
+    for server_thread in threads {
+        assert_eq!(server_thread.join().unwrap(), Ok(()));
+    }
+}
+
+#[test]
+fn real_journal_run_stream_fetches_next_page_after_window_ack() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000018";
+    let events = (1..=(MAX_RUN_STREAM_WINDOW_EVENTS as u64 + 1))
+        .map(|seq| {
+            let mut event = prompt(RUN, "private", "2026-07-16T03:00:00Z");
+            event.event_id = format!("0190a200-0000-7000-8001-{seq:012x}");
+            event.run_seq = seq;
+            event
+        })
+        .collect::<Vec<_>>();
+    let mut journal = RunJournal::open(":memory:").unwrap();
+    journal.append_batch(0, &events).unwrap();
+    journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let server_thread = thread::spawn(move || {
+        run_authenticated_session_with_authorization(
+            server,
+            credentials(),
+            "0.1.0",
+            Duration::from_secs(2),
+            AuthorizationSessionDependencies {
+                fill_random: |bytes: &mut [u8]| {
+                    bytes.fill(9);
+                    Ok(())
+                },
+                clock: TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                tokens: TestTokens(1),
+                approvals: |_: &muniment_core::attach::PairingChallenge, _: Duration| {
+                    Some(ApprovalDecision::Approve(approval()))
+                },
+            },
+            &mut journal,
+        )
+    });
+    client.write_all(&hello(1, 1)).unwrap();
+    let _: Welcome = read_frame(&mut client);
+    let _: Authorized = read_frame(&mut client);
+    client
+        .write_all(&request(
+            50,
+            Operation::RunStream,
+            json!({"run_id": RUN, "after_run_seq": 0}),
+        ))
+        .unwrap();
+    let response: Response = read_frame(&mut client);
+    let subscription = response.body["subscription_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for expected in 1..=MAX_RUN_STREAM_WINDOW_EVENTS as u64 {
+        let Envelope::Event(event) = read_frame::<Envelope>(&mut client) else {
+            panic!("expected first-page event")
+        };
+        assert_eq!(event.run_seq, Some(expected));
+    }
+    client
+        .write_all(&request(
+            51,
+            Operation::RunCursorAck,
+            json!({"subscription_id": subscription, "through_run_seq": MAX_RUN_STREAM_WINDOW_EVENTS}),
+        ))
+        .unwrap();
+    let _: Response = read_frame(&mut client);
+    let Envelope::Event(event) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected second-page event")
+    };
+    assert_eq!(event.run_seq, Some(MAX_RUN_STREAM_WINDOW_EVENTS as u64 + 1));
+    let Envelope::Event(caught_up) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected caught-up event")
+    };
+    assert_eq!(caught_up.event, EventName::SubscriptionCaughtUp);
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(server_thread.join().unwrap(), Ok(()));
 }
 
 #[test]
@@ -1125,7 +1554,6 @@ fn run_stream_byte_window_counts_exact_framed_bytes_and_pauses_one_byte_over() {
             json!({"run_id": RUN, "after_run_seq": 0}),
         ))
         .unwrap();
-    client.shutdown(Shutdown::Write).unwrap();
     let response: Response = read_frame(&mut client);
     assert_eq!(
         response.body["window"]["max_bytes"],
@@ -1133,11 +1561,9 @@ fn run_stream_byte_window_counts_exact_framed_bytes_and_pauses_one_byte_over() {
     );
     let mut event_bytes = 0;
     let mut sequences = Vec::new();
-    loop {
+    for _ in 0..targets.len() {
         let mut prefix = [0; 4];
-        if client.read_exact(&mut prefix).is_err() {
-            break;
-        }
+        client.read_exact(&mut prefix).unwrap();
         let mut frame = vec![0; 4 + u32::from_be_bytes(prefix) as usize];
         frame[..4].copy_from_slice(&prefix);
         client.read_exact(&mut frame[4..]).unwrap();
@@ -1148,10 +1574,27 @@ fn run_stream_byte_window_counts_exact_framed_bytes_and_pauses_one_byte_over() {
         assert_eq!(event.event, EventName::RunEvent);
         sequences.push(event.run_seq.unwrap());
     }
-    assert_eq!(server_thread.join().unwrap(), Ok(()));
     assert_eq!(sequences.len(), targets.len());
     assert_eq!(sequences.last(), Some(&(targets.len() as u64)));
     assert_eq!(event_bytes, MAX_RUN_STREAM_WINDOW_BYTES);
+    client
+        .write_all(&request(
+            49,
+            Operation::RunCursorAck,
+            json!({"subscription_id": response.body["subscription_id"], "through_run_seq": targets.len()}),
+        ))
+        .unwrap();
+    let _: Response = read_frame(&mut client);
+    let Envelope::Event(resumed) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected byte-window resumed event")
+    };
+    assert_eq!(resumed.run_seq, Some(over_seq));
+    let Envelope::Event(caught_up) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected caught-up event")
+    };
+    assert_eq!(caught_up.event, EventName::SubscriptionCaughtUp);
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(server_thread.join().unwrap(), Ok(()));
 }
 
 #[test]
