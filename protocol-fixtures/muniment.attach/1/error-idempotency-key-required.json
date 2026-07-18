@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"0000000000000000000000000000012f","ok":false,"error":{"code":"idempotency_key_required","message":"An idempotency key is required for this operation.","retryable":false}}

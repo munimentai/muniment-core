@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"00000000000000000000000000000069","operation":"run.cursor_ack","capability":"fixture-capability","body":{"subscription_id":"00000000000000000000000000000190","through_run_seq":7}}

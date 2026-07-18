@@ -1,1 +1,1 @@
-{"protocol":"muniment.attach/1","subscription_id":"00000000000000000000000000000002","event":"permission.pending","run_id":"00000000000000000000000000000003","run_seq":8,"body":{"permission_id":"permission-fixture","summary":"Allow reading the selected file?"}}
+{"protocol":"muniment.attach/1","subscription_id":"00000000000000000000000000000190","event":"permission.pending","run_id":"00000000000000000000000000000191","run_seq":3,"body":{"gate_id":"permission-1","kind":"confirm","message":"Update src/main.rs","title":"Allow file update?"}}

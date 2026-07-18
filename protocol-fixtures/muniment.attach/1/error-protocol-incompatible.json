@@ -1,1 +1,1 @@
-{"protocol":"muniment.attach/1","ok":false,"error":{"code":"protocol_incompatible","message":"The companion and desktop protocol versions are incompatible.","retryable":false,"action":"upgrade_companion","details":{"supported":{"min":1,"max":1}}}}
+{"protocol":"muniment.attach/1","request_id":"0000000000000000000000000000012c","ok":false,"error":{"code":"protocol_incompatible","message":"The companion and desktop protocol versions are incompatible.","retryable":false,"action":"upgrade_companion","details":{"supported":{"min":1,"max":1}}}}

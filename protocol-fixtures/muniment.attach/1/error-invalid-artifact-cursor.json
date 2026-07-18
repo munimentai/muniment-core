@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"00000000000000000000000000000134","ok":false,"error":{"code":"invalid_artifact_cursor","message":"The artifact transfer cursor is invalid.","retryable":false}}

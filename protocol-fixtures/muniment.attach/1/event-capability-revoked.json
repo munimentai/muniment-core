@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","subscription_id":"00000000000000000000000000000190","event":"capability.revoked","run_id":"00000000000000000000000000000191","run_seq":7,"body":{"capability":"fixture-capability","reason":"authorization_revoked"}}

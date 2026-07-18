@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"0000000000000000000000000000012e","ok":false,"error":{"code":"malformed_frame","message":"The frame is malformed.","retryable":false}}

@@ -57,6 +57,9 @@ pub fn export(root: &Path, mode: Mode) -> io::Result<()> {
     let expected = fixture_bytes()?;
     let target = root.join(FIXTURE_DIRECTORY);
     if mode == Mode::Check {
+        if !target.exists() {
+            return check(&target, &expected);
+        }
         let generation = open_generation(&target)?;
         return check(generation.path(), &expected);
     }
@@ -431,10 +434,7 @@ mod windows_tests {
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios", windows)))]
 compile_error!("atomic fixture publication is not implemented for this platform");
 
-fn fixture_bytes() -> io::Result<BTreeMap<&'static str, Vec<u8>>> {
-    let request_id = id(1)?;
-    let subscription_id = id(2)?;
-    let run_id = id(3)?;
+fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
     let mut fixtures = BTreeMap::new();
     insert(
         &mut fixtures,
@@ -442,7 +442,7 @@ fn fixture_bytes() -> io::Result<BTreeMap<&'static str, Vec<u8>>> {
         &Hello {
             protocol: Protocol,
             client: Client {
-                kind: "editor_extension".into(),
+                kind: "editor-extension".into(),
                 version: "0.0.1".into(),
             },
             supported: VersionRange { min: 1, max: 1 },
@@ -457,83 +457,263 @@ fn fixture_bytes() -> io::Result<BTreeMap<&'static str, Vec<u8>>> {
             desktop_version: "0.0.1".into(),
             server_nonce: "fixture-server-nonce".into(),
             authorization: Authorization::PairingRequired,
-            approval_challenge: "fixture-approval-challenge".into(),
+            approval_challenge: "fixture-challenge".into(),
         },
     )?;
     insert(
         &mut fixtures,
-        "request-run-start.json",
-        &Request {
-            protocol: Protocol,
-            request_id: request_id.clone(),
-            operation: Operation::RunStart,
-            capability: "fixture-capability".into(),
-            idempotency_key: Some(id(4)?),
-            body: json!({"prompt":"Summarize the selected file.","workspace_id":"workspace-fixture"}),
-        },
+        "authorization-authorized.json",
+        &crate::authorized(
+            "fixture-capability",
+            3600,
+            900,
+            [("workspace-1".into(), BTreeSet::from(["thread.read".into()]))]
+                .into_iter()
+                .collect(),
+        ),
     )?;
+
+    let operations = [
+        ("thread-list", Operation::ThreadList),
+        ("thread-open", Operation::ThreadOpen),
+        ("run-open", Operation::RunOpen),
+        ("run-start", Operation::RunStart),
+        ("run-stream", Operation::RunStream),
+        ("run-cursor-ack", Operation::RunCursorAck),
+        ("run-steer", Operation::RunSteer),
+        ("run-follow-up", Operation::RunFollowUp),
+        ("run-cancel", Operation::RunCancel),
+        ("permission-answer", Operation::PermissionAnswer),
+        ("artifact-fetch", Operation::ArtifactFetch),
+        ("artifact-window", Operation::ArtifactWindow),
+        ("request-cancel", Operation::RequestCancel),
+    ];
+    for (index, (name, operation)) in operations.into_iter().enumerate() {
+        insert(
+            &mut fixtures,
+            &format!("request-{name}.json"),
+            &Request {
+                protocol: Protocol,
+                request_id: id(100 + index as u128)?,
+                operation,
+                capability: "fixture-capability".into(),
+                idempotency_key: operation
+                    .requires_idempotency_key()
+                    .then(|| id(200 + index as u128))
+                    .transpose()?,
+                body: request_body(operation),
+            },
+        )?;
+    }
     insert(
         &mut fixtures,
         "response-run-start.json",
         &Response {
             protocol: Protocol,
-            request_id: request_id.clone(),
+            request_id: id(103)?,
             ok: Success,
-            body: json!({"accepted":true,"run_id":run_id.as_str()}),
+            body: json!({
+                "run_id": "00000000000000000000000000000191",
+                "committed_seq": 1,
+                "accepted_at": "2026-07-17T00:00:00Z"
+            }),
         },
     )?;
-    insert(
-        &mut fixtures,
-        "event-run-stream.json",
-        &Event {
-            protocol: Protocol,
-            subscription_id: subscription_id.clone(),
-            event: EventName::RunEvent,
-            run_id: Some(run_id.clone()),
-            run_seq: Some(7),
-            body: json!({"kind":"assistant_message","text":"Fixture response."}),
-        },
-    )?;
-    insert(
-        &mut fixtures,
-        "event-permission-pending.json",
-        &Event {
-            protocol: Protocol,
-            subscription_id,
-            event: EventName::PermissionPending,
-            run_id: Some(run_id),
-            run_seq: Some(8),
-            body: json!({"permission_id":"permission-fixture","summary":"Allow reading the selected file?"}),
-        },
-    )?;
-    insert(
-        &mut fixtures,
-        "error-protocol-incompatible.json",
-        &ErrorEnvelope {
-            protocol: Protocol,
-            request_id: None,
-            ok: Failure,
-            error: ProtocolError::protocol_incompatible(
-                VersionRange { min: 1, max: 1 },
-                crate::ErrorAction::UpgradeCompanion,
-            ),
-        },
-    )?;
+
+    let errors = [
+        crate::ErrorCode::ProtocolIncompatible,
+        crate::ErrorCode::PayloadTooLarge,
+        crate::ErrorCode::MalformedFrame,
+        crate::ErrorCode::IdempotencyKeyRequired,
+        crate::ErrorCode::IdempotencyKeyForbidden,
+        crate::ErrorCode::IdempotencyConflict,
+        crate::ErrorCode::PersistenceFailed,
+        crate::ErrorCode::InvalidCursor,
+        crate::ErrorCode::InvalidArtifactCursor,
+        crate::ErrorCode::InvalidRequest,
+        crate::ErrorCode::Unauthorized,
+        crate::ErrorCode::UnsupportedOperation,
+    ];
+    for (index, code) in errors.into_iter().enumerate() {
+        let (name, error) = error_fixture(code);
+        insert(
+            &mut fixtures,
+            &format!("error-{name}.json"),
+            &ErrorEnvelope {
+                protocol: Protocol,
+                request_id: Some(id(300 + index as u128)?),
+                ok: Failure,
+                error,
+            },
+        )?;
+    }
+
+    let events = [
+        ("run-stream", EventName::RunEvent),
+        ("subscription-caught-up", EventName::SubscriptionCaughtUp),
+        ("permission-pending", EventName::PermissionPending),
+        ("artifact-chunk", EventName::ArtifactChunk),
+        ("artifact-complete", EventName::ArtifactComplete),
+        ("request-cancelled", EventName::RequestCancelled),
+        ("capability-revoked", EventName::CapabilityRevoked),
+        ("stream-closed", EventName::StreamClosed),
+        (
+            "unknown",
+            serde_json::from_value(json!("future.optional")).map_err(io::Error::other)?,
+        ),
+    ];
+    for (index, (name, event)) in events.into_iter().enumerate() {
+        let body = event_body(&event);
+        let artifact_event = matches!(
+            event,
+            EventName::ArtifactChunk | EventName::ArtifactComplete
+        );
+        insert(
+            &mut fixtures,
+            &format!("event-{name}.json"),
+            &Event {
+                protocol: Protocol,
+                subscription_id: id(400)?,
+                event,
+                run_id: (!artifact_event).then(|| id(401)).transpose()?,
+                run_seq: (!artifact_event).then_some(index as u64 + 1),
+                body,
+            },
+        )?;
+    }
     Ok(fixtures)
 }
 
+// These exhaustive matches deliberately make additions to the public wire enums
+// fail to compile until their canonical fixture is defined.
+fn request_body(operation: Operation) -> serde_json::Value {
+    match operation {
+        Operation::ThreadList => json!({"cursor": "thread-cursor-1", "limit": 50}),
+        Operation::ThreadOpen => {
+            json!({"thread_id": "thread-1", "cursor": "message-cursor-1", "limit": 100})
+        }
+        Operation::RunOpen => json!({"run_id": "00000000000000000000000000000191"}),
+        Operation::RunStart => {
+            json!({"text": "Summarize the selected file.", "context": {"selected_file": "src/main.rs"}})
+        }
+        Operation::RunStream => {
+            json!({"run_id": "00000000000000000000000000000191", "after_run_seq": 7})
+        }
+        Operation::RunCursorAck => {
+            json!({"subscription_id": "00000000000000000000000000000190", "through_run_seq": 7})
+        }
+        Operation::RunSteer => {
+            json!({"run_id": "00000000000000000000000000000191", "text": "Focus on error handling."})
+        }
+        Operation::RunFollowUp => {
+            json!({"run_id": "00000000000000000000000000000191", "text": "Now suggest tests."})
+        }
+        Operation::RunCancel => json!({"run_id": "00000000000000000000000000000191"}),
+        Operation::PermissionAnswer => {
+            json!({"run_id": "00000000000000000000000000000191", "gate_id": "permission-1", "decision": "allow"})
+        }
+        Operation::ArtifactFetch => {
+            json!({"artifact_id": "00000000000000000000000000000192"})
+        }
+        Operation::ArtifactWindow => {
+            json!({"transfer_id": "00000000000000000000000000000190", "ack_through_chunk": -1, "max_chunks": 1})
+        }
+        Operation::RequestCancel => {
+            json!({"kind": "request", "request_id": "00000000000000000000000000000064"})
+        }
+    }
+}
+
+fn error_fixture(code: crate::ErrorCode) -> (&'static str, ProtocolError) {
+    use crate::ErrorCode::*;
+    match code {
+        ProtocolIncompatible => (
+            "protocol-incompatible",
+            ProtocolError::protocol_incompatible(
+                VersionRange { min: 1, max: 1 },
+                crate::ErrorAction::UpgradeCompanion,
+            ),
+        ),
+        PayloadTooLarge => ("payload-too-large", ProtocolError::payload_too_large()),
+        MalformedFrame => ("malformed-frame", ProtocolError::malformed_frame()),
+        IdempotencyKeyRequired => (
+            "idempotency-key-required",
+            ProtocolError::idempotency_key_required(),
+        ),
+        IdempotencyKeyForbidden => (
+            "idempotency-key-forbidden",
+            ProtocolError::idempotency_key_forbidden(),
+        ),
+        IdempotencyConflict => (
+            "idempotency-conflict",
+            ProtocolError::idempotency_conflict(),
+        ),
+        PersistenceFailed => ("persistence-failed", ProtocolError::persistence_failed()),
+        InvalidCursor => ("invalid-cursor", ProtocolError::invalid_cursor()),
+        InvalidArtifactCursor => (
+            "invalid-artifact-cursor",
+            ProtocolError::invalid_artifact_cursor(),
+        ),
+        InvalidRequest => ("invalid-request", ProtocolError::invalid_request()),
+        Unauthorized => ("unauthorized", ProtocolError::unauthorized()),
+        UnsupportedOperation => (
+            "unsupported-operation",
+            ProtocolError::unsupported_operation(),
+        ),
+    }
+}
+
+fn event_body(event: &EventName) -> serde_json::Value {
+    match event {
+        EventName::RunEvent => json!({
+            "event_type": "assistant.message",
+            "event_version": 1,
+            "recorded_at": "2026-07-17T00:00:00Z",
+            "payload": {"withheld": true}
+        }),
+        EventName::SubscriptionCaughtUp => json!({"through_run_seq": 7}),
+        EventName::PermissionPending => {
+            json!({"gate_id": "permission-1", "kind": "confirm", "title": "Allow file update?", "message": "Update src/main.rs"})
+        }
+        EventName::ArtifactChunk => {
+            json!({
+                "artifact_id": "00000000000000000000000000000192",
+                "chunk_index": 0,
+                "offset": 0,
+                "byte_length": 7,
+                "chunk_sha256": "f16d05ec6b29248d2c61adb1e9263f78e4f7bace1b955014a2d17872cfe4064d",
+                "data": "Zml4dHVyZQ=="
+            })
+        }
+        EventName::ArtifactComplete => {
+            json!({
+                "transfer_id": "00000000000000000000000000000190",
+                "artifact_id": "00000000000000000000000000000192",
+                "total_bytes": 7,
+                "sha256": "f16d05ec6b29248d2c61adb1e9263f78e4f7bace1b955014a2d17872cfe4064d"
+            })
+        }
+        EventName::RequestCancelled => json!({"request_id": "00000000000000000000000000000064"}),
+        EventName::CapabilityRevoked => {
+            json!({"capability": "fixture-capability", "reason": "authorization_revoked"})
+        }
+        EventName::StreamClosed => json!({"code": "cancelled", "resumable": true}),
+        EventName::Unknown(name) => json!({"name": name.as_str(), "optional": true}),
+    }
+}
+
 fn insert<T: Serialize>(
-    fixtures: &mut BTreeMap<&'static str, Vec<u8>>,
-    name: &'static str,
+    fixtures: &mut BTreeMap<String, Vec<u8>>,
+    name: &str,
     value: &T,
 ) -> io::Result<()> {
     let mut bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
     bytes.push(b'\n');
-    fixtures.insert(name, bytes);
+    fixtures.insert(name.into(), bytes);
     Ok(())
 }
 
-fn check(target: &Path, expected: &BTreeMap<&str, Vec<u8>>) -> io::Result<()> {
+fn check(target: &Path, expected: &BTreeMap<String, Vec<u8>>) -> io::Result<()> {
     let actual_names: BTreeSet<String> = match fs::read_dir(target) {
         Ok(entries) => entries
             .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
@@ -541,18 +721,28 @@ fn check(target: &Path, expected: &BTreeMap<&str, Vec<u8>>) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => BTreeSet::new(),
         Err(error) => return Err(error),
     };
-    let expected_names: BTreeSet<String> = expected.keys().map(|name| (*name).into()).collect();
-    if actual_names != expected_names {
-        return Err(io::Error::other(format!(
-            "fixture file set is stale (expected {expected_names:?}, found {actual_names:?})"
-        )));
+    let expected_names: BTreeSet<String> = expected.keys().cloned().collect();
+    let mut drift = Vec::new();
+    for name in expected_names.difference(&actual_names) {
+        drift.push(format!("missing: {}", target.join(name).display()));
+    }
+    for name in actual_names.difference(&expected_names) {
+        drift.push(format!("extra: {}", target.join(name).display()));
     }
     for (name, bytes) in expected {
-        if fs::read(target.join(name))? != *bytes {
-            return Err(io::Error::other(format!("fixture is byte-stale: {name}")));
+        let path = target.join(name);
+        if path.exists() && fs::read(&path)? != *bytes {
+            drift.push(format!("stale: {}", path.display()));
         }
     }
-    Ok(())
+    if drift.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "attach fixture drift detected:\n{}\nregenerate with: cargo run -p muniment-attach --bin export-attach-fixtures -- ../protocol-fixtures",
+            drift.join("\n")
+        )))
+    }
 }
 
 fn id(value: u128) -> io::Result<Id> {
@@ -568,5 +758,73 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_inventory_covers_every_public_wire_variant() {
+        let fixtures = fixture_bytes().unwrap();
+        let operations = [
+            Operation::ThreadList,
+            Operation::ThreadOpen,
+            Operation::RunOpen,
+            Operation::RunStart,
+            Operation::RunStream,
+            Operation::RunCursorAck,
+            Operation::RunSteer,
+            Operation::RunFollowUp,
+            Operation::RunCancel,
+            Operation::PermissionAnswer,
+            Operation::ArtifactFetch,
+            Operation::ArtifactWindow,
+            Operation::RequestCancel,
+        ];
+        for operation in operations {
+            let name = operation.as_str().replace(['.', '_'], "-");
+            assert!(fixtures.contains_key(&format!("request-{name}.json")));
+            let _ = request_body(operation);
+        }
+
+        let error_codes = [
+            crate::ErrorCode::ProtocolIncompatible,
+            crate::ErrorCode::PayloadTooLarge,
+            crate::ErrorCode::MalformedFrame,
+            crate::ErrorCode::IdempotencyKeyRequired,
+            crate::ErrorCode::IdempotencyKeyForbidden,
+            crate::ErrorCode::IdempotencyConflict,
+            crate::ErrorCode::PersistenceFailed,
+            crate::ErrorCode::InvalidCursor,
+            crate::ErrorCode::InvalidArtifactCursor,
+            crate::ErrorCode::InvalidRequest,
+            crate::ErrorCode::Unauthorized,
+            crate::ErrorCode::UnsupportedOperation,
+        ];
+        for code in error_codes {
+            let (name, _) = error_fixture(code);
+            assert!(fixtures.contains_key(&format!("error-{name}.json")));
+        }
+
+        for name in [
+            "event-run-stream.json",
+            "event-subscription-caught-up.json",
+            "event-permission-pending.json",
+            "event-artifact-chunk.json",
+            "event-artifact-complete.json",
+            "event-request-cancelled.json",
+            "event-capability-revoked.json",
+            "event-stream-closed.json",
+            "event-unknown.json",
+        ] {
+            assert!(fixtures.contains_key(name));
+        }
+        assert_eq!(
+            fixtures.len(),
+            38,
+            "every canonical fixture must be inventoried"
+        );
     }
 }

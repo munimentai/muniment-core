@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"00000000000000000000000000000136","ok":false,"error":{"code":"unauthorized","message":"The capability is not authorized.","retryable":false}}

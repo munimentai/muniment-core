@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"0000000000000000000000000000006b","operation":"run.follow_up","capability":"fixture-capability","idempotency_key":"000000000000000000000000000000cf","body":{"run_id":"00000000000000000000000000000191","text":"Now suggest tests."}}

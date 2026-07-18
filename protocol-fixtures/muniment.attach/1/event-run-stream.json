@@ -1,1 +1,1 @@
-{"protocol":"muniment.attach/1","subscription_id":"00000000000000000000000000000002","event":"run.event","run_id":"00000000000000000000000000000003","run_seq":7,"body":{"kind":"assistant_message","text":"Fixture response."}}
+{"protocol":"muniment.attach/1","subscription_id":"00000000000000000000000000000190","event":"run.event","run_id":"00000000000000000000000000000191","run_seq":1,"body":{"event_type":"assistant.message","event_version":1,"payload":{"withheld":true},"recorded_at":"2026-07-17T00:00:00Z"}}

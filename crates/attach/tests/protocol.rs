@@ -1,5 +1,242 @@
 use muniment_attach::*;
 use serde_json::{json, Value};
+use std::{
+    fs,
+    path::PathBuf,
+    process::{Command, Output},
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn fixture_temp_dir() -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "muniment-attach-fixtures-{}-{}",
+        std::process::id(),
+        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&path).unwrap();
+    path
+}
+
+fn exporter(root: &PathBuf, check: bool) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_export-attach-fixtures"));
+    command.arg(root);
+    if check {
+        command.arg("--check");
+    }
+    command.output().unwrap()
+}
+
+fn generated_fixture_dir() -> PathBuf {
+    let root = fixture_temp_dir();
+    let output = exporter(&root, false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    root
+}
+
+fn assert_check_failure(root: &PathBuf, classification: &str, filename: &str) {
+    let output = exporter(root, true);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains(classification), "{stderr}");
+    assert!(stderr.contains(filename), "{stderr}");
+}
+
+#[test]
+fn fixture_exporter_check_accepts_a_clean_corpus() {
+    let root = generated_fixture_dir();
+    assert!(exporter(&root, true).status.success());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn fixture_exporter_check_reports_missing_without_writing() {
+    let root = generated_fixture_dir();
+    let fixture = root.join("muniment.attach/1/request-thread-list.json");
+    fs::remove_file(&fixture).unwrap();
+    assert_check_failure(&root, "missing:", "request-thread-list.json");
+    assert!(!fixture.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn fixture_exporter_check_reports_extra_without_writing() {
+    let root = generated_fixture_dir();
+    let fixture = root.join("muniment.attach/1/extra.json");
+    fs::write(&fixture, b"{}\n").unwrap();
+    assert_check_failure(&root, "extra:", "extra.json");
+    assert_eq!(fs::read(&fixture).unwrap(), b"{}\n");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn fixture_exporter_check_reports_stale_without_writing() {
+    let root = generated_fixture_dir();
+    let fixture = root.join("muniment.attach/1/response-run-start.json");
+    fs::write(&fixture, b"{}\n").unwrap();
+    assert_check_failure(&root, "stale:", "response-run-start.json");
+    assert_eq!(fs::read(&fixture).unwrap(), b"{}\n");
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn canonical_fixture(name: &str) -> Value {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../protocol-fixtures/muniment.attach/1")
+        .join(name);
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+#[test]
+fn canonical_run_start_fixtures_match_client_contracts() {
+    let request: Envelope =
+        serde_json::from_value(canonical_fixture("request-run-start.json")).unwrap();
+    let Envelope::Request(request) = request else {
+        panic!("expected request fixture");
+    };
+    assert_eq!(request.operation, Operation::RunStart);
+    assert_eq!(
+        request.body,
+        json!({
+            "text": "Summarize the selected file.",
+            "context": {"selected_file": "src/main.rs"}
+        })
+    );
+
+    let response: Envelope =
+        serde_json::from_value(canonical_fixture("response-run-start.json")).unwrap();
+    let Envelope::Response(response) = response else {
+        panic!("expected response fixture");
+    };
+    assert_eq!(response.request_id, request.request_id);
+    #[cfg(feature = "client")]
+    {
+        let accepted: RunStartAccepted = serde_json::from_value(response.body).unwrap();
+        assert_eq!(accepted.committed_seq, 1);
+    }
+    #[cfg(not(feature = "client"))]
+    assert_eq!(response.body["committed_seq"], 1);
+}
+
+#[test]
+fn canonical_cursor_ack_and_permission_fixtures_match_client_contracts() {
+    let request: Envelope =
+        serde_json::from_value(canonical_fixture("request-run-cursor-ack.json")).unwrap();
+    let Envelope::Request(request) = request else {
+        panic!("expected request fixture");
+    };
+    assert_eq!(request.operation, Operation::RunCursorAck);
+    assert_eq!(
+        request.body,
+        json!({
+            "subscription_id": "00000000000000000000000000000190",
+            "through_run_seq": 7
+        })
+    );
+
+    let event: Envelope =
+        serde_json::from_value(canonical_fixture("event-permission-pending.json")).unwrap();
+    let Envelope::Event(event) = event else {
+        panic!("expected event fixture");
+    };
+    assert_eq!(event.event, EventName::PermissionPending);
+    #[cfg(feature = "client")]
+    {
+        let permission: PendingPermission = serde_json::from_value(event.body).unwrap();
+        assert_eq!(permission.kind, PermissionKind::Confirm);
+    }
+    #[cfg(not(feature = "client"))]
+    assert_eq!(event.body["kind"], "confirm");
+}
+
+#[test]
+fn canonical_command_and_artifact_fixtures_match_the_pinned_contract() {
+    for (name, operation, text) in [
+        (
+            "request-run-steer.json",
+            Operation::RunSteer,
+            "Focus on error handling.",
+        ),
+        (
+            "request-run-follow-up.json",
+            Operation::RunFollowUp,
+            "Now suggest tests.",
+        ),
+    ] {
+        let Envelope::Request(request) = serde_json::from_value(canonical_fixture(name)).unwrap()
+        else {
+            panic!("expected request fixture");
+        };
+        assert_eq!(request.operation, operation);
+        assert_eq!(request.body["text"], text);
+        assert!(request.body.get("prompt").is_none());
+        Id::new(request.body["run_id"].as_str().unwrap().to_owned()).unwrap();
+    }
+
+    let transfer_id = "00000000000000000000000000000190";
+    let artifact_id = "00000000000000000000000000000192";
+    let sha256 = "f16d05ec6b29248d2c61adb1e9263f78e4f7bace1b955014a2d17872cfe4064d";
+    Id::new(transfer_id.to_owned()).unwrap();
+    Id::new(artifact_id.to_owned()).unwrap();
+
+    let Envelope::Request(window) =
+        serde_json::from_value(canonical_fixture("request-artifact-window.json")).unwrap()
+    else {
+        panic!("expected artifact window request");
+    };
+    assert_eq!(window.operation, Operation::ArtifactWindow);
+    assert_eq!(
+        window.body,
+        json!({"transfer_id": transfer_id, "ack_through_chunk": -1, "max_chunks": 1})
+    );
+
+    let Envelope::Event(chunk) =
+        serde_json::from_value(canonical_fixture("event-artifact-chunk.json")).unwrap()
+    else {
+        panic!("expected artifact chunk event");
+    };
+    assert_eq!(chunk.subscription_id.as_str(), transfer_id);
+    assert_eq!(chunk.run_id, None);
+    assert_eq!(chunk.run_seq, None);
+    assert_eq!(chunk.body["artifact_id"], artifact_id);
+    assert_eq!(chunk.body["chunk_index"], 0);
+    assert_eq!(chunk.body["offset"], 0);
+    assert_eq!(chunk.body["byte_length"], 7);
+    assert_eq!(chunk.body["chunk_sha256"], sha256);
+    assert_eq!(chunk.body["data"], "Zml4dHVyZQ==");
+
+    let Envelope::Event(complete) =
+        serde_json::from_value(canonical_fixture("event-artifact-complete.json")).unwrap()
+    else {
+        panic!("expected artifact complete event");
+    };
+    assert_eq!(complete.subscription_id.as_str(), transfer_id);
+    assert_eq!(complete.body["transfer_id"], transfer_id);
+    assert_eq!(complete.body["artifact_id"], artifact_id);
+    assert_eq!(complete.body["total_bytes"], 7);
+    assert_eq!(complete.body["sha256"], sha256);
+
+    let Envelope::Request(cancel) =
+        serde_json::from_value(canonical_fixture("request-request-cancel.json")).unwrap()
+    else {
+        panic!("expected cancellation request");
+    };
+    assert_eq!(cancel.operation, Operation::RequestCancel);
+    assert_eq!(cancel.body["kind"], "request");
+    Id::new(cancel.body["request_id"].as_str().unwrap().to_owned()).unwrap();
+
+    let Envelope::Event(closed) =
+        serde_json::from_value(canonical_fixture("event-stream-closed.json")).unwrap()
+    else {
+        panic!("expected stream close event");
+    };
+    assert_eq!(closed.event, EventName::StreamClosed);
+    assert_eq!(closed.body, json!({"code": "cancelled", "resumable": true}));
+}
 
 fn id(n: u128) -> Id {
     Id::new(format!("{n:032x}")).unwrap()

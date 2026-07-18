@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"00000000000000000000000000000133","ok":false,"error":{"code":"invalid_cursor","message":"The stream cursor is invalid.","retryable":false}}

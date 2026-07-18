@@ -292,6 +292,41 @@ fn run_stream_decodes_pending_permissions_and_counts_them_for_acknowledgement() 
 }
 
 #[test]
+fn canonical_run_event_fixture_passes_client_validation() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let fixture: Event = serde_json::from_str(include_str!(
+        "../../../protocol-fixtures/muniment.attach/1/event-run-stream.json"
+    ))
+    .unwrap();
+    let run_id = fixture.run_id.as_ref().unwrap().as_str().to_owned();
+    let subscription_id = fixture.subscription_id.as_str().to_owned();
+    let server_run_id = run_id.clone();
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        let request = read_client_value(&mut server);
+        server
+            .write_all(
+                &encode_frame(&Response {
+                    protocol: Protocol,
+                    request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+                    ok: Success,
+                    body: valid_run_stream_summary(&server_run_id, &subscription_id),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        server.write_all(&encode_frame(&fixture).unwrap()).unwrap();
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    client.subscribe_run(&run_id, 0).unwrap();
+    let RunStreamMessage::Event(event) = client.read_run_stream_message().unwrap() else {
+        panic!("expected run event fixture");
+    };
+    assert_eq!(event.event_type, "assistant.message");
+    worker.join().unwrap();
+}
+
+#[test]
 fn run_stream_reads_and_acknowledges_live_events_after_catch_up() {
     let (client, mut server) = UnixStream::pair().unwrap();
     let run_id = "01900000-0000-7000-8000-000000000001";
