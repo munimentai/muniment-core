@@ -11,6 +11,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use super::{
@@ -23,7 +24,9 @@ use super::{
 use super::{
     RunEventAdmission, RunStreamCursor, MAX_RUN_STREAM_WINDOW_BYTES, MAX_RUN_STREAM_WINDOW_EVENTS,
 };
-use crate::journal::{summaries::RunSummaryListError, RunEventPageError, RunJournal};
+use crate::journal::{
+    summaries::RunSummaryListError, JournalCommitHint, RunEventPageError, RunJournal,
+};
 
 const ATTACH_DIRECTORY: &[u8] = b"muniment\0";
 const ENDPOINT_NAME: &str = "attach-v1.sock";
@@ -465,6 +468,13 @@ pub trait ThreadListService {
     ) -> Result<RunStreamPage, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
+
+    fn subscribe_run_commits(
+        &mut self,
+        _run_id: &str,
+    ) -> Result<Option<(u64, Receiver<JournalCommitHint>)>, ProtocolError> {
+        Ok(None)
+    }
 }
 
 impl<F> ThreadListService for F
@@ -481,6 +491,18 @@ where
 }
 
 impl ThreadListService for RunJournal {
+    fn subscribe_run_commits(
+        &mut self,
+        run_id: &str,
+    ) -> Result<Option<(u64, Receiver<JournalCommitHint>)>, ProtocolError> {
+        if self.path.is_none() {
+            return Ok(None);
+        }
+        self.subscribe_commits(run_id)
+            .map(Some)
+            .map_err(|_| ProtocolError::persistence_failed())
+    }
+
     fn stream_run(
         &mut self,
         workspace: &str,
@@ -916,15 +938,43 @@ where
         let idle_deadline = Instant::now()
             .checked_add(idle_remaining)
             .ok_or(AttachSessionError::Timeout)?;
+        let live_events = if authorization_expired {
+            Vec::new()
+        } else {
+            match poll_run_streams(service, &mut subscriptions) {
+                Ok(events) => events,
+                Err(error) => {
+                    write_protocol_error(stream, error, Instant::now() + timeout);
+                    return Err(AttachSessionError::Closed);
+                }
+            }
+        };
+        for event in live_events {
+            let frame = encode_frame(&event).map_err(|_| AttachSessionError::MalformedFrame)?;
+            write_before(
+                stream,
+                &frame,
+                (Instant::now() + timeout).min(idle_deadline),
+            )?;
+        }
+        let poll_deadline = (Instant::now() + Duration::from_millis(50)).min(idle_deadline);
         let mut prefix = [0; 4];
-        match read_before(stream, &mut prefix, idle_deadline) {
+        match wait_until_readable(stream, poll_deadline) {
             Ok(()) => {}
             Err(AttachSessionError::Closed) => return Ok(()),
             Err(AttachSessionError::Timeout) => {
+                if Instant::now() < idle_deadline {
+                    continue;
+                }
                 let deadline = Instant::now() + timeout;
                 write_protocol_error(stream, ProtocolError::unauthorized(), deadline);
                 return Err(AttachSessionError::Authorization);
             }
+            Err(error) => return Err(error),
+        }
+        match read_before(stream, &mut prefix, idle_deadline) {
+            Ok(()) => {}
+            Err(AttachSessionError::Closed) => return Ok(()),
             Err(error) => return Err(error),
         }
         let deadline = Instant::now()
@@ -1022,6 +1072,35 @@ where
     }
 }
 
+fn wait_until_readable(stream: &UnixStream, deadline: Instant) -> Result<(), AttachSessionError> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(AttachSessionError::Timeout)?;
+    let millis = remaining.as_millis().clamp(1, libc::c_int::MAX as u128) as libc::c_int;
+    let mut descriptor = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let result = unsafe { libc::poll(&mut descriptor, 1, millis) };
+    if result == 0 {
+        return Err(AttachSessionError::Timeout);
+    }
+    if result < 0 {
+        return if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            Err(AttachSessionError::Timeout)
+        } else {
+            Err(AttachSessionError::Closed)
+        };
+    }
+    if descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+        && descriptor.revents & libc::POLLIN == 0
+    {
+        return Err(AttachSessionError::Closed);
+    }
+    Ok(())
+}
+
 struct DispatchResult {
     body: serde_json::Value,
     events: Vec<Event>,
@@ -1051,6 +1130,53 @@ struct ActiveRunStream {
     fetched_through_run_seq: u64,
     exhausted: bool,
     caught_up: bool,
+    commit_hints: Option<Receiver<JournalCommitHint>>,
+}
+
+fn poll_run_streams<S: ThreadListService>(
+    service: &mut S,
+    subscriptions: &mut [ActiveRunStream],
+) -> Result<Vec<Event>, ProtocolError> {
+    let mut events = Vec::new();
+    for stream in subscriptions {
+        let window = stream.cursor.window();
+        if !stream.caught_up
+            || !stream.pending.is_empty()
+            || stream.cursor.outstanding_events() == window.max_events
+            || stream.cursor.outstanding_bytes() == window.max_bytes
+        {
+            continue;
+        }
+        let mut wake = false;
+        if let Some(receiver) = stream.commit_hints.as_ref() {
+            loop {
+                match receiver.try_recv() {
+                    Ok(hint) => {
+                        if hint.run_id == stream.cursor.run_id().as_str() {
+                            wake = true;
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        stream.commit_hints = None;
+                        break;
+                    }
+                }
+            }
+        }
+        if !wake {
+            continue;
+        }
+        let page = service.stream_run(
+            &stream.workspace,
+            stream.cursor.run_id().as_str(),
+            stream.fetched_through_run_seq,
+        )?;
+        stream.snapshot_run_seq = page.current_run_seq;
+        append_run_stream_page(stream, page)?;
+        events.extend(drain_run_stream(stream)?);
+    }
+    Ok(events)
 }
 
 fn append_run_stream_page(
@@ -1275,7 +1401,13 @@ fn dispatch_request<S: ThreadListService>(
             serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
         let run_id =
             super::Id::new(body.run_id.clone()).map_err(|_| ProtocolError::invalid_request())?;
+        let subscription = service.subscribe_run_commits(run_id.as_str())?;
         let page = service.stream_run(workspace, run_id.as_str(), body.after_run_seq)?;
+        if let Some((high_water, _)) = subscription.as_ref() {
+            if page.current_run_seq < *high_water {
+                return Err(ProtocolError::persistence_failed().into());
+            }
+        }
         if page.run_id != run_id.as_str()
             || page.first_available_run_seq == 0
             || (page.first_available_run_seq > page.current_run_seq
@@ -1316,6 +1448,7 @@ fn dispatch_request<S: ThreadListService>(
             fetched_through_run_seq: body.after_run_seq,
             exhausted: false,
             caught_up: false,
+            commit_hints: subscription.map(|(_, receiver)| receiver),
         };
         append_run_stream_page(&mut active, page)?;
         let events = drain_run_stream(&mut active)?;

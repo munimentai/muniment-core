@@ -14,7 +14,7 @@ use muniment_core::attach::{
     MAX_FRAME_LENGTH, MAX_JSON_DEPTH, MAX_RUN_STREAM_WINDOW_BYTES, MAX_RUN_STREAM_WINDOW_EVENTS,
 };
 use muniment_core::journal::{
-    EventEnvelope, EventPayload, Provenance, RunEventProjection, RunJournal,
+    EventEnvelope, EventPayload, JournalCommitHint, Provenance, RunEventProjection, RunJournal,
 };
 use serde_json::json;
 use std::cell::Cell;
@@ -23,6 +23,11 @@ use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::rc::Rc;
+use std::sync::mpsc::Receiver;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -115,6 +120,115 @@ struct StartService {
 
 struct StreamService {
     page: RunStreamPage,
+}
+
+struct SubscribeRaceService {
+    journal: RunJournal,
+    racing_event: Option<EventEnvelope>,
+}
+
+struct CountingJournalService {
+    journal: RunJournal,
+    stream_calls: Arc<AtomicUsize>,
+}
+
+impl ThreadListService for CountingJournalService {
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, muniment_core::attach::ProtocolError> {
+        panic!("thread reads must not dispatch")
+    }
+
+    fn subscribe_run_commits(
+        &mut self,
+        run_id: &str,
+    ) -> Result<Option<(u64, Receiver<JournalCommitHint>)>, muniment_core::attach::ProtocolError>
+    {
+        self.journal
+            .subscribe_commits(run_id)
+            .map(Some)
+            .map_err(|_| muniment_core::attach::ProtocolError::persistence_failed())
+    }
+
+    fn stream_run(
+        &mut self,
+        workspace: &str,
+        run_id: &str,
+        after_run_seq: u64,
+    ) -> Result<RunStreamPage, muniment_core::attach::ProtocolError> {
+        self.stream_calls.fetch_add(1, Ordering::SeqCst);
+        let page = self
+            .journal
+            .workspace_catch_up(
+                workspace,
+                run_id,
+                after_run_seq,
+                MAX_RUN_STREAM_WINDOW_EVENTS,
+                MAX_RUN_STREAM_WINDOW_BYTES,
+            )
+            .map_err(|_| muniment_core::attach::ProtocolError::persistence_failed())?;
+        Ok(RunStreamPage {
+            run_id: run_id.to_owned(),
+            first_available_run_seq: page.first_available_run_seq,
+            current_run_seq: page.current_run_seq,
+            events: page.events,
+            exhausted: page.exhausted,
+        })
+    }
+}
+
+impl ThreadListService for SubscribeRaceService {
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, muniment_core::attach::ProtocolError> {
+        panic!("thread reads must not dispatch")
+    }
+
+    fn subscribe_run_commits(
+        &mut self,
+        run_id: &str,
+    ) -> Result<Option<(u64, Receiver<JournalCommitHint>)>, muniment_core::attach::ProtocolError>
+    {
+        let subscription = self
+            .journal
+            .subscribe_commits(run_id)
+            .map_err(|_| muniment_core::attach::ProtocolError::persistence_failed())?;
+        if let Some(event) = self.racing_event.take() {
+            self.journal
+                .append(event.run_seq - 1, &event)
+                .map_err(|_| muniment_core::attach::ProtocolError::persistence_failed())?;
+        }
+        Ok(Some(subscription))
+    }
+
+    fn stream_run(
+        &mut self,
+        workspace: &str,
+        run_id: &str,
+        after_run_seq: u64,
+    ) -> Result<RunStreamPage, muniment_core::attach::ProtocolError> {
+        let page = self
+            .journal
+            .workspace_catch_up(
+                workspace,
+                run_id,
+                after_run_seq,
+                MAX_RUN_STREAM_WINDOW_EVENTS,
+                MAX_RUN_STREAM_WINDOW_BYTES,
+            )
+            .map_err(|_| muniment_core::attach::ProtocolError::persistence_failed())?;
+        Ok(RunStreamPage {
+            run_id: run_id.to_owned(),
+            first_available_run_seq: page.first_available_run_seq,
+            current_run_seq: page.current_run_seq,
+            events: page.events,
+            exhausted: page.exhausted,
+        })
+    }
 }
 
 impl ThreadListService for StreamService {
@@ -1490,6 +1604,297 @@ fn real_journal_run_stream_fetches_next_page_after_window_ack() {
         panic!("expected caught-up event")
     };
     assert_eq!(caught_up.event, EventName::SubscriptionCaughtUp);
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(server_thread.join().unwrap(), Ok(()));
+}
+
+#[test]
+fn file_journal_run_stream_stays_live_and_ignores_other_run_commits() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000028";
+    const OTHER_RUN: &str = "0190a100-0000-7000-8000-000000000029";
+    let path = std::env::temp_dir().join(format!(
+        "muniment-attach-live-{}-{}.sqlite",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut writer = RunJournal::open(&path).unwrap();
+    let mut initial = prompt(RUN, "private-initial", "2026-07-16T02:59:00Z");
+    initial.event_id = "0190a200-0000-7000-8001-000000000027".into();
+    let mut other_initial = prompt(OTHER_RUN, "private-other", "2026-07-16T02:59:00Z");
+    other_initial.event_id = "0190a200-0000-7000-8001-000000000026".into();
+    writer.append_batch(0, &[initial]).unwrap();
+    writer.append_batch(0, &[other_initial]).unwrap();
+    writer.bind_run_workspace(RUN, "workspace-1").unwrap();
+    writer.bind_run_workspace(OTHER_RUN, "workspace-1").unwrap();
+    let mut service = RunJournal::open(&path).unwrap();
+
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let server_thread = thread::spawn(move || {
+        run_authenticated_session_with_authorization(
+            server,
+            credentials(),
+            "0.1.0",
+            Duration::from_secs(2),
+            AuthorizationSessionDependencies {
+                fill_random: |bytes: &mut [u8]| {
+                    bytes.fill(9);
+                    Ok(())
+                },
+                clock: TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                tokens: TestTokens(1),
+                approvals: |_: &muniment_core::attach::PairingChallenge, _: Duration| {
+                    Some(ApprovalDecision::Approve(approval()))
+                },
+            },
+            &mut service,
+        )
+    });
+    client.write_all(&hello(1, 1)).unwrap();
+    let _: Welcome = read_frame(&mut client);
+    let _: Authorized = read_frame(&mut client);
+    client
+        .write_all(&request(
+            75,
+            Operation::RunStream,
+            json!({"run_id": RUN, "after_run_seq": 1}),
+        ))
+        .unwrap();
+    let _: Response = read_frame(&mut client);
+    let Envelope::Event(caught_up) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected caught-up marker")
+    };
+    assert_eq!(caught_up.event, EventName::SubscriptionCaughtUp);
+
+    let mut unrelated = prompt(OTHER_RUN, "private-other", "2026-07-16T03:00:00Z");
+    unrelated.event_id = "0190a200-0000-7000-8001-000000000029".into();
+    unrelated.run_seq = 2;
+    writer.append_batch(1, &[unrelated]).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_millis(150)))
+        .unwrap();
+    let mut byte = [0];
+    assert!(matches!(
+        client.read(&mut byte).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
+
+    let mut committed = prompt(RUN, "private-live", "2026-07-16T03:00:01Z");
+    committed.event_id = "0190a200-0000-7000-8001-000000000028".into();
+    committed.run_seq = 2;
+    writer.append_batch(1, &[committed]).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let Envelope::Event(event) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected live run event")
+    };
+    assert_eq!(event.event, EventName::RunEvent);
+    assert_eq!(event.run_seq, Some(2));
+    assert_eq!(event.body["payload"], json!({"withheld": true}));
+    assert!(!format!("{event:?}").contains("private-live"));
+
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(server_thread.join().unwrap(), Ok(()));
+}
+
+#[test]
+fn file_journal_run_stream_captures_commit_racing_subscription_snapshot() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000030";
+    let path = std::env::temp_dir().join(format!(
+        "muniment-attach-race-{}-{}.sqlite",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut journal = RunJournal::open(&path).unwrap();
+    journal
+        .append(0, &prompt(RUN, "private-initial", "2026-07-16T03:00:00Z"))
+        .unwrap();
+    journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+    let mut racing_event = prompt(RUN, "private-racing", "2026-07-16T03:00:01Z");
+    racing_event.event_id = "0190a200-0000-7000-8001-000000000030".into();
+    racing_event.run_seq = 2;
+    let mut service = SubscribeRaceService {
+        journal,
+        racing_event: Some(racing_event),
+    };
+
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let server_thread = thread::spawn(move || {
+        run_authenticated_session_with_authorization(
+            server,
+            credentials(),
+            "0.1.0",
+            Duration::from_secs(2),
+            AuthorizationSessionDependencies {
+                fill_random: |bytes: &mut [u8]| {
+                    bytes.fill(9);
+                    Ok(())
+                },
+                clock: TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                tokens: TestTokens(1),
+                approvals: |_: &muniment_core::attach::PairingChallenge, _: Duration| {
+                    Some(ApprovalDecision::Approve(approval()))
+                },
+            },
+            &mut service,
+        )
+    });
+    client.write_all(&hello(1, 1)).unwrap();
+    let _: Welcome = read_frame(&mut client);
+    let _: Authorized = read_frame(&mut client);
+    client
+        .write_all(&request(
+            76,
+            Operation::RunStream,
+            json!({"run_id": RUN, "after_run_seq": 1}),
+        ))
+        .unwrap();
+    let _: Response = read_frame(&mut client);
+    let Envelope::Event(event) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected racing event before caught-up")
+    };
+    assert_eq!(event.event, EventName::RunEvent);
+    assert_eq!(event.run_seq, Some(2));
+    assert_eq!(event.body["payload"], json!({"withheld": true}));
+    assert!(!format!("{event:?}").contains("private-racing"));
+    let Envelope::Event(caught_up) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected caught-up after racing event")
+    };
+    assert_eq!(caught_up.event, EventName::SubscriptionCaughtUp);
+    assert_eq!(caught_up.run_seq, Some(2));
+
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(server_thread.join().unwrap(), Ok(()));
+}
+
+#[test]
+fn live_run_stream_stays_bounded_and_recovers_after_hint_overflow_and_ack() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000031";
+    let path = std::env::temp_dir().join(format!(
+        "muniment-attach-overflow-{}-{}.sqlite",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut writer = RunJournal::open(&path).unwrap();
+    writer
+        .append(0, &prompt(RUN, "private-initial", "2026-07-16T03:00:00Z"))
+        .unwrap();
+    writer.bind_run_workspace(RUN, "workspace-1").unwrap();
+    let stream_calls = Arc::new(AtomicUsize::new(0));
+    let mut service = CountingJournalService {
+        journal: RunJournal::open(&path).unwrap(),
+        stream_calls: Arc::clone(&stream_calls),
+    };
+
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let server_thread = thread::spawn(move || {
+        run_authenticated_session_with_authorization(
+            server,
+            credentials(),
+            "0.1.0",
+            Duration::from_secs(5),
+            AuthorizationSessionDependencies {
+                fill_random: |bytes: &mut [u8]| {
+                    bytes.fill(9);
+                    Ok(())
+                },
+                clock: TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                tokens: TestTokens(1),
+                approvals: |_: &muniment_core::attach::PairingChallenge, _: Duration| {
+                    Some(ApprovalDecision::Approve(approval()))
+                },
+            },
+            &mut service,
+        )
+    });
+    client.write_all(&hello(1, 1)).unwrap();
+    let _: Welcome = read_frame(&mut client);
+    let _: Authorized = read_frame(&mut client);
+    client
+        .write_all(&request(
+            77,
+            Operation::RunStream,
+            json!({"run_id": RUN, "after_run_seq": 1}),
+        ))
+        .unwrap();
+    let response: Response = read_frame(&mut client);
+    let subscription = response.body["subscription_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let Envelope::Event(caught_up) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected initial caught-up marker")
+    };
+    assert_eq!(caught_up.event, EventName::SubscriptionCaughtUp);
+
+    let window_end = MAX_RUN_STREAM_WINDOW_EVENTS as u64 + 1;
+    let window_events = (2..=window_end)
+        .map(|seq| {
+            let mut event = prompt(RUN, "private-live", "2026-07-16T03:00:01Z");
+            event.event_id = format!("0190a200-0000-7000-8002-{seq:012x}");
+            event.run_seq = seq;
+            event
+        })
+        .collect::<Vec<_>>();
+    writer.append_batch(1, &window_events).unwrap();
+    for expected in 2..=window_end {
+        let Envelope::Event(event) = read_frame::<Envelope>(&mut client) else {
+            panic!("expected live window event")
+        };
+        assert_eq!(event.run_seq, Some(expected));
+        assert_eq!(event.body["payload"], json!({"withheld": true}));
+    }
+    assert_eq!(stream_calls.load(Ordering::SeqCst), 2);
+
+    let final_seq = window_end + 66;
+    for seq in (window_end + 1)..=final_seq {
+        let mut event = prompt(RUN, "private-live", "2026-07-16T03:00:01Z");
+        event.event_id = format!("0190a200-0000-7000-8002-{seq:012x}");
+        event.run_seq = seq;
+        writer.append(seq - 1, &event).unwrap();
+    }
+    client
+        .set_read_timeout(Some(Duration::from_millis(150)))
+        .unwrap();
+    let mut byte = [0];
+    assert!(matches!(
+        client.read(&mut byte).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
+    assert_eq!(stream_calls.load(Ordering::SeqCst), 2);
+
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    client
+        .write_all(&request(
+            78,
+            Operation::RunCursorAck,
+            json!({
+                "subscription_id": subscription,
+                "through_run_seq": window_end,
+            }),
+        ))
+        .unwrap();
+    let _: Response = read_frame(&mut client);
+    for expected in (window_end + 1)..=final_seq {
+        let Envelope::Event(event) = read_frame::<Envelope>(&mut client) else {
+            panic!("expected overflow recovery event")
+        };
+        assert_eq!(event.run_seq, Some(expected));
+        assert_eq!(event.body["payload"], json!({"withheld": true}));
+    }
+    assert_eq!(stream_calls.load(Ordering::SeqCst), 3);
+
     client.shutdown(Shutdown::Write).unwrap();
     assert_eq!(server_thread.join().unwrap(), Ok(()));
 }
