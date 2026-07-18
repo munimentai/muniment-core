@@ -56,6 +56,36 @@ pub struct RunStartAccepted {
     pub accepted_at: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionDecision {
+    Allow,
+    Deny,
+}
+
+#[derive(Clone, Eq, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionAnswerAccepted {
+    pub run_id: String,
+    pub gate_id: String,
+    pub decision: PermissionDecision,
+    pub committed_seq: u64,
+    pub accepted_at: String,
+}
+
+impl fmt::Debug for PermissionAnswerAccepted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PermissionAnswerAccepted")
+            .field("run_id", &self.run_id)
+            .field("gate_id", &"[redacted]")
+            .field("decision", &self.decision)
+            .field("committed_seq", &self.committed_seq)
+            .field("accepted_at", &self.accepted_at)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunStreamWindow {
@@ -158,8 +188,9 @@ impl fmt::Debug for ThreadListPage {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::{
-        AuthorizationSummary, ClientError, RedactedRunEvent, RunStartAccepted, RunStreamMessage,
-        RunStreamSubscription, ThreadListPage, ThreadOpenPage,
+        AuthorizationSummary, ClientError, PermissionAnswerAccepted, PermissionDecision,
+        RedactedRunEvent, RunStartAccepted, RunStreamMessage, RunStreamSubscription,
+        ThreadListPage, ThreadOpenPage,
     };
     use crate::{
         decode_frame, encode_frame, Authorized, Client, Envelope, ErrorCode, ErrorEnvelope,
@@ -184,6 +215,7 @@ mod linux {
     const MAX_CURSOR_LENGTH: usize = 1024;
     const MAX_RUN_START_TEXT_LENGTH: usize = 32 * 1024;
     const MAX_RUN_START_CONTEXT_LENGTH: usize = 64 * 1024;
+    const MAX_PERMISSION_GATE_ID_LENGTH: usize = 256;
     const MAX_RUN_STREAM_WINDOW_EVENTS: usize = 1_024;
     const MAX_RUN_STREAM_WINDOW_BYTES: usize = 4 * 1024 * 1024;
 
@@ -402,6 +434,64 @@ mod linux {
             let accepted: RunStartAccepted = serde_json::from_value(response.body)
                 .map_err(|_| ClientError::UnexpectedMessage)?;
             if Id::new(accepted.run_id.clone()).is_err()
+                || accepted.committed_seq == 0
+                || accepted.accepted_at.is_empty()
+                || accepted.accepted_at.len() > MAX_TEXT_LENGTH
+                || !is_rfc3339(&accepted.accepted_at)
+            {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            Ok(accepted)
+        }
+
+        pub fn answer_permission(
+            &mut self,
+            run_id: &str,
+            gate_id: &str,
+            decision: PermissionDecision,
+        ) -> Result<PermissionAnswerAccepted, ClientError> {
+            let run_id = Id::new(run_id.to_owned()).map_err(|_| ClientError::UnexpectedMessage)?;
+            if gate_id.trim().is_empty() || gate_id.len() > MAX_PERMISSION_GATE_ID_LENGTH {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            let request_id = fresh_request_id()?;
+            let idempotency_key = fresh_request_id()?;
+            let request = Request {
+                protocol: Protocol,
+                request_id: request_id.clone(),
+                operation: Operation::PermissionAnswer,
+                capability: self.capability.clone(),
+                idempotency_key: Some(idempotency_key),
+                body: serde_json::json!({
+                    "run_id": run_id.as_str(),
+                    "gate_id": gate_id,
+                    "decision": decision,
+                }),
+            };
+            let deadline = deadline(self.io_timeout);
+            let bytes = encode_frame(&request).map_err(map_frame_error)?;
+            write_all_before(&mut self.stream, &bytes, deadline)?;
+            let value = read_value(&mut self.stream, deadline)?;
+            if value
+                .get("protocol")
+                .and_then(Value::as_str)
+                .is_some_and(|protocol| protocol != PROTOCOL)
+            {
+                return Err(ClientError::ProtocolIncompatible);
+            }
+            let response =
+                match serde_json::from_value(value).map_err(|_| ClientError::UnexpectedMessage)? {
+                    Envelope::Response(response) if response.request_id == request_id => response,
+                    Envelope::Error(error) if error.request_id.as_ref() == Some(&request_id) => {
+                        return Err(map_protocol_error(error.error.code()));
+                    }
+                    _ => return Err(ClientError::UnexpectedMessage),
+                };
+            let accepted: PermissionAnswerAccepted = serde_json::from_value(response.body)
+                .map_err(|_| ClientError::UnexpectedMessage)?;
+            if accepted.run_id != run_id.as_str()
+                || accepted.gate_id != gate_id
+                || accepted.decision != decision
                 || accepted.committed_seq == 0
                 || accepted.accepted_at.is_empty()
                 || accepted.accepted_at.len() > MAX_TEXT_LENGTH
@@ -994,6 +1084,15 @@ impl AuthorizedClient {
         _text: &str,
         _context: Option<serde_json::Value>,
     ) -> Result<RunStartAccepted, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+
+    pub fn answer_permission(
+        &mut self,
+        _run_id: &str,
+        _gate_id: &str,
+        _decision: PermissionDecision,
+    ) -> Result<PermissionAnswerAccepted, ClientError> {
         Err(ClientError::UnsupportedPlatform)
     }
 

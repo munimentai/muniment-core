@@ -2,8 +2,8 @@
 
 use muniment_attach::{
     authorized, encode_frame, handshake_stream, welcome, ClientError, ErrorAction, ErrorEnvelope,
-    Event, EventName, Failure, Id, Protocol, ProtocolError, Response, RunStreamMessage, Success,
-    VersionRange, MAX_FRAME_LENGTH,
+    Event, EventName, Failure, Id, PermissionDecision, Protocol, ProtocolError, Response,
+    RunStreamMessage, Success, VersionRange, MAX_FRAME_LENGTH,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -1193,6 +1193,135 @@ fn run_start_rejects_correlation_mismatch() {
         Err(ClientError::UnexpectedMessage)
     );
     worker.join().unwrap();
+}
+
+#[test]
+fn permission_answer_uses_exact_envelopes_and_fresh_ids() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let run_id = "01900000-0000-7000-8000-000000000001";
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        let mut seen = BTreeSet::new();
+        for (gate_id, decision) in [("gate-a", "allow"), ("gate-b", "deny")] {
+            let request = read_client_value(&mut server);
+            let request_id = request["request_id"].as_str().unwrap().to_owned();
+            let idempotency_key = request["idempotency_key"].as_str().unwrap().to_owned();
+            assert_eq!(
+                request,
+                serde_json::json!({
+                    "protocol": "muniment.attach/1", "request_id": request_id,
+                    "operation": "permission.answer", "capability": "33".repeat(32),
+                    "idempotency_key": idempotency_key,
+                    "body": { "run_id": run_id, "gate_id": gate_id, "decision": decision }
+                })
+            );
+            assert_eq!(request_id.as_bytes()[14], b'7');
+            assert_eq!(idempotency_key.as_bytes()[14], b'7');
+            assert!(seen.insert(request_id.clone()));
+            assert!(seen.insert(idempotency_key));
+            server
+                .write_all(
+                    &encode_frame(&Response {
+                        protocol: Protocol,
+                        request_id: Id::new(request_id).unwrap(),
+                        ok: Success,
+                        body: serde_json::json!({
+                            "run_id": run_id, "gate_id": gate_id, "decision": decision,
+                            "committed_seq": 2, "accepted_at": "2026-07-17T00:00:00Z"
+                        }),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    let accepted = client
+        .answer_permission(run_id, "gate-a", PermissionDecision::Allow)
+        .unwrap();
+    assert!(!format!("{accepted:?}").contains("gate-a"));
+    client
+        .answer_permission(run_id, "gate-b", PermissionDecision::Deny)
+        .unwrap();
+    worker.join().unwrap();
+}
+
+#[test]
+fn permission_answer_rejects_invalid_input_without_writing() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        server.set_read_timeout(Some(SHORT)).unwrap();
+        assert!(server.read(&mut [0]).is_err());
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    for (run_id, gate_id) in [
+        ("bad", "gate"),
+        ("01900000-0000-7000-8000-000000000001", " "),
+        ("01900000-0000-7000-8000-000000000001", &"x".repeat(257)),
+    ] {
+        assert_eq!(
+            client.answer_permission(run_id, gate_id, PermissionDecision::Allow),
+            Err(ClientError::UnexpectedMessage)
+        );
+    }
+    worker.join().unwrap();
+}
+
+#[test]
+fn permission_answer_rejects_hostile_receipts_and_maps_errors() {
+    let run_id = "01900000-0000-7000-8000-000000000001";
+    for (body, expected) in [
+        (
+            Some(
+                serde_json::json!({"run_id":run_id,"gate_id":"other","decision":"allow","committed_seq":2,"accepted_at":"2026-07-17T00:00:00Z"}),
+            ),
+            ClientError::UnexpectedMessage,
+        ),
+        (
+            Some(
+                serde_json::json!({"run_id":run_id,"gate_id":"gate","decision":"deny","committed_seq":2,"accepted_at":"2026-07-17T00:00:00Z"}),
+            ),
+            ClientError::UnexpectedMessage,
+        ),
+        (
+            Some(
+                serde_json::json!({"run_id":run_id,"gate_id":"gate","decision":"allow","committed_seq":0,"accepted_at":"bad","unknown":true}),
+            ),
+            ClientError::UnexpectedMessage,
+        ),
+        (None, ClientError::DesktopFailed),
+    ] {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            complete_pairing(&mut server);
+            let request = read_client_value(&mut server);
+            let request_id = Id::new(request["request_id"].as_str().unwrap()).unwrap();
+            let bytes = match body {
+                Some(body) => encode_frame(&Response {
+                    protocol: Protocol,
+                    request_id,
+                    ok: Success,
+                    body,
+                })
+                .unwrap(),
+                None => encode_frame(&ErrorEnvelope {
+                    protocol: Protocol,
+                    request_id: Some(request_id),
+                    ok: Failure,
+                    error: ProtocolError::persistence_failed(),
+                })
+                .unwrap(),
+            };
+            server.write_all(&bytes).unwrap();
+        });
+        let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+        assert_eq!(
+            client.answer_permission(run_id, "gate", PermissionDecision::Allow),
+            Err(expected)
+        );
+        worker.join().unwrap();
+    }
 }
 
 #[test]
