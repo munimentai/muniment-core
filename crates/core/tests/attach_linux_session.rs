@@ -303,6 +303,7 @@ fn stream_projection(run_id: &str, run_seq: u64, event_type: String) -> RunEvent
         event_type,
         event_version: 1,
         recorded_at: "2026-07-16T03:00:00Z".into(),
+        pending_permission: None,
     }
 }
 
@@ -945,6 +946,183 @@ fn authorized_run_stream_catches_up_in_order_with_redacted_projection() {
 }
 
 #[test]
+fn authorized_run_stream_delivers_exact_bounded_pending_permission() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000041";
+    let mut started = prompt(RUN, "private prompt", "2026-07-16T03:00:00Z");
+    let mut permission = prompt(RUN, "unused", "2026-07-16T03:00:01Z");
+    permission.event_id = "0190a200-0000-7000-8001-000000000041".into();
+    permission.run_seq = 2;
+    permission.event_type = "permission.requested".into();
+    permission.payload = EventPayload::Inline {
+        payload_json: json!({
+            "gate_id": "gate-41", "kind": "confirm", "title": "Allow search?",
+            "message": "Search the public web", "secret": "never emit me",
+            "command": "rm private", "path": "/private/path"
+        }),
+    };
+    let mut permission_without_message = permission.clone();
+    permission_without_message.event_id = "0190a200-0000-7000-8001-000000000042".into();
+    permission_without_message.run_seq = 3;
+    permission_without_message.payload = EventPayload::Inline {
+        payload_json: json!({
+            "gate_id": "gate-42", "kind": "confirm", "title": "Allow without context?"
+        }),
+    };
+    started.event_id = "0190a200-0000-7000-8001-000000000040".into();
+    let mut journal = RunJournal::open(":memory:").unwrap();
+    journal
+        .append_batch(0, &[started, permission, permission_without_message])
+        .unwrap();
+    journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello(1, 1)).unwrap();
+    client
+        .write_all(&request(
+            43,
+            Operation::RunStream,
+            json!({"run_id": RUN, "after_run_seq": 0}),
+        ))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(
+        dispatch_session(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            &mut journal,
+        ),
+        Ok(())
+    );
+    let response: Response = read_frame(&mut client);
+    let subscription = response.body["subscription_id"].as_str().unwrap();
+    let Envelope::Event(first) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected withheld run event")
+    };
+    assert_eq!(first.event, EventName::RunEvent);
+    let Envelope::Event(pending) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected pending permission")
+    };
+    assert_eq!(pending.event, EventName::PermissionPending);
+    assert_eq!(pending.subscription_id.as_str(), subscription);
+    assert_eq!(pending.run_id.as_ref().unwrap().as_str(), RUN);
+    assert_eq!(pending.run_seq, Some(2));
+    assert_eq!(
+        pending.body,
+        json!({
+            "gate_id": "gate-41", "kind": "confirm", "title": "Allow search?",
+            "message": "Search the public web"
+        })
+    );
+    let Envelope::Event(without_message) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected pending permission without message")
+    };
+    assert_eq!(without_message.event, EventName::PermissionPending);
+    assert_eq!(without_message.subscription_id.as_str(), subscription);
+    assert_eq!(without_message.run_id.as_ref().unwrap().as_str(), RUN);
+    assert_eq!(without_message.run_seq, Some(3));
+    assert_eq!(
+        without_message.body,
+        json!({
+            "gate_id": "gate-42", "kind": "confirm", "title": "Allow without context?"
+        })
+    );
+    let Envelope::Event(caught_up) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected caught-up marker")
+    };
+    assert_eq!(caught_up.event, EventName::SubscriptionCaughtUp);
+}
+
+#[test]
+fn run_stream_catch_up_fails_closed_for_hostile_pending_permissions() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000043";
+    let cases = [
+        EventPayload::Inline {
+            payload_json: json!({
+                "gate_id": "malformed-secret", "kind": "confirm", "title": "Malformed",
+                "message": {"private": "malformed-private"}
+            }),
+        },
+        EventPayload::Inline {
+            payload_json: json!({
+                "gate_id": "unsupported-secret", "kind": "select", "title": "Unsupported",
+                "options": ["unsupported-private"]
+            }),
+        },
+        EventPayload::Inline {
+            payload_json: json!({
+                "gate_id": "oversized-secret", "kind": "confirm", "title": "x".repeat(1_025),
+                "message": "oversized-private"
+            }),
+        },
+        EventPayload::Cas {
+            payload_cas: muniment_core::journal::CasReference {
+                sha256: "ab".repeat(32),
+                media_type: "application/private+json".into(),
+                byte_length: 999_999,
+            },
+        },
+    ];
+    let mut expected_error = None;
+    for (index, payload) in cases.into_iter().enumerate() {
+        let mut permission = prompt(RUN, "unused", "2026-07-16T03:00:00Z");
+        permission.event_id = format!("0190a200-0000-7000-8001-{:012}", 100 + index);
+        permission.event_type = "permission.requested".into();
+        permission.payload = payload;
+        let mut later = prompt(RUN, "later-private", "2026-07-16T03:00:01Z");
+        later.event_id = format!("0190a200-0000-7000-8001-{:012}", 200 + index);
+        later.run_seq = 2;
+        let mut journal = RunJournal::open(":memory:").unwrap();
+        journal.append_batch(0, &[permission, later]).unwrap();
+        journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&hello(1, 1)).unwrap();
+        client
+            .write_all(&request(
+                44,
+                Operation::RunStream,
+                json!({"run_id": RUN, "after_run_seq": 0}),
+            ))
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        assert_eq!(
+            dispatch_session(
+                &mut client,
+                server,
+                TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                &mut journal,
+            ),
+            Ok(())
+        );
+        let error: ErrorEnvelope = read_frame(&mut client);
+        assert_eq!(error.error.code(), ErrorCode::PersistenceFailed);
+        let encoded = serde_json::to_string(&error).unwrap();
+        for private in [
+            "malformed-secret",
+            "malformed-private",
+            "unsupported-secret",
+            "unsupported-private",
+            "oversized-secret",
+            "oversized-private",
+            "application/private+json",
+            "later-private",
+        ] {
+            assert!(!encoded.contains(private));
+        }
+        let error_value = serde_json::to_value(error).unwrap();
+        if let Some(expected) = &expected_error {
+            assert_eq!(&error_value, expected);
+        } else {
+            expected_error = Some(error_value);
+        }
+        let mut remaining = Vec::new();
+        client.read_to_end(&mut remaining).unwrap();
+        assert!(remaining.is_empty());
+    }
+}
+
+#[test]
 fn run_stream_does_not_read_or_emit_an_oversized_inline_payload() {
     const RUN: &str = "0190a100-0000-7000-8000-000000000012";
     let secret = "payload-secret-".repeat(MAX_FRAME_LENGTH);
@@ -1011,9 +1189,16 @@ fn run_stream_rejects_missing_scope_other_workspace_and_strictly_malformed_bodie
     ];
     for (has_scope, body, expected) in cases {
         let mut journal = RunJournal::open(":memory:").unwrap();
-        journal
-            .append(0, &prompt(RUN, "private", "2026-07-16T03:00:00Z"))
-            .unwrap();
+        let mut permission = prompt(RUN, "unused", "2026-07-16T03:00:00Z");
+        permission.event_type = "permission.requested".into();
+        permission.payload = EventPayload::Inline {
+            payload_json: json!({
+                "gate_id": "other-workspace-private-gate", "kind": "confirm",
+                "title": "Other workspace private title",
+                "message": "other-workspace-private-context"
+            }),
+        };
+        journal.append(0, &permission).unwrap();
         journal.bind_run_workspace(RUN, "workspace-2").unwrap();
         let (mut client, server) = UnixStream::pair().unwrap();
         client.write_all(&hello(1, 1)).unwrap();
@@ -1034,7 +1219,13 @@ fn run_stream_rejects_missing_scope_other_workspace_and_strictly_malformed_bodie
         );
         let error: ErrorEnvelope = read_frame(&mut client);
         assert_eq!(error.error.code(), expected);
-        assert!(!serde_json::to_string(&error).unwrap().contains("private"));
+        let encoded = serde_json::to_string(&error).unwrap();
+        assert!(!encoded.contains("other-workspace-private-gate"));
+        assert!(!encoded.contains("Other workspace private title"));
+        assert!(!encoded.contains("other-workspace-private-context"));
+        let mut remaining = Vec::new();
+        client.read_to_end(&mut remaining).unwrap();
+        assert!(remaining.is_empty());
     }
 }
 
@@ -1672,7 +1863,7 @@ fn file_journal_run_stream_stays_live_and_ignores_other_run_commits() {
     writer.append_batch(0, &[initial]).unwrap();
     writer.append_batch(0, &[other_initial]).unwrap();
     writer.bind_run_workspace(RUN, "workspace-1").unwrap();
-    writer.bind_run_workspace(OTHER_RUN, "workspace-1").unwrap();
+    writer.bind_run_workspace(OTHER_RUN, "workspace-2").unwrap();
     let mut service = RunJournal::open(&path).unwrap();
 
     let (mut client, server) = UnixStream::pair().unwrap();
@@ -1728,6 +1919,13 @@ fn file_journal_run_stream_stays_live_and_ignores_other_run_commits() {
     let mut committed = prompt(RUN, "private-live", "2026-07-16T03:00:01Z");
     committed.event_id = "0190a200-0000-7000-8001-000000000028".into();
     committed.run_seq = 2;
+    committed.event_type = "permission.requested".into();
+    committed.payload = EventPayload::Inline {
+        payload_json: json!({
+            "gate_id": "live-gate", "kind": "confirm", "title": "Allow live action?",
+            "message": "Continue the running task", "private": "private-live"
+        }),
+    };
     writer.append_batch(1, &[committed]).unwrap();
     client
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -1735,13 +1933,49 @@ fn file_journal_run_stream_stays_live_and_ignores_other_run_commits() {
     let Envelope::Event(event) = read_frame::<Envelope>(&mut client) else {
         panic!("expected live run event")
     };
-    assert_eq!(event.event, EventName::RunEvent);
+    assert_eq!(event.event, EventName::PermissionPending);
     assert_eq!(event.run_seq, Some(2));
-    assert_eq!(event.body["payload"], json!({"withheld": true}));
+    assert_eq!(
+        event.body,
+        json!({
+            "gate_id": "live-gate", "kind": "confirm", "title": "Allow live action?",
+            "message": "Continue the running task"
+        })
+    );
     assert!(!format!("{event:?}").contains("private-live"));
 
+    let mut hostile = prompt(RUN, "unused", "2026-07-16T03:00:02Z");
+    hostile.event_id = "0190a200-0000-7000-8001-000000000030".into();
+    hostile.run_seq = 3;
+    hostile.event_type = "permission.requested".into();
+    hostile.payload = EventPayload::Cas {
+        payload_cas: muniment_core::journal::CasReference {
+            sha256: "cd".repeat(32),
+            media_type: "application/live-private+json".into(),
+            byte_length: 999_999,
+        },
+    };
+    let mut later = prompt(RUN, "later-live-private", "2026-07-16T03:00:03Z");
+    later.event_id = "0190a200-0000-7000-8001-000000000031".into();
+    later.run_seq = 4;
+    writer.append_batch(2, &[hostile, later]).unwrap();
+    let error: ErrorEnvelope = read_frame(&mut client);
+    assert_eq!(error.error.code(), ErrorCode::PersistenceFailed);
+    let error_value = serde_json::to_value(&error).unwrap();
+    assert_eq!(error_value["error"]["code"], "persistence_failed");
+    assert_eq!(error_value["error"].get("details"), None);
+    let encoded = serde_json::to_string(&error).unwrap();
+    assert!(!encoded.contains("live-private"));
+    assert!(!encoded.contains("later-live-private"));
     client.shutdown(Shutdown::Write).unwrap();
-    assert_eq!(server_thread.join().unwrap(), Ok(()));
+    let mut remaining = Vec::new();
+    client.read_to_end(&mut remaining).unwrap();
+    assert!(remaining.is_empty());
+
+    assert!(matches!(
+        server_thread.join().unwrap(),
+        Ok(()) | Err(AttachSessionError::Closed)
+    ));
 }
 
 #[test]

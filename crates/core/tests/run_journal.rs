@@ -86,6 +86,115 @@ fn cas_payload(hash: &str) -> EventPayload {
 }
 
 #[test]
+fn pending_permission_projection_is_bounded_and_hostile_inputs_are_invalid() {
+    let cases = [
+        EventPayload::Inline {
+            payload_json: json!({
+                "gate_id": "g", "kind": "select", "title": "Unsupported",
+                "options": ["private option"]
+            }),
+        },
+        EventPayload::Inline {
+            payload_json: json!({
+                "gate_id": "g", "kind": "confirm", "title": "x".repeat(1_025),
+                "message": "private"
+            }),
+        },
+        cas_payload(&"ab".repeat(32)),
+    ];
+    let mut events = Vec::new();
+    for (index, payload) in cases.into_iter().enumerate() {
+        let seq = index as u64 + 1;
+        let mut pending = event(seq);
+        pending.event_type = "permission.requested".into();
+        pending.payload = payload;
+        events.push(pending);
+    }
+    let mut journal = RunJournal::open(":memory:").unwrap();
+    journal.append_batch(0, &events).unwrap();
+    journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+
+    let page = journal
+        .workspace_catch_up("workspace-1", RUN, 0, 10, 16 * 1024)
+        .unwrap();
+    assert_eq!(page.events.len(), 3);
+    assert!(page.events.iter().all(|event| {
+        event
+            .pending_permission
+            .as_ref()
+            .is_some_and(|projection| !projection.valid)
+    }));
+    assert!(format!("{:?}", page.events).len() < 2_000);
+}
+
+#[test]
+fn reopening_pre_projection_journal_backfills_valid_and_hostile_permissions() {
+    let db = TestDb::new();
+    let mut valid = event(1);
+    valid.event_type = "permission.requested".into();
+    valid.payload = EventPayload::Inline {
+        payload_json: json!({
+            "gate_id": "old-gate", "kind": "confirm", "title": "Allow old request?",
+            "private": "do not project"
+        }),
+    };
+    let mut hostile = event(2);
+    hostile.event_type = "permission.requested".into();
+    hostile.payload = EventPayload::Inline {
+        payload_json: json!({
+            "gate_id": "hostile-gate", "kind": "confirm", "title": "Hostile",
+            "message": {"secret": "not text"}, "command": "private command"
+        }),
+    };
+    let mut oversized = event(3);
+    oversized.event_type = "permission.requested".into();
+    oversized.payload = EventPayload::Inline {
+        payload_json: json!({
+            "gate_id": "oversized-private-gate", "kind": "confirm", "title": "Hostile",
+            "message": "oversized-private-context", "private": "x".repeat(1_000_000)
+        }),
+    };
+    {
+        let mut journal = RunJournal::open(&db).unwrap();
+        journal
+            .append_batch(0, &[valid, hostile, oversized])
+            .unwrap();
+        journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+    }
+    let connection = Connection::open(&db).unwrap();
+    connection
+        .execute_batch("DROP TABLE permission_pending_projection")
+        .unwrap();
+    drop(connection);
+
+    let mut journal = RunJournal::open(&db).unwrap();
+    let page = journal
+        .workspace_catch_up("workspace-1", RUN, 0, 10, 16 * 1024)
+        .unwrap();
+    let valid = page.events[0].pending_permission.as_ref().unwrap();
+    assert!(valid.valid);
+    assert_eq!(valid.gate_id, "old-gate");
+    assert_eq!(valid.kind, "confirm");
+    assert_eq!(valid.title, "Allow old request?");
+    assert_eq!(valid.message, None);
+    let hostile = page.events[1].pending_permission.as_ref().unwrap();
+    assert!(!hostile.valid);
+    assert_eq!(hostile.gate_id, "");
+    assert_eq!(hostile.kind, "");
+    assert_eq!(hostile.title, "");
+    assert_eq!(hostile.message, None);
+    let oversized = page.events[2].pending_permission.as_ref().unwrap();
+    assert!(!oversized.valid);
+    assert_eq!(oversized.gate_id, "");
+    assert_eq!(oversized.kind, "");
+    assert_eq!(oversized.title, "");
+    assert_eq!(oversized.message, None);
+    let projected = format!("{oversized:?}");
+    assert!(projected.len() < 200);
+    assert!(!projected.contains("oversized-private"));
+}
+
+#[test]
 fn commit_subscription_registration_cannot_miss_a_racing_commit() {
     let db = TestDb::new();
     let mut subscriber = RunJournal::open(&db).unwrap();

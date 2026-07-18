@@ -1233,18 +1233,51 @@ fn append_run_stream_page(
         if journal_event.run_seq > stream.snapshot_run_seq {
             break;
         }
+        let (event_name, body) = if journal_event.event_type == "permission.requested" {
+            let projection = journal_event
+                .pending_permission
+                .as_ref()
+                .filter(|projection| projection.valid)
+                .ok_or_else(ProtocolError::persistence_failed)?;
+            if projection.gate_id.trim().is_empty()
+                || projection.gate_id.len() > MAX_PERMISSION_GATE_ID_LENGTH
+                || projection.kind != "confirm"
+                || projection.title.trim().is_empty()
+                || projection.title.len() > 1_024
+                || projection
+                    .message
+                    .as_ref()
+                    .is_some_and(|message| message.len() > 4_096)
+            {
+                return Err(ProtocolError::persistence_failed());
+            }
+            let mut body = serde_json::json!({
+                "gate_id": projection.gate_id,
+                "kind": projection.kind,
+                "title": projection.title,
+            });
+            if let Some(message) = &projection.message {
+                body["message"] = serde_json::json!(message);
+            }
+            (EventName::PermissionPending, body)
+        } else {
+            (
+                EventName::RunEvent,
+                serde_json::json!({
+                    "event_type": journal_event.event_type,
+                    "event_version": journal_event.event_version,
+                    "recorded_at": journal_event.recorded_at,
+                    "payload": { "withheld": true }
+                }),
+            )
+        };
         let event = Event {
             protocol: Protocol,
             subscription_id: stream.cursor.subscription_id().clone(),
-            event: EventName::RunEvent,
+            event: event_name,
             run_id: Some(stream.cursor.run_id().clone()),
             run_seq: Some(journal_event.run_seq),
-            body: serde_json::json!({
-                "event_type": journal_event.event_type,
-                "event_version": journal_event.event_version,
-                "recorded_at": journal_event.recorded_at,
-                "payload": { "withheld": true }
-            }),
+            body,
         };
         if encode_frame(&event)
             .map_err(|_| ProtocolError::persistence_failed())?
