@@ -110,6 +110,24 @@ pub struct RedactedRunEvent {
     pub event_type: String,
     pub event_version: u32,
     pub recorded_at: String,
+    pub receipt: Option<RunReceipt>,
+}
+
+#[derive(Clone, Eq, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunReceipt {
+    pub route: Option<String>,
+    pub model: Option<String>,
+    pub cost: Option<String>,
+    pub time: Option<String>,
+    pub capabilities: Vec<ReceiptCapability>,
+}
+
+#[derive(Clone, Eq, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptCapability {
+    pub name: String,
+    pub version: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
@@ -160,6 +178,7 @@ impl fmt::Debug for RedactedRunEvent {
             .field("event_type", &self.event_type)
             .field("event_version", &self.event_version)
             .field("recorded_at", &self.recorded_at)
+            .field("receipt", &self.receipt.as_ref().map(|_| "[redacted]"))
             .finish()
     }
 }
@@ -778,6 +797,8 @@ mod linux {
                     #[serde(deny_unknown_fields)]
                     struct Withheld {
                         withheld: bool,
+                        #[serde(default)]
+                        receipt: Option<crate::RunReceipt>,
                     }
                     let body: Body = serde_json::from_value(event.body)
                         .map_err(|_| ClientError::UnexpectedMessage)?;
@@ -788,6 +809,25 @@ mod linux {
                         || body.recorded_at.len() > MAX_TEXT_LENGTH
                         || !is_rfc3339(&body.recorded_at)
                         || !body.payload.withheld
+                        || (body.payload.receipt.is_some() && body.event_type != "run.completed")
+                        || body.payload.receipt.as_ref().is_some_and(|receipt| {
+                            let valid = |value: &Option<String>| {
+                                value.as_ref().is_none_or(|value| {
+                                    !value.trim().is_empty() && value.len() <= 1_024
+                                })
+                            };
+                            !valid(&receipt.route)
+                                || !valid(&receipt.model)
+                                || !valid(&receipt.cost)
+                                || !valid(&receipt.time)
+                                || receipt.capabilities.len() > 64
+                                || receipt.capabilities.iter().any(|capability| {
+                                    capability.name.trim().is_empty()
+                                        || capability.name.len() > 1_024
+                                        || capability.version.trim().is_empty()
+                                        || capability.version.len() > 1_024
+                                })
+                        })
                     {
                         return Err(ClientError::UnexpectedMessage);
                     }
@@ -800,6 +840,7 @@ mod linux {
                         event_type: body.event_type,
                         event_version: body.event_version,
                         recorded_at: body.recorded_at,
+                        receipt: body.payload.receipt,
                     }))
                 }
                 EventName::SubscriptionCaughtUp => {

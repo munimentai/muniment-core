@@ -304,6 +304,7 @@ fn stream_projection(run_id: &str, run_seq: u64, event_type: String) -> RunEvent
         event_version: 1,
         recorded_at: "2026-07-16T03:00:00Z".into(),
         pending_permission: None,
+        receipt: None,
     }
 }
 
@@ -904,6 +905,17 @@ fn authorized_run_stream_catches_up_in_order_with_redacted_projection() {
     journal
         .append(0, &prompt(RUN, "private prompt", "2026-07-16T03:00:00Z"))
         .unwrap();
+    let mut completed = prompt(RUN, "unused", "2026-07-16T03:00:01Z");
+    completed.event_id = "0190a200-0000-7000-8000-000000000012".into();
+    completed.run_seq = 2;
+    completed.event_type = "run.completed".into();
+    completed.payload = EventPayload::Inline {
+        payload_json: json!({
+            "receipt": {"route": "cloud", "capabilities": [{"name": "search", "version": "1"}]},
+            "private": "must remain withheld"
+        }),
+    };
+    journal.append(1, &completed).unwrap();
     journal.bind_run_workspace(RUN, "workspace-1").unwrap();
 
     let (mut client, server) = UnixStream::pair().unwrap();
@@ -928,7 +940,7 @@ fn authorized_run_stream_catches_up_in_order_with_redacted_projection() {
     let response: Response = read_frame(&mut client);
     assert_eq!(response.body["run_id"], RUN);
     assert_eq!(response.body["first_available_run_seq"], 1);
-    assert_eq!(response.body["current_run_seq"], 1);
+    assert_eq!(response.body["current_run_seq"], 2);
     let subscription = response.body["subscription_id"].as_str().unwrap();
     let Envelope::Event(event) = read_frame::<Envelope>(&mut client) else {
         panic!("expected run event")
@@ -938,6 +950,14 @@ fn authorized_run_stream_catches_up_in_order_with_redacted_projection() {
     assert_eq!(event.run_seq, Some(1));
     assert_eq!(event.body["payload"]["withheld"], true);
     assert!(!event.body.to_string().contains("private"));
+    let Envelope::Event(completed) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected completed event")
+    };
+    assert_eq!(completed.run_seq, Some(2));
+    assert_eq!(completed.body["payload"]["withheld"], true);
+    assert_eq!(completed.body["payload"]["receipt"]["route"], "cloud");
+    assert_eq!(completed.body["payload"]["receipt"]["model"], json!(null));
+    assert!(!completed.body.to_string().contains("must remain withheld"));
     let Envelope::Event(caught_up) = read_frame::<Envelope>(&mut client) else {
         panic!("expected caught-up event")
     };

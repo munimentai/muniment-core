@@ -1261,13 +1261,18 @@ fn append_run_stream_page(
             }
             (EventName::PermissionPending, body)
         } else {
+            let mut payload = serde_json::json!({ "withheld": true });
+            if let Some(receipt) = &journal_event.receipt {
+                payload["receipt"] = serde_json::to_value(receipt)
+                    .map_err(|_| ProtocolError::persistence_failed())?;
+            }
             (
                 EventName::RunEvent,
                 serde_json::json!({
                     "event_type": journal_event.event_type,
                     "event_version": journal_event.event_version,
                     "recorded_at": journal_event.recorded_at,
-                    "payload": { "withheld": true }
+                    "payload": payload
                 }),
             )
         };

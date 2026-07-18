@@ -160,6 +160,29 @@ pub struct RunEventProjection {
     pub event_version: u32,
     pub recorded_at: String,
     pub pending_permission: Option<PendingPermissionProjection>,
+    pub receipt: Option<ReceiptProjection>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptProjection {
+    #[serde(default)]
+    pub route: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub cost: Option<String>,
+    #[serde(default)]
+    pub time: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<ReceiptCapabilityProjection>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptCapabilityProjection {
+    pub name: String,
+    pub version: String,
 }
 
 /// The bounded allow/deny context retained separately from a journal envelope.
@@ -177,6 +200,9 @@ const MAX_PENDING_KIND_BYTES: usize = 32;
 const MAX_PENDING_TITLE_BYTES: usize = 1_024;
 const MAX_PENDING_MESSAGE_BYTES: usize = 4_096;
 const MAX_PENDING_BACKFILL_ENVELOPE_BYTES: usize = 16 * 1024;
+const MAX_RECEIPT_FIELD_BYTES: usize = 1_024;
+const MAX_RECEIPT_CAPABILITIES: usize = 64;
+const MAX_RECEIPT_BACKFILL_ENVELOPE_BYTES: usize = 128 * 1024;
 
 #[derive(Debug)]
 pub enum RunEventPageError {
@@ -371,9 +397,11 @@ impl RunJournal {
                  length(CAST(e.run_id AS BLOB))+length(CAST(e.event_type AS BLOB))+ \
                  length(CAST(e.recorded_at AS BLOB))+COALESCE(length(CAST(p.gate_id AS BLOB)),0)+ \
                  COALESCE(length(CAST(p.kind AS BLOB)),0)+COALESCE(length(CAST(p.title AS BLOB)),0)+ \
-                 COALESCE(length(CAST(p.message AS BLOB)),0),p.gate_id,p.kind,p.title,p.message,p.valid \
+                 COALESCE(length(CAST(p.message AS BLOB)),0)+COALESCE(length(CAST(r.receipt_json AS BLOB)),0), \
+                 p.gate_id,p.kind,p.title,p.message,p.valid,r.receipt_json,r.valid \
                  FROM events e LEFT JOIN permission_pending_projection p \
                  ON p.run_id=e.run_id AND p.run_seq=e.run_seq \
+                 LEFT JOIN receipt_projection r ON r.run_id=e.run_id AND r.run_seq=e.run_seq \
                  WHERE e.run_id=?1 AND e.run_seq>?2 \
                  AND e.run_seq<=?3 ORDER BY e.run_seq LIMIT ?4",
             )
@@ -424,6 +452,18 @@ impl RunJournal {
                             .map_err(JournalError::from)?
                             .unwrap_or(false),
                     })
+                } else {
+                    None
+                },
+                receipt: if row.get::<_, String>(2).map_err(JournalError::from)? == "run.completed"
+                    && row
+                        .get::<_, Option<bool>>(12)
+                        .map_err(JournalError::from)?
+                        .unwrap_or(false)
+                {
+                    row.get::<_, Option<String>>(11)
+                        .map_err(JournalError::from)?
+                        .and_then(|value| serde_json::from_str(&value).ok())
                 } else {
                     None
                 },
@@ -485,7 +525,7 @@ impl RunJournal {
         let _operation = coordination
             .as_ref()
             .map(|state| state.operation.lock().unwrap());
-        let connection = Connection::open(path)?;
+        let mut connection = Connection::open(path)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
@@ -521,9 +561,13 @@ impl RunJournal {
              ON thread_projection_versions(run_id, ordinal, valid_from_seq, valid_until_seq); \
              CREATE TABLE IF NOT EXISTS permission_pending_projection( \
              run_id TEXT NOT NULL, run_seq INTEGER NOT NULL, gate_id TEXT, kind TEXT, \
-             title TEXT, message TEXT, valid INTEGER NOT NULL, PRIMARY KEY(run_id, run_seq));",
+             title TEXT, message TEXT, valid INTEGER NOT NULL, PRIMARY KEY(run_id, run_seq)); \
+             CREATE TABLE IF NOT EXISTS receipt_projection( \
+             run_id TEXT NOT NULL, run_seq INTEGER NOT NULL, receipt_json TEXT, \
+             valid INTEGER NOT NULL, PRIMARY KEY(run_id, run_seq));",
         )?;
         backfill_permission_pending_projection(&connection)?;
+        backfill_receipt_projection(&mut connection)?;
         // Journals created by the first projection implementation have only a
         // current row. Treat that row as the initial version; new writes use
         // interval versions from this point forward.
@@ -597,6 +641,7 @@ impl RunJournal {
         )?;
         update_thread_projection(&tx, event)?;
         update_permission_pending_projection(&tx, event)?;
+        update_receipt_projection(&tx, event)?;
         tx.execute(
             "INSERT INTO run_workspaces(run_id, workspace) VALUES(?1, ?2)",
             params![event.run_id, workspace],
@@ -687,6 +732,7 @@ impl RunJournal {
             result?;
             update_thread_projection(&tx, event)?;
             update_permission_pending_projection(&tx, event)?;
+            update_receipt_projection(&tx, event)?;
         }
         tx.commit()?;
         publish_commit_hint(
@@ -904,6 +950,7 @@ impl RunJournal {
             "DELETE FROM permission_pending_projection WHERE run_id=?1",
             [run_id],
         )?;
+        tx.execute("DELETE FROM receipt_projection WHERE run_id=?1", [run_id])?;
         tx.execute(
             "DELETE FROM thread_projection_entries WHERE run_id=?1",
             [run_id],
@@ -1324,6 +1371,10 @@ CREATE TABLE permission_pending_projection (
  valid INTEGER NOT NULL,
  PRIMARY KEY(run_id, run_seq)
 ) STRICT;
+CREATE TABLE receipt_projection (
+ run_id TEXT NOT NULL, run_seq INTEGER NOT NULL, receipt_json TEXT,
+ valid INTEGER NOT NULL, PRIMARY KEY(run_id, run_seq)
+) STRICT;
 CREATE TABLE run_workspaces (
  run_id TEXT PRIMARY KEY NOT NULL,
  workspace TEXT NOT NULL
@@ -1415,6 +1466,92 @@ fn update_permission_pending_projection(
             params![event.run_id, event.run_seq],
         )?;
     }
+    Ok(())
+}
+
+fn update_receipt_projection(
+    tx: &rusqlite::Transaction<'_>,
+    event: &EventEnvelope,
+) -> Result<(), JournalError> {
+    if event.event_type != "run.completed" {
+        return Ok(());
+    }
+    let receipt = match &event.payload {
+        EventPayload::Inline { payload_json } => payload_json
+            .get("receipt")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<ReceiptProjection>(value).ok())
+            .filter(valid_receipt),
+        _ => None,
+    };
+    if let Some(receipt) = receipt {
+        let encoded = serde_json::to_string(&receipt)
+            .map_err(|error| JournalError::InvalidEnvelope(error.to_string()))?;
+        tx.execute(
+            "INSERT INTO receipt_projection(run_id,run_seq,receipt_json,valid) VALUES(?1,?2,?3,1)",
+            params![event.run_id, event.run_seq, encoded],
+        )?;
+    } else {
+        tx.execute(
+            "INSERT INTO receipt_projection(run_id,run_seq,valid) VALUES(?1,?2,0)",
+            params![event.run_id, event.run_seq],
+        )?;
+    }
+    Ok(())
+}
+
+fn valid_receipt(receipt: &ReceiptProjection) -> bool {
+    let valid_optional = |value: &Option<String>| {
+        value
+            .as_ref()
+            .is_none_or(|value| !value.trim().is_empty() && value.len() <= MAX_RECEIPT_FIELD_BYTES)
+    };
+    valid_optional(&receipt.route)
+        && valid_optional(&receipt.model)
+        && valid_optional(&receipt.cost)
+        && valid_optional(&receipt.time)
+        && receipt.capabilities.len() <= MAX_RECEIPT_CAPABILITIES
+        && receipt.capabilities.iter().all(|capability| {
+            !capability.name.trim().is_empty()
+                && capability.name.len() <= MAX_RECEIPT_FIELD_BYTES
+                && !capability.version.trim().is_empty()
+                && capability.version.len() <= MAX_RECEIPT_FIELD_BYTES
+        })
+}
+
+fn backfill_receipt_projection(connection: &mut Connection) -> Result<(), JournalError> {
+    let rows = {
+        let mut statement = connection.prepare(
+            "SELECT run_id,run_seq,CASE WHEN length(CAST(envelope_json AS BLOB))<=?1 \
+             THEN envelope_json END FROM events WHERE event_type='run.completed' \
+             AND NOT EXISTS (SELECT 1 FROM receipt_projection r \
+             WHERE r.run_id=events.run_id AND r.run_seq=events.run_seq)",
+        )?;
+        let rows = statement
+            .query_map([MAX_RECEIPT_BACKFILL_ENVELOPE_BYTES], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    let tx = connection.transaction()?;
+    for (run_id, run_seq, encoded) in rows {
+        if let Some(encoded) = encoded {
+            let event = serde_json::from_str::<EventEnvelope>(&encoded)
+                .map_err(|error| JournalError::Corrupt(error.to_string()))?;
+            update_receipt_projection(&tx, &event)?;
+        } else {
+            tx.execute(
+                "INSERT INTO receipt_projection(run_id,run_seq,valid) VALUES(?1,?2,0)",
+                params![run_id, run_seq],
+            )?;
+        }
+    }
+    tx.commit()?;
     Ok(())
 }
 

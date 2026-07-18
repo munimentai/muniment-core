@@ -712,6 +712,35 @@ fn delete_unknown_run_is_a_no_op() {
 }
 
 #[test]
+fn catch_up_projects_only_a_bounded_authoritative_completion_receipt() {
+    let mut completed = event(1);
+    completed.event_type = "run.completed".into();
+    completed.payload = EventPayload::Inline {
+        payload_json: json!({
+            "receipt": {
+                "route": "cloud", "cost": "$0.01",
+                "capabilities": [{"name": "search", "version": "1"}]
+            },
+            "private": "must not be projected"
+        }),
+    };
+    let mut journal = RunJournal::open(":memory:").unwrap();
+    journal.append(0, &completed).unwrap();
+    journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+
+    let page = journal
+        .workspace_catch_up("workspace-1", RUN, 0, 10, 64 * 1024)
+        .unwrap();
+    let receipt = page.events[0].receipt.as_ref().unwrap();
+    assert_eq!(receipt.route.as_deref(), Some("cloud"));
+    assert_eq!(receipt.model, None);
+    assert_eq!(receipt.cost.as_deref(), Some("$0.01"));
+    assert_eq!(receipt.time, None);
+    assert_eq!(receipt.capabilities[0].name, "search");
+    assert!(!format!("{receipt:?}").contains("must not be projected"));
+}
+
+#[test]
 fn failed_delete_leaves_the_run_untouched() {
     let db = TestDb::new();
     let mut journal = RunJournal::open(db.as_ref()).unwrap();
