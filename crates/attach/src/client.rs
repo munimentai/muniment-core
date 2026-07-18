@@ -168,6 +168,7 @@ mod linux {
     };
     use serde::de::DeserializeOwned;
     use serde_json::Value;
+    use std::collections::VecDeque;
     use std::env;
     use std::fs::File;
     use std::io::{self, Read, Write};
@@ -192,7 +193,9 @@ mod linux {
         current_run_seq: u64,
         highest_run_seq: u64,
         acknowledged_run_seq: u64,
+        max_unacknowledged_events: usize,
         caught_up: bool,
+        pending_messages: VecDeque<RunStreamMessage>,
     }
 
     /// An authorization bound to the connection on which pairing completed.
@@ -200,6 +203,7 @@ mod linux {
         stream: UnixStream,
         capability: String,
         summary: AuthorizationSummary,
+        authorized_at: Instant,
         io_timeout: Duration,
         active_run_stream: Option<ActiveRunStream>,
     }
@@ -470,7 +474,9 @@ mod linux {
                 current_run_seq: summary.current_run_seq,
                 highest_run_seq: after_run_seq,
                 acknowledged_run_seq: after_run_seq,
+                max_unacknowledged_events: summary.window.max_events,
                 caught_up: false,
+                pending_messages: VecDeque::new(),
             });
             Ok(summary)
         }
@@ -501,22 +507,33 @@ mod linux {
             let deadline = deadline(self.io_timeout);
             let bytes = encode_frame(&request).map_err(map_frame_error)?;
             write_all_before(&mut self.stream, &bytes, deadline)?;
-            let value = read_value(&mut self.stream, deadline)?;
-            if value
-                .get("protocol")
-                .and_then(Value::as_str)
-                .is_some_and(|p| p != PROTOCOL)
-            {
-                return Err(ClientError::ProtocolIncompatible);
-            }
-            let response =
+            let response = loop {
+                let value = read_value(&mut self.stream, deadline)?;
+                if value
+                    .get("protocol")
+                    .and_then(Value::as_str)
+                    .is_some_and(|p| p != PROTOCOL)
+                {
+                    return Err(ClientError::ProtocolIncompatible);
+                }
                 match serde_json::from_value(value).map_err(|_| ClientError::UnexpectedMessage)? {
-                    Envelope::Response(response) if response.request_id == request_id => response,
+                    Envelope::Response(response) if response.request_id == request_id => {
+                        break response;
+                    }
                     Envelope::Error(error) if error.request_id.as_ref() == Some(&request_id) => {
                         return Err(map_protocol_error(error.error.code()));
                     }
+                    Envelope::Event(event) => {
+                        let message = self.validate_run_stream_event(event)?;
+                        self.active_run_stream
+                            .as_mut()
+                            .ok_or(ClientError::UnexpectedMessage)?
+                            .pending_messages
+                            .push_back(message);
+                    }
                     _ => return Err(ClientError::UnexpectedMessage),
-                };
+                }
+            };
             #[derive(serde::Deserialize)]
             #[serde(deny_unknown_fields)]
             struct Acknowledged {
@@ -538,11 +555,23 @@ mod linux {
         }
 
         pub fn read_run_stream_message(&mut self) -> Result<RunStreamMessage, ClientError> {
-            let active = self
+            if let Some(message) = self
                 .active_run_stream
                 .as_mut()
-                .ok_or(ClientError::UnexpectedMessage)?;
-            let value = read_value(&mut self.stream, deadline(self.io_timeout))?;
+                .ok_or(ClientError::UnexpectedMessage)?
+                .pending_messages
+                .pop_front()
+            {
+                return Ok(message);
+            }
+            let authorization_remaining = Duration::from_secs(self.summary.expires_in_seconds)
+                .saturating_sub(self.authorized_at.elapsed());
+            let wait =
+                authorization_remaining.min(Duration::from_secs(self.summary.idle_timeout_seconds));
+            if wait.is_zero() {
+                return Err(ClientError::AuthorizationExpired);
+            }
+            let value = read_value(&mut self.stream, deadline(wait))?;
             if value
                 .get("protocol")
                 .and_then(Value::as_str)
@@ -558,6 +587,17 @@ mod linux {
                     }
                     _ => return Err(ClientError::UnexpectedMessage),
                 };
+            self.validate_run_stream_event(event)
+        }
+
+        fn validate_run_stream_event(
+            &mut self,
+            event: crate::Event,
+        ) -> Result<RunStreamMessage, ClientError> {
+            let active = self
+                .active_run_stream
+                .as_mut()
+                .ok_or(ClientError::UnexpectedMessage)?;
             if event.subscription_id != active.subscription_id
                 || event.run_id.as_ref() != Some(&active.run_id)
             {
@@ -568,6 +608,8 @@ mod linux {
                     let run_seq = event.run_seq.ok_or(ClientError::UnexpectedMessage)?;
                     if active.highest_run_seq.checked_add(1) != Some(run_seq)
                         || (!active.caught_up && run_seq > active.current_run_seq)
+                        || run_seq.saturating_sub(active.acknowledged_run_seq)
+                            > active.max_unacknowledged_events as u64
                     {
                         return Err(ClientError::UnexpectedMessage);
                     }
@@ -764,6 +806,7 @@ mod linux {
                 expires_in_seconds: authorized.expires_at,
                 idle_timeout_seconds: authorized.idle_timeout_seconds,
             },
+            authorized_at: Instant::now(),
             io_timeout,
             active_run_stream: None,
         })
