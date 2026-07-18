@@ -19,12 +19,21 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 use uuid::{Uuid, Version};
 
 const SCHEMA_VERSION: i64 = 1;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const COMMIT_HINT_CAPACITY: usize = 64;
+
+/// A loss-tolerant wake-up hint. SQLite remains the authoritative event source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JournalCommitHint {
+    pub run_id: String,
+    pub run_seq: u64,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CasReference {
@@ -188,6 +197,12 @@ struct ThreadProjectionCursor {
 pub(crate) struct JournalCoordination {
     pub(crate) operation: Mutex<()>,
     pub(crate) generation: std::sync::atomic::AtomicU64,
+    subscribers: Mutex<Vec<CommitSubscriber>>,
+}
+
+struct CommitSubscriber {
+    run_id: String,
+    sender: SyncSender<JournalCommitHint>,
 }
 
 fn coordination_for(path: &Path) -> Arc<JournalCoordination> {
@@ -201,6 +216,7 @@ fn coordination_for(path: &Path) -> Arc<JournalCoordination> {
     let coordination = Arc::new(JournalCoordination {
         operation: Mutex::new(()),
         generation: std::sync::atomic::AtomicU64::new(0),
+        subscribers: Mutex::new(Vec::new()),
     });
     journals.insert(key, Arc::downgrade(&coordination));
     coordination
@@ -234,7 +250,66 @@ fn normalized_path(path: &Path) -> PathBuf {
         })
 }
 
+fn publish_commit_hint(coordination: Option<&JournalCoordination>, run_id: &str, run_seq: u64) {
+    let Some(coordination) = coordination else {
+        return;
+    };
+    let hint = JournalCommitHint {
+        run_id: run_id.to_owned(),
+        run_seq,
+    };
+    coordination
+        .subscribers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|subscriber| {
+            if subscriber.run_id != run_id {
+                return true;
+            }
+            !matches!(
+                subscriber.sender.try_send(hint.clone()),
+                Err(TrySendError::Disconnected(_))
+            )
+        });
+}
+
 impl RunJournal {
+    /// Registers a bounded commit-hint receiver and returns the run's committed
+    /// high-water sequence at the same coordination boundary. Hints may be
+    /// dropped under backpressure; consumers recover by reading SQLite after
+    /// `high_water`.
+    pub fn subscribe_commits(
+        &mut self,
+        run_id: &str,
+    ) -> Result<(u64, Receiver<JournalCommitHint>), JournalError> {
+        let coordination = self.coordination.clone().ok_or_else(|| {
+            JournalError::InvalidEnvelope(
+                "commit subscriptions require a file-backed journal".into(),
+            )
+        })?;
+        let _operation = coordination.operation.lock().unwrap();
+        self.refresh_after_compaction()?;
+        let high_water = self
+            .connection
+            .as_ref()
+            .expect("journal connection is always present outside compaction")
+            .query_row(
+                "SELECT COALESCE(MAX(run_seq), 0) FROM events WHERE run_id=?1",
+                [run_id],
+                |row| row.get(0),
+            )?;
+        let (sender, receiver) = mpsc::sync_channel(COMMIT_HINT_CAPACITY);
+        coordination
+            .subscribers
+            .lock()
+            .unwrap()
+            .push(CommitSubscriber {
+                run_id: run_id.to_owned(),
+                sender,
+            });
+        Ok((high_water, receiver))
+    }
+
     /// Reads retained events after a committed sequence from a single bounded snapshot.
     pub fn workspace_catch_up(
         &mut self,
@@ -476,6 +551,7 @@ impl RunJournal {
             params![event.run_id, workspace],
         )?;
         tx.commit()?;
+        publish_commit_hint(coordination.as_deref(), &event.run_id, event.run_seq);
         Ok(())
     }
 
@@ -561,6 +637,11 @@ impl RunJournal {
             update_thread_projection(&tx, event)?;
         }
         tx.commit()?;
+        publish_commit_hint(
+            coordination.as_deref(),
+            run_id,
+            events.last().expect("non-empty batch").run_seq,
+        );
         Ok(())
     }
 

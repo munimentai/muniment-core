@@ -10,6 +10,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 static NEXT_DB: AtomicU64 = AtomicU64::new(0);
 struct TestDb(PathBuf);
@@ -81,6 +83,84 @@ fn cas_payload(hash: &str) -> EventPayload {
             byte_length: 1,
         },
     }
+}
+
+#[test]
+fn commit_subscription_registration_cannot_miss_a_racing_commit() {
+    let db = TestDb::new();
+    let mut subscriber = RunJournal::open(&db).unwrap();
+    let mut writer = RunJournal::open(&db).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let writer_barrier = barrier.clone();
+    let handle = thread::spawn(move || {
+        writer_barrier.wait();
+        writer.append(0, &event(1)).unwrap();
+    });
+
+    barrier.wait();
+    let (high_water, receiver) = subscriber.subscribe_commits(RUN).unwrap();
+    handle.join().unwrap();
+
+    if high_water == 0 {
+        assert_eq!(receiver.try_recv().unwrap().run_seq, 1);
+    } else {
+        assert_eq!(high_water, 1);
+        assert!(receiver.try_recv().is_err());
+    }
+}
+
+#[test]
+fn batch_commit_publishes_only_its_final_high_water() {
+    let db = TestDb::new();
+    let mut journal = RunJournal::open(&db).unwrap();
+    let (_, receiver) = journal.subscribe_commits(RUN).unwrap();
+
+    let batch = [event(1), event(2), event(3)];
+    journal.append_batch(0, &batch).unwrap();
+    assert_eq!(receiver.try_recv().unwrap().run_seq, 3);
+    assert!(receiver.try_recv().is_err());
+
+    journal.append_batch(0, &batch).unwrap();
+    assert!(
+        receiver.try_recv().is_err(),
+        "an exact retry emitted a hint"
+    );
+}
+
+#[test]
+fn commit_hints_cross_file_backed_journal_handles() {
+    let db = TestDb::new();
+    let mut subscriber = RunJournal::open(&db).unwrap();
+    let mut writer = RunJournal::open(&db).unwrap();
+    let (high_water, receiver) = subscriber.subscribe_commits(RUN).unwrap();
+    assert_eq!(high_water, 0);
+
+    writer.append_new_run("workspace-a", &event(1)).unwrap();
+    assert_eq!(receiver.try_recv().unwrap().run_seq, 1);
+}
+
+#[test]
+fn full_and_dropped_commit_subscribers_do_not_affect_appends() {
+    let db = TestDb::new();
+    let mut journal = RunJournal::open(&db).unwrap();
+    let (_, slow) = journal.subscribe_commits(RUN).unwrap();
+    let (_, dropped) = journal.subscribe_commits(RUN).unwrap();
+    drop(dropped);
+
+    for seq in 1..=65 {
+        journal.append(seq - 1, &event(seq)).unwrap();
+    }
+    assert_eq!(journal.events(RUN).unwrap().len(), 65);
+    for expected in 1..=64 {
+        assert_eq!(slow.try_recv().unwrap().run_seq, expected);
+    }
+    assert!(
+        slow.try_recv().is_err(),
+        "the bounded queue accepted overflow"
+    );
+
+    journal.append(65, &event(66)).unwrap();
+    assert_eq!(slow.try_recv().unwrap().run_seq, 66);
 }
 
 #[test]
