@@ -130,6 +130,28 @@ pub struct RunEventPage {
     pub next_cursor: Option<String>,
 }
 
+/// Sequence bounds and a bounded retained slice captured from one workspace-owned run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunCatchUpPage {
+    pub first_available_run_seq: u64,
+    pub current_run_seq: u64,
+    pub events: Vec<RunEventProjection>,
+    pub exhausted: bool,
+}
+
+/// The bounded subset of a retained event needed by companion catch-up.
+///
+/// These fields are stored in dedicated columns, so reading a redacted stream
+/// never loads or parses the potentially large raw journal payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunEventProjection {
+    pub run_id: String,
+    pub run_seq: u64,
+    pub event_type: String,
+    pub event_version: u32,
+    pub recorded_at: String,
+}
+
 #[derive(Debug)]
 pub enum RunEventPageError {
     InvalidLimit,
@@ -213,6 +235,88 @@ fn normalized_path(path: &Path) -> PathBuf {
 }
 
 impl RunJournal {
+    /// Reads retained events after a committed sequence from a single bounded snapshot.
+    pub fn workspace_catch_up(
+        &mut self,
+        workspace: &str,
+        run_id: &str,
+        after_run_seq: u64,
+        limit: usize,
+        byte_limit: usize,
+    ) -> Result<RunCatchUpPage, RunEventPageError> {
+        if !(1..=1_024).contains(&limit) || byte_limit == 0 {
+            return Err(RunEventPageError::InvalidLimit);
+        }
+        let coordination = self.coordination.clone();
+        let _operation = coordination
+            .as_ref()
+            .map(|state| state.operation.lock().unwrap());
+        self.refresh_after_compaction()
+            .map_err(RunEventPageError::Journal)?;
+        let connection = self
+            .connection
+            .as_ref()
+            .expect("journal connection is always present outside compaction");
+        let bounds = connection
+            .query_row(
+                "SELECT MIN(e.run_seq), MAX(e.run_seq) FROM events e \
+                 JOIN run_workspaces w ON w.run_id=e.run_id \
+                 WHERE e.run_id=?1 AND w.workspace=?2",
+                params![run_id, workspace],
+                |row| Ok((row.get::<_, Option<u64>>(0)?, row.get::<_, Option<u64>>(1)?)),
+            )
+            .map_err(JournalError::from)
+            .map_err(RunEventPageError::Journal)?;
+        let (Some(first), Some(current)) = bounds else {
+            return Err(RunEventPageError::NotFoundOrInaccessible);
+        };
+        if after_run_seq < first.saturating_sub(1) || after_run_seq > current {
+            return Err(RunEventPageError::InvalidCursor);
+        }
+        let mut statement = connection
+            .prepare(
+                "SELECT run_id,run_seq,event_type,event_version,recorded_at, \
+                 length(CAST(run_id AS BLOB))+length(CAST(event_type AS BLOB))+ \
+                 length(CAST(recorded_at AS BLOB)) \
+                 FROM events WHERE run_id=?1 AND run_seq>?2 \
+                 AND run_seq<=?3 ORDER BY run_seq LIMIT ?4",
+            )
+            .map_err(JournalError::from)
+            .map_err(RunEventPageError::Journal)?;
+        let mut rows = statement
+            .query(params![run_id, after_run_seq, current, (limit + 1) as u64])
+            .map_err(JournalError::from)
+            .map_err(RunEventPageError::Journal)?;
+        let mut events = Vec::with_capacity(limit);
+        let mut retained_bytes = 0usize;
+        let mut exhausted = true;
+        while let Some(row) = rows
+            .next()
+            .map_err(JournalError::from)
+            .map_err(RunEventPageError::Journal)?
+        {
+            let field_bytes = row.get::<_, usize>(5).map_err(JournalError::from)?;
+            if events.len() == limit || field_bytes > byte_limit.saturating_sub(retained_bytes) {
+                exhausted = false;
+                break;
+            }
+            events.push(RunEventProjection {
+                run_id: row.get(0).map_err(JournalError::from)?,
+                run_seq: row.get(1).map_err(JournalError::from)?,
+                event_type: row.get(2).map_err(JournalError::from)?,
+                event_version: row.get(3).map_err(JournalError::from)?,
+                recorded_at: row.get(4).map_err(JournalError::from)?,
+            });
+            retained_bytes += field_bytes;
+        }
+        Ok(RunCatchUpPage {
+            first_available_run_seq: first,
+            current_run_seq: current,
+            events,
+            exhausted,
+        })
+    }
+
     pub fn thread_projection_boundary(
         &self,
         workspace: &str,

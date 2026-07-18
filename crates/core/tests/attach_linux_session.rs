@@ -3,15 +3,19 @@
 use muniment_core::attach::linux::{
     run_authenticated_session_with, run_authenticated_session_with_authorization, ApprovalDecision,
     AttachSessionError, AuthorizationSessionDependencies, CompanionProvenance, PeerCredentials,
-    RedactedThreadSummary, RunStartAccepted, RunStartRequest, ThreadListPage, ThreadListRequest,
-    ThreadListService, ThreadOpenRequest, MAX_RUN_START_CONTEXT_LENGTH, MAX_RUN_START_TEXT_LENGTH,
+    RedactedThreadSummary, RunStartAccepted, RunStartRequest, RunStreamPage, ThreadListPage,
+    ThreadListRequest, ThreadListService, ThreadOpenRequest, MAX_RUN_START_CONTEXT_LENGTH,
+    MAX_RUN_START_TEXT_LENGTH,
 };
 use muniment_core::attach::{
     decode_frame, encode_frame, Approval, AuthorizationClock, AuthorizationTokenGenerator,
-    Authorized, ErrorAction, ErrorCode, ErrorEnvelope, Hello, Id, Operation, Protocol, Request,
-    Response, VersionRange, Welcome, CHALLENGE_LIFETIME, MAX_FRAME_LENGTH, MAX_JSON_DEPTH,
+    Authorized, Envelope, ErrorAction, ErrorCode, ErrorEnvelope, Event, EventName, Hello, Id,
+    Operation, Protocol, Request, Response, VersionRange, Welcome, CHALLENGE_LIFETIME,
+    MAX_FRAME_LENGTH, MAX_JSON_DEPTH, MAX_RUN_STREAM_WINDOW_BYTES, MAX_RUN_STREAM_WINDOW_EVENTS,
 };
-use muniment_core::journal::{EventEnvelope, EventPayload, Provenance, RunJournal};
+use muniment_core::journal::{
+    EventEnvelope, EventPayload, Provenance, RunEventProjection, RunJournal,
+};
 use serde_json::json;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -107,6 +111,59 @@ fn unavailable_service(
 struct StartService {
     calls: Vec<(String, RunStartRequest, Id, Id, CompanionProvenance)>,
     output: Option<RunStartAccepted>,
+}
+
+struct StreamService {
+    page: RunStreamPage,
+}
+
+impl ThreadListService for StreamService {
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, muniment_core::attach::ProtocolError> {
+        panic!("thread reads must not dispatch")
+    }
+
+    fn stream_run(
+        &mut self,
+        workspace: &str,
+        run_id: &str,
+        _: u64,
+    ) -> Result<RunStreamPage, muniment_core::attach::ProtocolError> {
+        assert_eq!(workspace, "workspace-1");
+        assert_eq!(run_id, self.page.run_id);
+        Ok(self.page.clone())
+    }
+}
+
+fn stream_projection(run_id: &str, run_seq: u64, event_type: String) -> RunEventProjection {
+    RunEventProjection {
+        run_id: run_id.into(),
+        run_seq,
+        event_type,
+        event_version: 1,
+        recorded_at: "2026-07-16T03:00:00Z".into(),
+    }
+}
+
+fn projected_run_event_frame_len(run_id: &str, run_seq: u64, event_type: &str) -> usize {
+    encode_frame(&Event {
+        protocol: Protocol,
+        subscription_id: Id::new("0".repeat(32)).unwrap(),
+        event: EventName::RunEvent,
+        run_id: Some(Id::new(run_id.to_owned()).unwrap()),
+        run_seq: Some(run_seq),
+        body: json!({
+            "event_type": event_type,
+            "event_version": 1,
+            "recorded_at": "2026-07-16T03:00:00Z",
+            "payload": {"withheld": true},
+        }),
+    })
+    .unwrap()
+    .len()
 }
 
 impl ThreadListService for StartService {
@@ -679,6 +736,422 @@ fn authorized_thread_list_is_bounded_paginated_and_correlated() {
     );
     assert_eq!(response.body["next_cursor"], "opaque-page-3");
     assert_eq!(calls.get(), 1);
+}
+
+#[test]
+fn authorized_run_stream_catches_up_in_order_with_redacted_projection() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000011";
+    let mut journal = RunJournal::open(":memory:").unwrap();
+    journal
+        .append(0, &prompt(RUN, "private prompt", "2026-07-16T03:00:00Z"))
+        .unwrap();
+    journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello(1, 1)).unwrap();
+    client
+        .write_all(&request(
+            41,
+            Operation::RunStream,
+            json!({"run_id": RUN, "after_run_seq": 0}),
+        ))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(
+        dispatch_session(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            &mut journal,
+        ),
+        Ok(())
+    );
+    let response: Response = read_frame(&mut client);
+    assert_eq!(response.body["run_id"], RUN);
+    assert_eq!(response.body["first_available_run_seq"], 1);
+    assert_eq!(response.body["current_run_seq"], 1);
+    let subscription = response.body["subscription_id"].as_str().unwrap();
+    let Envelope::Event(event) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected run event")
+    };
+    assert_eq!(event.event, EventName::RunEvent);
+    assert_eq!(event.subscription_id.as_str(), subscription);
+    assert_eq!(event.run_seq, Some(1));
+    assert_eq!(event.body["payload"]["withheld"], true);
+    assert!(!event.body.to_string().contains("private"));
+    let Envelope::Event(caught_up) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected caught-up event")
+    };
+    assert_eq!(caught_up.event, EventName::SubscriptionCaughtUp);
+    assert_eq!(caught_up.subscription_id.as_str(), subscription);
+}
+
+#[test]
+fn run_stream_does_not_read_or_emit_an_oversized_inline_payload() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000012";
+    let secret = "payload-secret-".repeat(MAX_FRAME_LENGTH);
+    let mut event = prompt(RUN, "placeholder", "2026-07-16T03:00:00Z");
+    event.payload = EventPayload::Inline {
+        payload_json: json!({"secret": secret}),
+    };
+    let mut journal = RunJournal::open(":memory:").unwrap();
+    journal.append(0, &event).unwrap();
+    journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello(1, 1)).unwrap();
+    client
+        .write_all(&request(
+            42,
+            Operation::RunStream,
+            json!({"run_id": RUN, "after_run_seq": 0}),
+        ))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(
+        dispatch_session(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            &mut journal,
+        ),
+        Ok(())
+    );
+    let response: Response = read_frame(&mut client);
+    let event: Envelope = read_frame(&mut client);
+    let caught_up: Envelope = read_frame(&mut client);
+    let encoded = format!("{response:?}{event:?}{caught_up:?}");
+    assert!(!encoded.contains("payload-secret"));
+    assert!(encoded.len() < 10_000);
+}
+
+#[test]
+fn run_stream_rejects_missing_scope_other_workspace_and_strictly_malformed_bodies() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000013";
+    let cases = [
+        (
+            false,
+            json!({"run_id": RUN, "after_run_seq": 0}),
+            ErrorCode::Unauthorized,
+        ),
+        (
+            true,
+            json!({"run_id": RUN, "after_run_seq": 0}),
+            ErrorCode::InvalidRequest,
+        ),
+        (true, json!({"run_id": RUN}), ErrorCode::InvalidRequest),
+        (
+            true,
+            json!({"run_id": RUN, "after_run_seq": -1}),
+            ErrorCode::InvalidRequest,
+        ),
+        (
+            true,
+            json!({"run_id": RUN, "after_run_seq": 0, "extra": true}),
+            ErrorCode::InvalidRequest,
+        ),
+    ];
+    for (has_scope, body, expected) in cases {
+        let mut journal = RunJournal::open(":memory:").unwrap();
+        journal
+            .append(0, &prompt(RUN, "private", "2026-07-16T03:00:00Z"))
+            .unwrap();
+        journal.bind_run_workspace(RUN, "workspace-2").unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&hello(1, 1)).unwrap();
+        client
+            .write_all(&request(43, Operation::RunStream, body))
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut approved = approval();
+        if !has_scope {
+            approved.scopes.clear();
+        }
+        let _ = dispatch_session_with_approval(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            approved,
+            &mut journal,
+        );
+        let error: ErrorEnvelope = read_frame(&mut client);
+        assert_eq!(error.error.code(), expected);
+        assert!(!serde_json::to_string(&error).unwrap().contains("private"));
+    }
+}
+
+#[test]
+fn run_stream_rejects_missing_removed_ahead_and_expired_cursors() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000014";
+    for (present, after, expected) in [
+        (false, 0, ErrorCode::InvalidRequest),
+        (true, 2, ErrorCode::InvalidCursor),
+    ] {
+        let mut journal = RunJournal::open(":memory:").unwrap();
+        if present {
+            journal
+                .append(0, &prompt(RUN, "private", "2026-07-16T03:00:00Z"))
+                .unwrap();
+            journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+        }
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&hello(1, 1)).unwrap();
+        client
+            .write_all(&request(
+                44,
+                Operation::RunStream,
+                json!({"run_id": RUN, "after_run_seq": after}),
+            ))
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        dispatch_session(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            &mut journal,
+        )
+        .unwrap();
+        let error: ErrorEnvelope = read_frame(&mut client);
+        assert_eq!(error.error.code(), expected);
+    }
+
+    let mut journal = RunJournal::open(":memory:").unwrap();
+    journal
+        .append(0, &prompt(RUN, "private", "2026-07-16T03:00:00Z"))
+        .unwrap();
+    journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+    journal.delete_run(RUN).unwrap();
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello(1, 1)).unwrap();
+    client
+        .write_all(&request(
+            45,
+            Operation::RunStream,
+            json!({"run_id": RUN, "after_run_seq": 0}),
+        ))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    dispatch_session(
+        &mut client,
+        server,
+        TestClock(Rc::new(Cell::new(Duration::ZERO))),
+        &mut journal,
+    )
+    .unwrap();
+    let error: ErrorEnvelope = read_frame(&mut client);
+    assert_eq!(error.error.code(), ErrorCode::InvalidRequest);
+}
+
+#[test]
+fn run_stream_resumes_in_order_without_duplicates_and_marks_only_exhausted_catch_up() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000015";
+    let mut events = Vec::new();
+    for seq in 1..=3 {
+        let mut event = prompt(RUN, "private", "2026-07-16T03:00:00Z");
+        event.event_id = format!("0190a200-0000-7000-8000-{seq:012x}");
+        event.run_seq = seq;
+        event.event_type = format!("safe.event.{seq}");
+        events.push(event);
+    }
+    let mut journal = RunJournal::open(":memory:").unwrap();
+    journal.append_batch(0, &events).unwrap();
+    journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello(1, 1)).unwrap();
+    client
+        .write_all(&request(
+            46,
+            Operation::RunStream,
+            json!({"run_id": RUN, "after_run_seq": 1}),
+        ))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    dispatch_session(
+        &mut client,
+        server,
+        TestClock(Rc::new(Cell::new(Duration::ZERO))),
+        &mut journal,
+    )
+    .unwrap();
+    let response: Response = read_frame(&mut client);
+    let subscription = response.body["subscription_id"].as_str().unwrap();
+    for expected_seq in [2, 3] {
+        let Envelope::Event(event) = read_frame::<Envelope>(&mut client) else {
+            panic!("expected event")
+        };
+        assert_eq!(event.event, EventName::RunEvent);
+        assert_eq!(event.subscription_id.as_str(), subscription);
+        assert_eq!(event.run_id.as_ref().unwrap().as_str(), RUN);
+        assert_eq!(event.run_seq, Some(expected_seq));
+        assert!(!event.body.to_string().contains("private"));
+    }
+    let Envelope::Event(caught) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected caught up")
+    };
+    assert_eq!(caught.event, EventName::SubscriptionCaughtUp);
+    assert_eq!(caught.run_seq, Some(3));
+}
+
+#[test]
+fn run_stream_event_window_pauses_without_caught_up() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000016";
+    let events = (1..=(MAX_RUN_STREAM_WINDOW_EVENTS as u64 + 1))
+        .map(|seq| stream_projection(RUN, seq, "safe.event".into()))
+        .collect();
+    let mut service = StreamService {
+        page: RunStreamPage {
+            run_id: RUN.into(),
+            first_available_run_seq: 1,
+            current_run_seq: MAX_RUN_STREAM_WINDOW_EVENTS as u64 + 1,
+            events,
+            exhausted: true,
+        },
+    };
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let server_thread = thread::spawn(move || {
+        run_authenticated_session_with_authorization(
+            server,
+            credentials(),
+            "0.1.0",
+            Duration::from_secs(1),
+            AuthorizationSessionDependencies {
+                fill_random: |bytes: &mut [u8]| {
+                    bytes.fill(9);
+                    Ok(())
+                },
+                clock: TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                tokens: TestTokens(1),
+                approvals: |_: &muniment_core::attach::PairingChallenge, _: Duration| {
+                    Some(ApprovalDecision::Approve(approval()))
+                },
+            },
+            &mut service,
+        )
+    });
+    client.write_all(&hello(1, 1)).unwrap();
+    let _: Welcome = read_frame(&mut client);
+    let _: Authorized = read_frame(&mut client);
+    client
+        .write_all(&request(
+            47,
+            Operation::RunStream,
+            json!({"run_id": RUN, "after_run_seq": 0}),
+        ))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let _: Response = read_frame(&mut client);
+    let mut sequences = Vec::new();
+    loop {
+        let mut prefix = [0; 4];
+        if client.read_exact(&mut prefix).is_err() {
+            break;
+        }
+        let mut frame = vec![0; 4 + u32::from_be_bytes(prefix) as usize];
+        frame[..4].copy_from_slice(&prefix);
+        client.read_exact(&mut frame[4..]).unwrap();
+        let (Envelope::Event(event), _) = decode_frame(&frame).unwrap().unwrap() else {
+            panic!("expected event")
+        };
+        assert_eq!(event.event, EventName::RunEvent);
+        sequences.push(event.run_seq.unwrap());
+    }
+    assert_eq!(server_thread.join().unwrap(), Ok(()));
+    assert_eq!(sequences.len(), MAX_RUN_STREAM_WINDOW_EVENTS);
+    assert_eq!(sequences.first(), Some(&1));
+    assert_eq!(
+        sequences.last(),
+        Some(&(MAX_RUN_STREAM_WINDOW_EVENTS as u64))
+    );
+}
+
+#[test]
+fn run_stream_byte_window_counts_exact_framed_bytes_and_pauses_one_byte_over() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000017";
+    let event_count = MAX_RUN_STREAM_WINDOW_BYTES.div_ceil(60_000);
+    let base_target = MAX_RUN_STREAM_WINDOW_BYTES / event_count;
+    let remainder = MAX_RUN_STREAM_WINDOW_BYTES % event_count;
+    let targets = (0..event_count)
+        .map(|index| base_target + usize::from(index < remainder))
+        .collect::<Vec<_>>();
+    let mut events = Vec::new();
+    for (index, target) in targets.iter().copied().enumerate() {
+        let seq = index as u64 + 1;
+        let base = projected_run_event_frame_len(RUN, seq, "x") - 1;
+        let event_type = "x".repeat(target - base);
+        assert_eq!(projected_run_event_frame_len(RUN, seq, &event_type), target);
+        assert!(target <= MAX_FRAME_LENGTH + 4);
+        events.push(stream_projection(RUN, seq, event_type));
+    }
+    let over_seq = events.len() as u64 + 1;
+    events.push(stream_projection(RUN, over_seq, "one-byte-over".into()));
+    let mut service = StreamService {
+        page: RunStreamPage {
+            run_id: RUN.into(),
+            first_available_run_seq: 1,
+            current_run_seq: over_seq,
+            events,
+            exhausted: true,
+        },
+    };
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let server_thread = thread::spawn(move || {
+        run_authenticated_session_with_authorization(
+            server,
+            credentials(),
+            "0.1.0",
+            Duration::from_secs(2),
+            AuthorizationSessionDependencies {
+                fill_random: |bytes: &mut [u8]| {
+                    bytes.fill(9);
+                    Ok(())
+                },
+                clock: TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                tokens: TestTokens(1),
+                approvals: |_: &muniment_core::attach::PairingChallenge, _: Duration| {
+                    Some(ApprovalDecision::Approve(approval()))
+                },
+            },
+            &mut service,
+        )
+    });
+    client.write_all(&hello(1, 1)).unwrap();
+    let _: Welcome = read_frame(&mut client);
+    let _: Authorized = read_frame(&mut client);
+    client
+        .write_all(&request(
+            48,
+            Operation::RunStream,
+            json!({"run_id": RUN, "after_run_seq": 0}),
+        ))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let response: Response = read_frame(&mut client);
+    assert_eq!(
+        response.body["window"]["max_bytes"],
+        MAX_RUN_STREAM_WINDOW_BYTES
+    );
+    let mut event_bytes = 0;
+    let mut sequences = Vec::new();
+    loop {
+        let mut prefix = [0; 4];
+        if client.read_exact(&mut prefix).is_err() {
+            break;
+        }
+        let mut frame = vec![0; 4 + u32::from_be_bytes(prefix) as usize];
+        frame[..4].copy_from_slice(&prefix);
+        client.read_exact(&mut frame[4..]).unwrap();
+        event_bytes += frame.len();
+        let (Envelope::Event(event), _) = decode_frame(&frame).unwrap().unwrap() else {
+            panic!("expected event")
+        };
+        assert_eq!(event.event, EventName::RunEvent);
+        sequences.push(event.run_seq.unwrap());
+    }
+    assert_eq!(server_thread.join().unwrap(), Ok(()));
+    assert_eq!(sequences.len(), targets.len());
+    assert_eq!(sequences.last(), Some(&(targets.len() as u64)));
+    assert_eq!(event_bytes, MAX_RUN_STREAM_WINDOW_BYTES);
 }
 
 #[test]

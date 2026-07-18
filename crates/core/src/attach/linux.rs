@@ -15,8 +15,12 @@ use std::time::{Duration, Instant};
 use super::{
     authorized, encode_frame, welcome, Approval, AuthorizationClock, AuthorizationError,
     AuthorizationState, AuthorizationTokenGenerator, ConnectionBinding, Envelope, ErrorEnvelope,
-    Failure, FirstMessage, NegotiationError, Operation, Protocol, ProtocolError, Request, Response,
-    Success, VersionRange, CHALLENGE_LIFETIME, MAX_FRAME_LENGTH, MAX_TEXT_LENGTH,
+    Event, EventName, Failure, FirstMessage, NegotiationError, Operation, Protocol, ProtocolError,
+    Request, Response, Success, VersionRange, CHALLENGE_LIFETIME, MAX_FRAME_LENGTH,
+    MAX_TEXT_LENGTH,
+};
+use super::{
+    RunEventAdmission, RunStreamCursor, MAX_RUN_STREAM_WINDOW_BYTES, MAX_RUN_STREAM_WINDOW_EVENTS,
 };
 use crate::journal::{summaries::RunSummaryListError, RunEventPageError, RunJournal};
 
@@ -416,6 +420,15 @@ pub struct RunStartAccepted {
     pub accepted_at: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunStreamPage {
+    pub run_id: String,
+    pub first_available_run_seq: u64,
+    pub current_run_seq: u64,
+    pub events: Vec<crate::journal::RunEventProjection>,
+    pub exhausted: bool,
+}
+
 /// Deterministic desktop service seam for authorized attach requests.
 pub trait ThreadListService {
     fn list_threads(
@@ -442,6 +455,15 @@ pub trait ThreadListService {
     ) -> Result<RunStartAccepted, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
+
+    fn stream_run(
+        &mut self,
+        _workspace: &str,
+        _run_id: &str,
+        _after_run_seq: u64,
+    ) -> Result<RunStreamPage, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
 }
 
 impl<F> ThreadListService for F
@@ -458,6 +480,35 @@ where
 }
 
 impl ThreadListService for RunJournal {
+    fn stream_run(
+        &mut self,
+        workspace: &str,
+        run_id: &str,
+        after_run_seq: u64,
+    ) -> Result<RunStreamPage, ProtocolError> {
+        let page = self
+            .workspace_catch_up(
+                workspace,
+                run_id,
+                after_run_seq,
+                MAX_RUN_STREAM_WINDOW_EVENTS,
+                MAX_RUN_STREAM_WINDOW_BYTES,
+            )
+            .map_err(|error| match error {
+                RunEventPageError::InvalidCursor => ProtocolError::invalid_cursor(),
+                RunEventPageError::NotFoundOrInaccessible => ProtocolError::invalid_request(),
+                RunEventPageError::InvalidLimit => ProtocolError::invalid_request(),
+                RunEventPageError::Journal(_) => ProtocolError::persistence_failed(),
+            })?;
+        Ok(RunStreamPage {
+            run_id: run_id.to_owned(),
+            first_available_run_seq: page.first_available_run_seq,
+            current_run_seq: page.current_run_seq,
+            events: page.events,
+            exhausted: page.exhausted,
+        })
+    }
+
     fn list_threads(
         &mut self,
         workspace: &str,
@@ -908,7 +959,9 @@ where
             return Err(AttachSessionError::Authorization);
         }
         let required_scope = match request.operation {
-            Operation::ThreadList | Operation::ThreadOpen => Some("thread.read"),
+            Operation::ThreadList | Operation::ThreadOpen | Operation::RunStream => {
+                Some("thread.read")
+            }
             Operation::RunStart => Some("run.write"),
             _ => None,
         };
@@ -932,19 +985,36 @@ where
         }
         let request_id = request.request_id.clone();
         match dispatch_request(request, workspace, provenance.clone(), service) {
-            Ok(body) => {
+            Ok(dispatched) => {
                 let response = Response {
                     protocol: Protocol,
                     request_id,
                     ok: Success,
-                    body,
+                    body: dispatched.body,
                 };
                 let frame =
                     encode_frame(&response).map_err(|_| AttachSessionError::MalformedFrame)?;
                 write_before(stream, &frame, deadline)?;
+                for event in dispatched.events {
+                    let frame =
+                        encode_frame(&event).map_err(|_| AttachSessionError::MalformedFrame)?;
+                    write_before(stream, &frame, deadline)?;
+                }
             }
             Err(error) => write_request_error(stream, Some(request_id), error, deadline),
         }
+    }
+}
+
+struct DispatchResult {
+    body: serde_json::Value,
+    events: Vec<Event>,
+}
+
+fn response_only(body: serde_json::Value) -> DispatchResult {
+    DispatchResult {
+        body,
+        events: Vec::new(),
     }
 }
 
@@ -953,7 +1023,7 @@ fn dispatch_request<S: ThreadListService>(
     workspace: &str,
     provenance: CompanionProvenance,
     service: &mut S,
-) -> Result<serde_json::Value, ProtocolError> {
+) -> Result<DispatchResult, ProtocolError> {
     request.validate_idempotency_key()?;
     if request.operation == Operation::RunStart {
         #[derive(serde::Deserialize)]
@@ -1000,11 +1070,101 @@ fn dispatch_request<S: ThreadListService>(
         {
             return Err(ProtocolError::persistence_failed());
         }
-        return Ok(serde_json::json!({
+        return Ok(response_only(serde_json::json!({
             "run_id": accepted.run_id,
             "committed_seq": accepted.committed_seq,
             "accepted_at": accepted.accepted_at,
-        }));
+        })));
+    }
+    if request.operation == Operation::RunStream {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            run_id: String,
+            after_run_seq: u64,
+        }
+        let body: Body =
+            serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
+        let run_id =
+            super::Id::new(body.run_id.clone()).map_err(|_| ProtocolError::invalid_request())?;
+        let page = service.stream_run(workspace, run_id.as_str(), body.after_run_seq)?;
+        if page.run_id != run_id.as_str()
+            || page.first_available_run_seq == 0
+            || page.first_available_run_seq > page.current_run_seq
+            || page.events.iter().enumerate().any(|(index, event)| {
+                event.run_id != page.run_id
+                    || event.run_seq != body.after_run_seq.saturating_add(index as u64 + 1)
+                    || event.run_seq > page.current_run_seq
+            })
+        {
+            return Err(ProtocolError::persistence_failed());
+        }
+        let mut subscription_random = [0u8; 16];
+        getrandom::fill(&mut subscription_random)
+            .map_err(|_| ProtocolError::persistence_failed())?;
+        let subscription_id = super::Id::new(hex(&subscription_random))
+            .map_err(|_| ProtocolError::persistence_failed())?;
+        let mut cursor = RunStreamCursor::new(
+            subscription_id.clone(),
+            run_id.clone(),
+            page.first_available_run_seq,
+            page.current_run_seq,
+            body.after_run_seq,
+            MAX_RUN_STREAM_WINDOW_EVENTS,
+            MAX_RUN_STREAM_WINDOW_BYTES,
+        )
+        .map_err(|_| ProtocolError::invalid_cursor())?;
+        let mut events = Vec::new();
+        let mut paused = false;
+        for journal_event in page.events {
+            let projection = serde_json::json!({
+                "event_type": journal_event.event_type,
+                "event_version": journal_event.event_version,
+                "recorded_at": journal_event.recorded_at,
+                "payload": { "withheld": true }
+            });
+            let event = Event {
+                protocol: Protocol,
+                subscription_id: subscription_id.clone(),
+                event: EventName::RunEvent,
+                run_id: Some(run_id.clone()),
+                run_seq: Some(journal_event.run_seq),
+                body: projection,
+            };
+            let bytes = encode_frame(&event)
+                .map_err(|_| ProtocolError::persistence_failed())?
+                .len();
+            match cursor
+                .admit_event(&run_id, journal_event.run_seq, bytes)
+                .map_err(|_| ProtocolError::invalid_cursor())?
+            {
+                RunEventAdmission::Sent => events.push(event),
+                RunEventAdmission::Paused => {
+                    paused = true;
+                    break;
+                }
+            }
+        }
+        if page.exhausted && !paused && cursor.highest_sent_run_seq() == page.current_run_seq {
+            events.push(Event {
+                protocol: Protocol,
+                subscription_id: subscription_id.clone(),
+                event: EventName::SubscriptionCaughtUp,
+                run_id: Some(run_id.clone()),
+                run_seq: Some(page.current_run_seq),
+                body: serde_json::json!({}),
+            });
+        }
+        return Ok(DispatchResult {
+            body: serde_json::json!({
+                "subscription_id": subscription_id,
+                "run_id": run_id,
+                "first_available_run_seq": page.first_available_run_seq,
+                "current_run_seq": page.current_run_seq,
+                "window": { "max_events": MAX_RUN_STREAM_WINDOW_EVENTS, "max_bytes": MAX_RUN_STREAM_WINDOW_BYTES }
+            }),
+            events,
+        });
     }
     if request.operation == Operation::ThreadOpen {
         #[derive(serde::Deserialize)]
@@ -1066,7 +1226,7 @@ fn dispatch_request<S: ThreadListService>(
         {
             return Err(ProtocolError::persistence_failed());
         }
-        return Ok(value);
+        return Ok(response_only(value));
     }
     if request.operation != Operation::ThreadList {
         return Err(ProtocolError::unsupported_operation());
@@ -1112,7 +1272,9 @@ fn dispatch_request<S: ThreadListService>(
     {
         return Err(ProtocolError::persistence_failed());
     }
-    serde_json::to_value(page).map_err(|_| ProtocolError::persistence_failed())
+    serde_json::to_value(page)
+        .map(response_only)
+        .map_err(|_| ProtocolError::persistence_failed())
 }
 
 fn read_frame_after_prefix(
