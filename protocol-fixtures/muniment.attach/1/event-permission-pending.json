@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","subscription_id":"00000000000000000000000000000002","event":"permission.pending","run_id":"00000000000000000000000000000003","run_seq":8,"body":{"permission_id":"permission-fixture","summary":"Allow reading the selected file?"}}

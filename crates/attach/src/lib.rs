@@ -3,6 +3,7 @@
 #[cfg(feature = "client")]
 mod client;
 mod envelope;
+pub mod fixtures;
 mod framing;
 mod negotiation;
 

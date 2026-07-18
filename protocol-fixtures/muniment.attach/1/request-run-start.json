@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"00000000000000000000000000000001","operation":"run.start","capability":"fixture-capability","idempotency_key":"00000000000000000000000000000004","body":{"prompt":"Summarize the selected file.","workspace_id":"workspace-fixture"}}

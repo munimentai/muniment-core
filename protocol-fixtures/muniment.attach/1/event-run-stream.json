@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","subscription_id":"00000000000000000000000000000002","event":"run.event","run_id":"00000000000000000000000000000003","run_seq":7,"body":{"kind":"assistant_message","text":"Fixture response."}}
