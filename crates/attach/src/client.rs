@@ -191,6 +191,7 @@ mod linux {
         run_id: Id,
         current_run_seq: u64,
         highest_run_seq: u64,
+        acknowledged_run_seq: u64,
         caught_up: bool,
     }
 
@@ -468,9 +469,72 @@ mod linux {
                 run_id,
                 current_run_seq: summary.current_run_seq,
                 highest_run_seq: after_run_seq,
+                acknowledged_run_seq: after_run_seq,
                 caught_up: false,
             });
             Ok(summary)
+        }
+
+        pub fn acknowledge_run_cursor(&mut self, through_run_seq: u64) -> Result<(), ClientError> {
+            let active = self
+                .active_run_stream
+                .as_ref()
+                .ok_or(ClientError::UnexpectedMessage)?;
+            if through_run_seq <= active.acknowledged_run_seq
+                || through_run_seq > active.highest_run_seq
+            {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            let request_id = fresh_request_id()?;
+            let request = Request {
+                protocol: Protocol,
+                request_id: request_id.clone(),
+                operation: Operation::RunCursorAck,
+                capability: self.capability.clone(),
+                idempotency_key: None,
+                body: serde_json::json!({
+                    "subscription_id": active.subscription_id.as_str(),
+                    "through_run_seq": through_run_seq,
+                }),
+            };
+            let subscription_id = active.subscription_id.clone();
+            let deadline = deadline(self.io_timeout);
+            let bytes = encode_frame(&request).map_err(map_frame_error)?;
+            write_all_before(&mut self.stream, &bytes, deadline)?;
+            let value = read_value(&mut self.stream, deadline)?;
+            if value
+                .get("protocol")
+                .and_then(Value::as_str)
+                .is_some_and(|p| p != PROTOCOL)
+            {
+                return Err(ClientError::ProtocolIncompatible);
+            }
+            let response =
+                match serde_json::from_value(value).map_err(|_| ClientError::UnexpectedMessage)? {
+                    Envelope::Response(response) if response.request_id == request_id => response,
+                    Envelope::Error(error) if error.request_id.as_ref() == Some(&request_id) => {
+                        return Err(map_protocol_error(error.error.code()));
+                    }
+                    _ => return Err(ClientError::UnexpectedMessage),
+                };
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Acknowledged {
+                subscription_id: String,
+                through_run_seq: u64,
+            }
+            let acknowledged: Acknowledged = serde_json::from_value(response.body)
+                .map_err(|_| ClientError::UnexpectedMessage)?;
+            if acknowledged.subscription_id != subscription_id.as_str()
+                || acknowledged.through_run_seq != through_run_seq
+            {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            self.active_run_stream
+                .as_mut()
+                .ok_or(ClientError::UnexpectedMessage)?
+                .acknowledged_run_seq = through_run_seq;
+            Ok(())
         }
 
         pub fn read_run_stream_message(&mut self) -> Result<RunStreamMessage, ClientError> {
@@ -898,6 +962,10 @@ impl AuthorizedClient {
     }
 
     pub fn read_run_stream_message(&mut self) -> Result<RunStreamMessage, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+
+    pub fn acknowledge_run_cursor(&mut self, _through_run_seq: u64) -> Result<(), ClientError> {
         Err(ClientError::UnsupportedPlatform)
     }
 }

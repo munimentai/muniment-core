@@ -1203,7 +1203,10 @@ fn dispatch_request<S: ThreadListService>(
         }
         let events = drain_run_stream(&mut subscriptions[index])?;
         return Ok(DispatchResult {
-            body: serde_json::json!({ "through_run_seq": body.through_run_seq }),
+            body: serde_json::json!({
+                "subscription_id": subscription_id.as_str(),
+                "through_run_seq": body.through_run_seq,
+            }),
             events,
         });
     }
