@@ -542,9 +542,6 @@ mod linux {
                 .active_run_stream
                 .as_mut()
                 .ok_or(ClientError::UnexpectedMessage)?;
-            if active.caught_up {
-                return Err(ClientError::UnexpectedMessage);
-            }
             let value = read_value(&mut self.stream, deadline(self.io_timeout))?;
             if value
                 .get("protocol")
@@ -569,8 +566,8 @@ mod linux {
             match event.event {
                 EventName::RunEvent => {
                     let run_seq = event.run_seq.ok_or(ClientError::UnexpectedMessage)?;
-                    if run_seq != active.highest_run_seq.saturating_add(1)
-                        || run_seq > active.current_run_seq
+                    if active.highest_run_seq.checked_add(1) != Some(run_seq)
+                        || (!active.caught_up && run_seq > active.current_run_seq)
                     {
                         return Err(ClientError::UnexpectedMessage);
                     }
@@ -600,6 +597,9 @@ mod linux {
                         return Err(ClientError::UnexpectedMessage);
                     }
                     active.highest_run_seq = run_seq;
+                    if active.caught_up {
+                        active.current_run_seq = run_seq;
+                    }
                     Ok(RunStreamMessage::Event(RedactedRunEvent {
                         run_seq,
                         event_type: body.event_type,
@@ -608,7 +608,8 @@ mod linux {
                     }))
                 }
                 EventName::SubscriptionCaughtUp => {
-                    if event.run_seq != Some(active.current_run_seq)
+                    if active.caught_up
+                        || event.run_seq != Some(active.current_run_seq)
                         || active.highest_run_seq != active.current_run_seq
                         || event.body != serde_json::json!({})
                     {
