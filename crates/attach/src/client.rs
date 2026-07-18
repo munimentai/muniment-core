@@ -112,6 +112,46 @@ pub struct RedactedRunEvent {
     pub recorded_at: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionKind {
+    Confirm,
+}
+
+#[derive(Clone, Eq, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingPermission {
+    #[serde(skip)]
+    pub run_seq: u64,
+    pub gate_id: String,
+    pub kind: PermissionKind,
+    pub title: String,
+    #[serde(default, deserialize_with = "deserialize_optional_permission_message")]
+    pub message: Option<String>,
+}
+
+fn deserialize_optional_permission_message<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(deserializer).map(Some)
+}
+
+impl fmt::Debug for PendingPermission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingPermission")
+            .field("run_seq", &self.run_seq)
+            .field("gate_id", &"[redacted]")
+            .field("kind", &self.kind)
+            .field("title", &"[redacted]")
+            .field("message", &self.message.as_ref().map(|_| "[redacted]"))
+            .finish()
+    }
+}
+
 impl fmt::Debug for RedactedRunEvent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -127,6 +167,7 @@ impl fmt::Debug for RedactedRunEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RunStreamMessage {
     Event(RedactedRunEvent),
+    PermissionPending(PendingPermission),
     CaughtUp { current_run_seq: u64 },
 }
 
@@ -188,9 +229,9 @@ impl fmt::Debug for ThreadListPage {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::{
-        AuthorizationSummary, ClientError, PermissionAnswerAccepted, PermissionDecision,
-        RedactedRunEvent, RunStartAccepted, RunStreamMessage, RunStreamSubscription,
-        ThreadListPage, ThreadOpenPage,
+        AuthorizationSummary, ClientError, PendingPermission, PermissionAnswerAccepted,
+        PermissionDecision, RedactedRunEvent, RunStartAccepted, RunStreamMessage,
+        RunStreamSubscription, ThreadListPage, ThreadOpenPage,
     };
     use crate::{
         decode_frame, encode_frame, Authorized, Client, Envelope, ErrorCode, ErrorEnvelope,
@@ -216,6 +257,8 @@ mod linux {
     const MAX_RUN_START_TEXT_LENGTH: usize = 32 * 1024;
     const MAX_RUN_START_CONTEXT_LENGTH: usize = 64 * 1024;
     const MAX_PERMISSION_GATE_ID_LENGTH: usize = 256;
+    const MAX_PERMISSION_TITLE_LENGTH: usize = 1_024;
+    const MAX_PERMISSION_MESSAGE_LENGTH: usize = 4_096;
     const MAX_RUN_STREAM_WINDOW_EVENTS: usize = 1_024;
     const MAX_RUN_STREAM_WINDOW_BYTES: usize = 4 * 1024 * 1024;
 
@@ -694,7 +737,7 @@ mod linux {
                 return Err(ClientError::UnexpectedMessage);
             }
             match event.event {
-                EventName::RunEvent => {
+                EventName::RunEvent | EventName::PermissionPending => {
                     let run_seq = event.run_seq.ok_or(ClientError::UnexpectedMessage)?;
                     if active.highest_run_seq.checked_add(1) != Some(run_seq)
                         || (!active.caught_up && run_seq > active.current_run_seq)
@@ -702,6 +745,26 @@ mod linux {
                             > active.max_unacknowledged_events as u64
                     {
                         return Err(ClientError::UnexpectedMessage);
+                    }
+                    if event.event == EventName::PermissionPending {
+                        let mut body: PendingPermission = serde_json::from_value(event.body)
+                            .map_err(|_| ClientError::UnexpectedMessage)?;
+                        if body.gate_id.trim().is_empty()
+                            || body.gate_id.len() > MAX_PERMISSION_GATE_ID_LENGTH
+                            || body.title.trim().is_empty()
+                            || body.title.len() > MAX_PERMISSION_TITLE_LENGTH
+                            || body.message.as_ref().is_some_and(|message| {
+                                message.len() > MAX_PERMISSION_MESSAGE_LENGTH
+                            })
+                        {
+                            return Err(ClientError::UnexpectedMessage);
+                        }
+                        body.run_seq = run_seq;
+                        active.highest_run_seq = run_seq;
+                        if active.caught_up {
+                            active.current_run_seq = run_seq;
+                        }
+                        return Ok(RunStreamMessage::PermissionPending(body));
                     }
                     #[derive(serde::Deserialize)]
                     #[serde(deny_unknown_fields)]

@@ -2,8 +2,8 @@
 
 use muniment_attach::{
     authorized, encode_frame, handshake_stream, welcome, ClientError, ErrorAction, ErrorEnvelope,
-    Event, EventName, Failure, Id, PermissionDecision, Protocol, ProtocolError, Response,
-    RunStreamMessage, Success, VersionRange, MAX_FRAME_LENGTH,
+    Event, EventName, Failure, Id, PermissionDecision, PermissionKind, Protocol, ProtocolError,
+    Response, RunStreamMessage, Success, VersionRange, MAX_FRAME_LENGTH,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -173,6 +173,121 @@ fn run_stream_uses_exact_envelope_and_reads_fragmented_catch_up() {
         client.read_run_stream_message().unwrap(),
         RunStreamMessage::CaughtUp { current_run_seq: 5 }
     );
+    worker.join().unwrap();
+}
+
+#[test]
+fn run_stream_decodes_pending_permissions_and_counts_them_for_acknowledgement() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let run_id = "01900000-0000-7000-8000-000000000001";
+    let subscription_id = "01900000-0000-7000-8000-000000000002";
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        let request = read_client_value(&mut server);
+        server
+            .write_all(
+                &encode_frame(&Response {
+                    protocol: Protocol,
+                    request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+                    ok: Success,
+                    body: valid_run_stream_summary(run_id, subscription_id),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        for envelope in [
+            run_stream_event(
+                subscription_id,
+                run_id,
+                1,
+                "permission.pending",
+                serde_json::json!({
+                    "gate_id": "secret-gate", "kind": "confirm", "title": "Allow access?"
+                }),
+            ),
+            run_stream_event(
+                subscription_id,
+                run_id,
+                2,
+                "run.event",
+                serde_json::json!({
+                    "event_type": "assistant.message", "event_version": 1,
+                    "recorded_at": "2026-07-17T00:00:00Z", "payload": { "withheld": true }
+                }),
+            ),
+            run_stream_event(
+                subscription_id,
+                run_id,
+                2,
+                "subscription.caught_up",
+                serde_json::json!({}),
+            ),
+            run_stream_event(
+                subscription_id,
+                run_id,
+                3,
+                "permission.pending",
+                serde_json::json!({
+                    "gate_id": "another-secret", "kind": "confirm", "title": "Run command?",
+                    "message": "Sensitive command details"
+                }),
+            ),
+        ] {
+            server.write_all(&encode_frame(&envelope).unwrap()).unwrap();
+        }
+        let acknowledgement = read_client_value(&mut server);
+        assert_eq!(acknowledgement["operation"], "run.cursor_ack");
+        assert_eq!(acknowledgement["body"]["through_run_seq"], 3);
+        server
+            .write_all(
+                &encode_frame(&Response {
+                    protocol: Protocol,
+                    request_id: Id::new(acknowledgement["request_id"].as_str().unwrap()).unwrap(),
+                    ok: Success,
+                    body: serde_json::json!({
+                        "subscription_id": subscription_id, "through_run_seq": 3
+                    }),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    client.subscribe_run(run_id, 0).unwrap();
+    let RunStreamMessage::PermissionPending(permission) = client.read_run_stream_message().unwrap()
+    else {
+        panic!("expected pending permission")
+    };
+    assert_eq!(permission.run_seq, 1);
+    assert_eq!(permission.kind, PermissionKind::Confirm);
+    assert_eq!(permission.gate_id, "secret-gate");
+    assert_eq!(permission.title, "Allow access?");
+    assert_eq!(permission.message, None);
+    let debug = format!("{permission:?}");
+    assert!(!debug.contains("secret-gate"));
+    assert!(!debug.contains("Allow access?"));
+    assert!(matches!(
+        client.read_run_stream_message(),
+        Ok(RunStreamMessage::Event(event)) if event.run_seq == 2
+    ));
+    assert_eq!(
+        client.read_run_stream_message().unwrap(),
+        RunStreamMessage::CaughtUp { current_run_seq: 2 }
+    );
+    let RunStreamMessage::PermissionPending(permission) = client.read_run_stream_message().unwrap()
+    else {
+        panic!("expected pending permission")
+    };
+    assert_eq!(permission.run_seq, 3);
+    assert_eq!(
+        permission.message.as_deref(),
+        Some("Sensitive command details")
+    );
+    let debug = format!("{permission:?}");
+    assert!(!debug.contains("another-secret"));
+    assert!(!debug.contains("Run command?"));
+    assert!(!debug.contains("Sensitive command details"));
+    client.acknowledge_run_cursor(3).unwrap();
     worker.join().unwrap();
 }
 
@@ -765,6 +880,82 @@ fn run_stream_rejects_hostile_event_envelopes_without_leaking_bodies() {
             1,
             "unknown.event",
             serde_json::json!({}),
+        ),
+        run_stream_event(
+            subscription_id,
+            run_id,
+            1,
+            "permission.pending",
+            serde_json::json!({ "kind": "confirm", "title": "Title" }),
+        ),
+        run_stream_event(
+            subscription_id,
+            run_id,
+            1,
+            "permission.pending",
+            serde_json::json!({
+                "gate_id": "gate", "kind": "confirm", "title": "Title",
+                "unexpected": "hostile-secret"
+            }),
+        ),
+        run_stream_event(
+            subscription_id,
+            run_id,
+            1,
+            "permission.pending",
+            serde_json::json!({ "gate_id": " \n", "kind": "confirm", "title": "Title" }),
+        ),
+        run_stream_event(
+            subscription_id,
+            run_id,
+            1,
+            "permission.pending",
+            serde_json::json!({
+                "gate_id": "g".repeat(257), "kind": "confirm", "title": "Title"
+            }),
+        ),
+        run_stream_event(
+            subscription_id,
+            run_id,
+            1,
+            "permission.pending",
+            serde_json::json!({ "gate_id": "gate", "kind": "allow", "title": "Title" }),
+        ),
+        run_stream_event(
+            subscription_id,
+            run_id,
+            1,
+            "permission.pending",
+            serde_json::json!({ "gate_id": "gate", "kind": "confirm", "title": "\t" }),
+        ),
+        run_stream_event(
+            subscription_id,
+            run_id,
+            1,
+            "permission.pending",
+            serde_json::json!({
+                "gate_id": "gate", "kind": "confirm", "title": "t".repeat(1025)
+            }),
+        ),
+        run_stream_event(
+            subscription_id,
+            run_id,
+            1,
+            "permission.pending",
+            serde_json::json!({
+                "gate_id": "gate", "kind": "confirm", "title": "Title",
+                "message": null
+            }),
+        ),
+        run_stream_event(
+            subscription_id,
+            run_id,
+            1,
+            "permission.pending",
+            serde_json::json!({
+                "gate_id": "gate", "kind": "confirm", "title": "Title",
+                "message": "m".repeat(4097)
+            }),
         ),
         serde_json::json!({
             "protocol": "muniment.attach/1", "request_id": subscription_id,
