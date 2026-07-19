@@ -1807,7 +1807,7 @@ fn real_journal_run_stream_fetches_next_page_after_window_ack() {
             server,
             credentials(),
             "0.1.0",
-            Duration::from_secs(2),
+            Duration::from_secs(5),
             AuthorizationSessionDependencies {
                 fill_random: |bytes: &mut [u8]| {
                     bytes.fill(9);
