@@ -7,6 +7,7 @@ pub mod pipeline;
 mod recognizer;
 pub mod utterance;
 mod vad;
+pub mod validation;
 
 pub use pipeline::{DictationPipeline, DictationPipelineError, DictationPipelinePushError};
 pub use recognizer::{OfflineParakeetRecognizer, OfflineRecognitionError};

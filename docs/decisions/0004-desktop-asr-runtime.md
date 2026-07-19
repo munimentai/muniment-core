@@ -157,6 +157,9 @@ The minimum gate is RTF ≤ 1.0 and p95 final latency ≤ 1.0 s after end-of-spe
 on every target, with peak RSS ≤ 2.0 GiB and no crash or unbounded growth over
 100 consecutive utterances.
 
+The reproducible local runner and its versioned manifest/report formats are
+documented in [Parakeet target-hardware validation](../voice-validation.md).
+
 Quality checks use a versioned, human-transcribed set containing accents,
 punctuation, names/org jargon, numbers, self-corrections, background noise, and
 at least English plus one fixture for every claimed language. Report per-language
