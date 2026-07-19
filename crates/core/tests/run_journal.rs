@@ -741,6 +741,77 @@ fn catch_up_projects_only_a_bounded_authoritative_completion_receipt() {
 }
 
 #[test]
+fn completion_receipt_projection_rejects_malformed_and_oversized_values() {
+    let payloads = [
+        json!({"receipt": {"route": 7}}),
+        json!({"receipt": {"route": "x".repeat(1_025)}}),
+        json!({"receipt": {"route": "cloud", "secret": "do not leak"}}),
+        json!({"receipt": {"capabilities": [{"name": "search", "version": "x".repeat(1_025)}]}}),
+    ];
+    let events = payloads
+        .into_iter()
+        .enumerate()
+        .map(|(index, payload_json)| {
+            let mut completed = event(index as u64 + 1);
+            completed.event_type = "run.completed".into();
+            completed.payload = EventPayload::Inline { payload_json };
+            completed
+        })
+        .collect::<Vec<_>>();
+    let mut journal = RunJournal::open(":memory:").unwrap();
+    journal.append_batch(0, &events).unwrap();
+    journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+
+    let page = journal
+        .workspace_catch_up("workspace-1", RUN, 0, 10, 64 * 1024)
+        .unwrap();
+    assert!(page.events.iter().all(|event| event.receipt.is_none()));
+    assert!(!format!("{:?}", page.events).contains("do not leak"));
+}
+
+#[test]
+fn receipt_backfill_fails_closed_and_stream_byte_limit_counts_projection() {
+    let db = TestDb::new();
+    let mut completed = event(1);
+    completed.event_type = "run.completed".into();
+    completed.payload = EventPayload::Inline {
+        payload_json: json!({"receipt": {"route": "cloud", "cost": "$0.01"}}),
+    };
+    let mut corrupt = event(2);
+    corrupt.event_type = "run.completed".into();
+    corrupt.payload = EventPayload::Inline {
+        payload_json: json!({"receipt": {"route": "cloud", "secret": "historical secret"}}),
+    };
+    {
+        let mut journal = RunJournal::open(&db).unwrap();
+        journal.append_batch(0, &[completed, corrupt]).unwrap();
+        journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+    }
+    let connection = Connection::open(&db).unwrap();
+    connection
+        .execute_batch("DROP TABLE receipt_projection")
+        .unwrap();
+    drop(connection);
+
+    let mut journal = RunJournal::open(&db).unwrap();
+    let page = journal
+        .workspace_catch_up("workspace-1", RUN, 0, 10, 64 * 1024)
+        .unwrap();
+    assert_eq!(
+        page.events[0].receipt.as_ref().unwrap().route.as_deref(),
+        Some("cloud")
+    );
+    assert!(page.events[1].receipt.is_none());
+    assert!(!format!("{:?}", page.events).contains("historical secret"));
+
+    let too_small = journal
+        .workspace_catch_up("workspace-1", RUN, 0, 10, 1)
+        .unwrap();
+    assert!(too_small.events.is_empty());
+    assert!(!too_small.exhausted);
+}
+
+#[test]
 fn failed_delete_leaves_the_run_untouched() {
     let db = TestDb::new();
     let mut journal = RunJournal::open(db.as_ref()).unwrap();

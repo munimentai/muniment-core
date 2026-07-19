@@ -956,7 +956,7 @@ fn authorized_run_stream_catches_up_in_order_with_redacted_projection() {
     assert_eq!(completed.run_seq, Some(2));
     assert_eq!(completed.body["payload"]["withheld"], true);
     assert_eq!(completed.body["payload"]["receipt"]["route"], "cloud");
-    assert_eq!(completed.body["payload"]["receipt"]["model"], json!(null));
+    assert!(completed.body["payload"]["receipt"].get("model").is_none());
     assert!(!completed.body.to_string().contains("must remain withheld"));
     let Envelope::Event(caught_up) = read_frame::<Envelope>(&mut client) else {
         panic!("expected caught-up event")

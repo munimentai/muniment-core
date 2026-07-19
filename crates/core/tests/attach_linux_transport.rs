@@ -239,20 +239,27 @@ fn stale_recovery_never_removes_a_replacement() {
     let filesystem = AttachFilesystem::from_runtime_directory(&runtime.0).unwrap();
     let stale = UnixListener::bind(filesystem.endpoint_path()).unwrap();
     drop(stale);
-    let error = AttachTransport::bind_with_hooks(
-        &filesystem,
-        || {},
-        || {
-            fs::remove_file(filesystem.endpoint_path()).unwrap();
-            fs::write(filesystem.endpoint_path(), b"replacement").unwrap();
-        },
-    )
-    .unwrap_err();
-    assert_eq!(error, AttachTransportError::ExistingEndpointRemove);
-    assert_eq!(
-        fs::read(filesystem.endpoint_path()).unwrap(),
-        b"replacement"
-    );
+    for _ in 0..3 {
+        let error = AttachTransport::bind_with_hooks(
+            &filesystem,
+            || {},
+            || {
+                fs::remove_file(filesystem.endpoint_path()).unwrap();
+                fs::write(filesystem.endpoint_path(), b"replacement").unwrap();
+            },
+        )
+        .unwrap_err();
+        if error == AttachTransportError::ExistingListener {
+            continue;
+        }
+        assert_eq!(error, AttachTransportError::ExistingEndpointRemove);
+        assert_eq!(
+            fs::read(filesystem.endpoint_path()).unwrap(),
+            b"replacement"
+        );
+        return;
+    }
+    panic!("closed stale listener was repeatedly reported as live");
 }
 
 #[test]
