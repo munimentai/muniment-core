@@ -129,19 +129,31 @@ fn stale_recovery_preserves_a_colliding_quarantine_entry() {
     let attach_directory = filesystem.endpoint_path().parent().unwrap().to_owned();
     let mut candidate_count = 0;
 
-    let recovered = AttachTransport::bind_with_quarantine_candidate_hook(
-        &filesystem,
-        || {},
-        || {},
-        || {},
-        |candidate| {
-            candidate_count += 1;
-            if candidate_count == 1 {
-                fs::write(attach_directory.join(candidate), b"unrelated").unwrap();
+    let mut recovered = None;
+    for _ in 0..3 {
+        match AttachTransport::bind_with_quarantine_candidate_hook(
+            &filesystem,
+            || {},
+            || {},
+            || {},
+            |candidate| {
+                candidate_count += 1;
+                if candidate_count == 1 {
+                    fs::write(attach_directory.join(candidate), b"unrelated").unwrap();
+                }
+            },
+        ) {
+            Ok(transport) => {
+                recovered = Some(transport);
+                break;
             }
-        },
-    )
-    .unwrap();
+            // A just-closed Unix listener can briefly remain connectable. Retry the
+            // stale probe without weakening the production live-listener check.
+            Err(AttachTransportError::ExistingListener) => continue,
+            Err(error) => panic!("stale recovery failed: {error:?}"),
+        }
+    }
+    let recovered = recovered.expect("closed stale listener was repeatedly reported as live");
 
     assert!(candidate_count >= 2);
     let unrelated: Vec<_> = fs::read_dir(&attach_directory)
