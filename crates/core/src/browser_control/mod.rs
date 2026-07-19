@@ -8,6 +8,8 @@ mod linux_transport;
 mod macos_identity;
 #[cfg(target_os = "macos")]
 mod macos_transport;
+#[cfg(target_os = "windows")]
+mod windows_identity;
 
 #[cfg(target_os = "linux")]
 pub use linux_identity::{
@@ -38,4 +40,13 @@ pub use macos_identity::{
     resolve_browser_process_with_reader, AuthorizationError, AuthorizedBrowserProcess,
     BrowserProcessIdentity, MacOsProcessReader, NativeProcessReader, ProcessReadError,
     ProcessSocket, ResolutionError, VerificationError,
+};
+
+#[cfg(target_os = "windows")]
+pub use windows_identity::{
+    authorize_browser_process, authorize_browser_process_with_reader, resolve_browser_process,
+    resolve_browser_process_with_reader, verify_browser_process,
+    verify_browser_process_with_reader, AuthorizationError, AuthorizedBrowserProcess,
+    BrowserProcessIdentity, NativeProcessError, NativeReadError, ResolutionError, TcpConnection,
+    VerificationError, WindowsIdentityReader, WindowsNativeReader,
 };
