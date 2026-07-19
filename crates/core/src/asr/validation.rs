@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use super::OfflineParakeetRecognizer;
 
 pub const CORPUS_SCHEMA_VERSION: u32 = 1;
-pub const REPORT_SCHEMA_VERSION: u32 = 1;
+pub const REPORT_SCHEMA_VERSION: u32 = 2;
+pub const MAX_ENDURANCE_DECODE_COUNT: usize = 100;
 pub const REQUIRED_DURATIONS_SECONDS: [f64; 3] = [5.0, 15.0, 60.0];
 pub const MATRIX_DURATION_TOLERANCE_SECONDS: f64 = 0.25;
 
@@ -45,8 +46,19 @@ pub struct ValidationReport {
     pub model_revision: String,
     pub platform: Platform,
     pub machine_tier: String,
+    pub decode_run: DecodeRunReport,
     pub cases: Vec<CaseReport>,
     pub aggregate: AggregateReport,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct DecodeRunReport {
+    pub requested_decode_count: usize,
+    pub completed_decode_count: usize,
+    /// Current resident memory immediately before the first decode, or null when unsupported.
+    pub start_process_resident_memory_bytes: Option<u64>,
+    /// Current resident memory immediately after the final decode, or null when unsupported.
+    pub end_process_resident_memory_bytes: Option<u64>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -184,12 +196,25 @@ pub fn run_cases(
     cold_model_load_seconds: f64,
     model_revision: &str,
     machine_tier: &str,
+    endurance_decode_count: Option<usize>,
 ) -> Result<ValidationReport, String> {
     if machine_tier.trim().is_empty() {
         return Err("machine tier must not be empty".into());
     }
-    let mut cases = Vec::with_capacity(manifest.cases.len());
-    for case in &manifest.cases {
+    if endurance_decode_count.is_some_and(|count| count == 0 || count > MAX_ENDURANCE_DECODE_COUNT)
+    {
+        return Err(format!(
+            "endurance decode count must be between 1 and {MAX_ENDURANCE_DECODE_COUNT}"
+        ));
+    }
+    let requested_decode_count = endurance_decode_count.unwrap_or(manifest.cases.len());
+    let mut cases = Vec::with_capacity(manifest.cases.len().min(requested_decode_count));
+    let mut first_latencies = Vec::with_capacity(requested_decode_count);
+    let mut final_latencies = Vec::with_capacity(requested_decode_count);
+    let mut post_eos_latencies = Vec::with_capacity(requested_decode_count);
+    let start_process_resident_memory_bytes = process_resident_memory_bytes();
+    for decode_index in 0..requested_decode_count {
+        let case = &manifest.cases[decode_index % manifest.cases.len()];
         let (sample_rate, samples, actual_duration) =
             read_wav(&manifest_directory.join(&case.audio_path))?;
         let tolerance = (1.0 / sample_rate as f64).max(0.001);
@@ -202,27 +227,35 @@ pub fn run_cases(
         let started = Instant::now();
         let transcript = decoder.decode(sample_rate, &samples)?;
         let wall = started.elapsed().as_secs_f64();
-        cases.push(CaseReport {
-            id: case.id.clone(),
-            language: case.language.clone(),
-            audio_class: match case.audio_class {
-                AudioClass::Clean => "clean",
-                AudioClass::Noisy => "noisy",
-            }
-            .into(),
-            duration_seconds: case.duration_seconds,
-            decode_wall_seconds: wall,
-            real_time_factor: wall / case.duration_seconds,
-            first_transcript_latency_seconds: case.duration_seconds + wall,
-            final_transcript_latency_seconds: case.duration_seconds + wall,
-            word_error: case
-                .reference_transcript
-                .as_deref()
-                .map(|reference| word_error(reference, &transcript)),
-            transcript,
-        });
+        first_latencies.push(case.duration_seconds + wall);
+        final_latencies.push(case.duration_seconds + wall);
+        post_eos_latencies.push(wall);
+        if decode_index < manifest.cases.len() {
+            cases.push(CaseReport {
+                id: case.id.clone(),
+                language: case.language.clone(),
+                audio_class: match case.audio_class {
+                    AudioClass::Clean => "clean",
+                    AudioClass::Noisy => "noisy",
+                }
+                .into(),
+                duration_seconds: case.duration_seconds,
+                decode_wall_seconds: wall,
+                real_time_factor: wall / case.duration_seconds,
+                first_transcript_latency_seconds: case.duration_seconds + wall,
+                final_transcript_latency_seconds: case.duration_seconds + wall,
+                word_error: case
+                    .reference_transcript
+                    .as_deref()
+                    .map(|reference| word_error(reference, &transcript)),
+                transcript,
+            });
+        }
     }
-    let (first_latencies, final_latencies, post_eos_latencies) = aggregate_latencies(&cases);
+    let end_process_resident_memory_bytes = process_resident_memory_bytes();
+    first_latencies.sort_by(f64::total_cmp);
+    final_latencies.sort_by(f64::total_cmp);
+    post_eos_latencies.sort_by(f64::total_cmp);
     Ok(ValidationReport {
         schema_version: REPORT_SCHEMA_VERSION,
         model_revision: model_revision.into(),
@@ -231,6 +264,12 @@ pub fn run_cases(
             architecture: std::env::consts::ARCH.into(),
         },
         machine_tier: machine_tier.into(),
+        decode_run: DecodeRunReport {
+            requested_decode_count,
+            completed_decode_count: requested_decode_count,
+            start_process_resident_memory_bytes,
+            end_process_resident_memory_bytes,
+        },
         aggregate: AggregateReport {
             cold_model_load_seconds,
             p50_first_transcript_latency_seconds: percentile(&first_latencies, 0.50),
@@ -245,6 +284,7 @@ pub fn run_cases(
     })
 }
 
+#[cfg(test)]
 fn aggregate_latencies(cases: &[CaseReport]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     let mut first: Vec<_> = cases
         .iter()
@@ -406,6 +446,97 @@ fn process_peak_rss_bytes() -> Option<u64> {
     None
 }
 
+#[cfg(target_os = "linux")]
+fn process_resident_memory_bytes() -> Option<u64> {
+    let statm = fs::read_to_string("/proc/self/statm").ok()?;
+    let resident_pages = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return None;
+    }
+    resident_pages.checked_mul(page_size as u64)
+}
+
+#[cfg(target_os = "macos")]
+fn process_resident_memory_bytes() -> Option<u64> {
+    #[repr(C)]
+    struct ProcTaskInfo {
+        virtual_size: u64,
+        resident_size: u64,
+        total_user: u64,
+        total_system: u64,
+        threads_user: u64,
+        threads_system: u64,
+        policy: i32,
+        faults: i32,
+        pageins: i32,
+        cow_faults: i32,
+        messages_sent: i32,
+        messages_received: i32,
+        syscalls_mach: i32,
+        syscalls_unix: i32,
+        context_switches: i32,
+        thread_count: i32,
+        running_thread_count: i32,
+        priority: i32,
+    }
+
+    unsafe extern "C" {
+        fn proc_pidinfo(
+            pid: libc::c_int,
+            flavor: libc::c_int,
+            arg: u64,
+            buffer: *mut libc::c_void,
+            buffer_size: libc::c_int,
+        ) -> libc::c_int;
+    }
+
+    const PROC_PIDTASKINFO: libc::c_int = 4;
+    let mut info = std::mem::MaybeUninit::<ProcTaskInfo>::uninit();
+    let size = std::mem::size_of::<ProcTaskInfo>();
+    let bytes = unsafe {
+        proc_pidinfo(
+            libc::getpid(),
+            PROC_PIDTASKINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size as libc::c_int,
+        )
+    };
+    if bytes != size as libc::c_int {
+        None
+    } else {
+        Some(unsafe { info.assume_init() }.resident_size)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn process_resident_memory_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut counters = std::mem::MaybeUninit::<PROCESS_MEMORY_COUNTERS>::zeroed();
+    let succeeded = unsafe {
+        GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            counters.as_mut_ptr(),
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        )
+    };
+    if succeeded == 0 {
+        None
+    } else {
+        Some(unsafe { counters.assume_init() }.WorkingSetSize as u64)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn process_resident_memory_bytes() -> Option<u64> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,15 +608,17 @@ mod tests {
             }],
         };
         let decoder = FakeDecoder(AtomicUsize::new(0));
-        let report = run_cases(&manifest, &root, &decoder, 1.25, "revision", "tier").unwrap();
+        let report = run_cases(&manifest, &root, &decoder, 1.25, "revision", "tier", None).unwrap();
         assert_eq!(decoder.0.load(Ordering::Relaxed), 1);
         assert_eq!(report.cases[0].word_error.as_ref().unwrap().insertions, 1);
         assert_eq!(report.aggregate.cold_model_load_seconds, 1.25);
+        assert_eq!(report.decode_run.requested_decode_count, 1);
+        assert_eq!(report.decode_run.completed_decode_count, 1);
 
         let serialized = serde_json::to_string(&report).unwrap();
         assert!(serialized
-            .starts_with(r#"{"schema_version":1,"model_revision":"revision","platform":{"os":"#));
-        assert!(serialized.contains(r#""machine_tier":"tier","cases":[{"id":"tiny""#));
+            .starts_with(r#"{"schema_version":2,"model_revision":"revision","platform":{"os":"#));
+        assert!(serialized.contains(r#""machine_tier":"tier","decode_run":{"requested_decode_count":1,"completed_decode_count":1"#));
 
         let mut invalid = manifest;
         invalid.cases[0].duration_seconds = 0.0;
@@ -510,13 +643,19 @@ mod tests {
     #[test]
     fn report_json_field_order_and_null_measurements_are_stable() {
         let report = ValidationReport {
-            schema_version: 1,
+            schema_version: REPORT_SCHEMA_VERSION,
             model_revision: "rev".into(),
             platform: Platform {
                 os: "test-os".into(),
                 architecture: "test-arch".into(),
             },
             machine_tier: "test-tier".into(),
+            decode_run: DecodeRunReport {
+                requested_decode_count: 1,
+                completed_decode_count: 1,
+                start_process_resident_memory_bytes: None,
+                end_process_resident_memory_bytes: None,
+            },
             cases: Vec::new(),
             aggregate: AggregateReport {
                 cold_model_load_seconds: 1.0,
@@ -531,8 +670,139 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&report).unwrap(),
-            r#"{"schema_version":1,"model_revision":"rev","platform":{"os":"test-os","architecture":"test-arch"},"machine_tier":"test-tier","cases":[],"aggregate":{"cold_model_load_seconds":1.0,"p50_first_transcript_latency_seconds":2.0,"p95_first_transcript_latency_seconds":3.0,"p50_final_transcript_latency_seconds":4.0,"p95_final_transcript_latency_seconds":5.0,"p50_post_eos_decode_latency_seconds":0.2,"p95_post_eos_decode_latency_seconds":0.3,"process_peak_rss_bytes":null}}"#
+            r#"{"schema_version":2,"model_revision":"rev","platform":{"os":"test-os","architecture":"test-arch"},"machine_tier":"test-tier","decode_run":{"requested_decode_count":1,"completed_decode_count":1,"start_process_resident_memory_bytes":null,"end_process_resident_memory_bytes":null},"cases":[],"aggregate":{"cold_model_load_seconds":1.0,"p50_first_transcript_latency_seconds":2.0,"p95_first_transcript_latency_seconds":3.0,"p50_final_transcript_latency_seconds":4.0,"p95_final_transcript_latency_seconds":5.0,"p50_post_eos_decode_latency_seconds":0.2,"p95_post_eos_decode_latency_seconds":0.3,"process_peak_rss_bytes":null}}"#
         );
+    }
+
+    #[test]
+    fn endurance_run_counts_decodes_and_keeps_case_reports_bounded() {
+        let root = std::env::temp_dir().join(format!(
+            "muniment-asr-endurance-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut writer = hound::WavWriter::create(
+            root.join("tiny.wav"),
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 16_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for _ in 0..160 {
+            writer.write_sample(0_i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        let manifest = CorpusManifest {
+            schema_version: CORPUS_SCHEMA_VERSION,
+            cases: vec![CorpusCase {
+                id: "tiny".into(),
+                language: "en".into(),
+                audio_class: AudioClass::Clean,
+                duration_seconds: 0.01,
+                audio_path: "tiny.wav".into(),
+                reference_transcript: None,
+            }],
+        };
+        let decoder = FakeDecoder(AtomicUsize::new(0));
+        let report = run_cases(
+            &manifest,
+            &root,
+            &decoder,
+            0.0,
+            "revision",
+            "tier",
+            Some(MAX_ENDURANCE_DECODE_COUNT),
+        )
+        .unwrap();
+        assert_eq!(decoder.0.load(Ordering::Relaxed), 100);
+        assert_eq!(report.decode_run.requested_decode_count, 100);
+        assert_eq!(report.decode_run.completed_decode_count, 100);
+        #[cfg(target_os = "linux")]
+        {
+            assert!(report
+                .decode_run
+                .start_process_resident_memory_bytes
+                .is_some());
+            assert!(report
+                .decode_run
+                .end_process_resident_memory_bytes
+                .is_some());
+        }
+        assert_eq!(report.cases.len(), 1);
+        assert!(
+            serde_json::to_value(report).unwrap()["decode_run"]
+                .as_object()
+                .unwrap()
+                .len()
+                == 4
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn endurance_decode_failure_aborts_without_a_report() {
+        struct FailingDecoder(AtomicUsize);
+        impl ValidationDecoder for FailingDecoder {
+            fn decode(&self, _: u32, _: &[f32]) -> Result<String, String> {
+                let count = self.0.fetch_add(1, Ordering::Relaxed) + 1;
+                if count == 3 {
+                    Err("decode failed".into())
+                } else {
+                    Ok(String::new())
+                }
+            }
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("muniment-asr-failure-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut writer = hound::WavWriter::create(
+            root.join("tiny.wav"),
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 16_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for _ in 0..160 {
+            writer.write_sample(0_i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        let manifest = CorpusManifest {
+            schema_version: 1,
+            cases: vec![CorpusCase {
+                id: "tiny".into(),
+                language: "en".into(),
+                audio_class: AudioClass::Clean,
+                duration_seconds: 0.01,
+                audio_path: "tiny.wav".into(),
+                reference_transcript: None,
+            }],
+        };
+        let decoder = FailingDecoder(AtomicUsize::new(0));
+        assert_eq!(
+            run_cases(
+                &manifest,
+                &root,
+                &decoder,
+                0.0,
+                "revision",
+                "tier",
+                Some(100)
+            )
+            .unwrap_err(),
+            "decode failed"
+        );
+        assert_eq!(decoder.0.load(Ordering::Relaxed), 3);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

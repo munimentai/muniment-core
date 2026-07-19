@@ -2,6 +2,41 @@ use std::fs;
 use std::process::Command;
 
 #[test]
+fn rejects_out_of_bounds_endurance_count_without_publishing_a_report() {
+    let root = std::env::temp_dir().join(format!(
+        "muniment-parakeet-eval-bad-endurance-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let output = root.join("report.json");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_parakeet-eval"))
+        .args([
+            "--model-root",
+            "unused-model",
+            "--manifest",
+            "unused-corpus.json",
+            "--output",
+            output.to_str().unwrap(),
+            "--machine-tier",
+            "test-tier",
+            "--endurance-utterances",
+            "101",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!result.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&result.stderr),
+        "parakeet-eval: --endurance-utterances must be between 1 and 100\n"
+    );
+    assert!(!output.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn valid_corpus_does_not_produce_report_without_verified_model() {
     let root = std::env::temp_dir().join(format!(
         "muniment-parakeet-eval-no-model-{}",
