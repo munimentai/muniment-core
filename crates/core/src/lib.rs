@@ -8,7 +8,7 @@ pub mod asr;
 pub mod attach;
 pub mod attachment;
 pub mod auth;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod browser_control;
 pub mod cas;
 pub mod journal;

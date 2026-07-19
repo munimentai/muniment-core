@@ -1,4 +1,4 @@
-//! Fail-closed Linux transport for browser-control connections.
+// Fail-closed native transport for browser-control connections.
 
 use super::{authorize_browser_process, AuthorizationError};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -94,7 +94,7 @@ impl BrowserControlListener {
 
     /// Accepts one stream and releases it only after browser-process authorization.
     pub fn accept(&self) -> Result<TcpStream, BrowserControlAcceptError> {
-        self.accept_with(&self.listener, &LinuxBrowserProcessAuthorizer)
+        self.accept_with(&self.listener, &NATIVE_BROWSER_PROCESS_AUTHORIZER)
     }
 
     /// Authorizes one peer, completes its bounded WebSocket handshake, then releases it.
@@ -105,7 +105,7 @@ impl BrowserControlListener {
     ) -> Result<TcpStream, WebSocketHandshakeError> {
         self.accept_websocket_with(
             &self.listener,
-            &LinuxBrowserProcessAuthorizer,
+            &NATIVE_BROWSER_PROCESS_AUTHORIZER,
             pairing_authorizer,
             config,
         )
@@ -120,7 +120,27 @@ impl BrowserControlListener {
         pairing_authorizer: &impl BrowserControlPairingAuthorizer,
         config: &WebSocketHandshakeConfig,
     ) -> Result<TcpStream, WebSocketHandshakeError> {
-        let mut stream = self.accept_with(listener, authorizer)?;
+        self.accept_websocket_with_endpoint_inspector(
+            listener,
+            &NATIVE_ENDPOINT_INSPECTOR,
+            authorizer,
+            pairing_authorizer,
+            config,
+        )
+    }
+
+    /// Injected endpoint-inspection variant used by fail-closed contract tests.
+    #[doc(hidden)]
+    pub fn accept_websocket_with_endpoint_inspector(
+        &self,
+        listener: &impl BrowserControlStreamListener,
+        endpoint_inspector: &impl BrowserControlEndpointInspector,
+        authorizer: &impl BrowserControlProcessAuthorizer,
+        pairing_authorizer: &impl BrowserControlPairingAuthorizer,
+        config: &WebSocketHandshakeConfig,
+    ) -> Result<TcpStream, WebSocketHandshakeError> {
+        let mut stream =
+            self.accept_with_endpoint_inspector(listener, endpoint_inspector, authorizer)?;
         perform_websocket_handshake(&mut stream, config, pairing_authorizer)?;
         Ok(stream)
     }
@@ -132,14 +152,25 @@ impl BrowserControlListener {
         listener: &impl BrowserControlStreamListener,
         authorizer: &impl BrowserControlProcessAuthorizer,
     ) -> Result<TcpStream, BrowserControlAcceptError> {
+        self.accept_with_endpoint_inspector(listener, &NATIVE_ENDPOINT_INSPECTOR, authorizer)
+    }
+
+    /// Injected endpoint-inspection variant used by fail-closed contract tests.
+    #[doc(hidden)]
+    pub fn accept_with_endpoint_inspector(
+        &self,
+        listener: &impl BrowserControlStreamListener,
+        endpoint_inspector: &impl BrowserControlEndpointInspector,
+        authorizer: &impl BrowserControlProcessAuthorizer,
+    ) -> Result<TcpStream, BrowserControlAcceptError> {
         let stream = listener
             .accept_stream()
             .map_err(|_| BrowserControlAcceptError::Accept)?;
-        let local = stream
-            .local_addr()
+        let local = endpoint_inspector
+            .local_addr(&stream)
             .map_err(|_| BrowserControlAcceptError::EndpointUnavailable)?;
-        let peer = stream
-            .peer_addr()
+        let peer = endpoint_inspector
+            .peer_addr(&stream)
             .map_err(|_| BrowserControlAcceptError::EndpointUnavailable)?;
         authorizer
             .authorize(local, peer, &self.expected_executable)
@@ -147,6 +178,27 @@ impl BrowserControlListener {
         Ok(stream)
     }
 }
+
+/// Injected accepted-stream endpoint-inspection boundary.
+pub trait BrowserControlEndpointInspector {
+    fn local_addr(&self, stream: &TcpStream) -> io::Result<SocketAddr>;
+    fn peer_addr(&self, stream: &TcpStream) -> io::Result<SocketAddr>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct NativeEndpointInspector;
+
+impl BrowserControlEndpointInspector for NativeEndpointInspector {
+    fn local_addr(&self, stream: &TcpStream) -> io::Result<SocketAddr> {
+        stream.local_addr()
+    }
+
+    fn peer_addr(&self, stream: &TcpStream) -> io::Result<SocketAddr> {
+        stream.peer_addr()
+    }
+}
+
+const NATIVE_ENDPOINT_INSPECTOR: NativeEndpointInspector = NativeEndpointInspector;
 
 /// Injected single-use pairing-token boundary. Implementations own expiry and revocation state.
 pub trait BrowserControlPairingAuthorizer {
@@ -178,9 +230,11 @@ pub trait BrowserControlProcessAuthorizer {
     ) -> Result<(), AuthorizationError>;
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LinuxBrowserProcessAuthorizer;
 
+#[cfg(target_os = "linux")]
 impl BrowserControlProcessAuthorizer for LinuxBrowserProcessAuthorizer {
     fn authorize(
         &self,
@@ -191,6 +245,29 @@ impl BrowserControlProcessAuthorizer for LinuxBrowserProcessAuthorizer {
         authorize_browser_process(local, peer, expected_executable).map(|_| ())
     }
 }
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MacOsBrowserProcessAuthorizer;
+
+#[cfg(target_os = "macos")]
+impl BrowserControlProcessAuthorizer for MacOsBrowserProcessAuthorizer {
+    fn authorize(
+        &self,
+        local: SocketAddr,
+        peer: SocketAddr,
+        expected_executable: &Path,
+    ) -> Result<(), AuthorizationError> {
+        authorize_browser_process(local, peer, expected_executable).map(|_| ())
+    }
+}
+
+#[cfg(target_os = "linux")]
+const NATIVE_BROWSER_PROCESS_AUTHORIZER: LinuxBrowserProcessAuthorizer =
+    LinuxBrowserProcessAuthorizer;
+#[cfg(target_os = "macos")]
+const NATIVE_BROWSER_PROCESS_AUTHORIZER: MacOsBrowserProcessAuthorizer =
+    MacOsBrowserProcessAuthorizer;
 
 /// A bounded, redacted listener-creation failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

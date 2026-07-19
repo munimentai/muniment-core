@@ -1,12 +1,13 @@
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use muniment_core::browser_control::{
-    AuthorizationError, BrowserControlAcceptError, BrowserControlBindError, BrowserControlListener,
-    BrowserControlPairingAuthorizer, BrowserControlProcessAuthorizer, PairingAuthorizationError,
-    WebSocketHandshakeConfig, WebSocketHandshakeError,
+    AuthorizationError, BrowserControlAcceptError, BrowserControlBindError,
+    BrowserControlEndpointInspector, BrowserControlListener, BrowserControlPairingAuthorizer,
+    BrowserControlProcessAuthorizer, PairingAuthorizationError, WebSocketHandshakeConfig,
+    WebSocketHandshakeError,
 };
 use std::cell::RefCell;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +22,24 @@ struct RecordingAuthorizer {
 struct RecordingPairingAuthorizer {
     calls: RefCell<Vec<Option<String>>>,
     result: Result<(), PairingAuthorizationError>,
+}
+
+struct FailingEndpointInspector {
+    fail_local: bool,
+}
+
+impl BrowserControlEndpointInspector for FailingEndpointInspector {
+    fn local_addr(&self, stream: &TcpStream) -> io::Result<SocketAddr> {
+        if self.fail_local {
+            Err(io::Error::other("sensitive endpoint failure"))
+        } else {
+            stream.local_addr()
+        }
+    }
+
+    fn peer_addr(&self, _stream: &TcpStream) -> io::Result<SocketAddr> {
+        Err(io::Error::other("sensitive endpoint failure"))
+    }
 }
 
 impl BrowserControlPairingAuthorizer for RecordingPairingAuthorizer {
@@ -82,6 +101,57 @@ fn drops_an_unauthorized_accepted_peer() {
         .set_read_timeout(Some(std::time::Duration::from_secs(1)))
         .unwrap();
     assert_eq!(client.peek(&mut [0]).unwrap(), 0);
+}
+
+#[test]
+fn endpoint_inspection_failure_drops_stream_before_authorization_or_handshake() {
+    for fail_local in [true, false] {
+        let listener = BrowserControlListener::bind("127.0.0.1:0", "/secret/browser").unwrap();
+        let injected = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(injected.local_addr().unwrap()).unwrap();
+        client.write_all(valid_request().as_bytes()).unwrap();
+        let process = RecordingAuthorizer {
+            calls: RefCell::new(Vec::new()),
+            result: Ok(()),
+        };
+        let pairing = RecordingPairingAuthorizer {
+            calls: RefCell::new(Vec::new()),
+            result: Ok(()),
+        };
+
+        let error = listener
+            .accept_websocket_with_endpoint_inspector(
+                &injected,
+                &FailingEndpointInspector { fail_local },
+                &process,
+                &pairing,
+                &handshake_config(1024, 16, Duration::from_secs(1)),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            WebSocketHandshakeError::Accept(BrowserControlAcceptError::EndpointUnavailable)
+        );
+        assert!(process.calls.borrow().is_empty());
+        assert!(pairing.calls.borrow().is_empty());
+        assert_eq!(
+            error.to_string(),
+            "browser-control connection was not accepted"
+        );
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut response = Vec::new();
+        let read = client.read_to_end(&mut response);
+        assert!(
+            read.is_ok()
+                || read
+                    .as_ref()
+                    .is_err_and(|error| error.kind() == io::ErrorKind::ConnectionReset)
+        );
+        assert!(response.is_empty());
+    }
 }
 
 #[test]
