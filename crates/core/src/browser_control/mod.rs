@@ -10,6 +10,8 @@ mod macos_identity;
 mod macos_transport;
 #[cfg(target_os = "windows")]
 mod windows_identity;
+#[cfg(target_os = "windows")]
+mod windows_transport;
 
 #[cfg(target_os = "linux")]
 pub use linux_identity::{
@@ -49,4 +51,11 @@ pub use windows_identity::{
     verify_browser_process_with_reader, AuthorizationError, AuthorizedBrowserProcess,
     BrowserProcessIdentity, NativeProcessError, NativeReadError, ResolutionError, TcpConnection,
     VerificationError, WindowsIdentityReader, WindowsNativeReader,
+};
+#[cfg(target_os = "windows")]
+pub use windows_transport::{
+    BrowserControlAcceptError, BrowserControlBindError, BrowserControlEndpointInspector,
+    BrowserControlListener, BrowserControlPairingAuthorizer, BrowserControlProcessAuthorizer,
+    BrowserControlStreamListener, PairingAuthorizationError, WebSocketHandshakeConfig,
+    WebSocketHandshakeError, WindowsBrowserProcessAuthorizer,
 };

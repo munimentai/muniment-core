@@ -262,12 +262,31 @@ impl BrowserControlProcessAuthorizer for MacOsBrowserProcessAuthorizer {
     }
 }
 
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowsBrowserProcessAuthorizer;
+
+#[cfg(target_os = "windows")]
+impl BrowserControlProcessAuthorizer for WindowsBrowserProcessAuthorizer {
+    fn authorize(
+        &self,
+        local: SocketAddr,
+        peer: SocketAddr,
+        expected_executable: &Path,
+    ) -> Result<(), AuthorizationError> {
+        authorize_browser_process(local, peer, expected_executable).map(|_| ())
+    }
+}
+
 #[cfg(target_os = "linux")]
 const NATIVE_BROWSER_PROCESS_AUTHORIZER: LinuxBrowserProcessAuthorizer =
     LinuxBrowserProcessAuthorizer;
 #[cfg(target_os = "macos")]
 const NATIVE_BROWSER_PROCESS_AUTHORIZER: MacOsBrowserProcessAuthorizer =
     MacOsBrowserProcessAuthorizer;
+#[cfg(target_os = "windows")]
+const NATIVE_BROWSER_PROCESS_AUTHORIZER: WindowsBrowserProcessAuthorizer =
+    WindowsBrowserProcessAuthorizer;
 
 /// A bounded, redacted listener-creation failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

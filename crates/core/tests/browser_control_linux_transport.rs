@@ -1,4 +1,4 @@
-#![cfg(any(target_os = "linux", target_os = "macos"))]
+#![cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 
 use muniment_core::browser_control::{
     AuthorizationError, BrowserControlAcceptError, BrowserControlBindError,
@@ -152,6 +152,50 @@ fn endpoint_inspection_failure_drops_stream_before_authorization_or_handshake() 
         );
         assert!(response.is_empty());
     }
+}
+
+#[test]
+fn identity_rejection_drops_stream_before_pairing_or_handshake_response() {
+    let listener = BrowserControlListener::bind("127.0.0.1:0", "/secret/browser").unwrap();
+    let injected = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(injected.local_addr().unwrap()).unwrap();
+    client.write_all(valid_request().as_bytes()).unwrap();
+    let process = RecordingAuthorizer {
+        calls: RefCell::new(Vec::new()),
+        result: Err(AuthorizationError::ExecutableVerificationFailed),
+    };
+    let pairing = RecordingPairingAuthorizer {
+        calls: RefCell::new(Vec::new()),
+        result: Ok(()),
+    };
+
+    let error = listener
+        .accept_websocket_with(
+            &injected,
+            &process,
+            &pairing,
+            &handshake_config(1024, 16, Duration::from_secs(1)),
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        WebSocketHandshakeError::Accept(BrowserControlAcceptError::Unauthorized)
+    );
+    assert_eq!(process.calls.borrow().len(), 1);
+    assert!(pairing.calls.borrow().is_empty());
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut response = Vec::new();
+    let read = client.read_to_end(&mut response);
+    assert!(
+        read.is_ok()
+            || read
+                .as_ref()
+                .is_err_and(|error| error.kind() == io::ErrorKind::ConnectionReset)
+    );
+    assert!(response.is_empty());
 }
 
 #[test]
