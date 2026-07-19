@@ -4,6 +4,8 @@
 mod linux_identity;
 #[cfg(target_os = "linux")]
 mod linux_transport;
+#[cfg(any(target_os = "macos", test))]
+mod macos_identity;
 
 #[cfg(target_os = "linux")]
 pub use linux_identity::{
@@ -19,4 +21,12 @@ pub use linux_transport::{
     BrowserControlPairingAuthorizer, BrowserControlProcessAuthorizer, BrowserControlStreamListener,
     LinuxBrowserProcessAuthorizer, PairingAuthorizationError, WebSocketHandshakeConfig,
     WebSocketHandshakeError,
+};
+
+#[cfg(target_os = "macos")]
+pub use macos_identity::{
+    authorize_browser_process, authorize_browser_process_with_reader, resolve_browser_process,
+    resolve_browser_process_with_reader, AuthorizationError, AuthorizedBrowserProcess,
+    BrowserProcessIdentity, MacOsProcessReader, NativeProcessReader, ProcessReadError,
+    ProcessSocket, ResolutionError, VerificationError,
 };
