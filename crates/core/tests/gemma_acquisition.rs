@@ -8,14 +8,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use muniment_core::llama::acquisition::{
-    acquire_gemma_stage, remaining_stage_bytes, GemmaAcquisitionError, GemmaAcquisitionLimits,
-    GemmaAcquisitionRuntime, GemmaCancellation, GemmaDownloadRequest, GemmaDownloadResponse,
-    GemmaDownloadTransport, GemmaTransportError,
+    acquire_gemma_stage, acquire_gemma_stage_with_progress, remaining_stage_bytes,
+    GemmaAcquisitionError, GemmaAcquisitionLimits, GemmaAcquisitionRuntime, GemmaCancellation,
+    GemmaDownloadRequest, GemmaDownloadResponse, GemmaDownloadTransport, GemmaTransportError,
 };
 use muniment_core::llama::lifecycle::{GemmaNoticeDescriptor, GemmaRevisionDescriptor};
 use muniment_core::llama::ResidentModelDescriptor;
 
 static MODEL: ResidentModelDescriptor = ResidentModelDescriptor {
+    source_url: "https://huggingface.co/google/gemma-3-4b-it-qat-q4_0-gguf/resolve/0123456789abcdef/model.gguf",
+    license: "fixture",
     filename: "model.gguf",
     byte_size: 3,
     sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
@@ -145,6 +147,33 @@ fn resumes_a_part_and_returns_only_a_verified_publication_stage() {
         b"fixture notice"
     );
     assert!(!stage.join("model.gguf.part").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn surfaces_resumed_download_progress_to_callers() {
+    let root = root();
+    fs::create_dir(root.join("install")).unwrap();
+    fs::write(root.join("install/model.gguf.part"), b"a").unwrap();
+    let mut transport = Transport::new([Reply::Response(206, Some((1, 2, 3)), b"bc")]);
+    let mut progress = Vec::new();
+
+    acquire_gemma_stage_with_progress(
+        &root,
+        "install",
+        &REVISION,
+        GemmaAcquisitionLimits::default(),
+        &mut transport,
+        GemmaAcquisitionRuntime {
+            clock: &|| Duration::ZERO,
+            retry_wait: &mut no_wait,
+        },
+        &|| false,
+        &mut |event| progress.push((event.downloaded_bytes, event.total_bytes)),
+    )
+    .unwrap();
+
+    assert_eq!(progress, [(1, 3), (3, 3)]);
     fs::remove_dir_all(root).unwrap();
 }
 

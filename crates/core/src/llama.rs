@@ -26,6 +26,10 @@ const ROUTING_CLASSIFIER_SYSTEM_PROMPT: &str = "You classify requests without ch
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResidentModelDescriptor {
+    /// Immutable artifact URL. Kept in the descriptor so a future release can
+    /// swap the origin without weakening client-side verification.
+    pub source_url: &'static str,
+    pub license: &'static str,
     pub filename: &'static str,
     pub byte_size: u64,
     pub sha256: &'static str,
@@ -34,15 +38,17 @@ pub struct ResidentModelDescriptor {
 }
 
 pub const RESIDENT_MODEL: ResidentModelDescriptor = ResidentModelDescriptor {
-    filename: "gemma-3-4b-it-q4_0.gguf",
-    byte_size: 3_155_051_328,
-    sha256: "76aed0a8285b83102f18b5d60e53c70d09eb4e9917a20ce8956bd546452b56e2",
-    alias: "muniment-resident-gemma",
-    context_tokens: 131_072,
+    source_url: "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf",
+    license: "Apache-2.0",
+    filename: "Qwen3.5-4B-Q4_K_M.gguf",
+    byte_size: 2_740_937_888,
+    sha256: "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
+    alias: "muniment-required-qwen3.5-4b",
+    context_tokens: 262_144,
 };
 
 /// Immutable upstream revision carrying [`RESIDENT_MODEL`].
-pub const RESIDENT_MODEL_REVISION: &str = "15f73f5eee9c28f53afefef5723e29680c2fc78a";
+pub const RESIDENT_MODEL_REVISION: &str = "e87f176479d0855a907a41277aca2f8ee7a09523";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelVerificationError {
@@ -453,6 +459,9 @@ pub struct LlamaServerConfig {
     model: PathBuf,
     port: u16,
     host: LoopbackHost,
+    model_descriptor: &'static ResidentModelDescriptor,
+    tolerate_startup_transport_errors: bool,
+    health_interval: Option<Duration>,
 }
 
 impl LlamaServerConfig {
@@ -462,7 +471,30 @@ impl LlamaServerConfig {
             model: model.into(),
             port,
             host: LoopbackHost::Ipv4,
+            model_descriptor: &RESIDENT_MODEL,
+            tolerate_startup_transport_errors: false,
+            health_interval: None,
         }
+    }
+
+    /// Overrides the artifact descriptor for composition tests that exercise
+    /// the production launch boundary with a small checksum-pinned fixture.
+    #[doc(hidden)]
+    pub fn with_model_descriptor(mut self, descriptor: &'static ResidentModelDescriptor) -> Self {
+        self.model_descriptor = descriptor;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_startup_transport_tolerance(mut self) -> Self {
+        self.tolerate_startup_transport_errors = true;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_health_interval(mut self, interval: Duration) -> Self {
+        self.health_interval = Some(interval);
+        self
     }
 
     pub fn with_host(mut self, host: LoopbackHost) -> Self {
@@ -475,19 +507,22 @@ impl LlamaServerConfig {
     }
 
     pub fn sidecar_config(&self) -> Result<SidecarConfig, ModelVerificationError> {
-        verify_model_artifact(&self.model, &RESIDENT_MODEL)?;
+        verify_model_artifact(&self.model, self.model_descriptor)?;
         Ok(self.build_sidecar_config())
     }
 
     fn build_sidecar_config(&self) -> SidecarConfig {
         let mut config = SidecarConfig::new(self.executable.to_string_lossy().into_owned());
+        if let Some(interval) = self.health_interval {
+            config.health_interval = interval;
+        }
         config.args = vec![
             "--model".into(),
             self.model.to_string_lossy().into_owned(),
             "--alias".into(),
-            RESIDENT_MODEL.alias.into(),
+            self.model_descriptor.alias.into(),
             "--ctx-size".into(),
-            RESIDENT_MODEL.context_tokens.to_string(),
+            self.model_descriptor.context_tokens.to_string(),
             "--host".into(),
             self.host.argument().into(),
             "--port".into(),
@@ -529,7 +564,7 @@ mod tests {
                 "--alias",
                 RESIDENT_MODEL.alias,
                 "--ctx-size",
-                "131072",
+                "262144",
                 "--host",
                 "127.0.0.1",
                 "--port",
@@ -692,12 +727,16 @@ impl std::error::Error for LlamaServerError {}
 impl LlamaServer {
     pub fn spawn(config: LlamaServerConfig) -> Result<Self, LlamaServerError> {
         let base_url = config.base_url();
+        let tolerate_startup_transport_errors = config.tolerate_startup_transport_errors;
         let health = LlamaHealthClient::new(base_url.clone(), DEFAULT_HEALTH_TIMEOUT)
             .expect("typed llama configuration always produces a loopback URL");
         let probe = health.clone();
         let sidecar_config = config.sidecar_config().map_err(LlamaServerError::Model)?;
-        let supervisor = SidecarSupervisor::spawn(sidecar_config, move |_| probe.probe())
-            .map_err(LlamaServerError::Sidecar)?;
+        let supervisor = SidecarSupervisor::spawn(sidecar_config, move |_| match probe.probe() {
+            Err(_) if tolerate_startup_transport_errors => Ok(ProbeOutcome::Loading),
+            outcome => outcome,
+        })
+        .map_err(LlamaServerError::Sidecar)?;
         Ok(Self {
             base_url,
             health,

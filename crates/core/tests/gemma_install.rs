@@ -9,7 +9,7 @@ use muniment_core::llama::acquisition::{
     GemmaAcquisitionLimits, GemmaAcquisitionRuntime, GemmaCancellation, GemmaDownloadRequest,
     GemmaDownloadResponse, GemmaDownloadTransport, GemmaTransportError,
 };
-use muniment_core::llama::install::install_gemma_revision;
+use muniment_core::llama::install::install_gemma_revision_with_progress;
 use muniment_core::llama::lifecycle::{
     GemmaLifecycleBoundary, GemmaNoticeDescriptor, GemmaPersistenceError, GemmaRevisionDescriptor,
     GemmaRevisionLifecycle,
@@ -21,6 +21,8 @@ use muniment_core::model_install::{
 
 const MARGIN: u64 = 256 * 1024 * 1024;
 static MODEL: ResidentModelDescriptor = ResidentModelDescriptor {
+    source_url: "https://example.invalid/model.gguf",
+    license: "fixture",
     filename: "model.gguf",
     byte_size: 3,
     sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
@@ -136,7 +138,8 @@ fn coordinator_owns_locking_and_uses_gemmas_exact_stage_accounting() {
         Ok(Some(value))
     };
 
-    let installed = install_gemma_revision(
+    let mut progress = Vec::new();
+    let installed = install_gemma_revision_with_progress(
         &root.join("staging"),
         "install",
         &REVISION,
@@ -151,6 +154,7 @@ fn coordinator_owns_locking_and_uses_gemmas_exact_stage_accounting() {
         &mut space,
         &lifecycle,
         &boundary,
+        &mut |update| progress.push(update.downloaded_bytes),
     )
     .unwrap();
 
@@ -159,5 +163,6 @@ fn coordinator_owns_locking_and_uses_gemmas_exact_stage_accounting() {
     assert_eq!(checks, [MARGIN + 2, MARGIN]);
     assert_eq!(lock.0, 1);
     assert_eq!(boundary.0.load(Ordering::Relaxed), 0);
+    assert_eq!(progress, [1, 3]);
     fs::remove_dir_all(root).unwrap();
 }

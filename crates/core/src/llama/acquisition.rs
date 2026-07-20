@@ -12,7 +12,6 @@ use std::time::Duration;
 use super::lifecycle::GemmaRevisionDescriptor;
 use super::{verify_model_artifact, ModelVerificationError};
 
-const SOURCE_REPOSITORY: &str = "google/gemma-3-4b-it-qat-q4_0-gguf";
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +125,12 @@ pub struct GemmaAcquisitionRuntime<'a, K, W> {
     pub retry_wait: &'a mut W,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelDownloadProgress {
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+}
+
 impl<F: Fn() -> bool> GemmaCancellation for F {
     fn is_cancelled(&self) -> bool {
         self()
@@ -223,6 +228,36 @@ pub fn acquire_gemma_stage<
     runtime: GemmaAcquisitionRuntime<'_, K, W>,
     cancellation: &C,
 ) -> Result<PathBuf, GemmaAcquisitionError> {
+    acquire_gemma_stage_with_progress(
+        staging_root,
+        install_id,
+        descriptor,
+        limits,
+        transport,
+        runtime,
+        cancellation,
+        &mut |_| {},
+    )
+}
+
+/// Equivalent to [`acquire_gemma_stage`], with transport-independent progress
+/// notifications suitable for desktop, CLI, and extension adapters.
+#[allow(clippy::too_many_arguments)]
+pub fn acquire_gemma_stage_with_progress<
+    T: GemmaDownloadTransport,
+    C: GemmaCancellation,
+    K: GemmaAcquisitionClock,
+    W: GemmaRetryWait,
+>(
+    staging_root: &Path,
+    install_id: &str,
+    descriptor: &'static GemmaRevisionDescriptor,
+    limits: GemmaAcquisitionLimits,
+    transport: &mut T,
+    runtime: GemmaAcquisitionRuntime<'_, K, W>,
+    cancellation: &C,
+    progress: &mut dyn FnMut(ModelDownloadProgress),
+) -> Result<PathBuf, GemmaAcquisitionError> {
     if !safe_component(install_id)
         || limits.max_attempts == 0
         || limits.connect_timeout.is_zero()
@@ -253,6 +288,10 @@ pub fn acquire_gemma_stage<
                 && verify_model_artifact(&completed, descriptor.model).is_ok() =>
         {
             write_notice(&stage, descriptor)?;
+            progress(ModelDownloadProgress {
+                downloaded_bytes: descriptor.model.byte_size,
+                total_bytes: descriptor.model.byte_size,
+            });
             return Ok(stage);
         }
         Ok(_) => remove_part(&completed)?,
@@ -266,6 +305,10 @@ pub fn acquire_gemma_stage<
         }
         let remaining = remaining_budget(runtime.clock, started_at, limits.deadline)?;
         let offset = part_length(&part, descriptor.model.byte_size)?;
+        progress(ModelDownloadProgress {
+            downloaded_bytes: offset,
+            total_bytes: descriptor.model.byte_size,
+        });
         if offset == descriptor.model.byte_size {
             return finish_stage(stage, part, descriptor);
         }
@@ -340,6 +383,7 @@ pub fn acquire_gemma_stage<
             started_at,
             limits.deadline,
             cancellation,
+            progress,
         ) {
             Ok(true) => return finish_stage(stage, part, descriptor),
             Ok(false) if attempt + 1 < limits.max_attempts => {
@@ -415,6 +459,7 @@ fn wait_before_retry<W: GemmaRetryWait, K: GemmaAcquisitionClock>(
     remaining_budget(clock, started_at, deadline).map(|_| ())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stream_response<R: Read, C: GemmaCancellation, K: GemmaAcquisitionClock>(
     mut body: R,
     part: &Path,
@@ -423,6 +468,7 @@ fn stream_response<R: Read, C: GemmaCancellation, K: GemmaAcquisitionClock>(
     started_at: Duration,
     deadline: Duration,
     cancellation: &C,
+    progress: &mut dyn FnMut(ModelDownloadProgress),
 ) -> Result<bool, GemmaAcquisitionError> {
     let mut file = OpenOptions::new()
         .create(true)
@@ -460,6 +506,10 @@ fn stream_response<R: Read, C: GemmaCancellation, K: GemmaAcquisitionClock>(
         }
         file.write_all(&buffer[..count])
             .map_err(|_| GemmaAcquisitionError::Persistence)?;
+        progress(ModelDownloadProgress {
+            downloaded_bytes: total,
+            total_bytes: expected,
+        });
     }
 }
 
@@ -548,10 +598,7 @@ fn remove_part(path: &Path) -> Result<(), GemmaAcquisitionError> {
 }
 
 fn source_url(descriptor: &GemmaRevisionDescriptor) -> String {
-    format!(
-        "https://huggingface.co/{SOURCE_REPOSITORY}/resolve/{}/{}",
-        descriptor.revision, descriptor.model.filename
-    )
+    descriptor.model.source_url.to_owned()
 }
 
 fn require_directory(path: &Path) -> Result<(), GemmaAcquisitionError> {

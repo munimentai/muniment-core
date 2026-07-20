@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 pub const LLAMA_SERVER_RELEASE: &str = "b10068";
 pub const LLAMA_SERVER_RELEASE_BASE: &str =
@@ -90,6 +91,224 @@ pub enum RuntimeArchiveError {
     UnsafeArchive,
     ManifestMismatch,
     InvalidExecutable,
+    Download,
+    NotInstalled,
+}
+
+const POINTER_HEADER: &str = "muniment-llama-runtime-pointer-v1";
+
+pub struct RuntimeDownloadRequest {
+    url: String,
+    pub offset: u64,
+    pub connect_timeout: Duration,
+    pub read_timeout: Duration,
+    pub deadline: Duration,
+}
+
+impl RuntimeDownloadRequest {
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+}
+
+pub struct RuntimeDownloadResponse<R> {
+    pub status: u16,
+    pub content_range: Option<(u64, u64, u64)>,
+    pub body: R,
+}
+
+pub trait RuntimeDownloadTransport {
+    type Body: Read;
+    fn download(
+        &mut self,
+        request: &RuntimeDownloadRequest,
+    ) -> Result<RuntimeDownloadResponse<Self::Body>, RuntimeArchiveError>;
+}
+
+/// Acquires and publishes the pinned runtime. A retained partial archive is
+/// resumed, and the archive and complete extracted tree are verified before
+/// the pointer can become current.
+pub fn acquire_runtime<T: RuntimeDownloadTransport>(
+    root: &Path,
+    transport: &mut T,
+) -> Result<PathBuf, RuntimeArchiveError> {
+    acquire_runtime_for(
+        root,
+        LLAMA_SERVER_RELEASE_BASE,
+        &LLAMA_SERVER_ARTIFACT,
+        transport,
+    )
+}
+
+#[doc(hidden)]
+pub fn acquire_runtime_for<T: RuntimeDownloadTransport>(
+    root: &Path,
+    release_base: &str,
+    descriptor: &LlamaRuntimeDescriptor,
+    transport: &mut T,
+) -> Result<PathBuf, RuntimeArchiveError> {
+    if let Ok(executable) = resolve_runtime_for(root, descriptor) {
+        return Ok(executable);
+    }
+    let stage = root.join("staging").join(descriptor.revision);
+    fs::create_dir_all(&stage).map_err(|_| RuntimeArchiveError::Io)?;
+    let completed_archive = stage.join(descriptor.archive);
+    if fs::symlink_metadata(&completed_archive).is_ok() {
+        fs::remove_file(&completed_archive).map_err(|_| RuntimeArchiveError::Io)?;
+    }
+    if fs::symlink_metadata(stage.join("tree")).is_ok() {
+        fs::remove_dir_all(stage.join("tree")).map_err(|_| RuntimeArchiveError::Io)?;
+    }
+    let partial = stage.join(format!("{}.part", descriptor.archive));
+    let mut delay = Duration::from_millis(100);
+    for attempt in 0..4 {
+        let offset = fs::metadata(&partial).map(|m| m.len()).unwrap_or(0);
+        if offset > descriptor.byte_size {
+            fs::remove_file(&partial).map_err(|_| RuntimeArchiveError::Io)?;
+            continue;
+        }
+        let request = RuntimeDownloadRequest {
+            url: format!("{release_base}/{}", descriptor.archive),
+            offset,
+            connect_timeout: Duration::from_secs(10),
+            read_timeout: Duration::from_secs(30),
+            deadline: Duration::from_secs(30 * 60),
+        };
+        match transport.download(&request) {
+            Ok(response)
+                if (offset == 0 && response.status == 200)
+                    || (offset > 0
+                        && response.status == 206
+                        && response.content_range
+                            == Some((offset, descriptor.byte_size - 1, descriptor.byte_size))) =>
+            {
+                let mut output = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&partial)
+                    .map_err(|_| RuntimeArchiveError::Io)?;
+                let remaining = descriptor.byte_size.saturating_sub(offset);
+                let copied = std::io::copy(&mut response.body.take(remaining + 1), &mut output)
+                    .map_err(|_| RuntimeArchiveError::Download)?;
+                output.sync_all().map_err(|_| RuntimeArchiveError::Io)?;
+                if copied <= remaining && offset + copied == descriptor.byte_size {
+                    break;
+                }
+            }
+            Ok(response) if offset > 0 && response.status == 200 => {
+                fs::remove_file(&partial).map_err(|_| RuntimeArchiveError::Io)?;
+            }
+            _ => {}
+        }
+        if attempt == 3 {
+            return Err(RuntimeArchiveError::Download);
+        }
+        std::thread::sleep(delay);
+        delay = delay.saturating_mul(2);
+    }
+    let archive = stage.join(descriptor.archive);
+    fs::rename(&partial, &archive).map_err(|_| RuntimeArchiveError::Io)?;
+    verify_archive(&archive, descriptor)?;
+    let tree = stage.join("tree");
+    extract_verified_archive(&archive, &tree, descriptor)?;
+    publish_runtime(root, &stage, descriptor)
+}
+
+fn publish_runtime(
+    root: &Path,
+    stage: &Path,
+    descriptor: &LlamaRuntimeDescriptor,
+) -> Result<PathBuf, RuntimeArchiveError> {
+    verify_archive_and_tree(
+        &stage.join(descriptor.archive),
+        &stage.join("tree"),
+        descriptor,
+    )?;
+    let revisions = root.join("revisions");
+    fs::create_dir_all(&revisions).map_err(|_| RuntimeArchiveError::Io)?;
+    let destination = revisions.join(descriptor.revision);
+    if fs::symlink_metadata(&destination).is_ok()
+        && verify_archive_and_tree(
+            &destination.join(descriptor.archive),
+            &destination.join("tree"),
+            descriptor,
+        )
+        .is_err()
+    {
+        fs::remove_dir_all(&destination).map_err(|_| RuntimeArchiveError::Io)?;
+    }
+    if fs::symlink_metadata(&destination).is_err() {
+        fs::rename(stage, &destination).map_err(|_| RuntimeArchiveError::Io)?;
+    }
+    let temporary = root.join(".current.tmp");
+    let _ = fs::remove_file(&temporary);
+    let mut pointer = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|_| RuntimeArchiveError::Io)?;
+    writeln!(pointer, "{POINTER_HEADER}\n{}", descriptor.revision)
+        .map_err(|_| RuntimeArchiveError::Io)?;
+    pointer.sync_all().map_err(|_| RuntimeArchiveError::Io)?;
+    replace_pointer(&temporary, &root.join("current"))?;
+    resolve_runtime_for(root, descriptor)
+}
+
+#[cfg(not(windows))]
+fn replace_pointer(temporary: &Path, destination: &Path) -> Result<(), RuntimeArchiveError> {
+    fs::rename(temporary, destination).map_err(|_| RuntimeArchiveError::Io)
+}
+
+#[cfg(windows)]
+fn replace_pointer(temporary: &Path, destination: &Path) -> Result<(), RuntimeArchiveError> {
+    use std::os::windows::ffi::OsStrExt;
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+    let old: Vec<_> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+    let new: Vec<_> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // SAFETY: both buffers are live, NUL-terminated UTF-16 paths.
+    let result = unsafe {
+        MoveFileExW(
+            old.as_ptr(),
+            new.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    (result != 0).then_some(()).ok_or(RuntimeArchiveError::Io)
+}
+
+/// Resolves only the compiled current revision and immediately re-verifies
+/// both its retained archive and extracted tree before returning its owned executable.
+pub fn resolve_runtime(root: &Path) -> Result<PathBuf, RuntimeArchiveError> {
+    resolve_runtime_for(root, &LLAMA_SERVER_ARTIFACT)
+}
+
+#[doc(hidden)]
+pub fn resolve_runtime_for(
+    root: &Path,
+    descriptor: &LlamaRuntimeDescriptor,
+) -> Result<PathBuf, RuntimeArchiveError> {
+    let pointer =
+        fs::read_to_string(root.join("current")).map_err(|_| RuntimeArchiveError::NotInstalled)?;
+    let lines: Vec<_> = pointer.lines().collect();
+    if lines != [POINTER_HEADER, descriptor.revision] {
+        return Err(RuntimeArchiveError::NotInstalled);
+    }
+    let revision = root.join("revisions").join(descriptor.revision);
+    verify_archive_and_tree(
+        &revision.join(descriptor.archive),
+        &revision.join("tree"),
+        descriptor,
+    )?;
+    Ok(revision.join("tree").join(descriptor.executable))
 }
 impl std::fmt::Display for RuntimeArchiveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

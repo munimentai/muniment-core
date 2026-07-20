@@ -72,11 +72,11 @@ pub struct GemmaNoticeDescriptor {
 
 const GEMMA_NOTICE: GemmaNoticeDescriptor = GemmaNoticeDescriptor {
     filename: "NOTICE.txt",
-    contents: b"Gemma is provided under and subject to the Gemma Terms of Use found at ai.google.dev/gemma/terms\n",
+    contents: b"Qwen3.5 is provided by the Qwen team under the Apache License 2.0. Source: huggingface.co/unsloth/Qwen3.5-4B-GGUF\n",
 };
 
 pub const RESIDENT_GEMMA_REVISION: GemmaRevisionDescriptor = GemmaRevisionDescriptor {
-    identity: "gemma-3-4b-it-q4_0-v1",
+    identity: "qwen3.5-4b-instruct-q4_k_m-v1",
     revision: RESIDENT_MODEL_REVISION,
     model: &RESIDENT_MODEL,
     notice: GEMMA_NOTICE,
@@ -456,8 +456,21 @@ fn valid_descriptor(descriptor: &GemmaRevisionDescriptor) -> bool {
     safe_component(descriptor.identity)
         && safe_component(descriptor.revision)
         && safe_component(descriptor.model.filename)
+        && valid_source_url(descriptor.model.source_url)
+        && !descriptor.model.license.is_empty()
         && safe_component(descriptor.notice.filename)
         && !descriptor.notice.contents.is_empty()
+}
+
+fn valid_source_url(value: &str) -> bool {
+    url::Url::parse(value).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+    })
 }
 
 fn verify_notice(

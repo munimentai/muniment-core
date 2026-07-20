@@ -2148,11 +2148,13 @@ version = "0.0.1"
 dependencies = [
  "chrono",
  "cpal",
+ "flate2",
  "keyring",
  "muniment-core",
  "serde",
  "serde_json",
  "sha2",
+ "tar",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",

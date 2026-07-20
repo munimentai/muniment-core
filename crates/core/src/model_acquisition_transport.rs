@@ -9,6 +9,9 @@ use crate::asr::acquisition::{
 use crate::llama::acquisition::{
     GemmaDownloadRequest, GemmaDownloadResponse, GemmaDownloadTransport, GemmaTransportError,
 };
+use crate::llama::runtime::{
+    RuntimeArchiveError, RuntimeDownloadRequest, RuntimeDownloadResponse, RuntimeDownloadTransport,
+};
 use crate::sidecar::pi_install::{
     PiDownloadRequest, PiDownloadResponse, PiDownloadTransport, PiTransportError,
 };
@@ -143,6 +146,29 @@ impl AsrDownloadTransport for NativeModelAcquisitionTransport {
             TransportFailure::Unavailable => AsrTransportError::Unavailable,
             TransportFailure::Rejected => AsrTransportError::Rejected,
         })
+    }
+}
+
+impl RuntimeDownloadTransport for NativeModelAcquisitionTransport {
+    type Body = ModelResponseBody;
+
+    fn download(
+        &mut self,
+        request: &RuntimeDownloadRequest,
+    ) -> Result<RuntimeDownloadResponse<Self::Body>, RuntimeArchiveError> {
+        self.request(
+            request.url(),
+            request.offset,
+            request.connect_timeout,
+            request.read_timeout,
+            request.deadline,
+        )
+        .map(|response| RuntimeDownloadResponse {
+            status: response.status,
+            content_range: response.content_range,
+            body: response.body,
+        })
+        .map_err(|_| RuntimeArchiveError::Download)
     }
 }
 

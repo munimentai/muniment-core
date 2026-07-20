@@ -11,6 +11,8 @@ use muniment_core::llama::lifecycle::{
 use muniment_core::llama::ResidentModelDescriptor;
 
 static OLD_MODEL: ResidentModelDescriptor = ResidentModelDescriptor {
+    source_url: "https://example.invalid/old.gguf",
+    license: "fixture",
     filename: "model.gguf",
     byte_size: 3,
     sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
@@ -18,6 +20,8 @@ static OLD_MODEL: ResidentModelDescriptor = ResidentModelDescriptor {
     context_tokens: 1,
 };
 static NEW_MODEL: ResidentModelDescriptor = ResidentModelDescriptor {
+    source_url: "https://example.invalid/new.gguf",
+    license: "fixture",
     filename: "model.gguf",
     byte_size: 3,
     sha256: "cb8379ac2098aa165029e3938a51da0bcecfc008fd6795f401178647f96c5b34",

@@ -153,12 +153,29 @@ fn temp_fixture(name: &str, contents: &[u8]) -> PathBuf {
 fn fixture_descriptor(contents: &[u8]) -> ResidentModelDescriptor {
     let digest = format!("{:x}", Sha256::digest(contents));
     ResidentModelDescriptor {
+        source_url: "https://example.invalid/fixture.gguf",
+        license: "fixture",
         filename: "fixture.gguf",
         byte_size: contents.len() as u64,
         sha256: Box::leak(digest.into_boxed_str()),
         alias: "fixture",
         context_tokens: 8,
     }
+}
+
+#[test]
+fn required_qwen_descriptor_is_fully_pinned() {
+    assert_eq!(RESIDENT_MODEL.filename, "Qwen3.5-4B-Q4_K_M.gguf");
+    assert_eq!(RESIDENT_MODEL.license, "Apache-2.0");
+    assert_eq!(RESIDENT_MODEL.byte_size, 2_740_937_888);
+    assert_eq!(
+        RESIDENT_MODEL.sha256,
+        "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
+    );
+    assert_eq!(
+        RESIDENT_MODEL.source_url,
+        "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf"
+    );
 }
 
 #[test]
