@@ -145,11 +145,6 @@ fn initial_metadata_and_limits_are_explicit_and_bounded() {
         (state.first_available_run_seq(), state.current_run_seq()),
         (1, 0)
     );
-    assert_eq!(
-        state.window(),
-        RunStreamWindow {
-            max_events: 4,
-            max_bytes: 40
-        }
-    );
+    assert_eq!(state.window().max_events, 4);
+    assert_eq!(state.window().max_bytes, 40);
 }

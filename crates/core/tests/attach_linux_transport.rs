@@ -5,7 +5,7 @@ use muniment_core::attach::linux::{
     AttachTransportError, PeerCredentials,
 };
 use muniment_core::attach::{
-    decode_frame, encode_frame, Client, Hello, Protocol, VersionRange, Welcome,
+    decode_frame, encode_frame, Client, Hello, Id, Protocol, VersionRange, Welcome,
 };
 use std::fs;
 use std::io::{Read, Write};
@@ -72,6 +72,8 @@ fn authenticated_pathname_peer_negotiates_then_closes() {
         },
         supported: VersionRange { min: 1, max: 1 },
         client_nonce: "client-nonce".into(),
+        authorized_client_id: Id::new("018f0000-0000-7000-8000-000000000099").unwrap(),
+        authorized_client_credential: None,
     })
     .unwrap();
     for fragment in hello.chunks(3) {

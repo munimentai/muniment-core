@@ -2150,6 +2150,8 @@ dependencies = [
  "cpal",
  "flate2",
  "keyring",
+ "libc",
+ "muniment-attach",
  "muniment-core",
  "serde",
  "serde_json",

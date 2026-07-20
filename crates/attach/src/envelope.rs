@@ -238,6 +238,10 @@ pub enum ErrorCode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Operation {
+    #[serde(rename = "workspace.onboard")]
+    WorkspaceOnboard,
+    #[serde(rename = "home.ensure")]
+    HomeEnsure,
     #[serde(rename = "thread.list")]
     ThreadList,
     #[serde(rename = "thread.open")]
@@ -280,6 +284,8 @@ impl Operation {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::WorkspaceOnboard => "workspace.onboard",
+            Self::HomeEnsure => "home.ensure",
             Self::ThreadList => "thread.list",
             Self::ThreadOpen => "thread.open",
             Self::RunOpen => "run.open",

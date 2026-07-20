@@ -1,8 +1,9 @@
 #![cfg(target_os = "linux")]
 
 use muniment_core::attach::linux::{
-    run_authenticated_session_with, run_authenticated_session_with_authorization, ApprovalDecision,
-    AttachSessionError, AuthorizationSessionDependencies, CompanionProvenance, PeerCredentials,
+    run_authenticated_session_with, run_authenticated_session_with_authorization,
+    run_authenticated_session_with_service_and_approvals, ApprovalDecision, AttachSessionError,
+    AuthorizationSessionDependencies, CompanionProvenance, PeerCredentials,
     PermissionAnswerAccepted, PermissionAnswerRequest, RedactedThreadSummary, RunStartAccepted,
     RunStartRequest, RunStreamPage, ThreadListPage, ThreadListRequest, ThreadListService,
     ThreadOpenRequest, MAX_PERMISSION_GATE_ID_LENGTH, MAX_RUN_START_CONTEXT_LENGTH,
@@ -11,15 +12,16 @@ use muniment_core::attach::linux::{
 use muniment_core::attach::{
     decode_frame, encode_frame, Approval, AuthorizationClock, AuthorizationTokenGenerator,
     Authorized, Envelope, ErrorAction, ErrorCode, ErrorEnvelope, Event, EventName, Hello, Id,
-    Operation, Protocol, Request, Response, VersionRange, Welcome, CHALLENGE_LIFETIME,
-    MAX_FRAME_LENGTH, MAX_JSON_DEPTH, MAX_RUN_STREAM_WINDOW_BYTES, MAX_RUN_STREAM_WINDOW_EVENTS,
+    Operation, Protocol, Request, Response, VersionRange, Welcome, WorkspaceOnboardRequest,
+    WorkspaceOnboarded, CHALLENGE_LIFETIME, MAX_FRAME_LENGTH, MAX_JSON_DEPTH,
+    MAX_RUN_STREAM_WINDOW_BYTES, MAX_RUN_STREAM_WINDOW_EVENTS,
 };
 use muniment_core::journal::{
     EventEnvelope, EventPayload, JournalCommitHint, Provenance, RunEventProjection, RunJournal,
 };
 use serde_json::json;
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
@@ -41,6 +43,10 @@ fn credentials() -> PeerCredentials {
 }
 
 fn hello(min: u32, max: u32) -> Vec<u8> {
+    hello_for_client(min, max, "018f0000-0000-7000-8000-000000000099")
+}
+
+fn hello_for_client(min: u32, max: u32, client_id: &str) -> Vec<u8> {
     encode_frame(&Hello {
         protocol: Protocol,
         client: muniment_core::attach::Client {
@@ -49,6 +55,8 @@ fn hello(min: u32, max: u32) -> Vec<u8> {
         },
         supported: VersionRange { min, max },
         client_nonce: "client-nonce".into(),
+        authorized_client_id: Id::new(client_id).unwrap(),
+        authorized_client_credential: None,
     })
     .unwrap()
 }
@@ -117,6 +125,79 @@ fn unavailable_service(
 struct StartService {
     calls: Vec<(String, RunStartRequest, Id, Id, CompanionProvenance)>,
     output: Option<RunStartAccepted>,
+}
+
+#[derive(Clone, Default)]
+struct OnboardingStartService {
+    instructions: Arc<std::sync::Mutex<HashMap<String, HashMap<String, String>>>>,
+    runs: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    client_identity: Option<String>,
+}
+
+impl ThreadListService for OnboardingStartService {
+    fn bind_authorized_client(&mut self, client_identity: &str) {
+        self.client_identity = Some(client_identity.to_owned());
+    }
+
+    fn onboard_workspace(
+        &mut self,
+        request: WorkspaceOnboardRequest,
+    ) -> Result<WorkspaceOnboarded, muniment_core::attach::ProtocolError> {
+        let instructions = format!("instructions for {}", request.opened_directory);
+        let mut all_instructions = self.instructions.lock().unwrap();
+        let instructions_by_workspace = all_instructions
+            .entry(self.client_identity.clone().unwrap())
+            .or_default();
+        instructions_by_workspace.insert(request.opened_directory.clone(), instructions.clone());
+        instructions_by_workspace.insert(request.memory_location.clone(), instructions.clone());
+        Ok(WorkspaceOnboarded {
+            opened_directory: request.opened_directory,
+            memory_location: request.memory_location,
+            instructions: Some(instructions),
+        })
+    }
+
+    fn authorized_workspace(&self, workspace: &str) -> Option<String> {
+        self.client_identity.as_ref().and_then(|identity| {
+            self.instructions
+                .lock()
+                .unwrap()
+                .get(identity)
+                .and_then(|workspaces| {
+                    workspaces
+                        .contains_key(workspace)
+                        .then(|| workspace.to_owned())
+                })
+        })
+    }
+
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, muniment_core::attach::ProtocolError> {
+        panic!("thread reads must not dispatch")
+    }
+
+    fn start_run(
+        &mut self,
+        workspace: &str,
+        _: RunStartRequest,
+        _: &Id,
+        _: &Id,
+        _: CompanionProvenance,
+    ) -> Result<RunStartAccepted, muniment_core::attach::ProtocolError> {
+        self.runs.lock().unwrap().push((
+            workspace.to_owned(),
+            self.instructions.lock().unwrap()[self.client_identity.as_ref().unwrap()][workspace]
+                .clone(),
+        ));
+        Ok(RunStartAccepted {
+            run_id: "0190a100-0000-7000-8000-000000000001".into(),
+            committed_seq: 2,
+            accepted_at: "2026-07-17T00:00:00Z".into(),
+        })
+    }
 }
 
 #[derive(Default)]
@@ -436,6 +517,49 @@ fn approval_continues_into_dispatch() {
     let response: Response = read_frame(&mut client);
     assert_eq!(response.request_id, Id::new(format!("{:032x}", 1)).unwrap());
     assert_eq!(client.read(&mut [0]).unwrap(), 0);
+}
+
+#[test]
+fn production_service_composition_uses_approved_pairing_and_dispatches() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let worker = std::thread::spawn(move || {
+        let mut service = |_: &str, _: ThreadListRequest| {
+            Ok(ThreadListPage {
+                threads: vec![],
+                next_cursor: None,
+            })
+        };
+        run_authenticated_session_with_service_and_approvals(
+            server,
+            credentials(),
+            "0.1.0",
+            &mut service,
+            |_: &muniment_core::attach::PairingChallenge, _: Duration| {
+                Some(ApprovalDecision::Approve(approval()))
+            },
+        )
+    });
+    client.write_all(&hello(1, 1)).unwrap();
+    let _: Welcome = read_frame(&mut client);
+    let authorized: Authorized = read_frame(&mut client);
+    let request = Request {
+        protocol: Protocol,
+        request_id: Id::new(format!("{:032x}", 91)).unwrap(),
+        operation: Operation::ThreadList,
+        capability: authorized.capability,
+        idempotency_key: None,
+        body: json!({"limit": 1}),
+    };
+    client
+        .write_all(&encode_frame(&Envelope::Request(request)).unwrap())
+        .unwrap();
+    let response: Response = read_frame(&mut client);
+    assert_eq!(
+        response.request_id,
+        Id::new(format!("{:032x}", 91)).unwrap()
+    );
+    client.shutdown(Shutdown::Both).unwrap();
+    assert_eq!(worker.join().unwrap(), Ok(()));
 }
 
 #[test]
@@ -3004,6 +3128,150 @@ fn authorized_run_start_dispatches_once_with_bounded_input_and_provenance() {
     assert_eq!(provenance.companion_kind, "cli");
     assert_eq!(provenance.companion_version, "1.0.0");
     assert_eq!(provenance.peer_uid, unsafe { libc::geteuid() });
+}
+
+#[test]
+fn onboarding_authorizes_only_opened_and_memory_workspaces_for_run_start() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello(1, 1)).unwrap();
+    let workspaces = [
+        ("/cli/default", "/cli/default"),
+        ("/cli/override-repo", "/cli/external-memory"),
+        ("/extension/root-one", "/extension/root-one"),
+        ("/extension/root-two", "/extension/external-memory"),
+    ];
+    for (index, (opened, memory)) in workspaces.iter().enumerate() {
+        client
+            .write_all(&request(
+                200 + index as u128,
+                Operation::WorkspaceOnboard,
+                json!({"opened_directory": opened, "memory_location": memory}),
+            ))
+            .unwrap();
+        client
+            .write_all(&request_with_idempotency(
+                210 + index as u128,
+                Operation::RunStart,
+                json!({"text": "use instructions", "workspace": memory}),
+            ))
+            .unwrap();
+    }
+    client
+        .write_all(&request_with_idempotency(
+            220,
+            Operation::RunStart,
+            json!({"text": "escape grant", "workspace": "/arbitrary/not-onboarded"}),
+        ))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+
+    let mut approved = approval();
+    approved.scopes.insert("run.write".into());
+    let mut service = OnboardingStartService::default();
+    assert_eq!(
+        dispatch_session_with_approval(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            approved,
+            &mut service,
+        ),
+        Ok(())
+    );
+    for _ in workspaces {
+        let _: Response = read_frame(&mut client);
+        let _: Response = read_frame(&mut client);
+    }
+    let error: ErrorEnvelope = read_frame(&mut client);
+    assert_eq!(error.error.code(), ErrorCode::Unauthorized);
+    let runs = service.runs.lock().unwrap();
+    assert_eq!(runs.len(), workspaces.len());
+    for ((selected, instructions), (opened, memory)) in runs.iter().zip(workspaces.iter()) {
+        assert_eq!(selected, memory);
+        assert_eq!(instructions, &format!("instructions for {opened}"));
+    }
+}
+
+#[test]
+fn workspace_registrations_are_bounded_to_the_approved_client_across_connections() {
+    let shared = OnboardingStartService::default();
+    let instructions = shared.instructions.clone();
+    let runs = shared.runs.clone();
+    let workspace = "workspace-1";
+    let override_memory = "/sensitive/external-memory";
+
+    let run_session = |client_id: &str, frames: Vec<Vec<u8>>| {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .write_all(&hello_for_client(1, 1, client_id))
+            .unwrap();
+        for frame in frames {
+            client.write_all(&frame).unwrap();
+        }
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut approved = approval();
+        approved.profile = "desktop-owner".into();
+        approved.scopes.insert("run.write".into());
+        let mut service = OnboardingStartService {
+            instructions: instructions.clone(),
+            runs: runs.clone(),
+            client_identity: None,
+        };
+        assert_eq!(
+            dispatch_session_with_approval(
+                &mut client,
+                server,
+                TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                approved,
+                &mut service,
+            ),
+            Ok(())
+        );
+        client
+    };
+
+    let mut onboarding = run_session(
+        "018f0000-0000-7000-8000-00000000000a",
+        vec![request(
+            230,
+            Operation::WorkspaceOnboard,
+            json!({"opened_directory": workspace, "memory_location": override_memory}),
+        )],
+    );
+    let _: Response = read_frame(&mut onboarding);
+
+    for (request_id, selected) in [(231, workspace), (234, override_memory)] {
+        let mut client_b = run_session(
+            "018f0000-0000-7000-8000-00000000000b",
+            vec![request_with_idempotency(
+                request_id,
+                Operation::RunStart,
+                json!({"text": "steal context", "workspace": selected}),
+            )],
+        );
+        let rejected: ErrorEnvelope = read_frame(&mut client_b);
+        assert_eq!(rejected.error.code(), ErrorCode::Unauthorized);
+    }
+    assert!(runs.lock().unwrap().is_empty());
+
+    let mut client_a_follow_up = run_session(
+        "018f0000-0000-7000-8000-00000000000a",
+        vec![
+            request_with_idempotency(
+                232,
+                Operation::RunStart,
+                json!({"text": "default registration", "workspace": workspace}),
+            ),
+            request_with_idempotency(
+                233,
+                Operation::RunStart,
+                json!({"text": "override registration", "workspace": override_memory}),
+            ),
+        ],
+    );
+    let _: Response = read_frame(&mut client_a_follow_up);
+    let _: Response = read_frame(&mut client_a_follow_up);
+    assert_eq!(runs.lock().unwrap().len(), 2);
 }
 
 #[test]

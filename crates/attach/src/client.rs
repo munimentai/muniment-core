@@ -254,8 +254,8 @@ mod linux {
     };
     use crate::{
         decode_frame, encode_frame, Authorized, Client, Envelope, ErrorCode, ErrorEnvelope,
-        EventName, FrameError, Hello, Id, Operation, Protocol, Request, VersionRange, Welcome,
-        MAX_FRAME_LENGTH, MAX_TEXT_LENGTH, PROTOCOL,
+        EventName, FrameError, Hello, Id, Operation, Protocol, Request, Response, VersionRange,
+        Welcome, WorkspaceOnboarded, MAX_FRAME_LENGTH, MAX_TEXT_LENGTH, PROTOCOL,
     };
     use serde::de::DeserializeOwned;
     use serde_json::Value;
@@ -300,6 +300,7 @@ mod linux {
         authorized_at: Instant,
         io_timeout: Duration,
         active_run_stream: Option<ActiveRunStream>,
+        authorized_client_credential: String,
     }
 
     impl std::fmt::Debug for AuthorizedClient {
@@ -311,6 +312,73 @@ mod linux {
     impl AuthorizedClient {
         pub fn authorization_summary(&self) -> AuthorizationSummary {
             self.summary.clone()
+        }
+
+        pub fn authorized_client_credential(&self) -> &str {
+            &self.authorized_client_credential
+        }
+
+        pub fn onboard_workspace(
+            &mut self,
+            opened_directory: &str,
+            memory_location: &str,
+        ) -> Result<WorkspaceOnboarded, ClientError> {
+            if opened_directory.is_empty()
+                || memory_location.is_empty()
+                || opened_directory.len() > MAX_TEXT_LENGTH
+                || memory_location.len() > MAX_TEXT_LENGTH
+            {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            let request_id = fresh_request_id()?;
+            let request = Request {
+                protocol: Protocol,
+                request_id: request_id.clone(),
+                operation: Operation::WorkspaceOnboard,
+                capability: self.capability.clone(),
+                idempotency_key: None,
+                body: serde_json::json!({
+                    "opened_directory": opened_directory, "memory_location": memory_location
+                }),
+            };
+            let response = self.send_request(request, &request_id)?;
+            serde_json::from_value(response.body).map_err(|_| ClientError::UnexpectedMessage)
+        }
+
+        pub fn ensure_home(&mut self) -> Result<(), ClientError> {
+            let request_id = fresh_request_id()?;
+            let request = Request {
+                protocol: Protocol,
+                request_id: request_id.clone(),
+                operation: Operation::HomeEnsure,
+                capability: self.capability.clone(),
+                idempotency_key: None,
+                body: serde_json::json!({}),
+            };
+            let response = self.send_request(request, &request_id)?;
+            if response.body != serde_json::json!({}) {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            Ok(())
+        }
+
+        fn send_request(
+            &mut self,
+            request: Request,
+            request_id: &Id,
+        ) -> Result<Response, ClientError> {
+            let deadline = deadline(self.io_timeout);
+            let bytes = encode_frame(&request).map_err(map_frame_error)?;
+            write_all_before(&mut self.stream, &bytes, deadline)?;
+            match serde_json::from_value(read_value(&mut self.stream, deadline)?)
+                .map_err(|_| ClientError::UnexpectedMessage)?
+            {
+                Envelope::Response(response) if &response.request_id == request_id => Ok(response),
+                Envelope::Error(error) if error.request_id.as_ref() == Some(request_id) => {
+                    Err(map_protocol_error(error.error.code()))
+                }
+                _ => Err(ClientError::UnexpectedMessage),
+            }
         }
 
         pub fn list_threads(
@@ -447,6 +515,15 @@ mod linux {
             text: &str,
             context: Option<Value>,
         ) -> Result<RunStartAccepted, ClientError> {
+            self.start_run_in_workspace(text, context, None)
+        }
+
+        pub fn start_run_in_workspace(
+            &mut self,
+            text: &str,
+            context: Option<Value>,
+            workspace: Option<&str>,
+        ) -> Result<RunStartAccepted, ClientError> {
             let context_length = context
                 .as_ref()
                 .map(|context| serde_json::to_vec(context).map(|bytes| bytes.len()))
@@ -455,6 +532,7 @@ mod linux {
                 .unwrap_or(0);
             if text.trim().is_empty()
                 || text.len() > MAX_RUN_START_TEXT_LENGTH
+                || workspace.is_some_and(|value| value.is_empty() || value.len() > MAX_TEXT_LENGTH)
                 || context_length > MAX_RUN_START_CONTEXT_LENGTH
             {
                 return Err(ClientError::UnexpectedMessage);
@@ -465,6 +543,9 @@ mod linux {
             let mut body = serde_json::json!({ "text": text });
             if let Some(context) = context {
                 body["context"] = context;
+            }
+            if let Some(workspace) = workspace {
+                body["workspace"] = Value::String(workspace.to_owned());
             }
             let request = Request {
                 protocol: Protocol,
@@ -928,11 +1009,31 @@ mod linux {
         client_version: &str,
         pairing_pending: impl FnOnce(),
     ) -> Result<AuthorizedClient, ClientError> {
+        let identity = fresh_request_id()?;
+        handshake_as(client_version, identity.as_str(), pairing_pending)
+    }
+
+    pub fn handshake_as(
+        client_version: &str,
+        authorized_client_id: &str,
+        pairing_pending: impl FnOnce(),
+    ) -> Result<AuthorizedClient, ClientError> {
+        handshake_as_with_credential(client_version, authorized_client_id, None, pairing_pending)
+    }
+
+    pub fn handshake_as_with_credential(
+        client_version: &str,
+        authorized_client_id: &str,
+        authorized_client_credential: Option<&str>,
+        pairing_pending: impl FnOnce(),
+    ) -> Result<AuthorizedClient, ClientError> {
         let endpoint = endpoint_from_environment()?;
         let stream = UnixStream::connect(endpoint).map_err(|_| ClientError::DesktopUnavailable)?;
-        handshake_stream(
+        handshake_stream_with_credential(
             stream,
             client_version,
+            authorized_client_id,
+            authorized_client_credential,
             IO_TIMEOUT,
             APPROVAL_TIMEOUT,
             pairing_pending,
@@ -951,12 +1052,55 @@ mod linux {
 
     #[doc(hidden)]
     pub fn handshake_stream(
-        mut stream: UnixStream,
+        stream: UnixStream,
         client_version: &str,
         io_timeout: Duration,
         approval_timeout: Duration,
         pairing_pending: impl FnOnce(),
     ) -> Result<AuthorizedClient, ClientError> {
+        let identity = fresh_request_id()?;
+        handshake_stream_as(
+            stream,
+            client_version,
+            identity.as_str(),
+            io_timeout,
+            approval_timeout,
+            pairing_pending,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn handshake_stream_as(
+        stream: UnixStream,
+        client_version: &str,
+        authorized_client_id: &str,
+        io_timeout: Duration,
+        approval_timeout: Duration,
+        pairing_pending: impl FnOnce(),
+    ) -> Result<AuthorizedClient, ClientError> {
+        handshake_stream_with_credential(
+            stream,
+            client_version,
+            authorized_client_id,
+            None,
+            io_timeout,
+            approval_timeout,
+            pairing_pending,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn handshake_stream_with_credential(
+        mut stream: UnixStream,
+        client_version: &str,
+        authorized_client_id: &str,
+        authorized_client_credential: Option<&str>,
+        io_timeout: Duration,
+        approval_timeout: Duration,
+        pairing_pending: impl FnOnce(),
+    ) -> Result<AuthorizedClient, ClientError> {
+        let authorized_client_id =
+            Id::new(authorized_client_id).map_err(|_| ClientError::UnexpectedMessage)?;
         let hello = Hello {
             protocol: Protocol,
             client: Client {
@@ -965,6 +1109,8 @@ mod linux {
             },
             supported: VersionRange { min: 1, max: 1 },
             client_nonce: fresh_nonce()?,
+            authorized_client_id,
+            authorized_client_credential: authorized_client_credential.map(str::to_owned),
         };
         let bytes = encode_frame(&hello).map_err(map_frame_error)?;
         write_all_before(&mut stream, &bytes, deadline(io_timeout))?;
@@ -986,6 +1132,7 @@ mod linux {
         reject_protocol_error(&authorized_value)?;
         let authorized: Authorized = parse_message(authorized_value)?;
         if !is_hex_secret(&authorized.capability, 64)
+            || !is_hex_secret(&authorized.authorized_client_credential, 64)
             || authorized.expires_at == 0
             || authorized.expires_at > 8 * 60 * 60
             || authorized.idle_timeout_seconds == 0
@@ -1003,6 +1150,7 @@ mod linux {
             authorized_at: Instant::now(),
             io_timeout,
             active_run_stream: None,
+            authorized_client_credential: authorized.authorized_client_credential,
         })
     }
 
@@ -1163,7 +1311,7 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{handshake_stream, AuthorizedClient};
+pub use linux::{handshake_stream, handshake_stream_with_credential, AuthorizedClient};
 
 #[cfg(not(target_os = "linux"))]
 #[derive(Debug)]
@@ -1171,6 +1319,16 @@ pub struct AuthorizedClient;
 
 #[cfg(not(target_os = "linux"))]
 impl AuthorizedClient {
+    pub fn onboard_workspace(
+        &mut self,
+        _opened_directory: &str,
+        _memory_location: &str,
+    ) -> Result<crate::WorkspaceOnboarded, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+    pub fn ensure_home(&mut self) -> Result<(), ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
     pub fn list_threads(&mut self, _cursor: Option<&str>) -> Result<ThreadListPage, ClientError> {
         Err(ClientError::UnsupportedPlatform)
     }
@@ -1187,6 +1345,14 @@ impl AuthorizedClient {
         &mut self,
         _text: &str,
         _context: Option<serde_json::Value>,
+    ) -> Result<RunStartAccepted, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+    pub fn start_run_in_workspace(
+        &mut self,
+        _text: &str,
+        _context: Option<serde_json::Value>,
+        _workspace: Option<&str>,
     ) -> Result<RunStartAccepted, ClientError> {
         Err(ClientError::UnsupportedPlatform)
     }
@@ -1223,6 +1389,39 @@ pub fn handshake(
     pairing_pending: impl FnOnce(),
 ) -> Result<AuthorizedClient, ClientError> {
     linux::handshake(client_version, pairing_pending)
+}
+
+#[cfg(target_os = "linux")]
+pub fn handshake_as(
+    client_version: &str,
+    authorized_client_id: &str,
+    pairing_pending: impl FnOnce(),
+) -> Result<AuthorizedClient, ClientError> {
+    linux::handshake_as(client_version, authorized_client_id, pairing_pending)
+}
+
+#[cfg(target_os = "linux")]
+pub fn handshake_as_with_credential(
+    client_version: &str,
+    authorized_client_id: &str,
+    authorized_client_credential: Option<&str>,
+    pairing_pending: impl FnOnce(),
+) -> Result<AuthorizedClient, ClientError> {
+    linux::handshake_as_with_credential(
+        client_version,
+        authorized_client_id,
+        authorized_client_credential,
+        pairing_pending,
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn handshake_as(
+    _client_version: &str,
+    _authorized_client_id: &str,
+    _pairing_pending: impl FnOnce(),
+) -> Result<AuthorizedClient, ClientError> {
+    Err(ClientError::UnsupportedPlatform)
 }
 
 #[cfg(not(target_os = "linux"))]

@@ -5,7 +5,7 @@ use std::{
 
 use serde::{de, Deserialize, Deserializer, Serialize};
 
-use crate::{ErrorAction, Protocol, ProtocolError, VersionRange};
+use crate::{ErrorAction, Id, Protocol, ProtocolError, VersionRange};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Client {
@@ -19,6 +19,9 @@ pub struct Hello {
     pub client: Client,
     pub supported: VersionRange,
     pub client_nonce: String,
+    pub authorized_client_id: Id,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorized_client_credential: Option<String>,
 }
 
 impl fmt::Debug for Hello {
@@ -40,6 +43,9 @@ impl<'de> Deserialize<'de> for Hello {
             client: Client,
             supported: VersionRange,
             client_nonce: String,
+            authorized_client_id: Id,
+            #[serde(default)]
+            authorized_client_credential: Option<String>,
             #[serde(flatten)]
             extra: BTreeMap<String, serde_json::Value>,
         }
@@ -74,6 +80,8 @@ impl<'de> Deserialize<'de> for Hello {
             client: fields.client,
             supported: fields.supported,
             client_nonce: fields.client_nonce,
+            authorized_client_id: fields.authorized_client_id,
+            authorized_client_credential: fields.authorized_client_credential,
         })
     }
 }
@@ -162,6 +170,7 @@ pub struct Authorized {
     pub expires_at: u64,
     pub idle_timeout_seconds: u64,
     pub workspace_scopes: BTreeMap<String, BTreeSet<String>>,
+    pub authorized_client_credential: String,
 }
 
 impl<'de> Deserialize<'de> for Authorized {
@@ -172,6 +181,7 @@ impl<'de> Deserialize<'de> for Authorized {
             expires_at: u64,
             idle_timeout_seconds: u64,
             workspace_scopes: BTreeMap<String, BTreeSet<String>>,
+            authorized_client_credential: String,
             #[serde(flatten)]
             extra: BTreeMap<String, serde_json::Value>,
         }
@@ -205,6 +215,7 @@ impl<'de> Deserialize<'de> for Authorized {
             expires_at: fields.expires_at,
             idle_timeout_seconds: fields.idle_timeout_seconds,
             workspace_scopes: fields.workspace_scopes,
+            authorized_client_credential: fields.authorized_client_credential,
         })
     }
 }
@@ -302,10 +313,27 @@ pub fn authorized(
     idle_timeout_seconds: u64,
     workspace_scopes: BTreeMap<String, BTreeSet<String>>,
 ) -> Authorized {
+    authorized_with_client_credential(
+        capability,
+        expires_at,
+        idle_timeout_seconds,
+        workspace_scopes,
+        "00".repeat(32),
+    )
+}
+
+pub fn authorized_with_client_credential(
+    capability: impl Into<String>,
+    expires_at: u64,
+    idle_timeout_seconds: u64,
+    workspace_scopes: BTreeMap<String, BTreeSet<String>>,
+    authorized_client_credential: impl Into<String>,
+) -> Authorized {
     Authorized {
         capability: capability.into(),
         expires_at,
         idle_timeout_seconds,
         workspace_scopes,
+        authorized_client_credential: authorized_client_credential.into(),
     }
 }

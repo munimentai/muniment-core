@@ -401,6 +401,8 @@ fn hello_welcome_and_version_overlap() {
         },
         supported: VersionRange { min: 1, max: 2 },
         client_nonce: "client-nonce".into(),
+        authorized_client_id: Id::new("018f0000-0000-7000-8000-000000000099").unwrap(),
+        authorized_client_credential: None,
     };
     let selected =
         negotiate_first(FirstMessage::Hello(hello), VersionRange { min: 1, max: 1 }).unwrap();
@@ -471,6 +473,7 @@ fn hello_first_rejects_operation_shapes_but_allows_future_optional_fields() {
         "client": {"kind": "cli", "version": "1.0.0"},
         "supported": {"min": 1, "max": 1},
         "client_nonce": "client-nonce",
+        "authorized_client_id": id(99),
         "request_id": id(1),
         "operation": "thread.list",
         "capability": "connection-capability",
@@ -488,6 +491,7 @@ fn hello_first_rejects_operation_shapes_but_allows_future_optional_fields() {
         "client": {"kind": "cli", "version": "1.0.0"},
         "supported": {"min": 1, "max": 1},
         "client_nonce": "client-nonce",
+        "authorized_client_id": id(99),
         "future_optional": {"enabled": true}
     });
     let first = serde_json::from_value::<FirstMessage>(future_hello).unwrap();

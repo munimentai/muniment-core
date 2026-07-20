@@ -1,1 +1,1 @@
-{"capability":"fixture-capability","expires_at":3600,"idle_timeout_seconds":900,"workspace_scopes":{"workspace-1":["thread.read"]}}
+{"capability":"fixture-capability","expires_at":3600,"idle_timeout_seconds":900,"workspace_scopes":{"workspace-1":["thread.read"]},"authorized_client_credential":"0000000000000000000000000000000000000000000000000000000000000000"}
