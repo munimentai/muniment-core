@@ -553,7 +553,7 @@ fn supervisor_restarts_stub_and_shutdown_cleans_up_child() {
     let events = supervisor.subscribe();
     let mut healthy_generation = None;
     while let Ok(event) = events.recv_timeout(Duration::from_secs(5)) {
-        if event.status == SidecarStatus::Healthy {
+        if event.status == SidecarStatus::Healthy && event.generation == Some(2) {
             healthy_generation = event.generation;
             break;
         }
