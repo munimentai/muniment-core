@@ -47,6 +47,15 @@ fn hello(min: u32, max: u32) -> Vec<u8> {
 }
 
 fn hello_for_client(min: u32, max: u32, client_id: &str) -> Vec<u8> {
+    hello_for_client_with_credential(min, max, client_id, None)
+}
+
+fn hello_for_client_with_credential(
+    min: u32,
+    max: u32,
+    client_id: &str,
+    credential: Option<&str>,
+) -> Vec<u8> {
     encode_frame(&Hello {
         protocol: Protocol,
         client: muniment_core::attach::Client {
@@ -56,9 +65,45 @@ fn hello_for_client(min: u32, max: u32, client_id: &str) -> Vec<u8> {
         supported: VersionRange { min, max },
         client_nonce: "client-nonce".into(),
         authorized_client_id: Id::new(client_id).unwrap(),
-        authorized_client_credential: None,
+        authorized_client_credential: credential.map(str::to_owned),
     })
     .unwrap()
+}
+
+struct CredentialService {
+    expected: String,
+    bound: bool,
+}
+
+impl ThreadListService for CredentialService {
+    fn reconnect_approval(&self) -> Option<Approval> {
+        Some(approval())
+    }
+
+    fn authorize_client(
+        &mut self,
+        _: &str,
+        presented_credential: Option<&str>,
+        issued_credential: &str,
+    ) -> Result<String, muniment_core::attach::ProtocolError> {
+        if presented_credential == Some(self.expected.as_str()) {
+            self.bound = true;
+            Ok(self.expected.clone())
+        } else if presented_credential.is_none() {
+            self.bound = true;
+            Ok(issued_credential.to_owned())
+        } else {
+            Err(muniment_core::attach::ProtocolError::unauthorized())
+        }
+    }
+
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, muniment_core::attach::ProtocolError> {
+        panic!("request must not dispatch")
+    }
 }
 
 fn read_frame<T: serde::de::DeserializeOwned>(stream: &mut UnixStream) -> T {
@@ -517,6 +562,108 @@ fn approval_continues_into_dispatch() {
     let response: Response = read_frame(&mut client);
     assert_eq!(response.request_id, Id::new(format!("{:032x}", 1)).unwrap());
     assert_eq!(client.read(&mut [0]).unwrap(), 0);
+}
+
+#[test]
+fn authorized_client_reconnects_without_waiting_for_pairing() {
+    let credential = "ab".repeat(32);
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .write_all(&hello_for_client_with_credential(
+            1,
+            1,
+            "018f0000-0000-7000-8000-000000000099",
+            Some(&credential),
+        ))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut service = CredentialService {
+        expected: credential.clone(),
+        bound: false,
+    };
+    assert_eq!(
+        run_authenticated_session_with_authorization(
+            server,
+            credentials(),
+            "0.1.0",
+            Duration::from_secs(1),
+            AuthorizationSessionDependencies {
+                fill_random: |bytes: &mut [u8]| {
+                    bytes.fill(9);
+                    Ok(())
+                },
+                clock: TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                tokens: TestTokens(1),
+                approvals: |_: &muniment_core::attach::PairingChallenge, _: Duration| {
+                    panic!("known clients must not invoke the pairing waiter")
+                },
+            },
+            &mut service,
+        ),
+        Ok(())
+    );
+    let welcome: Welcome = read_frame(&mut client);
+    assert_eq!(
+        welcome.authorization,
+        muniment_attach::Authorization::Authorized
+    );
+    let authorized: Authorized = read_frame(&mut client);
+    assert_eq!(authorized.authorized_client_credential, credential);
+    assert!(service.bound);
+}
+
+#[test]
+fn invalid_reconnect_credential_still_requires_pairing_and_is_not_replaced() {
+    let expected = "ab".repeat(32);
+    let presented = "cd".repeat(32);
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .write_all(&hello_for_client_with_credential(
+            1,
+            1,
+            "018f0000-0000-7000-8000-000000000099",
+            Some(&presented),
+        ))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let waits = Rc::new(Cell::new(0));
+    let waiter_calls = waits.clone();
+    let mut service = CredentialService {
+        expected: expected.clone(),
+        bound: false,
+    };
+    assert_eq!(
+        run_authenticated_session_with_authorization(
+            server,
+            credentials(),
+            "0.1.0",
+            Duration::from_secs(1),
+            AuthorizationSessionDependencies {
+                fill_random: |bytes: &mut [u8]| {
+                    bytes.fill(9);
+                    Ok(())
+                },
+                clock: TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                tokens: TestTokens(1),
+                approvals: move |_: &muniment_core::attach::PairingChallenge, _: Duration| {
+                    waiter_calls.set(waiter_calls.get() + 1);
+                    (waiter_calls.get() == 1).then(|| ApprovalDecision::Approve(approval()))
+                },
+            },
+            &mut service,
+        ),
+        Err(AttachSessionError::Authorization)
+    );
+    let welcome: Welcome = read_frame(&mut client);
+    assert_eq!(
+        welcome.authorization,
+        muniment_attach::Authorization::PairingRequired
+    );
+    let error: ErrorEnvelope = read_frame(&mut client);
+    assert_eq!(error.error.code(), ErrorCode::Unauthorized);
+    assert_eq!(waits.get(), 2);
+    assert_eq!(service.expected, expected);
+    assert!(!service.bound);
 }
 
 #[test]

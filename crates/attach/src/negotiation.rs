@@ -90,6 +90,7 @@ impl<'de> Deserialize<'de> for Hello {
 #[serde(rename_all = "snake_case")]
 pub enum Authorization {
     PairingRequired,
+    Authorized,
 }
 
 #[derive(Clone, PartialEq, Serialize)]
@@ -303,6 +304,21 @@ pub fn welcome(
         desktop_version: desktop_version.into(),
         server_nonce: server_nonce.into(),
         authorization: Authorization::PairingRequired,
+        approval_challenge: approval_challenge.into(),
+    }
+}
+
+pub fn reconnect_welcome(
+    selected: u32,
+    desktop_version: impl Into<String>,
+    server_nonce: impl Into<String>,
+    approval_challenge: impl Into<String>,
+) -> Welcome {
+    Welcome {
+        selected,
+        desktop_version: desktop_version.into(),
+        server_nonce: server_nonce.into(),
+        authorization: Authorization::Authorized,
         approval_challenge: approval_challenge.into(),
     }
 }

@@ -253,9 +253,9 @@ mod linux {
         RunStreamSubscription, ThreadListPage, ThreadOpenPage,
     };
     use crate::{
-        decode_frame, encode_frame, Authorized, Client, Envelope, ErrorCode, ErrorEnvelope,
-        EventName, FrameError, Hello, Id, Operation, Protocol, Request, Response, VersionRange,
-        Welcome, WorkspaceOnboarded, MAX_FRAME_LENGTH, MAX_TEXT_LENGTH, PROTOCOL,
+        decode_frame, encode_frame, Authorization, Authorized, Client, Envelope, ErrorCode,
+        ErrorEnvelope, EventName, FrameError, Hello, Id, Operation, Protocol, Request, Response,
+        VersionRange, Welcome, WorkspaceOnboarded, MAX_FRAME_LENGTH, MAX_TEXT_LENGTH, PROTOCOL,
     };
     use serde::de::DeserializeOwned;
     use serde_json::Value;
@@ -1126,7 +1126,9 @@ mod linux {
         {
             return Err(ClientError::UnexpectedMessage);
         }
-        pairing_pending();
+        if welcome.authorization == Authorization::PairingRequired {
+            pairing_pending();
+        }
 
         let authorized_value = read_value(&mut stream, deadline(approval_timeout))?;
         reject_protocol_error(&authorized_value)?;

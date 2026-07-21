@@ -461,6 +461,10 @@ pub struct RunStreamPage {
 pub trait ThreadListService {
     fn bind_authorized_client(&mut self, _client_identity: &str) {}
 
+    fn reconnect_approval(&self) -> Option<Approval> {
+        None
+    }
+
     fn authorize_client(
         &mut self,
         client_identity: &str,
@@ -927,6 +931,15 @@ where
             companion_identity: format!("{}:{}", credentials.uid, credentials.pid),
             companion_kind,
         };
+        let reconnect = authorized_client_credential
+            .as_deref()
+            .and_then(|credential| {
+                let approval = service.reconnect_approval()?;
+                service
+                    .authorize_client(&authorized_client_id, Some(credential), "")
+                    .ok()
+                    .map(|credential| (approval, credential))
+            });
         let mut authorization = AuthorizationState::new(clock.clone(), tokens, binding.clone());
         let challenge_expires_at = clock.now() + CHALLENGE_LIFETIME;
         let challenge = authorization
@@ -938,17 +951,33 @@ where
         let authorization_deadline = Instant::now()
             .checked_add(CHALLENGE_LIFETIME)
             .ok_or(AttachSessionError::Timeout)?;
-        let response = welcome(selected, desktop_version, server_nonce, challenge.as_str());
+        let response = if reconnect.is_some() {
+            muniment_attach::reconnect_welcome(
+                selected,
+                desktop_version,
+                server_nonce,
+                challenge.as_str(),
+            )
+        } else {
+            welcome(selected, desktop_version, server_nonce, challenge.as_str())
+        };
         write_before(
             &mut stream,
             &encode_frame(&response).map_err(|_| AttachSessionError::MalformedFrame)?,
             deadline,
         )?;
 
-        let remaining = challenge_expires_at.saturating_sub(clock.now());
-        let Some(ApprovalDecision::Approve(approval)) = approvals.wait(&challenge, remaining)
-        else {
-            return Ok(());
+        let (approval, reconnect_credential) = match reconnect {
+            Some((approval, credential)) => (approval, Some(credential)),
+            None => {
+                let remaining = challenge_expires_at.saturating_sub(clock.now());
+                let Some(ApprovalDecision::Approve(approval)) =
+                    approvals.wait(&challenge, remaining)
+                else {
+                    return Ok(());
+                };
+                (approval, None)
+            }
         };
         let (capability, grant) = authorization
             .approve(&challenge, approval)
@@ -957,31 +986,38 @@ where
                 AuthorizationError::ChallengeExpired => AttachSessionError::Timeout,
                 _ => AttachSessionError::Authorization,
             })?;
-        // Reject one already-queued repeat action against the consumed challenge.
-        if let Some(ApprovalDecision::Approve(approval)) =
-            approvals.wait(&challenge, Duration::ZERO)
-        {
-            if authorization.approve(&challenge, approval)
-                != Err(AuthorizationError::ChallengeConsumed)
+        if reconnect_credential.is_none() {
+            // Reject one already-queued repeat action against the consumed challenge.
+            if let Some(ApprovalDecision::Approve(approval)) =
+                approvals.wait(&challenge, Duration::ZERO)
             {
-                return Err(AttachSessionError::Authorization);
+                if authorization.approve(&challenge, approval)
+                    != Err(AuthorizationError::ChallengeConsumed)
+                {
+                    return Err(AttachSessionError::Authorization);
+                }
             }
         }
         let remaining = grant.expires_at.saturating_sub(clock.now()).as_secs();
         let mut workspace_scopes = std::collections::BTreeMap::new();
         workspace_scopes.insert(grant.workspace.clone(), grant.scopes.clone());
-        let mut credential_bytes = [0u8; 32];
-        fill_random(&mut credential_bytes).map_err(|_| AttachSessionError::Randomness)?;
-        let issued_credential = hex(&credential_bytes);
-        let client_credential = match service.authorize_client(
-            &authorized_client_id,
-            authorized_client_credential.as_deref(),
-            &issued_credential,
-        ) {
-            Ok(credential) => credential,
-            Err(error) => {
-                write_protocol_error(&mut stream, error, authorization_deadline);
-                return Err(AttachSessionError::Authorization);
+        let client_credential = match reconnect_credential {
+            Some(credential) => credential,
+            None => {
+                let mut credential_bytes = [0u8; 32];
+                fill_random(&mut credential_bytes).map_err(|_| AttachSessionError::Randomness)?;
+                let issued_credential = hex(&credential_bytes);
+                match service.authorize_client(
+                    &authorized_client_id,
+                    authorized_client_credential.as_deref(),
+                    &issued_credential,
+                ) {
+                    Ok(credential) => credential,
+                    Err(error) => {
+                        write_protocol_error(&mut stream, error, authorization_deadline);
+                        return Err(AttachSessionError::Authorization);
+                    }
+                }
             }
         };
         let response = super::authorized_with_client_credential(
