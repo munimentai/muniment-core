@@ -325,7 +325,8 @@ impl OnboardingTriageRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OnboardingTriageReport {
     pub user_type: String,
     pub proposed_home_layout: String,
@@ -405,7 +406,8 @@ fn is_level_two_atx_heading(line: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t'))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OnboardingTriageResponse {
     pub report: OnboardingTriageReport,
     pub usage: Option<ChatTokenUsage>,
@@ -418,7 +420,8 @@ struct RoutingClassifierLabels {
     difficulty: RoutingDifficulty,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
 pub struct ChatTokenUsage {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,

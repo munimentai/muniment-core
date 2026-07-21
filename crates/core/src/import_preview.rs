@@ -13,7 +13,7 @@
 //! expanded bytes are counted as they stream and decompression stops the
 //! instant a bound is exceeded.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
@@ -35,7 +35,7 @@ pub const MAX_PATH_DEPTH: usize = 16;
 pub const MAX_EXCERPT_BYTES: usize = 4 * 1024;
 
 /// Kind of a supported, previewable text member.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum EntryKind {
     Text,
@@ -64,7 +64,7 @@ pub struct PreviewManifest {
 }
 
 /// Full text retained for one explicitly selected archive member.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtractedEntry {
     pub source_name: String,
