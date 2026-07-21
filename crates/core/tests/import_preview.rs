@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use muniment_core::import_preview::{
-    preview_export_zip, EntryKind, PreviewErrorKind, MAX_ENTRY_COUNT, MAX_ENTRY_EXPANDED_BYTES,
-    MAX_EXCERPT_BYTES, MAX_TOTAL_EXPANDED_BYTES,
+    extract_selected_zip_entries, preview_export_zip, EntryKind, PreviewErrorKind, MAX_ENTRY_COUNT,
+    MAX_ENTRY_EXPANDED_BYTES, MAX_EXCERPT_BYTES, MAX_TOTAL_EXPANDED_BYTES,
 };
 use zip::write::SimpleFileOptions;
 use zip::{AesMode, ZipWriter};
@@ -297,5 +297,176 @@ fn rejects_invalid_and_missing_archives() {
         preview_export_zip(&temp.0),
         Err(PreviewErrorKind::NotFound),
         "a directory is not a previewable archive"
+    );
+}
+
+#[test]
+fn extracts_only_selected_entries_verbatim_in_source_name_order() {
+    let temp = Temp::new("extract-valid");
+    let archive = temp.join("export.zip");
+    build_zip(
+        &archive,
+        &[
+            Member::File("z/ignored.txt", b"must not be returned"),
+            Member::File("notes/b.md", "line one\n\u{1f642}\n".as_bytes()),
+            Member::File("a.json", b"{\n  \"exact\": true\n}\n"),
+        ],
+    );
+    let before = snapshot(&temp.0);
+    let selected = vec!["notes/b.md".to_string(), "a.json".to_string()];
+
+    let entries = extract_selected_zip_entries(&archive, &selected).unwrap();
+
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].source_name, "a.json");
+    assert_eq!(entries[0].kind, EntryKind::Json);
+    assert_eq!(entries[0].text, "{\n  \"exact\": true\n}\n");
+    assert!(entries[0]
+        .source_provenance
+        .starts_with("assistant-export-zip:v1:"));
+    assert!(entries[0].source_provenance.ends_with(":a.json"));
+    assert_eq!(entries[1].source_name, "notes/b.md");
+    assert_eq!(entries[1].kind, EntryKind::Markdown);
+    assert_eq!(entries[1].text, "line one\n\u{1f642}\n");
+    assert_eq!(snapshot(&temp.0), before, "extraction must not write");
+}
+
+#[test]
+fn selection_cannot_escape_the_archive_or_return_an_unselected_member() {
+    let temp = Temp::new("extract-contained");
+    let archive = temp.join("export.zip");
+    std::fs::write(temp.join("sibling.txt"), b"filesystem secret").unwrap();
+    build_zip(
+        &archive,
+        &[
+            Member::File("chosen.txt", b"chosen"),
+            Member::File("secret.txt", b"archive secret"),
+        ],
+    );
+
+    let entries = extract_selected_zip_entries(&archive, &["chosen.txt".to_string()]).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].text, "chosen");
+    assert_eq!(
+        extract_selected_zip_entries(&archive, &["../sibling.txt".to_string()]),
+        Err(PreviewErrorKind::PathTraversal)
+    );
+}
+
+#[test]
+fn rejects_invalid_duplicate_unknown_and_directory_selections() {
+    let temp = Temp::new("extract-selection-errors");
+    let archive = temp.join("export.zip");
+    build_zip(
+        &archive,
+        &[Member::Dir("folder.txt"), Member::File("known.txt", b"ok")],
+    );
+
+    assert_eq!(
+        extract_selected_zip_entries(&archive, &[]),
+        Err(PreviewErrorKind::EmptySelection)
+    );
+    assert_eq!(
+        extract_selected_zip_entries(&archive, &["a/./known.txt".to_string()]),
+        Err(PreviewErrorKind::InvalidSelection)
+    );
+    assert_eq!(
+        extract_selected_zip_entries(
+            &archive,
+            &["known.txt".to_string(), "known.txt".to_string()]
+        ),
+        Err(PreviewErrorKind::DuplicateSelection)
+    );
+    assert_eq!(
+        extract_selected_zip_entries(&archive, &["missing.txt".to_string()]),
+        Err(PreviewErrorKind::UnknownSelection)
+    );
+    assert_eq!(
+        extract_selected_zip_entries(&archive, &["folder.txt".to_string()]),
+        Err(PreviewErrorKind::DirectorySelection)
+    );
+}
+
+#[test]
+fn reopens_and_revalidates_an_archive_changed_after_preview() {
+    let temp = Temp::new("extract-changed");
+    let archive = temp.join("export.zip");
+    build_zip(&archive, &[Member::File("chosen.txt", b"previewed")]);
+    let manifest = preview_export_zip(&archive).unwrap();
+    assert_eq!(manifest.entries[0].name, "chosen.txt");
+
+    build_zip(&archive, &[Member::File("../chosen.txt", b"replacement")]);
+
+    assert_eq!(
+        extract_selected_zip_entries(&archive, &["chosen.txt".to_string()]),
+        Err(PreviewErrorKind::PathTraversal)
+    );
+}
+
+#[test]
+fn provenance_is_stable_and_distinguishes_independently_read_sources() {
+    let temp = Temp::new("extract-provenance");
+    let first_archive = temp.join("first.zip");
+    let second_archive = temp.join("second.zip");
+    let selection = ["chat.json".to_string()];
+    build_zip(&first_archive, &[Member::File("chat.json", b"first")]);
+    build_zip(&second_archive, &[Member::File("chat.json", b"second")]);
+
+    let first = extract_selected_zip_entries(&first_archive, &selection).unwrap();
+    let repeated = extract_selected_zip_entries(&first_archive, &selection).unwrap();
+    let second = extract_selected_zip_entries(&second_archive, &selection).unwrap();
+    assert_eq!(first[0].source_provenance, repeated[0].source_provenance);
+    assert_ne!(first[0].source_provenance, second[0].source_provenance);
+
+    build_zip(&first_archive, &[Member::File("chat.json", b"changed")]);
+    let changed = extract_selected_zip_entries(&first_archive, &selection).unwrap();
+    assert_ne!(first[0].source_provenance, changed[0].source_provenance);
+}
+
+#[test]
+fn extraction_reenforces_streamed_size_and_text_validation() {
+    let temp = Temp::new("extract-bounds");
+    let archive = temp.join("export.zip");
+    let oversized = vec![b'x'; (MAX_ENTRY_EXPANDED_BYTES + 1) as usize];
+    build_zip(&archive, &[Member::File("huge.txt", &oversized)]);
+    assert_eq!(
+        extract_selected_zip_entries(&archive, &["huge.txt".to_string()]),
+        Err(PreviewErrorKind::EntryTooLarge)
+    );
+
+    build_zip(&archive, &[Member::File("bad.txt", &[0xff])]);
+    assert_eq!(
+        extract_selected_zip_entries(&archive, &["bad.txt".to_string()]),
+        Err(PreviewErrorKind::InvalidText)
+    );
+}
+
+#[test]
+fn extraction_rejects_unsupported_symlink_encrypted_and_overdeep_selections() {
+    let temp = Temp::new("extract-member-hazards");
+    let archive = temp.join("export.zip");
+
+    build_zip(&archive, &[Member::File("image.png", b"not text")]);
+    assert_eq!(
+        extract_selected_zip_entries(&archive, &["image.png".to_string()]),
+        Err(PreviewErrorKind::UnsupportedEntry)
+    );
+
+    build_zip(&archive, &[Member::Symlink("link.txt", "target.txt")]);
+    assert_eq!(
+        extract_selected_zip_entries(&archive, &["link.txt".to_string()]),
+        Err(PreviewErrorKind::Symlink)
+    );
+
+    build_zip(&archive, &[Member::Encrypted("secret.txt", b"secret")]);
+    assert_eq!(
+        extract_selected_zip_entries(&archive, &["secret.txt".to_string()]),
+        Err(PreviewErrorKind::Encrypted)
+    );
+
+    let overdeep = format!("{}/note.txt", vec!["d"; 16].join("/"));
+    assert_eq!(
+        extract_selected_zip_entries(&archive, &[overdeep]),
+        Err(PreviewErrorKind::PathTooDeep)
     );
 }

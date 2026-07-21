@@ -14,8 +14,9 @@
 //! instant a bound is exceeded.
 
 use serde::Serialize;
-use std::fs;
-use std::io::Read;
+use sha2::{Digest, Sha256};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use zip::result::ZipError;
@@ -62,11 +63,32 @@ pub struct PreviewManifest {
     pub total_byte_size: u64,
 }
 
+/// Full text retained for one explicitly selected archive member.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtractedEntry {
+    pub source_name: String,
+    pub kind: EntryKind,
+    pub text: String,
+    /// Stable provenance identifier, independent of the archive's local path.
+    pub source_provenance: String,
+}
+
 /// Stable, typed failure modes. Serialized as camelCase strings so a later UI
 /// can branch on the kind and supply its own copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PreviewErrorKind {
+    /// Extraction was requested without selecting any members.
+    EmptySelection,
+    /// A requested name was not already in normalized archive-name form.
+    InvalidSelection,
+    /// The same normalized member was selected more than once.
+    DuplicateSelection,
+    /// A requested member is a directory rather than a text file.
+    DirectorySelection,
+    /// A requested member does not exist in the independently read archive.
+    UnknownSelection,
     /// The path does not exist or is not a regular file.
     NotFound,
     /// The archive is larger than [`MAX_ARCHIVE_BYTES`].
@@ -101,6 +123,13 @@ impl PreviewErrorKind {
     /// A neutral fallback message; the UI is expected to key off the kind.
     pub fn message(self) -> &'static str {
         match self {
+            PreviewErrorKind::EmptySelection => "At least one archive entry must be selected.",
+            PreviewErrorKind::InvalidSelection => {
+                "A selected archive entry name is not normalized."
+            }
+            PreviewErrorKind::DuplicateSelection => "An archive entry was selected more than once.",
+            PreviewErrorKind::DirectorySelection => "A selected archive entry is a directory.",
+            PreviewErrorKind::UnknownSelection => "A selected archive entry could not be found.",
             PreviewErrorKind::NotFound => "The selected file could not be found.",
             PreviewErrorKind::ArchiveTooLarge => "The selected archive is too large to preview.",
             PreviewErrorKind::InvalidArchive => "The selected file is not a readable ZIP archive.",
@@ -135,26 +164,7 @@ impl std::error::Error for PreviewErrorKind {}
 /// manifest. Fails closed with a typed kind and never extracts, writes, or
 /// scans anything outside the given file.
 pub fn preview_export_zip(archive_path: &Path) -> Result<PreviewManifest, PreviewErrorKind> {
-    let metadata = match fs::symlink_metadata(archive_path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(PreviewErrorKind::NotFound)
-        }
-        Err(_) => return Err(PreviewErrorKind::Io),
-    };
-    // The archive itself must be a plain file, not a directory or a symlink
-    // that could redirect the read to an unbounded target elsewhere.
-    if !metadata.file_type().is_file() {
-        return Err(PreviewErrorKind::NotFound);
-    }
-    if metadata.len() > MAX_ARCHIVE_BYTES {
-        return Err(PreviewErrorKind::ArchiveTooLarge);
-    }
-
-    let file = fs::File::open(archive_path).map_err(|error| match error.kind() {
-        std::io::ErrorKind::NotFound => PreviewErrorKind::NotFound,
-        _ => PreviewErrorKind::Io,
-    })?;
+    let (file, _) = open_validated_archive(archive_path)?;
     let mut archive = zip::ZipArchive::new(file).map_err(|_| PreviewErrorKind::InvalidArchive)?;
     if archive.len() > MAX_ENTRY_COUNT {
         return Err(PreviewErrorKind::TooManyEntries);
@@ -233,6 +243,224 @@ pub fn preview_export_zip(archive_path: &Path) -> Result<PreviewManifest, Previe
     })
 }
 
+/// Re-opens and validates one explicitly chosen ZIP, returning full UTF-8 text
+/// only for the normalized member names in `selected_names`. The entire
+/// archive is streamed through the same bounds as preview, while selected
+/// output is sorted by source name for deterministic downstream handling.
+pub fn extract_selected_zip_entries(
+    archive_path: &Path,
+    selected_names: &[String],
+) -> Result<Vec<ExtractedEntry>, PreviewErrorKind> {
+    if selected_names.is_empty() {
+        return Err(PreviewErrorKind::EmptySelection);
+    }
+
+    let mut selected = std::collections::BTreeSet::new();
+    for requested in selected_names {
+        let normalized = normalize_entry_name(requested)?;
+        if normalized != *requested {
+            return Err(PreviewErrorKind::InvalidSelection);
+        }
+        if classify(&normalized).is_none() {
+            return Err(PreviewErrorKind::UnsupportedEntry);
+        }
+        if !selected.insert(normalized) {
+            return Err(PreviewErrorKind::DuplicateSelection);
+        }
+    }
+
+    let (file, archive_digest) = open_validated_archive(archive_path)?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|_| PreviewErrorKind::InvalidArchive)?;
+    if archive.len() > MAX_ENTRY_COUNT {
+        return Err(PreviewErrorKind::TooManyEntries);
+    }
+
+    let mut archive_names = std::collections::BTreeSet::new();
+    let mut extracted = std::collections::BTreeMap::new();
+    let mut total_expanded = 0u64;
+    for index in 0..archive.len() {
+        let mut member = match archive.by_index(index) {
+            Ok(member) => member,
+            Err(ZipError::UnsupportedArchive(message))
+                if message == ZipError::PASSWORD_REQUIRED =>
+            {
+                return Err(PreviewErrorKind::Encrypted)
+            }
+            Err(_) => return Err(PreviewErrorKind::InvalidArchive),
+        };
+        if member.encrypted() {
+            return Err(PreviewErrorKind::Encrypted);
+        }
+        let name = normalize_entry_name(member.name())?;
+        if member.is_symlink() {
+            return Err(PreviewErrorKind::Symlink);
+        }
+        if member.is_dir() {
+            if selected.contains(&name) {
+                return Err(PreviewErrorKind::DirectorySelection);
+            }
+            continue;
+        }
+        let kind = classify(&name).ok_or(PreviewErrorKind::UnsupportedEntry)?;
+        if !archive_names.insert(name.clone()) {
+            return Err(PreviewErrorKind::DuplicateEntry);
+        }
+
+        let remaining_total = MAX_TOTAL_EXPANDED_BYTES - total_expanded;
+        let cap = MAX_ENTRY_EXPANDED_BYTES.min(remaining_total);
+        let mut bytes = Vec::new();
+        member
+            .by_ref()
+            .take(cap + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| PreviewErrorKind::InvalidArchive)?;
+        let expanded = bytes.len() as u64;
+        if expanded > MAX_ENTRY_EXPANDED_BYTES {
+            return Err(PreviewErrorKind::EntryTooLarge);
+        }
+        if expanded > remaining_total {
+            return Err(PreviewErrorKind::TotalTooLarge);
+        }
+        total_expanded += expanded;
+        let text = String::from_utf8(bytes).map_err(|_| PreviewErrorKind::InvalidText)?;
+
+        if selected.contains(&name) {
+            let content_digest = hex_digest(Sha256::digest(text.as_bytes()));
+            extracted.insert(
+                name.clone(),
+                ExtractedEntry {
+                    source_provenance: format!(
+                        "assistant-export-zip:v1:{archive_digest}:{content_digest}:{name}"
+                    ),
+                    source_name: name,
+                    kind,
+                    text,
+                },
+            );
+        }
+    }
+
+    if extracted.len() != selected.len() {
+        return Err(PreviewErrorKind::UnknownSelection);
+    }
+    Ok(extracted.into_values().collect())
+}
+
+/// Opens the selected path without following a final-component symlink, then
+/// validates and hashes that opened object. The returned reader exposes only
+/// the bytes covered by the digest, so later growth cannot evade the bound.
+fn open_validated_archive(
+    archive_path: &Path,
+) -> Result<(BoundedArchiveReader, String), PreviewErrorKind> {
+    let mut file = open_archive_no_follow(archive_path)?;
+    validate_opened_archive(&file)?;
+
+    let mut hasher = Sha256::new();
+    let mut byte_count = 0u64;
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let remaining = MAX_ARCHIVE_BYTES + 1 - byte_count;
+        if remaining == 0 {
+            return Err(PreviewErrorKind::ArchiveTooLarge);
+        }
+        let read = file
+            .by_ref()
+            .take(remaining)
+            .read(&mut buffer)
+            .map_err(|_| PreviewErrorKind::Io)?;
+        if read == 0 {
+            break;
+        }
+        byte_count += read as u64;
+        hasher.update(&buffer[..read]);
+    }
+    if byte_count > MAX_ARCHIVE_BYTES {
+        return Err(PreviewErrorKind::ArchiveTooLarge);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| PreviewErrorKind::Io)?;
+    Ok((
+        BoundedArchiveReader {
+            file,
+            length: byte_count,
+        },
+        hex_digest(hasher.finalize()),
+    ))
+}
+
+fn validate_opened_archive(file: &File) -> Result<(), PreviewErrorKind> {
+    let metadata = file.metadata().map_err(|_| PreviewErrorKind::Io)?;
+    if !metadata.file_type().is_file() {
+        return Err(PreviewErrorKind::NotFound);
+    }
+    if metadata.len() > MAX_ARCHIVE_BYTES {
+        return Err(PreviewErrorKind::ArchiveTooLarge);
+    }
+    Ok(())
+}
+
+fn open_archive_no_follow(path: &Path) -> Result<File, PreviewErrorKind> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => PreviewErrorKind::NotFound,
+        _ => PreviewErrorKind::Io,
+    })
+}
+
+struct BoundedArchiveReader {
+    file: File,
+    length: u64,
+}
+
+impl Read for BoundedArchiveReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let position = self.file.stream_position()?;
+        let remaining = self.length.saturating_sub(position);
+        self.file.by_ref().take(remaining).read(buffer)
+    }
+}
+
+impl Seek for BoundedArchiveReader {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        let current = self.file.stream_position()? as i128;
+        let target = match position {
+            SeekFrom::Start(offset) => offset as i128,
+            SeekFrom::End(offset) => self.length as i128 + offset as i128,
+            SeekFrom::Current(offset) => current + offset as i128,
+        };
+        if !(0..=self.length as i128).contains(&target) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek outside validated archive",
+            ));
+        }
+        self.file.seek(SeekFrom::Start(target as u64))
+    }
+}
+
+fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
+    use std::fmt::Write as _;
+    bytes
+        .as_ref()
+        .iter()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            write!(output, "{byte:02x}").expect("writing to a String cannot fail");
+            output
+        })
+}
+
 /// Normalizes a raw archive entry name into a `/`-joined relative path,
 /// rejecting absolute, parent-traversal, backslash, and over-deep paths.
 fn normalize_entry_name(raw: &str) -> Result<String, PreviewErrorKind> {
@@ -285,4 +513,37 @@ fn excerpt_of(text: &str) -> (String, bool) {
         end -= 1;
     }
     (text[..end].to_string(), true)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn validation_uses_opened_object_after_path_replacement() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "muniment-opened-archive-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("export.zip");
+        std::fs::write(&path, b"opened object").unwrap();
+
+        let opened = open_archive_no_follow(&path).unwrap();
+        std::fs::rename(&path, directory.join("original.zip")).unwrap();
+        let replacement = File::create(&path).unwrap();
+        replacement.set_len(MAX_ARCHIVE_BYTES + 1).unwrap();
+
+        assert_eq!(validate_opened_archive(&opened), Ok(()));
+        assert_eq!(
+            open_validated_archive(&path).map(|_| ()),
+            Err(PreviewErrorKind::ArchiveTooLarge)
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }
