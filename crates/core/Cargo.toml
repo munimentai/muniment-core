@@ -38,6 +38,11 @@ url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+[dev-dependencies]
+# Tests need to author AES-encrypted entries to exercise the encrypted-entry
+# rejection; the library itself only ever reads and needs no crypto stack.
+zip = { version = "2", default-features = false, features = ["deflate", "aes-crypto"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
