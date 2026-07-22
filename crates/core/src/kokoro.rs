@@ -2,6 +2,7 @@
 
 pub mod acquisition;
 pub mod lifecycle;
+pub mod packing;
 
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
