@@ -13,7 +13,7 @@ use std::os::unix::fs::{symlink, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -131,8 +131,9 @@ fn stale_recovery_preserves_a_colliding_quarantine_entry() {
     let attach_directory = filesystem.endpoint_path().parent().unwrap().to_owned();
     let mut candidate_count = 0;
 
+    let deadline = Instant::now() + Duration::from_secs(1);
     let mut recovered = None;
-    for _ in 0..3 {
+    while Instant::now() < deadline {
         match AttachTransport::bind_with_quarantine_candidate_hook(
             &filesystem,
             || {},
@@ -151,7 +152,9 @@ fn stale_recovery_preserves_a_colliding_quarantine_entry() {
             }
             // A just-closed Unix listener can briefly remain connectable. Retry the
             // stale probe without weakening the production live-listener check.
-            Err(AttachTransportError::ExistingListener) => continue,
+            Err(AttachTransportError::ExistingListener) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
             Err(error) => panic!("stale recovery failed: {error:?}"),
         }
     }
@@ -253,7 +256,8 @@ fn stale_recovery_never_removes_a_replacement() {
     let filesystem = AttachFilesystem::from_runtime_directory(&runtime.0).unwrap();
     let stale = UnixListener::bind(filesystem.endpoint_path()).unwrap();
     drop(stale);
-    for _ in 0..3 {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
         let error = AttachTransport::bind_with_hooks(
             &filesystem,
             || {},
@@ -264,6 +268,7 @@ fn stale_recovery_never_removes_a_replacement() {
         )
         .unwrap_err();
         if error == AttachTransportError::ExistingListener {
+            std::thread::sleep(Duration::from_millis(10));
             continue;
         }
         assert_eq!(error, AttachTransportError::ExistingEndpointRemove);
