@@ -1,6 +1,7 @@
 //! Verification and acquisition boundary for the pinned Kokoro v1.0 assets.
 
 pub mod acquisition;
+pub mod lifecycle;
 
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
