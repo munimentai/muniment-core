@@ -6,6 +6,9 @@ use std::time::{Duration, Instant};
 use crate::asr::acquisition::{
     AsrDownloadRequest, AsrDownloadResponse, AsrDownloadTransport, AsrTransportError,
 };
+use crate::kokoro::acquisition::{
+    KokoroDownloadRequest, KokoroDownloadResponse, KokoroDownloadTransport, KokoroTransportError,
+};
 use crate::llama::acquisition::{
     GemmaDownloadRequest, GemmaDownloadResponse, GemmaDownloadTransport, GemmaTransportError,
 };
@@ -145,6 +148,33 @@ impl AsrDownloadTransport for NativeModelAcquisitionTransport {
             TransportFailure::Transient => AsrTransportError::Transient,
             TransportFailure::Unavailable => AsrTransportError::Unavailable,
             TransportFailure::Rejected => AsrTransportError::Rejected,
+        })
+    }
+}
+
+impl KokoroDownloadTransport for NativeModelAcquisitionTransport {
+    type Body = ModelResponseBody;
+
+    fn download(
+        &mut self,
+        request: &KokoroDownloadRequest,
+    ) -> Result<KokoroDownloadResponse<Self::Body>, KokoroTransportError> {
+        self.request(
+            request.url(),
+            request.offset,
+            request.limits.connect_timeout,
+            request.limits.read_timeout,
+            request.limits.deadline,
+        )
+        .map(|response| KokoroDownloadResponse {
+            status: response.status,
+            content_range: response.content_range,
+            body: response.body,
+        })
+        .map_err(|error| match error {
+            TransportFailure::Transient => KokoroTransportError::Transient,
+            TransportFailure::Unavailable => KokoroTransportError::Unavailable,
+            TransportFailure::Rejected => KokoroTransportError::Rejected,
         })
     }
 }
@@ -418,6 +448,20 @@ mod tests {
         )
     }
 
+    fn kokoro_request() -> KokoroDownloadRequest {
+        KokoroDownloadRequest::for_transport_test(
+            "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/model"
+                .into(),
+            7,
+            crate::kokoro::acquisition::KokoroAcquisitionLimits {
+                connect_timeout: Duration::from_secs(10),
+                read_timeout: Duration::from_secs(30),
+                deadline: Duration::from_secs(5),
+                max_attempts: 1,
+            },
+        )
+    }
+
     #[test]
     fn gemma_adapter_streams_200() {
         let mut transport = transport(vec![Ok(reply(200, None, None, b"streamed"))]);
@@ -439,6 +483,72 @@ mod tests {
         let mut bytes = Vec::new();
         response.body.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"abc");
+    }
+
+    #[test]
+    fn kokoro_adapter_forwards_range_and_maps_response() {
+        let mut transport = transport(vec![Ok(reply(206, None, Some("bytes 7-9/10"), b"abc"))]);
+        let mut response =
+            KokoroDownloadTransport::download(&mut transport, &kokoro_request()).unwrap();
+        assert_eq!(response.status, 206);
+        assert_eq!(response.content_range, Some((7, 9, 10)));
+        let mut bytes = Vec::new();
+        response.body.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"abc");
+    }
+
+    #[test]
+    fn kokoro_adapter_maps_failures_and_enforces_redirect_policy() {
+        for (reply, expected) in [
+            (
+                Err(TransportFailure::Transient),
+                KokoroTransportError::Transient,
+            ),
+            (
+                Err(TransportFailure::Unavailable),
+                KokoroTransportError::Unavailable,
+            ),
+            (
+                Err(TransportFailure::Rejected),
+                KokoroTransportError::Rejected,
+            ),
+            (
+                Ok(reply(302, Some("http://github.com/file"), None, b"")),
+                KokoroTransportError::Rejected,
+            ),
+            (
+                Ok(reply(302, Some("https://example.com/file"), None, b"")),
+                KokoroTransportError::Rejected,
+            ),
+        ] {
+            let mut transport = transport(vec![reply]);
+            assert!(matches!(
+                KokoroDownloadTransport::download(&mut transport, &kokoro_request()),
+                Err(error) if error == expected
+            ));
+        }
+
+        let mut allowed = transport(vec![
+            Ok(reply(
+                302,
+                Some("https://release-assets.githubusercontent.com/file"),
+                None,
+                b"",
+            )),
+            Ok(reply(200, None, None, b"ok")),
+        ]);
+        assert!(KokoroDownloadTransport::download(&mut allowed, &kokoro_request()).is_ok());
+
+        for (status, expected) in [
+            (503, KokoroTransportError::Transient),
+            (404, KokoroTransportError::Unavailable),
+        ] {
+            let mut transport = transport(vec![Ok(reply(status, None, None, b"private"))]);
+            assert!(matches!(
+                KokoroDownloadTransport::download(&mut transport, &kokoro_request()),
+                Err(error) if error == expected
+            ));
+        }
     }
 
     #[test]

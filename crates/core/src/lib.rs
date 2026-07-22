@@ -14,6 +14,7 @@ pub mod cas;
 pub mod home;
 pub mod import_preview;
 pub mod journal;
+pub mod kokoro;
 pub mod llama;
 pub mod model_acquisition_transport;
 pub mod model_install;
