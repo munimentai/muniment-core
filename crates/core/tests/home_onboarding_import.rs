@@ -7,7 +7,7 @@ use muniment_core::{
     import_preview::{EntryKind, ExtractedEntry},
     llama::OnboardingTriageReport,
 };
-use std::path::{Component, Path};
+use std::path::Component;
 
 fn report(agents: &[&str]) -> OnboardingTriageReport {
     OnboardingTriageReport::parse(&format!(
@@ -56,14 +56,18 @@ fn compiles_multiple_sources_deterministically_and_preserves_verbatim_bodies() {
             .components()
             .any(|part| matches!(part, Component::ParentDir)));
     }
-    assert_eq!(
-        first.writes()[1].relative_path(),
-        Path::new("agents/agent-research-reviewer.md")
-    );
-    assert_eq!(
-        first.writes()[2].relative_path(),
-        Path::new("agents/agent-shell-runner.md")
-    );
+    assert!(first.writes()[1]
+        .relative_path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("agent-research-reviewer-"));
+    assert!(first.writes()[2]
+        .relative_path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("agent-shell-runner-"));
 
     for (write, original) in first.writes()[3..].iter().zip(&entries) {
         let frontmatter = format!(
@@ -79,7 +83,7 @@ fn compiles_multiple_sources_deterministically_and_preserves_verbatim_bodies() {
 }
 
 #[test]
-fn rejects_empty_and_colliding_inputs_with_stable_kinds() {
+fn rejects_empty_inputs_and_disambiguates_duplicate_destinations() {
     let valid_report = report(&["One", "Two"]);
     let date = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
     assert_eq!(
@@ -92,17 +96,22 @@ fn rejects_empty_and_colliding_inputs_with_stable_kinds() {
     );
 
     let duplicate = entry("same.md", "same-source", "body");
-    assert_eq!(
-        compile_onboarding_home_write_plan(&valid_report, &[duplicate.clone(), duplicate], date),
-        Err(OnboardingHomeWritePlanError::DestinationCollision)
+    let duplicate_plan =
+        compile_onboarding_home_write_plan(&valid_report, &[duplicate.clone(), duplicate], date)
+            .unwrap();
+    assert_ne!(
+        duplicate_plan.writes()[3].relative_path(),
+        duplicate_plan.writes()[4].relative_path()
     );
-    assert_eq!(
-        compile_onboarding_home_write_plan(
-            &report(&["../", "\\"]),
-            &[entry("x", "p", "body")],
-            date,
-        ),
-        Err(OnboardingHomeWritePlanError::DestinationCollision)
+    let disambiguated = compile_onboarding_home_write_plan(
+        &report(&["../", "\\"]),
+        &[entry("x", "p", "body")],
+        date,
+    )
+    .unwrap();
+    assert_ne!(
+        disambiguated.writes()[1].relative_path(),
+        disambiguated.writes()[2].relative_path()
     );
 }
 
@@ -167,7 +176,7 @@ fn enforces_entry_count_and_total_byte_bounds() {
     );
     assert_eq!(
         compile_onboarding_home_write_plan(&report, &[too_large], date),
-        Err(OnboardingHomeWritePlanError::TotalBytesExceeded)
+        Err(OnboardingHomeWritePlanError::DocumentBytesExceeded)
     );
 
     let oversized_aggregate = [
@@ -176,6 +185,6 @@ fn enforces_entry_count_and_total_byte_bounds() {
     ];
     assert_eq!(
         compile_onboarding_home_write_plan(&report, &oversized_aggregate, date),
-        Err(OnboardingHomeWritePlanError::TotalBytesExceeded)
+        Err(OnboardingHomeWritePlanError::DocumentBytesExceeded)
     );
 }

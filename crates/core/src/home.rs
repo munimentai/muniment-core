@@ -22,28 +22,34 @@ const ONBOARDING_IMPORT_MAX_SLUG_BYTES: usize = 48;
 
 /// Maximum number of approved originals in one onboarding write plan.
 pub const ONBOARDING_IMPORT_MAX_ENTRIES: usize = 128;
+/// Maximum size of any Markdown payload in one onboarding write plan.
+pub const ONBOARDING_IMPORT_MAX_DOCUMENT_BYTES: usize = 64 * 1024;
 /// Maximum combined size of all Markdown payloads in one onboarding write plan.
 pub const ONBOARDING_IMPORT_MAX_TOTAL_BYTES: usize = 256 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HomeWrite {
-    relative_path: PathBuf,
-    bytes: Vec<u8>,
+    /// A normalized, `/`-separated path relative to Muniment Home.
+    pub relative_path: String,
+    /// The complete UTF-8 Markdown file contents.
+    pub contents: String,
 }
 
 impl HomeWrite {
     pub fn relative_path(&self) -> &Path {
-        &self.relative_path
+        Path::new(&self.relative_path)
     }
 
     pub fn bytes(&self) -> &[u8] {
-        &self.bytes
+        self.contents.as_bytes()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OnboardingHomeWritePlan {
-    writes: Vec<HomeWrite>,
+    pub writes: Vec<HomeWrite>,
 }
 
 impl OnboardingHomeWritePlan {
@@ -52,12 +58,34 @@ impl OnboardingHomeWritePlan {
     }
 }
 
+/// An explicit import time accepted by the pure plan compiler.
+pub trait OnboardingImportTimestamp {
+    fn import_date(self) -> Result<chrono::NaiveDate, OnboardingHomeWritePlanError>;
+}
+
+impl OnboardingImportTimestamp for chrono::NaiveDate {
+    fn import_date(self) -> Result<chrono::NaiveDate, OnboardingHomeWritePlanError> {
+        Ok(self)
+    }
+}
+
+impl OnboardingImportTimestamp for &str {
+    fn import_date(self) -> Result<chrono::NaiveDate, OnboardingHomeWritePlanError> {
+        chrono::DateTime::parse_from_rfc3339(self)
+            .map(|timestamp| timestamp.date_naive())
+            .map_err(|_| OnboardingHomeWritePlanError::InvalidTimestamp)
+    }
+}
+
 /// Stable failure modes for compiling a confirmed onboarding proposal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnboardingHomeWritePlanError {
     EmptyInput,
+    InvalidTimestamp,
     InvalidReport,
+    UnsafeMetadata,
     TooManyEntries,
+    DocumentBytesExceeded,
     DestinationCollision,
     TotalBytesExceeded,
 }
@@ -66,8 +94,11 @@ impl fmt::Display for OnboardingHomeWritePlanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
             Self::EmptyInput => "The onboarding import input is empty.",
+            Self::InvalidTimestamp => "The onboarding import timestamp is invalid.",
             Self::InvalidReport => "The onboarding report is invalid.",
+            Self::UnsafeMetadata => "The onboarding import metadata is unsafe.",
             Self::TooManyEntries => "The onboarding import contains too many entries.",
+            Self::DocumentBytesExceeded => "An onboarding import document is too large.",
             Self::DestinationCollision => "The onboarding import destinations collide.",
             Self::TotalBytesExceeded => "The onboarding import plan is too large.",
         };
@@ -78,11 +109,15 @@ impl fmt::Display for OnboardingHomeWritePlanError {
 impl std::error::Error for OnboardingHomeWritePlanError {}
 
 /// Compiles complete, bounded Markdown writes without accessing the filesystem.
-pub fn compile_onboarding_home_write_plan(
+pub fn compile_onboarding_home_write_plan<T: OnboardingImportTimestamp>(
     report: &OnboardingTriageReport,
     approved_entries: &[ExtractedEntry],
-    import_date: chrono::NaiveDate,
+    import_timestamp: T,
 ) -> Result<OnboardingHomeWritePlan, OnboardingHomeWritePlanError> {
+    let import_date = import_timestamp
+        .import_date()?
+        .format("%Y-%m-%d")
+        .to_string();
     if report.user_type.trim().is_empty()
         || report.proposed_home_layout.trim().is_empty()
         || report.starter_agents.is_empty()
@@ -144,38 +179,52 @@ pub fn compile_onboarding_home_write_plan(
         return Err(OnboardingHomeWritePlanError::TooManyEntries);
     }
 
-    let date = import_date.format("%Y-%m-%d").to_string();
     let mut destinations =
         Vec::with_capacity(1 + report.starter_agents.len() + approved_entries.len());
-    destinations.push(PathBuf::from(format!("memory/onboarding-report-{date}.md")));
-    let mut total_bytes = report_markdown.len();
+    destinations.push(format!("memory/onboarding-report-{import_date}.md"));
+    let mut total_bytes = 0;
+    add_payload_len(&mut total_bytes, report_markdown.len())?;
 
-    for agent in &report.starter_agents {
-        destinations.push(PathBuf::from("agents").join(format!("agent-{}.md", safe_slug(agent))));
-        add_payload_len(&mut total_bytes, 3usize.checked_add(agent.len()))?;
+    for (index, agent) in report.starter_agents.iter().enumerate() {
+        reject_unsafe_metadata(agent)?;
+        let mut identity = agent.as_bytes().to_vec();
+        identity.extend_from_slice(&(index as u64).to_be_bytes());
+        destinations.push(format!(
+            "agents/agent-{}-{}.md",
+            safe_slug(agent),
+            short_digest(&identity)
+        ));
+        add_payload_len(
+            &mut total_bytes,
+            3usize
+                .checked_add(agent.len())
+                .ok_or(OnboardingHomeWritePlanError::DocumentBytesExceeded)?,
+        )?;
     }
 
-    for entry in approved_entries {
-        let mut hasher = Sha256::new();
-        hasher.update(entry.source_provenance.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(entry.source_name.as_bytes());
-        let digest = format!("{:x}", hasher.finalize());
-        destinations.push(PathBuf::from("memory/imports").join(format!(
-            "{}-{}-{}.md",
-            date,
+    for (index, entry) in approved_entries.iter().enumerate() {
+        reject_unsafe_metadata(&entry.source_name)?;
+        reject_unsafe_metadata(&entry.source_provenance)?;
+        let mut identity = entry.source_provenance.as_bytes().to_vec();
+        identity.push(0);
+        identity.extend_from_slice(entry.source_name.as_bytes());
+        identity.extend_from_slice(&(index as u64).to_be_bytes());
+        destinations.push(format!(
+            "memory/imports/{import_date}-{}-{}.md",
             safe_slug(&entry.source_name),
-            &digest[..12]
-        )));
+            short_digest(&identity)
+        ));
         let provenance_len = json_string_len(&entry.source_provenance)?;
         let frontmatter_len = "---\nsource: \nimport_date: \n---\n"
             .len()
             .checked_add(provenance_len)
-            .and_then(|length| length.checked_add(date.len()))
-            .ok_or(OnboardingHomeWritePlanError::TotalBytesExceeded)?;
+            .and_then(|length| length.checked_add(import_date.len()))
+            .ok_or(OnboardingHomeWritePlanError::DocumentBytesExceeded)?;
         add_payload_len(
             &mut total_bytes,
-            frontmatter_len.checked_add(entry.text.len()),
+            frontmatter_len
+                .checked_add(entry.text.len())
+                .ok_or(OnboardingHomeWritePlanError::DocumentBytesExceeded)?,
         )?;
     }
 
@@ -191,25 +240,24 @@ pub fn compile_onboarding_home_write_plan(
     let mut destinations = destinations.into_iter();
     writes.push(HomeWrite {
         relative_path: destinations.next().expect("report destination exists"),
-        bytes: report_markdown.into_bytes(),
+        contents: report_markdown,
     });
     for agent in &report.starter_agents {
         writes.push(HomeWrite {
             relative_path: destinations.next().expect("agent destination exists"),
-            bytes: format!("# {agent}\n").into_bytes(),
+            contents: format!("# {agent}\n"),
         });
     }
     for entry in approved_entries {
-        let mut bytes = format!(
+        let mut contents = format!(
             "---\nsource: {}\nimport_date: {}\n---\n",
             yaml_string(&entry.source_provenance),
-            date
-        )
-        .into_bytes();
-        bytes.extend_from_slice(entry.text.as_bytes());
+            import_date
+        );
+        contents.push_str(&entry.text);
         writes.push(HomeWrite {
             relative_path: destinations.next().expect("entry destination exists"),
-            bytes,
+            contents,
         });
     }
     Ok(OnboardingHomeWritePlan { writes })
@@ -217,15 +265,31 @@ pub fn compile_onboarding_home_write_plan(
 
 fn add_payload_len(
     total: &mut usize,
-    payload_len: Option<usize>,
+    payload_len: usize,
 ) -> Result<(), OnboardingHomeWritePlanError> {
+    if payload_len > ONBOARDING_IMPORT_MAX_DOCUMENT_BYTES {
+        return Err(OnboardingHomeWritePlanError::DocumentBytesExceeded);
+    }
     *total = total
-        .checked_add(payload_len.ok_or(OnboardingHomeWritePlanError::TotalBytesExceeded)?)
+        .checked_add(payload_len)
         .ok_or(OnboardingHomeWritePlanError::TotalBytesExceeded)?;
     if *total > ONBOARDING_IMPORT_MAX_TOTAL_BYTES {
         return Err(OnboardingHomeWritePlanError::TotalBytesExceeded);
     }
     Ok(())
+}
+
+fn reject_unsafe_metadata(value: &str) -> Result<(), OnboardingHomeWritePlanError> {
+    if value.chars().any(|character| character == '\0') {
+        Err(OnboardingHomeWritePlanError::UnsafeMetadata)
+    } else {
+        Ok(())
+    }
+}
+
+fn short_digest(value: &[u8]) -> String {
+    let digest = format!("{:x}", Sha256::digest(value));
+    digest[..12].to_owned()
 }
 
 fn json_string_len(value: &str) -> Result<usize, OnboardingHomeWritePlanError> {
@@ -278,6 +342,147 @@ fn safe_slug(input: &str) -> String {
 
 fn yaml_string(value: &str) -> String {
     serde_json::to_string(value).expect("serializing a string cannot fail")
+}
+
+#[cfg(test)]
+mod onboarding_write_plan_tests {
+    use super::*;
+    use crate::import_preview::EntryKind;
+
+    const TIMESTAMP: &str = "2026-07-21T15:04:05Z";
+
+    fn report() -> OnboardingTriageReport {
+        OnboardingTriageReport {
+            user_type: "Independent researcher".to_owned(),
+            proposed_home_layout: "Organize work by topic.".to_owned(),
+            starter_agents: vec!["Research Scout".to_owned(), "Writing Partner".to_owned()],
+        }
+    }
+
+    fn entry(name: &str, provenance: &str, text: &str) -> ExtractedEntry {
+        ExtractedEntry {
+            source_name: name.to_owned(),
+            kind: EntryKind::Markdown,
+            text: text.to_owned(),
+            source_provenance: provenance.to_owned(),
+        }
+    }
+
+    #[test]
+    fn plans_are_ordered_serializable_and_byte_deterministic() {
+        let entries = vec![entry("notes.md", "export:notes.md", "Hello\n")];
+        let first = compile_onboarding_home_write_plan(&report(), &entries, TIMESTAMP).unwrap();
+        let second = compile_onboarding_home_write_plan(&report(), &entries, TIMESTAMP).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            serde_json::to_vec(&first).unwrap(),
+            serde_json::to_vec(&second).unwrap()
+        );
+        assert_eq!(
+            first.writes[0].relative_path,
+            "memory/onboarding-report-2026-07-21.md"
+        );
+        assert!(first.writes[1].relative_path.starts_with("agents/"));
+        assert!(first.writes[2].relative_path.starts_with("agents/"));
+        assert!(first.writes[3].relative_path.starts_with("memory/imports/"));
+    }
+
+    #[test]
+    fn duplicate_and_path_like_names_are_safely_disambiguated() {
+        let mut report = report();
+        report.starter_agents = vec!["CON/../Scout".to_owned(), "con\\..\\scout".to_owned()];
+        let entries = vec![
+            entry("../../CON.md", "export:first", "one"),
+            entry("../../CON.md", "export:second", "two"),
+        ];
+        let plan = compile_onboarding_home_write_plan(&report, &entries, TIMESTAMP).unwrap();
+        let mut case_folded = BTreeSet::new();
+
+        for write in &plan.writes {
+            assert!(
+                write.relative_path.starts_with("memory/")
+                    || write.relative_path.starts_with("agents/")
+            );
+            assert!(!write.relative_path.contains(".."));
+            assert!(!write.relative_path.contains('\\'));
+            assert!(case_folded.insert(write.relative_path.to_ascii_lowercase()));
+        }
+    }
+
+    #[test]
+    fn frontmatter_is_escaped_and_original_body_is_verbatim() {
+        let original = "Unicode: café 🦀\n\n---\nmultiline\r\n";
+        let provenance = "archive.zip\n---\nsource: forged\nquote: \"yes\"";
+        let plan = compile_onboarding_home_write_plan(
+            &report(),
+            &[entry("memory.md", provenance, original)],
+            TIMESTAMP,
+        )
+        .unwrap();
+        let imported = &plan.writes.last().unwrap().contents;
+        let (_, body) = imported
+            .strip_prefix("---\n")
+            .unwrap()
+            .split_once("\n---\n")
+            .unwrap();
+
+        assert_eq!(body.as_bytes(), original.as_bytes());
+        assert!(imported.starts_with("---\nsource: \"archive.zip\\n---\\nsource: forged"));
+        assert!(imported.contains("\nimport_date: 2026-07-21\n---\n"));
+    }
+
+    #[test]
+    fn rejects_invalid_timestamp_and_unsafe_metadata() {
+        let entries = [entry("notes.md", "export:notes.md", "text")];
+        assert_eq!(
+            compile_onboarding_home_write_plan(&report(), &entries, "2026-07-21"),
+            Err(OnboardingHomeWritePlanError::InvalidTimestamp)
+        );
+        assert_eq!(
+            compile_onboarding_home_write_plan(
+                &report(),
+                &[entry("notes.md", "bad\0source", "text")],
+                TIMESTAMP,
+            ),
+            Err(OnboardingHomeWritePlanError::UnsafeMetadata)
+        );
+    }
+
+    #[test]
+    fn enforces_entry_document_and_aggregate_bounds_without_truncation() {
+        let too_many = (0..=ONBOARDING_IMPORT_MAX_ENTRIES)
+            .map(|index| entry(&format!("{index}.md"), &format!("source:{index}"), "x"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            compile_onboarding_home_write_plan(&report(), &too_many, TIMESTAMP),
+            Err(OnboardingHomeWritePlanError::TooManyEntries)
+        );
+
+        let oversized = "é".repeat(ONBOARDING_IMPORT_MAX_DOCUMENT_BYTES / 2);
+        assert_eq!(
+            compile_onboarding_home_write_plan(
+                &report(),
+                &[entry("large.md", "source:large", &oversized)],
+                TIMESTAMP,
+            ),
+            Err(OnboardingHomeWritePlanError::DocumentBytesExceeded)
+        );
+
+        let aggregate = (0..5)
+            .map(|index| {
+                entry(
+                    &format!("{index}.md"),
+                    &format!("source:{index}"),
+                    &"x".repeat(60_000),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            compile_onboarding_home_write_plan(&report(), &aggregate, TIMESTAMP),
+            Err(OnboardingHomeWritePlanError::TotalBytesExceeded)
+        );
+    }
 }
 
 #[derive(Debug)]
