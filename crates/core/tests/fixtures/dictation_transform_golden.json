@@ -1,0 +1,30 @@
+[
+  {
+    "name": "key_points",
+    "transform": "key-points",
+    "transcript": "We agreed to send Maya the draft tomorrow and review her notes Friday.",
+    "transformed_text": "- Send Maya the draft tomorrow.\n- Review her notes Friday.",
+    "instruction": "Rewrite the transcript as concise key points."
+  },
+  {
+    "name": "formal",
+    "transform": "formal",
+    "transcript": "Can you get back to me by Friday?",
+    "transformed_text": "Please respond by Friday.",
+    "instruction": "Rewrite the transcript in a formal, professional tone."
+  },
+  {
+    "name": "short",
+    "transform": "short",
+    "transcript": "The meeting will begin at nine tomorrow morning in the main conference room.",
+    "transformed_text": "The meeting is tomorrow at 9 a.m. in the main conference room.",
+    "instruction": "Shorten the transcript while retaining all essential information."
+  },
+  {
+    "name": "long",
+    "transform": "long",
+    "transcript": "Send the revised budget to Maya Friday.",
+    "transformed_text": "Send the revised budget to Maya on Friday.",
+    "instruction": "Expand the transcript for clarity and completeness without inventing facts or intent."
+  }
+]
