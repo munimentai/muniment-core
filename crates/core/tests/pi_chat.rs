@@ -1,6 +1,6 @@
 use muniment_core::sidecar::pi_chat::{
     parse_frame, ExtensionUiAnswer, ExtensionUiDialog, ExtensionUiRequest, ExtensionUiResponse,
-    FollowUpCommand, PiChatEvent, PiRunAdapter, PromptCommand, SteerCommand,
+    FollowUpCommand, PiChatEvent, PiImageContent, PiRunAdapter, PromptCommand, SteerCommand,
 };
 
 fn extension_request(frame: serde_json::Value) -> ExtensionUiRequest {
@@ -225,6 +225,79 @@ fn prompt_contract_and_interleaved_deltas_are_typed() {
         parse_frame(&json!({"type":"error","message":"secret upstream detail"})).unwrap(),
         PiChatEvent::Failed
     );
+}
+
+fn captured_prompt(images: Option<Vec<PiImageContent>>) -> (serde_json::Value, PiChatEvent) {
+    let temp = TempDir::new();
+    let capture = temp.path().join("prompt.json");
+    let mut config = SidecarConfig::new(env!("CARGO_BIN_EXE_sidecar-test-stub"));
+    config.args = vec![
+        "pi-chat-capture".into(),
+        capture.to_string_lossy().into_owned(),
+    ];
+    config.health_interval = Duration::from_secs(60);
+    let wiring = PiRpcWiring::new();
+    let mut supervisor =
+        SidecarSupervisor::spawn(config, wiring.readiness_probe(Duration::from_millis(100)))
+            .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while supervisor.status() != SidecarStatus::Healthy && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(supervisor.status(), SidecarStatus::Healthy);
+    let transport = wiring.transport().unwrap();
+    let (_, accepted) = match images {
+        Some(images) => PiRunAdapter::start_with_images(
+            "run-1",
+            &transport,
+            "inspect these",
+            images,
+            Duration::from_millis(100),
+        ),
+        None => PiRunAdapter::start(
+            "run-1",
+            &transport,
+            "inspect these",
+            Duration::from_millis(100),
+        ),
+    }
+    .unwrap();
+    let outbound = serde_json::from_str(&fs::read_to_string(capture).unwrap()).unwrap();
+    supervisor.shutdown().unwrap();
+    (outbound, accepted)
+}
+
+#[test]
+fn text_only_adapter_prompt_omits_images_and_is_acknowledged() {
+    let (outbound, accepted) = captured_prompt(None);
+    assert_eq!(
+        outbound,
+        json!({
+            "id":"muniment-pi-2", "type":"prompt", "message":"inspect these",
+            "streamingBehavior":"steer"
+        })
+    );
+    assert_eq!(accepted, PiChatEvent::PromptAccepted);
+}
+
+#[test]
+fn multi_image_adapter_prompt_matches_pi_contract_and_is_acknowledged() {
+    let (outbound, accepted) = captured_prompt(Some(vec![
+        PiImageContent::new("aGVsbG8=", "image/png"),
+        PiImageContent::new("d29ybGQ=", "image/jpeg"),
+    ]));
+    assert_eq!(
+        outbound,
+        json!({
+            "id":"muniment-pi-2", "type":"prompt", "message":"inspect these",
+            "streamingBehavior":"steer",
+            "images":[
+                {"type":"image", "data":"aGVsbG8=", "mimeType":"image/png"},
+                {"type":"image", "data":"d29ybGQ=", "mimeType":"image/jpeg"}
+            ]
+        })
+    );
+    assert_eq!(accepted, PiChatEvent::PromptAccepted);
 }
 
 #[test]

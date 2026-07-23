@@ -20,6 +20,27 @@ pub struct PromptCommand<'a> {
     pub kind: &'static str,
     pub message: &'a str,
     pub streaming_behavior: StreamingBehavior,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<PiImageContent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiImageContent {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub data: String,
+    pub mime_type: String,
+}
+
+impl PiImageContent {
+    pub fn new(data: impl Into<String>, mime_type: impl Into<String>) -> Self {
+        Self {
+            kind: "image",
+            data: data.into(),
+            mime_type: mime_type.into(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -36,6 +57,14 @@ impl<'a> PromptCommand<'a> {
             kind: "prompt",
             message,
             streaming_behavior: StreamingBehavior::Steer,
+            images: Vec::new(),
+        }
+    }
+
+    pub fn with_images(message: &'a str, images: Vec<PiImageContent>) -> Self {
+        Self {
+            images,
+            ..Self::new(message)
         }
     }
 
@@ -382,8 +411,21 @@ impl PiRunAdapter {
         prompt: &str,
         timeout: Duration,
     ) -> Result<(Self, PiChatEvent), String> {
+        Self::start_with_images(run_id, transport, prompt, Vec::new(), timeout)
+    }
+
+    pub fn start_with_images(
+        run_id: impl Into<String>,
+        transport: &PiRpcTransport,
+        prompt: &str,
+        images: Vec<PiImageContent>,
+        timeout: Duration,
+    ) -> Result<(Self, PiChatEvent), String> {
         let frames = transport.subscribe();
-        let response = transport.call(PromptCommand::new(prompt).into_value(), timeout)?;
+        let response = transport.call(
+            PromptCommand::with_images(prompt, images).into_value(),
+            timeout,
+        )?;
         let accepted = parse_frame(&response).map_err(str::to_owned)?;
         if accepted != PiChatEvent::PromptAccepted {
             return Err("Pi rejected the prompt".into());
