@@ -1,12 +1,12 @@
 //! Pure source-text packing for Kokoro synthesis.
 //!
-//! This module stops at ADR 0015's initial ranges. Short-segment repair and
-//! final per-segment phonemization belong to follow-up boundaries.
+//! Final per-segment phonemization belongs to a follow-up boundary.
 
 use std::ops::Range;
 
 const PRIMARY_LIMIT: usize = 200;
 const MAX_LIMIT: usize = 400;
+const MIN_LIMIT: usize = 20;
 
 /// A failure to produce initial synthesis ranges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +90,84 @@ pub fn pack_initial_ranges(
     }
 
     Ok(ranges)
+}
+
+/// Repairs short initial ranges with ADR 0015's single left-to-right pass.
+///
+/// `count_tokens` must return the exact Kokoro token count for the supplied
+/// source slice. The function performs no I/O and never uses source length as
+/// a token-count proxy.
+pub fn repair_short_ranges(
+    source: &str,
+    mut ranges: Vec<Range<usize>>,
+    mut count_tokens: impl FnMut(&str) -> usize,
+) -> Result<Vec<Range<usize>>, PackingError> {
+    validate_partition(source, &ranges, &mut count_tokens)?;
+
+    let mut index = 0;
+    while index < ranges.len() {
+        if count_tokens(&source[ranges[index].clone()]) >= MIN_LIMIT {
+            index += 1;
+            continue;
+        }
+
+        if index + 1 < ranges.len() {
+            let merged = ranges[index].start..ranges[index + 1].end;
+            if count_tokens(&source[merged.clone()]) <= MAX_LIMIT {
+                ranges[index] = merged;
+                ranges.remove(index + 1);
+                index += 1;
+                continue;
+            }
+        }
+
+        if index > 0 {
+            let merged = ranges[index - 1].start..ranges[index].end;
+            if count_tokens(&source[merged.clone()]) <= MAX_LIMIT {
+                ranges[index - 1] = merged;
+                ranges.remove(index);
+                continue;
+            }
+        }
+
+        index += 1;
+    }
+
+    Ok(ranges)
+}
+
+fn validate_partition(
+    source: &str,
+    ranges: &[Range<usize>],
+    count: &mut impl FnMut(&str) -> usize,
+) -> Result<(), PackingError> {
+    if source.is_empty() {
+        return Err(PackingError::NoContent);
+    }
+    if ranges.is_empty() {
+        return Err(PackingError::UnsupportedInput);
+    }
+
+    let mut next = 0;
+    for range in ranges {
+        if range.start != next
+            || range.start >= range.end
+            || !source.is_char_boundary(range.start)
+            || !source.is_char_boundary(range.end)
+            || range.end > source.len()
+        {
+            return Err(PackingError::UnsupportedInput);
+        }
+        if count(&source[range.clone()]) > MAX_LIMIT {
+            return Err(PackingError::UnsupportedInput);
+        }
+        next = range.end;
+    }
+
+    if next != source.len() {
+        return Err(PackingError::UnsupportedInput);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -492,5 +570,89 @@ mod tests {
         .unwrap();
         assert_eq!(ranges[0], 0..sentence_end);
         assert_eq!(&source[ranges[1].clone()], "  three");
+    }
+
+    #[test]
+    fn repair_uses_exact_zero_one_nineteen_and_twenty_token_decisions() {
+        for tokens in [0, 1, 19] {
+            let ranges = repair_short_ranges("ab", vec![0..1, 1..2], |slice| match slice {
+                "a" => tokens,
+                "b" => 20,
+                "ab" => 21,
+                _ => unreachable!(),
+            })
+            .unwrap();
+            assert_eq!(ranges, vec![0..2]);
+            assert_partition("ab", &ranges, |_| 21);
+        }
+
+        let ranges = repair_short_ranges("ab", vec![0..1, 1..2], |slice| match slice {
+            "a" | "b" => 20,
+            "ab" => 40,
+            _ => unreachable!(),
+        })
+        .unwrap();
+        assert_eq!(ranges, vec![0..1, 1..2]);
+    }
+
+    #[test]
+    fn repair_falls_back_left_when_the_recomputed_right_merge_is_over_cap() {
+        let ranges = repair_short_ranges("abc", vec![0..1, 1..2, 2..3], |slice| match slice {
+            "a" | "c" => 20,
+            "b" => 19,
+            "ab" => 400,
+            "bc" => 401,
+            _ => unreachable!(),
+        })
+        .unwrap();
+        assert_eq!(ranges, vec![0..2, 2..3]);
+    }
+
+    #[test]
+    fn repair_retains_a_final_short_segment_when_left_merge_is_over_cap() {
+        let ranges = repair_short_ranges("ab", vec![0..1, 1..2], |slice| match slice {
+            "a" => 400,
+            "b" => 19,
+            "ab" => 401,
+            _ => unreachable!(),
+        })
+        .unwrap();
+        assert_eq!(ranges, vec![0..1, 1..2]);
+    }
+
+    #[test]
+    fn repair_does_not_reconsider_a_newly_short_right_merge() {
+        let ranges = repair_short_ranges("abc", vec![0..1, 1..2, 2..3], |slice| match slice {
+            "a" => 19,
+            "b" | "c" => 20,
+            "ab" => 1,
+            "abc" => 21,
+            _ => unreachable!(),
+        })
+        .unwrap();
+        assert_eq!(ranges, vec![0..2, 2..3]);
+    }
+
+    #[test]
+    fn repair_rejects_invalid_or_over_cap_initial_partitions() {
+        for ranges in [
+            vec![],
+            std::iter::once(0..1).collect(),
+            vec![0..1, 2..3],
+            vec![0..2, 1..3],
+        ] {
+            assert_eq!(
+                repair_short_ranges("abc", ranges, |_| 20),
+                Err(PackingError::UnsupportedInput)
+            );
+        }
+        assert_eq!(
+            repair_short_ranges("éx", vec![0..1, 1..3], |_| 20),
+            Err(PackingError::UnsupportedInput)
+        );
+        assert_eq!(
+            repair_short_ranges("a", std::iter::once(0..1).collect(), |_| 401),
+            Err(PackingError::UnsupportedInput)
+        );
     }
 }
