@@ -168,6 +168,21 @@ impl LocalCas {
         }
     }
 
+    /// Reads an object and verifies the returned bytes against its address.
+    pub fn get_verified(&self, hash: &ContentHash) -> Result<Vec<u8>, CasError> {
+        let bytes = self
+            .get(hash)?
+            .ok_or_else(|| CasError::NotFound(hash.clone()))?;
+        let actual = ContentHash(format!("{:x}", Sha256::digest(&bytes)));
+        if actual != *hash {
+            return Err(CasError::Corrupt {
+                expected: hash.clone(),
+                actual,
+            });
+        }
+        Ok(bytes)
+    }
+
     /// Opens an object for constant-memory streaming reads.
     pub fn open_object(&self, hash: &ContentHash) -> Result<Option<fs::File>, CasError> {
         match fs::File::open(self.object_path(hash)) {
