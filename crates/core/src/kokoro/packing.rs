@@ -1,6 +1,4 @@
-//! Pure source-text packing for Kokoro synthesis.
-//!
-//! Final per-segment phonemization belongs to a follow-up boundary.
+//! Pure source-text segment preparation for Kokoro synthesis.
 
 use std::ops::Range;
 
@@ -27,6 +25,99 @@ impl std::fmt::Display for PackingError {
 }
 
 impl std::error::Error for PackingError {}
+
+/// Exact output of the injected accent-aware phonemize/filter boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhonemizedText {
+    pub phonemes: String,
+    pub token_ids: Vec<i64>,
+}
+
+/// A final source segment ready for Kokoro model input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedSegment {
+    pub source_range: Range<usize>,
+    pub phonemes: String,
+    pub token_ids: Vec<i64>,
+}
+
+/// A segment-preparation failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreparationError<E> {
+    Packing(PackingError),
+    Boundary(E),
+}
+
+impl<E> From<PackingError> for PreparationError<E> {
+    fn from(error: PackingError) -> Self {
+        Self::Packing(error)
+    }
+}
+
+/// Prepares normalized UTF-8 source for Kokoro model input.
+///
+/// `phonemize` supplies the pinned accent-aware phonemize/filter operation.
+/// It may be called while selecting and repairing ranges; each final source
+/// slice is called once more to obtain the exact output stored in the record.
+/// This function performs no I/O.
+pub fn prepare_segments<E>(
+    source: &str,
+    mut phonemize: impl FnMut(&str) -> Result<PhonemizedText, E>,
+) -> Result<Vec<PreparedSegment>, PreparationError<E>> {
+    let mut boundary_error = None;
+    let initial = pack_initial_ranges(source, |slice| {
+        count_boundary_tokens(slice, &mut phonemize, &mut boundary_error)
+    });
+    if let Some(error) = boundary_error {
+        return Err(PreparationError::Boundary(error));
+    }
+    let initial = initial?;
+
+    let mut boundary_error = None;
+    let ranges = repair_short_ranges(source, initial, |slice| {
+        count_boundary_tokens(slice, &mut phonemize, &mut boundary_error)
+    });
+    if let Some(error) = boundary_error {
+        return Err(PreparationError::Boundary(error));
+    }
+    let ranges = ranges?;
+
+    ranges
+        .into_iter()
+        .map(|source_range| {
+            let output =
+                phonemize(&source[source_range.clone()]).map_err(PreparationError::Boundary)?;
+            if output.phonemes.is_empty() || output.token_ids.is_empty() {
+                return Err(PreparationError::Packing(PackingError::NoContent));
+            }
+            if output.token_ids.len() > MAX_LIMIT {
+                return Err(PreparationError::Packing(PackingError::UnsupportedInput));
+            }
+            Ok(PreparedSegment {
+                source_range,
+                phonemes: output.phonemes,
+                token_ids: output.token_ids,
+            })
+        })
+        .collect()
+}
+
+fn count_boundary_tokens<E>(
+    source: &str,
+    phonemize: &mut impl FnMut(&str) -> Result<PhonemizedText, E>,
+    error: &mut Option<E>,
+) -> usize {
+    if error.is_some() {
+        return MAX_LIMIT + 1;
+    }
+    match phonemize(source) {
+        Ok(output) => output.token_ids.len(),
+        Err(boundary_error) => {
+            *error = Some(boundary_error);
+            MAX_LIMIT + 1
+        }
+    }
+}
 
 /// Packs normalized UTF-8 source into contiguous half-open byte ranges.
 ///
@@ -433,6 +524,13 @@ mod tests {
         source.chars().count()
     }
 
+    fn phonemized(phonemes: impl Into<String>, tokens: usize) -> PhonemizedText {
+        PhonemizedText {
+            phonemes: phonemes.into(),
+            token_ids: (0..tokens as i64).collect(),
+        }
+    }
+
     fn assert_partition(source: &str, ranges: &[Range<usize>], count: impl Fn(&str) -> usize) {
         let mut next = 0;
         for range in ranges {
@@ -653,6 +751,118 @@ mod tests {
         assert_eq!(
             repair_short_ranges("a", std::iter::once(0..1).collect(), |_| 401),
             Err(PackingError::UnsupportedInput)
+        );
+    }
+
+    #[test]
+    fn preparation_repairs_multiple_segments_and_preserves_final_outputs() {
+        let source = "aaa. bbb. ccc.";
+        let prepared = prepare_segments(source, |slice| {
+            let has_a = slice.contains('a');
+            let has_b = slice.contains('b');
+            let has_c = slice.contains('c');
+            let tokens = match (has_a, has_b, has_c) {
+                (true, false, false) => 200,
+                (false, true, false) => 10,
+                (false, false, true) => 200,
+                (false, true, true) => 210,
+                _ => 401,
+            };
+            Ok::<_, ()>(phonemized(format!("exact:{slice}"), tokens))
+        })
+        .unwrap();
+
+        assert_eq!(prepared.len(), 2);
+        assert_eq!(prepared[0].source_range, 0..4);
+        assert_eq!(prepared[1].source_range, 4..source.len());
+        assert_eq!(prepared[0].phonemes, "exact:aaa.");
+        assert_eq!(prepared[1].phonemes, "exact: bbb. ccc.");
+        assert_eq!(prepared[0].token_ids, (0..200).collect::<Vec<_>>());
+        assert_eq!(prepared[1].token_ids, (0..210).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn preparation_handles_token_boundaries_and_unicode_byte_ranges() {
+        for tokens in [1, 20, 400, 401] {
+            let source = "é".repeat(tokens);
+            let prepared = prepare_segments(&source, |slice| {
+                Ok::<_, ()>(PhonemizedText {
+                    phonemes: format!("/{slice}/"),
+                    token_ids: vec![7; slice.chars().count()],
+                })
+            })
+            .unwrap();
+
+            assert_eq!(prepared.first().unwrap().source_range.start, 0);
+            assert_eq!(prepared.last().unwrap().source_range.end, source.len());
+            assert!(prepared
+                .windows(2)
+                .all(|pair| pair[0].source_range.end == pair[1].source_range.start));
+            assert!(prepared
+                .iter()
+                .all(|segment| (1..=400).contains(&segment.token_ids.len())));
+            assert_eq!(
+                prepared
+                    .iter()
+                    .map(|segment| &source[segment.source_range.clone()])
+                    .collect::<String>(),
+                source
+            );
+            assert_eq!(
+                prepared
+                    .iter()
+                    .map(|segment| segment.phonemes.as_str())
+                    .collect::<Vec<_>>(),
+                prepared
+                    .iter()
+                    .map(|segment| format!("/{}/", &source[segment.source_range.clone()]))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn preparation_maps_empty_and_over_cap_final_outputs_without_truncation() {
+        for output in [phonemized("", 1), phonemized("voice", 0)] {
+            let mut calls = 0;
+            let result = prepare_segments("x", |_| {
+                calls += 1;
+                Ok::<_, ()>(if calls == 6 {
+                    output.clone()
+                } else {
+                    phonemized("x", 1)
+                })
+            });
+            assert_eq!(
+                result,
+                Err(PreparationError::Packing(PackingError::NoContent))
+            );
+        }
+
+        let mut calls = 0;
+        let result = prepare_segments("x", |_| {
+            calls += 1;
+            Ok::<_, ()>(if calls == 6 {
+                phonemized("x", 401)
+            } else {
+                phonemized("x", 1)
+            })
+        });
+        assert_eq!(
+            result,
+            Err(PreparationError::Packing(PackingError::UnsupportedInput))
+        );
+    }
+
+    #[test]
+    fn preparation_maps_phoneme_empty_input_and_boundary_failures() {
+        assert_eq!(
+            prepare_segments("text", |_| Ok::<_, ()>(phonemized("", 0))),
+            Err(PreparationError::Packing(PackingError::NoContent))
+        );
+        assert_eq!(
+            prepare_segments("text", |_| Err::<PhonemizedText, _>("g2p failed")),
+            Err(PreparationError::Boundary("g2p failed"))
         );
     }
 }
