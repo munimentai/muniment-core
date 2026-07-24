@@ -1002,8 +1002,15 @@ mod onboarding_write_plan_tests {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomeErrorKind {
+    InvalidInput,
+    Io,
+}
+
 #[derive(Debug)]
 pub struct HomeError {
+    kind: HomeErrorKind,
     message: &'static str,
     source: Option<io::Error>,
 }
@@ -1011,6 +1018,7 @@ pub struct HomeError {
 impl HomeError {
     fn io(message: &'static str, source: io::Error) -> Self {
         Self {
+            kind: HomeErrorKind::Io,
             message,
             source: Some(source),
         }
@@ -1018,9 +1026,14 @@ impl HomeError {
 
     fn invalid(message: &'static str) -> Self {
         Self {
+            kind: HomeErrorKind::InvalidInput,
             message,
             source: None,
         }
+    }
+
+    pub fn kind(&self) -> HomeErrorKind {
+        self.kind
     }
 }
 
@@ -1065,6 +1078,12 @@ pub fn confirm_home(config_dir: &Path, home: &Path) -> Result<(), HomeError> {
     validate_config_location(config_dir, home)?;
     scaffold_home(home)?;
     persist_home(config_dir, home)
+}
+
+/// Validates a Home selection without creating it or recording configuration.
+pub fn validate_home_selection(config_dir: &Path, home: &Path) -> Result<(), HomeError> {
+    validate_home(home)?;
+    validate_config_location(config_dir, home)
 }
 
 fn validate_config_location(config_dir: &Path, home: &Path) -> Result<(), HomeError> {

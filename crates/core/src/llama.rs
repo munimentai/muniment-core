@@ -390,7 +390,7 @@ impl OnboardingTriageRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OnboardingTriageReport {
     pub user_type: String,
