@@ -1,11 +1,13 @@
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::{ambient_authority, fs::Dir};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fmt, fs,
-    fs::OpenOptions,
-    io,
+    fs::{File, OpenOptions},
+    io::{self, Write},
     path::{Component, Path, PathBuf},
 };
 
@@ -26,6 +28,8 @@ pub const ONBOARDING_IMPORT_MAX_ENTRIES: usize = 128;
 pub const ONBOARDING_IMPORT_MAX_DOCUMENT_BYTES: usize = 64 * 1024;
 /// Maximum combined size of all Markdown payloads in one onboarding write plan.
 pub const ONBOARDING_IMPORT_MAX_TOTAL_BYTES: usize = 256 * 1024;
+const ONBOARDING_IMPORT_LOCK_FILE: &str = ".onboarding-import.lock";
+const ONBOARDING_IMPORT_MAX_PLAN_WRITES: usize = ONBOARDING_IMPORT_MAX_ENTRIES + 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -107,6 +111,375 @@ impl fmt::Display for OnboardingHomeWritePlanError {
 }
 
 impl std::error::Error for OnboardingHomeWritePlanError {}
+
+/// Stable failure modes for persisting a confirmed onboarding write plan.
+#[derive(Debug)]
+pub enum OnboardingHomePersistenceError {
+    InvalidHome,
+    InvalidPlan,
+    TooManyEntries,
+    DocumentBytesExceeded,
+    TotalBytesExceeded,
+    DestinationConflict { relative_path: String },
+    Io(io::Error),
+}
+
+impl fmt::Display for OnboardingHomePersistenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidHome => formatter.write_str("The Muniment Home is invalid."),
+            Self::InvalidPlan => formatter.write_str("The onboarding write plan is invalid."),
+            Self::TooManyEntries => {
+                formatter.write_str("The onboarding write plan contains too many entries.")
+            }
+            Self::DocumentBytesExceeded => {
+                formatter.write_str("An onboarding write plan document is too large.")
+            }
+            Self::TotalBytesExceeded => {
+                formatter.write_str("The onboarding write plan is too large.")
+            }
+            Self::DestinationConflict { relative_path } => {
+                write!(
+                    formatter,
+                    "The onboarding destination already exists: {relative_path}"
+                )
+            }
+            Self::Io(_) => formatter.write_str("The onboarding write plan could not be saved."),
+        }
+    }
+}
+
+impl std::error::Error for OnboardingHomePersistenceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for OnboardingHomePersistenceError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+/// Persists a confirmed write plan without replacing any existing Home entry.
+pub fn persist_onboarding_home_write_plan(
+    home: &Path,
+    plan: &OnboardingHomeWritePlan,
+) -> Result<(), OnboardingHomePersistenceError> {
+    persist_onboarding_home_write_plan_with_hook(
+        home,
+        plan,
+        |_, file| file.sync_all(),
+        |_, _| Ok(()),
+    )
+}
+
+fn persist_onboarding_home_write_plan_with_hook(
+    home: &Path,
+    plan: &OnboardingHomeWritePlan,
+    mut stage_sync: impl FnMut(usize, &File) -> io::Result<()>,
+    mut before_publish: impl FnMut(usize, &Dir) -> io::Result<()>,
+) -> Result<(), OnboardingHomePersistenceError> {
+    let relative_destinations = validate_persistence_plan(plan)?;
+    let home = validate_persistence_home(home)?;
+    let home_dir = open_validated_home(&home)?;
+    let mut lock_options = cap_std::fs::OpenOptions::new();
+    lock_options
+        .create(true)
+        .read(true)
+        .write(true)
+        .follow(FollowSymlinks::No);
+    let lock = home_dir
+        .open_with(ONBOARDING_IMPORT_LOCK_FILE, &lock_options)?
+        .into_std();
+    lock.lock_exclusive()?;
+
+    for (relative_path, destination) in &relative_destinations {
+        match home_dir.symlink_metadata(destination) {
+            Ok(_) => {
+                return Err(OnboardingHomePersistenceError::DestinationConflict {
+                    relative_path: relative_path.clone(),
+                })
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    struct StagedWrite {
+        relative_path: String,
+        parent_path: PathBuf,
+        parent: Dir,
+        destination_name: std::ffi::OsString,
+        temporary_name: String,
+        identity: Option<same_file::Handle>,
+    }
+
+    let mut staged = Vec::with_capacity(plan.writes.len());
+    let mut published = Vec::with_capacity(plan.writes.len());
+    let result = (|| {
+        for (index, ((relative_path, destination), write)) in
+            relative_destinations.iter().zip(&plan.writes).enumerate()
+        {
+            let parent_path = destination
+                .parent()
+                .ok_or(OnboardingHomePersistenceError::InvalidPlan)?;
+            let parent = create_import_parent_directories(&home_dir, parent_path)?;
+            let destination_name = destination
+                .file_name()
+                .ok_or(OnboardingHomePersistenceError::InvalidPlan)?
+                .to_owned();
+            let temporary_name = format!(
+                ".{}.{}.tmp",
+                destination_name
+                    .to_str()
+                    .ok_or(OnboardingHomePersistenceError::InvalidPlan)?,
+                uuid::Uuid::new_v4()
+            );
+            let mut options = cap_std::fs::OpenOptions::new();
+            options
+                .create_new(true)
+                .write(true)
+                .follow(FollowSymlinks::No);
+            let mut file = parent.open_with(&temporary_name, &options)?.into_std();
+            staged.push(StagedWrite {
+                relative_path: relative_path.clone(),
+                parent_path: parent_path.to_owned(),
+                parent,
+                destination_name,
+                temporary_name,
+                identity: None,
+            });
+            file.write_all(write.bytes())?;
+            file.flush()?;
+            stage_sync(index, &file)?;
+            let identity = same_file::Handle::from_file(file.try_clone()?)?;
+            staged[index].identity = Some(identity);
+        }
+
+        for (index, write) in staged.iter().enumerate() {
+            before_publish(index, &write.parent)?;
+            let current_parent = open_existing_parent(&home_dir, &write.parent_path)
+                .map_err(|_| OnboardingHomePersistenceError::InvalidPlan)?;
+            if !same_open_directory(&write.parent, &current_parent)? {
+                return Err(OnboardingHomePersistenceError::InvalidPlan);
+            }
+            write
+                .parent
+                .hard_link(
+                    &write.temporary_name,
+                    &write.parent,
+                    &write.destination_name,
+                )
+                .map_err(|error| {
+                    if error.kind() == io::ErrorKind::AlreadyExists {
+                        OnboardingHomePersistenceError::DestinationConflict {
+                            relative_path: write.relative_path.clone(),
+                        }
+                    } else {
+                        error.into()
+                    }
+                })?;
+            published.push(index);
+            sync_open_directory(&write.parent)?;
+        }
+        Ok(())
+    })();
+
+    let mut result = result;
+    for write in &staged {
+        if let Err(error) = write.parent.remove_file(&write.temporary_name) {
+            if result.is_ok() {
+                result = Err(error.into());
+            }
+        }
+    }
+    for write in &staged {
+        if let Err(error) = sync_open_directory(&write.parent) {
+            if result.is_ok() {
+                result = Err(error.into());
+            }
+        }
+    }
+    if result.is_err() {
+        for &index in published.iter().rev() {
+            let write = &staged[index];
+            if is_published_file(
+                &write.parent,
+                &write.destination_name,
+                write
+                    .identity
+                    .as_ref()
+                    .expect("published writes have a recorded identity"),
+            )
+            .unwrap_or(false)
+            {
+                let _ = write.parent.remove_file(&write.destination_name);
+            }
+        }
+        for write in &staged {
+            let _ = sync_open_directory(&write.parent);
+        }
+    }
+    result
+}
+
+fn validate_persistence_plan(
+    plan: &OnboardingHomeWritePlan,
+) -> Result<Vec<(String, PathBuf)>, OnboardingHomePersistenceError> {
+    if plan.writes.is_empty() {
+        return Err(OnboardingHomePersistenceError::InvalidPlan);
+    }
+    if plan.writes.len() > ONBOARDING_IMPORT_MAX_PLAN_WRITES {
+        return Err(OnboardingHomePersistenceError::TooManyEntries);
+    }
+    let mut unique = BTreeSet::new();
+    let mut total_bytes = 0usize;
+    let mut relative_paths = Vec::with_capacity(plan.writes.len());
+    for write in &plan.writes {
+        let path = Path::new(&write.relative_path);
+        let mut segments = write.relative_path.split('/');
+        if write.relative_path.is_empty()
+            || write.relative_path.contains('\0')
+            || write.relative_path.contains('\\')
+            || write.relative_path.starts_with('/')
+            || segments
+                .next()
+                .is_some_and(|segment| segment.ends_with(':'))
+            || segments.any(|segment| segment.is_empty() || segment == "." || segment == "..")
+            || path.is_absolute()
+            || !write.relative_path.ends_with(".md")
+            || path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+            || !unique.insert(write.relative_path.to_ascii_lowercase())
+        {
+            return Err(OnboardingHomePersistenceError::InvalidPlan);
+        }
+        if write.bytes().len() > ONBOARDING_IMPORT_MAX_DOCUMENT_BYTES {
+            return Err(OnboardingHomePersistenceError::DocumentBytesExceeded);
+        }
+        total_bytes = total_bytes
+            .checked_add(write.bytes().len())
+            .ok_or(OnboardingHomePersistenceError::TotalBytesExceeded)?;
+        if total_bytes > ONBOARDING_IMPORT_MAX_TOTAL_BYTES {
+            return Err(OnboardingHomePersistenceError::TotalBytesExceeded);
+        }
+        relative_paths.push((write.relative_path.clone(), path.to_path_buf()));
+    }
+    Ok(relative_paths)
+}
+
+fn validate_persistence_home(home: &Path) -> Result<PathBuf, OnboardingHomePersistenceError> {
+    validate_home(home).map_err(|_| OnboardingHomePersistenceError::InvalidHome)?;
+    let selected_metadata =
+        fs::symlink_metadata(home).map_err(|_| OnboardingHomePersistenceError::InvalidHome)?;
+    if selected_metadata.file_type().is_symlink() || !selected_metadata.is_dir() {
+        return Err(OnboardingHomePersistenceError::InvalidHome);
+    }
+    let home = fs::canonicalize(home).map_err(|_| OnboardingHomePersistenceError::InvalidHome)?;
+    validate_home(&home).map_err(|_| OnboardingHomePersistenceError::InvalidHome)?;
+    Ok(home)
+}
+
+fn open_validated_home(home: &Path) -> Result<Dir, OnboardingHomePersistenceError> {
+    let parent = home
+        .parent()
+        .ok_or(OnboardingHomePersistenceError::InvalidHome)?;
+    let name = home
+        .file_name()
+        .ok_or(OnboardingHomePersistenceError::InvalidHome)?;
+    let parent = Dir::open_ambient_dir(parent, ambient_authority())
+        .map_err(|_| OnboardingHomePersistenceError::InvalidHome)?;
+    parent
+        .open_dir_nofollow(name)
+        .map_err(|_| OnboardingHomePersistenceError::InvalidHome)
+}
+
+fn create_import_parent_directories(
+    home: &Dir,
+    parent: &Path,
+) -> Result<Dir, OnboardingHomePersistenceError> {
+    let mut current = home.try_clone()?;
+    for component in parent.components() {
+        let name = component.as_os_str();
+        match current.open_dir_nofollow(name) {
+            Ok(next) => current = next,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match current.create_dir(name) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
+                }
+                sync_open_directory(&current)?;
+                current = current
+                    .open_dir_nofollow(name)
+                    .map_err(|_| OnboardingHomePersistenceError::InvalidPlan)?;
+            }
+            Err(_) => return Err(OnboardingHomePersistenceError::InvalidPlan),
+        }
+    }
+    Ok(current)
+}
+
+fn open_existing_parent(home: &Dir, parent: &Path) -> io::Result<Dir> {
+    let mut current = home.try_clone()?;
+    for component in parent.components() {
+        current = current.open_dir_nofollow(component.as_os_str())?;
+    }
+    Ok(current)
+}
+
+#[cfg(unix)]
+fn same_open_directory(first: &Dir, second: &Dir) -> io::Result<bool> {
+    use cap_fs_ext::MetadataExt;
+    let first = first.dir_metadata()?;
+    let second = second.dir_metadata()?;
+    Ok(first.dev() == second.dev() && first.ino() == second.ino())
+}
+
+#[cfg(windows)]
+fn same_open_directory(first: &Dir, second: &Dir) -> io::Result<bool> {
+    Ok(
+        same_file::Handle::from_file(first.try_clone()?.into_std_file())?
+            == same_file::Handle::from_file(second.try_clone()?.into_std_file())?,
+    )
+}
+
+fn is_published_file(
+    parent: &Dir,
+    destination: impl AsRef<Path>,
+    identity: &same_file::Handle,
+) -> io::Result<bool> {
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let destination = parent.open_with(destination, &options)?.into_std();
+    Ok(same_file::Handle::from_file(destination)? == *identity)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn sync_open_directory(directory: &Dir) -> io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    unsafe { fs::File::from_raw_fd(descriptor) }.sync_all()
+}
+
+#[cfg(target_os = "windows")]
+fn sync_open_directory(_directory: &Dir) -> io::Result<()> {
+    Ok(())
+}
 
 /// Compiles complete, bounded Markdown writes without accessing the filesystem.
 pub fn compile_onboarding_home_write_plan<T: OnboardingImportTimestamp>(
@@ -482,6 +855,150 @@ mod onboarding_write_plan_tests {
             compile_onboarding_home_write_plan(&report(), &aggregate, TIMESTAMP),
             Err(OnboardingHomeWritePlanError::TotalBytesExceeded)
         );
+    }
+
+    fn persistence_test_home(name: &str) -> PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "muniment-persistence-{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&home).unwrap();
+        scaffold_home(&home).unwrap();
+        home
+    }
+
+    #[test]
+    fn later_publication_collision_rolls_back_only_this_attempt() {
+        let home = persistence_test_home("rollback");
+        let plan = OnboardingHomeWritePlan {
+            writes: vec![
+                HomeWrite {
+                    relative_path: "memory/first.md".into(),
+                    contents: "first".into(),
+                },
+                HomeWrite {
+                    relative_path: "memory/second.md".into(),
+                    contents: "planned second".into(),
+                },
+            ],
+        };
+
+        let result = persist_onboarding_home_write_plan_with_hook(
+            &home,
+            &plan,
+            |_, file| file.sync_all(),
+            |index, parent| {
+                if index == 1 {
+                    parent.write("second.md", b"user collision")?;
+                }
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(OnboardingHomePersistenceError::DestinationConflict { relative_path })
+                if relative_path == "memory/second.md"
+        ));
+        assert!(!home.join("memory/first.md").exists());
+        assert_eq!(
+            fs::read(home.join("memory/second.md")).unwrap(),
+            b"user collision"
+        );
+        assert!(!fs::read_dir(home.join("memory")).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+
+        fs::remove_file(home.join("memory/second.md")).unwrap();
+        persist_onboarding_home_write_plan(&home, &plan).unwrap();
+        assert_eq!(fs::read(home.join("memory/first.md")).unwrap(), b"first");
+        assert_eq!(
+            fs::read(home.join("memory/second.md")).unwrap(),
+            b"planned second"
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swapped_parent_symlink_cannot_redirect_publication_outside_home() {
+        use std::os::unix::fs::symlink;
+
+        let home = persistence_test_home("parent-swap");
+        let outside = persistence_test_home("outside");
+        fs::create_dir(home.join("memory/imports")).unwrap();
+        let plan = OnboardingHomeWritePlan {
+            writes: vec![HomeWrite {
+                relative_path: "memory/imports/new.md".into(),
+                contents: "planned".into(),
+            }],
+        };
+        let result = persist_onboarding_home_write_plan_with_hook(
+            &home,
+            &plan,
+            |_, file| file.sync_all(),
+            |_, _| {
+                fs::rename(
+                    home.join("memory/imports"),
+                    home.join("memory/pinned-imports"),
+                )?;
+                symlink(&outside, home.join("memory/imports"))?;
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(OnboardingHomePersistenceError::InvalidPlan)
+        ));
+        assert!(!outside.join("new.md").exists());
+        assert!(!home.join("memory/pinned-imports/new.md").exists());
+        assert!(!fs::read_dir(home.join("memory/pinned-imports"))
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")));
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn staging_failure_removes_temporary_file_without_publishing() {
+        let home = persistence_test_home("staging-failure");
+        let plan = OnboardingHomeWritePlan {
+            writes: vec![HomeWrite {
+                relative_path: "memory/new.md".into(),
+                contents: "planned".into(),
+            }],
+        };
+
+        let result = persist_onboarding_home_write_plan_with_hook(
+            &home,
+            &plan,
+            |_, _| Err(io::Error::other("injected staging sync failure")),
+            |_, _| Ok(()),
+        );
+
+        assert!(matches!(
+            result,
+            Err(OnboardingHomePersistenceError::Io(error))
+                if error.to_string() == "injected staging sync failure"
+        ));
+        assert!(!home.join("memory/new.md").exists());
+        assert!(!fs::read_dir(home.join("memory")).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+        fs::remove_dir_all(home).unwrap();
     }
 }
 
