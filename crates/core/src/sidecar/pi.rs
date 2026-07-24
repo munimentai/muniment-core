@@ -11,7 +11,7 @@ use super::{ProbeOutcome, RestartPolicy, SidecarConfig, SidecarIo};
 pub const PI_NPM_PACKAGE: &str = "@mariozechner/pi-coding-agent";
 pub const PI_VERSION: &str = "0.73.1";
 
-type PendingCalls = Arc<Mutex<HashMap<String, mpsc::Sender<Result<Value, String>>>>>;
+type PendingCalls = Arc<Mutex<HashMap<String, Option<mpsc::Sender<Result<Value, String>>>>>>;
 type CurrentTransport = Arc<Mutex<Option<(u64, Arc<PiRpcTransport>)>>>;
 /// Builds the production Pi RPC launch contract for a verified, platform-native
 /// Pi executable. The executable contains its Node-compatible runtime; a system
@@ -201,7 +201,7 @@ impl PiRpcTransport {
     fn new_for_generation(io: SidecarIo, generation: u64) -> Self {
         let pending = Arc::new(Mutex::new(HashMap::<
             String,
-            mpsc::Sender<Result<Value, String>>,
+            Option<mpsc::Sender<Result<Value, String>>>,
         >::new()));
         let subscribers = Arc::new(Mutex::new(Vec::<mpsc::Sender<Value>>::new()));
         let reader = io.stdout.clone();
@@ -215,10 +215,11 @@ impl PiRpcTransport {
                         Ok(frame) => frame,
                         Err(error) => {
                             let message = format!("invalid Pi RPC JSON: {error}");
-                            for (_, waiter) in reader_pending
+                            for waiter in reader_pending
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .drain()
+                                .filter_map(|(_, waiter)| waiter)
                             {
                                 let _ = waiter.send(Err(message.clone()));
                             }
@@ -227,10 +228,11 @@ impl PiRpcTransport {
                     },
                     Err(error) => {
                         let message = error.to_string();
-                        for (_, waiter) in reader_pending
+                        for waiter in reader_pending
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .drain()
+                            .filter_map(|(_, waiter)| waiter)
                         {
                             let _ = waiter.send(Err(message.clone()));
                         }
@@ -243,9 +245,9 @@ impl PiRpcTransport {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .remove(id)
                 });
-                if let Some(waiter) = waiter {
+                if let Some(Some(waiter)) = waiter {
                     let _ = waiter.send(Ok(frame));
-                } else {
+                } else if waiter.is_none() {
                     reader_subscribers
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -343,7 +345,7 @@ impl PiRpcTransport {
         self.pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id.to_owned(), sender);
+            .insert(id.to_owned(), Some(sender));
         if let Err(error) = self.io.stdin.write_line(&command.to_string()) {
             self.pending
                 .lock()
@@ -354,10 +356,17 @@ impl PiRpcTransport {
         match receiver.recv_timeout(timeout) {
             Ok(response) => response,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                self.pending
+                // Keep a tombstone until the response arrives (or the
+                // generation ends), so a late correlated response cannot be
+                // mistaken for an unsolicited stream frame.
+                if let Some(waiter) = self
+                    .pending
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(id);
+                    .get_mut(id)
+                {
+                    *waiter = None;
+                }
                 Err(format!("timed out waiting for Pi RPC response `{id}`"))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(format!(

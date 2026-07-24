@@ -252,14 +252,9 @@ fn captured_prompt(images: Option<Vec<PiImageContent>>) -> (serde_json::Value, P
             &transport,
             "inspect these",
             images,
-            Duration::from_millis(100),
+            Duration::from_secs(1),
         ),
-        None => PiRunAdapter::start(
-            "run-1",
-            &transport,
-            "inspect these",
-            Duration::from_millis(100),
-        ),
+        None => PiRunAdapter::start("run-1", &transport, "inspect these", Duration::from_secs(1)),
     }
     .unwrap();
     let outbound = serde_json::from_str(&fs::read_to_string(capture).unwrap()).unwrap();
@@ -423,6 +418,35 @@ fn adapter_queues_messages_without_consuming_interleaved_stream_events() {
     supervisor.shutdown().unwrap();
 }
 
+#[test]
+fn late_correlated_responses_do_not_become_stream_events() {
+    let mut config = SidecarConfig::new(env!("CARGO_BIN_EXE_sidecar-test-stub"));
+    config.args = vec!["pi-chat-late-response".into()];
+    config.health_interval = Duration::from_secs(60);
+    let wiring = PiRpcWiring::new();
+    let mut supervisor =
+        SidecarSupervisor::spawn(config, wiring.readiness_probe(Duration::from_millis(100)))
+            .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while supervisor.status() != SidecarStatus::Healthy && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(supervisor.status(), SidecarStatus::Healthy);
+    let transport = wiring.transport().unwrap();
+    let (adapter, _) =
+        PiRunAdapter::start("run-1", &transport, "prompt", Duration::from_secs(1)).unwrap();
+
+    assert!(transport
+        .session_locator(std::path::Path::new("."), Duration::from_millis(1))
+        .unwrap_err()
+        .contains("timed out waiting for Pi RPC response"));
+    assert_eq!(
+        adapter.next(Duration::from_secs(1)).unwrap(),
+        PiChatEvent::TextDelta("after late response".into())
+    );
+    supervisor.shutdown().unwrap();
+}
+
 fn deferred_session_supervisor(
     session_file: &std::path::Path,
     cancel_marker: Option<&std::path::Path>,
@@ -455,7 +479,7 @@ fn accepted_prompt_waits_for_session_file_and_preserves_stream_frames() {
     let (mut supervisor, wiring) = deferred_session_supervisor(&session_file, None);
     let transport = wiring.transport().unwrap();
     let (adapter, _) =
-        PiRunAdapter::start("run-1", &transport, "prompt", Duration::from_millis(100)).unwrap();
+        PiRunAdapter::start("run-1", &transport, "prompt", Duration::from_secs(1)).unwrap();
 
     let (locator, buffered) = adapter
         .await_session_binding(&transport, temp.path(), Duration::from_secs(1))
@@ -524,7 +548,7 @@ fn invalid_session_state_cancels_accepted_agent_work() {
     let (mut supervisor, wiring) = deferred_session_supervisor(&outside, Some(&marker));
     let transport = wiring.transport().unwrap();
     let (adapter, _) =
-        PiRunAdapter::start("run-1", &transport, "prompt", Duration::from_millis(100)).unwrap();
+        PiRunAdapter::start("run-1", &transport, "prompt", Duration::from_secs(1)).unwrap();
 
     assert_eq!(
         adapter

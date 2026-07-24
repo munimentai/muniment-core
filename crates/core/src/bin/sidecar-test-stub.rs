@@ -20,6 +20,7 @@ fn main() {
         Some("pi-rpc-interleaved") => pi_rpc_interleaved(),
         Some("pi-chat-queue") => pi_chat_queue(),
         Some("pi-chat-capture") => pi_chat_capture(args.next().unwrap()),
+        Some("pi-chat-late-response") => pi_chat_late_response(),
         Some("pi-session-deferred") => pi_session_deferred(args.next().unwrap(), args.next()),
         Some("pi-rpc-restart-once") => {
             let marker = args.next().unwrap();
@@ -293,6 +294,34 @@ fn pi_chat_capture(output: String) {
                 "type":"response", "command":command, "success":true, "id":request["id"]
             })
         );
+        io::stdout().flush().unwrap();
+    }
+}
+
+fn pi_chat_late_response() {
+    let mut prompted = false;
+    for line in io::stdin().lock().lines() {
+        let request: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+        let command = request["type"].as_str().unwrap();
+        if command == "prompt" {
+            prompted = true;
+        } else if command == "get_state" && prompted {
+            thread::sleep(Duration::from_millis(25));
+        }
+        println!(
+            "{}",
+            serde_json::json!({
+                "type":"response", "command":command, "success":true, "id":request["id"]
+            })
+        );
+        if command == "get_state" && prompted {
+            println!(
+                "{}",
+                serde_json::json!({"type":"message_update", "assistantMessageEvent":{
+                    "type":"text_delta", "delta":"after late response"
+                }})
+            );
+        }
         io::stdout().flush().unwrap();
     }
 }
