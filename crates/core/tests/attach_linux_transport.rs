@@ -118,8 +118,26 @@ fn refuses_a_live_listener_and_recovers_a_stale_socket() {
     )
     .unwrap();
     drop(stale);
-    let recovered = AttachTransport::bind(&filesystem).unwrap();
-    drop(recovered);
+    // Running as root, the fork in `rejects_a_different_uid_peer_…` duplicates every
+    // descriptor open in this process, so a listener dropped here stays connectable
+    // until that child exits and the stale probe reports it live. Retry the probe —
+    // which mutates nothing on that path — without weakening the production
+    // live-listener check asserted above.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut recovered = None;
+    while Instant::now() < deadline {
+        match AttachTransport::bind(&filesystem) {
+            Ok(transport) => {
+                recovered = Some(transport);
+                break;
+            }
+            Err(AttachTransportError::ExistingListener) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("stale recovery failed: {error:?}"),
+        }
+    }
+    drop(recovered.expect("closed stale listener was repeatedly reported as live"));
 }
 
 #[test]
