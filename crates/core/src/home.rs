@@ -174,6 +174,7 @@ pub fn persist_onboarding_home_write_plan(
         plan,
         |_, file| file.sync_all(),
         |_, _| Ok(()),
+        |_, parent, temporary_name| parent.remove_file(temporary_name),
     )
 }
 
@@ -182,6 +183,7 @@ fn persist_onboarding_home_write_plan_with_hook(
     plan: &OnboardingHomeWritePlan,
     mut stage_sync: impl FnMut(usize, &File) -> io::Result<()>,
     mut before_publish: impl FnMut(usize, &Dir) -> io::Result<()>,
+    mut remove_temporary: impl FnMut(usize, &Dir, &str) -> io::Result<()>,
 ) -> Result<(), OnboardingHomePersistenceError> {
     let relative_destinations = validate_persistence_plan(plan)?;
     let home = validate_persistence_home(home)?;
@@ -289,20 +291,11 @@ fn persist_onboarding_home_write_plan_with_hook(
         Ok(())
     })();
 
-    let mut result = result;
-    for write in &staged {
-        if let Err(error) = write.parent.remove_file(&write.temporary_name) {
-            if result.is_ok() {
-                result = Err(error.into());
-            }
-        }
+    for (index, write) in staged.iter().enumerate() {
+        let _ = remove_temporary(index, &write.parent, &write.temporary_name);
     }
     for write in &staged {
-        if let Err(error) = sync_open_directory(&write.parent) {
-            if result.is_ok() {
-                result = Err(error.into());
-            }
-        }
+        let _ = sync_open_directory(&write.parent);
     }
     if result.is_err() {
         for &index in published.iter().rev() {
@@ -894,6 +887,7 @@ mod onboarding_write_plan_tests {
                 }
                 Ok(())
             },
+            |_, parent, temporary_name| parent.remove_file(temporary_name),
         );
         assert!(matches!(
             result,
@@ -949,6 +943,7 @@ mod onboarding_write_plan_tests {
                 symlink(&outside, home.join("memory/imports"))?;
                 Ok(())
             },
+            |_, parent, temporary_name| parent.remove_file(temporary_name),
         );
 
         assert!(matches!(
@@ -983,6 +978,7 @@ mod onboarding_write_plan_tests {
             &plan,
             |_, _| Err(io::Error::other("injected staging sync failure")),
             |_, _| Ok(()),
+            |_, parent, temporary_name| parent.remove_file(temporary_name),
         );
 
         assert!(matches!(
@@ -998,6 +994,56 @@ mod onboarding_write_plan_tests {
                 .to_string_lossy()
                 .ends_with(".tmp")
         }));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn cleanup_failure_after_publication_keeps_published_files() {
+        let home = persistence_test_home("cleanup-failure");
+        let plan = OnboardingHomeWritePlan {
+            writes: vec![
+                HomeWrite {
+                    relative_path: "memory/first.md".into(),
+                    contents: "first".into(),
+                },
+                HomeWrite {
+                    relative_path: "memory/second.md".into(),
+                    contents: "second".into(),
+                },
+            ],
+        };
+
+        persist_onboarding_home_write_plan_with_hook(
+            &home,
+            &plan,
+            |_, file| file.sync_all(),
+            |_, _| Ok(()),
+            |index, parent, temporary_name| {
+                if index == 0 {
+                    Err(io::Error::other("injected temporary cleanup failure"))
+                } else {
+                    parent.remove_file(temporary_name)
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(home.join("memory/first.md")).unwrap(), b"first");
+        assert_eq!(fs::read(home.join("memory/second.md")).unwrap(), b"second");
+        assert_eq!(
+            fs::read_dir(home.join("memory"))
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .ends_with(".tmp")
+                })
+                .count(),
+            1
+        );
         fs::remove_dir_all(home).unwrap();
     }
 }
