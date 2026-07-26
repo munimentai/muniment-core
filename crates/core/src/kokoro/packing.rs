@@ -143,29 +143,92 @@ pub fn pack_initial_ranges(
     let mut waived_protected = None;
 
     while start < source.len() {
-        let end = ranked_end(source, start, PRIMARY_LIMIT, &candidates, &mut count_tokens)
-            .or_else(|| ranked_end(source, start, MAX_LIMIT, &candidates, &mut count_tokens))
-            .or_else(|| {
-                oversized_protected_end(
-                    source,
-                    start,
-                    &protected,
-                    &whitespace,
-                    &mut waived_protected,
-                    &mut count_tokens,
-                )
-            })
-            .or_else(|| {
-                hard_split_end(
-                    source,
-                    start,
-                    PRIMARY_LIMIT,
-                    &protected,
-                    &whitespace,
-                    &mut count_tokens,
-                )
-            })
-            .ok_or(PackingError::UnsupportedInput)?;
+        let end = ranked_end(
+            source,
+            start,
+            PRIMARY_LIMIT,
+            &candidates,
+            false,
+            &mut count_tokens,
+        )
+        .or_else(|| {
+            ranked_end(
+                source,
+                start,
+                MAX_LIMIT,
+                &candidates,
+                false,
+                &mut count_tokens,
+            )
+        })
+        .or_else(|| {
+            oversized_protected_end(
+                source,
+                start,
+                &protected,
+                &whitespace,
+                &mut waived_protected,
+                false,
+                &mut count_tokens,
+            )
+        })
+        .or_else(|| {
+            hard_split_end(
+                source,
+                start,
+                PRIMARY_LIMIT,
+                &protected,
+                &whitespace,
+                false,
+                &mut count_tokens,
+            )
+        })
+        // An arbitrary non-monotonic counter can hide a fitting island from
+        // every bounded probe. Retry exhaustively only when the complete
+        // monotonic search found no way to make progress.
+        .or_else(|| {
+            ranked_end(
+                source,
+                start,
+                PRIMARY_LIMIT,
+                &candidates,
+                true,
+                &mut count_tokens,
+            )
+        })
+        .or_else(|| {
+            ranked_end(
+                source,
+                start,
+                MAX_LIMIT,
+                &candidates,
+                true,
+                &mut count_tokens,
+            )
+        })
+        .or_else(|| {
+            oversized_protected_end(
+                source,
+                start,
+                &protected,
+                &whitespace,
+                &mut waived_protected,
+                true,
+                &mut count_tokens,
+            )
+        })
+        .or_else(|| {
+            hard_split_end(
+                source,
+                start,
+                PRIMARY_LIMIT,
+                &protected,
+                &whitespace,
+                true,
+                &mut count_tokens,
+            )
+        })
+        .ok_or(PackingError::UnsupportedInput)?;
 
         if end <= start || count_tokens(&source[start..end]) > MAX_LIMIT {
             return Err(PackingError::UnsupportedInput);
@@ -272,15 +335,16 @@ fn ranked_end(
     start: usize,
     limit: usize,
     candidates: &[Candidate],
+    exhaustive: bool,
     count: &mut impl FnMut(&str) -> usize,
 ) -> Option<usize> {
     (1..=3).find_map(|rank| {
-        candidates
+        let ends = candidates
             .iter()
             .filter(|candidate| candidate.rank == rank && candidate.end > start)
-            .filter(|candidate| count(&source[start..candidate.end]) <= limit)
             .map(|candidate| candidate.end)
-            .max()
+            .collect::<Vec<_>>();
+        farthest_fitting_end(source, start, limit, &ends, exhaustive, count)
     })
 }
 
@@ -290,16 +354,17 @@ fn hard_split_end(
     limit: usize,
     protected: &[Range<usize>],
     whitespace: &[Range<usize>],
+    exhaustive: bool,
     count: &mut impl FnMut(&str) -> usize,
 ) -> Option<usize> {
-    source[start..]
+    let ends = source[start..]
         .char_indices()
         .skip(1)
         .map(|(offset, _)| start + offset)
         .chain(std::iter::once(source.len()))
         .filter(|&end| allowed_fallback_end(end, protected, whitespace))
-        .filter(|&end| count(&source[start..end]) <= limit)
-        .max()
+        .collect::<Vec<_>>();
+    farthest_fitting_end(source, start, limit, &ends, exhaustive, count)
 }
 
 fn oversized_protected_end(
@@ -308,16 +373,17 @@ fn oversized_protected_end(
     protected: &[Range<usize>],
     whitespace: &[Range<usize>],
     waived: &mut Option<Range<usize>>,
+    exhaustive: bool,
     count: &mut impl FnMut(&str) -> usize,
 ) -> Option<usize> {
     if let Some(run) = waived.as_ref().filter(|run| run.contains(&start)) {
-        return source[start..run.end]
+        let ends = source[start..run.end]
             .char_indices()
             .skip(1)
             .map(|(offset, _)| start + offset)
             .chain(std::iter::once(run.end))
-            .filter(|&end| count(&source[start..end]) <= MAX_LIMIT)
-            .max();
+            .collect::<Vec<_>>();
+        return farthest_fitting_end(source, start, MAX_LIMIT, &ends, exhaustive, count);
     }
 
     let run_start = whitespace
@@ -330,13 +396,65 @@ fn oversized_protected_end(
     }
     *waived = Some(run.clone());
 
-    source[run.start..run.end]
+    let ends = source[run.start..run.end]
         .char_indices()
         .skip(1)
         .map(|(offset, _)| run.start + offset)
         .chain(std::iter::once(run.end))
-        .filter(|&end| count(&source[start..end]) <= MAX_LIMIT)
-        .max()
+        .collect::<Vec<_>>();
+    farthest_fitting_end(source, start, MAX_LIMIT, &ends, exhaustive, count)
+}
+
+fn farthest_fitting_end(
+    source: &str,
+    start: usize,
+    limit: usize,
+    ends: &[usize],
+    exhaustive: bool,
+    count: &mut impl FnMut(&str) -> usize,
+) -> Option<usize> {
+    if exhaustive {
+        return ends
+            .iter()
+            .rev()
+            .copied()
+            .find(|&end| count(&source[start..end]) <= limit);
+    }
+
+    // Phoneme counts are expected to be monotonic as source scalars are appended,
+    // so binary search keeps boundary calls logarithmic. Probing immediately after
+    // an over-limit midpoint detects a violated ordering; injected non-monotonic
+    // counters then fall back to the exhaustive search needed to preserve
+    // farthest-fitting semantics.
+    let mut fitting = None;
+    let mut left = 0;
+    let mut right = ends.len();
+    while left < right {
+        let middle = left + (right - left) / 2;
+        let end = ends[middle];
+        if count(&source[start..end]) <= limit {
+            fitting = Some(end);
+            left = middle + 1;
+        } else {
+            if let Some(&later) = ends.get(middle + 1) {
+                if count(&source[start..later]) <= limit {
+                    return ends
+                        .iter()
+                        .rev()
+                        .copied()
+                        .find(|&end| count(&source[start..end]) <= limit);
+                }
+            }
+            right = middle;
+        }
+    }
+
+    let farthest = *ends.last()?;
+    if fitting != Some(farthest) && count(&source[start..farthest]) <= limit {
+        return Some(farthest);
+    }
+
+    fitting
 }
 
 fn allowed_fallback_end(
@@ -668,6 +786,74 @@ mod tests {
         .unwrap();
         assert_eq!(ranges[0], 0..sentence_end);
         assert_eq!(&source[ranges[1].clone()], "  three");
+    }
+
+    #[test]
+    fn punctuation_dense_packing_bounds_boundary_calls() {
+        let source = "a, ".repeat(2_000);
+        let mut calls = 0;
+        let ranges = pack_initial_ranges(&source, |slice| {
+            calls += 1;
+            slice.chars().count()
+        })
+        .unwrap();
+
+        assert_partition(&source, &ranges, lengths);
+        assert!(
+            calls < 1_000,
+            "2,000 clauses required {calls} boundary calls"
+        );
+    }
+
+    #[test]
+    fn non_monotonic_count_after_over_limit_midpoint_still_partitions() {
+        let source = "w".repeat(500);
+        let count = |slice: &str| match slice.len() {
+            251 => 401,
+            252..=300 => 200,
+            301.. => 401,
+            length => length,
+        };
+
+        let ranges = pack_initial_ranges(&source, count).unwrap();
+
+        assert_eq!(ranges[0], 0..300);
+        assert_partition(&source, &ranges, count);
+    }
+
+    #[test]
+    fn non_monotonic_count_with_hidden_fitting_island_still_partitions() {
+        let source = "w".repeat(600);
+        let count = |slice: &str| {
+            if (260..=300).contains(&slice.len()) {
+                200
+            } else {
+                401
+            }
+        };
+
+        let ranges = pack_initial_ranges(&source, count).unwrap();
+
+        assert_eq!(ranges, vec![0..300, 300..600]);
+        assert_partition(&source, &ranges, count);
+    }
+
+    #[test]
+    fn exhaustive_fallback_finds_hidden_fitting_island() {
+        let source = "w".repeat(500);
+        let ends = (1..=source.len()).collect::<Vec<_>>();
+        let mut count = |slice: &str| {
+            if (260..=300).contains(&slice.len()) {
+                200
+            } else {
+                401
+            }
+        };
+
+        assert_eq!(
+            farthest_fitting_end(&source, 0, MAX_LIMIT, &ends, true, &mut count),
+            Some(300)
+        );
     }
 
     #[test]
