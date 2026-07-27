@@ -21,16 +21,12 @@ use crate::sidecar::pi_install::{
 };
 
 const MAX_REDIRECTS: usize = 5;
-const ALLOWED_HOSTS: &[&str] = &[
-    "huggingface.co",
-    "cdn-lfs.huggingface.co",
-    "cdn-lfs-us-1.huggingface.co",
-    "cdn-lfs-eu-1.huggingface.co",
-    "cas-bridge.xethub.hf.co",
-    "cas-server.xethub.hf.co",
-    "github.com",
-    "release-assets.githubusercontent.com",
-];
+
+#[derive(Clone, Copy)]
+enum HostPolicy {
+    HuggingFace,
+    GitHub,
+}
 
 pub type ModelResponseBody = Box<dyn Read + Send + Sync + 'static>;
 
@@ -83,6 +79,7 @@ impl NativeModelAcquisitionTransport {
     fn request(
         &mut self,
         url: &str,
+        host_policy: HostPolicy,
         offset: u64,
         connect_timeout: Duration,
         read_timeout: Duration,
@@ -90,6 +87,7 @@ impl NativeModelAcquisitionTransport {
     ) -> Result<Response, TransportFailure> {
         request_with(
             url,
+            host_policy,
             offset,
             connect_timeout,
             read_timeout,
@@ -108,6 +106,7 @@ impl ResidentModelDownloadTransport for NativeModelAcquisitionTransport {
     ) -> Result<ResidentModelDownloadResponse<Self::Body>, ResidentModelTransportError> {
         self.request(
             request.url(),
+            HostPolicy::HuggingFace,
             request.offset,
             request.limits.connect_timeout,
             request.limits.read_timeout,
@@ -135,6 +134,7 @@ impl AsrDownloadTransport for NativeModelAcquisitionTransport {
     ) -> Result<AsrDownloadResponse<Self::Body>, AsrTransportError> {
         self.request(
             request.url(),
+            HostPolicy::HuggingFace,
             request.offset,
             request.limits.connect_timeout,
             request.limits.read_timeout,
@@ -162,6 +162,7 @@ impl KokoroDownloadTransport for NativeModelAcquisitionTransport {
     ) -> Result<KokoroDownloadResponse<Self::Body>, KokoroTransportError> {
         self.request(
             request.url(),
+            HostPolicy::GitHub,
             request.offset,
             request.limits.connect_timeout,
             request.limits.read_timeout,
@@ -189,6 +190,7 @@ impl RuntimeDownloadTransport for NativeModelAcquisitionTransport {
     ) -> Result<RuntimeDownloadResponse<Self::Body>, RuntimeArchiveError> {
         self.request(
             request.url(),
+            HostPolicy::GitHub,
             request.offset,
             request.connect_timeout,
             request.read_timeout,
@@ -212,6 +214,7 @@ impl PiDownloadTransport for NativeModelAcquisitionTransport {
     ) -> Result<PiDownloadResponse<Self::Body>, PiTransportError> {
         self.request(
             request.url(),
+            HostPolicy::GitHub,
             0,
             request.connect_timeout,
             request.read_timeout,
@@ -293,6 +296,7 @@ impl HttpBackend for UreqBackend {
 
 fn request_with<F>(
     initial_url: &str,
+    host_policy: HostPolicy,
     offset: u64,
     connect_timeout: Duration,
     read_timeout: Duration,
@@ -302,7 +306,7 @@ fn request_with<F>(
 where
     F: FnMut(&BackendRequest) -> Result<BackendResponse, TransportFailure>,
 {
-    let mut url = checked_url(initial_url)?;
+    let mut url = checked_initial_url(initial_url, host_policy)?;
     let started_at = Instant::now();
     for hop in 0..=MAX_REDIRECTS {
         let remaining = deadline
@@ -321,10 +325,11 @@ where
                 return Err(TransportFailure::Rejected);
             }
             let location = response.location.ok_or(TransportFailure::Rejected)?;
-            url = checked_url(
+            url = checked_redirect_url(
                 url.join(&location)
                     .map_err(|_| TransportFailure::Rejected)?
                     .as_str(),
+                host_policy,
             )?;
             continue;
         }
@@ -349,15 +354,45 @@ where
     Err(TransportFailure::Rejected)
 }
 
-fn checked_url(value: &str) -> Result<url::Url, TransportFailure> {
+fn checked_initial_url(value: &str, host_policy: HostPolicy) -> Result<url::Url, TransportFailure> {
     let parsed = url::Url::parse(value).map_err(|_| TransportFailure::Rejected)?;
-    if parsed.scheme() != "https"
-        || parsed.port_or_known_default() != Some(443)
-        || !ALLOWED_HOSTS.contains(&parsed.host_str().unwrap_or_default())
-    {
+    let expected_host = match host_policy {
+        HostPolicy::HuggingFace => "huggingface.co",
+        HostPolicy::GitHub => "github.com",
+    };
+    if !has_secure_origin(&parsed) || parsed.host_str() != Some(expected_host) {
         return Err(TransportFailure::Rejected);
     }
     Ok(parsed)
+}
+
+fn checked_redirect_url(
+    value: &str,
+    host_policy: HostPolicy,
+) -> Result<url::Url, TransportFailure> {
+    let parsed = url::Url::parse(value).map_err(|_| TransportFailure::Rejected)?;
+    let host = parsed.host_str().unwrap_or_default();
+    let allowed_host = match host_policy {
+        HostPolicy::HuggingFace => {
+            host_equals_or_has_dot_suffix(host, "hf.co")
+                || host_equals_or_has_dot_suffix(host, "huggingface.co")
+        }
+        HostPolicy::GitHub => {
+            host == "github.com" || host == "release-assets.githubusercontent.com"
+        }
+    };
+    if !has_secure_origin(&parsed) || !allowed_host {
+        return Err(TransportFailure::Rejected);
+    }
+    Ok(parsed)
+}
+
+fn has_secure_origin(url: &url::Url) -> bool {
+    url.scheme() == "https" && url.port_or_known_default() == Some(443)
+}
+
+fn host_equals_or_has_dot_suffix(host: &str, domain: &str) -> bool {
+    host == domain || host.ends_with(&format!(".{domain}"))
 }
 
 fn parse_content_range(value: &str) -> Result<Option<(u64, u64, u64)>, TransportFailure> {
@@ -381,6 +416,8 @@ mod tests {
     use super::*;
     use crate::asr::acquisition::AsrAcquisitionLimits;
     use crate::llama::acquisition::ResidentModelAcquisitionLimits;
+    #[cfg(feature = "network-tests")]
+    use crate::llama::RESIDENT_MODEL;
     use std::collections::VecDeque;
     use std::io::Cursor;
 
@@ -641,5 +678,77 @@ mod tests {
         assert_eq!(error, "Rejected");
         assert!(!error.contains("token"));
         assert!(!error.contains("credential"));
+    }
+
+    #[test]
+    fn redirect_policy_rejects_insecure_ports_and_unrelated_hosts() {
+        for url in [
+            "http://us.aws.cdn.hf.co/file",
+            "https://us.aws.cdn.hf.co:444/file",
+            "https://evilhf.co/file",
+            "https://hf.co.attacker.com/file",
+            "https://nothuggingface.co/file",
+            "https://attacker.com/file",
+        ] {
+            assert_eq!(
+                checked_redirect_url(url, HostPolicy::HuggingFace),
+                Err(TransportFailure::Rejected),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_policy_accepts_hugging_face_owned_hosts() {
+        for url in [
+            "https://us.aws.cdn.hf.co/file",
+            "https://eu.aws.cdn.hf.co/file",
+            "https://cas-bridge.xethub.hf.co/file",
+            "https://cdn-lfs-us-1.huggingface.co/file",
+        ] {
+            assert!(
+                checked_redirect_url(url, HostPolicy::HuggingFace).is_ok(),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn initial_url_policy_rejects_hugging_face_cdn_hosts() {
+        assert_eq!(
+            checked_initial_url("https://us.aws.cdn.hf.co/file", HostPolicy::HuggingFace),
+            Err(TransportFailure::Rejected)
+        );
+    }
+
+    #[cfg(feature = "network-tests")]
+    #[test]
+    fn resident_model_redirect_matches_redirect_policy() {
+        let initial_url =
+            checked_initial_url(RESIDENT_MODEL.source_url, HostPolicy::HuggingFace).unwrap();
+        let agent = ureq::AgentBuilder::new()
+            .redirects(0)
+            .https_only(true)
+            .try_proxy_from_env(true)
+            .build();
+        let response = match agent.head(initial_url.as_str()).call() {
+            Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+            Err(error) => panic!("resident model HEAD failed: {error}"),
+        };
+        assert!(
+            matches!(response.status(), 301 | 302 | 303 | 307 | 308),
+            "resident model HEAD returned {}",
+            response.status()
+        );
+        let location = response
+            .header("Location")
+            .expect("resident model redirect lacks a Location header");
+        let redirect_url = initial_url
+            .join(location)
+            .expect("resident model Location header is invalid");
+        assert_eq!(
+            checked_redirect_url(redirect_url.as_str(), HostPolicy::HuggingFace),
+            Ok(redirect_url)
+        );
     }
 }
