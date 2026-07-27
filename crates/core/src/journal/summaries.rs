@@ -205,7 +205,7 @@ impl RunJournal {
     }
 }
 
-fn title_from(events: &[EventEnvelope]) -> String {
+pub(super) fn title_from(events: &[EventEnvelope]) -> String {
     let prompt = events.iter().find_map(|event| {
         if event.event_type != "user.prompt.submitted" {
             return None;

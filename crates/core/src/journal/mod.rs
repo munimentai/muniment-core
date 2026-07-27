@@ -5,6 +5,7 @@ pub mod export;
 pub mod reducer;
 pub mod retention;
 pub mod summaries;
+pub mod thread_summaries;
 
 pub const MAX_THREAD_TITLE_CHARS: usize = summaries::MAX_TITLE_CHARS;
 
