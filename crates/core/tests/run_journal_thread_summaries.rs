@@ -156,6 +156,111 @@ fn thread_run_read_rejects_unknown_and_deleted_threads() {
 }
 
 #[test]
+fn deletion_gaps_keep_thread_order_title_and_ledger_lifecycle() {
+    let path = journal_file();
+    let mut journal = RunJournal::open(&path).unwrap();
+    journal
+        .append_new_run(
+            "alpha",
+            &event(RUN_A, 1, "run.started", "2026-07-10T10:00:00Z", json!({})),
+        )
+        .unwrap();
+    let thread_id = thread_for(&path, RUN_A);
+    journal
+        .append_new_run_in_thread(
+            "alpha",
+            &thread_id,
+            &prompt(RUN_B, 1, "removed prompt", "2026-07-10T11:00:00Z"),
+        )
+        .unwrap();
+    journal
+        .append_new_run_in_thread(
+            "alpha",
+            &thread_id,
+            &prompt(RUN_C, 1, "third prompt", "2026-07-10T12:00:00Z"),
+        )
+        .unwrap();
+
+    journal.delete_run(RUN_B).unwrap();
+    journal
+        .append_new_run_in_thread(
+            "alpha",
+            &thread_id,
+            &prompt(RUN_D, 1, "fourth prompt", "2026-07-10T13:00:00Z"),
+        )
+        .unwrap();
+    drop(journal);
+    let mut journal = RunJournal::open(&path).unwrap();
+    assert_eq!(
+        Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT thread_run_ordinal FROM run_threads WHERE run_id=?1",
+                [RUN_D],
+                |row| row.get::<_, u64>(0)
+            )
+            .unwrap(),
+        4
+    );
+    let first = journal.thread_run_ids(&thread_id, 1, None).unwrap();
+    let second = journal
+        .thread_run_ids(&thread_id, 1, first.next_cursor.as_deref())
+        .unwrap();
+    let third = journal
+        .thread_run_ids(&thread_id, 1, second.next_cursor.as_deref())
+        .unwrap();
+    assert_eq!(
+        [first.run_ids, second.run_ids, third.run_ids].concat(),
+        [RUN_A, RUN_C, RUN_D]
+    );
+    assert!(third.next_cursor.is_none());
+    assert_eq!(
+        journal.thread_summaries(1, None).unwrap().summaries[0].title,
+        "third prompt"
+    );
+    assert_eq!(
+        Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM thread_events WHERE thread_id=?1",
+                [&thread_id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+
+    journal.delete_run(RUN_A).unwrap();
+    assert_eq!(
+        journal
+            .thread_run_ids(&thread_id, 10, None)
+            .unwrap()
+            .run_ids,
+        [RUN_C, RUN_D]
+    );
+    journal.delete_run(RUN_C).unwrap();
+    assert_eq!(
+        journal
+            .thread_run_ids(&thread_id, 10, None)
+            .unwrap()
+            .run_ids,
+        [RUN_D]
+    );
+    journal.delete_run(RUN_D).unwrap();
+    assert_eq!(
+        Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM thread_events WHERE thread_id=?1",
+                [&thread_id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn pages_threads_by_combined_update_time_and_thread_id() {
     let path = journal_file();
     let mut journal = RunJournal::open(&path).unwrap();

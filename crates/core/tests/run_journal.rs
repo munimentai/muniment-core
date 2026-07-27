@@ -759,7 +759,6 @@ fn schema_v3_rejects_thread_identity_invariant_violations() {
     for mutation in [
         "DELETE FROM run_threads",
         "DELETE FROM thread_events",
-        "UPDATE run_threads SET thread_run_ordinal=2",
         "UPDATE thread_events SET thread_seq=2, \
          envelope_json=json_replace(envelope_json,'$.thread_seq',2)",
     ] {
@@ -803,6 +802,112 @@ fn schema_v3_rejects_thread_identity_invariant_violations() {
     assert!(matches!(
         RunJournal::open(db.as_ref()),
         Err(JournalError::Corrupt(_))
+    ));
+}
+
+#[test]
+fn new_run_in_thread_uses_next_ordinal_and_mirrors_run_creation() {
+    let db = TestDb::new();
+    let mut journal = RunJournal::open(db.as_ref()).unwrap();
+    journal.append_new_run("workspace-a", &event(1)).unwrap();
+    let thread_id = thread_id(&db);
+    let other_run = "0190a100-0000-7000-8000-000000000002";
+    let mut first = event_for(
+        other_run,
+        "0190a100-0000-7000-8000-000000000102",
+        1,
+        "user.prompt.submitted",
+    );
+    first.payload = EventPayload::Inline {
+        payload_json: json!({"prompt": "second prompt"}),
+    };
+
+    journal
+        .append_new_run_in_thread("workspace-a", &thread_id, &first)
+        .unwrap();
+
+    let raw = Connection::open(db.as_ref()).unwrap();
+    assert_eq!(
+        raw.query_row(
+            "SELECT COUNT(*) FROM events e \
+             JOIN run_workspaces rw ON rw.run_id=e.run_id \
+             JOIN run_threads rt ON rt.run_id=e.run_id \
+             WHERE e.run_id=?1 AND e.run_seq=1 AND rw.workspace='workspace-a' \
+             AND rt.thread_id=?2 AND rt.thread_run_ordinal=2",
+            (other_run, &thread_id),
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT COUNT(*) FROM thread_projection_entries WHERE run_id=?1",
+            [other_run],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn new_run_in_thread_rejections_write_nothing() {
+    let db = TestDb::new();
+    let mut journal = RunJournal::open(db.as_ref()).unwrap();
+    journal.append_new_run("workspace-a", &event(1)).unwrap();
+    let thread_id = thread_id(&db);
+    let provenance = test_provenance();
+    let new_run = || {
+        event_for(
+            "0190a100-0000-7000-8000-000000000002",
+            "0190a100-0000-7000-8000-000000000102",
+            1,
+            "future.event",
+        )
+    };
+
+    for (workspace, selected_thread) in [
+        ("workspace-a", "0190a100-0000-7000-8000-000000000099"),
+        ("workspace-b", thread_id.as_str()),
+    ] {
+        assert!(matches!(
+            journal.append_new_run_in_thread(workspace, selected_thread, &new_run()),
+            Err(JournalError::InvalidEnvelope(_))
+        ));
+    }
+    assert!(matches!(
+        journal.append_new_run_in_thread("workspace-a", &thread_id, &event(1)),
+        Err(JournalError::Conflict(Conflict::Sequence {
+            run_seq: 1,
+            ..
+        }))
+    ));
+    journal
+        .append_thread_deleted(1, &thread_id, "2026-07-10T12:00:01Z", &provenance)
+        .unwrap();
+    assert!(matches!(
+        journal.append_new_run_in_thread("workspace-a", &thread_id, &new_run()),
+        Err(JournalError::InvalidEnvelope(_))
+    ));
+    assert_eq!(
+        Connection::open(db.as_ref())
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+
+    let mut invalid_seq = new_run();
+    invalid_seq.run_seq = 2;
+    assert!(matches!(
+        journal.append_new_run_in_thread("workspace-a", &thread_id, &invalid_seq),
+        Err(JournalError::InvalidEnvelope(_))
+    ));
+    assert!(matches!(
+        journal.append_new_run_in_thread("", &thread_id, &new_run()),
+        Err(JournalError::InvalidEnvelope(_))
     ));
 }
 
