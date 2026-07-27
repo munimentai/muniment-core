@@ -3,6 +3,7 @@ use muniment_core::cas::LocalCas;
 use muniment_core::journal::{
     reducer::{reduce, RunStatus},
     CasReference, Conflict, EventEnvelope, EventPayload, JournalError, Provenance, RunJournal,
+    MAX_THREAD_TITLE_CHARS,
 };
 use rusqlite::Connection;
 use serde_json::json;
@@ -84,6 +85,29 @@ fn cas_payload(hash: &str) -> EventPayload {
             byte_length: 1,
         },
     }
+}
+
+fn test_provenance() -> Provenance {
+    Provenance {
+        source: "desktop".into(),
+        source_version: "1".into(),
+        actor_id: Some("profile-a".into()),
+        device_id: Some("device-a".into()),
+        rpc_request_id: None,
+        capability_versions: None,
+        extra: BTreeMap::new(),
+    }
+}
+
+fn thread_id(db: &TestDb) -> String {
+    Connection::open(db.as_ref())
+        .unwrap()
+        .query_row(
+            "SELECT thread_id FROM run_threads WHERE run_id=?1",
+            [RUN],
+            |row| row.get(0),
+        )
+        .unwrap()
 }
 
 #[test]
@@ -820,6 +844,239 @@ fn new_run_is_stamped_and_deletion_removes_its_empty_thread() {
         .unwrap(),
         0
     );
+}
+
+#[test]
+fn thread_rename_and_delete_append_validated_canonical_events() {
+    let db = TestDb::new();
+    let mut journal = RunJournal::open(db.as_ref()).unwrap();
+    journal.append_new_run("workspace-a", &event(1)).unwrap();
+    let thread_id = thread_id(&db);
+    let provenance = test_provenance();
+    let at = "2026-07-10T12:00:01Z";
+
+    journal
+        .append_thread_title_renamed(1, &thread_id, "  New title  ", at, &provenance)
+        .unwrap();
+    let raw = Connection::open(db.as_ref()).unwrap();
+    let envelope: String = raw
+        .query_row(
+            "SELECT envelope_json FROM thread_events WHERE thread_id=?1 AND thread_seq=2",
+            [&thread_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        envelope,
+        format!(
+            "{{\"envelope_version\":1,\"event_id\":\"{}\",\"event_type\":\"thread.title.renamed\",\
+             \"event_version\":1,\"payload_json\":{{\"title\":\"New title\"}},\
+             \"provenance\":{{\"actor_id\":\"profile-a\",\"device_id\":\"device-a\",\
+             \"source\":\"desktop\",\"source_version\":\"1\"}},\"recorded_at\":\"{at}\",\
+             \"thread_id\":\"{thread_id}\",\"thread_seq\":2}}",
+            serde_json::from_str::<serde_json::Value>(&envelope).unwrap()["event_id"]
+                .as_str()
+                .unwrap()
+        )
+    );
+    drop(raw);
+
+    journal
+        .append_thread_deleted(2, &thread_id, "2026-07-10T12:00:02Z", &provenance)
+        .unwrap();
+    let raw = Connection::open(db.as_ref()).unwrap();
+    assert_eq!(
+        raw.query_row(
+            "SELECT COUNT(*) FROM thread_events WHERE thread_id=?1 AND thread_seq=3 \
+             AND event_type='thread.deleted' \
+             AND json_extract(envelope_json,'$.provenance.actor_id')='profile-a' \
+             AND json(envelope_json)=json(envelope_json)",
+            [&thread_id],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn thread_title_boundaries_and_conflicts_write_no_events() {
+    let db = TestDb::new();
+    let mut journal = RunJournal::open(db.as_ref()).unwrap();
+    journal.append_new_run("workspace-a", &event(1)).unwrap();
+    let thread_id = thread_id(&db);
+    let provenance = test_provenance();
+    let at = "2026-07-10T12:00:01Z";
+    let over_limit = "é".repeat(MAX_THREAD_TITLE_CHARS + 1);
+
+    for invalid in [" \n\t ", over_limit.as_str()] {
+        assert!(matches!(
+            journal.append_thread_title_renamed(1, &thread_id, invalid, at, &provenance),
+            Err(JournalError::InvalidEnvelope(_))
+        ));
+    }
+    assert!(matches!(
+        journal.append_thread_title_renamed(0, &thread_id, "stale", at, &provenance),
+        Err(JournalError::Conflict(Conflict::StaleSequence {
+            expected: 0,
+            actual: 1
+        }))
+    ));
+    assert!(matches!(
+        journal.append_thread_deleted(0, "0190a100-0000-7000-8000-000000000099", at, &provenance),
+        Err(JournalError::InvalidEnvelope(_))
+    ));
+    journal
+        .append_thread_title_renamed(
+            1,
+            &thread_id,
+            &"é".repeat(MAX_THREAD_TITLE_CHARS),
+            at,
+            &provenance,
+        )
+        .unwrap();
+    assert_eq!(
+        Connection::open(db.as_ref())
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM thread_events WHERE thread_id=?1",
+                [&thread_id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn deleted_thread_rejects_every_append_without_writing() {
+    let db = TestDb::new();
+    let mut journal = RunJournal::open(db.as_ref()).unwrap();
+    journal.append_new_run("workspace-a", &event(1)).unwrap();
+    let thread_id = thread_id(&db);
+    let provenance = test_provenance();
+    journal
+        .append_thread_deleted(1, &thread_id, "2026-07-10T12:00:01Z", &provenance)
+        .unwrap();
+
+    assert!(matches!(
+        journal.append_thread_title_renamed(
+            2,
+            &thread_id,
+            "too late",
+            "2026-07-10T12:00:02Z",
+            &provenance
+        ),
+        Err(JournalError::InvalidEnvelope(_))
+    ));
+    assert!(matches!(
+        journal.append_thread_deleted(2, &thread_id, "2026-07-10T12:00:02Z", &provenance),
+        Err(JournalError::InvalidEnvelope(_))
+    ));
+    assert_eq!(
+        Connection::open(db.as_ref())
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM thread_events WHERE thread_id=?1",
+                [&thread_id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn validation_rejects_an_event_after_thread_deletion() {
+    let db = TestDb::new();
+    let mut journal = RunJournal::open(db.as_ref()).unwrap();
+    journal.append_new_run("workspace-a", &event(1)).unwrap();
+    let thread_id = thread_id(&db);
+    let provenance = test_provenance();
+    journal
+        .append_thread_title_renamed(1, &thread_id, "title", "2026-07-10T12:00:01Z", &provenance)
+        .unwrap();
+    journal
+        .append_thread_deleted(2, &thread_id, "2026-07-10T12:00:02Z", &provenance)
+        .unwrap();
+    drop(journal);
+
+    let raw = Connection::open(db.as_ref()).unwrap();
+    let renamed: String = raw
+        .query_row(
+            "SELECT envelope_json FROM thread_events WHERE thread_id=?1 AND thread_seq=2",
+            [&thread_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let event_id = "0190a100-0000-7000-8000-000000000099";
+    let later = renamed
+        .replace(
+            serde_json::from_str::<serde_json::Value>(&renamed).unwrap()["event_id"]
+                .as_str()
+                .unwrap(),
+            event_id,
+        )
+        .replace("\"thread_seq\":2", "\"thread_seq\":4");
+    raw.execute(
+        "INSERT INTO thread_events VALUES(?1,?2,4,'thread.title.renamed',1,1,\
+         '2026-07-10T12:00:01Z',?3)",
+        (&event_id, &thread_id, later),
+    )
+    .unwrap();
+    drop(raw);
+
+    assert!(matches!(
+        RunJournal::open(db.as_ref()),
+        Err(JournalError::Corrupt(_))
+    ));
+}
+
+#[test]
+fn validation_allows_an_unknown_event_before_thread_deletion() {
+    let db = TestDb::new();
+    let mut journal = RunJournal::open(db.as_ref()).unwrap();
+    journal.append_new_run("workspace-a", &event(1)).unwrap();
+    let thread_id = thread_id(&db);
+    let provenance = test_provenance();
+    journal
+        .append_thread_deleted(1, &thread_id, "2026-07-10T12:00:02Z", &provenance)
+        .unwrap();
+    drop(journal);
+
+    let raw = Connection::open(db.as_ref()).unwrap();
+    let deleted: String = raw
+        .query_row(
+            "SELECT envelope_json FROM thread_events WHERE thread_id=?1 AND thread_seq=2",
+            [&thread_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let deleted = deleted.replace("\"thread_seq\":2", "\"thread_seq\":3");
+    raw.execute(
+        "UPDATE thread_events SET thread_seq=3,envelope_json=?1 \
+         WHERE thread_id=?2 AND thread_seq=2",
+        (&deleted, &thread_id),
+    )
+    .unwrap();
+    let event_id = "0190a100-0000-7000-8000-000000000099";
+    let unknown = format!(
+        "{{\"envelope_version\":1,\"event_id\":\"{event_id}\",\"event_type\":\"thread.future\",\
+         \"event_version\":1,\"payload_json\":{{\"future\":true}},\
+         \"provenance\":{{\"actor_id\":\"profile-a\",\"device_id\":\"device-a\",\
+         \"source\":\"desktop\",\"source_version\":\"1\"}},\
+         \"recorded_at\":\"2026-07-10T12:00:01Z\",\
+         \"thread_id\":\"{thread_id}\",\"thread_seq\":2}}"
+    );
+    raw.execute(
+        "INSERT INTO thread_events VALUES(?1,?2,2,'thread.future',1,1,\
+         '2026-07-10T12:00:01Z',?3)",
+        (&event_id, &thread_id, unknown),
+    )
+    .unwrap();
+    drop(raw);
+
+    RunJournal::open(db.as_ref()).unwrap();
 }
 
 #[test]

@@ -6,6 +6,8 @@ pub mod reducer;
 pub mod retention;
 pub mod summaries;
 
+pub const MAX_THREAD_TITLE_CHARS: usize = summaries::MAX_TITLE_CHARS;
+
 use crate::attachment::ChatAttachment;
 use crate::cas::ContentHash;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -585,6 +587,124 @@ impl RunJournal {
         event: &EventEnvelope,
     ) -> Result<(), JournalError> {
         self.append_batch(expected_last_seq, std::slice::from_ref(event))
+    }
+
+    pub fn append_thread_title_renamed(
+        &mut self,
+        expected_last_thread_seq: u64,
+        thread_id: &str,
+        title: &str,
+        recorded_at: &str,
+        provenance: &Provenance,
+    ) -> Result<(), JournalError> {
+        let title = title.trim();
+        if title.is_empty() || title.chars().count() > MAX_THREAD_TITLE_CHARS {
+            return Err(JournalError::InvalidEnvelope(format!(
+                "thread title must contain 1 to {MAX_THREAD_TITLE_CHARS} characters"
+            )));
+        }
+        self.append_thread_event(
+            expected_last_thread_seq,
+            thread_id,
+            "thread.title.renamed",
+            recorded_at,
+            serde_json::json!({ "title": title }),
+            provenance,
+        )
+    }
+
+    pub fn append_thread_deleted(
+        &mut self,
+        expected_last_thread_seq: u64,
+        thread_id: &str,
+        recorded_at: &str,
+        provenance: &Provenance,
+    ) -> Result<(), JournalError> {
+        self.append_thread_event(
+            expected_last_thread_seq,
+            thread_id,
+            "thread.deleted",
+            recorded_at,
+            serde_json::json!({}),
+            provenance,
+        )
+    }
+
+    fn append_thread_event(
+        &mut self,
+        expected_last_thread_seq: u64,
+        thread_id: &str,
+        event_type: &str,
+        recorded_at: &str,
+        payload_json: Value,
+        provenance: &Provenance,
+    ) -> Result<(), JournalError> {
+        let event = ThreadEventEnvelope {
+            event_id: Uuid::now_v7().to_string(),
+            thread_id: thread_id.to_owned(),
+            thread_seq: expected_last_thread_seq
+                .checked_add(1)
+                .ok_or_else(|| JournalError::InvalidEnvelope("thread sequence overflow".into()))?,
+            event_type: event_type.to_owned(),
+            event_version: 1,
+            envelope_version: 1,
+            recorded_at: recorded_at.to_owned(),
+            payload_json,
+            provenance: provenance.clone(),
+        };
+        validate_thread_envelope(&event)?;
+        let canonical = canonical_thread_envelope(&event)?;
+        let coordination = self.coordination.clone();
+        let _operation = coordination
+            .as_ref()
+            .map(|state| state.operation.lock().unwrap());
+        self.refresh_after_compaction()?;
+        let tx = self
+            .connection
+            .as_mut()
+            .expect("journal connection is always present outside compaction")
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let actual: u64 = tx.query_row(
+            "SELECT COALESCE(MAX(thread_seq), 0) FROM thread_events WHERE thread_id=?1",
+            [thread_id],
+            |row| row.get(0),
+        )?;
+        if actual != expected_last_thread_seq {
+            return Err(JournalError::Conflict(Conflict::StaleSequence {
+                expected: expected_last_thread_seq,
+                actual,
+            }));
+        }
+        if actual == 0 {
+            return Err(JournalError::InvalidEnvelope(
+                "thread does not exist".into(),
+            ));
+        }
+        let deleted: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM thread_events \
+             WHERE thread_id=?1 AND event_type='thread.deleted')",
+            [thread_id],
+            |row| row.get(0),
+        )?;
+        if deleted {
+            return Err(JournalError::InvalidEnvelope("thread is deleted".into()));
+        }
+        tx.execute(
+            "INSERT INTO thread_events(event_id,thread_id,thread_seq,event_type,event_version,\
+             envelope_version,recorded_at,envelope_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                event.event_id,
+                event.thread_id,
+                event.thread_seq,
+                event.event_type,
+                event.event_version,
+                event.envelope_version,
+                event.recorded_at,
+                canonical
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Atomically creates a run and records its authoritative workspace.
@@ -1322,6 +1442,79 @@ fn canonical_thread_envelope(event: &ThreadEventEnvelope) -> Result<String, Jour
     serde_json::to_string(&value).map_err(|e| JournalError::InvalidEnvelope(e.to_string()))
 }
 
+fn validate_thread_envelope(event: &ThreadEventEnvelope) -> Result<(), JournalError> {
+    if event.thread_seq == 0
+        || event.event_version != 1
+        || event.envelope_version != 1
+        || event.provenance.source.trim().is_empty()
+        || event.provenance.source_version.trim().is_empty()
+    {
+        return Err(JournalError::InvalidEnvelope(
+            "thread sequence and versions must be valid and provenance must be non-empty".into(),
+        ));
+    }
+    for (name, value) in [
+        ("thread event ID", event.event_id.as_str()),
+        ("thread ID", event.thread_id.as_str()),
+    ] {
+        let uuid = Uuid::parse_str(value)
+            .map_err(|_| JournalError::InvalidEnvelope(format!("{name} must be a UUIDv7")))?;
+        if uuid.get_version() != Some(Version::SortRand) {
+            return Err(JournalError::InvalidEnvelope(format!(
+                "{name} must be a UUIDv7"
+            )));
+        }
+    }
+    validate_time("recorded_at", &event.recorded_at, true)?;
+    match event.event_type.as_str() {
+        "thread.created" => {
+            let valid = event.payload_json.as_object().is_some_and(|payload| {
+                payload.len() == 2
+                    && payload
+                        .get("migration_backfill")
+                        .is_some_and(Value::is_boolean)
+                    && payload
+                        .get("workspace")
+                        .is_some_and(|value| value.is_null() || value.is_string())
+            });
+            if !valid {
+                return Err(JournalError::InvalidEnvelope(
+                    "thread.created payload is invalid".into(),
+                ));
+            }
+        }
+        "thread.title.renamed" => {
+            let title = event
+                .payload_json
+                .as_object()
+                .filter(|payload| payload.len() == 1)
+                .and_then(|payload| payload.get("title"))
+                .and_then(Value::as_str);
+            if !title.is_some_and(|title| {
+                !title.is_empty()
+                    && title == title.trim()
+                    && title.chars().count() <= MAX_THREAD_TITLE_CHARS
+            }) {
+                return Err(JournalError::InvalidEnvelope(
+                    "thread.title.renamed payload is invalid".into(),
+                ));
+            }
+        }
+        "thread.deleted"
+            if event
+                .payload_json
+                .as_object()
+                .is_some_and(|value| value.is_empty()) => {}
+        "thread.deleted" => {
+            return Err(JournalError::InvalidEnvelope(
+                "thread.deleted payload is invalid".into(),
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn append_thread_created(
     tx: &rusqlite::Transaction<'_>,
     thread_id: &str,
@@ -1356,6 +1549,7 @@ fn append_thread_created(
             extra: BTreeMap::new(),
         },
     };
+    validate_thread_envelope(&envelope)?;
     let canonical = canonical_thread_envelope(&envelope)?;
     tx.execute(
         "INSERT INTO thread_events(event_id,thread_id,thread_seq,event_type,event_version,\
@@ -1530,16 +1724,7 @@ fn validate_thread_identity(connection: &Connection) -> Result<(), JournalError>
         let raw: String = row.get(7)?;
         let event: ThreadEventEnvelope = serde_json::from_str(&raw)
             .map_err(|e| JournalError::Corrupt(format!("invalid thread envelope JSON: {e}")))?;
-        for (name, value) in [
-            ("thread event ID", event.event_id.as_str()),
-            ("thread ID", event.thread_id.as_str()),
-        ] {
-            let uuid = Uuid::parse_str(value)
-                .map_err(|_| JournalError::Corrupt(format!("{name} is not a UUID")))?;
-            if uuid.get_version() != Some(Version::SortRand) {
-                return Err(JournalError::Corrupt(format!("{name} is not UUIDv7")));
-            }
-        }
+        validate_thread_envelope(&event).map_err(|e| JournalError::Corrupt(e.to_string()))?;
         let canonical =
             canonical_thread_envelope(&event).map_err(|e| JournalError::Corrupt(e.to_string()))?;
         if raw != canonical
@@ -1556,14 +1741,15 @@ fn validate_thread_identity(connection: &Connection) -> Result<(), JournalError>
                 event.event_id
             )));
         }
-        validate_time("recorded_at", &event.recorded_at, true)
-            .map_err(|e| JournalError::Corrupt(e.to_string()))?;
         let expected = previous
             .as_ref()
             .filter(|(id, _)| id == &event.thread_id)
             .map_or(1, |(_, seq)| seq + 1);
         if event.thread_seq != expected
             || (event.thread_seq == 1 && event.event_type != "thread.created")
+            || previous.as_ref().is_some_and(|(id, _)| {
+                id == &event.thread_id && event.event_type == "thread.created"
+            })
         {
             return Err(JournalError::Corrupt(format!(
                 "thread {} has invalid sequence or creation event",
@@ -1571,6 +1757,18 @@ fn validate_thread_identity(connection: &Connection) -> Result<(), JournalError>
             )));
         }
         previous = Some((event.thread_id, event.thread_seq));
+    }
+    let events_after_delete: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM thread_events deleted JOIN thread_events later \
+         ON later.thread_id=deleted.thread_id AND later.thread_seq>deleted.thread_seq \
+         WHERE deleted.event_type='thread.deleted'",
+        [],
+        |row| row.get(0),
+    )?;
+    if events_after_delete != 0 {
+        return Err(JournalError::Corrupt(
+            "thread deletion must be the last event".into(),
+        ));
     }
     let unstamped_threads: i64 = connection.query_row(
         "SELECT COUNT(*) FROM (SELECT DISTINCT te.thread_id FROM thread_events te \
