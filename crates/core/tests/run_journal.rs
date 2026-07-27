@@ -165,6 +165,7 @@ fn reopening_pre_projection_journal_backfills_valid_and_hostile_permissions() {
     connection
         .execute_batch("DROP TABLE permission_pending_projection")
         .unwrap();
+    connection.pragma_update(None, "user_version", 1).unwrap();
     drop(connection);
 
     let mut journal = RunJournal::open(&db).unwrap();
@@ -571,6 +572,157 @@ fn open_detects_invalid_sequence_and_schema_version() {
 }
 
 #[test]
+fn fresh_and_shipped_v1_journals_migrate_to_head_idempotently() {
+    let db = TestDb::new();
+    RunJournal::open(db.as_ref()).unwrap();
+    let raw = Connection::open(db.as_ref()).unwrap();
+    assert_eq!(
+        raw.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    raw.execute(
+        "INSERT INTO thread_projection_entries(run_id,ordinal,run_seq,kind,text) \
+         VALUES(?1,0,1,'user','hello')",
+        [RUN],
+    )
+    .unwrap();
+    raw.pragma_update(None, "user_version", 1).unwrap();
+    drop(raw);
+
+    RunJournal::open(db.as_ref()).unwrap();
+    let raw = Connection::open(db.as_ref()).unwrap();
+    assert_eq!(
+        raw.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT COUNT(*) FROM thread_projection_versions WHERE run_id=?1",
+            [RUN],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn newer_schema_version_fails_without_writing() {
+    let db = TestDb::new();
+    let raw = Connection::open(db.as_ref()).unwrap();
+    raw.execute("CREATE TABLE future_table(value TEXT)", [])
+        .unwrap();
+    raw.pragma_update(None, "user_version", 99).unwrap();
+    let before: Vec<String> = raw
+        .prepare("SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    drop(raw);
+
+    assert!(matches!(
+        RunJournal::open(db.as_ref()),
+        Err(JournalError::Corrupt(_))
+    ));
+    let raw = Connection::open(db.as_ref()).unwrap();
+    assert_eq!(
+        raw.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        99
+    );
+    let after: Vec<String> = raw
+        .prepare("SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(after, before);
+}
+
+#[test]
+fn head_schema_missing_journal_metadata_fails_without_recreating_it() {
+    let db = TestDb::new();
+    RunJournal::open(db.as_ref()).unwrap();
+    let raw = Connection::open(db.as_ref()).unwrap();
+    raw.execute_batch("DROP TABLE journal_metadata").unwrap();
+    drop(raw);
+
+    assert!(matches!(
+        RunJournal::open(db.as_ref()),
+        Err(JournalError::Sqlite(_))
+    ));
+    let raw = Connection::open(db.as_ref()).unwrap();
+    assert_eq!(
+        raw.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' \
+             AND name='journal_metadata'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn failed_migration_rolls_back_schema_and_version() {
+    let db = TestDb::new();
+    RunJournal::open(db.as_ref()).unwrap();
+    let raw = Connection::open(db.as_ref()).unwrap();
+    raw.execute_batch(
+        "DROP TABLE run_workspaces;
+         DROP TABLE thread_projection_entries;
+         DROP TABLE thread_projection_history;
+         DROP TABLE thread_projection_versions;
+         DROP TABLE permission_pending_projection;
+         DROP TABLE receipt_projection;",
+    )
+    .unwrap();
+    raw.execute(
+        "INSERT INTO events VALUES(?1,?2,2,'future.event',1,1,'2026-07-10T12:00:00Z',?3)",
+        (
+            "0190a100-0000-7000-8000-000000000099",
+            RUN,
+            serde_json::to_string(&event(2)).unwrap(),
+        ),
+    )
+    .unwrap();
+    raw.pragma_update(None, "user_version", 1).unwrap();
+    drop(raw);
+
+    assert!(matches!(
+        RunJournal::open(db.as_ref()),
+        Err(JournalError::Corrupt(_))
+    ));
+    let raw = Connection::open(db.as_ref()).unwrap();
+    assert_eq!(
+        raw.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' \
+             AND name='thread_projection_versions'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn delete_run_returns_cas_hashes_and_preserves_shared_references_and_other_runs() {
     const OTHER_RUN: &str = "0190a100-0000-7000-8000-000000000002";
     const SHARED: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -791,6 +943,7 @@ fn receipt_backfill_fails_closed_and_stream_byte_limit_counts_projection() {
     connection
         .execute_batch("DROP TABLE receipt_projection")
         .unwrap();
+    connection.pragma_update(None, "user_version", 1).unwrap();
     drop(connection);
 
     let mut journal = RunJournal::open(&db).unwrap();

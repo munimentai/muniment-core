@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 use uuid::{Uuid, Version};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMIT_HINT_CAPACITY: usize = 64;
 
@@ -526,58 +526,31 @@ impl RunJournal {
             .as_ref()
             .map(|state| state.operation.lock().unwrap());
         let mut connection = Connection::open(path)?;
-        connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.pragma_update(None, "synchronous", "FULL")?;
-        connection.busy_timeout(BUSY_TIMEOUT)?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version == 0 {
-            connection.execute_batch(SCHEMA)?;
-            connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        } else if version != SCHEMA_VERSION {
+        if version > SCHEMA_VERSION {
             return Err(JournalError::Corrupt(format!(
                 "unsupported schema version {version}"
             )));
         }
-        connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS run_workspaces( \
-             run_id TEXT PRIMARY KEY NOT NULL, workspace TEXT NOT NULL); \
-             CREATE INDEX IF NOT EXISTS run_workspaces_workspace_run \
-             ON run_workspaces(workspace, run_id); \
-             CREATE TABLE IF NOT EXISTS thread_projection_entries( \
-             run_id TEXT NOT NULL, ordinal INTEGER NOT NULL, run_seq INTEGER NOT NULL, \
-             kind TEXT NOT NULL, text TEXT, PRIMARY KEY(run_id, ordinal)); \
-             CREATE INDEX IF NOT EXISTS thread_projection_run_order \
-             ON thread_projection_entries(run_id, ordinal); \
-             CREATE TABLE IF NOT EXISTS thread_projection_history( \
-             run_id TEXT NOT NULL, ordinal INTEGER NOT NULL, valid_until_seq INTEGER NOT NULL, \
-             run_seq INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT, \
-             PRIMARY KEY(run_id, ordinal, valid_until_seq)); \
-             CREATE TABLE IF NOT EXISTS thread_projection_versions( \
-             run_id TEXT NOT NULL, ordinal INTEGER NOT NULL, valid_from_seq INTEGER NOT NULL, \
-             valid_until_seq INTEGER, run_seq INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT, \
-             PRIMARY KEY(run_id, ordinal, valid_from_seq)); \
-             CREATE INDEX IF NOT EXISTS thread_projection_versions_page \
-             ON thread_projection_versions(run_id, ordinal, valid_from_seq, valid_until_seq); \
-             CREATE TABLE IF NOT EXISTS permission_pending_projection( \
-             run_id TEXT NOT NULL, run_seq INTEGER NOT NULL, gate_id TEXT, kind TEXT, \
-             title TEXT, message TEXT, valid INTEGER NOT NULL, PRIMARY KEY(run_id, run_seq)); \
-             CREATE TABLE IF NOT EXISTS receipt_projection( \
-             run_id TEXT NOT NULL, run_seq INTEGER NOT NULL, receipt_json TEXT, \
-             valid INTEGER NOT NULL, PRIMARY KEY(run_id, run_seq));",
-        )?;
-        backfill_permission_pending_projection(&connection)?;
-        backfill_receipt_projection(&mut connection)?;
-        // Journals created by the first projection implementation have only a
-        // current row. Treat that row as the initial version; new writes use
-        // interval versions from this point forward.
-        connection.execute(
-            "INSERT OR IGNORE INTO thread_projection_versions( \
-             run_id,ordinal,valid_from_seq,run_seq,kind,text) \
-             SELECT run_id,ordinal,run_seq,run_seq,kind,text \
-             FROM thread_projection_entries",
-            [],
-        )?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        connection.busy_timeout(BUSY_TIMEOUT)?;
+        let mut current_version = version;
+        while current_version < SCHEMA_VERSION {
+            let migration = MIGRATIONS
+                .iter()
+                .find(|migration| migration.version == current_version + 1)
+                .ok_or_else(|| {
+                    JournalError::Corrupt(format!("unsupported schema version {current_version}"))
+                })?;
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            (migration.apply)(&tx)?;
+            validate_database(&tx)?;
+            tx.pragma_update(None, "user_version", migration.version)?;
+            tx.commit()?;
+            current_version = migration.version;
+        }
         validate_database(&connection)?;
         let cursor_key = load_or_create_cursor_key(&connection)?;
         let generation = coordination.as_ref().map_or(0, |state| {
@@ -1142,9 +1115,6 @@ fn decode_run_event_cursor(
 }
 
 fn load_or_create_cursor_key(connection: &Connection) -> Result<[u8; 32], JournalError> {
-    connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS journal_metadata (key TEXT PRIMARY KEY NOT NULL, value BLOB NOT NULL) STRICT;",
-    )?;
     let existing = connection
         .query_row(
             "SELECT value FROM journal_metadata WHERE key='run_summary_cursor_key'",
@@ -1348,7 +1318,6 @@ fn validate_database(connection: &Connection) -> Result<(), JournalError> {
 }
 
 const SCHEMA: &str = r#"
-BEGIN;
 CREATE TABLE events (
  event_id TEXT PRIMARY KEY NOT NULL,
  run_id TEXT NOT NULL,
@@ -1414,8 +1383,71 @@ CREATE TABLE journal_metadata (
  key TEXT PRIMARY KEY NOT NULL,
  value BLOB NOT NULL
 ) STRICT;
-COMMIT;
 "#;
+
+struct Migration {
+    version: i64,
+    apply: fn(&rusqlite::Transaction<'_>) -> Result<(), JournalError>,
+}
+
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        apply: migrate_to_1,
+    },
+    Migration {
+        version: 2,
+        apply: migrate_to_2,
+    },
+];
+
+fn migrate_to_1(tx: &rusqlite::Transaction<'_>) -> Result<(), JournalError> {
+    tx.execute_batch(SCHEMA)?;
+    Ok(())
+}
+
+fn migrate_to_2(tx: &rusqlite::Transaction<'_>) -> Result<(), JournalError> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS run_workspaces( \
+         run_id TEXT PRIMARY KEY NOT NULL, workspace TEXT NOT NULL); \
+         CREATE INDEX IF NOT EXISTS run_workspaces_workspace_run \
+         ON run_workspaces(workspace, run_id); \
+         CREATE TABLE IF NOT EXISTS thread_projection_entries( \
+         run_id TEXT NOT NULL, ordinal INTEGER NOT NULL, run_seq INTEGER NOT NULL, \
+         kind TEXT NOT NULL, text TEXT, PRIMARY KEY(run_id, ordinal)); \
+         CREATE INDEX IF NOT EXISTS thread_projection_run_order \
+         ON thread_projection_entries(run_id, ordinal); \
+         CREATE TABLE IF NOT EXISTS thread_projection_history( \
+         run_id TEXT NOT NULL, ordinal INTEGER NOT NULL, valid_until_seq INTEGER NOT NULL, \
+         run_seq INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT, \
+         PRIMARY KEY(run_id, ordinal, valid_until_seq)); \
+         CREATE TABLE IF NOT EXISTS thread_projection_versions( \
+         run_id TEXT NOT NULL, ordinal INTEGER NOT NULL, valid_from_seq INTEGER NOT NULL, \
+         valid_until_seq INTEGER, run_seq INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT, \
+         PRIMARY KEY(run_id, ordinal, valid_from_seq)); \
+         CREATE INDEX IF NOT EXISTS thread_projection_versions_page \
+         ON thread_projection_versions(run_id, ordinal, valid_from_seq, valid_until_seq); \
+         CREATE TABLE IF NOT EXISTS permission_pending_projection( \
+         run_id TEXT NOT NULL, run_seq INTEGER NOT NULL, gate_id TEXT, kind TEXT, \
+         title TEXT, message TEXT, valid INTEGER NOT NULL, PRIMARY KEY(run_id, run_seq)); \
+         CREATE TABLE IF NOT EXISTS receipt_projection( \
+         run_id TEXT NOT NULL, run_seq INTEGER NOT NULL, receipt_json TEXT, \
+         valid INTEGER NOT NULL, PRIMARY KEY(run_id, run_seq));",
+    )?;
+    backfill_permission_pending_projection(tx)?;
+    backfill_receipt_projection(tx)?;
+    // Journals created by the first projection implementation have only a
+    // current row. Treat that row as the initial version; new writes use
+    // interval versions from this point forward.
+    tx.execute(
+        "INSERT OR IGNORE INTO thread_projection_versions( \
+         run_id,ordinal,valid_from_seq,run_seq,kind,text) \
+         SELECT run_id,ordinal,run_seq,run_seq,kind,text \
+         FROM thread_projection_entries",
+        [],
+    )?;
+    Ok(())
+}
 
 // Mutable chunks are deliberately small: snapshot versioning can copy at most
 // this many bytes per appended byte, so projection storage remains linearly
@@ -1519,9 +1551,9 @@ fn valid_receipt(receipt: &ReceiptProjection) -> bool {
         })
 }
 
-fn backfill_receipt_projection(connection: &mut Connection) -> Result<(), JournalError> {
+fn backfill_receipt_projection(tx: &rusqlite::Transaction<'_>) -> Result<(), JournalError> {
     let rows = {
-        let mut statement = connection.prepare(
+        let mut statement = tx.prepare(
             "SELECT run_id,run_seq,CASE WHEN length(CAST(envelope_json AS BLOB))<=?1 \
              THEN envelope_json END FROM events WHERE event_type='run.completed' \
              AND NOT EXISTS (SELECT 1 FROM receipt_projection r \
@@ -1538,12 +1570,11 @@ fn backfill_receipt_projection(connection: &mut Connection) -> Result<(), Journa
             .collect::<Result<Vec<_>, _>>()?;
         rows
     };
-    let tx = connection.transaction()?;
     for (run_id, run_seq, encoded) in rows {
         if let Some(encoded) = encoded {
             let event = serde_json::from_str::<EventEnvelope>(&encoded)
                 .map_err(|error| JournalError::Corrupt(error.to_string()))?;
-            update_receipt_projection(&tx, &event)?;
+            update_receipt_projection(tx, &event)?;
         } else {
             tx.execute(
                 "INSERT INTO receipt_projection(run_id,run_seq,valid) VALUES(?1,?2,0)",
@@ -1551,7 +1582,6 @@ fn backfill_receipt_projection(connection: &mut Connection) -> Result<(), Journa
             )?;
         }
     }
-    tx.commit()?;
     Ok(())
 }
 
