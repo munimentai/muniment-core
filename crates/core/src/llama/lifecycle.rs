@@ -1,4 +1,4 @@
-//! Filesystem publication and crash recovery for resident Gemma revisions.
+//! Filesystem publication and crash recovery for resident-model revisions.
 //!
 //! Locking and durable replacement are platform concerns, so callers inject
 //! those operations. Core owns the layout, verification, pointer format, and
@@ -13,18 +13,19 @@ use super::{
     RESIDENT_MODEL_REVISION,
 };
 
+// Keep this legacy header spelling to preserve the persisted pointer wire format.
 const POINTER_HEADER: &str = "muniment-gemma-pointer-v1";
 
 /// The only startup detail persisted by activation. These categories are
 /// deliberately incapable of carrying paths, process output, or HTTP bodies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GemmaActivationFailure {
+pub enum ResidentModelActivationFailure {
     Start,
     ExitedBeforeReady,
     Readiness,
 }
 
-impl GemmaActivationFailure {
+impl ResidentModelActivationFailure {
     fn persisted(self) -> &'static str {
         match self {
             Self::Start => "start\n",
@@ -35,62 +36,65 @@ impl GemmaActivationFailure {
 }
 
 /// Injectable process and bounded-health boundary used by pure core.
-pub trait GemmaActivationBoundary {
+pub trait ResidentModelActivationBoundary {
     type Server;
 
-    fn launch(&self, model: &Path) -> Result<Self::Server, GemmaActivationFailure>;
-    fn await_ready(&self, server: &mut Self::Server) -> Result<(), GemmaActivationFailure>;
+    fn launch(&self, model: &Path) -> Result<Self::Server, ResidentModelActivationFailure>;
+    fn await_ready(&self, server: &mut Self::Server) -> Result<(), ResidentModelActivationFailure>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GemmaUnavailable {
+pub enum ResidentModelUnavailable {
     CurrentInvalid,
     PreviousInvalid,
     RollbackActivationFailed,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum GemmaActivation<S> {
+pub enum ResidentModelActivation<S> {
     Active { revision: PathBuf, server: S },
     RolledBack { revision: PathBuf, server: S },
-    Unavailable(GemmaUnavailable),
+    Unavailable(ResidentModelUnavailable),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GemmaRevisionDescriptor {
+pub struct ResidentModelRevisionDescriptor {
     pub identity: &'static str,
     pub revision: &'static str,
     pub model: &'static ResidentModelDescriptor,
-    pub notice: GemmaNoticeDescriptor,
+    pub notice: ResidentModelNoticeDescriptor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GemmaNoticeDescriptor {
+pub struct ResidentModelNoticeDescriptor {
     pub filename: &'static str,
     pub contents: &'static [u8],
 }
 
-const GEMMA_NOTICE: GemmaNoticeDescriptor = GemmaNoticeDescriptor {
+const RESIDENT_MODEL_NOTICE: ResidentModelNoticeDescriptor = ResidentModelNoticeDescriptor {
     filename: "NOTICE.txt",
     contents: b"Qwen3.5 is provided by the Qwen team under the Apache License 2.0. Source: huggingface.co/unsloth/Qwen3.5-4B-GGUF\n",
 };
 
-pub const RESIDENT_GEMMA_REVISION: GemmaRevisionDescriptor = GemmaRevisionDescriptor {
-    identity: "qwen3.5-4b-instruct-q4_k_m-v1",
-    revision: RESIDENT_MODEL_REVISION,
-    model: &RESIDENT_MODEL,
-    notice: GEMMA_NOTICE,
-};
+pub const PINNED_RESIDENT_MODEL_REVISION: ResidentModelRevisionDescriptor =
+    ResidentModelRevisionDescriptor {
+        identity: "qwen3.5-4b-instruct-q4_k_m-v1",
+        revision: RESIDENT_MODEL_REVISION,
+        model: &RESIDENT_MODEL,
+        notice: RESIDENT_MODEL_NOTICE,
+    };
 
-pub const RESIDENT_GEMMA_REVISIONS: [&GemmaRevisionDescriptor; 1] = [&RESIDENT_GEMMA_REVISION];
+pub const RESIDENT_MODEL_REVISIONS: [&ResidentModelRevisionDescriptor; 1] =
+    [&PINNED_RESIDENT_MODEL_REVISION];
 
 /// Platform operations required to serialize and durably publish state.
-pub trait GemmaLifecycleBoundary {
+pub trait ResidentModelLifecycleBoundary {
     type LockGuard;
 
-    fn lock_exclusive(&self, path: &Path) -> Result<Self::LockGuard, GemmaPersistenceError>;
-    fn sync_file(&self, path: &Path) -> Result<(), GemmaPersistenceError>;
-    fn sync_directory(&self, path: &Path) -> Result<(), GemmaPersistenceError>;
+    fn lock_exclusive(&self, path: &Path)
+        -> Result<Self::LockGuard, ResidentModelPersistenceError>;
+    fn sync_file(&self, path: &Path) -> Result<(), ResidentModelPersistenceError>;
+    fn sync_directory(&self, path: &Path) -> Result<(), ResidentModelPersistenceError>;
     /// Publishes `staged` at `destination`, replacing an existing corrupt
     /// revision if necessary. The operation must be crash-safe: interruption
     /// may leave either directory unpublished, but must never expose a partial
@@ -99,39 +103,39 @@ pub trait GemmaLifecycleBoundary {
         &self,
         staged: &Path,
         destination: &Path,
-    ) -> Result<(), GemmaPersistenceError>;
+    ) -> Result<(), ResidentModelPersistenceError>;
     fn replace_pointer(
         &self,
         temporary: &Path,
         destination: &Path,
-    ) -> Result<(), GemmaPersistenceError>;
+    ) -> Result<(), ResidentModelPersistenceError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GemmaPersistenceError {
+pub enum ResidentModelPersistenceError {
     Failed,
 }
 
-impl std::fmt::Display for GemmaPersistenceError {
+impl std::fmt::Display for ResidentModelPersistenceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("resident model state could not be persisted")
     }
 }
 
-impl std::error::Error for GemmaPersistenceError {}
+impl std::error::Error for ResidentModelPersistenceError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GemmaLifecycleError {
+pub enum ResidentModelLifecycleError {
     InvalidDescriptor,
     InvalidStage,
     InvalidPointer,
     UnknownPointer,
     RevisionMissing,
     RevisionInvalid(ModelVerificationError),
-    Persistence(GemmaPersistenceError),
+    Persistence(ResidentModelPersistenceError),
 }
 
-impl std::fmt::Display for GemmaLifecycleError {
+impl std::fmt::Display for ResidentModelLifecycleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidDescriptor => f.write_str("resident model descriptor is invalid"),
@@ -145,34 +149,34 @@ impl std::fmt::Display for GemmaLifecycleError {
     }
 }
 
-impl std::error::Error for GemmaLifecycleError {}
+impl std::error::Error for ResidentModelLifecycleError {}
 
-impl From<GemmaPersistenceError> for GemmaLifecycleError {
-    fn from(error: GemmaPersistenceError) -> Self {
+impl From<ResidentModelPersistenceError> for ResidentModelLifecycleError {
+    fn from(error: ResidentModelPersistenceError) -> Self {
         Self::Persistence(error)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GemmaRecovery {
+pub enum ResidentModelRecovery {
     Current(PathBuf),
     RestoredPrevious(PathBuf),
     NotInstalled,
     RepairRequired,
 }
 
-pub struct GemmaRevisionLifecycle {
+pub struct ResidentModelRevisionLifecycle {
     root: PathBuf,
-    descriptors: &'static [&'static GemmaRevisionDescriptor],
-    target: &'static GemmaRevisionDescriptor,
+    descriptors: &'static [&'static ResidentModelRevisionDescriptor],
+    target: &'static ResidentModelRevisionDescriptor,
 }
 
-impl GemmaRevisionLifecycle {
+impl ResidentModelRevisionLifecycle {
     pub fn new(
         root: PathBuf,
-        descriptors: &'static [&'static GemmaRevisionDescriptor],
-        target: &'static GemmaRevisionDescriptor,
-    ) -> Result<Self, GemmaLifecycleError> {
+        descriptors: &'static [&'static ResidentModelRevisionDescriptor],
+        target: &'static ResidentModelRevisionDescriptor,
+    ) -> Result<Self, ResidentModelLifecycleError> {
         if descriptors.is_empty()
             || !descriptors.contains(&target)
             || descriptors
@@ -184,7 +188,7 @@ impl GemmaRevisionLifecycle {
                 })
             })
         {
-            return Err(GemmaLifecycleError::InvalidDescriptor);
+            return Err(ResidentModelLifecycleError::InvalidDescriptor);
         }
         Ok(Self {
             root,
@@ -193,42 +197,43 @@ impl GemmaRevisionLifecycle {
         })
     }
 
-    pub fn resolve_current(&self) -> Result<PathBuf, GemmaLifecycleError> {
+    pub fn resolve_current(&self) -> Result<PathBuf, ResidentModelLifecycleError> {
         self.resolve_pointer("current").map(|pointer| pointer.path)
     }
 
-    pub fn publish<B: GemmaLifecycleBoundary>(
+    pub fn publish<B: ResidentModelLifecycleBoundary>(
         &self,
         staged_directory: &Path,
         boundary: &B,
-    ) -> Result<PathBuf, GemmaLifecycleError> {
+    ) -> Result<PathBuf, ResidentModelLifecycleError> {
         let _lock = boundary.lock_exclusive(&self.root.join("install.lock"))?;
         self.publish_lock_held(staged_directory, boundary)
     }
 
     /// Publishes a verified stage while the caller retains `install.lock`.
     /// Coordinated installs use this entry point to avoid recursive locking.
-    pub fn publish_lock_held<B: GemmaLifecycleBoundary>(
+    pub fn publish_lock_held<B: ResidentModelLifecycleBoundary>(
         &self,
         staged_directory: &Path,
         boundary: &B,
-    ) -> Result<PathBuf, GemmaLifecycleError> {
+    ) -> Result<PathBuf, ResidentModelLifecycleError> {
         if staged_directory.parent() != Some(self.root.join("staging").as_path()) {
-            return Err(GemmaLifecycleError::InvalidStage);
+            return Err(ResidentModelLifecycleError::InvalidStage);
         }
-        require_directory(staged_directory).map_err(|_| GemmaLifecycleError::InvalidStage)?;
+        require_directory(staged_directory)
+            .map_err(|_| ResidentModelLifecycleError::InvalidStage)?;
         let staged_model = staged_directory.join(self.target.model.filename);
         let staged_notice = staged_directory.join(self.target.notice.filename);
         verify_model_artifact(&staged_model, self.target.model)
-            .map_err(GemmaLifecycleError::RevisionInvalid)?;
+            .map_err(ResidentModelLifecycleError::RevisionInvalid)?;
         verify_notice(&staged_notice, self.target.notice)
-            .map_err(GemmaLifecycleError::RevisionInvalid)?;
+            .map_err(ResidentModelLifecycleError::RevisionInvalid)?;
         boundary.sync_file(&staged_model)?;
         boundary.sync_file(&staged_notice)?;
         boundary.sync_directory(staged_directory)?;
 
         let revisions = self.root.join("revisions");
-        fs::create_dir_all(&revisions).map_err(|_| GemmaPersistenceError::Failed)?;
+        fs::create_dir_all(&revisions).map_err(|_| ResidentModelPersistenceError::Failed)?;
         let revision = revisions.join(self.target.revision);
         let installed_is_valid = require_directory(&revision).is_ok()
             && verify_model_artifact(revision.join(self.target.model.filename), self.target.model)
@@ -251,48 +256,48 @@ impl GemmaRevisionLifecycle {
         Ok(revision)
     }
 
-    pub fn recover<B: GemmaLifecycleBoundary>(
+    pub fn recover<B: ResidentModelLifecycleBoundary>(
         &self,
         boundary: &B,
-    ) -> Result<GemmaRecovery, GemmaLifecycleError> {
+    ) -> Result<ResidentModelRecovery, ResidentModelLifecycleError> {
         let _lock = boundary.lock_exclusive(&self.root.join("install.lock"))?;
         match self.resolve_pointer("current") {
-            Ok(pointer) => return Ok(GemmaRecovery::Current(pointer.path)),
-            Err(GemmaLifecycleError::Persistence(error)) => return Err(error.into()),
+            Ok(pointer) => return Ok(ResidentModelRecovery::Current(pointer.path)),
+            Err(ResidentModelLifecycleError::Persistence(error)) => return Err(error.into()),
             Err(_) => {}
         }
         match self.resolve_pointer("previous") {
             Ok(pointer) => {
                 self.write_pointer("current", &pointer.value, boundary)?;
                 boundary.sync_directory(&self.root)?;
-                Ok(GemmaRecovery::RestoredPrevious(pointer.path))
+                Ok(ResidentModelRecovery::RestoredPrevious(pointer.path))
             }
-            Err(GemmaLifecycleError::Persistence(error)) => Err(error.into()),
+            Err(ResidentModelLifecycleError::Persistence(error)) => Err(error.into()),
             Err(_)
                 if !path_entry_exists(&self.root.join("current"))
                     && !path_entry_exists(&self.root.join("previous")) =>
             {
-                Ok(GemmaRecovery::NotInstalled)
+                Ok(ResidentModelRecovery::NotInstalled)
             }
-            Err(_) => Ok(GemmaRecovery::RepairRequired),
+            Err(_) => Ok(ResidentModelRecovery::RepairRequired),
         }
     }
 
     /// Activates the verified current revision. A failed bounded startup marks
     /// that revision rejected, restores verified previous atomically, and
     /// makes exactly one rollback activation attempt.
-    pub fn activate<B: GemmaLifecycleBoundary, A: GemmaActivationBoundary>(
+    pub fn activate<B: ResidentModelLifecycleBoundary, A: ResidentModelActivationBoundary>(
         &self,
         persistence: &B,
         activation: &A,
-    ) -> Result<GemmaActivation<A::Server>, GemmaLifecycleError> {
+    ) -> Result<ResidentModelActivation<A::Server>, ResidentModelLifecycleError> {
         let _lock = persistence.lock_exclusive(&self.root.join("install.lock"))?;
         let current = match self.resolve_pointer("current") {
             Ok(pointer) => pointer,
-            Err(GemmaLifecycleError::Persistence(error)) => return Err(error.into()),
+            Err(ResidentModelLifecycleError::Persistence(error)) => return Err(error.into()),
             Err(_) => {
-                return Ok(GemmaActivation::Unavailable(
-                    GemmaUnavailable::CurrentInvalid,
+                return Ok(ResidentModelActivation::Unavailable(
+                    ResidentModelUnavailable::CurrentInvalid,
                 ))
             }
         };
@@ -303,7 +308,7 @@ impl GemmaRevisionLifecycle {
             return self.activate_previous(persistence, activation);
         }
         match activate_pointer(&current, activation) {
-            Ok(server) => Ok(GemmaActivation::Active {
+            Ok(server) => Ok(ResidentModelActivation::Active {
                 revision: current.path,
                 server,
             }),
@@ -316,54 +321,54 @@ impl GemmaRevisionLifecycle {
         }
     }
 
-    fn activate_previous<B: GemmaLifecycleBoundary, A: GemmaActivationBoundary>(
+    fn activate_previous<B: ResidentModelLifecycleBoundary, A: ResidentModelActivationBoundary>(
         &self,
         persistence: &B,
         activation: &A,
-    ) -> Result<GemmaActivation<A::Server>, GemmaLifecycleError> {
+    ) -> Result<ResidentModelActivation<A::Server>, ResidentModelLifecycleError> {
         let previous = match self.resolve_pointer("previous") {
             Ok(pointer) => pointer,
-            Err(GemmaLifecycleError::Persistence(error)) => return Err(error.into()),
+            Err(ResidentModelLifecycleError::Persistence(error)) => return Err(error.into()),
             Err(_) => {
-                return Ok(GemmaActivation::Unavailable(
-                    GemmaUnavailable::PreviousInvalid,
+                return Ok(ResidentModelActivation::Unavailable(
+                    ResidentModelUnavailable::PreviousInvalid,
                 ))
             }
         };
         self.write_pointer("current", &previous.value, persistence)?;
         persistence.sync_directory(&self.root)?;
         match activate_pointer(&previous, activation) {
-            Ok(server) => Ok(GemmaActivation::RolledBack {
+            Ok(server) => Ok(ResidentModelActivation::RolledBack {
                 revision: previous.path,
                 server,
             }),
-            Err(_) => Ok(GemmaActivation::Unavailable(
-                GemmaUnavailable::RollbackActivationFailed,
+            Err(_) => Ok(ResidentModelActivation::Unavailable(
+                ResidentModelUnavailable::RollbackActivationFailed,
             )),
         }
     }
 
-    fn write_redacted_failure<B: GemmaLifecycleBoundary>(
+    fn write_redacted_failure<B: ResidentModelLifecycleBoundary>(
         &self,
-        failure: GemmaActivationFailure,
+        failure: ResidentModelActivationFailure,
         boundary: &B,
-    ) -> Result<(), GemmaLifecycleError> {
+    ) -> Result<(), ResidentModelLifecycleError> {
         self.write_value("activation-failure", failure.persisted(), boundary)
     }
 
-    fn resolve_pointer(&self, name: &str) -> Result<ResolvedPointer, GemmaLifecycleError> {
+    fn resolve_pointer(&self, name: &str) -> Result<ResolvedPointer, ResidentModelLifecycleError> {
         let pointer_path = self.root.join(name);
         let metadata = fs::symlink_metadata(&pointer_path).map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => GemmaLifecycleError::RevisionMissing,
-            _ => GemmaLifecycleError::Persistence(GemmaPersistenceError::Failed),
+            std::io::ErrorKind::NotFound => ResidentModelLifecycleError::RevisionMissing,
+            _ => ResidentModelLifecycleError::Persistence(ResidentModelPersistenceError::Failed),
         })?;
         if !metadata.file_type().is_file() {
-            return Err(GemmaLifecycleError::InvalidPointer);
+            return Err(ResidentModelLifecycleError::InvalidPointer);
         }
         let value = fs::read_to_string(pointer_path).map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => GemmaLifecycleError::RevisionMissing,
-            std::io::ErrorKind::InvalidData => GemmaLifecycleError::InvalidPointer,
-            _ => GemmaLifecycleError::Persistence(GemmaPersistenceError::Failed),
+            std::io::ErrorKind::NotFound => ResidentModelLifecycleError::RevisionMissing,
+            std::io::ErrorKind::InvalidData => ResidentModelLifecycleError::InvalidPointer,
+            _ => ResidentModelLifecycleError::Persistence(ResidentModelPersistenceError::Failed),
         })?;
         let lines: Vec<_> = value.lines().collect();
         if lines.len() != 3
@@ -371,54 +376,54 @@ impl GemmaRevisionLifecycle {
             || !safe_component(lines[1])
             || !safe_component(lines[2])
         {
-            return Err(GemmaLifecycleError::InvalidPointer);
+            return Err(ResidentModelLifecycleError::InvalidPointer);
         }
         let descriptor = self
             .descriptors
             .iter()
             .copied()
             .find(|descriptor| descriptor.identity == lines[1] && descriptor.revision == lines[2])
-            .ok_or(GemmaLifecycleError::UnknownPointer)?;
+            .ok_or(ResidentModelLifecycleError::UnknownPointer)?;
         let path = self.root.join("revisions").join(descriptor.revision);
-        require_directory(&path).map_err(GemmaLifecycleError::RevisionInvalid)?;
+        require_directory(&path).map_err(ResidentModelLifecycleError::RevisionInvalid)?;
         verify_model_artifact(path.join(descriptor.model.filename), descriptor.model)
-            .map_err(GemmaLifecycleError::RevisionInvalid)?;
+            .map_err(ResidentModelLifecycleError::RevisionInvalid)?;
         verify_notice(path.join(descriptor.notice.filename), descriptor.notice)
-            .map_err(GemmaLifecycleError::RevisionInvalid)?;
+            .map_err(ResidentModelLifecycleError::RevisionInvalid)?;
         let model = path.join(descriptor.model.filename);
         Ok(ResolvedPointer { path, model, value })
     }
 
-    fn write_pointer<B: GemmaLifecycleBoundary>(
+    fn write_pointer<B: ResidentModelLifecycleBoundary>(
         &self,
         name: &str,
         value: &str,
         boundary: &B,
-    ) -> Result<(), GemmaLifecycleError> {
+    ) -> Result<(), ResidentModelLifecycleError> {
         self.write_value(name, value, boundary)
     }
 
-    fn write_value<B: GemmaLifecycleBoundary>(
+    fn write_value<B: ResidentModelLifecycleBoundary>(
         &self,
         name: &str,
         value: &str,
         boundary: &B,
-    ) -> Result<(), GemmaLifecycleError> {
-        fs::create_dir_all(&self.root).map_err(|_| GemmaPersistenceError::Failed)?;
+    ) -> Result<(), ResidentModelLifecycleError> {
+        fs::create_dir_all(&self.root).map_err(|_| ResidentModelPersistenceError::Failed)?;
         let temporary = self.root.join(format!(".{name}.tmp"));
         if let Err(error) = fs::remove_file(&temporary) {
             if error.kind() != std::io::ErrorKind::NotFound {
-                return Err(GemmaPersistenceError::Failed.into());
+                return Err(ResidentModelPersistenceError::Failed.into());
             }
         }
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temporary)
-            .map_err(|_| GemmaPersistenceError::Failed)?;
-        let result = (|| -> Result<(), GemmaPersistenceError> {
+            .map_err(|_| ResidentModelPersistenceError::Failed)?;
+        let result = (|| -> Result<(), ResidentModelPersistenceError> {
             file.write_all(value.as_bytes())
-                .map_err(|_| GemmaPersistenceError::Failed)?;
+                .map_err(|_| ResidentModelPersistenceError::Failed)?;
             drop(file);
             boundary.sync_file(&temporary)?;
             boundary.replace_pointer(&temporary, &self.root.join(name))
@@ -430,10 +435,10 @@ impl GemmaRevisionLifecycle {
     }
 }
 
-fn activate_pointer<A: GemmaActivationBoundary>(
+fn activate_pointer<A: ResidentModelActivationBoundary>(
     pointer: &ResolvedPointer,
     activation: &A,
-) -> Result<A::Server, GemmaActivationFailure> {
+) -> Result<A::Server, ResidentModelActivationFailure> {
     let mut server = activation.launch(&pointer.model)?;
     activation.await_ready(&mut server)?;
     Ok(server)
@@ -445,14 +450,14 @@ struct ResolvedPointer {
     value: String,
 }
 
-fn pointer_value(descriptor: &GemmaRevisionDescriptor) -> String {
+fn pointer_value(descriptor: &ResidentModelRevisionDescriptor) -> String {
     format!(
         "{POINTER_HEADER}\n{}\n{}\n",
         descriptor.identity, descriptor.revision
     )
 }
 
-fn valid_descriptor(descriptor: &GemmaRevisionDescriptor) -> bool {
+fn valid_descriptor(descriptor: &ResidentModelRevisionDescriptor) -> bool {
     safe_component(descriptor.identity)
         && safe_component(descriptor.revision)
         && safe_component(descriptor.model.filename)
@@ -475,7 +480,7 @@ fn valid_source_url(value: &str) -> bool {
 
 fn verify_notice(
     path: impl AsRef<Path>,
-    descriptor: GemmaNoticeDescriptor,
+    descriptor: ResidentModelNoticeDescriptor,
 ) -> Result<(), ModelVerificationError> {
     let path = path.as_ref();
     let metadata = fs::symlink_metadata(path).map_err(|error| {

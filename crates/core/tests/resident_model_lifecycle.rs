@@ -4,9 +4,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use muniment_core::llama::lifecycle::{
-    GemmaActivation, GemmaActivationBoundary, GemmaActivationFailure, GemmaLifecycleBoundary,
-    GemmaLifecycleError, GemmaNoticeDescriptor, GemmaPersistenceError, GemmaRecovery,
-    GemmaRevisionDescriptor, GemmaRevisionLifecycle, GemmaUnavailable,
+    ResidentModelActivation, ResidentModelActivationBoundary, ResidentModelActivationFailure,
+    ResidentModelLifecycleBoundary, ResidentModelLifecycleError, ResidentModelNoticeDescriptor,
+    ResidentModelPersistenceError, ResidentModelRecovery, ResidentModelRevisionDescriptor,
+    ResidentModelRevisionLifecycle, ResidentModelUnavailable,
 };
 use muniment_core::llama::ResidentModelDescriptor;
 
@@ -28,25 +29,25 @@ static NEW_MODEL: ResidentModelDescriptor = ResidentModelDescriptor {
     alias: "fixture",
     context_tokens: 1,
 };
-static OLD: GemmaRevisionDescriptor = GemmaRevisionDescriptor {
+static OLD: ResidentModelRevisionDescriptor = ResidentModelRevisionDescriptor {
     identity: "gemma-fixture-v1",
     revision: "old",
     model: &OLD_MODEL,
-    notice: GemmaNoticeDescriptor {
+    notice: ResidentModelNoticeDescriptor {
         filename: "NOTICE.txt",
         contents: b"notice-v1",
     },
 };
-static NEW: GemmaRevisionDescriptor = GemmaRevisionDescriptor {
+static NEW: ResidentModelRevisionDescriptor = ResidentModelRevisionDescriptor {
     identity: "gemma-fixture-v2",
     revision: "new",
     model: &NEW_MODEL,
-    notice: GemmaNoticeDescriptor {
+    notice: ResidentModelNoticeDescriptor {
         filename: "NOTICE.txt",
         contents: b"notice-v2",
     },
 };
-static KNOWN: [&GemmaRevisionDescriptor; 2] = [&OLD, &NEW];
+static KNOWN: [&ResidentModelRevisionDescriptor; 2] = [&OLD, &NEW];
 
 struct Boundary {
     locks: AtomicUsize,
@@ -90,58 +91,59 @@ impl Boundary {
     }
 }
 
-impl GemmaLifecycleBoundary for Boundary {
+impl ResidentModelLifecycleBoundary for Boundary {
     type LockGuard = ();
-    fn lock_exclusive(&self, path: &Path) -> Result<(), GemmaPersistenceError> {
+    fn lock_exclusive(&self, path: &Path) -> Result<(), ResidentModelPersistenceError> {
         assert_eq!(path.file_name().unwrap(), "install.lock");
         self.locks.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
-    fn sync_file(&self, _: &Path) -> Result<(), GemmaPersistenceError> {
+    fn sync_file(&self, _: &Path) -> Result<(), ResidentModelPersistenceError> {
         Ok(())
     }
-    fn sync_directory(&self, _: &Path) -> Result<(), GemmaPersistenceError> {
+    fn sync_directory(&self, _: &Path) -> Result<(), ResidentModelPersistenceError> {
         Ok(())
     }
     fn replace_revision(
         &self,
         staged: &Path,
         destination: &Path,
-    ) -> Result<(), GemmaPersistenceError> {
+    ) -> Result<(), ResidentModelPersistenceError> {
         if self.revision_failure.load(Ordering::Relaxed) == 1 {
-            return Err(GemmaPersistenceError::Failed);
+            return Err(ResidentModelPersistenceError::Failed);
         }
         let quarantine = destination.with_extension("replaced");
         if quarantine.exists() {
-            fs::remove_dir_all(&quarantine).map_err(|_| GemmaPersistenceError::Failed)?;
+            fs::remove_dir_all(&quarantine).map_err(|_| ResidentModelPersistenceError::Failed)?;
         }
         if destination.exists() || fs::symlink_metadata(destination).is_ok() {
-            fs::rename(destination, &quarantine).map_err(|_| GemmaPersistenceError::Failed)?;
+            fs::rename(destination, &quarantine)
+                .map_err(|_| ResidentModelPersistenceError::Failed)?;
         }
         if self.revision_failure.load(Ordering::Relaxed) == 2 {
-            return Err(GemmaPersistenceError::Failed);
+            return Err(ResidentModelPersistenceError::Failed);
         }
-        fs::rename(staged, destination).map_err(|_| GemmaPersistenceError::Failed)
+        fs::rename(staged, destination).map_err(|_| ResidentModelPersistenceError::Failed)
     }
     fn replace_pointer(
         &self,
         temporary: &Path,
         destination: &Path,
-    ) -> Result<(), GemmaPersistenceError> {
+    ) -> Result<(), ResidentModelPersistenceError> {
         if destination.file_name().and_then(|name| name.to_str()) == Some("current")
             && self.fail_current.swap(false, Ordering::Relaxed)
         {
-            return Err(GemmaPersistenceError::Failed);
+            return Err(ResidentModelPersistenceError::Failed);
         }
         if destination.exists() {
             fs::remove_file(destination).unwrap();
         }
-        fs::rename(temporary, destination).map_err(|_| GemmaPersistenceError::Failed)?;
+        fs::rename(temporary, destination).map_err(|_| ResidentModelPersistenceError::Failed)?;
         let name = destination.file_name().and_then(|name| name.to_str());
         let mut failure = self.fail_pointer_after_replace.lock().unwrap();
         if failure.as_deref() == name {
             failure.take();
-            return Err(GemmaPersistenceError::Failed);
+            return Err(ResidentModelPersistenceError::Failed);
         }
         Ok(())
     }
@@ -193,35 +195,35 @@ impl ActivationBoundary {
     }
 }
 
-impl GemmaActivationBoundary for ActivationBoundary {
+impl ResidentModelActivationBoundary for ActivationBoundary {
     type Server = (PathBuf, Attempt);
 
-    fn launch(&self, model: &Path) -> Result<Self::Server, GemmaActivationFailure> {
+    fn launch(&self, model: &Path) -> Result<Self::Server, ResidentModelActivationFailure> {
         self.launched.lock().unwrap().push(model.to_owned());
         let attempt = self.attempts.lock().unwrap().pop().unwrap();
         if matches!(attempt, Attempt::StartFails) {
-            Err(GemmaActivationFailure::Start)
+            Err(ResidentModelActivationFailure::Start)
         } else {
             Ok((model.to_owned(), attempt))
         }
     }
 
-    fn await_ready(&self, server: &mut Self::Server) -> Result<(), GemmaActivationFailure> {
+    fn await_ready(&self, server: &mut Self::Server) -> Result<(), ResidentModelActivationFailure> {
         match server.1 {
             Attempt::Ready => Ok(()),
-            Attempt::ExitsBeforeReady => Err(GemmaActivationFailure::ExitedBeforeReady),
-            Attempt::ReadinessFails => Err(GemmaActivationFailure::Readiness),
+            Attempt::ExitsBeforeReady => Err(ResidentModelActivationFailure::ExitedBeforeReady),
+            Attempt::ReadinessFails => Err(ResidentModelActivationFailure::Readiness),
             Attempt::StartFails => unreachable!(),
         }
     }
 }
 
-fn published_update(root: &Path) -> GemmaRevisionLifecycle {
-    GemmaRevisionLifecycle::new(root.to_owned(), &KNOWN, &OLD)
+fn published_update(root: &Path) -> ResidentModelRevisionLifecycle {
+    ResidentModelRevisionLifecycle::new(root.to_owned(), &KNOWN, &OLD)
         .unwrap()
         .publish(&stage(root, "old-activation", b"abc"), &Boundary::working())
         .unwrap();
-    let update = GemmaRevisionLifecycle::new(root.to_owned(), &KNOWN, &NEW).unwrap();
+    let update = ResidentModelRevisionLifecycle::new(root.to_owned(), &KNOWN, &NEW).unwrap();
     update
         .publish(&stage(root, "new-activation", b"def"), &Boundary::working())
         .unwrap();
@@ -238,7 +240,7 @@ fn activation_returns_current_only_after_readiness() {
         .unwrap();
     assert!(matches!(
         result,
-        GemmaActivation::Active { revision, .. } if revision == root.join("revisions/new")
+        ResidentModelActivation::Active { revision, .. } if revision == root.join("revisions/new")
     ));
     assert_eq!(activation.launched.lock().unwrap().len(), 1);
     assert!(!root.join("activation-failure").exists());
@@ -255,7 +257,7 @@ fn failed_current_is_rejected_and_verified_previous_activates_once() {
         .unwrap();
     assert!(matches!(
         result,
-        GemmaActivation::RolledBack { revision, .. } if revision == root.join("revisions/old")
+        ResidentModelActivation::RolledBack { revision, .. } if revision == root.join("revisions/old")
     ));
     assert_eq!(
         lifecycle.resolve_current().unwrap(),
@@ -275,7 +277,7 @@ fn failed_current_is_rejected_and_verified_previous_activates_once() {
 #[test]
 fn failed_current_without_valid_previous_is_typed_unavailable() {
     let root = root();
-    let lifecycle = GemmaRevisionLifecycle::new(root.clone(), &KNOWN, &NEW).unwrap();
+    let lifecycle = ResidentModelRevisionLifecycle::new(root.clone(), &KNOWN, &NEW).unwrap();
     lifecycle
         .publish(&stage(&root, "only-new", b"def"), &Boundary::working())
         .unwrap();
@@ -284,7 +286,7 @@ fn failed_current_without_valid_previous_is_typed_unavailable() {
         lifecycle
             .activate(&Boundary::working(), &activation)
             .unwrap(),
-        GemmaActivation::Unavailable(GemmaUnavailable::PreviousInvalid)
+        ResidentModelActivation::Unavailable(ResidentModelUnavailable::PreviousInvalid)
     ));
     assert_eq!(activation.launched.lock().unwrap().len(), 1);
     assert_eq!(
@@ -296,7 +298,7 @@ fn failed_current_without_valid_previous_is_typed_unavailable() {
         lifecycle
             .activate(&Boundary::working(), &automatic_retry)
             .unwrap(),
-        GemmaActivation::Unavailable(GemmaUnavailable::PreviousInvalid)
+        ResidentModelActivation::Unavailable(ResidentModelUnavailable::PreviousInvalid)
     ));
     assert!(automatic_retry.launched.lock().unwrap().is_empty());
     fs::remove_dir_all(root).unwrap();
@@ -311,7 +313,7 @@ fn failed_rollback_activation_stops_after_exactly_two_attempts() {
         lifecycle
             .activate(&Boundary::working(), &activation)
             .unwrap(),
-        GemmaActivation::Unavailable(GemmaUnavailable::RollbackActivationFailed)
+        ResidentModelActivation::Unavailable(ResidentModelUnavailable::RollbackActivationFailed)
     ));
     assert_eq!(activation.launched.lock().unwrap().len(), 2);
     assert_eq!(
@@ -333,8 +335,8 @@ fn interrupted_activation_state_replacement_never_relaunches_rejected_current() 
                 &Boundary::interrupt_after_pointer(interrupted_pointer),
                 &failed,
             ),
-            Err(GemmaLifecycleError::Persistence(
-                GemmaPersistenceError::Failed
+            Err(ResidentModelLifecycleError::Persistence(
+                ResidentModelPersistenceError::Failed
             ))
         );
 
@@ -342,8 +344,8 @@ fn interrupted_activation_state_replacement_never_relaunches_rejected_current() 
         let result = lifecycle.activate(&Boundary::working(), &retry).unwrap();
         assert!(matches!(
             result,
-            GemmaActivation::Active { revision, .. }
-                | GemmaActivation::RolledBack { revision, .. }
+            ResidentModelActivation::Active { revision, .. }
+                | ResidentModelActivation::RolledBack { revision, .. }
                 if revision == root.join("revisions/old")
         ));
         assert_eq!(
@@ -365,20 +367,20 @@ fn interrupted_activation_state_replacement_never_relaunches_rejected_current() 
 #[test]
 fn notice_must_match_the_revision_descriptor_for_publication_and_resolution() {
     let root = root();
-    let lifecycle = GemmaRevisionLifecycle::new(root.clone(), &KNOWN, &OLD).unwrap();
+    let lifecycle = ResidentModelRevisionLifecycle::new(root.clone(), &KNOWN, &OLD).unwrap();
 
     let missing = stage(&root, "missing-notice", b"abc");
     fs::remove_file(missing.join("NOTICE.txt")).unwrap();
     assert!(matches!(
         lifecycle.publish(&missing, &Boundary::working()),
-        Err(GemmaLifecycleError::RevisionInvalid(_))
+        Err(ResidentModelLifecycleError::RevisionInvalid(_))
     ));
 
     let wrong_association = stage(&root, "wrong-notice", b"abc");
     fs::write(wrong_association.join("NOTICE.txt"), NEW.notice.contents).unwrap();
     assert!(matches!(
         lifecycle.publish(&wrong_association, &Boundary::working()),
-        Err(GemmaLifecycleError::RevisionInvalid(_))
+        Err(ResidentModelLifecycleError::RevisionInvalid(_))
     ));
 
     lifecycle
@@ -387,11 +389,11 @@ fn notice_must_match_the_revision_descriptor_for_publication_and_resolution() {
     fs::write(root.join("revisions/old/NOTICE.txt"), b"tampered").unwrap();
     assert!(matches!(
         lifecycle.resolve_current(),
-        Err(GemmaLifecycleError::RevisionInvalid(_))
+        Err(ResidentModelLifecycleError::RevisionInvalid(_))
     ));
     assert_eq!(
         lifecycle.recover(&Boundary::working()).unwrap(),
-        GemmaRecovery::RepairRequired
+        ResidentModelRecovery::RepairRequired
     );
     fs::remove_dir_all(root).unwrap();
 }
@@ -399,12 +401,12 @@ fn notice_must_match_the_revision_descriptor_for_publication_and_resolution() {
 #[test]
 fn publishes_only_verified_stage_under_an_exclusive_lock() {
     let root = root();
-    let lifecycle = GemmaRevisionLifecycle::new(root.clone(), &KNOWN, &OLD).unwrap();
+    let lifecycle = ResidentModelRevisionLifecycle::new(root.clone(), &KNOWN, &OLD).unwrap();
     let bad = stage(&root, "bad", b"abd");
     let boundary = Boundary::working();
     assert!(matches!(
         lifecycle.publish(&bad, &boundary),
-        Err(GemmaLifecycleError::RevisionInvalid(_))
+        Err(ResidentModelLifecycleError::RevisionInvalid(_))
     ));
     assert!(!root.join("current").exists());
 
@@ -419,16 +421,16 @@ fn publishes_only_verified_stage_under_an_exclusive_lock() {
 #[test]
 fn interrupted_pointer_replace_keeps_verified_current_and_previous() {
     let root = root();
-    let old = GemmaRevisionLifecycle::new(root.clone(), &KNOWN, &OLD).unwrap();
+    let old = ResidentModelRevisionLifecycle::new(root.clone(), &KNOWN, &OLD).unwrap();
     old.publish(&stage(&root, "old", b"abc"), &Boundary::working())
         .unwrap();
     let old_pointer = fs::read(root.join("current")).unwrap();
 
-    let update = GemmaRevisionLifecycle::new(root.clone(), &KNOWN, &NEW).unwrap();
+    let update = ResidentModelRevisionLifecycle::new(root.clone(), &KNOWN, &NEW).unwrap();
     assert_eq!(
         update.publish(&stage(&root, "new", b"def"), &Boundary::failing_current()),
-        Err(GemmaLifecycleError::Persistence(
-            GemmaPersistenceError::Failed
+        Err(ResidentModelLifecycleError::Persistence(
+            ResidentModelPersistenceError::Failed
         ))
     );
     assert_eq!(fs::read(root.join("current")).unwrap(), old_pointer);
@@ -443,10 +445,10 @@ fn interrupted_pointer_replace_keeps_verified_current_and_previous() {
 #[test]
 fn corrupt_current_restores_verified_previous_and_never_promotes_staging() {
     let root = root();
-    let old = GemmaRevisionLifecycle::new(root.clone(), &KNOWN, &OLD).unwrap();
+    let old = ResidentModelRevisionLifecycle::new(root.clone(), &KNOWN, &OLD).unwrap();
     old.publish(&stage(&root, "old", b"abc"), &Boundary::working())
         .unwrap();
-    let update = GemmaRevisionLifecycle::new(root.clone(), &KNOWN, &NEW).unwrap();
+    let update = ResidentModelRevisionLifecycle::new(root.clone(), &KNOWN, &NEW).unwrap();
     update
         .publish(&stage(&root, "new", b"def"), &Boundary::working())
         .unwrap();
@@ -457,7 +459,7 @@ fn corrupt_current_restores_verified_previous_and_never_promotes_staging() {
     let boundary = Boundary::working();
     assert_eq!(
         update.recover(&boundary).unwrap(),
-        GemmaRecovery::RestoredPrevious(root.join("revisions/old"))
+        ResidentModelRecovery::RestoredPrevious(root.join("revisions/old"))
     );
     assert_eq!(
         update.resolve_current().unwrap(),
@@ -470,7 +472,7 @@ fn corrupt_current_restores_verified_previous_and_never_promotes_staging() {
 #[test]
 fn verified_stage_repairs_corrupt_existing_revision() {
     let root = root();
-    let lifecycle = GemmaRevisionLifecycle::new(root.clone(), &KNOWN, &OLD).unwrap();
+    let lifecycle = ResidentModelRevisionLifecycle::new(root.clone(), &KNOWN, &OLD).unwrap();
     lifecycle
         .publish(&stage(&root, "first", b"abc"), &Boundary::working())
         .unwrap();
@@ -489,7 +491,7 @@ fn verified_stage_repairs_corrupt_existing_revision() {
 fn interrupted_corrupt_revision_replacement_never_exposes_staged_bytes() {
     for failure_step in [1, 2] {
         let root = root();
-        let lifecycle = GemmaRevisionLifecycle::new(root.clone(), &KNOWN, &OLD).unwrap();
+        let lifecycle = ResidentModelRevisionLifecycle::new(root.clone(), &KNOWN, &OLD).unwrap();
         lifecycle
             .publish(&stage(&root, "first", b"abc"), &Boundary::working())
             .unwrap();
@@ -498,8 +500,8 @@ fn interrupted_corrupt_revision_replacement_never_exposes_staged_bytes() {
 
         assert_eq!(
             lifecycle.publish(&repair, &Boundary::failing_revision_at(failure_step)),
-            Err(GemmaLifecycleError::Persistence(
-                GemmaPersistenceError::Failed
+            Err(ResidentModelLifecycleError::Persistence(
+                ResidentModelPersistenceError::Failed
             ))
         );
         assert!(lifecycle.resolve_current().is_err());
@@ -520,7 +522,7 @@ fn rejects_linked_stage_directory_and_model() {
     use std::os::unix::fs::symlink;
 
     let root = root();
-    let lifecycle = GemmaRevisionLifecycle::new(root.clone(), &KNOWN, &OLD).unwrap();
+    let lifecycle = ResidentModelRevisionLifecycle::new(root.clone(), &KNOWN, &OLD).unwrap();
     let outside = root.with_extension("outside");
     fs::create_dir(&outside).unwrap();
     fs::write(outside.join("model.gguf"), b"abc").unwrap();
@@ -528,7 +530,7 @@ fn rejects_linked_stage_directory_and_model() {
     symlink(&outside, &linked_stage).unwrap();
     assert_eq!(
         lifecycle.publish(&linked_stage, &Boundary::working()),
-        Err(GemmaLifecycleError::InvalidStage)
+        Err(ResidentModelLifecycleError::InvalidStage)
     );
 
     let model_stage = root.join("staging/linked-model");
@@ -536,7 +538,7 @@ fn rejects_linked_stage_directory_and_model() {
     symlink(outside.join("model.gguf"), model_stage.join("model.gguf")).unwrap();
     assert!(matches!(
         lifecycle.publish(&model_stage, &Boundary::working()),
-        Err(GemmaLifecycleError::RevisionInvalid(_))
+        Err(ResidentModelLifecycleError::RevisionInvalid(_))
     ));
     assert!(!root.join("current").exists());
     fs::remove_dir_all(root).unwrap();
@@ -550,7 +552,7 @@ fn recovery_rejects_linked_revision_directory_and_model() {
 
     for link_directory in [true, false] {
         let root = root();
-        let lifecycle = GemmaRevisionLifecycle::new(root.clone(), &KNOWN, &OLD).unwrap();
+        let lifecycle = ResidentModelRevisionLifecycle::new(root.clone(), &KNOWN, &OLD).unwrap();
         lifecycle
             .publish(&stage(&root, "first", b"abc"), &Boundary::working())
             .unwrap();
@@ -568,11 +570,11 @@ fn recovery_rejects_linked_revision_directory_and_model() {
 
         assert!(matches!(
             lifecycle.resolve_current(),
-            Err(GemmaLifecycleError::RevisionInvalid(_))
+            Err(ResidentModelLifecycleError::RevisionInvalid(_))
         ));
         assert_eq!(
             lifecycle.recover(&Boundary::working()).unwrap(),
-            GemmaRecovery::RepairRequired
+            ResidentModelRecovery::RepairRequired
         );
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(outside).unwrap();
@@ -589,33 +591,33 @@ fn linked_pointer_files_require_repair_even_when_the_target_looks_valid() {
         "malformed",
     ] {
         let root = root();
-        let lifecycle = GemmaRevisionLifecycle::new(root.clone(), &KNOWN, &OLD).unwrap();
+        let lifecycle = ResidentModelRevisionLifecycle::new(root.clone(), &KNOWN, &OLD).unwrap();
         let external = root.with_extension("pointer");
         fs::write(&external, external_contents).unwrap();
         symlink(&external, root.join("current")).unwrap();
 
         assert_eq!(
             lifecycle.resolve_current(),
-            Err(GemmaLifecycleError::InvalidPointer)
+            Err(ResidentModelLifecycleError::InvalidPointer)
         );
         assert_eq!(
             lifecycle.recover(&Boundary::working()).unwrap(),
-            GemmaRecovery::RepairRequired
+            ResidentModelRecovery::RepairRequired
         );
         fs::remove_dir_all(root).unwrap();
         fs::remove_file(external).unwrap();
     }
 
     let root = root();
-    let lifecycle = GemmaRevisionLifecycle::new(root.clone(), &KNOWN, &OLD).unwrap();
+    let lifecycle = ResidentModelRevisionLifecycle::new(root.clone(), &KNOWN, &OLD).unwrap();
     symlink(root.join("does-not-exist"), root.join("current")).unwrap();
     assert_eq!(
         lifecycle.resolve_current(),
-        Err(GemmaLifecycleError::InvalidPointer)
+        Err(ResidentModelLifecycleError::InvalidPointer)
     );
     assert_eq!(
         lifecycle.recover(&Boundary::working()).unwrap(),
-        GemmaRecovery::RepairRequired
+        ResidentModelRecovery::RepairRequired
     );
     fs::remove_dir_all(root).unwrap();
 }
@@ -623,7 +625,7 @@ fn linked_pointer_files_require_repair_even_when_the_target_looks_valid() {
 #[test]
 fn unknown_or_unsafe_pointers_require_repair_without_leaking_paths() {
     let root = root();
-    let lifecycle = GemmaRevisionLifecycle::new(root.clone(), &KNOWN, &OLD).unwrap();
+    let lifecycle = ResidentModelRevisionLifecycle::new(root.clone(), &KNOWN, &OLD).unwrap();
     for pointer in [
         "muniment-gemma-pointer-v1\nunknown\nold\n",
         "muniment-gemma-pointer-v1\ngemma-fixture-v1\n../old\n",
@@ -634,13 +636,13 @@ fn unknown_or_unsafe_pointers_require_repair_without_leaking_paths() {
         assert!(!format!("{error:?} {error}").contains(root.to_str().unwrap()));
         assert_eq!(
             lifecycle.recover(&Boundary::working()).unwrap(),
-            GemmaRecovery::RepairRequired
+            ResidentModelRecovery::RepairRequired
         );
     }
     fs::remove_file(root.join("current")).unwrap();
     assert_eq!(
         lifecycle.recover(&Boundary::working()).unwrap(),
-        GemmaRecovery::NotInstalled
+        ResidentModelRecovery::NotInstalled
     );
     fs::remove_dir_all(root).unwrap();
 }

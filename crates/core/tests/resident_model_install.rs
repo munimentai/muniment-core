@@ -6,13 +6,14 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use muniment_core::llama::acquisition::{
-    GemmaAcquisitionLimits, GemmaAcquisitionRuntime, GemmaCancellation, GemmaDownloadRequest,
-    GemmaDownloadResponse, GemmaDownloadTransport, GemmaTransportError,
+    ResidentModelAcquisitionLimits, ResidentModelAcquisitionRuntime, ResidentModelCancellation,
+    ResidentModelDownloadRequest, ResidentModelDownloadResponse, ResidentModelDownloadTransport,
+    ResidentModelTransportError,
 };
-use muniment_core::llama::install::install_gemma_revision_with_progress;
+use muniment_core::llama::install::install_resident_model_revision_with_progress;
 use muniment_core::llama::lifecycle::{
-    GemmaLifecycleBoundary, GemmaNoticeDescriptor, GemmaPersistenceError, GemmaRevisionDescriptor,
-    GemmaRevisionLifecycle,
+    ResidentModelLifecycleBoundary, ResidentModelNoticeDescriptor, ResidentModelPersistenceError,
+    ResidentModelRevisionDescriptor, ResidentModelRevisionLifecycle,
 };
 use muniment_core::llama::ResidentModelDescriptor;
 use muniment_core::model_install::{
@@ -29,27 +30,27 @@ static MODEL: ResidentModelDescriptor = ResidentModelDescriptor {
     alias: "fixture",
     context_tokens: 1,
 };
-static REVISION: GemmaRevisionDescriptor = GemmaRevisionDescriptor {
+static REVISION: ResidentModelRevisionDescriptor = ResidentModelRevisionDescriptor {
     identity: "fixture-v1",
     revision: "revision",
     model: &MODEL,
-    notice: GemmaNoticeDescriptor {
+    notice: ResidentModelNoticeDescriptor {
         filename: "NOTICE.txt",
         contents: b"fixture notice",
     },
 };
-static REVISIONS: [&GemmaRevisionDescriptor; 1] = [&REVISION];
+static REVISIONS: [&ResidentModelRevisionDescriptor; 1] = [&REVISION];
 
 struct Transport;
-impl GemmaDownloadTransport for Transport {
+impl ResidentModelDownloadTransport for Transport {
     type Body = Cursor<Vec<u8>>;
 
     fn download(
         &mut self,
-        request: &GemmaDownloadRequest,
-    ) -> Result<GemmaDownloadResponse<Self::Body>, GemmaTransportError> {
+        request: &ResidentModelDownloadRequest,
+    ) -> Result<ResidentModelDownloadResponse<Self::Body>, ResidentModelTransportError> {
         assert_eq!(request.offset, 1);
-        Ok(GemmaDownloadResponse {
+        Ok(ResidentModelDownloadResponse {
             status: 206,
             content_range: Some((1, 2, 3)),
             body: Cursor::new(b"bc".to_vec()),
@@ -75,19 +76,19 @@ impl InstallLock for Lock {
 }
 
 struct Boundary(AtomicUsize);
-impl GemmaLifecycleBoundary for Boundary {
+impl ResidentModelLifecycleBoundary for Boundary {
     type LockGuard = ();
 
-    fn lock_exclusive(&self, _: &Path) -> Result<(), GemmaPersistenceError> {
+    fn lock_exclusive(&self, _: &Path) -> Result<(), ResidentModelPersistenceError> {
         self.0.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
-    fn sync_file(&self, _: &Path) -> Result<(), GemmaPersistenceError> {
+    fn sync_file(&self, _: &Path) -> Result<(), ResidentModelPersistenceError> {
         Ok(())
     }
 
-    fn sync_directory(&self, _: &Path) -> Result<(), GemmaPersistenceError> {
+    fn sync_directory(&self, _: &Path) -> Result<(), ResidentModelPersistenceError> {
         Ok(())
     }
 
@@ -95,16 +96,16 @@ impl GemmaLifecycleBoundary for Boundary {
         &self,
         staged: &Path,
         destination: &Path,
-    ) -> Result<(), GemmaPersistenceError> {
-        fs::rename(staged, destination).map_err(|_| GemmaPersistenceError::Failed)
+    ) -> Result<(), ResidentModelPersistenceError> {
+        fs::rename(staged, destination).map_err(|_| ResidentModelPersistenceError::Failed)
     }
 
     fn replace_pointer(
         &self,
         temporary: &Path,
         destination: &Path,
-    ) -> Result<(), GemmaPersistenceError> {
-        fs::rename(temporary, destination).map_err(|_| GemmaPersistenceError::Failed)
+    ) -> Result<(), ResidentModelPersistenceError> {
+        fs::rename(temporary, destination).map_err(|_| ResidentModelPersistenceError::Failed)
     }
 }
 
@@ -119,15 +120,16 @@ fn root() -> PathBuf {
     root
 }
 
-fn no_wait(_: Duration, _: &dyn GemmaCancellation) -> bool {
+fn no_wait(_: Duration, _: &dyn ResidentModelCancellation) -> bool {
     true
 }
 
 #[test]
-fn coordinator_owns_locking_and_uses_gemmas_exact_stage_accounting() {
+fn coordinator_owns_locking_and_uses_resident_models_exact_stage_accounting() {
     let root = root();
     fs::write(root.join("staging/install/model.gguf.part"), b"a").unwrap();
-    let lifecycle = GemmaRevisionLifecycle::new(root.clone(), &REVISIONS, &REVISION).unwrap();
+    let lifecycle =
+        ResidentModelRevisionLifecycle::new(root.clone(), &REVISIONS, &REVISION).unwrap();
     let boundary = Boundary(AtomicUsize::new(0));
     let mut lock = Lock(0);
     let mut available = VecDeque::from([MARGIN + 2, MARGIN]);
@@ -139,13 +141,13 @@ fn coordinator_owns_locking_and_uses_gemmas_exact_stage_accounting() {
     };
 
     let mut progress = Vec::new();
-    let installed = install_gemma_revision_with_progress(
+    let installed = install_resident_model_revision_with_progress(
         &root.join("staging"),
         "install",
         &REVISION,
-        GemmaAcquisitionLimits::default(),
+        ResidentModelAcquisitionLimits::default(),
         &mut Transport,
-        GemmaAcquisitionRuntime {
+        ResidentModelAcquisitionRuntime {
             clock: &|| Duration::ZERO,
             retry_wait: &mut no_wait,
         },

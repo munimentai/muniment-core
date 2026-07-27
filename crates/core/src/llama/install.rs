@@ -1,4 +1,4 @@
-//! Coordinated acquisition and publication of a resident Gemma revision.
+//! Coordinated acquisition and publication of a resident-model revision.
 
 use std::path::{Path, PathBuf};
 
@@ -7,42 +7,45 @@ use crate::model_install::{
 };
 
 use super::acquisition::{
-    acquire_gemma_stage_with_progress, remaining_stage_bytes, GemmaAcquisitionClock,
-    GemmaAcquisitionError, GemmaAcquisitionLimits, GemmaAcquisitionRuntime, GemmaCancellation,
-    GemmaDownloadTransport, GemmaRetryWait, ModelDownloadProgress,
+    acquire_resident_model_stage_with_progress, remaining_stage_bytes, ModelDownloadProgress,
+    ResidentModelAcquisitionClock, ResidentModelAcquisitionError, ResidentModelAcquisitionLimits,
+    ResidentModelAcquisitionRuntime, ResidentModelCancellation, ResidentModelDownloadTransport,
+    ResidentModelRetryWait,
 };
 use super::lifecycle::{
-    GemmaLifecycleBoundary, GemmaLifecycleError, GemmaRevisionDescriptor, GemmaRevisionLifecycle,
+    ResidentModelLifecycleBoundary, ResidentModelLifecycleError, ResidentModelRevisionDescriptor,
+    ResidentModelRevisionLifecycle,
 };
 
-pub type GemmaInstallError = ModelInstallError<GemmaAcquisitionError, GemmaLifecycleError>;
+pub type ResidentModelInstallError =
+    ModelInstallError<ResidentModelAcquisitionError, ResidentModelLifecycleError>;
 
-/// Acquires and publishes one pinned Gemma revision under the shared install
+/// Acquires and publishes one pinned resident-model revision under the shared install
 /// lock and exact resumable-stage storage checks.
 #[allow(clippy::too_many_arguments)]
-pub fn install_gemma_revision<T, C, K, W, L, S, B>(
+pub fn install_resident_model_revision<T, C, K, W, L, S, B>(
     staging_root: &Path,
     install_id: &str,
-    descriptor: &'static GemmaRevisionDescriptor,
-    limits: GemmaAcquisitionLimits,
+    descriptor: &'static ResidentModelRevisionDescriptor,
+    limits: ResidentModelAcquisitionLimits,
     transport: &mut T,
-    runtime: GemmaAcquisitionRuntime<'_, K, W>,
+    runtime: ResidentModelAcquisitionRuntime<'_, K, W>,
     cancellation: &C,
     lock: &mut L,
     space: &mut S,
-    lifecycle: &GemmaRevisionLifecycle,
+    lifecycle: &ResidentModelRevisionLifecycle,
     lifecycle_boundary: &B,
-) -> Result<PathBuf, GemmaInstallError>
+) -> Result<PathBuf, ResidentModelInstallError>
 where
-    T: GemmaDownloadTransport,
-    C: GemmaCancellation + InstallCancellation,
-    K: GemmaAcquisitionClock,
-    W: GemmaRetryWait,
+    T: ResidentModelDownloadTransport,
+    C: ResidentModelCancellation + InstallCancellation,
+    K: ResidentModelAcquisitionClock,
+    W: ResidentModelRetryWait,
     L: InstallLock,
     S: AvailableSpace,
-    B: GemmaLifecycleBoundary,
+    B: ResidentModelLifecycleBoundary,
 {
-    install_gemma_revision_with_progress(
+    install_resident_model_revision_with_progress(
         staging_root,
         install_id,
         descriptor,
@@ -60,28 +63,28 @@ where
 
 /// Installs a revision while reporting resumable, transport-independent byte progress.
 #[allow(clippy::too_many_arguments)]
-pub fn install_gemma_revision_with_progress<T, C, K, W, L, S, B>(
+pub fn install_resident_model_revision_with_progress<T, C, K, W, L, S, B>(
     staging_root: &Path,
     install_id: &str,
-    descriptor: &'static GemmaRevisionDescriptor,
-    limits: GemmaAcquisitionLimits,
+    descriptor: &'static ResidentModelRevisionDescriptor,
+    limits: ResidentModelAcquisitionLimits,
     transport: &mut T,
-    runtime: GemmaAcquisitionRuntime<'_, K, W>,
+    runtime: ResidentModelAcquisitionRuntime<'_, K, W>,
     cancellation: &C,
     lock: &mut L,
     space: &mut S,
-    lifecycle: &GemmaRevisionLifecycle,
+    lifecycle: &ResidentModelRevisionLifecycle,
     lifecycle_boundary: &B,
     progress: &mut dyn FnMut(ModelDownloadProgress),
-) -> Result<PathBuf, GemmaInstallError>
+) -> Result<PathBuf, ResidentModelInstallError>
 where
-    T: GemmaDownloadTransport,
-    C: GemmaCancellation + InstallCancellation,
-    K: GemmaAcquisitionClock,
-    W: GemmaRetryWait,
+    T: ResidentModelDownloadTransport,
+    C: ResidentModelCancellation + InstallCancellation,
+    K: ResidentModelAcquisitionClock,
+    W: ResidentModelRetryWait,
     L: InstallLock,
     S: AvailableSpace,
-    B: GemmaLifecycleBoundary,
+    B: ResidentModelLifecycleBoundary,
 {
     install_model(
         lock,
@@ -89,7 +92,7 @@ where
         cancellation,
         || remaining_stage_bytes(staging_root, install_id, descriptor),
         || {
-            acquire_gemma_stage_with_progress(
+            acquire_resident_model_stage_with_progress(
                 staging_root,
                 install_id,
                 descriptor,

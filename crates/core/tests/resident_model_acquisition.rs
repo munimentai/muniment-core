@@ -8,11 +8,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use muniment_core::llama::acquisition::{
-    acquire_gemma_stage, acquire_gemma_stage_with_progress, remaining_stage_bytes,
-    GemmaAcquisitionError, GemmaAcquisitionLimits, GemmaAcquisitionRuntime, GemmaCancellation,
-    GemmaDownloadRequest, GemmaDownloadResponse, GemmaDownloadTransport, GemmaTransportError,
+    acquire_resident_model_stage, acquire_resident_model_stage_with_progress,
+    remaining_stage_bytes, ResidentModelAcquisitionError, ResidentModelAcquisitionLimits,
+    ResidentModelAcquisitionRuntime, ResidentModelCancellation, ResidentModelDownloadRequest,
+    ResidentModelDownloadResponse, ResidentModelDownloadTransport, ResidentModelTransportError,
 };
-use muniment_core::llama::lifecycle::{GemmaNoticeDescriptor, GemmaRevisionDescriptor};
+use muniment_core::llama::lifecycle::{
+    ResidentModelNoticeDescriptor, ResidentModelRevisionDescriptor,
+};
 use muniment_core::llama::ResidentModelDescriptor;
 
 static MODEL: ResidentModelDescriptor = ResidentModelDescriptor {
@@ -24,11 +27,11 @@ static MODEL: ResidentModelDescriptor = ResidentModelDescriptor {
     alias: "fixture",
     context_tokens: 1,
 };
-static REVISION: GemmaRevisionDescriptor = GemmaRevisionDescriptor {
+static REVISION: ResidentModelRevisionDescriptor = ResidentModelRevisionDescriptor {
     identity: "fixture-v1",
     revision: "0123456789abcdef",
     model: &MODEL,
-    notice: GemmaNoticeDescriptor {
+    notice: ResidentModelNoticeDescriptor {
         filename: "NOTICE.txt",
         contents: b"fixture notice",
     },
@@ -36,7 +39,7 @@ static REVISION: GemmaRevisionDescriptor = GemmaRevisionDescriptor {
 
 enum Reply {
     Response(u16, Option<(u64, u64, u64)>, &'static [u8]),
-    Error(GemmaTransportError),
+    Error(ResidentModelTransportError),
 }
 
 struct Transport {
@@ -53,18 +56,18 @@ impl Transport {
     }
 }
 
-impl GemmaDownloadTransport for Transport {
+impl ResidentModelDownloadTransport for Transport {
     type Body = Cursor<Vec<u8>>;
 
     fn download(
         &mut self,
-        request: &GemmaDownloadRequest,
-    ) -> Result<GemmaDownloadResponse<Self::Body>, GemmaTransportError> {
+        request: &ResidentModelDownloadRequest,
+    ) -> Result<ResidentModelDownloadResponse<Self::Body>, ResidentModelTransportError> {
         assert_eq!(request.url(), "https://huggingface.co/google/gemma-3-4b-it-qat-q4_0-gguf/resolve/0123456789abcdef/model.gguf");
         assert!(!request.limits.deadline.is_zero());
         self.offsets.push(request.offset);
         match self.replies.pop_front().unwrap() {
-            Reply::Response(status, range, bytes) => Ok(GemmaDownloadResponse {
+            Reply::Response(status, range, bytes) => Ok(ResidentModelDownloadResponse {
                 status,
                 content_range: range,
                 body: Cursor::new(bytes.to_vec()),
@@ -85,7 +88,7 @@ fn root() -> PathBuf {
     root
 }
 
-fn no_wait(_: Duration, _: &dyn GemmaCancellation) -> bool {
+fn no_wait(_: Duration, _: &dyn ResidentModelCancellation) -> bool {
     true
 }
 
@@ -108,13 +111,13 @@ fn accounting_rejects_oversized_and_non_regular_parts() {
     fs::write(root.join("install/model.gguf.part"), b"abcd").unwrap();
     assert_eq!(
         remaining_stage_bytes(&root, "install", &REVISION),
-        Err(GemmaAcquisitionError::TooLarge)
+        Err(ResidentModelAcquisitionError::TooLarge)
     );
     fs::remove_file(root.join("install/model.gguf.part")).unwrap();
     fs::create_dir(root.join("install/model.gguf.part")).unwrap();
     assert_eq!(
         remaining_stage_bytes(&root, "install", &REVISION),
-        Err(GemmaAcquisitionError::InvalidStage)
+        Err(ResidentModelAcquisitionError::InvalidStage)
     );
     fs::remove_dir_all(root).unwrap();
 }
@@ -126,13 +129,13 @@ fn resumes_a_part_and_returns_only_a_verified_publication_stage() {
     fs::write(root.join("install/model.gguf.part"), b"a").unwrap();
     let mut transport = Transport::new([Reply::Response(206, Some((1, 2, 3)), b"bc")]);
 
-    let stage = acquire_gemma_stage(
+    let stage = acquire_resident_model_stage(
         &root,
         "install",
         &REVISION,
-        GemmaAcquisitionLimits::default(),
+        ResidentModelAcquisitionLimits::default(),
         &mut transport,
-        GemmaAcquisitionRuntime {
+        ResidentModelAcquisitionRuntime {
             clock: &|| Duration::ZERO,
             retry_wait: &mut no_wait,
         },
@@ -158,13 +161,13 @@ fn surfaces_resumed_download_progress_to_callers() {
     let mut transport = Transport::new([Reply::Response(206, Some((1, 2, 3)), b"bc")]);
     let mut progress = Vec::new();
 
-    acquire_gemma_stage_with_progress(
+    acquire_resident_model_stage_with_progress(
         &root,
         "install",
         &REVISION,
-        GemmaAcquisitionLimits::default(),
+        ResidentModelAcquisitionLimits::default(),
         &mut transport,
-        GemmaAcquisitionRuntime {
+        ResidentModelAcquisitionRuntime {
             clock: &|| Duration::ZERO,
             retry_wait: &mut no_wait,
         },
@@ -183,13 +186,13 @@ fn a_full_response_to_a_range_request_restarts_instead_of_appending() {
     fs::create_dir(root.join("install")).unwrap();
     fs::write(root.join("install/model.gguf.part"), b"a").unwrap();
     let mut transport = Transport::new([Reply::Response(200, None, b"abc")]);
-    acquire_gemma_stage(
+    acquire_resident_model_stage(
         &root,
         "install",
         &REVISION,
-        GemmaAcquisitionLimits::default(),
+        ResidentModelAcquisitionLimits::default(),
         &mut transport,
-        GemmaAcquisitionRuntime {
+        ResidentModelAcquisitionRuntime {
             clock: &|| Duration::ZERO,
             retry_wait: &mut no_wait,
         },
@@ -204,16 +207,16 @@ fn a_full_response_to_a_range_request_restarts_instead_of_appending() {
 fn transient_failure_retries_from_the_preserved_part() {
     let root = root();
     let mut transport = Transport::new([
-        Reply::Error(GemmaTransportError::Transient),
+        Reply::Error(ResidentModelTransportError::Transient),
         Reply::Response(200, None, b"abc"),
     ]);
-    acquire_gemma_stage(
+    acquire_resident_model_stage(
         &root,
         "install",
         &REVISION,
-        GemmaAcquisitionLimits::default(),
+        ResidentModelAcquisitionLimits::default(),
         &mut transport,
-        GemmaAcquisitionRuntime {
+        ResidentModelAcquisitionRuntime {
             clock: &|| Duration::ZERO,
             retry_wait: &mut no_wait,
         },
@@ -233,13 +236,13 @@ fn server_failure_retries_from_the_preserved_part() {
         Reply::Response(503, None, b""),
         Reply::Response(206, Some((1, 2, 3)), b"bc"),
     ]);
-    acquire_gemma_stage(
+    acquire_resident_model_stage(
         &root,
         "install",
         &REVISION,
-        GemmaAcquisitionLimits::default(),
+        ResidentModelAcquisitionLimits::default(),
         &mut transport,
-        GemmaAcquisitionRuntime {
+        ResidentModelAcquisitionRuntime {
             clock: &|| Duration::ZERO,
             retry_wait: &mut no_wait,
         },
@@ -260,13 +263,13 @@ fn an_inconsistent_range_discards_the_part_before_retrying() {
         Reply::Response(206, Some((0, 2, 3)), b"abc"),
         Reply::Response(200, None, b"abc"),
     ]);
-    acquire_gemma_stage(
+    acquire_resident_model_stage(
         &root,
         "install",
         &REVISION,
-        GemmaAcquisitionLimits::default(),
+        ResidentModelAcquisitionLimits::default(),
         &mut transport,
-        GemmaAcquisitionRuntime {
+        ResidentModelAcquisitionRuntime {
             clock: &|| Duration::ZERO,
             retry_wait: &mut no_wait,
         },
@@ -288,13 +291,13 @@ fn a_resumed_range_must_cover_the_complete_remaining_artifact() {
         Reply::Response(200, None, b"abc"),
     ]);
 
-    acquire_gemma_stage(
+    acquire_resident_model_stage(
         &root,
         "install",
         &REVISION,
-        GemmaAcquisitionLimits::default(),
+        ResidentModelAcquisitionLimits::default(),
         &mut transport,
-        GemmaAcquisitionRuntime {
+        ResidentModelAcquisitionRuntime {
             clock: &|| Duration::ZERO,
             retry_wait: &mut no_wait,
         },
@@ -314,13 +317,13 @@ fn an_invalid_completed_model_is_replaced_by_a_verified_download() {
     fs::write(root.join("install/model.gguf"), b"bad").unwrap();
     let mut transport = Transport::new([Reply::Response(200, None, b"abc")]);
 
-    let stage = acquire_gemma_stage(
+    let stage = acquire_resident_model_stage(
         &root,
         "install",
         &REVISION,
-        GemmaAcquisitionLimits::default(),
+        ResidentModelAcquisitionLimits::default(),
         &mut transport,
-        GemmaAcquisitionRuntime {
+        ResidentModelAcquisitionRuntime {
             clock: &|| Duration::ZERO,
             retry_wait: &mut no_wait,
         },
@@ -339,19 +342,20 @@ fn bad_or_oversized_bytes_are_never_exposed_as_a_complete_stage() {
         let root = root();
         let mut transport = Transport::new([Reply::Response(200, None, bytes)]);
         assert!(matches!(
-            acquire_gemma_stage(
+            acquire_resident_model_stage(
                 &root,
                 "install",
                 &REVISION,
-                GemmaAcquisitionLimits::default(),
+                ResidentModelAcquisitionLimits::default(),
                 &mut transport,
-                GemmaAcquisitionRuntime {
+                ResidentModelAcquisitionRuntime {
                     clock: &|| Duration::ZERO,
                     retry_wait: &mut no_wait,
                 },
                 &|| false
             ),
-            Err(GemmaAcquisitionError::Verification(_)) | Err(GemmaAcquisitionError::TooLarge)
+            Err(ResidentModelAcquisitionError::Verification(_))
+                | Err(ResidentModelAcquisitionError::TooLarge)
         ));
         assert!(!root.join("install/model.gguf").exists());
         assert!(!root.join("install/model.gguf.part").exists());
@@ -366,19 +370,19 @@ fn cancellation_is_retryable_without_destroying_resume_bytes() {
     fs::write(root.join("install/model.gguf.part"), b"a").unwrap();
     let mut transport = Transport::new([]);
     assert_eq!(
-        acquire_gemma_stage(
+        acquire_resident_model_stage(
             &root,
             "install",
             &REVISION,
-            GemmaAcquisitionLimits::default(),
+            ResidentModelAcquisitionLimits::default(),
             &mut transport,
-            GemmaAcquisitionRuntime {
+            ResidentModelAcquisitionRuntime {
                 clock: &|| Duration::ZERO,
                 retry_wait: &mut no_wait,
             },
             &|| true
         ),
-        Err(GemmaAcquisitionError::Cancelled)
+        Err(ResidentModelAcquisitionError::Cancelled)
     );
     assert_eq!(
         fs::read(root.join("install/model.gguf.part")).unwrap(),
@@ -394,16 +398,17 @@ fn retries_share_one_acquisition_deadline() {
         deadlines: Vec<Duration>,
     }
 
-    impl GemmaDownloadTransport for DeadlineTransport {
+    impl ResidentModelDownloadTransport for DeadlineTransport {
         type Body = Cursor<Vec<u8>>;
 
         fn download(
             &mut self,
-            request: &GemmaDownloadRequest,
-        ) -> Result<GemmaDownloadResponse<Self::Body>, GemmaTransportError> {
+            request: &ResidentModelDownloadRequest,
+        ) -> Result<ResidentModelDownloadResponse<Self::Body>, ResidentModelTransportError>
+        {
             self.deadlines.push(request.limits.deadline);
             self.now.set(self.now.get() + Duration::from_secs(6));
-            Err(GemmaTransportError::Transient)
+            Err(ResidentModelTransportError::Transient)
         }
     }
 
@@ -415,26 +420,26 @@ fn retries_share_one_acquisition_deadline() {
         now,
         deadlines: Vec::new(),
     };
-    let limits = GemmaAcquisitionLimits {
+    let limits = ResidentModelAcquisitionLimits {
         deadline: Duration::from_secs(10),
         max_attempts: 3,
-        ..GemmaAcquisitionLimits::default()
+        ..ResidentModelAcquisitionLimits::default()
     };
 
     assert_eq!(
-        acquire_gemma_stage(
+        acquire_resident_model_stage(
             &root,
             "install",
             &REVISION,
             limits,
             &mut transport,
-            GemmaAcquisitionRuntime {
+            ResidentModelAcquisitionRuntime {
                 clock: &clock,
                 retry_wait: &mut no_wait,
             },
             &|| false,
         ),
-        Err(GemmaAcquisitionError::Retryable)
+        Err(ResidentModelAcquisitionError::Retryable)
     );
     assert_eq!(
         transport.deadlines,
@@ -452,29 +457,29 @@ fn retries_use_capped_backoff_within_the_shared_deadline() {
     let wait_now = Rc::clone(&now);
     let delays = Rc::new(std::cell::RefCell::new(Vec::new()));
     let recorded_delays = Rc::clone(&delays);
-    let mut wait = move |delay: Duration, cancellation: &dyn GemmaCancellation| {
+    let mut wait = move |delay: Duration, cancellation: &dyn ResidentModelCancellation| {
         assert!(!cancellation.is_cancelled());
         recorded_delays.borrow_mut().push(delay);
         wait_now.set(wait_now.get() + delay);
         true
     };
     let mut transport = Transport::new([
-        Reply::Error(GemmaTransportError::Transient),
+        Reply::Error(ResidentModelTransportError::Transient),
         Reply::Response(503, None, b""),
         Reply::Response(200, None, b"abc"),
     ]);
-    let limits = GemmaAcquisitionLimits {
+    let limits = ResidentModelAcquisitionLimits {
         deadline: Duration::from_secs(4),
-        ..GemmaAcquisitionLimits::default()
+        ..ResidentModelAcquisitionLimits::default()
     };
 
-    acquire_gemma_stage(
+    acquire_resident_model_stage(
         &root,
         "install",
         &REVISION,
         limits,
         &mut transport,
-        GemmaAcquisitionRuntime {
+        ResidentModelAcquisitionRuntime {
             clock: &clock,
             retry_wait: &mut wait,
         },
@@ -492,23 +497,23 @@ fn retries_use_capped_backoff_within_the_shared_deadline() {
 #[test]
 fn cancellation_can_interrupt_retry_backoff() {
     let root = root();
-    let mut transport = Transport::new([Reply::Error(GemmaTransportError::Transient)]);
-    let mut wait = |_: Duration, _: &dyn GemmaCancellation| false;
+    let mut transport = Transport::new([Reply::Error(ResidentModelTransportError::Transient)]);
+    let mut wait = |_: Duration, _: &dyn ResidentModelCancellation| false;
 
     assert_eq!(
-        acquire_gemma_stage(
+        acquire_resident_model_stage(
             &root,
             "install",
             &REVISION,
-            GemmaAcquisitionLimits::default(),
+            ResidentModelAcquisitionLimits::default(),
             &mut transport,
-            GemmaAcquisitionRuntime {
+            ResidentModelAcquisitionRuntime {
                 clock: &|| Duration::ZERO,
                 retry_wait: &mut wait,
             },
             &|| false,
         ),
-        Err(GemmaAcquisitionError::Cancelled)
+        Err(ResidentModelAcquisitionError::Cancelled)
     );
     assert_eq!(transport.offsets, [0]);
     fs::remove_dir_all(root).unwrap();

@@ -10,7 +10,8 @@ use crate::kokoro::acquisition::{
     KokoroDownloadRequest, KokoroDownloadResponse, KokoroDownloadTransport, KokoroTransportError,
 };
 use crate::llama::acquisition::{
-    GemmaDownloadRequest, GemmaDownloadResponse, GemmaDownloadTransport, GemmaTransportError,
+    ResidentModelDownloadRequest, ResidentModelDownloadResponse, ResidentModelDownloadTransport,
+    ResidentModelTransportError,
 };
 use crate::llama::runtime::{
     RuntimeArchiveError, RuntimeDownloadRequest, RuntimeDownloadResponse, RuntimeDownloadTransport,
@@ -33,7 +34,7 @@ const ALLOWED_HOSTS: &[&str] = &[
 
 pub type ModelResponseBody = Box<dyn Read + Send + Sync + 'static>;
 
-/// Production transport shared by the Gemma and Parakeet state machines.
+/// Production transport shared by the resident model and Parakeet state machines.
 pub struct NativeModelAcquisitionTransport {
     backend: Box<dyn HttpBackend>,
 }
@@ -98,13 +99,13 @@ impl NativeModelAcquisitionTransport {
     }
 }
 
-impl GemmaDownloadTransport for NativeModelAcquisitionTransport {
+impl ResidentModelDownloadTransport for NativeModelAcquisitionTransport {
     type Body = ModelResponseBody;
 
     fn download(
         &mut self,
-        request: &GemmaDownloadRequest,
-    ) -> Result<GemmaDownloadResponse<Self::Body>, GemmaTransportError> {
+        request: &ResidentModelDownloadRequest,
+    ) -> Result<ResidentModelDownloadResponse<Self::Body>, ResidentModelTransportError> {
         self.request(
             request.url(),
             request.offset,
@@ -112,15 +113,15 @@ impl GemmaDownloadTransport for NativeModelAcquisitionTransport {
             request.limits.read_timeout,
             request.limits.deadline,
         )
-        .map(|response| GemmaDownloadResponse {
+        .map(|response| ResidentModelDownloadResponse {
             status: response.status,
             content_range: response.content_range,
             body: response.body,
         })
         .map_err(|error| match error {
-            TransportFailure::Transient => GemmaTransportError::Transient,
-            TransportFailure::Unavailable => GemmaTransportError::Unavailable,
-            TransportFailure::Rejected => GemmaTransportError::Rejected,
+            TransportFailure::Transient => ResidentModelTransportError::Transient,
+            TransportFailure::Unavailable => ResidentModelTransportError::Unavailable,
+            TransportFailure::Rejected => ResidentModelTransportError::Rejected,
         })
     }
 }
@@ -379,7 +380,7 @@ fn parse_content_range(value: &str) -> Result<Option<(u64, u64, u64)>, Transport
 mod tests {
     use super::*;
     use crate::asr::acquisition::AsrAcquisitionLimits;
-    use crate::llama::acquisition::GemmaAcquisitionLimits;
+    use crate::llama::acquisition::ResidentModelAcquisitionLimits;
     use std::collections::VecDeque;
     use std::io::Cursor;
 
@@ -422,11 +423,11 @@ mod tests {
         })
     }
 
-    fn gemma_request() -> GemmaDownloadRequest {
-        GemmaDownloadRequest::for_transport_test(
+    fn resident_model_request() -> ResidentModelDownloadRequest {
+        ResidentModelDownloadRequest::for_transport_test(
             "https://huggingface.co/repo/resolve/revision/model?secret=value".into(),
             7,
-            GemmaAcquisitionLimits {
+            ResidentModelAcquisitionLimits {
                 connect_timeout: Duration::from_secs(10),
                 read_timeout: Duration::from_secs(30),
                 deadline: Duration::from_secs(5),
@@ -463,10 +464,11 @@ mod tests {
     }
 
     #[test]
-    fn gemma_adapter_streams_200() {
+    fn resident_model_adapter_streams_200() {
         let mut transport = transport(vec![Ok(reply(200, None, None, b"streamed"))]);
         let mut response =
-            GemmaDownloadTransport::download(&mut transport, &gemma_request()).unwrap();
+            ResidentModelDownloadTransport::download(&mut transport, &resident_model_request())
+                .unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.content_range, None);
         let mut bytes = Vec::new();
@@ -553,10 +555,13 @@ mod tests {
 
     #[test]
     fn both_adapters_map_status_and_transport_failures() {
-        let mut gemma = transport(vec![Ok(reply(503, None, None, b"private body"))]);
+        let mut resident_model = transport(vec![Ok(reply(503, None, None, b"private body"))]);
         assert!(matches!(
-            GemmaDownloadTransport::download(&mut gemma, &gemma_request()),
-            Err(GemmaTransportError::Transient)
+            ResidentModelDownloadTransport::download(
+                &mut resident_model,
+                &resident_model_request()
+            ),
+            Err(ResidentModelTransportError::Transient)
         ));
         let mut asr = transport(vec![Err(TransportFailure::Transient)]);
         assert!(matches!(
@@ -564,10 +569,13 @@ mod tests {
             Err(AsrTransportError::Transient)
         ));
         for status in [404, 410] {
-            let mut gemma = transport(vec![Ok(reply(status, None, None, b"secret body"))]);
+            let mut resident_model = transport(vec![Ok(reply(status, None, None, b"secret body"))]);
             assert!(matches!(
-                GemmaDownloadTransport::download(&mut gemma, &gemma_request()),
-                Err(GemmaTransportError::Unavailable)
+                ResidentModelDownloadTransport::download(
+                    &mut resident_model,
+                    &resident_model_request()
+                ),
+                Err(ResidentModelTransportError::Unavailable)
             ));
             let mut asr = transport(vec![Ok(reply(status, None, None, b"secret body"))]);
             assert!(matches!(
@@ -579,15 +587,18 @@ mod tests {
 
     #[test]
     fn rejects_downgrade_and_unrelated_redirects() {
-        let mut gemma = transport(vec![Ok(reply(
+        let mut resident_model = transport(vec![Ok(reply(
             302,
             Some("http://huggingface.co/file"),
             None,
             b"",
         ))]);
         assert!(matches!(
-            GemmaDownloadTransport::download(&mut gemma, &gemma_request()),
-            Err(GemmaTransportError::Rejected)
+            ResidentModelDownloadTransport::download(
+                &mut resident_model,
+                &resident_model_request()
+            ),
+            Err(ResidentModelTransportError::Rejected)
         ));
         let mut asr = transport(vec![Ok(reply(
             302,
@@ -612,7 +623,10 @@ mod tests {
             )),
             Ok(reply(200, None, None, b"streamed")),
         ]);
-        let result = GemmaDownloadTransport::download(&mut allowed_transport, &gemma_request());
+        let result = ResidentModelDownloadTransport::download(
+            &mut allowed_transport,
+            &resident_model_request(),
+        );
         assert!(result.is_ok());
         let mut transport = transport(vec![Ok(reply(
             302,

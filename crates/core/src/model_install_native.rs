@@ -11,8 +11,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::asr::acquisition::{AsrAcquisitionClock, AsrCancellation, AsrRetryWait};
 use crate::asr::{AsrLifecycleBoundary, AsrPersistenceError};
-use crate::llama::acquisition::{GemmaAcquisitionClock, GemmaCancellation, GemmaRetryWait};
-use crate::llama::lifecycle::{GemmaLifecycleBoundary, GemmaPersistenceError};
+use crate::llama::acquisition::{
+    ResidentModelAcquisitionClock, ResidentModelCancellation, ResidentModelRetryWait,
+};
+use crate::llama::lifecycle::{ResidentModelLifecycleBoundary, ResidentModelPersistenceError};
 use crate::model_install::{
     AvailableSpace, AvailableSpaceError, InstallCancellation, InstallLock, InstallLockError,
     InstallLockState,
@@ -41,7 +43,7 @@ impl InstallCancellation for NativeInstallCancellation {
         self.is_cancelled()
     }
 }
-impl GemmaCancellation for NativeInstallCancellation {
+impl ResidentModelCancellation for NativeInstallCancellation {
     fn is_cancelled(&self) -> bool {
         self.is_cancelled()
     }
@@ -126,7 +128,7 @@ impl Default for NativeAcquisitionClock {
         Self::new()
     }
 }
-impl GemmaAcquisitionClock for NativeAcquisitionClock {
+impl ResidentModelAcquisitionClock for NativeAcquisitionClock {
     fn now(&self) -> Duration {
         self.0.elapsed()
     }
@@ -140,8 +142,12 @@ impl AsrAcquisitionClock for NativeAcquisitionClock {
 /// Bounded jittered retry sleep which polls cancellation every 10ms.
 #[derive(Debug, Default)]
 pub struct NativeRetryWait;
-impl GemmaRetryWait for NativeRetryWait {
-    fn wait(&mut self, maximum_delay: Duration, cancellation: &dyn GemmaCancellation) -> bool {
+impl ResidentModelRetryWait for NativeRetryWait {
+    fn wait(
+        &mut self,
+        maximum_delay: Duration,
+        cancellation: &dyn ResidentModelCancellation,
+    ) -> bool {
         cancellable_sleep(jittered_delay(maximum_delay), || {
             cancellation.is_cancelled()
         })
@@ -181,33 +187,36 @@ fn cancellable_sleep(duration: Duration, cancelled: impl Fn() -> bool) -> bool {
     }
 }
 
-/// Native durable filesystem operations for Gemma publication.
+/// Native durable filesystem operations for ResidentModel publication.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct NativeGemmaLifecycleBoundary;
-impl GemmaLifecycleBoundary for NativeGemmaLifecycleBoundary {
+pub struct NativeResidentModelLifecycleBoundary;
+impl ResidentModelLifecycleBoundary for NativeResidentModelLifecycleBoundary {
     type LockGuard = File;
-    fn lock_exclusive(&self, path: &Path) -> Result<Self::LockGuard, GemmaPersistenceError> {
+    fn lock_exclusive(
+        &self,
+        path: &Path,
+    ) -> Result<Self::LockGuard, ResidentModelPersistenceError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(path)
-            .map_err(|_| GemmaPersistenceError::Failed)?;
+            .map_err(|_| ResidentModelPersistenceError::Failed)?;
         file.lock_exclusive()
-            .map_err(|_| GemmaPersistenceError::Failed)?;
+            .map_err(|_| ResidentModelPersistenceError::Failed)?;
         Ok(file)
     }
-    fn sync_file(&self, path: &Path) -> Result<(), GemmaPersistenceError> {
+    fn sync_file(&self, path: &Path) -> Result<(), ResidentModelPersistenceError> {
         File::open(path)
             .and_then(|file| file.sync_all())
-            .map_err(|_| GemmaPersistenceError::Failed)
+            .map_err(|_| ResidentModelPersistenceError::Failed)
     }
-    fn sync_directory(&self, path: &Path) -> Result<(), GemmaPersistenceError> {
+    fn sync_directory(&self, path: &Path) -> Result<(), ResidentModelPersistenceError> {
         #[cfg(unix)]
         File::open(path)
             .and_then(|file| file.sync_all())
-            .map_err(|_| GemmaPersistenceError::Failed)?;
+            .map_err(|_| ResidentModelPersistenceError::Failed)?;
         let _ = path;
         Ok(())
     }
@@ -215,15 +224,15 @@ impl GemmaLifecycleBoundary for NativeGemmaLifecycleBoundary {
         &self,
         staged: &Path,
         destination: &Path,
-    ) -> Result<(), GemmaPersistenceError> {
+    ) -> Result<(), ResidentModelPersistenceError> {
         atomic_replace_directory(staged, destination)
     }
     fn replace_pointer(
         &self,
         temporary: &Path,
         destination: &Path,
-    ) -> Result<(), GemmaPersistenceError> {
-        fs::rename(temporary, destination).map_err(|_| GemmaPersistenceError::Failed)
+    ) -> Result<(), ResidentModelPersistenceError> {
+        fs::rename(temporary, destination).map_err(|_| ResidentModelPersistenceError::Failed)
     }
 }
 
@@ -258,9 +267,9 @@ impl AsrLifecycleBoundary for NativeAsrLifecycleBoundary {
 fn atomic_replace_directory(
     staged: &Path,
     destination: &Path,
-) -> Result<(), GemmaPersistenceError> {
+) -> Result<(), ResidentModelPersistenceError> {
     if !destination.exists() {
-        return fs::rename(staged, destination).map_err(|_| GemmaPersistenceError::Failed);
+        return fs::rename(staged, destination).map_err(|_| ResidentModelPersistenceError::Failed);
     }
     #[cfg(target_os = "linux")]
     {
@@ -278,9 +287,9 @@ fn atomic_replace_directory(
             ) -> i32;
         }
         let old = CString::new(staged.as_os_str().as_bytes())
-            .map_err(|_| GemmaPersistenceError::Failed)?;
+            .map_err(|_| ResidentModelPersistenceError::Failed)?;
         let new = CString::new(destination.as_os_str().as_bytes())
-            .map_err(|_| GemmaPersistenceError::Failed)?;
+            .map_err(|_| ResidentModelPersistenceError::Failed)?;
         if unsafe {
             renameat2(
                 AT_FDCWD,
@@ -291,9 +300,9 @@ fn atomic_replace_directory(
             )
         } != 0
         {
-            return Err(GemmaPersistenceError::Failed);
+            return Err(ResidentModelPersistenceError::Failed);
         }
-        fs::remove_dir_all(staged).map_err(|_| GemmaPersistenceError::Failed)
+        fs::remove_dir_all(staged).map_err(|_| ResidentModelPersistenceError::Failed)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -303,10 +312,10 @@ fn atomic_replace_directory(
         // permits, but never exposes a partially staged revision.
         let quarantine = destination.with_extension("replaced");
         if quarantine.exists() {
-            fs::remove_dir_all(&quarantine).map_err(|_| GemmaPersistenceError::Failed)?;
+            fs::remove_dir_all(&quarantine).map_err(|_| ResidentModelPersistenceError::Failed)?;
         }
-        fs::rename(destination, &quarantine).map_err(|_| GemmaPersistenceError::Failed)?;
-        fs::rename(staged, destination).map_err(|_| GemmaPersistenceError::Failed)
+        fs::rename(destination, &quarantine).map_err(|_| ResidentModelPersistenceError::Failed)?;
+        fs::rename(staged, destination).map_err(|_| ResidentModelPersistenceError::Failed)
     }
 }
 
@@ -365,7 +374,7 @@ mod tests {
         fs::write(staged.join("value"), b"new").unwrap();
         fs::create_dir(&destination).unwrap();
         fs::write(destination.join("value"), b"old").unwrap();
-        NativeGemmaLifecycleBoundary
+        NativeResidentModelLifecycleBoundary
             .replace_revision(&staged, &destination)
             .unwrap();
         assert_eq!(fs::read(destination.join("value")).unwrap(), b"new");
@@ -377,27 +386,33 @@ mod tests {
         let cancellation = NativeInstallCancellation::new();
         cancellation.cancel();
         let started = Instant::now();
-        let result =
-            GemmaRetryWait::wait(&mut NativeRetryWait, Duration::from_secs(1), &cancellation);
+        let result = ResidentModelRetryWait::wait(
+            &mut NativeRetryWait,
+            Duration::from_secs(1),
+            &cancellation,
+        );
         assert!(!result);
         assert!(started.elapsed() < Duration::from_millis(100));
     }
 
     #[test]
-    fn native_gemma_install_composition_is_compile_checked_without_network() {
-        use crate::llama::acquisition::{GemmaAcquisitionLimits, GemmaAcquisitionRuntime};
-        use crate::llama::install::install_gemma_revision;
+    fn native_resident_model_install_composition_is_compile_checked_without_network() {
+        use crate::llama::acquisition::{
+            ResidentModelAcquisitionLimits, ResidentModelAcquisitionRuntime,
+        };
+        use crate::llama::install::install_resident_model_revision;
         use crate::llama::lifecycle::{
-            GemmaRevisionLifecycle, RESIDENT_GEMMA_REVISION, RESIDENT_GEMMA_REVISIONS,
+            ResidentModelRevisionLifecycle, PINNED_RESIDENT_MODEL_REVISION,
+            RESIDENT_MODEL_REVISIONS,
         };
         use crate::model_acquisition_transport::NativeModelAcquisitionTransport;
 
         let root = temp_dir("composition");
         let missing_staging = root.join("missing-staging");
-        let lifecycle = GemmaRevisionLifecycle::new(
+        let lifecycle = ResidentModelRevisionLifecycle::new(
             root.join("models"),
-            &RESIDENT_GEMMA_REVISIONS,
-            &RESIDENT_GEMMA_REVISION,
+            &RESIDENT_MODEL_REVISIONS,
+            &PINNED_RESIDENT_MODEL_REVISION,
         )
         .unwrap();
         let mut transport = NativeModelAcquisitionTransport::new();
@@ -406,13 +421,13 @@ mod tests {
         let cancellation = NativeInstallCancellation::new();
         let mut lock = NativeInstallLock::new(root.join("install.lock"));
         let mut space = NativeAvailableSpace::new(&root);
-        let result = install_gemma_revision(
+        let result = install_resident_model_revision(
             &missing_staging,
             "native-composition",
-            &RESIDENT_GEMMA_REVISION,
-            GemmaAcquisitionLimits::default(),
+            &PINNED_RESIDENT_MODEL_REVISION,
+            ResidentModelAcquisitionLimits::default(),
             &mut transport,
-            GemmaAcquisitionRuntime {
+            ResidentModelAcquisitionRuntime {
                 clock: &clock,
                 retry_wait: &mut wait,
             },
@@ -420,7 +435,7 @@ mod tests {
             &mut lock,
             &mut space,
             &lifecycle,
-            &NativeGemmaLifecycleBoundary,
+            &NativeResidentModelLifecycleBoundary,
         );
         assert!(result.is_err());
         fs::remove_dir_all(root).unwrap();
