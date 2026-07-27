@@ -73,7 +73,7 @@ pub struct ResidentModelNoticeDescriptor {
 
 const RESIDENT_MODEL_NOTICE: ResidentModelNoticeDescriptor = ResidentModelNoticeDescriptor {
     filename: "NOTICE.txt",
-    contents: b"Qwen3.5 is provided by the Qwen team under the Apache License 2.0. Source: huggingface.co/unsloth/Qwen3.5-4B-GGUF\n",
+    contents: b"Qwen3.5 is provided by the Qwen team under the Apache License 2.0. Source: huggingface.co/munimentai/Qwen3.5-4B-GGUF\n",
 };
 
 pub const PINNED_RESIDENT_MODEL_REVISION: ResidentModelRevisionDescriptor =

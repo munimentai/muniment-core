@@ -22,9 +22,10 @@ use crate::sidecar::pi_install::{
 
 const MAX_REDIRECTS: usize = 5;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum HostPolicy {
     HuggingFace,
+    MunimentHuggingFace,
     GitHub,
 }
 
@@ -106,7 +107,7 @@ impl ResidentModelDownloadTransport for NativeModelAcquisitionTransport {
     ) -> Result<ResidentModelDownloadResponse<Self::Body>, ResidentModelTransportError> {
         self.request(
             request.url(),
-            HostPolicy::HuggingFace,
+            HostPolicy::MunimentHuggingFace,
             request.offset,
             request.limits.connect_timeout,
             request.limits.read_timeout,
@@ -357,10 +358,14 @@ where
 fn checked_initial_url(value: &str, host_policy: HostPolicy) -> Result<url::Url, TransportFailure> {
     let parsed = url::Url::parse(value).map_err(|_| TransportFailure::Rejected)?;
     let expected_host = match host_policy {
-        HostPolicy::HuggingFace => "huggingface.co",
+        HostPolicy::HuggingFace | HostPolicy::MunimentHuggingFace => "huggingface.co",
         HostPolicy::GitHub => "github.com",
     };
     if !has_secure_origin(&parsed) || parsed.host_str() != Some(expected_host) {
+        return Err(TransportFailure::Rejected);
+    }
+    if host_policy == HostPolicy::MunimentHuggingFace && !parsed.path().starts_with("/munimentai/")
+    {
         return Err(TransportFailure::Rejected);
     }
     Ok(parsed)
@@ -373,7 +378,7 @@ fn checked_redirect_url(
     let parsed = url::Url::parse(value).map_err(|_| TransportFailure::Rejected)?;
     let host = parsed.host_str().unwrap_or_default();
     let allowed_host = match host_policy {
-        HostPolicy::HuggingFace => {
+        HostPolicy::HuggingFace | HostPolicy::MunimentHuggingFace => {
             host_equals_or_has_dot_suffix(host, "hf.co")
                 || host_equals_or_has_dot_suffix(host, "huggingface.co")
         }
@@ -416,7 +421,6 @@ mod tests {
     use super::*;
     use crate::asr::acquisition::AsrAcquisitionLimits;
     use crate::llama::acquisition::ResidentModelAcquisitionLimits;
-    #[cfg(feature = "network-tests")]
     use crate::llama::RESIDENT_MODEL;
     use std::collections::VecDeque;
     use std::io::Cursor;
@@ -462,7 +466,7 @@ mod tests {
 
     fn resident_model_request() -> ResidentModelDownloadRequest {
         ResidentModelDownloadRequest::for_transport_test(
-            "https://huggingface.co/repo/resolve/revision/model?secret=value".into(),
+            "https://huggingface.co/munimentai/repo/resolve/revision/model?secret=value".into(),
             7,
             ResidentModelAcquisitionLimits {
                 connect_timeout: Duration::from_secs(10),
@@ -721,11 +725,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resident_model_initial_url_rejects_another_namespace() {
+        let other_namespace = RESIDENT_MODEL
+            .source_url
+            .replace("/munimentai/", "/another-account/");
+
+        assert_eq!(
+            checked_initial_url(&other_namespace, HostPolicy::MunimentHuggingFace),
+            Err(TransportFailure::Rejected)
+        );
+    }
+
     #[cfg(feature = "network-tests")]
     #[test]
     fn resident_model_redirect_matches_redirect_policy() {
         let initial_url =
-            checked_initial_url(RESIDENT_MODEL.source_url, HostPolicy::HuggingFace).unwrap();
+            checked_initial_url(RESIDENT_MODEL.source_url, HostPolicy::MunimentHuggingFace)
+                .unwrap();
         let agent = ureq::AgentBuilder::new()
             .redirects(0)
             .https_only(true)

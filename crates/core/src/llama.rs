@@ -46,17 +46,17 @@ pub struct ResidentModelDescriptor {
 }
 
 pub const RESIDENT_MODEL: ResidentModelDescriptor = ResidentModelDescriptor {
-    source_url: "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf",
+    source_url: "https://huggingface.co/munimentai/Qwen3.5-4B-GGUF/resolve/0ddb6039fd5a9d75a8a7fd03227de02c9e97daae/qwen3.5-4b-Q4_K_M.gguf",
     license: "Apache-2.0",
-    filename: "Qwen3.5-4B-Q4_K_M.gguf",
-    byte_size: 2_740_937_888,
-    sha256: "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
+    filename: "qwen3.5-4b-Q4_K_M.gguf",
+    byte_size: 2_783_446_784,
+    sha256: "5ca0d868d45462e33c7671740bbd97b1ec4d38834827609fcd1a3f726cf49649",
     alias: "muniment-required-qwen3.5-4b",
     context_tokens: 262_144,
 };
 
-/// Immutable upstream revision carrying [`RESIDENT_MODEL`].
-pub const RESIDENT_MODEL_REVISION: &str = "e87f176479d0855a907a41277aca2f8ee7a09523";
+/// Immutable repository revision carrying [`RESIDENT_MODEL`].
+pub const RESIDENT_MODEL_REVISION: &str = "0ddb6039fd5a9d75a8a7fd03227de02c9e97daae";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelVerificationError {
