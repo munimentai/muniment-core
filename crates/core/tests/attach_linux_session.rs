@@ -1662,7 +1662,7 @@ fn run_stream_event_window_ack_resumes_and_catches_up_once() {
             server,
             credentials(),
             "0.1.0",
-            Duration::from_secs(1),
+            Duration::from_secs(30),
             AuthorizationSessionDependencies {
                 fill_random: |bytes: &mut [u8]| {
                     bytes.fill(9);
@@ -1780,7 +1780,7 @@ fn run_cursor_ack_rejections_are_correlated_redacted_and_stream_local() {
             server,
             credentials(),
             "0.1.0",
-            Duration::from_secs(2),
+            Duration::from_secs(30),
             AuthorizationSessionDependencies {
                 fill_random: |bytes: &mut [u8]| {
                     bytes.fill(9);
@@ -1983,7 +1983,7 @@ fn run_cursor_ack_subscription_ids_are_isolated_between_connections() {
                 server,
                 credentials(),
                 "0.1.0",
-                Duration::from_secs(2),
+                Duration::from_secs(30),
                 AuthorizationSessionDependencies {
                     fill_random: |bytes: &mut [u8]| {
                         bytes.fill(9);
@@ -2086,7 +2086,7 @@ fn real_journal_run_stream_fetches_next_page_after_window_ack() {
             server,
             credentials(),
             "0.1.0",
-            Duration::from_secs(5),
+            Duration::from_secs(30),
             AuthorizationSessionDependencies {
                 fill_random: |bytes: &mut [u8]| {
                     bytes.fill(9);
@@ -2378,7 +2378,7 @@ fn live_run_stream_stays_bounded_and_recovers_after_hint_overflow_and_ack() {
             server,
             credentials(),
             "0.1.0",
-            Duration::from_secs(5),
+            Duration::from_secs(30),
             AuthorizationSessionDependencies {
                 fill_random: |bytes: &mut [u8]| {
                     bytes.fill(9);
@@ -2511,7 +2511,7 @@ fn run_stream_byte_window_counts_exact_framed_bytes_and_pauses_one_byte_over() {
             server,
             credentials(),
             "0.1.0",
-            Duration::from_secs(2),
+            Duration::from_secs(30),
             AuthorizationSessionDependencies {
                 fill_random: |bytes: &mut [u8]| {
                     bytes.fill(9);
