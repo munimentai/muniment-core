@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
+use uuid::{Uuid, Version};
 
 static NEXT_DB: AtomicU64 = AtomicU64::new(0);
 struct TestDb(PathBuf);
@@ -579,7 +580,7 @@ fn fresh_and_shipped_v1_journals_migrate_to_head_idempotently() {
     assert_eq!(
         raw.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        2
+        3
     );
     raw.execute(
         "INSERT INTO thread_projection_entries(run_id,ordinal,run_seq,kind,text) \
@@ -595,7 +596,7 @@ fn fresh_and_shipped_v1_journals_migrate_to_head_idempotently() {
     assert_eq!(
         raw.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        2
+        3
     );
     assert_eq!(
         raw.query_row(
@@ -605,6 +606,251 @@ fn fresh_and_shipped_v1_journals_migrate_to_head_idempotently() {
         )
         .unwrap(),
         1
+    );
+}
+
+#[test]
+fn populated_v2_journal_backfills_distinct_threads_with_workspace_scope() {
+    let db = TestDb::new();
+    let other_run = "0190a100-0000-7000-8000-000000000002";
+    {
+        let mut journal = RunJournal::open(db.as_ref()).unwrap();
+        journal.append_new_run("workspace-a", &event(1)).unwrap();
+        journal
+            .append_new_run(
+                "workspace-b",
+                &event_for(
+                    other_run,
+                    "0190a100-0000-7000-8000-000000000102",
+                    1,
+                    "future.event",
+                ),
+            )
+            .unwrap();
+    }
+    let raw = Connection::open(db.as_ref()).unwrap();
+    raw.execute_batch("DROP TABLE run_threads; DROP TABLE thread_events;")
+        .unwrap();
+    raw.pragma_update(None, "user_version", 2).unwrap();
+    drop(raw);
+
+    RunJournal::open(db.as_ref()).unwrap();
+    let raw = Connection::open(db.as_ref()).unwrap();
+    assert_eq!(
+        raw.query_row(
+            "SELECT COUNT(DISTINCT thread_id) FROM run_threads",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT COUNT(*) FROM thread_events te JOIN run_threads rt \
+             ON rt.thread_id=te.thread_id WHERE te.thread_seq=1 \
+             AND te.event_type='thread.created' AND rt.thread_run_ordinal=1 \
+             AND json_extract(te.envelope_json,'$.payload_json.migration_backfill')=1 \
+             AND json_extract(te.envelope_json,'$.payload_json.workspace') \
+                 IN ('workspace-a','workspace-b')",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn populated_v2_journal_backfills_run_without_workspace_scope() {
+    let db = TestDb::new();
+    {
+        let mut journal = RunJournal::open(db.as_ref()).unwrap();
+        journal.append(0, &event(1)).unwrap();
+    }
+    let raw = Connection::open(db.as_ref()).unwrap();
+    assert_eq!(
+        raw.query_row(
+            "SELECT COUNT(*) FROM run_workspaces WHERE run_id=?1",
+            [RUN],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    raw.execute_batch("DROP TABLE run_threads; DROP TABLE thread_events;")
+        .unwrap();
+    raw.pragma_update(None, "user_version", 2).unwrap();
+    drop(raw);
+
+    RunJournal::open(db.as_ref()).unwrap();
+    let raw = Connection::open(db.as_ref()).unwrap();
+    let (thread_id, ordinal): (String, i64) = raw
+        .query_row(
+            "SELECT thread_id,thread_run_ordinal FROM run_threads WHERE run_id=?1",
+            [RUN],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        Uuid::parse_str(&thread_id).unwrap().get_version(),
+        Some(Version::SortRand)
+    );
+    assert_eq!(ordinal, 1);
+    assert_eq!(
+        raw.query_row(
+            "SELECT COUNT(*) FROM thread_events WHERE thread_id=?1 \
+             AND thread_seq=1 AND event_type='thread.created' \
+             AND json_extract(envelope_json,'$.payload_json.migration_backfill')=1 \
+             AND json_type(envelope_json,'$.payload_json.workspace')='null'",
+            [&thread_id],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn schema_v3_requires_each_thread_table() {
+    for statements in [
+        "DROP TABLE run_threads;",
+        "DROP TABLE thread_events;",
+        "DROP TABLE run_threads; DROP TABLE thread_events;",
+    ] {
+        let db = TestDb::new();
+        RunJournal::open(db.as_ref()).unwrap();
+        let raw = Connection::open(db.as_ref()).unwrap();
+        raw.execute_batch(statements).unwrap();
+        drop(raw);
+        assert!(matches!(
+            RunJournal::open(db.as_ref()),
+            Err(JournalError::Corrupt(_))
+        ));
+    }
+}
+
+#[test]
+fn schema_v3_rejects_thread_identity_invariant_violations() {
+    for mutation in [
+        "DELETE FROM run_threads",
+        "DELETE FROM thread_events",
+        "UPDATE run_threads SET thread_run_ordinal=2",
+        "UPDATE thread_events SET thread_seq=2, \
+         envelope_json=json_replace(envelope_json,'$.thread_seq',2)",
+    ] {
+        let db = TestDb::new();
+        {
+            let mut journal = RunJournal::open(db.as_ref()).unwrap();
+            journal.append_new_run("workspace-a", &event(1)).unwrap();
+        }
+        let raw = Connection::open(db.as_ref()).unwrap();
+        raw.execute_batch(mutation).unwrap();
+        drop(raw);
+        assert!(matches!(
+            RunJournal::open(db.as_ref()),
+            Err(JournalError::Corrupt(_))
+        ));
+    }
+
+    let db = TestDb::new();
+    let other_run = "0190a100-0000-7000-8000-000000000002";
+    {
+        let mut journal = RunJournal::open(db.as_ref()).unwrap();
+        journal.append_new_run("workspace-a", &event(1)).unwrap();
+        journal
+            .append_new_run(
+                "workspace-a",
+                &event_for(
+                    other_run,
+                    "0190a100-0000-7000-8000-000000000102",
+                    1,
+                    "future.event",
+                ),
+            )
+            .unwrap();
+    }
+    let raw = Connection::open(db.as_ref()).unwrap();
+    raw.execute("DELETE FROM events WHERE run_id=?1", [other_run])
+        .unwrap();
+    raw.execute("DELETE FROM run_threads WHERE run_id=?1", [other_run])
+        .unwrap();
+    drop(raw);
+    assert!(matches!(
+        RunJournal::open(db.as_ref()),
+        Err(JournalError::Corrupt(_))
+    ));
+}
+
+#[test]
+fn new_run_is_stamped_and_deletion_removes_its_empty_thread() {
+    let db = TestDb::new();
+    let mut journal = RunJournal::open(db.as_ref()).unwrap();
+    journal.append_new_run("workspace-a", &event(1)).unwrap();
+    let raw = Connection::open(db.as_ref()).unwrap();
+    let thread_id: String = raw
+        .query_row(
+            "SELECT thread_id FROM run_threads WHERE run_id=?1 \
+             AND thread_run_ordinal=1",
+            [RUN],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        raw.query_row(
+            "SELECT COUNT(*) FROM thread_events WHERE thread_id=?1 \
+             AND thread_seq=1 AND event_type='thread.created'",
+            [&thread_id],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    drop(raw);
+
+    journal.delete_run(RUN).unwrap();
+    let raw = Connection::open(db.as_ref()).unwrap();
+    assert_eq!(
+        raw.query_row(
+            "SELECT (SELECT COUNT(*) FROM run_threads WHERE run_id=?1) + \
+             (SELECT COUNT(*) FROM thread_events WHERE thread_id=?2)",
+            (RUN, thread_id),
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn failed_step_three_rolls_back_schema_and_version() {
+    let db = TestDb::new();
+    RunJournal::open(db.as_ref()).unwrap();
+    let raw = Connection::open(db.as_ref()).unwrap();
+    raw.execute_batch(
+        "DROP TABLE run_threads;
+         DROP TABLE thread_events;
+         CREATE TABLE thread_events(bad TEXT) STRICT;",
+    )
+    .unwrap();
+    raw.pragma_update(None, "user_version", 2).unwrap();
+    drop(raw);
+
+    assert!(RunJournal::open(db.as_ref()).is_err());
+    let raw = Connection::open(db.as_ref()).unwrap();
+    assert_eq!(
+        raw.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='run_threads'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
     );
 }
 
@@ -660,7 +906,7 @@ fn head_schema_missing_journal_metadata_fails_without_recreating_it() {
     assert_eq!(
         raw.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        2
+        3
     );
     assert_eq!(
         raw.query_row(

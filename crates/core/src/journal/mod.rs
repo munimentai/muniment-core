@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 use uuid::{Uuid, Version};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMIT_HINT_CAPACITY: usize = 64;
 
@@ -87,6 +87,19 @@ pub struct EventEnvelope {
     /// Fields unknown to this reader are retained in the stored canonical envelope.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct ThreadEventEnvelope {
+    event_id: String,
+    thread_id: String,
+    thread_seq: u64,
+    event_type: String,
+    event_version: u32,
+    envelope_version: u32,
+    recorded_at: String,
+    payload_json: Value,
+    provenance: Provenance,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -619,6 +632,12 @@ impl RunJournal {
             "INSERT INTO run_workspaces(run_id, workspace) VALUES(?1, ?2)",
             params![event.run_id, workspace],
         )?;
+        let thread_id = Uuid::now_v7().to_string();
+        append_thread_created(&tx, &thread_id, Some(workspace), &event.recorded_at, false)?;
+        tx.execute(
+            "INSERT INTO run_threads(run_id,thread_id,thread_run_ordinal) VALUES(?1,?2,1)",
+            params![event.run_id, thread_id],
+        )?;
         tx.commit()?;
         publish_commit_hint(coordination.as_deref(), &event.run_id, event.run_seq);
         Ok(())
@@ -690,6 +709,16 @@ impl RunJournal {
                 actual,
             }));
         }
+        if actual == 0 {
+            // Low-level append remains available for import/tests. Production
+            // creation uses append_new_run, which records the real scope.
+            let thread_id = Uuid::now_v7().to_string();
+            append_thread_created(&tx, &thread_id, Some(""), &events[0].recorded_at, false)?;
+            tx.execute(
+                "INSERT INTO run_threads(run_id,thread_id,thread_run_ordinal) VALUES(?1,?2,1)",
+                params![run_id, thread_id],
+            )?;
+        }
         for (event, bytes) in events.iter().zip(canonical) {
             let result = tx.execute(
                 "INSERT INTO events(event_id,run_id,run_seq,event_type,event_version,envelope_version,recorded_at,envelope_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -730,23 +759,24 @@ impl RunJournal {
         }
         let connection = self
             .connection
-            .as_ref()
+            .as_mut()
             .expect("journal connection is always present outside compaction");
-        let exists: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM events WHERE run_id=?1)",
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let recorded_at: Option<String> = tx.query_row(
+            "SELECT MIN(recorded_at) FROM events WHERE run_id=?1",
             [run_id],
             |row| row.get(0),
         )?;
-        if !exists {
+        let Some(recorded_at) = recorded_at else {
             return Err(JournalError::InvalidEnvelope("run does not exist".into()));
-        }
-        connection.execute(
+        };
+        tx.execute(
             "INSERT INTO run_workspaces(run_id, workspace) VALUES(?1, ?2) \
              ON CONFLICT(run_id) DO UPDATE SET workspace=excluded.workspace \
              WHERE run_workspaces.workspace=excluded.workspace",
             params![run_id, workspace],
         )?;
-        let bound: Option<String> = connection
+        let bound: Option<String> = tx
             .query_row(
                 "SELECT workspace FROM run_workspaces WHERE run_id=?1",
                 [run_id],
@@ -758,6 +788,20 @@ impl RunJournal {
                 event_id: run_id.to_owned(),
             }));
         }
+        let stamped: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM run_threads WHERE run_id=?1)",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if !stamped {
+            let thread_id = Uuid::now_v7().to_string();
+            append_thread_created(&tx, &thread_id, Some(workspace), &recorded_at, false)?;
+            tx.execute(
+                "INSERT INTO run_threads(run_id,thread_id,thread_run_ordinal) VALUES(?1,?2,1)",
+                params![run_id, thread_id],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -936,6 +980,21 @@ impl RunJournal {
             "DELETE FROM thread_projection_versions WHERE run_id=?1",
             [&run_id],
         )?;
+        let thread_id: Option<String> = tx
+            .query_row(
+                "SELECT thread_id FROM run_threads WHERE run_id=?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        tx.execute("DELETE FROM run_threads WHERE run_id=?1", [run_id])?;
+        if let Some(thread_id) = thread_id {
+            tx.execute(
+                "DELETE FROM thread_events WHERE thread_id=?1 \
+                 AND NOT EXISTS(SELECT 1 FROM run_threads WHERE thread_id=?1)",
+                [thread_id],
+            )?;
+        }
         tx.execute("DELETE FROM run_workspaces WHERE run_id=?1", [run_id])?;
         tx.commit()?;
         Ok(hashes)
@@ -1255,6 +1314,64 @@ fn canonical_envelope(event: &EventEnvelope) -> Result<String, JournalError> {
     sort_json(&mut value);
     serde_json::to_string(&value).map_err(|e| JournalError::InvalidEnvelope(e.to_string()))
 }
+
+fn canonical_thread_envelope(event: &ThreadEventEnvelope) -> Result<String, JournalError> {
+    let mut value =
+        serde_json::to_value(event).map_err(|e| JournalError::InvalidEnvelope(e.to_string()))?;
+    sort_json(&mut value);
+    serde_json::to_string(&value).map_err(|e| JournalError::InvalidEnvelope(e.to_string()))
+}
+
+fn append_thread_created(
+    tx: &rusqlite::Transaction<'_>,
+    thread_id: &str,
+    workspace: Option<&str>,
+    recorded_at: &str,
+    migration_backfill: bool,
+) -> Result<(), JournalError> {
+    let envelope = ThreadEventEnvelope {
+        event_id: Uuid::now_v7().to_string(),
+        thread_id: thread_id.to_owned(),
+        thread_seq: 1,
+        event_type: "thread.created".into(),
+        event_version: 1,
+        envelope_version: 1,
+        recorded_at: recorded_at.to_owned(),
+        payload_json: serde_json::json!({
+            "migration_backfill": migration_backfill,
+            "workspace": workspace,
+        }),
+        provenance: Provenance {
+            source: if migration_backfill {
+                "schema-v3-migration"
+            } else {
+                "run-journal"
+            }
+            .into(),
+            source_version: "1".into(),
+            actor_id: None,
+            device_id: None,
+            rpc_request_id: None,
+            capability_versions: None,
+            extra: BTreeMap::new(),
+        },
+    };
+    let canonical = canonical_thread_envelope(&envelope)?;
+    tx.execute(
+        "INSERT INTO thread_events(event_id,thread_id,thread_seq,event_type,event_version,\
+         envelope_version,recorded_at,envelope_json) VALUES(?1,?2,1,?3,?4,?5,?6,?7)",
+        params![
+            envelope.event_id,
+            envelope.thread_id,
+            envelope.event_type,
+            envelope.event_version,
+            envelope.envelope_version,
+            envelope.recorded_at,
+            canonical
+        ],
+    )?;
+    Ok(())
+}
 fn sort_json(value: &mut Value) {
     match value {
         Value::Object(map) => {
@@ -1313,6 +1430,165 @@ fn validate_database(connection: &Connection) -> Result<(), JournalError> {
             )));
         }
         previous = Some((event.run_id, event.run_seq));
+    }
+    let schema_version: i64 =
+        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let thread_schema_objects: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE \
+         (type='table' AND name IN ('thread_events','run_threads')) OR \
+         (type='index' AND name IN ('thread_events_thread_order','run_threads_thread_run'))",
+        [],
+        |row| row.get(0),
+    )?;
+    if schema_version >= 3 || thread_schema_objects != 0 {
+        validate_thread_schema(connection)?;
+        validate_thread_identity(connection)?;
+    }
+    Ok(())
+}
+
+fn normalized_schema_sql(sql: &str) -> String {
+    sql.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+        .replace(" if not exists", "")
+}
+
+fn validate_thread_schema(connection: &Connection) -> Result<(), JournalError> {
+    for (object_type, name, expected) in [
+        ("table", "thread_events", CREATE_THREAD_EVENTS),
+        (
+            "index",
+            "thread_events_thread_order",
+            CREATE_THREAD_EVENTS_INDEX,
+        ),
+        ("table", "run_threads", CREATE_RUN_THREADS),
+        ("index", "run_threads_thread_run", CREATE_RUN_THREADS_INDEX),
+    ] {
+        let actual = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type=?1 AND name=?2",
+                params![object_type, name],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let expected = normalized_schema_sql(expected);
+        if actual.as_deref().map(normalized_schema_sql).as_deref() != Some(expected.as_str()) {
+            return Err(JournalError::Corrupt(format!(
+                "missing or malformed schema object {name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_thread_identity(connection: &Connection) -> Result<(), JournalError> {
+    let missing_or_duplicate: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM (SELECT e.run_id FROM events e \
+         LEFT JOIN run_threads rt ON rt.run_id=e.run_id GROUP BY e.run_id \
+         HAVING COUNT(DISTINCT rt.rowid) != 1)",
+        [],
+        |row| row.get(0),
+    )?;
+    if missing_or_duplicate != 0 {
+        return Err(JournalError::Corrupt(
+            "every run must have exactly one thread stamp".into(),
+        ));
+    }
+    let orphan_stamps: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM run_threads rt \
+         WHERE NOT EXISTS(SELECT 1 FROM events e WHERE e.run_id=rt.run_id)",
+        [],
+        |row| row.get(0),
+    )?;
+    if orphan_stamps != 0 {
+        return Err(JournalError::Corrupt(
+            "thread stamp references a missing run".into(),
+        ));
+    }
+    let noncontiguous_ordinals: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM (SELECT thread_id, COUNT(*) AS stamp_count, \
+         MIN(thread_run_ordinal) AS first_ordinal, \
+         MAX(thread_run_ordinal) AS last_ordinal FROM run_threads GROUP BY thread_id \
+         HAVING first_ordinal != 1 OR last_ordinal != stamp_count)",
+        [],
+        |row| row.get(0),
+    )?;
+    if noncontiguous_ordinals != 0 {
+        return Err(JournalError::Corrupt(
+            "thread run ordinals must be contiguous starting at 1".into(),
+        ));
+    }
+    let mut statement = connection.prepare(
+        "SELECT event_id,thread_id,thread_seq,event_type,event_version,envelope_version,\
+         recorded_at,envelope_json FROM thread_events ORDER BY thread_id,thread_seq",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut previous: Option<(String, u64)> = None;
+    while let Some(row) = rows.next()? {
+        let raw: String = row.get(7)?;
+        let event: ThreadEventEnvelope = serde_json::from_str(&raw)
+            .map_err(|e| JournalError::Corrupt(format!("invalid thread envelope JSON: {e}")))?;
+        for (name, value) in [
+            ("thread event ID", event.event_id.as_str()),
+            ("thread ID", event.thread_id.as_str()),
+        ] {
+            let uuid = Uuid::parse_str(value)
+                .map_err(|_| JournalError::Corrupt(format!("{name} is not a UUID")))?;
+            if uuid.get_version() != Some(Version::SortRand) {
+                return Err(JournalError::Corrupt(format!("{name} is not UUIDv7")));
+            }
+        }
+        let canonical =
+            canonical_thread_envelope(&event).map_err(|e| JournalError::Corrupt(e.to_string()))?;
+        if raw != canonical
+            || event.event_id != row.get::<_, String>(0)?
+            || event.thread_id != row.get::<_, String>(1)?
+            || event.thread_seq != row.get::<_, u64>(2)?
+            || event.event_type != row.get::<_, String>(3)?
+            || event.event_version != row.get::<_, u32>(4)?
+            || event.envelope_version != row.get::<_, u32>(5)?
+            || event.recorded_at != row.get::<_, String>(6)?
+        {
+            return Err(JournalError::Corrupt(format!(
+                "stored thread envelope/index mismatch for {}",
+                event.event_id
+            )));
+        }
+        validate_time("recorded_at", &event.recorded_at, true)
+            .map_err(|e| JournalError::Corrupt(e.to_string()))?;
+        let expected = previous
+            .as_ref()
+            .filter(|(id, _)| id == &event.thread_id)
+            .map_or(1, |(_, seq)| seq + 1);
+        if event.thread_seq != expected
+            || (event.thread_seq == 1 && event.event_type != "thread.created")
+        {
+            return Err(JournalError::Corrupt(format!(
+                "thread {} has invalid sequence or creation event",
+                event.thread_id
+            )));
+        }
+        previous = Some((event.thread_id, event.thread_seq));
+    }
+    let unstamped_threads: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM (SELECT DISTINCT te.thread_id FROM thread_events te \
+         WHERE NOT EXISTS(SELECT 1 FROM run_threads rt WHERE rt.thread_id=te.thread_id))",
+        [],
+        |row| row.get(0),
+    )?;
+    let stamps_without_threads: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM run_threads rt WHERE NOT EXISTS(\
+         SELECT 1 FROM thread_events te WHERE te.thread_id=rt.thread_id \
+         AND te.thread_seq=1 AND te.event_type='thread.created')",
+        [],
+        |row| row.get(0),
+    )?;
+    if unstamped_threads != 0 || stamps_without_threads != 0 {
+        return Err(JournalError::Corrupt(
+            "thread ledger and run stamps are inconsistent".into(),
+        ));
     }
     Ok(())
 }
@@ -1399,7 +1675,42 @@ const MIGRATIONS: &[Migration] = &[
         version: 2,
         apply: migrate_to_2,
     },
+    Migration {
+        version: 3,
+        apply: migrate_to_3,
+    },
 ];
+
+const CREATE_THREAD_EVENTS: &str = "CREATE TABLE IF NOT EXISTS thread_events( \
+ event_id TEXT PRIMARY KEY NOT NULL, thread_id TEXT NOT NULL, \
+ thread_seq INTEGER NOT NULL CHECK(thread_seq > 0), event_type TEXT NOT NULL, \
+ event_version INTEGER NOT NULL CHECK(event_version > 0), \
+ envelope_version INTEGER NOT NULL CHECK(envelope_version > 0), \
+ recorded_at TEXT NOT NULL, envelope_json TEXT NOT NULL, \
+ UNIQUE(thread_id, thread_seq)) STRICT";
+const CREATE_THREAD_EVENTS_INDEX: &str = "CREATE INDEX IF NOT EXISTS thread_events_thread_order \
+ ON thread_events(thread_id, thread_seq)";
+const CREATE_RUN_THREADS: &str = "CREATE TABLE IF NOT EXISTS run_threads( \
+ run_id TEXT PRIMARY KEY NOT NULL, thread_id TEXT NOT NULL, \
+ thread_run_ordinal INTEGER NOT NULL CHECK(thread_run_ordinal > 0), \
+ UNIQUE(thread_id, thread_run_ordinal)) STRICT";
+const CREATE_RUN_THREADS_INDEX: &str = "CREATE INDEX IF NOT EXISTS run_threads_thread_run \
+ ON run_threads(thread_id, thread_run_ordinal)";
+const THREAD_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS thread_events( \
+ event_id TEXT PRIMARY KEY NOT NULL, thread_id TEXT NOT NULL, \
+ thread_seq INTEGER NOT NULL CHECK(thread_seq > 0), event_type TEXT NOT NULL, \
+ event_version INTEGER NOT NULL CHECK(event_version > 0), \
+ envelope_version INTEGER NOT NULL CHECK(envelope_version > 0), \
+ recorded_at TEXT NOT NULL, envelope_json TEXT NOT NULL, \
+ UNIQUE(thread_id, thread_seq)) STRICT; \
+ CREATE INDEX IF NOT EXISTS thread_events_thread_order \
+ ON thread_events(thread_id, thread_seq); \
+ CREATE TABLE IF NOT EXISTS run_threads( \
+ run_id TEXT PRIMARY KEY NOT NULL, thread_id TEXT NOT NULL, \
+ thread_run_ordinal INTEGER NOT NULL CHECK(thread_run_ordinal > 0), \
+ UNIQUE(thread_id, thread_run_ordinal)) STRICT; \
+ CREATE INDEX IF NOT EXISTS run_threads_thread_run \
+ ON run_threads(thread_id, thread_run_ordinal);";
 
 fn migrate_to_1(tx: &rusqlite::Transaction<'_>) -> Result<(), JournalError> {
     tx.execute_batch(SCHEMA)?;
@@ -1446,6 +1757,37 @@ fn migrate_to_2(tx: &rusqlite::Transaction<'_>) -> Result<(), JournalError> {
          FROM thread_projection_entries",
         [],
     )?;
+    Ok(())
+}
+
+fn migrate_to_3(tx: &rusqlite::Transaction<'_>) -> Result<(), JournalError> {
+    tx.execute_batch(THREAD_SCHEMA)?;
+    let runs = {
+        let mut statement = tx.prepare(
+            "SELECT e.run_id, MIN(e.recorded_at), rw.workspace FROM events e \
+             LEFT JOIN run_workspaces rw ON rw.run_id=e.run_id \
+             WHERE NOT EXISTS(SELECT 1 FROM run_threads rt WHERE rt.run_id=e.run_id) \
+             GROUP BY e.run_id ORDER BY e.run_id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    for (run_id, recorded_at, workspace) in runs {
+        let thread_id = Uuid::now_v7().to_string();
+        append_thread_created(tx, &thread_id, workspace.as_deref(), &recorded_at, true)?;
+        tx.execute(
+            "INSERT INTO run_threads(run_id,thread_id,thread_run_ordinal) VALUES(?1,?2,1)",
+            params![run_id, thread_id],
+        )?;
+    }
     Ok(())
 }
 
