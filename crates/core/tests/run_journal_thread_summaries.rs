@@ -1,7 +1,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use muniment_core::journal::{
     summaries::MAX_PAGE_SIZE, thread_summaries::ThreadSummaryListError, EventEnvelope,
-    EventPayload, Provenance, RunJournal,
+    EventPayload, Provenance, RunJournal, ThreadRunPageError,
 };
 use rusqlite::{params, Connection};
 use serde_json::json;
@@ -90,6 +90,69 @@ fn merge_run_into_thread(path: &PathBuf, run_id: &str, thread_id: &str, ordinal:
     connection
         .execute("DELETE FROM thread_events WHERE thread_id=?1", [old_thread])
         .unwrap();
+}
+
+#[test]
+fn pages_thread_runs_in_stamp_order_and_reads_only_the_first_envelope() {
+    let path = journal_file();
+    let mut journal = RunJournal::open(&path).unwrap();
+    for (run, time) in [
+        (RUN_A, "2026-07-10T10:00:00Z"),
+        (RUN_B, "2026-07-10T11:00:00Z"),
+        (RUN_C, "2026-07-10T12:00:00Z"),
+    ] {
+        journal
+            .append_new_run("alpha", &event(run, 1, "run.started", time, json!({})))
+            .unwrap();
+        journal
+            .append(1, &event(run, 2, "run.completed", time, json!({})))
+            .unwrap();
+    }
+    let thread_id = thread_for(&path, RUN_A);
+    drop(journal);
+    merge_run_into_thread(&path, RUN_B, &thread_id, 2);
+    merge_run_into_thread(&path, RUN_C, &thread_id, 3);
+    let mut journal = RunJournal::open(&path).unwrap();
+
+    let first = journal.thread_run_ids(&thread_id, 2, None).unwrap();
+    assert_eq!(first.run_ids, [RUN_A, RUN_B]);
+    let second = journal
+        .thread_run_ids(&thread_id, 2, first.next_cursor.as_deref())
+        .unwrap();
+    assert_eq!(second.run_ids, [RUN_C]);
+    assert!(second.next_cursor.is_none());
+    assert_eq!(journal.first_envelope(RUN_B).unwrap().run_seq, 1);
+
+    let mut tampered = first.next_cursor.unwrap();
+    tampered.push('a');
+    assert!(matches!(
+        journal.thread_run_ids(&thread_id, 1, Some(&tampered)),
+        Err(ThreadRunPageError::InvalidCursor)
+    ));
+}
+
+#[test]
+fn thread_run_read_rejects_unknown_and_deleted_threads() {
+    let path = journal_file();
+    let mut journal = RunJournal::open(&path).unwrap();
+    journal
+        .append_new_run(
+            "alpha",
+            &event(RUN_A, 1, "run.started", "2026-07-10T10:00:00Z", json!({})),
+        )
+        .unwrap();
+    assert!(matches!(
+        journal.thread_run_ids("unknown", 1, None),
+        Err(ThreadRunPageError::NotFoundOrInaccessible)
+    ));
+    let thread_id = thread_for(&path, RUN_A);
+    journal
+        .append_thread_deleted(1, &thread_id, "2026-07-10T11:00:00Z", &provenance())
+        .unwrap();
+    assert!(matches!(
+        journal.thread_run_ids(&thread_id, 1, None),
+        Err(ThreadRunPageError::NotFoundOrInaccessible)
+    ));
 }
 
 #[test]

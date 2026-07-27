@@ -2371,6 +2371,7 @@ dependencies = [
  "libc",
  "muniment-attach",
  "muniment-core",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

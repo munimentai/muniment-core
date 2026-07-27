@@ -155,6 +155,13 @@ pub struct RunEventPage {
     pub next_cursor: Option<String>,
 }
 
+/// A bounded, stamp-ordered slice of a thread's runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadRunPage {
+    pub run_ids: Vec<String>,
+    pub next_cursor: Option<String>,
+}
+
 /// Sequence bounds and a bounded retained slice captured from one workspace-owned run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunCatchUpPage {
@@ -228,6 +235,20 @@ pub enum RunEventPageError {
     Journal(JournalError),
 }
 
+#[derive(Debug)]
+pub enum ThreadRunPageError {
+    InvalidLimit,
+    InvalidCursor,
+    NotFoundOrInaccessible,
+    Journal(JournalError),
+}
+
+impl From<JournalError> for ThreadRunPageError {
+    fn from(error: JournalError) -> Self {
+        Self::Journal(error)
+    }
+}
+
 impl From<JournalError> for RunEventPageError {
     fn from(error: JournalError) -> Self {
         Self::Journal(error)
@@ -240,6 +261,15 @@ struct RunEventCursor {
     version: u8,
     run_id: String,
     after_run_seq: u64,
+    authenticator: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThreadRunCursor {
+    version: u8,
+    thread_id: String,
+    after_ordinal: u64,
     authenticator: String,
 }
 
@@ -1034,6 +1064,112 @@ impl RunJournal {
         .collect()
     }
 
+    /// Reads at most `limit` stamped run IDs without loading run envelopes.
+    pub fn thread_run_ids(
+        &mut self,
+        thread_id: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<ThreadRunPage, ThreadRunPageError> {
+        const MAX_PAGE_SIZE: usize = 100;
+        if !(1..=MAX_PAGE_SIZE).contains(&limit) {
+            return Err(ThreadRunPageError::InvalidLimit);
+        }
+        let after = match cursor {
+            Some(value) => decode_thread_run_cursor(value, thread_id, &self.cursor_key)?,
+            None => 0,
+        };
+        let coordination = self.coordination.clone();
+        let _operation = coordination
+            .as_ref()
+            .map(|state| state.operation.lock().unwrap());
+        self.refresh_after_compaction()
+            .map_err(ThreadRunPageError::Journal)?;
+        let connection = self
+            .connection
+            .as_ref()
+            .expect("journal connection is always present outside compaction");
+        let accessible: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM thread_events te WHERE te.thread_id=?1 \
+                 AND NOT EXISTS(SELECT 1 FROM thread_events deleted \
+                    WHERE deleted.thread_id=te.thread_id AND deleted.event_type='thread.deleted'))",
+                [thread_id],
+                |row| row.get(0),
+            )
+            .map_err(JournalError::from)
+            .map_err(ThreadRunPageError::Journal)?;
+        if !accessible {
+            return Err(ThreadRunPageError::NotFoundOrInaccessible);
+        }
+        if after > 0 {
+            let boundary_exists: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM run_threads \
+                     WHERE thread_id=?1 AND thread_run_ordinal=?2)",
+                    params![thread_id, after],
+                    |row| row.get(0),
+                )
+                .map_err(JournalError::from)
+                .map_err(ThreadRunPageError::Journal)?;
+            if !boundary_exists {
+                return Err(ThreadRunPageError::InvalidCursor);
+            }
+        }
+        let mut statement = connection
+            .prepare(
+                "SELECT run_id,thread_run_ordinal FROM run_threads \
+                 WHERE thread_id=?1 AND thread_run_ordinal>?2 \
+                 ORDER BY thread_run_ordinal LIMIT ?3",
+            )
+            .map_err(JournalError::from)
+            .map_err(ThreadRunPageError::Journal)?;
+        let rows = statement
+            .query_map(params![thread_id, after, (limit + 1) as u64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+            })
+            .map_err(JournalError::from)
+            .map_err(ThreadRunPageError::Journal)?;
+        let mut runs = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(JournalError::from)
+            .map_err(ThreadRunPageError::Journal)?;
+        let has_more = runs.len() > limit;
+        runs.truncate(limit);
+        let next_cursor = if has_more {
+            runs.last()
+                .map(|(_, ordinal)| encode_thread_run_cursor(thread_id, *ordinal, &self.cursor_key))
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(ThreadRunPage {
+            run_ids: runs.into_iter().map(|(run_id, _)| run_id).collect(),
+            next_cursor,
+        })
+    }
+
+    /// Reads only the first envelope for one run.
+    pub fn first_envelope(&mut self, run_id: &str) -> Result<EventEnvelope, JournalError> {
+        let coordination = self.coordination.clone();
+        let _operation = coordination
+            .as_ref()
+            .map(|state| state.operation.lock().unwrap());
+        self.refresh_after_compaction()?;
+        let raw = self
+            .connection
+            .as_ref()
+            .expect("journal connection is always present outside compaction")
+            .query_row(
+                "SELECT envelope_json FROM events WHERE run_id=?1 ORDER BY run_seq LIMIT 1",
+                [run_id],
+                |row| row.get::<_, String>(0),
+            )?;
+        serde_json::from_str(&raw).map_err(|error| {
+            JournalError::Corrupt(format!("invalid stored envelope JSON: {error}"))
+        })
+    }
+
     /// Reads at most `limit` envelopes without loading the complete run.
     pub fn event_page(
         &mut self,
@@ -1231,6 +1367,15 @@ fn run_event_cursor_mac(key: &[u8; 32], run_id: &str, sequence: u64) -> Hmac<Sha
     mac
 }
 
+fn thread_run_cursor_mac(key: &[u8; 32], thread_id: &str, ordinal: u64) -> Hmac<Sha256> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts all key lengths");
+    mac.update(b"muniment-thread-run-cursor-v1\0");
+    mac.update(thread_id.as_bytes());
+    mac.update(&[0]);
+    mac.update(&ordinal.to_be_bytes());
+    mac
+}
+
 fn thread_projection_cursor_mac(
     key: &[u8; 32],
     thread_id: &str,
@@ -1363,6 +1508,58 @@ fn decode_run_event_cursor(
         return Err(RunEventPageError::InvalidCursor);
     }
     Ok(cursor.after_run_seq)
+}
+
+fn encode_thread_run_cursor(
+    thread_id: &str,
+    ordinal: u64,
+    key: &[u8; 32],
+) -> Result<String, ThreadRunPageError> {
+    let cursor = ThreadRunCursor {
+        version: 1,
+        thread_id: thread_id.to_owned(),
+        after_ordinal: ordinal,
+        authenticator: URL_SAFE_NO_PAD.encode(
+            thread_run_cursor_mac(key, thread_id, ordinal)
+                .finalize()
+                .into_bytes(),
+        ),
+    };
+    serde_json::to_vec(&cursor)
+        .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+        .map_err(|error| {
+            ThreadRunPageError::Journal(JournalError::Corrupt(format!(
+                "could not encode thread-run cursor: {error}"
+            )))
+        })
+}
+
+fn decode_thread_run_cursor(
+    encoded: &str,
+    thread_id: &str,
+    key: &[u8; 32],
+) -> Result<u64, ThreadRunPageError> {
+    if encoded.is_empty() || encoded.len() > 512 {
+        return Err(ThreadRunPageError::InvalidCursor);
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| ThreadRunPageError::InvalidCursor)?;
+    let cursor: ThreadRunCursor =
+        serde_json::from_slice(&bytes).map_err(|_| ThreadRunPageError::InvalidCursor)?;
+    let authenticator = URL_SAFE_NO_PAD
+        .decode(&cursor.authenticator)
+        .map_err(|_| ThreadRunPageError::InvalidCursor)?;
+    if cursor.version != 1
+        || cursor.thread_id != thread_id
+        || cursor.after_ordinal == 0
+        || thread_run_cursor_mac(key, thread_id, cursor.after_ordinal)
+            .verify_slice(&authenticator)
+            .is_err()
+    {
+        return Err(ThreadRunPageError::InvalidCursor);
+    }
+    Ok(cursor.after_ordinal)
 }
 
 fn load_or_create_cursor_key(connection: &Connection) -> Result<[u8; 32], JournalError> {
