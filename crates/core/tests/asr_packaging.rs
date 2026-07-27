@@ -14,7 +14,7 @@ fn every_supported_target_bundles_the_pinned_linked_runtime_at_its_loader_path()
     let cases: &[PlatformCase] = &[
         (
             "linux",
-            "$ORIGIN/../lib/muniment/resources/asr-runtime",
+            "$ORIGIN/../lib/muniment/asr-runtime",
             &[
                 (
                     "linux-x86_64/libsherpa-onnx-c-api.so",
