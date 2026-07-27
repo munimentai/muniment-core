@@ -1,8 +1,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use muniment_core::journal::{
-    summaries::{RunSummaryListError, MAX_PAGE_SIZE},
-    thread_summaries::ThreadSummaryListError,
-    EventEnvelope, EventPayload, Provenance, RunJournal,
+    summaries::MAX_PAGE_SIZE, thread_summaries::ThreadSummaryListError, EventEnvelope,
+    EventPayload, Provenance, RunJournal,
 };
 use rusqlite::{params, Connection};
 use serde_json::json;
@@ -302,7 +301,15 @@ fn rejects_invalid_cross_contract_scoped_and_stale_cursors() {
         Err(ThreadSummaryListError::InvalidCursor)
     ));
 
-    let run_cursor = journal.run_summaries(1, None).unwrap().next_cursor.unwrap();
+    let run_cursor = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "updated_at": "2026-07-10T12:00:00Z",
+            "run_id": RUN_A,
+            "authenticator": "obsolete"
+        }))
+        .unwrap(),
+    );
     assert!(matches!(
         journal.thread_summaries(1, Some(&run_cursor)),
         Err(ThreadSummaryListError::InvalidCursor)
@@ -312,10 +319,6 @@ fn rejects_invalid_cross_contract_scoped_and_stale_cursors() {
         .unwrap()
         .next_cursor
         .unwrap();
-    assert!(matches!(
-        journal.run_summaries(1, Some(&thread_cursor)),
-        Err(RunSummaryListError::InvalidCursor)
-    ));
     assert!(matches!(
         journal.workspace_thread_summaries("alpha", 1, Some(&thread_cursor)),
         Err(ThreadSummaryListError::InvalidCursor)

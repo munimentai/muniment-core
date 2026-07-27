@@ -42,6 +42,14 @@ fn credentials() -> PeerCredentials {
     }
 }
 
+fn sole_thread_id(journal: &mut RunJournal, workspace: &str) -> String {
+    let page = journal
+        .workspace_thread_summaries(workspace, 2, None)
+        .unwrap();
+    assert_eq!(page.summaries.len(), 1);
+    page.summaries[0].thread_id.clone()
+}
+
 fn hello(min: u32, max: u32) -> Vec<u8> {
     hello_for_client(min, max, "018f0000-0000-7000-8000-000000000099")
 }
@@ -2594,6 +2602,14 @@ fn authorized_thread_list_pages_real_journal_summaries_without_payloads() {
     journal
         .bind_run_workspace(HIDDEN_RUN, "workspace-2")
         .unwrap();
+    let listed = journal
+        .workspace_thread_summaries("workspace-1", 10, None)
+        .unwrap();
+    let listed_ids = listed
+        .summaries
+        .iter()
+        .map(|summary| summary.thread_id.clone())
+        .collect::<Vec<_>>();
 
     let (mut client, server) = UnixStream::pair().unwrap();
     let client_thread = thread::spawn(move || {
@@ -2639,8 +2655,8 @@ fn authorized_thread_list_pages_real_journal_summaries_without_payloads() {
         first.body,
         json!({
             "threads": [
-                {"thread_id": RUN_A, "title": "first", "updated_at": "2026-07-16T03:00:00Z"},
-                {"thread_id": RUN_B, "title": "second", "updated_at": "2026-07-16T02:00:00Z"}
+                {"thread_id": listed_ids[0], "title": "first", "updated_at": "2026-07-16T03:00:00Z"},
+                {"thread_id": listed_ids[1], "title": "second", "updated_at": "2026-07-16T02:00:00Z"}
             ],
             "next_cursor": first.body["next_cursor"]
         })
@@ -2649,7 +2665,7 @@ fn authorized_thread_list_pages_real_journal_summaries_without_payloads() {
         second.body,
         json!({
             "threads": [
-                {"thread_id": RUN_C, "title": "third", "updated_at": "2026-07-16T01:00:00Z"}
+                {"thread_id": listed_ids[2], "title": "third", "updated_at": "2026-07-16T01:00:00Z"}
             ]
         })
     );
@@ -2672,6 +2688,7 @@ fn authorized_thread_open_pages_a_redacted_journal_projection() {
     };
     journal.append_batch(0, &[first, second]).unwrap();
     journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+    let thread_id = sole_thread_id(&mut journal, "workspace-1");
 
     let (mut client, server) = UnixStream::pair().unwrap();
     let client_thread = thread::spawn(move || {
@@ -2682,7 +2699,7 @@ fn authorized_thread_open_pages_a_redacted_journal_projection() {
             .write_all(&request(
                 40,
                 Operation::ThreadOpen,
-                json!({"thread_id": RUN, "limit": 1}),
+                json!({"thread_id": thread_id.clone(), "limit": 1}),
             ))
             .unwrap();
         let first: Response = read_frame(&mut client);
@@ -2690,7 +2707,7 @@ fn authorized_thread_open_pages_a_redacted_journal_projection() {
             .write_all(&request(
                 41,
                 Operation::ThreadOpen,
-                json!({"thread_id": RUN, "limit": 1, "cursor": first.body["next_cursor"]}),
+                json!({"thread_id": thread_id, "limit": 1, "cursor": first.body["next_cursor"]}),
             ))
             .unwrap();
         let second: Response = read_frame(&mut client);
@@ -2728,6 +2745,150 @@ fn authorized_thread_open_pages_a_redacted_journal_projection() {
         json!([{"run_seq": 2, "kind": "assistant_message", "text": "answer"}])
     );
     assert!(!format!("{first:?}{second:?}").contains("/home"));
+}
+
+#[test]
+fn journal_attach_uses_renamed_ledger_threads_and_hides_tombstones() {
+    const LIVE_RUN: &str = "0190a110-0000-7000-8000-000000000001";
+    const DELETED_RUN: &str = "0190a110-0000-7000-8000-000000000002";
+    let mut journal = RunJournal::open(":memory:").unwrap();
+    let live_first = prompt(LIVE_RUN, "old title", "2026-07-16T03:00:00Z");
+    let provenance = live_first.provenance.clone();
+    let mut live_second = live_first.clone();
+    live_second.event_id = "0190a210-0000-7000-8000-000000000002".into();
+    live_second.run_seq = 2;
+    live_second.event_type = "model.stream.delta".into();
+    live_second.payload = EventPayload::Inline {
+        payload_json: json!({"text":"answer"}),
+    };
+    journal.append_batch(0, &[live_first, live_second]).unwrap();
+    journal.bind_run_workspace(LIVE_RUN, "workspace-1").unwrap();
+    let live_thread = sole_thread_id(&mut journal, "workspace-1");
+    journal
+        .append_thread_title_renamed(
+            1,
+            &live_thread,
+            "Renamed thread",
+            "2026-07-16T03:01:00Z",
+            &provenance,
+        )
+        .unwrap();
+
+    journal
+        .append(0, &prompt(DELETED_RUN, "deleted", "2026-07-16T02:00:00Z"))
+        .unwrap();
+    journal
+        .bind_run_workspace(DELETED_RUN, "workspace-1")
+        .unwrap();
+    let deleted_thread = journal
+        .workspace_thread_summaries("workspace-1", 10, None)
+        .unwrap()
+        .summaries
+        .into_iter()
+        .find(|summary| summary.title == "deleted")
+        .unwrap()
+        .thread_id;
+    journal
+        .append_thread_deleted(1, &deleted_thread, "2026-07-16T03:02:00Z", &provenance)
+        .unwrap();
+
+    let listed = journal
+        .list_threads(
+            "workspace-1",
+            ThreadListRequest {
+                limit: 10,
+                cursor: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(listed.threads.len(), 1);
+    assert_eq!(listed.threads[0].thread_id, live_thread);
+    assert_eq!(listed.threads[0].title, "Renamed thread");
+
+    let first = journal
+        .open_thread(
+            "workspace-1",
+            ThreadOpenRequest {
+                thread_id: live_thread.clone(),
+                limit: 1,
+                cursor: None,
+            },
+        )
+        .unwrap();
+    assert!(first.next_cursor.is_some());
+    let second = journal
+        .open_thread(
+            "workspace-1",
+            ThreadOpenRequest {
+                thread_id: live_thread,
+                limit: 1,
+                cursor: first.next_cursor,
+            },
+        )
+        .unwrap();
+    assert_eq!(second.entries.len(), 1);
+    assert!(second.next_cursor.is_none());
+
+    for rejected in [DELETED_RUN, deleted_thread.as_str()] {
+        let error = journal
+            .open_thread(
+                "workspace-1",
+                ThreadOpenRequest {
+                    thread_id: rejected.to_owned(),
+                    limit: 1,
+                    cursor: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidRequest);
+    }
+}
+
+#[test]
+fn thread_open_cursor_is_bound_to_its_thread_and_workspace() {
+    const RUN_A: &str = "0190a120-0000-7000-8000-000000000001";
+    const RUN_B: &str = "0190a120-0000-7000-8000-000000000002";
+    let mut journal = RunJournal::open(":memory:").unwrap();
+    for (run_id, workspace, title) in [
+        (RUN_A, "workspace-1", "first"),
+        (RUN_B, "workspace-2", "second"),
+    ] {
+        let first = prompt(run_id, title, "2026-07-16T03:00:00Z");
+        let mut second = first.clone();
+        second.event_id = format!("0190a220-0000-7000-8000-{}", &run_id[24..]);
+        second.run_seq = 2;
+        second.event_type = "model.stream.delta".into();
+        second.payload = EventPayload::Inline {
+            payload_json: json!({"text":"answer"}),
+        };
+        journal.append_batch(0, &[first, second]).unwrap();
+        journal.bind_run_workspace(run_id, workspace).unwrap();
+    }
+    let thread_a = sole_thread_id(&mut journal, "workspace-1");
+    let thread_b = sole_thread_id(&mut journal, "workspace-2");
+    let cursor = journal
+        .open_thread(
+            "workspace-1",
+            ThreadOpenRequest {
+                thread_id: thread_a,
+                limit: 1,
+                cursor: None,
+            },
+        )
+        .unwrap()
+        .next_cursor;
+
+    let error = journal
+        .open_thread(
+            "workspace-2",
+            ThreadOpenRequest {
+                thread_id: thread_b,
+                limit: 1,
+                cursor,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::InvalidCursor);
 }
 
 #[test]
@@ -2776,11 +2937,12 @@ fn projected_pages_preserve_cross_boundary_state_and_ignore_unknown_events() {
     let mut journal = RunJournal::open(":memory:").unwrap();
     journal.append_batch(0, &events).unwrap();
     journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+    let thread_id = sole_thread_id(&mut journal, "workspace-1");
     let first = journal
         .open_thread(
             "workspace-1",
             ThreadOpenRequest {
-                thread_id: RUN.into(),
+                thread_id: thread_id.clone(),
                 limit: 1,
                 cursor: None,
             },
@@ -2790,7 +2952,7 @@ fn projected_pages_preserve_cross_boundary_state_and_ignore_unknown_events() {
         .open_thread(
             "workspace-1",
             ThreadOpenRequest {
-                thread_id: RUN.into(),
+                thread_id: thread_id.clone(),
                 limit: 1,
                 cursor: first.next_cursor,
             },
@@ -2803,7 +2965,7 @@ fn projected_pages_preserve_cross_boundary_state_and_ignore_unknown_events() {
         .open_thread(
             "workspace-1",
             ThreadOpenRequest {
-                thread_id: RUN.into(),
+                thread_id,
                 limit: 1,
                 cursor: second.next_cursor,
             },
@@ -2842,6 +3004,7 @@ fn large_escaped_projection_continues_losslessly_with_bounded_pages() {
     let mut journal = RunJournal::open(":memory:").unwrap();
     journal.append_batch(0, &events).unwrap();
     journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+    let thread_id = sole_thread_id(&mut journal, "workspace-1");
     // The journal projection seam itself is bounded; page formation does not
     // replay or retain all 1,001 source envelopes.
     assert_eq!(
@@ -2858,7 +3021,7 @@ fn large_escaped_projection_continues_losslessly_with_bounded_pages() {
             .open_thread(
                 "workspace-1",
                 ThreadOpenRequest {
-                    thread_id: RUN.into(),
+                    thread_id: thread_id.clone(),
                     limit: 100,
                     cursor,
                 },
@@ -2902,6 +3065,7 @@ fn thread_open_cursor_skips_removed_projection_ordinals_without_duplicates() {
     let mut journal = RunJournal::open(":memory:").unwrap();
     journal.append_batch(0, &events).unwrap();
     journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+    let thread_id = sole_thread_id(&mut journal, "workspace-1");
 
     let mut cursor = None;
     let mut found = Vec::new();
@@ -2910,7 +3074,7 @@ fn thread_open_cursor_skips_removed_projection_ordinals_without_duplicates() {
             .open_thread(
                 "workspace-1",
                 ThreadOpenRequest {
-                    thread_id: RUN.into(),
+                    thread_id: thread_id.clone(),
                     limit: 1,
                     cursor,
                 },
@@ -2947,11 +3111,12 @@ fn thread_projection_cursor_keeps_its_snapshot_after_later_deltas() {
     let mut journal = RunJournal::open(":memory:").unwrap();
     journal.append_batch(0, &events).unwrap();
     journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+    let thread_id = sole_thread_id(&mut journal, "workspace-1");
     let first = journal
         .open_thread(
             "workspace-1",
             ThreadOpenRequest {
-                thread_id: RUN.into(),
+                thread_id: thread_id.clone(),
                 limit: 1,
                 cursor: None,
             },
@@ -2971,7 +3136,7 @@ fn thread_projection_cursor_keeps_its_snapshot_after_later_deltas() {
         .open_thread(
             "workspace-1",
             ThreadOpenRequest {
-                thread_id: RUN.into(),
+                thread_id,
                 limit: 1,
                 cursor: first.next_cursor,
             },
@@ -2995,13 +3160,14 @@ fn thread_open_rejects_bad_cursor_missing_thread_and_oversized_body_values() {
     journal
         .bind_run_workspace(OTHER_RUN, "workspace-2")
         .unwrap();
+    let thread_id = sole_thread_id(&mut journal, "workspace-1");
     let (mut client, server) = UnixStream::pair().unwrap();
     client.write_all(&hello(1, 1)).unwrap();
     client
         .write_all(&request(
             50,
             Operation::ThreadOpen,
-            json!({"thread_id": RUN, "limit": 1, "cursor": "forged"}),
+            json!({"thread_id": thread_id, "limit": 1, "cursor": "forged"}),
         ))
         .unwrap();
     client
@@ -3015,20 +3181,23 @@ fn thread_open_rejects_bad_cursor_missing_thread_and_oversized_body_values() {
         .write_all(&request(
             52,
             Operation::ThreadOpen,
-            json!({"thread_id": RUN, "limit": 101}),
+            json!({"thread_id": thread_id, "limit": 101}),
         ))
         .unwrap();
     for (id, body) in [
         (53, json!({"thread_id": "", "limit": 1})),
         (54, json!({"thread_id": "x".repeat(37), "limit": 1})),
-        (55, json!({"thread_id": RUN, "limit": 1, "cursor": ""})),
+        (
+            55,
+            json!({"thread_id": thread_id, "limit": 1, "cursor": ""}),
+        ),
         (
             56,
-            json!({"thread_id": RUN, "limit": 1, "cursor": "x".repeat(1025)}),
+            json!({"thread_id": thread_id, "limit": 1, "cursor": "x".repeat(1025)}),
         ),
         (
             57,
-            json!({"thread_id": RUN, "limit": 1, "workspace": "other"}),
+            json!({"thread_id": thread_id, "limit": 1, "workspace": "other"}),
         ),
     ] {
         client
@@ -3039,7 +3208,7 @@ fn thread_open_rejects_bad_cursor_missing_thread_and_oversized_body_values() {
         .write_all(&request_with_idempotency(
             58,
             Operation::ThreadOpen,
-            json!({"thread_id": RUN, "limit": 1}),
+            json!({"thread_id": thread_id, "limit": 1}),
         ))
         .unwrap();
     client
@@ -3110,7 +3279,7 @@ fn journal_thread_list_maps_cursor_and_storage_failures_without_details() {
             },
         )
         .unwrap_err();
-    assert_eq!(cursor_error.code(), ErrorCode::InvalidRequest);
+    assert_eq!(cursor_error.code(), ErrorCode::InvalidCursor);
 
     let path = std::env::temp_dir().join(format!(
         "muniment-thread-list-storage-failure-{}.sqlite3",

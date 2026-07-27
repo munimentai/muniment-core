@@ -25,7 +25,7 @@ use super::{
     RunEventAdmission, RunStreamCursor, MAX_RUN_STREAM_WINDOW_BYTES, MAX_RUN_STREAM_WINDOW_EVENTS,
 };
 use crate::journal::{
-    summaries::RunSummaryListError, JournalCommitHint, RunEventPageError, RunJournal,
+    thread_summaries::ThreadSummaryListError, JournalCommitHint, RunEventPageError, RunJournal,
 };
 
 const ATTACH_DIRECTORY: &[u8] = b"muniment\0";
@@ -604,23 +604,22 @@ impl ThreadListService for RunJournal {
         request: ThreadListRequest,
     ) -> Result<ThreadListPage, ProtocolError> {
         let page = self
-            .workspace_run_summaries(
+            .workspace_thread_summaries(
                 workspace,
                 usize::from(request.limit),
                 request.cursor.as_deref(),
             )
             .map_err(|error| match error {
-                RunSummaryListError::InvalidLimit { .. } | RunSummaryListError::InvalidCursor => {
-                    ProtocolError::invalid_request()
-                }
-                RunSummaryListError::Journal(_) => ProtocolError::persistence_failed(),
+                ThreadSummaryListError::InvalidLimit { .. } => ProtocolError::invalid_request(),
+                ThreadSummaryListError::InvalidCursor => ProtocolError::invalid_cursor(),
+                ThreadSummaryListError::Journal(_) => ProtocolError::persistence_failed(),
             })?;
         Ok(ThreadListPage {
             threads: page
                 .summaries
                 .into_iter()
                 .map(|summary| RedactedThreadSummary {
-                    thread_id: summary.run_id,
+                    thread_id: summary.thread_id,
                     title: summary.title,
                     updated_at: summary.updated_at,
                 })
@@ -634,8 +633,12 @@ impl ThreadListService for RunJournal {
         workspace: &str,
         request: ThreadOpenRequest,
     ) -> Result<ThreadOpenPage, ProtocolError> {
-        let (snapshot_seq, last_ordinal) = self
-            .thread_projection_boundary(workspace, &request.thread_id, request.cursor.as_deref())
+        let mut boundary = self
+            .ledger_thread_projection_boundary(
+                workspace,
+                &request.thread_id,
+                request.cursor.as_deref(),
+            )
             .map_err(|error| match error {
                 RunEventPageError::InvalidLimit => ProtocolError::invalid_request(),
                 RunEventPageError::InvalidCursor => ProtocolError::invalid_cursor(),
@@ -643,11 +646,10 @@ impl ThreadListService for RunJournal {
                 RunEventPageError::Journal(_) => ProtocolError::persistence_failed(),
             })?;
         let projected = self
-            .projected_thread_entries(
+            .ledger_thread_projection_entries(
                 workspace,
                 &request.thread_id,
-                snapshot_seq,
-                last_ordinal,
+                &boundary,
                 usize::from(request.limit) + 1,
             )
             .map_err(|error| match error {
@@ -659,7 +661,7 @@ impl ThreadListService for RunJournal {
             .into_iter()
             .map(|entry| {
                 (
-                    entry.ordinal,
+                    (entry.run_ordinal, entry.run_seq, entry.entry_ordinal),
                     RedactedThreadEntry {
                         run_seq: entry.run_seq,
                         kind: entry.kind,
@@ -674,8 +676,8 @@ impl ThreadListService for RunJournal {
         let has_more = expanded.len() > usize::from(request.limit);
         expanded.truncate(usize::from(request.limit));
         let mut entries = Vec::new();
-        let mut emitted_ordinal = last_ordinal;
-        for (ordinal, entry) in expanded.iter() {
+        let mut emitted_position = None;
+        for (position, entry) in expanded.iter() {
             let mut candidate = entries.clone();
             candidate.push(entry.clone());
             let candidate_page = ThreadOpenPage {
@@ -691,11 +693,16 @@ impl ThreadListService for RunJournal {
                 break;
             }
             entries.push(entry.clone());
-            emitted_ordinal = *ordinal;
+            emitted_position = Some(*position);
         }
         let next_cursor = if has_more || entries.len() < expanded.len() {
+            let (run_ordinal, run_seq, entry_ordinal) =
+                emitted_position.ok_or_else(ProtocolError::persistence_failed)?;
+            boundary.last_run_ordinal = run_ordinal;
+            boundary.last_run_seq = run_seq;
+            boundary.last_entry_ordinal = entry_ordinal;
             Some(
-                self.thread_projection_cursor(&request.thread_id, snapshot_seq, emitted_ordinal)
+                self.ledger_thread_projection_cursor(&request.thread_id, workspace, &boundary)
                     .map_err(|_| ProtocolError::persistence_failed())?,
             )
         } else {

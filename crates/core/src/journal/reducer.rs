@@ -13,7 +13,100 @@ pub struct ProjectedThreadEntry {
     pub text: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StampedThreadEntry {
+    pub run_ordinal: i64,
+    pub entry_ordinal: i64,
+    pub run_seq: u64,
+    pub kind: String,
+    pub text: Option<String>,
+}
+
 impl super::RunJournal {
+    pub fn ledger_thread_projection_entries(
+        &mut self,
+        workspace: &str,
+        thread_id: &str,
+        boundary: &super::ThreadProjectionBoundary,
+        limit: usize,
+    ) -> Result<Vec<StampedThreadEntry>, super::RunEventPageError> {
+        let coordination = self.coordination.clone();
+        let _operation = coordination
+            .as_ref()
+            .map(|state| state.operation.lock().unwrap());
+        self.refresh_after_compaction()
+            .map_err(super::RunEventPageError::Journal)?;
+        let connection = self
+            .connection
+            .as_ref()
+            .expect("journal connection is always present outside compaction");
+        let accessible: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM thread_events te \
+                 WHERE te.thread_id=?1 \
+                 AND NOT EXISTS(SELECT 1 FROM thread_events deleted \
+                    WHERE deleted.thread_id=te.thread_id AND deleted.event_type='thread.deleted') \
+                 AND EXISTS(SELECT 1 FROM run_threads rt JOIN run_workspaces rw \
+                    ON rw.run_id=rt.run_id WHERE rt.thread_id=te.thread_id AND rw.workspace=?2))",
+                rusqlite::params![thread_id, workspace],
+                |row| row.get(0),
+            )
+            .map_err(super::JournalError::from)
+            .map_err(super::RunEventPageError::Journal)?;
+        if !accessible {
+            return Err(super::RunEventPageError::NotFoundOrInaccessible);
+        }
+        let mut statement = connection
+            .prepare(
+                "WITH run_snapshots AS (\
+                    SELECT rt.run_id, rt.thread_run_ordinal, MAX(e.run_seq) AS snapshot_seq \
+                    FROM run_threads rt JOIN run_workspaces rw ON rw.run_id=rt.run_id \
+                    JOIN events e ON e.run_id=rt.run_id AND e.rowid<=?3 \
+                    WHERE rt.thread_id=?1 AND rw.workspace=?2 \
+                    GROUP BY rt.run_id, rt.thread_run_ordinal) \
+                 SELECT rs.thread_run_ordinal,p.ordinal,p.run_seq,p.kind,p.text \
+                 FROM run_snapshots rs JOIN thread_projection_versions p ON p.run_id=rs.run_id \
+                 WHERE p.valid_from_seq<=rs.snapshot_seq \
+                 AND (p.valid_until_seq IS NULL OR p.valid_until_seq>rs.snapshot_seq) \
+                 AND (rs.thread_run_ordinal>?4 OR (rs.thread_run_ordinal=?4 \
+                    AND (p.run_seq>?5 OR (p.run_seq=?5 AND p.ordinal>?6)))) \
+                 ORDER BY rs.thread_run_ordinal,p.run_seq,p.ordinal LIMIT ?7",
+            )
+            .map_err(super::JournalError::from)
+            .map_err(super::RunEventPageError::Journal)?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![
+                    thread_id,
+                    workspace,
+                    boundary.snapshot_rowid,
+                    boundary.last_run_ordinal,
+                    boundary.last_run_seq,
+                    boundary.last_entry_ordinal,
+                    limit
+                ],
+                |row| {
+                    Ok(StampedThreadEntry {
+                        run_ordinal: row.get(0)?,
+                        entry_ordinal: row.get(1)?,
+                        run_seq: row.get(2)?,
+                        kind: row
+                            .get::<_, String>(3)?
+                            .split(':')
+                            .next()
+                            .unwrap_or_default()
+                            .to_owned(),
+                        text: row.get(4)?,
+                    })
+                },
+            )
+            .map_err(super::JournalError::from)
+            .map_err(super::RunEventPageError::Journal)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(super::JournalError::from)
+            .map_err(super::RunEventPageError::Journal)
+    }
+
     /// Replays a stable run snapshot one row at a time. This keeps reducer
     /// state across storage boundaries without loading the journal envelopes.
     pub fn projected_thread_entries(

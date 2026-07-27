@@ -247,10 +247,22 @@ struct RunEventCursor {
 #[serde(deny_unknown_fields)]
 struct ThreadProjectionCursor {
     version: u8,
-    run_id: String,
-    snapshot_seq: u64,
-    last_ordinal: i64,
+    thread_id: String,
+    workspace: String,
+    snapshot_event_id: String,
+    last_run_ordinal: i64,
+    last_run_seq: u64,
+    last_entry_ordinal: i64,
     authenticator: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadProjectionBoundary {
+    pub(crate) snapshot_rowid: i64,
+    pub(crate) snapshot_event_id: String,
+    pub(crate) last_run_ordinal: i64,
+    pub(crate) last_run_seq: u64,
+    pub(crate) last_entry_ordinal: i64,
 }
 
 pub(crate) struct JournalCoordination {
@@ -494,43 +506,79 @@ impl RunJournal {
         })
     }
 
-    pub fn thread_projection_boundary(
-        &self,
+    pub fn ledger_thread_projection_boundary(
+        &mut self,
         workspace: &str,
-        run_id: &str,
+        thread_id: &str,
         cursor: Option<&str>,
-    ) -> Result<(u64, i64), RunEventPageError> {
-        if !self
-            .run_belongs_to_workspace(run_id, workspace)
-            .map_err(RunEventPageError::Journal)?
-        {
+    ) -> Result<ThreadProjectionBoundary, RunEventPageError> {
+        let coordination = self.coordination.clone();
+        let _operation = coordination
+            .as_ref()
+            .map(|state| state.operation.lock().unwrap());
+        self.refresh_after_compaction()
+            .map_err(RunEventPageError::Journal)?;
+        let connection = self
+            .connection
+            .as_ref()
+            .expect("journal connection is always present outside compaction");
+        let accessible: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM thread_events te \
+                 WHERE te.thread_id=?1 \
+                 AND NOT EXISTS(SELECT 1 FROM thread_events deleted \
+                    WHERE deleted.thread_id=te.thread_id AND deleted.event_type='thread.deleted') \
+                 AND EXISTS(SELECT 1 FROM run_threads rt JOIN run_workspaces rw \
+                    ON rw.run_id=rt.run_id WHERE rt.thread_id=te.thread_id AND rw.workspace=?2))",
+                params![thread_id, workspace],
+                |row| row.get(0),
+            )
+            .map_err(JournalError::from)
+            .map_err(RunEventPageError::Journal)?;
+        if !accessible {
             return Err(RunEventPageError::NotFoundOrInaccessible);
         }
         if let Some(cursor) = cursor {
-            return decode_thread_projection_cursor(cursor, run_id, &self.cursor_key);
+            let mut boundary =
+                decode_thread_projection_cursor(cursor, thread_id, workspace, &self.cursor_key)?;
+            boundary.snapshot_rowid = connection
+                .query_row(
+                    "SELECT e.rowid FROM run_threads rt JOIN events e ON e.run_id=rt.run_id \
+                     WHERE rt.thread_id=?1 AND e.event_id=?2",
+                    params![thread_id, boundary.snapshot_event_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(JournalError::from)
+                .map_err(RunEventPageError::Journal)?
+                .ok_or(RunEventPageError::InvalidCursor)?;
+            return Ok(boundary);
         }
-        let snapshot = self
-            .connection
-            .as_ref()
-            .expect("journal connection is always present outside compaction")
+        let (snapshot_rowid, snapshot_event_id) = connection
             .query_row(
-                "SELECT MAX(run_seq) FROM events WHERE run_id=?1",
-                [run_id],
-                |row| row.get::<_, Option<u64>>(0),
+                "SELECT e.rowid,e.event_id FROM run_threads rt JOIN events e ON e.run_id=rt.run_id \
+                 WHERE rt.thread_id=?1 ORDER BY e.rowid DESC LIMIT 1",
+                [thread_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )
             .map_err(JournalError::from)
-            .map_err(RunEventPageError::Journal)?
-            .ok_or(RunEventPageError::NotFoundOrInaccessible)?;
-        Ok((snapshot, -1))
+            .map_err(RunEventPageError::Journal)?;
+        Ok(ThreadProjectionBoundary {
+            snapshot_rowid,
+            snapshot_event_id,
+            last_run_ordinal: 0,
+            last_run_seq: 0,
+            last_entry_ordinal: -1,
+        })
     }
 
-    pub fn thread_projection_cursor(
+    pub fn ledger_thread_projection_cursor(
         &self,
-        run_id: &str,
-        snapshot_seq: u64,
-        last_ordinal: i64,
+        thread_id: &str,
+        workspace: &str,
+        boundary: &ThreadProjectionBoundary,
     ) -> Result<String, RunEventPageError> {
-        encode_thread_projection_cursor(run_id, snapshot_seq, last_ordinal, &self.cursor_key)
+        encode_thread_projection_cursor(thread_id, workspace, boundary, &self.cursor_key)
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, JournalError> {
@@ -1185,32 +1233,40 @@ fn run_event_cursor_mac(key: &[u8; 32], run_id: &str, sequence: u64) -> Hmac<Sha
 
 fn thread_projection_cursor_mac(
     key: &[u8; 32],
-    run_id: &str,
-    snapshot_seq: u64,
-    last_ordinal: i64,
+    thread_id: &str,
+    workspace: &str,
+    boundary: &ThreadProjectionBoundary,
 ) -> Hmac<Sha256> {
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts all key lengths");
-    mac.update(b"muniment-thread-projection-cursor-v1\0");
-    mac.update(run_id.as_bytes());
+    mac.update(b"muniment-ledger-thread-projection-cursor-v1\0");
+    mac.update(thread_id.as_bytes());
     mac.update(&[0]);
-    mac.update(&snapshot_seq.to_be_bytes());
-    mac.update(&last_ordinal.to_be_bytes());
+    mac.update(workspace.as_bytes());
+    mac.update(&[0]);
+    mac.update(boundary.snapshot_event_id.as_bytes());
+    mac.update(&[0]);
+    mac.update(&boundary.last_run_ordinal.to_be_bytes());
+    mac.update(&boundary.last_run_seq.to_be_bytes());
+    mac.update(&boundary.last_entry_ordinal.to_be_bytes());
     mac
 }
 
 fn encode_thread_projection_cursor(
-    run_id: &str,
-    snapshot_seq: u64,
-    last_ordinal: i64,
+    thread_id: &str,
+    workspace: &str,
+    boundary: &ThreadProjectionBoundary,
     key: &[u8; 32],
 ) -> Result<String, RunEventPageError> {
     let cursor = ThreadProjectionCursor {
         version: 1,
-        run_id: run_id.to_owned(),
-        snapshot_seq,
-        last_ordinal,
+        thread_id: thread_id.to_owned(),
+        workspace: workspace.to_owned(),
+        snapshot_event_id: boundary.snapshot_event_id.clone(),
+        last_run_ordinal: boundary.last_run_ordinal,
+        last_run_seq: boundary.last_run_seq,
+        last_entry_ordinal: boundary.last_entry_ordinal,
         authenticator: URL_SAFE_NO_PAD.encode(
-            thread_projection_cursor_mac(key, run_id, snapshot_seq, last_ordinal)
+            thread_projection_cursor_mac(key, thread_id, workspace, boundary)
                 .finalize()
                 .into_bytes(),
         ),
@@ -1222,27 +1278,42 @@ fn encode_thread_projection_cursor(
 
 fn decode_thread_projection_cursor(
     value: &str,
-    run_id: &str,
+    thread_id: &str,
+    workspace: &str,
     key: &[u8; 32],
-) -> Result<(u64, i64), RunEventPageError> {
+) -> Result<ThreadProjectionBoundary, RunEventPageError> {
+    if value.is_empty() || value.len() > 1024 {
+        return Err(RunEventPageError::InvalidCursor);
+    }
     let bytes = URL_SAFE_NO_PAD
         .decode(value)
         .map_err(|_| RunEventPageError::InvalidCursor)?;
     let cursor: ThreadProjectionCursor =
         serde_json::from_slice(&bytes).map_err(|_| RunEventPageError::InvalidCursor)?;
-    if cursor.version != 1 || cursor.run_id != run_id || cursor.snapshot_seq == 0 {
+    if cursor.version != 1
+        || cursor.thread_id != thread_id
+        || cursor.workspace != workspace
+        || cursor.snapshot_event_id.is_empty()
+        || cursor.last_run_ordinal <= 0
+        || cursor.last_run_seq == 0
+        || cursor.last_entry_ordinal < 0
+    {
         return Err(RunEventPageError::InvalidCursor);
     }
     let authenticator = URL_SAFE_NO_PAD
         .decode(&cursor.authenticator)
         .map_err(|_| RunEventPageError::InvalidCursor)?;
-    if cursor.last_ordinal < 0 {
-        return Err(RunEventPageError::InvalidCursor);
-    }
-    thread_projection_cursor_mac(key, run_id, cursor.snapshot_seq, cursor.last_ordinal)
+    let boundary = ThreadProjectionBoundary {
+        snapshot_rowid: 0,
+        snapshot_event_id: cursor.snapshot_event_id,
+        last_run_ordinal: cursor.last_run_ordinal,
+        last_run_seq: cursor.last_run_seq,
+        last_entry_ordinal: cursor.last_entry_ordinal,
+    };
+    thread_projection_cursor_mac(key, thread_id, workspace, &boundary)
         .verify_slice(&authenticator)
         .map_err(|_| RunEventPageError::InvalidCursor)?;
-    Ok((cursor.snapshot_seq, cursor.last_ordinal))
+    Ok(boundary)
 }
 
 fn encode_run_event_cursor(
