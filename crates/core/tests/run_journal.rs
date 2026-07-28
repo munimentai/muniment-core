@@ -1201,6 +1201,31 @@ fn thread_rename_and_delete_append_validated_canonical_events() {
 }
 
 #[test]
+fn last_thread_seq_returns_the_tail_or_zero() {
+    let db = TestDb::new();
+    let mut journal = RunJournal::open(db.as_ref()).unwrap();
+    assert_eq!(
+        journal
+            .last_thread_seq("0190a100-0000-7000-8000-000000000099")
+            .unwrap(),
+        0
+    );
+    journal.append_new_run("workspace-a", &event(1)).unwrap();
+    let thread_id = thread_id(&db);
+    assert_eq!(journal.last_thread_seq(&thread_id).unwrap(), 1);
+    journal
+        .append_thread_title_renamed(
+            1,
+            &thread_id,
+            "New title",
+            "2026-07-10T12:00:01Z",
+            &test_provenance(),
+        )
+        .unwrap();
+    assert_eq!(journal.last_thread_seq(&thread_id).unwrap(), 2);
+}
+
+#[test]
 fn thread_title_boundaries_and_conflicts_write_no_events() {
     let db = TestDb::new();
     let mut journal = RunJournal::open(db.as_ref()).unwrap();

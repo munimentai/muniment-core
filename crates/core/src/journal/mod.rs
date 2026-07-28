@@ -699,6 +699,23 @@ impl RunJournal {
         )
     }
 
+    pub fn last_thread_seq(&mut self, thread_id: &str) -> Result<u64, JournalError> {
+        let coordination = self.coordination.clone();
+        let _operation = coordination
+            .as_ref()
+            .map(|state| state.operation.lock().unwrap());
+        self.refresh_after_compaction()?;
+        self.connection
+            .as_ref()
+            .expect("journal connection is always present outside compaction")
+            .query_row(
+                "SELECT COALESCE(MAX(thread_seq), 0) FROM thread_events WHERE thread_id=?1",
+                [thread_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     pub fn append_thread_deleted(
         &mut self,
         expected_last_thread_seq: u64,
