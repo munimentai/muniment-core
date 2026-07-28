@@ -316,6 +316,35 @@ fn pages_threads_by_combined_update_time_and_thread_id() {
 }
 
 #[test]
+fn run_update_time_uses_last_event_by_run_sequence() {
+    let path = journal_file();
+    let mut journal = RunJournal::open(&path).unwrap();
+    journal
+        .append_new_run(
+            "alpha",
+            &event(RUN_A, 1, "run.started", "2026-07-10T10:00:00Z", json!({})),
+        )
+        .unwrap();
+    journal
+        .append(
+            1,
+            &event(RUN_A, 2, "run.progress", "2026-07-10T12:00:00Z", json!({})),
+        )
+        .unwrap();
+    journal
+        .append(
+            2,
+            &event(RUN_A, 3, "run.completed", "2026-07-10T11:00:00Z", json!({})),
+        )
+        .unwrap();
+
+    assert_eq!(
+        journal.thread_summaries(1, None).unwrap().summaries[0].updated_at,
+        "2026-07-10T11:00:00Z"
+    );
+}
+
+#[test]
 fn latest_rename_wins_and_fallback_uses_first_prompt_in_stamp_order() {
     let path = journal_file();
     let mut journal = RunJournal::open(&path).unwrap();

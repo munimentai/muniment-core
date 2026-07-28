@@ -67,6 +67,8 @@ struct ThreadCursor {
 
 impl RunJournal {
     /// Lists non-deleted threads by latest event time, then thread ID.
+    ///
+    /// A run contributes its last event by `run_seq`.
     pub fn thread_summaries(
         &mut self,
         limit: usize,
@@ -76,6 +78,8 @@ impl RunJournal {
     }
 
     /// Lists non-deleted threads with a run owned by `workspace`.
+    ///
+    /// A run contributes its last event by `run_seq`.
     pub fn workspace_thread_summaries(
         &mut self,
         workspace: &str,
@@ -114,8 +118,9 @@ impl RunJournal {
         let summary_rows = "WITH thread_times AS (\
             SELECT te.thread_id, MAX(te.recorded_at) AS updated_at FROM thread_events te \
             GROUP BY te.thread_id), run_times AS (\
-            SELECT rt.thread_id, MAX(e.recorded_at) AS updated_at FROM run_threads rt \
-            JOIN events e ON e.run_id=rt.run_id GROUP BY rt.thread_id), summaries AS (\
+            SELECT rt.thread_id, MAX((SELECT e.recorded_at FROM events e \
+                WHERE e.run_id=rt.run_id ORDER BY e.run_seq DESC LIMIT 1)) AS updated_at \
+            FROM run_threads rt GROUP BY rt.thread_id), summaries AS (\
             SELECT tt.thread_id, MAX(tt.updated_at, COALESCE(rt.updated_at, tt.updated_at)) AS updated_at \
             FROM thread_times tt LEFT JOIN run_times rt ON rt.thread_id=tt.thread_id \
             WHERE NOT EXISTS(SELECT 1 FROM thread_events deleted \
