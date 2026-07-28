@@ -755,6 +755,29 @@ fn schema_v3_requires_each_thread_table() {
 }
 
 #[test]
+fn schema_v3_rejects_four_named_objects_with_a_missing_column_as_corrupt() {
+    let db = TestDb::new();
+    RunJournal::open(db.as_ref()).unwrap();
+    let raw = Connection::open(db.as_ref()).unwrap();
+    raw.execute_batch(
+        "DROP INDEX run_threads_thread_run;
+         DROP TABLE run_threads;
+         CREATE TABLE run_threads(
+           run_id TEXT PRIMARY KEY NOT NULL,
+           thread_id TEXT NOT NULL
+         ) STRICT;
+         CREATE INDEX run_threads_thread_run ON run_threads(thread_id);",
+    )
+    .unwrap();
+    drop(raw);
+
+    assert!(matches!(
+        RunJournal::open(db.as_ref()),
+        Err(JournalError::Corrupt(_))
+    ));
+}
+
+#[test]
 fn schema_v3_rejects_thread_identity_invariant_violations() {
     for mutation in [
         "DELETE FROM run_threads",
@@ -803,6 +826,109 @@ fn schema_v3_rejects_thread_identity_invariant_violations() {
         RunJournal::open(db.as_ref()),
         Err(JournalError::Corrupt(_))
     ));
+}
+
+#[test]
+fn schema_v3_rejects_duplicate_run_ordinals_within_a_thread() {
+    let db = TestDb::new();
+    let other_run = "0190a100-0000-7000-8000-000000000002";
+    {
+        let mut journal = RunJournal::open(db.as_ref()).unwrap();
+        journal.append_new_run("workspace-a", &event(1)).unwrap();
+        journal
+            .append_new_run(
+                "workspace-a",
+                &event_for(
+                    other_run,
+                    "0190a100-0000-7000-8000-000000000102",
+                    1,
+                    "future.event",
+                ),
+            )
+            .unwrap();
+    }
+    let raw = Connection::open(db.as_ref()).unwrap();
+    raw.execute_batch(
+        "ALTER TABLE run_threads RENAME TO old_run_threads;
+         CREATE TABLE run_threads(
+           run_id TEXT PRIMARY KEY NOT NULL,
+           thread_id TEXT NOT NULL,
+           thread_run_ordinal INTEGER NOT NULL CHECK(thread_run_ordinal > 0)
+         ) STRICT;
+         INSERT INTO run_threads
+           SELECT run_id,thread_id,thread_run_ordinal FROM old_run_threads
+           WHERE run_id='0190a100-0000-7000-8000-000000000001';
+         INSERT INTO run_threads
+           SELECT run_id,
+             (SELECT thread_id FROM run_threads
+              WHERE run_id='0190a100-0000-7000-8000-000000000001'),
+             1
+           FROM old_run_threads
+           WHERE run_id='0190a100-0000-7000-8000-000000000002';
+         DROP TABLE old_run_threads;
+         CREATE INDEX run_threads_thread_run
+           ON run_threads(thread_id,thread_run_ordinal);",
+    )
+    .unwrap();
+    drop(raw);
+
+    match RunJournal::open(db.as_ref()) {
+        Err(JournalError::Corrupt(message)) => {
+            assert_eq!(
+                message,
+                "thread run ordinals must be unique within each thread"
+            )
+        }
+        Err(error) => panic!("{error}"),
+        Ok(_) => panic!("journal with duplicate thread run ordinals opened"),
+    }
+}
+
+#[test]
+fn deleting_a_run_leaves_a_valid_thread_ordinal_gap() {
+    let db = TestDb::new();
+    let second_run = "0190a100-0000-7000-8000-000000000002";
+    let third_run = "0190a100-0000-7000-8000-000000000003";
+    {
+        let mut journal = RunJournal::open(db.as_ref()).unwrap();
+        let thread_id = journal.append_new_run("workspace-a", &event(1)).unwrap();
+        journal
+            .append_new_run_in_thread(
+                "workspace-a",
+                &thread_id,
+                &event_for(
+                    second_run,
+                    "0190a100-0000-7000-8000-000000000102",
+                    1,
+                    "future.event",
+                ),
+            )
+            .unwrap();
+        journal
+            .append_new_run_in_thread(
+                "workspace-a",
+                &thread_id,
+                &event_for(
+                    third_run,
+                    "0190a100-0000-7000-8000-000000000103",
+                    1,
+                    "future.event",
+                ),
+            )
+            .unwrap();
+        journal.delete_run(second_run).unwrap();
+    }
+
+    RunJournal::open(db.as_ref()).unwrap();
+    let raw = Connection::open(db.as_ref()).unwrap();
+    let ordinals = raw
+        .prepare("SELECT thread_run_ordinal FROM run_threads ORDER BY thread_run_ordinal")
+        .unwrap()
+        .query_map([], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(ordinals, [1, 3]);
 }
 
 #[test]

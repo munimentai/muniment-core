@@ -2022,8 +2022,20 @@ fn validate_database(connection: &Connection) -> Result<(), JournalError> {
         |row| row.get(0),
     )?;
     if schema_version >= 3 || thread_schema_objects != 0 {
-        validate_thread_schema(connection)?;
-        validate_thread_identity(connection)?;
+        if thread_schema_objects == 4 {
+            match validate_thread_identity(connection) {
+                Err(JournalError::Sqlite(error)) => {
+                    return Err(JournalError::Corrupt(format!(
+                        "malformed thread schema: {error}"
+                    )));
+                }
+                result => result?,
+            }
+            validate_thread_schema(connection)?;
+        } else {
+            validate_thread_schema(connection)?;
+            validate_thread_identity(connection)?;
+        }
     }
     Ok(())
 }
@@ -2096,6 +2108,17 @@ fn validate_thread_identity(connection: &Connection) -> Result<(), JournalError>
     if invalid_ordinals != 0 {
         return Err(JournalError::Corrupt(
             "thread run ordinals must be positive".into(),
+        ));
+    }
+    let duplicate_ordinals: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM (SELECT 1 FROM run_threads \
+         GROUP BY thread_id,thread_run_ordinal HAVING COUNT(*) > 1)",
+        [],
+        |row| row.get(0),
+    )?;
+    if duplicate_ordinals != 0 {
+        return Err(JournalError::Corrupt(
+            "thread run ordinals must be unique within each thread".into(),
         ));
     }
     let mut statement = connection.prepare(
