@@ -809,8 +809,9 @@ fn schema_v3_rejects_thread_identity_invariant_violations() {
 fn new_run_in_thread_uses_next_ordinal_and_mirrors_run_creation() {
     let db = TestDb::new();
     let mut journal = RunJournal::open(db.as_ref()).unwrap();
-    journal.append_new_run("workspace-a", &event(1)).unwrap();
+    let stamped_thread = journal.append_new_run("workspace-a", &event(1)).unwrap();
     let thread_id = thread_id(&db);
+    assert_eq!(stamped_thread, thread_id);
     let other_run = "0190a100-0000-7000-8000-000000000002";
     let mut first = event_for(
         other_run,
