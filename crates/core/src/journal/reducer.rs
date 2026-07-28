@@ -276,11 +276,17 @@ pub enum ToolActivityStatus {
 }
 
 pub fn project_chat(events: &[EventEnvelope]) -> Result<ChatProjection, ReduceError> {
+    project_chat_with_state(events).map(|(chat, _)| chat)
+}
+
+pub fn project_chat_with_state(
+    events: &[EventEnvelope],
+) -> Result<(ChatProjection, RunState), ReduceError> {
     let mut projector = ChatProjector::new();
     for event in events {
         projector.apply(event)?;
     }
-    projector.projection()
+    projector.finish()
 }
 
 /// Projects a bounded continuation fragment when the reducer state lives before
@@ -394,6 +400,17 @@ impl ChatProjector {
         };
         chat.status = Some(status);
         Ok(chat)
+    }
+
+    pub fn finish(self) -> Result<(ChatProjection, RunState), ReduceError> {
+        let state = self.reducer.finish()?;
+        let mut chat = self.chat;
+        chat.pending_permission = match &state.status {
+            RunStatus::PendingPermission(gate) => Some(gate.clone()),
+            _ => None,
+        };
+        chat.status = Some(state.status.clone());
+        Ok((chat, state))
     }
 }
 

@@ -525,6 +525,26 @@ fn incremental_chat_projection_matches_full_replay_after_every_prefix() {
 }
 
 #[test]
+fn combined_chat_projection_and_state_match_separate_replays() {
+    let events = stream(&[
+        ("run.started", json!({})),
+        ("model.prompt.accepted", json!({})),
+        ("model.stream.delta", json!({"text":"hello"})),
+        (
+            "runtime.pi_session.bound",
+            json!({"run_id":RUN, "locator":"session.jsonl"}),
+        ),
+        ("run.needs_attention", json!({"reason":"interrupted"})),
+    ]);
+
+    let (projection, state) =
+        muniment_core::journal::reducer::project_chat_with_state(&events).unwrap();
+
+    assert_eq!(projection, project_chat(&events).unwrap());
+    assert_eq!(state, reduce(&events).unwrap());
+}
+
+#[test]
 fn chat_projection_replays_completed_and_failed_runs() {
     let receipt = json!({
         "route": "litellm",
