@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 use uuid::{Uuid, Version};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMIT_HINT_CAPACITY: usize = 64;
 
@@ -2210,7 +2210,6 @@ CREATE TABLE events (
  envelope_json TEXT NOT NULL,
  UNIQUE(run_id, run_seq)
 ) STRICT;
-CREATE INDEX events_run_order ON events(run_id, run_seq);
 CREATE TABLE permission_pending_projection (
  run_id TEXT NOT NULL,
  run_seq INTEGER NOT NULL,
@@ -2283,6 +2282,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 3,
         apply: migrate_to_3,
+    },
+    Migration {
+        version: 4,
+        apply: migrate_to_4,
     },
 ];
 
@@ -2393,6 +2396,11 @@ fn migrate_to_3(tx: &rusqlite::Transaction<'_>) -> Result<(), JournalError> {
             params![run_id, thread_id],
         )?;
     }
+    Ok(())
+}
+
+fn migrate_to_4(tx: &rusqlite::Transaction<'_>) -> Result<(), JournalError> {
+    tx.execute_batch("DROP INDEX IF EXISTS events_run_order")?;
     Ok(())
 }
 

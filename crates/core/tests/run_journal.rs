@@ -604,7 +604,16 @@ fn fresh_and_shipped_v1_journals_migrate_to_head_idempotently() {
     assert_eq!(
         raw.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        3
+        4
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name='events_run_order'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
     );
     raw.execute(
         "INSERT INTO thread_projection_entries(run_id,ordinal,run_seq,kind,text) \
@@ -620,7 +629,7 @@ fn fresh_and_shipped_v1_journals_migrate_to_head_idempotently() {
     assert_eq!(
         raw.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        3
+        4
     );
     assert_eq!(
         raw.query_row(
@@ -631,6 +640,66 @@ fn fresh_and_shipped_v1_journals_migrate_to_head_idempotently() {
         .unwrap(),
         1
     );
+}
+
+#[test]
+fn populated_v3_journal_drops_duplicate_event_index_and_keeps_events_indexed() {
+    let db = TestDb::new();
+    {
+        let mut journal = RunJournal::open(db.as_ref()).unwrap();
+        journal
+            .append_batch(0, &[event(1), event(2), event(3)])
+            .unwrap();
+    }
+    let raw = Connection::open(db.as_ref()).unwrap();
+    raw.execute(
+        "CREATE INDEX events_run_order ON events(run_id, run_seq)",
+        [],
+    )
+    .unwrap();
+    raw.pragma_update(None, "user_version", 3).unwrap();
+    drop(raw);
+
+    let mut journal = RunJournal::open(db.as_ref()).unwrap();
+    assert_eq!(
+        journal
+            .events(RUN)
+            .unwrap()
+            .iter()
+            .map(|event| event.run_seq)
+            .collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+    drop(journal);
+
+    let raw = Connection::open(db.as_ref()).unwrap();
+    assert_eq!(
+        raw.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        raw.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name='events_run_order'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    let plan = raw
+        .prepare(
+            "EXPLAIN QUERY PLAN \
+             SELECT envelope_json FROM events WHERE run_id=?1 ORDER BY run_seq",
+        )
+        .unwrap()
+        .query_map([RUN], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .join(" ");
+    assert!(plan.contains("SEARCH events USING INDEX"), "{plan}");
+    assert!(!plan.contains("SCAN events"), "{plan}");
 }
 
 #[test]
@@ -1395,7 +1464,7 @@ fn head_schema_missing_journal_metadata_fails_without_recreating_it() {
     assert_eq!(
         raw.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        3
+        4
     );
     assert_eq!(
         raw.query_row(
