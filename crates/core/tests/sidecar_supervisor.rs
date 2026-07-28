@@ -664,6 +664,10 @@ fn pi_wiring_replaces_dispatcher_after_child_restart() {
         .call(json!({"type": "get_state"}), Duration::from_millis(100))
         .unwrap_err()
         .contains("replaced child generation"));
+    assert_eq!(
+        stale.send(json!({"type": "extension_ui_response", "id": "gate-1"})),
+        Err("Pi RPC transport belongs to a replaced child generation".into())
+    );
     let routed = transport.subscribe();
     let response = transport
         .call(json!({"type": "prompt"}), Duration::from_millis(100))

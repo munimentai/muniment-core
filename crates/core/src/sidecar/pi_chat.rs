@@ -443,6 +443,17 @@ impl PiRunAdapter {
         &self.run_id
     }
 
+    /// Answers a pending extension UI request without waiting for an RPC response.
+    pub fn answer_extension_ui(
+        &self,
+        transport: &PiRpcTransport,
+        request: &ExtensionUiRequest,
+        answer: ExtensionUiAnswer,
+    ) -> Result<(), String> {
+        let response = ExtensionUiResponse::new(request, answer).map_err(str::to_owned)?;
+        transport.send(response.into_value())
+    }
+
     /// Waits for Pi to materialize the persistent session after accepting a
     /// prompt. Stream frames arriving while the file is being created are
     /// returned in order. If the binding cannot be validated, the accepted

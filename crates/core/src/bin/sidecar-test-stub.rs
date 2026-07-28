@@ -20,6 +20,7 @@ fn main() {
         Some("pi-rpc-interleaved") => pi_rpc_interleaved(),
         Some("pi-chat-queue") => pi_chat_queue(),
         Some("pi-chat-capture") => pi_chat_capture(args.next().unwrap()),
+        Some("pi-chat-extension-ui") => pi_chat_extension_ui(args.next().unwrap()),
         Some("pi-chat-late-response") => pi_chat_late_response(),
         Some("pi-session-deferred") => pi_session_deferred(args.next().unwrap(), args.next()),
         Some("pi-rpc-restart-once") => {
@@ -294,6 +295,41 @@ fn pi_chat_capture(output: String) {
                 "type":"response", "command":command, "success":true, "id":request["id"]
             })
         );
+        io::stdout().flush().unwrap();
+    }
+}
+
+fn pi_chat_extension_ui(output: String) {
+    for line in io::stdin().lock().lines() {
+        let line = line.unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        match request["type"].as_str().unwrap() {
+            "get_state" => println!(
+                "{}",
+                serde_json::json!({
+                    "type":"response", "command":"get_state", "success":true, "id":request["id"]
+                })
+            ),
+            "prompt" if request["message"] == "wait" => {
+                fs::write(format!("{output}.waiting"), "").unwrap();
+                continue;
+            }
+            "prompt" => println!(
+                "{}",
+                serde_json::json!({
+                    "type":"response", "command":"prompt", "success":true, "id":request["id"]
+                })
+            ),
+            "extension_ui_response" => {
+                let mut capture = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&output)
+                    .unwrap();
+                writeln!(capture, "{line}").unwrap();
+            }
+            command => panic!("unexpected command: {command}"),
+        }
         io::stdout().flush().unwrap();
     }
 }

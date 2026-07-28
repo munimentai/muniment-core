@@ -297,6 +297,17 @@ impl PiRpcTransport {
         self.call_locked(command, &id, timeout, guard)
     }
 
+    /// Sends one pre-correlated Pi frame without waiting for a response.
+    pub fn send(&self, frame: Value) -> Result<(), String> {
+        if self.io.stdin.generation() != self.generation {
+            return Err("Pi RPC transport belongs to a replaced child generation".into());
+        }
+        self.io
+            .stdin
+            .write_line(&frame.to_string())
+            .map_err(|error| error.to_string())
+    }
+
     /// Builds a health probe on the same dispatcher used by application calls.
     /// If a call is active, its bounded timeout owns health detection and the
     /// periodic probe does not compete for stdout.

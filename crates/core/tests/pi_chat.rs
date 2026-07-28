@@ -559,3 +559,153 @@ fn invalid_session_state_cancels_accepted_agent_work() {
     assert_eq!(fs::read_to_string(marker).unwrap(), "cancelled");
     supervisor.shutdown().unwrap();
 }
+
+fn extension_ui_supervisor(capture: &std::path::Path) -> (SidecarSupervisor, PiRpcWiring) {
+    let mut config = SidecarConfig::new(env!("CARGO_BIN_EXE_sidecar-test-stub"));
+    config.args = vec![
+        "pi-chat-extension-ui".into(),
+        capture.to_string_lossy().into_owned(),
+    ];
+    config.health_interval = Duration::from_secs(60);
+    let wiring = PiRpcWiring::new();
+    let supervisor =
+        SidecarSupervisor::spawn(config, wiring.readiness_probe(Duration::from_millis(100)))
+            .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while supervisor.status() != SidecarStatus::Healthy && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(supervisor.status(), SidecarStatus::Healthy);
+    (supervisor, wiring)
+}
+
+#[test]
+fn adapter_sends_exact_extension_ui_answer_frames() {
+    let temp = TempDir::new();
+    let capture = temp.path().join("answers.jsonl");
+    let (mut supervisor, wiring) = extension_ui_supervisor(&capture);
+    let transport = wiring.transport().unwrap();
+    let (adapter, _) =
+        PiRunAdapter::start("run-1", &transport, "start", Duration::from_secs(1)).unwrap();
+    let cases = [
+        (
+            extension_request(json!({
+                "type":"extension_ui_request", "id":"select-1", "method":"select",
+                "title":"Pick", "options":["A"]
+            })),
+            ExtensionUiAnswer::Selection("A".into()),
+            json!({"type":"extension_ui_response", "id":"select-1", "value":"A"}),
+        ),
+        (
+            extension_request(json!({
+                "type":"extension_ui_request", "id":"confirm-1", "method":"confirm",
+                "title":"Sure?", "message":"Really?"
+            })),
+            ExtensionUiAnswer::Confirmation(false),
+            json!({"type":"extension_ui_response", "id":"confirm-1", "confirmed":false}),
+        ),
+        (
+            extension_request(json!({
+                "type":"extension_ui_request", "id":"input-1", "method":"input", "title":"Value"
+            })),
+            ExtensionUiAnswer::Input("answer".into()),
+            json!({"type":"extension_ui_response", "id":"input-1", "value":"answer"}),
+        ),
+        (
+            extension_request(json!({
+                "type":"extension_ui_request", "id":"editor-1", "method":"editor", "title":"Edit"
+            })),
+            ExtensionUiAnswer::Editor("lines".into()),
+            json!({"type":"extension_ui_response", "id":"editor-1", "value":"lines"}),
+        ),
+        (
+            extension_request(json!({
+                "type":"extension_ui_request", "id":"cancel-1", "method":"confirm",
+                "title":"Sure?", "message":"Really?"
+            })),
+            ExtensionUiAnswer::Cancelled,
+            json!({"type":"extension_ui_response", "id":"cancel-1", "cancelled":true}),
+        ),
+    ];
+    let expected: Vec<_> = cases.iter().map(|(_, _, frame)| frame.clone()).collect();
+    for (request, answer, _) in cases {
+        adapter
+            .answer_extension_ui(&transport, &request, answer)
+            .unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let captured = loop {
+        let frames = fs::read_to_string(&capture).unwrap_or_default();
+        let captured: Vec<serde_json::Value> = frames
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        if captured.len() == expected.len() || Instant::now() >= deadline {
+            break captured;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(captured, expected);
+    supervisor.shutdown().unwrap();
+}
+
+#[test]
+fn adapter_rejects_mismatched_answer_without_writing() {
+    let temp = TempDir::new();
+    let capture = temp.path().join("answers.jsonl");
+    let (mut supervisor, wiring) = extension_ui_supervisor(&capture);
+    let transport = wiring.transport().unwrap();
+    let (adapter, _) =
+        PiRunAdapter::start("run-1", &transport, "start", Duration::from_secs(1)).unwrap();
+    let request = extension_request(json!({
+        "type":"extension_ui_request", "id":"confirm-1", "method":"confirm",
+        "title":"Sure?", "message":"Really?"
+    }));
+
+    assert_eq!(
+        adapter.answer_extension_ui(&transport, &request, ExtensionUiAnswer::Input("yes".into())),
+        Err("answer kind does not match extension UI request".into())
+    );
+    std::thread::sleep(Duration::from_millis(25));
+    assert!(!capture.exists());
+    supervisor.shutdown().unwrap();
+}
+
+#[test]
+fn transport_send_completes_while_call_waits() {
+    let temp = TempDir::new();
+    let capture = temp.path().join("answers.jsonl");
+    let waiting = PathBuf::from(format!("{}.waiting", capture.to_string_lossy()));
+    let (mut supervisor, wiring) = extension_ui_supervisor(&capture);
+    let transport = wiring.transport().unwrap();
+    let calling = std::sync::Arc::clone(&transport);
+    let call = std::thread::spawn(move || {
+        calling.call(
+            json!({"type":"prompt", "message":"wait"}),
+            Duration::from_secs(1),
+        )
+    });
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !waiting.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(waiting.exists());
+
+    let started = Instant::now();
+    transport
+        .send(json!({
+            "type":"extension_ui_response", "id":"gate-1", "confirmed":true
+        }))
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_millis(100));
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !capture.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        fs::read_to_string(capture).unwrap(),
+        "{\"confirmed\":true,\"id\":\"gate-1\",\"type\":\"extension_ui_response\"}\n"
+    );
+    assert!(call.join().unwrap().is_err());
+    supervisor.shutdown().unwrap();
+}
