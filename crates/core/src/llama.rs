@@ -125,19 +125,19 @@ fn hash_reader(mut reader: impl Read) -> Result<String, ModelVerificationError> 
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
-    pub role: ChatRole,
-    pub content: String,
+    role: ChatRole,
+    content: String,
 }
 
 impl ChatMessage {
-    pub fn system(content: impl Into<String>) -> Self {
+    fn system(content: impl Into<String>) -> Self {
         Self {
             role: ChatRole::System,
             content: content.into(),
         }
     }
 
-    pub fn user(content: impl Into<String>) -> Self {
+    fn user(content: impl Into<String>) -> Self {
         Self {
             role: ChatRole::User,
             content: content.into(),
@@ -162,13 +162,13 @@ pub enum ChatRole {
 #[non_exhaustive]
 pub struct ChatCompletionRequest {
     model: String,
-    pub messages: Vec<ChatMessage>,
+    messages: Vec<ChatMessage>,
     pub max_tokens: u32,
     pub temperature: f32,
 }
 
 impl ChatCompletionRequest {
-    pub fn new(messages: Vec<ChatMessage>, max_tokens: u32, temperature: f32) -> Self {
+    fn new(messages: Vec<ChatMessage>, max_tokens: u32, temperature: f32) -> Self {
         Self {
             model: RESIDENT_MODEL.alias.into(),
             messages,
