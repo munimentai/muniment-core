@@ -11,10 +11,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::asr::acquisition::{AsrAcquisitionClock, AsrCancellation, AsrRetryWait};
 use crate::asr::{AsrLifecycleBoundary, AsrPersistenceError};
-use crate::llama::acquisition::{
-    ResidentModelAcquisitionClock, ResidentModelCancellation, ResidentModelRetryWait,
-};
-use crate::llama::lifecycle::{ResidentModelLifecycleBoundary, ResidentModelPersistenceError};
 use crate::model_install::{
     AvailableSpace, AvailableSpaceError, InstallCancellation, InstallLock, InstallLockError,
     InstallLockState,
@@ -39,11 +35,6 @@ impl NativeInstallCancellation {
     }
 }
 impl InstallCancellation for NativeInstallCancellation {
-    fn is_cancelled(&self) -> bool {
-        self.is_cancelled()
-    }
-}
-impl ResidentModelCancellation for NativeInstallCancellation {
     fn is_cancelled(&self) -> bool {
         self.is_cancelled()
     }
@@ -128,11 +119,6 @@ impl Default for NativeAcquisitionClock {
         Self::new()
     }
 }
-impl ResidentModelAcquisitionClock for NativeAcquisitionClock {
-    fn now(&self) -> Duration {
-        self.0.elapsed()
-    }
-}
 impl AsrAcquisitionClock for NativeAcquisitionClock {
     fn now(&self) -> Duration {
         self.0.elapsed()
@@ -142,17 +128,6 @@ impl AsrAcquisitionClock for NativeAcquisitionClock {
 /// Bounded jittered retry sleep which polls cancellation every 10ms.
 #[derive(Debug, Default)]
 pub struct NativeRetryWait;
-impl ResidentModelRetryWait for NativeRetryWait {
-    fn wait(
-        &mut self,
-        maximum_delay: Duration,
-        cancellation: &dyn ResidentModelCancellation,
-    ) -> bool {
-        cancellable_sleep(jittered_delay(maximum_delay), || {
-            cancellation.is_cancelled()
-        })
-    }
-}
 impl AsrRetryWait for NativeRetryWait {
     fn wait(&mut self, maximum_delay: Duration, cancellation: &dyn AsrCancellation) -> bool {
         cancellable_sleep(jittered_delay(maximum_delay), || {
@@ -187,55 +162,6 @@ fn cancellable_sleep(duration: Duration, cancelled: impl Fn() -> bool) -> bool {
     }
 }
 
-/// Native durable filesystem operations for ResidentModel publication.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NativeResidentModelLifecycleBoundary;
-impl ResidentModelLifecycleBoundary for NativeResidentModelLifecycleBoundary {
-    type LockGuard = File;
-    fn lock_exclusive(
-        &self,
-        path: &Path,
-    ) -> Result<Self::LockGuard, ResidentModelPersistenceError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .map_err(|_| ResidentModelPersistenceError::Failed)?;
-        file.lock_exclusive()
-            .map_err(|_| ResidentModelPersistenceError::Failed)?;
-        Ok(file)
-    }
-    fn sync_file(&self, path: &Path) -> Result<(), ResidentModelPersistenceError> {
-        File::open(path)
-            .and_then(|file| file.sync_all())
-            .map_err(|_| ResidentModelPersistenceError::Failed)
-    }
-    fn sync_directory(&self, path: &Path) -> Result<(), ResidentModelPersistenceError> {
-        #[cfg(unix)]
-        File::open(path)
-            .and_then(|file| file.sync_all())
-            .map_err(|_| ResidentModelPersistenceError::Failed)?;
-        let _ = path;
-        Ok(())
-    }
-    fn replace_revision(
-        &self,
-        staged: &Path,
-        destination: &Path,
-    ) -> Result<(), ResidentModelPersistenceError> {
-        atomic_replace_directory(staged, destination)
-    }
-    fn replace_pointer(
-        &self,
-        temporary: &Path,
-        destination: &Path,
-    ) -> Result<(), ResidentModelPersistenceError> {
-        fs::rename(temporary, destination).map_err(|_| ResidentModelPersistenceError::Failed)
-    }
-}
-
 /// Native durable filesystem operations for Parakeet publication.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NativeAsrLifecycleBoundary;
@@ -261,61 +187,6 @@ impl AsrLifecycleBoundary for NativeAsrLifecycleBoundary {
         destination: &Path,
     ) -> Result<(), AsrPersistenceError> {
         fs::rename(temporary, destination).map_err(|_| AsrPersistenceError::Failed)
-    }
-}
-
-fn atomic_replace_directory(
-    staged: &Path,
-    destination: &Path,
-) -> Result<(), ResidentModelPersistenceError> {
-    if !destination.exists() {
-        return fs::rename(staged, destination).map_err(|_| ResidentModelPersistenceError::Failed);
-    }
-    #[cfg(target_os = "linux")]
-    {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-        const AT_FDCWD: i32 = -100;
-        const RENAME_EXCHANGE: u32 = 2;
-        unsafe extern "C" {
-            fn renameat2(
-                olddirfd: i32,
-                oldpath: *const i8,
-                newdirfd: i32,
-                newpath: *const i8,
-                flags: u32,
-            ) -> i32;
-        }
-        let old = CString::new(staged.as_os_str().as_bytes())
-            .map_err(|_| ResidentModelPersistenceError::Failed)?;
-        let new = CString::new(destination.as_os_str().as_bytes())
-            .map_err(|_| ResidentModelPersistenceError::Failed)?;
-        if unsafe {
-            renameat2(
-                AT_FDCWD,
-                old.as_ptr(),
-                AT_FDCWD,
-                new.as_ptr(),
-                RENAME_EXCHANGE,
-            )
-        } != 0
-        {
-            return Err(ResidentModelPersistenceError::Failed);
-        }
-        fs::remove_dir_all(staged).map_err(|_| ResidentModelPersistenceError::Failed)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        // Match the native Pi lifecycle: quarantine the old complete revision
-        // before publishing the new complete revision. This can leave neither
-        // directory published after interruption, which the lifecycle contract
-        // permits, but never exposes a partially staged revision.
-        let quarantine = destination.with_extension("replaced");
-        if quarantine.exists() {
-            fs::remove_dir_all(&quarantine).map_err(|_| ResidentModelPersistenceError::Failed)?;
-        }
-        fs::rename(destination, &quarantine).map_err(|_| ResidentModelPersistenceError::Failed)?;
-        fs::rename(staged, destination).map_err(|_| ResidentModelPersistenceError::Failed)
     }
 }
 
@@ -366,78 +237,13 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn replacement_keeps_a_destination_and_removes_the_stage() {
-        let root = temp_dir("replace");
-        let staged = root.join("staged");
-        let destination = root.join("revision");
-        fs::create_dir(&staged).unwrap();
-        fs::write(staged.join("value"), b"new").unwrap();
-        fs::create_dir(&destination).unwrap();
-        fs::write(destination.join("value"), b"old").unwrap();
-        NativeResidentModelLifecycleBoundary
-            .replace_revision(&staged, &destination)
-            .unwrap();
-        assert_eq!(fs::read(destination.join("value")).unwrap(), b"new");
-        assert!(!staged.exists());
-        fs::remove_dir_all(root).unwrap();
-    }
-    #[test]
     fn retry_wait_stops_promptly_when_cancelled_at_start() {
         let cancellation = NativeInstallCancellation::new();
         cancellation.cancel();
         let started = Instant::now();
-        let result = ResidentModelRetryWait::wait(
-            &mut NativeRetryWait,
-            Duration::from_secs(1),
-            &cancellation,
-        );
+        let result =
+            AsrRetryWait::wait(&mut NativeRetryWait, Duration::from_secs(1), &cancellation);
         assert!(!result);
         assert!(started.elapsed() < Duration::from_millis(100));
-    }
-
-    #[test]
-    fn native_resident_model_install_composition_is_compile_checked_without_network() {
-        use crate::llama::acquisition::{
-            ResidentModelAcquisitionLimits, ResidentModelAcquisitionRuntime,
-        };
-        use crate::llama::install::install_resident_model_revision;
-        use crate::llama::lifecycle::{
-            ResidentModelRevisionLifecycle, PINNED_RESIDENT_MODEL_REVISION,
-            RESIDENT_MODEL_REVISIONS,
-        };
-        use crate::model_acquisition_transport::NativeModelAcquisitionTransport;
-
-        let root = temp_dir("composition");
-        let missing_staging = root.join("missing-staging");
-        let lifecycle = ResidentModelRevisionLifecycle::new(
-            root.join("models"),
-            &RESIDENT_MODEL_REVISIONS,
-            &PINNED_RESIDENT_MODEL_REVISION,
-        )
-        .unwrap();
-        let mut transport = NativeModelAcquisitionTransport::new();
-        let clock = NativeAcquisitionClock::new();
-        let mut wait = NativeRetryWait;
-        let cancellation = NativeInstallCancellation::new();
-        let mut lock = NativeInstallLock::new(root.join("install.lock"));
-        let mut space = NativeAvailableSpace::new(&root);
-        let result = install_resident_model_revision(
-            &missing_staging,
-            "native-composition",
-            &PINNED_RESIDENT_MODEL_REVISION,
-            ResidentModelAcquisitionLimits::default(),
-            &mut transport,
-            ResidentModelAcquisitionRuntime {
-                clock: &clock,
-                retry_wait: &mut wait,
-            },
-            &cancellation,
-            &mut lock,
-            &mut space,
-            &lifecycle,
-            &NativeResidentModelLifecycleBoundary,
-        );
-        assert!(result.is_err());
-        fs::remove_dir_all(root).unwrap();
     }
 }

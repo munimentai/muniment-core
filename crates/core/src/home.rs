@@ -11,12 +11,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use crate::{
-    import_preview::ExtractedEntry,
-    llama::{
-        OnboardingTriageReport, OnboardingTriageReportError, ONBOARDING_TRIAGE_MAX_OUTPUT_BYTES,
-    },
-};
+use crate::import_preview::ExtractedEntry;
 
 const CONFIG_FILE: &str = "home.json";
 const HOME_DIRECTORIES: [&str; 4] = ["memory", "agents", "projects", "sessions"];
@@ -30,6 +25,88 @@ pub const ONBOARDING_IMPORT_MAX_DOCUMENT_BYTES: usize = 64 * 1024;
 pub const ONBOARDING_IMPORT_MAX_TOTAL_BYTES: usize = 256 * 1024;
 const ONBOARDING_IMPORT_LOCK_FILE: &str = ".onboarding-import.lock";
 const ONBOARDING_IMPORT_MAX_PLAN_WRITES: usize = ONBOARDING_IMPORT_MAX_ENTRIES + 4;
+const ONBOARDING_REPORT_MAX_BYTES: usize = 32 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OnboardingTriageReport {
+    pub user_type: String,
+    pub proposed_home_layout: String,
+    pub starter_agents: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardingTriageReportError {
+    TooLarge,
+    InvalidSections,
+    EmptySection,
+    InvalidStarterAgents,
+}
+
+impl OnboardingTriageReport {
+    pub fn parse(markdown: &str) -> Result<Self, OnboardingTriageReportError> {
+        if markdown.len() > ONBOARDING_REPORT_MAX_BYTES {
+            return Err(OnboardingTriageReportError::TooLarge);
+        }
+        const HEADINGS: [&str; 3] = [
+            "## User type",
+            "## Proposed Home layout",
+            "## Starter agents",
+        ];
+        let mut sections = [String::new(), String::new(), String::new()];
+        let mut next_heading = 0;
+        for raw_line in markdown.lines() {
+            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+            if is_level_two_atx_heading(line) {
+                if next_heading == HEADINGS.len() || line != HEADINGS[next_heading] {
+                    return Err(OnboardingTriageReportError::InvalidSections);
+                }
+                next_heading += 1;
+            } else if next_heading == 0 {
+                if !line.trim().is_empty() {
+                    return Err(OnboardingTriageReportError::InvalidSections);
+                }
+            } else {
+                sections[next_heading - 1].push_str(line);
+                sections[next_heading - 1].push('\n');
+            }
+        }
+        if next_heading != HEADINGS.len() {
+            return Err(OnboardingTriageReportError::InvalidSections);
+        }
+        let [user_type, proposed_home_layout, starter_agents_markdown] =
+            sections.map(|section| section.trim().to_owned());
+        if user_type.is_empty()
+            || proposed_home_layout.is_empty()
+            || starter_agents_markdown.is_empty()
+        {
+            return Err(OnboardingTriageReportError::EmptySection);
+        }
+        let starter_agents: Vec<_> = starter_agents_markdown
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| line.strip_prefix("- ").unwrap_or("").trim().to_owned())
+            .collect();
+        if !(2..=3).contains(&starter_agents.len()) || starter_agents.iter().any(String::is_empty) {
+            return Err(OnboardingTriageReportError::InvalidStarterAgents);
+        }
+        Ok(Self {
+            user_type,
+            proposed_home_layout,
+            starter_agents,
+        })
+    }
+}
+
+fn is_level_two_atx_heading(line: &str) -> bool {
+    let line = line.strip_prefix("   ").unwrap_or_else(|| {
+        line.strip_prefix("  ")
+            .or_else(|| line.strip_prefix(' '))
+            .unwrap_or(line)
+    });
+    line.strip_prefix("##")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t'))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -511,7 +588,7 @@ pub fn compile_onboarding_home_write_plan<T: OnboardingImportTimestamp>(
         })
         .and_then(|length| length.checked_add(report.starter_agents.len() - 1))
         .ok_or(OnboardingHomeWritePlanError::InvalidReport)?;
-    if report_len > ONBOARDING_TRIAGE_MAX_OUTPUT_BYTES {
+    if report_len > ONBOARDING_REPORT_MAX_BYTES {
         return Err(OnboardingHomeWritePlanError::InvalidReport);
     }
     let report_markdown = format!(

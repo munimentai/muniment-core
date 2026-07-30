@@ -1,5 +1,6 @@
 use chrono::NaiveDate;
 use muniment_core::{
+    home::OnboardingTriageReport,
     home::{
         compile_onboarding_home_write_plan, persist_onboarding_home_write_plan, scaffold_home,
         HomeWrite, OnboardingHomePersistenceError, OnboardingHomeWritePlan,
@@ -7,7 +8,6 @@ use muniment_core::{
         ONBOARDING_IMPORT_MAX_ENTRIES, ONBOARDING_IMPORT_MAX_TOTAL_BYTES,
     },
     import_preview::{EntryKind, ExtractedEntry},
-    llama::OnboardingTriageReport,
 };
 use std::{
     fs,

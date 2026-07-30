@@ -9,13 +9,6 @@ use crate::asr::acquisition::{
 use crate::kokoro::acquisition::{
     KokoroDownloadRequest, KokoroDownloadResponse, KokoroDownloadTransport, KokoroTransportError,
 };
-use crate::llama::acquisition::{
-    ResidentModelDownloadRequest, ResidentModelDownloadResponse, ResidentModelDownloadTransport,
-    ResidentModelTransportError,
-};
-use crate::llama::runtime::{
-    RuntimeArchiveError, RuntimeDownloadRequest, RuntimeDownloadResponse, RuntimeDownloadTransport,
-};
 use crate::sidecar::pi_install::{
     PiDownloadRequest, PiDownloadResponse, PiDownloadTransport, PiTransportError,
 };
@@ -25,13 +18,12 @@ const MAX_REDIRECTS: usize = 5;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HostPolicy {
     HuggingFace,
-    MunimentHuggingFace,
     GitHub,
 }
 
 pub type ModelResponseBody = Box<dyn Read + Send + Sync + 'static>;
 
-/// Production transport shared by the resident model and Parakeet state machines.
+/// Production transport shared by the pinned model state machines.
 pub struct NativeModelAcquisitionTransport {
     backend: Box<dyn HttpBackend>,
 }
@@ -98,34 +90,6 @@ impl NativeModelAcquisitionTransport {
     }
 }
 
-impl ResidentModelDownloadTransport for NativeModelAcquisitionTransport {
-    type Body = ModelResponseBody;
-
-    fn download(
-        &mut self,
-        request: &ResidentModelDownloadRequest,
-    ) -> Result<ResidentModelDownloadResponse<Self::Body>, ResidentModelTransportError> {
-        self.request(
-            request.url(),
-            HostPolicy::MunimentHuggingFace,
-            request.offset,
-            request.limits.connect_timeout,
-            request.limits.read_timeout,
-            request.limits.deadline,
-        )
-        .map(|response| ResidentModelDownloadResponse {
-            status: response.status,
-            content_range: response.content_range,
-            body: response.body,
-        })
-        .map_err(|error| match error {
-            TransportFailure::Transient => ResidentModelTransportError::Transient,
-            TransportFailure::Unavailable => ResidentModelTransportError::Unavailable,
-            TransportFailure::Rejected => ResidentModelTransportError::Rejected,
-        })
-    }
-}
-
 impl AsrDownloadTransport for NativeModelAcquisitionTransport {
     type Body = ModelResponseBody;
 
@@ -179,30 +143,6 @@ impl KokoroDownloadTransport for NativeModelAcquisitionTransport {
             TransportFailure::Unavailable => KokoroTransportError::Unavailable,
             TransportFailure::Rejected => KokoroTransportError::Rejected,
         })
-    }
-}
-
-impl RuntimeDownloadTransport for NativeModelAcquisitionTransport {
-    type Body = ModelResponseBody;
-
-    fn download(
-        &mut self,
-        request: &RuntimeDownloadRequest,
-    ) -> Result<RuntimeDownloadResponse<Self::Body>, RuntimeArchiveError> {
-        self.request(
-            request.url(),
-            HostPolicy::GitHub,
-            request.offset,
-            request.connect_timeout,
-            request.read_timeout,
-            request.deadline,
-        )
-        .map(|response| RuntimeDownloadResponse {
-            status: response.status,
-            content_range: response.content_range,
-            body: response.body,
-        })
-        .map_err(|_| RuntimeArchiveError::Download)
     }
 }
 
@@ -358,14 +298,10 @@ where
 fn checked_initial_url(value: &str, host_policy: HostPolicy) -> Result<url::Url, TransportFailure> {
     let parsed = url::Url::parse(value).map_err(|_| TransportFailure::Rejected)?;
     let expected_host = match host_policy {
-        HostPolicy::HuggingFace | HostPolicy::MunimentHuggingFace => "huggingface.co",
+        HostPolicy::HuggingFace => "huggingface.co",
         HostPolicy::GitHub => "github.com",
     };
     if !has_secure_origin(&parsed) || parsed.host_str() != Some(expected_host) {
-        return Err(TransportFailure::Rejected);
-    }
-    if host_policy == HostPolicy::MunimentHuggingFace && !parsed.path().starts_with("/munimentai/")
-    {
         return Err(TransportFailure::Rejected);
     }
     Ok(parsed)
@@ -378,7 +314,7 @@ fn checked_redirect_url(
     let parsed = url::Url::parse(value).map_err(|_| TransportFailure::Rejected)?;
     let host = parsed.host_str().unwrap_or_default();
     let allowed_host = match host_policy {
-        HostPolicy::HuggingFace | HostPolicy::MunimentHuggingFace => {
+        HostPolicy::HuggingFace => {
             host_equals_or_has_dot_suffix(host, "hf.co")
                 || host_equals_or_has_dot_suffix(host, "huggingface.co")
         }
@@ -420,8 +356,6 @@ fn parse_content_range(value: &str) -> Result<Option<(u64, u64, u64)>, Transport
 mod tests {
     use super::*;
     use crate::asr::acquisition::AsrAcquisitionLimits;
-    use crate::llama::acquisition::ResidentModelAcquisitionLimits;
-    use crate::llama::RESIDENT_MODEL;
     use std::collections::VecDeque;
     use std::io::Cursor;
 
@@ -464,19 +398,6 @@ mod tests {
         })
     }
 
-    fn resident_model_request() -> ResidentModelDownloadRequest {
-        ResidentModelDownloadRequest::for_transport_test(
-            "https://huggingface.co/munimentai/repo/resolve/revision/model?secret=value".into(),
-            7,
-            ResidentModelAcquisitionLimits {
-                connect_timeout: Duration::from_secs(10),
-                read_timeout: Duration::from_secs(30),
-                deadline: Duration::from_secs(5),
-                max_attempts: 1,
-            },
-        )
-    }
-
     fn asr_request() -> AsrDownloadRequest {
         AsrDownloadRequest::for_transport_test(
             "https://huggingface.co/repo/resolve/revision/model?secret=value".into(),
@@ -502,19 +423,6 @@ mod tests {
                 max_attempts: 1,
             },
         )
-    }
-
-    #[test]
-    fn resident_model_adapter_streams_200() {
-        let mut transport = transport(vec![Ok(reply(200, None, None, b"streamed"))]);
-        let mut response =
-            ResidentModelDownloadTransport::download(&mut transport, &resident_model_request())
-                .unwrap();
-        assert_eq!(response.status, 200);
-        assert_eq!(response.content_range, None);
-        let mut bytes = Vec::new();
-        response.body.read_to_end(&mut bytes).unwrap();
-        assert_eq!(bytes, b"streamed");
     }
 
     #[test]
@@ -595,29 +503,13 @@ mod tests {
     }
 
     #[test]
-    fn both_adapters_map_status_and_transport_failures() {
-        let mut resident_model = transport(vec![Ok(reply(503, None, None, b"private body"))]);
-        assert!(matches!(
-            ResidentModelDownloadTransport::download(
-                &mut resident_model,
-                &resident_model_request()
-            ),
-            Err(ResidentModelTransportError::Transient)
-        ));
+    fn asr_adapter_maps_status_and_transport_failures() {
         let mut asr = transport(vec![Err(TransportFailure::Transient)]);
         assert!(matches!(
             AsrDownloadTransport::download(&mut asr, &asr_request()),
             Err(AsrTransportError::Transient)
         ));
         for status in [404, 410] {
-            let mut resident_model = transport(vec![Ok(reply(status, None, None, b"secret body"))]);
-            assert!(matches!(
-                ResidentModelDownloadTransport::download(
-                    &mut resident_model,
-                    &resident_model_request()
-                ),
-                Err(ResidentModelTransportError::Unavailable)
-            ));
             let mut asr = transport(vec![Ok(reply(status, None, None, b"secret body"))]);
             assert!(matches!(
                 AsrDownloadTransport::download(&mut asr, &asr_request()),
@@ -628,19 +520,6 @@ mod tests {
 
     #[test]
     fn rejects_downgrade_and_unrelated_redirects() {
-        let mut resident_model = transport(vec![Ok(reply(
-            302,
-            Some("http://huggingface.co/file"),
-            None,
-            b"",
-        ))]);
-        assert!(matches!(
-            ResidentModelDownloadTransport::download(
-                &mut resident_model,
-                &resident_model_request()
-            ),
-            Err(ResidentModelTransportError::Rejected)
-        ));
         let mut asr = transport(vec![Ok(reply(
             302,
             Some("https://example.com/file"),
@@ -664,10 +543,7 @@ mod tests {
             )),
             Ok(reply(200, None, None, b"streamed")),
         ]);
-        let result = ResidentModelDownloadTransport::download(
-            &mut allowed_transport,
-            &resident_model_request(),
-        );
+        let result = AsrDownloadTransport::download(&mut allowed_transport, &asr_request());
         assert!(result.is_ok());
         let mut transport = transport(vec![Ok(reply(
             302,
@@ -722,50 +598,6 @@ mod tests {
         assert_eq!(
             checked_initial_url("https://us.aws.cdn.hf.co/file", HostPolicy::HuggingFace),
             Err(TransportFailure::Rejected)
-        );
-    }
-
-    #[test]
-    fn resident_model_initial_url_rejects_another_namespace() {
-        let other_namespace = RESIDENT_MODEL
-            .source_url
-            .replace("/munimentai/", "/another-account/");
-
-        assert_eq!(
-            checked_initial_url(&other_namespace, HostPolicy::MunimentHuggingFace),
-            Err(TransportFailure::Rejected)
-        );
-    }
-
-    #[cfg(feature = "network-tests")]
-    #[test]
-    fn resident_model_redirect_matches_redirect_policy() {
-        let initial_url =
-            checked_initial_url(RESIDENT_MODEL.source_url, HostPolicy::MunimentHuggingFace)
-                .unwrap();
-        let agent = ureq::AgentBuilder::new()
-            .redirects(0)
-            .https_only(true)
-            .try_proxy_from_env(true)
-            .build();
-        let response = match agent.head(initial_url.as_str()).call() {
-            Ok(response) | Err(ureq::Error::Status(_, response)) => response,
-            Err(error) => panic!("resident model HEAD failed: {error}"),
-        };
-        assert!(
-            matches!(response.status(), 301 | 302 | 303 | 307 | 308),
-            "resident model HEAD returned {}",
-            response.status()
-        );
-        let location = response
-            .header("Location")
-            .expect("resident model redirect lacks a Location header");
-        let redirect_url = initial_url
-            .join(location)
-            .expect("resident model Location header is invalid");
-        assert_eq!(
-            checked_redirect_url(redirect_url.as_str(), HostPolicy::HuggingFace),
-            Ok(redirect_url)
         );
     }
 }

@@ -222,8 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn one_contract_installs_resident_model_and_parakeet_fixtures() {
-        successful_fixture_install("gemma", 1);
+    fn one_contract_installs_parakeet_fixtures() {
         successful_fixture_install("parakeet", 4);
     }
 
