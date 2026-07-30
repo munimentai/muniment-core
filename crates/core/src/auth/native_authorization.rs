@@ -1,5 +1,6 @@
 //! Installation-bound start of Muniment's native browser authorization.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
@@ -349,7 +350,7 @@ pub fn begin_native_authorization(
         .iter()
         .filter(|(key, _)| key.as_str() != "device_proof")
         .map(|(key, value)| (key.clone(), value.clone()))
-        .collect::<serde_json::Map<_, _>>();
+        .collect::<BTreeMap<_, _>>();
     let canonical = serde_json::to_vec(&unsigned).expect("JSON values serialize");
     let body_hash = Sha256::digest(canonical);
     let transcript = format!(
@@ -563,8 +564,13 @@ mod tests {
             .iter()
             .filter(|(key, _)| key.as_str() != "device_proof")
             .map(|(key, value)| (key.clone(), value.clone()))
-            .collect::<serde_json::Map<_, _>>();
-        let hash = Sha256::digest(serde_json::to_vec(&unsigned).unwrap());
+            .collect::<BTreeMap<_, _>>();
+        let unsigned_body = serde_json::to_vec(&unsigned).unwrap();
+        assert_eq!(
+            unsigned_body,
+            br#"{"client_id":"muniment-desktop","client_role":"desktop","code_challenge":"CgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgo","code_challenge_method":"S256","device_id":"10000000-0000-4000-8000-000000000001","redirect_uri":"http://127.0.0.1:49152/callback","registration_token":"CAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg","response_type":"code","state":"fixed-state"}"#
+        );
+        let hash = Sha256::digest(unsigned_body);
         let transcript = format!(
             "MUNIMENT-NATIVE-V1\nPOST\n/v1/auth/native/authorize\n{}\n{}\n{}\n{}",
             hex_lower(&hash),

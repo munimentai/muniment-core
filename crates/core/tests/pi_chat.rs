@@ -702,9 +702,11 @@ fn transport_send_completes_while_call_waits() {
     while !capture.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
+    let captured: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(capture).unwrap()).unwrap();
     assert_eq!(
-        fs::read_to_string(capture).unwrap(),
-        "{\"confirmed\":true,\"id\":\"gate-1\",\"type\":\"extension_ui_response\"}\n"
+        captured,
+        json!({"type":"extension_ui_response", "id":"gate-1", "confirmed":true})
     );
     assert!(call.join().unwrap().is_err());
     supervisor.shutdown().unwrap();
