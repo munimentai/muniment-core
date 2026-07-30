@@ -352,7 +352,15 @@ pub fn extract_selected_zip_entries(
 fn open_validated_archive(
     archive_path: &Path,
 ) -> Result<(BoundedArchiveReader, String), PreviewErrorKind> {
+    open_validated_archive_with_open_hook(archive_path, || {})
+}
+
+fn open_validated_archive_with_open_hook(
+    archive_path: &Path,
+    after_open: impl FnOnce(),
+) -> Result<(BoundedArchiveReader, String), PreviewErrorKind> {
     let mut file = open_archive_no_follow(archive_path)?;
+    after_open();
     validate_opened_archive(&file)?;
 
     let mut hasher = Sha256::new();
@@ -405,7 +413,7 @@ fn open_archive_no_follow(path: &Path) -> Result<File, PreviewErrorKind> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     #[cfg(windows)]
     {
@@ -413,10 +421,23 @@ fn open_archive_no_follow(path: &Path) -> Result<File, PreviewErrorKind> {
         use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    options.open(path).map_err(|error| match error.kind() {
-        std::io::ErrorKind::NotFound => PreviewErrorKind::NotFound,
-        _ => PreviewErrorKind::Io,
+    options.open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound || is_symlink_open_error(&error) {
+            PreviewErrorKind::NotFound
+        } else {
+            PreviewErrorKind::Io
+        }
     })
+}
+
+#[cfg(unix)]
+fn is_symlink_open_error(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ELOOP)
+}
+
+#[cfg(not(unix))]
+fn is_symlink_open_error(_error: &std::io::Error) -> bool {
+    false
 }
 
 struct BoundedArchiveReader {
@@ -518,10 +539,22 @@ fn excerpt_of(text: &str) -> (String, bool) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
+
+    fn build_zip(path: &Path, name: &str, body: &[u8]) {
+        let mut writer = ZipWriter::new(File::create(path).unwrap());
+        writer
+            .start_file(name, SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(body).unwrap();
+        writer.finish().unwrap();
+    }
 
     #[test]
-    fn validation_uses_opened_object_after_path_replacement() {
+    fn path_replacement_after_open_cannot_redirect_preview() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -532,17 +565,26 @@ mod tests {
         ));
         std::fs::create_dir(&directory).unwrap();
         let path = directory.join("export.zip");
-        std::fs::write(&path, b"opened object").unwrap();
+        let original = directory.join("original.zip");
+        let alternate = directory.join("alternate.zip");
+        build_zip(&path, "original.txt", b"opened file");
+        build_zip(&alternate, "alternate.txt", b"redirected file");
 
-        let opened = open_archive_no_follow(&path).unwrap();
-        std::fs::rename(&path, directory.join("original.zip")).unwrap();
-        let replacement = File::create(&path).unwrap();
-        replacement.set_len(MAX_ARCHIVE_BYTES + 1).unwrap();
+        let (reader, _) = open_validated_archive_with_open_hook(&path, || {
+            std::fs::rename(&path, &original).unwrap();
+            std::os::unix::fs::symlink(&alternate, &path).unwrap();
+        })
+        .unwrap();
+        let mut archive = zip::ZipArchive::new(reader).unwrap();
+        let mut member = archive.by_index(0).unwrap();
+        let mut body = String::new();
+        member.read_to_string(&mut body).unwrap();
 
-        assert_eq!(validate_opened_archive(&opened), Ok(()));
+        assert_eq!(member.name(), "original.txt");
+        assert_eq!(body, "opened file");
         assert_eq!(
             open_validated_archive(&path).map(|_| ()),
-            Err(PreviewErrorKind::ArchiveTooLarge)
+            Err(PreviewErrorKind::NotFound)
         );
         std::fs::remove_dir_all(directory).unwrap();
     }
