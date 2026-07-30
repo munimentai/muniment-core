@@ -1,7 +1,8 @@
 #![cfg(target_os = "linux")]
 
 use muniment_core::attach::linux::{
-    run_authenticated_session_with, run_authenticated_session_with_authorization,
+    approval_waiter_with_claims, run_authenticated_session_with,
+    run_authenticated_session_with_authorization,
     run_authenticated_session_with_service_and_approvals, ApprovalDecision, AttachSessionError,
     AuthorizationSessionDependencies, CompanionProvenance, PeerCredentials,
     PermissionAnswerAccepted, PermissionAnswerRequest, RedactedThreadSummary, RunStartAccepted,
@@ -64,11 +65,22 @@ fn hello_for_client_with_credential(
     client_id: &str,
     credential: Option<&str>,
 ) -> Vec<u8> {
+    hello_with_claims(min, max, client_id, credential, "cli", "1.0.0")
+}
+
+fn hello_with_claims(
+    min: u32,
+    max: u32,
+    client_id: &str,
+    credential: Option<&str>,
+    kind: &str,
+    version: &str,
+) -> Vec<u8> {
     encode_frame(&Hello {
         protocol: Protocol,
         client: muniment_core::attach::Client {
-            kind: "cli".into(),
-            version: "1.0.0".into(),
+            kind: kind.into(),
+            version: version.into(),
         },
         supported: VersionRange { min, max },
         client_nonce: "client-nonce".into(),
@@ -553,9 +565,16 @@ fn approval_continues_into_dispatch() {
                 },
                 clock,
                 tokens: TestTokens(1),
-                approvals: |_: &muniment_core::attach::PairingChallenge, _: Duration| {
-                    Some(ApprovalDecision::Approve(approval()))
-                },
+                approvals: approval_waiter_with_claims(
+                    |_: &muniment_core::attach::PairingChallenge,
+                     kind: &str,
+                     version: &str,
+                     _: Duration| {
+                        assert_eq!(kind, "cli");
+                        assert_eq!(version, "1.0.0");
+                        Some(ApprovalDecision::Approve(approval()))
+                    },
+                ),
             },
             &mut service,
         ),
@@ -570,6 +589,50 @@ fn approval_continues_into_dispatch() {
     let response: Response = read_frame(&mut client);
     assert_eq!(response.request_id, Id::new(format!("{:032x}", 1)).unwrap());
     assert_eq!(client.read(&mut [0]).unwrap(), 0);
+}
+
+#[test]
+fn hostile_companion_claim_reaches_approval_waiter_without_authority() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let hostile_kind = format!("acp\u{0000}{}", "x".repeat(100));
+    client
+        .write_all(&hello_with_claims(
+            1,
+            1,
+            "018f0000-0000-7000-8000-000000000099",
+            None,
+            &hostile_kind,
+            "\u{001b}[31m",
+        ))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let result = run_authenticated_session_with_authorization(
+        server,
+        credentials(),
+        "0.1.0",
+        Duration::from_secs(1),
+        AuthorizationSessionDependencies {
+            fill_random: |bytes: &mut [u8]| {
+                bytes.fill(9);
+                Ok(())
+            },
+            clock: TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            tokens: TestTokens(1),
+            approvals: approval_waiter_with_claims(
+                |_: &muniment_core::attach::PairingChallenge,
+                 kind: &str,
+                 version: &str,
+                 _: Duration| {
+                    assert_eq!(kind, hostile_kind);
+                    assert_eq!(version, "\u{001b}[31m");
+                    Some(ApprovalDecision::Deny)
+                },
+            ),
+        },
+        &mut unavailable_service,
+    );
+    assert_eq!(result, Ok(()));
+    let _: Welcome = read_frame(&mut client);
 }
 
 #[test]

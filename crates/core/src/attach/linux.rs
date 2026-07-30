@@ -335,6 +335,8 @@ pub trait ApprovalWaiter {
     fn wait(
         &mut self,
         challenge: &super::PairingChallenge,
+        claimed_kind: &str,
+        claimed_version: &str,
         remaining: Duration,
     ) -> Option<ApprovalDecision>;
 }
@@ -346,9 +348,32 @@ where
     fn wait(
         &mut self,
         challenge: &super::PairingChallenge,
+        _: &str,
+        _: &str,
         remaining: Duration,
     ) -> Option<ApprovalDecision> {
         self(challenge, remaining)
+    }
+}
+
+pub struct ClaimedApprovalWaiter<F>(F);
+
+pub fn approval_waiter_with_claims<F>(waiter: F) -> ClaimedApprovalWaiter<F> {
+    ClaimedApprovalWaiter(waiter)
+}
+
+impl<F> ApprovalWaiter for ClaimedApprovalWaiter<F>
+where
+    F: FnMut(&super::PairingChallenge, &str, &str, Duration) -> Option<ApprovalDecision>,
+{
+    fn wait(
+        &mut self,
+        challenge: &super::PairingChallenge,
+        claimed_kind: &str,
+        claimed_version: &str,
+        remaining: Duration,
+    ) -> Option<ApprovalDecision> {
+        (self.0)(challenge, claimed_kind, claimed_version, remaining)
     }
 }
 
@@ -936,7 +961,7 @@ where
             client_nonce,
             server_nonce: server_nonce.clone(),
             companion_identity: format!("{}:{}", credentials.uid, credentials.pid),
-            companion_kind,
+            companion_kind: companion_kind.clone(),
         };
         let reconnect = authorized_client_credential
             .as_deref()
@@ -979,7 +1004,7 @@ where
             None => {
                 let remaining = challenge_expires_at.saturating_sub(clock.now());
                 let Some(ApprovalDecision::Approve(approval)) =
-                    approvals.wait(&challenge, remaining)
+                    approvals.wait(&challenge, &companion_kind, &companion_version, remaining)
                 else {
                     return Ok(());
                 };
@@ -995,9 +1020,12 @@ where
             })?;
         if reconnect_credential.is_none() {
             // Reject one already-queued repeat action against the consumed challenge.
-            if let Some(ApprovalDecision::Approve(approval)) =
-                approvals.wait(&challenge, Duration::ZERO)
-            {
+            if let Some(ApprovalDecision::Approve(approval)) = approvals.wait(
+                &challenge,
+                &companion_kind,
+                &companion_version,
+                Duration::ZERO,
+            ) {
                 if authorization.approve(&challenge, approval)
                     != Err(AuthorizationError::ChallengeConsumed)
                 {
