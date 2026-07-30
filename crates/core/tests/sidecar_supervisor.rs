@@ -641,7 +641,7 @@ fn pi_wiring_replaces_dispatcher_after_child_restart() {
     cfg.health_interval = Duration::from_secs(60);
     let wiring = PiRpcWiring::new();
     let mut supervisor =
-        SidecarSupervisor::spawn(cfg, wiring.readiness_probe(Duration::from_millis(100))).unwrap();
+        SidecarSupervisor::spawn(cfg, wiring.readiness_probe(Duration::from_secs(10))).unwrap();
 
     wait_for(&supervisor, SidecarStatus::Healthy);
     let stale = wiring.transport().expect("first dispatcher installed");

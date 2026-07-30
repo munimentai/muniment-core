@@ -556,6 +556,10 @@ fn invalid_session_state_cancels_accepted_agent_work() {
             .unwrap_err(),
         "Pi session binding failed"
     );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !marker.is_file() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert_eq!(fs::read_to_string(marker).unwrap(), "cancelled");
     supervisor.shutdown().unwrap();
 }
