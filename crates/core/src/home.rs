@@ -25,88 +25,6 @@ pub const ONBOARDING_IMPORT_MAX_DOCUMENT_BYTES: usize = 64 * 1024;
 pub const ONBOARDING_IMPORT_MAX_TOTAL_BYTES: usize = 256 * 1024;
 const ONBOARDING_IMPORT_LOCK_FILE: &str = ".onboarding-import.lock";
 const ONBOARDING_IMPORT_MAX_PLAN_WRITES: usize = ONBOARDING_IMPORT_MAX_ENTRIES + 4;
-const ONBOARDING_REPORT_MAX_BYTES: usize = 32 * 1024;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OnboardingTriageReport {
-    pub user_type: String,
-    pub proposed_home_layout: String,
-    pub starter_agents: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OnboardingTriageReportError {
-    TooLarge,
-    InvalidSections,
-    EmptySection,
-    InvalidStarterAgents,
-}
-
-impl OnboardingTriageReport {
-    pub fn parse(markdown: &str) -> Result<Self, OnboardingTriageReportError> {
-        if markdown.len() > ONBOARDING_REPORT_MAX_BYTES {
-            return Err(OnboardingTriageReportError::TooLarge);
-        }
-        const HEADINGS: [&str; 3] = [
-            "## User type",
-            "## Proposed Home layout",
-            "## Starter agents",
-        ];
-        let mut sections = [String::new(), String::new(), String::new()];
-        let mut next_heading = 0;
-        for raw_line in markdown.lines() {
-            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-            if is_level_two_atx_heading(line) {
-                if next_heading == HEADINGS.len() || line != HEADINGS[next_heading] {
-                    return Err(OnboardingTriageReportError::InvalidSections);
-                }
-                next_heading += 1;
-            } else if next_heading == 0 {
-                if !line.trim().is_empty() {
-                    return Err(OnboardingTriageReportError::InvalidSections);
-                }
-            } else {
-                sections[next_heading - 1].push_str(line);
-                sections[next_heading - 1].push('\n');
-            }
-        }
-        if next_heading != HEADINGS.len() {
-            return Err(OnboardingTriageReportError::InvalidSections);
-        }
-        let [user_type, proposed_home_layout, starter_agents_markdown] =
-            sections.map(|section| section.trim().to_owned());
-        if user_type.is_empty()
-            || proposed_home_layout.is_empty()
-            || starter_agents_markdown.is_empty()
-        {
-            return Err(OnboardingTriageReportError::EmptySection);
-        }
-        let starter_agents: Vec<_> = starter_agents_markdown
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| line.strip_prefix("- ").unwrap_or("").trim().to_owned())
-            .collect();
-        if !(2..=3).contains(&starter_agents.len()) || starter_agents.iter().any(String::is_empty) {
-            return Err(OnboardingTriageReportError::InvalidStarterAgents);
-        }
-        Ok(Self {
-            user_type,
-            proposed_home_layout,
-            starter_agents,
-        })
-    }
-}
-
-fn is_level_two_atx_heading(line: &str) -> bool {
-    let line = line.strip_prefix("   ").unwrap_or_else(|| {
-        line.strip_prefix("  ")
-            .or_else(|| line.strip_prefix(' '))
-            .unwrap_or(line)
-    });
-    line.strip_prefix("##")
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t'))
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -158,12 +76,11 @@ impl OnboardingImportTimestamp for &str {
     }
 }
 
-/// Stable failure modes for compiling a confirmed onboarding proposal.
+/// Stable failure modes for compiling approved onboarding files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnboardingHomeWritePlanError {
     EmptyInput,
     InvalidTimestamp,
-    InvalidReport,
     UnsafeMetadata,
     TooManyEntries,
     DocumentBytesExceeded,
@@ -176,7 +93,6 @@ impl fmt::Display for OnboardingHomeWritePlanError {
         let message = match self {
             Self::EmptyInput => "The onboarding import input is empty.",
             Self::InvalidTimestamp => "The onboarding import timestamp is invalid.",
-            Self::InvalidReport => "The onboarding report is invalid.",
             Self::UnsafeMetadata => "The onboarding import metadata is unsafe.",
             Self::TooManyEntries => "The onboarding import contains too many entries.",
             Self::DocumentBytesExceeded => "An onboarding import document is too large.",
@@ -553,7 +469,6 @@ fn sync_open_directory(_directory: &Dir) -> io::Result<()> {
 
 /// Compiles complete, bounded Markdown writes without accessing the filesystem.
 pub fn compile_onboarding_home_write_plan<T: OnboardingImportTimestamp>(
-    report: &OnboardingTriageReport,
     approved_entries: &[ExtractedEntry],
     import_timestamp: T,
 ) -> Result<OnboardingHomeWritePlan, OnboardingHomeWritePlanError> {
@@ -561,54 +476,6 @@ pub fn compile_onboarding_home_write_plan<T: OnboardingImportTimestamp>(
         .import_date()?
         .format("%Y-%m-%d")
         .to_string();
-    if report.user_type.trim().is_empty()
-        || report.proposed_home_layout.trim().is_empty()
-        || report.starter_agents.is_empty()
-        || report
-            .starter_agents
-            .iter()
-            .any(|agent| agent.trim().is_empty())
-    {
-        return Err(OnboardingHomeWritePlanError::EmptyInput);
-    }
-    if !(2..=3).contains(&report.starter_agents.len()) {
-        return Err(OnboardingHomeWritePlanError::InvalidReport);
-    }
-    let report_len = "## User type\n\n\n\n## Proposed Home layout\n\n\n\n## Starter agents\n\n\n"
-        .len()
-        .checked_add(report.user_type.len())
-        .and_then(|length| length.checked_add(report.proposed_home_layout.len()))
-        .and_then(|length| {
-            report
-                .starter_agents
-                .iter()
-                .try_fold(length, |length, agent| {
-                    length.checked_add(2)?.checked_add(agent.len())
-                })
-        })
-        .and_then(|length| length.checked_add(report.starter_agents.len() - 1))
-        .ok_or(OnboardingHomeWritePlanError::InvalidReport)?;
-    if report_len > ONBOARDING_REPORT_MAX_BYTES {
-        return Err(OnboardingHomeWritePlanError::InvalidReport);
-    }
-    let report_markdown = format!(
-        "## User type\n\n{}\n\n## Proposed Home layout\n\n{}\n\n## Starter agents\n\n{}\n",
-        report.user_type,
-        report.proposed_home_layout,
-        report
-            .starter_agents
-            .iter()
-            .map(|agent| format!("- {agent}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-    match OnboardingTriageReport::parse(&report_markdown) {
-        Ok(parsed) if parsed == *report => {}
-        Err(OnboardingTriageReportError::EmptySection) => {
-            return Err(OnboardingHomeWritePlanError::EmptyInput);
-        }
-        _ => return Err(OnboardingHomeWritePlanError::InvalidReport),
-    }
     if approved_entries.is_empty()
         || approved_entries.iter().any(|entry| {
             entry.source_name.trim().is_empty()
@@ -622,28 +489,8 @@ pub fn compile_onboarding_home_write_plan<T: OnboardingImportTimestamp>(
         return Err(OnboardingHomeWritePlanError::TooManyEntries);
     }
 
-    let mut destinations =
-        Vec::with_capacity(1 + report.starter_agents.len() + approved_entries.len());
-    destinations.push(format!("memory/onboarding-report-{import_date}.md"));
+    let mut destinations = Vec::with_capacity(approved_entries.len());
     let mut total_bytes = 0;
-    add_payload_len(&mut total_bytes, report_markdown.len())?;
-
-    for (index, agent) in report.starter_agents.iter().enumerate() {
-        reject_unsafe_metadata(agent)?;
-        let mut identity = agent.as_bytes().to_vec();
-        identity.extend_from_slice(&(index as u64).to_be_bytes());
-        destinations.push(format!(
-            "agents/agent-{}-{}.md",
-            safe_slug(agent),
-            short_digest(&identity)
-        ));
-        add_payload_len(
-            &mut total_bytes,
-            3usize
-                .checked_add(agent.len())
-                .ok_or(OnboardingHomeWritePlanError::DocumentBytesExceeded)?,
-        )?;
-    }
 
     for (index, entry) in approved_entries.iter().enumerate() {
         reject_unsafe_metadata(&entry.source_name)?;
@@ -681,16 +528,6 @@ pub fn compile_onboarding_home_write_plan<T: OnboardingImportTimestamp>(
 
     let mut writes = Vec::with_capacity(destinations.len());
     let mut destinations = destinations.into_iter();
-    writes.push(HomeWrite {
-        relative_path: destinations.next().expect("report destination exists"),
-        contents: report_markdown,
-    });
-    for agent in &report.starter_agents {
-        writes.push(HomeWrite {
-            relative_path: destinations.next().expect("agent destination exists"),
-            contents: format!("# {agent}\n"),
-        });
-    }
     for entry in approved_entries {
         let mut contents = format!(
             "---\nsource: {}\nimport_date: {}\n---\n",
@@ -794,14 +631,6 @@ mod onboarding_write_plan_tests {
 
     const TIMESTAMP: &str = "2026-07-21T15:04:05Z";
 
-    fn report() -> OnboardingTriageReport {
-        OnboardingTriageReport {
-            user_type: "Independent researcher".to_owned(),
-            proposed_home_layout: "Organize work by topic.".to_owned(),
-            starter_agents: vec!["Research Scout".to_owned(), "Writing Partner".to_owned()],
-        }
-    }
-
     fn entry(name: &str, provenance: &str, text: &str) -> ExtractedEntry {
         ExtractedEntry {
             source_name: name.to_owned(),
@@ -814,39 +643,29 @@ mod onboarding_write_plan_tests {
     #[test]
     fn plans_are_ordered_serializable_and_byte_deterministic() {
         let entries = vec![entry("notes.md", "export:notes.md", "Hello\n")];
-        let first = compile_onboarding_home_write_plan(&report(), &entries, TIMESTAMP).unwrap();
-        let second = compile_onboarding_home_write_plan(&report(), &entries, TIMESTAMP).unwrap();
+        let first = compile_onboarding_home_write_plan(&entries, TIMESTAMP).unwrap();
+        let second = compile_onboarding_home_write_plan(&entries, TIMESTAMP).unwrap();
 
         assert_eq!(first, second);
         assert_eq!(
             serde_json::to_vec(&first).unwrap(),
             serde_json::to_vec(&second).unwrap()
         );
-        assert_eq!(
-            first.writes[0].relative_path,
-            "memory/onboarding-report-2026-07-21.md"
-        );
-        assert!(first.writes[1].relative_path.starts_with("agents/"));
-        assert!(first.writes[2].relative_path.starts_with("agents/"));
-        assert!(first.writes[3].relative_path.starts_with("memory/imports/"));
+        assert_eq!(first.writes.len(), 1);
+        assert!(first.writes[0].relative_path.starts_with("memory/imports/"));
     }
 
     #[test]
     fn duplicate_and_path_like_names_are_safely_disambiguated() {
-        let mut report = report();
-        report.starter_agents = vec!["CON/../Scout".to_owned(), "con\\..\\scout".to_owned()];
         let entries = vec![
             entry("../../CON.md", "export:first", "one"),
             entry("../../CON.md", "export:second", "two"),
         ];
-        let plan = compile_onboarding_home_write_plan(&report, &entries, TIMESTAMP).unwrap();
+        let plan = compile_onboarding_home_write_plan(&entries, TIMESTAMP).unwrap();
         let mut case_folded = BTreeSet::new();
 
         for write in &plan.writes {
-            assert!(
-                write.relative_path.starts_with("memory/")
-                    || write.relative_path.starts_with("agents/")
-            );
+            assert!(write.relative_path.starts_with("memory/imports/"));
             assert!(!write.relative_path.contains(".."));
             assert!(!write.relative_path.contains('\\'));
             assert!(case_folded.insert(write.relative_path.to_ascii_lowercase()));
@@ -858,7 +677,6 @@ mod onboarding_write_plan_tests {
         let original = "Unicode: café 🦀\n\n---\nmultiline\r\n";
         let provenance = "archive.zip\n---\nsource: forged\nquote: \"yes\"";
         let plan = compile_onboarding_home_write_plan(
-            &report(),
             &[entry("memory.md", provenance, original)],
             TIMESTAMP,
         )
@@ -879,12 +697,11 @@ mod onboarding_write_plan_tests {
     fn rejects_invalid_timestamp_and_unsafe_metadata() {
         let entries = [entry("notes.md", "export:notes.md", "text")];
         assert_eq!(
-            compile_onboarding_home_write_plan(&report(), &entries, "2026-07-21"),
+            compile_onboarding_home_write_plan(&entries, "2026-07-21"),
             Err(OnboardingHomeWritePlanError::InvalidTimestamp)
         );
         assert_eq!(
             compile_onboarding_home_write_plan(
-                &report(),
                 &[entry("notes.md", "bad\0source", "text")],
                 TIMESTAMP,
             ),
@@ -898,14 +715,13 @@ mod onboarding_write_plan_tests {
             .map(|index| entry(&format!("{index}.md"), &format!("source:{index}"), "x"))
             .collect::<Vec<_>>();
         assert_eq!(
-            compile_onboarding_home_write_plan(&report(), &too_many, TIMESTAMP),
+            compile_onboarding_home_write_plan(&too_many, TIMESTAMP),
             Err(OnboardingHomeWritePlanError::TooManyEntries)
         );
 
         let oversized = "é".repeat(ONBOARDING_IMPORT_MAX_DOCUMENT_BYTES / 2);
         assert_eq!(
             compile_onboarding_home_write_plan(
-                &report(),
                 &[entry("large.md", "source:large", &oversized)],
                 TIMESTAMP,
             ),
@@ -922,7 +738,7 @@ mod onboarding_write_plan_tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(
-            compile_onboarding_home_write_plan(&report(), &aggregate, TIMESTAMP),
+            compile_onboarding_home_write_plan(&aggregate, TIMESTAMP),
             Err(OnboardingHomeWritePlanError::TotalBytesExceeded)
         );
     }
