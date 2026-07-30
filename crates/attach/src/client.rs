@@ -292,6 +292,12 @@ mod linux {
         pending_messages: VecDeque<RunStreamMessage>,
     }
 
+    struct ClientIdentity<'a> {
+        kind: &'a str,
+        id: &'a str,
+        credential: Option<&'a str>,
+    }
+
     /// An authorization bound to the connection on which pairing completed.
     pub struct AuthorizedClient {
         stream: UnixStream,
@@ -1007,33 +1013,50 @@ mod linux {
 
     pub fn handshake(
         client_version: &str,
+        client_kind: &str,
         pairing_pending: impl FnOnce(),
     ) -> Result<AuthorizedClient, ClientError> {
         let identity = fresh_request_id()?;
-        handshake_as(client_version, identity.as_str(), pairing_pending)
+        handshake_as(
+            client_version,
+            client_kind,
+            identity.as_str(),
+            pairing_pending,
+        )
     }
 
     pub fn handshake_as(
         client_version: &str,
+        client_kind: &str,
         authorized_client_id: &str,
         pairing_pending: impl FnOnce(),
     ) -> Result<AuthorizedClient, ClientError> {
-        handshake_as_with_credential(client_version, authorized_client_id, None, pairing_pending)
+        handshake_as_with_credential(
+            client_version,
+            client_kind,
+            authorized_client_id,
+            None,
+            pairing_pending,
+        )
     }
 
     pub fn handshake_as_with_credential(
         client_version: &str,
+        client_kind: &str,
         authorized_client_id: &str,
         authorized_client_credential: Option<&str>,
         pairing_pending: impl FnOnce(),
     ) -> Result<AuthorizedClient, ClientError> {
         let endpoint = endpoint_from_environment()?;
         let stream = UnixStream::connect(endpoint).map_err(|_| ClientError::DesktopUnavailable)?;
-        handshake_stream_with_credential(
+        handshake_stream_with_identity(
             stream,
             client_version,
-            authorized_client_id,
-            authorized_client_credential,
+            ClientIdentity {
+                kind: client_kind,
+                id: authorized_client_id,
+                credential: authorized_client_credential,
+            },
             IO_TIMEOUT,
             APPROVAL_TIMEOUT,
             pairing_pending,
@@ -1091,7 +1114,7 @@ mod linux {
 
     #[doc(hidden)]
     pub fn handshake_stream_with_credential(
-        mut stream: UnixStream,
+        stream: UnixStream,
         client_version: &str,
         authorized_client_id: &str,
         authorized_client_credential: Option<&str>,
@@ -1099,18 +1122,40 @@ mod linux {
         approval_timeout: Duration,
         pairing_pending: impl FnOnce(),
     ) -> Result<AuthorizedClient, ClientError> {
+        handshake_stream_with_identity(
+            stream,
+            client_version,
+            ClientIdentity {
+                kind: "cli",
+                id: authorized_client_id,
+                credential: authorized_client_credential,
+            },
+            io_timeout,
+            approval_timeout,
+            pairing_pending,
+        )
+    }
+
+    fn handshake_stream_with_identity(
+        mut stream: UnixStream,
+        client_version: &str,
+        identity: ClientIdentity<'_>,
+        io_timeout: Duration,
+        approval_timeout: Duration,
+        pairing_pending: impl FnOnce(),
+    ) -> Result<AuthorizedClient, ClientError> {
         let authorized_client_id =
-            Id::new(authorized_client_id).map_err(|_| ClientError::UnexpectedMessage)?;
+            Id::new(identity.id).map_err(|_| ClientError::UnexpectedMessage)?;
         let hello = Hello {
             protocol: Protocol,
             client: Client {
-                kind: "cli".into(),
+                kind: identity.kind.into(),
                 version: client_version.into(),
             },
             supported: VersionRange { min: 1, max: 1 },
             client_nonce: fresh_nonce()?,
             authorized_client_id,
-            authorized_client_credential: authorized_client_credential.map(str::to_owned),
+            authorized_client_credential: identity.credential.map(str::to_owned),
         };
         let bytes = encode_frame(&hello).map_err(map_frame_error)?;
         write_all_before(&mut stream, &bytes, deadline(io_timeout))?;
@@ -1388,29 +1433,38 @@ impl AuthorizedClient {
 #[cfg(target_os = "linux")]
 pub fn handshake(
     client_version: &str,
+    client_kind: &str,
     pairing_pending: impl FnOnce(),
 ) -> Result<AuthorizedClient, ClientError> {
-    linux::handshake(client_version, pairing_pending)
+    linux::handshake(client_version, client_kind, pairing_pending)
 }
 
 #[cfg(target_os = "linux")]
 pub fn handshake_as(
     client_version: &str,
+    client_kind: &str,
     authorized_client_id: &str,
     pairing_pending: impl FnOnce(),
 ) -> Result<AuthorizedClient, ClientError> {
-    linux::handshake_as(client_version, authorized_client_id, pairing_pending)
+    linux::handshake_as(
+        client_version,
+        client_kind,
+        authorized_client_id,
+        pairing_pending,
+    )
 }
 
 #[cfg(target_os = "linux")]
 pub fn handshake_as_with_credential(
     client_version: &str,
+    client_kind: &str,
     authorized_client_id: &str,
     authorized_client_credential: Option<&str>,
     pairing_pending: impl FnOnce(),
 ) -> Result<AuthorizedClient, ClientError> {
     linux::handshake_as_with_credential(
         client_version,
+        client_kind,
         authorized_client_id,
         authorized_client_credential,
         pairing_pending,
@@ -1420,6 +1474,7 @@ pub fn handshake_as_with_credential(
 #[cfg(not(target_os = "linux"))]
 pub fn handshake_as(
     _client_version: &str,
+    _client_kind: &str,
     _authorized_client_id: &str,
     _pairing_pending: impl FnOnce(),
 ) -> Result<AuthorizedClient, ClientError> {
@@ -1429,6 +1484,18 @@ pub fn handshake_as(
 #[cfg(not(target_os = "linux"))]
 pub fn handshake(
     _client_version: &str,
+    _client_kind: &str,
+    _pairing_pending: impl FnOnce(),
+) -> Result<AuthorizedClient, ClientError> {
+    Err(ClientError::UnsupportedPlatform)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn handshake_as_with_credential(
+    _client_version: &str,
+    _client_kind: &str,
+    _authorized_client_id: &str,
+    _authorized_client_credential: Option<&str>,
     _pairing_pending: impl FnOnce(),
 ) -> Result<AuthorizedClient, ClientError> {
     Err(ClientError::UnsupportedPlatform)

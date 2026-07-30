@@ -2555,7 +2555,9 @@ name = "muniment-acp"
 version = "0.0.1"
 dependencies = [
  "agent-client-protocol",
+ "muniment-attach",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
