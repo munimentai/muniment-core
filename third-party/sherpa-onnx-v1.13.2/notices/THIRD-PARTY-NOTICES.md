@@ -18,7 +18,8 @@ release archives (SHA-256 from the v1.13.2 release `checksum.txt`):
 - `onnxruntime-ThirdPartyNotices.txt` is the notice inventory supplied for the
   packaged ONNX Runtime revision.
 
-The separately installed Parakeet model is NVIDIA `parakeet-tdt-0.6b-v3`,
-converted to ONNX/INT8 by the sherpa-onnx project. It is licensed under
-[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) and pinned to the
-converted revision `2bda32ec70b097a55adaa07d9a7173915b43cc78`.
+The separately installed Parakeet model is Muniment's ONNX/INT8 conversion at
+`munimentai/parakeet-tdt-0.6b-v3-int8`. It derives from NVIDIA
+`parakeet-tdt-0.6b-v3`. It is licensed under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) and pinned to revision
+`6da52323c581857056f9845291a40fb3846304eb`.

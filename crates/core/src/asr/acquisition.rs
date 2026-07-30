@@ -10,7 +10,7 @@ use super::{
     AsrModelSetVerificationError,
 };
 
-const SOURCE_REPOSITORY: &str = "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8";
+pub const SOURCE_REPOSITORY: &str = "munimentai/parakeet-tdt-0.6b-v3-int8";
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

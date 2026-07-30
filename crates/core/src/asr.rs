@@ -47,8 +47,8 @@ pub struct AsrSourcedArtifactDescriptor {
 pub const PARAKEET_ARTIFACTS: [AsrArtifactDescriptor; 4] = [
     AsrArtifactDescriptor {
         filename: "encoder.int8.onnx",
-        byte_size: 652_184_281,
-        sha256: "acfc2b4456377e15d04f0243af540b7fe7c992f8d898d751cf134c3a55fd2247",
+        byte_size: 652_282_294,
+        sha256: "e38b783d40dba5755bcb2a3e703305d9e7a3d6f10c8c6d943c329e58b6dd8d07",
     },
     AsrArtifactDescriptor {
         filename: "decoder.int8.onnx",
@@ -69,7 +69,7 @@ pub const PARAKEET_ARTIFACTS: [AsrArtifactDescriptor; 4] = [
 
 pub const PARAKEET_MODEL_MANIFEST: AsrArtifactManifest = AsrArtifactManifest {
     identity: "parakeet-tdt-0.6b-v3-int8-v1",
-    revision: "2bda32ec70b097a55adaa07d9a7173915b43cc78",
+    revision: "6da52323c581857056f9845291a40fb3846304eb",
     artifacts: &PARAKEET_ARTIFACTS,
     additional_artifact: Some(AsrSourcedArtifactDescriptor {
         repository: "csukuangfj/vad",

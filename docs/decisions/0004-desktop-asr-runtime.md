@@ -16,9 +16,8 @@ identities before capture code or distribution work begins.
 
 - Use NVIDIA's upstream NeMo files directly. Rejected: this does not define a
   sherpa-onnx integration and would add a different, heavier runtime boundary.
-- Convert the NVIDIA checkpoint ourselves. Rejected for this phase: conversion
-  settings and toolchain would become another artifact Muniment must reproduce,
-  test, publish, and support.
+- Convert the NVIDIA checkpoint ourselves. Selected with pinned conversion
+  settings, tooling, and source.
 - Use the converted float32 Parakeet v3 graphs. Rejected in favor of the
   publisher's INT8 conversion for the CPU and memory requirement; quality and
   speed still require the validation below.
@@ -29,23 +28,36 @@ identities before capture code or distribution work begins.
 
 Pin **sherpa-onnx v1.13.2**, tag commit
 `13d0ae6c539d2809d32f5eaa3ef1db0c459d0b24`, and the offline transducer model
-**sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8**. The conversion is published by
-sherpa-onnx maintainer `csukuangfj` and is pinned to Hugging Face revision
-`2bda32ec70b097a55adaa07d9a7173915b43cc78`; `main` is not an artifact identity.
-It derives from NVIDIA `parakeet-tdt-0.6b-v3` (upstream revision
-`7c35754d166cca382ad1e53e68b01e7c575f3a1d`).
+**parakeet-tdt-0.6b-v3-int8**. Muniment publishes the conversion at
+`munimentai/parakeet-tdt-0.6b-v3-int8`. The artifact uses Hugging Face revision
+`6da52323c581857056f9845291a40fb3846304eb`; `main` is not an artifact identity.
+
+| Field | Value |
+| --- | --- |
+| `identity` | `parakeet-tdt-0.6b-v3-int8-v1` |
+| `repository` | `munimentai/parakeet-tdt-0.6b-v3-int8` |
+| `revision` | `6da52323c581857056f9845291a40fb3846304eb` |
+
+The conversion derives from NVIDIA `parakeet-tdt-0.6b-v3` at revision
+`1b6821cbe889fcf82347cb95c3f8f0c7515a60e9`. It uses `k2-fsa/sherpa-onnx`
+conversion tooling at revision `091e6ff695d3d1ee959fe057f8e2a52e54dd7e4b`.
+Muniment made these changes:
+
+1. Exported the source model to ONNX with the pinned tooling.
+2. Applied dynamic INT8 weight quantization.
+3. Added sherpa-onnx metadata.
 
 The required model files are:
 
 | Filename | Byte size | SHA-256 |
 | --- | ---: | --- |
-| `encoder.int8.onnx` | 652,184,281 | `acfc2b4456377e15d04f0243af540b7fe7c992f8d898d751cf134c3a55fd2247` |
+| `encoder.int8.onnx` | 652,282,294 | `e38b783d40dba5755bcb2a3e703305d9e7a3d6f10c8c6d943c329e58b6dd8d07` |
 | `decoder.int8.onnx` | 11,845,275 | `179e50c43d1a9de79c8a24149a2f9bac6eb5981823f2a2ed88d655b24248db4e` |
 | `joiner.int8.onnx` | 6,355,277 | `3164c13fc2821009440d20fcb5fdc78bff28b4db2f8d0f0b329101719c0948b3` |
 | `tokens.txt` | 93,939 | `d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d` |
 
 Every file URL is
-`https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/2bda32ec70b097a55adaa07d9a7173915b43cc78/<filename>`.
+`https://huggingface.co/munimentai/parakeet-tdt-0.6b-v3-int8/resolve/6da52323c581857056f9845291a40fb3846304eb/<filename>`.
 The three LFS sizes and digests come from Hugging Face's revision metadata;
 the token-table values were reproduced by downloading that immutable URL and
 running `wc -c` and `sha256sum`. Future acquisition must verify size and digest
@@ -89,12 +101,12 @@ automatic; this decision does not promise equal quality across languages.
 
 ### Licenses and distribution notices
 
-The NVIDIA model card declares the model CC BY 4.0 and permits commercial and
-non-commercial use. Distribution must include the CC BY 4.0 text or link,
-credit NVIDIA and the `parakeet-tdt-0.6b-v3` model by name, link the source model
-and this converted revision, retain supplied notices, identify the ONNX/INT8
-artifact as a conversion, and label any later Muniment modifications without
-implying endorsement.
+The Muniment model card records the source model's CC BY 4.0 license and NVIDIA
+attribution. Distribution must include the CC BY 4.0 text or link, credit NVIDIA
+and the `parakeet-tdt-0.6b-v3` model by name, link the source model and this
+converted revision, retain supplied notices, identify the ONNX/INT8 artifact as
+a conversion, and label any later Muniment modifications without implying
+endorsement.
 
 sherpa-onnx v1.13.2 is Apache License 2.0. Desktop distributions must include
 its license, preserve copyright, patent, attribution, and NOTICE material
@@ -159,6 +171,9 @@ on every target, with peak RSS ≤ 2.0 GiB and no crash or unbounded growth over
 
 The reproducible local runner and its versioned manifest/report formats are
 documented in [Parakeet target-hardware validation](../voice-validation.md).
+The target-hardware matrix has no recorded run for this conversion. It stays
+an owner gate that requires five physical machines and a product-approved
+corpus. This ADR reports no measurement.
 
 Quality checks use a versioned, human-transcribed set containing accents,
 punctuation, names/org jargon, numbers, self-corrections, background noise, and
@@ -186,8 +201,9 @@ and application integration remain follow-up work.
 
 ## Sources
 
-- NVIDIA model card and license: <https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/tree/7c35754d166cca382ad1e53e68b01e7c575f3a1d>
-- Immutable converted artifact: <https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/tree/2bda32ec70b097a55adaa07d9a7173915b43cc78>
+- NVIDIA model card and license: <https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/tree/1b6821cbe889fcf82347cb95c3f8f0c7515a60e9>
+- Immutable converted artifact: <https://huggingface.co/munimentai/parakeet-tdt-0.6b-v3-int8/tree/6da52323c581857056f9845291a40fb3846304eb>
+- Conversion tooling: <https://github.com/k2-fsa/sherpa-onnx/tree/091e6ff695d3d1ee959fe057f8e2a52e54dd7e4b>
 - sherpa-onnx v1.13.2 release: <https://github.com/k2-fsa/sherpa-onnx/releases/tag/v1.13.2>
 - Offline Parakeet model documentation: <https://k2-fsa.github.io/sherpa/onnx/pretrained_models/offline-transducer/nemo-transducer-models.html>
 - Silero VAD integration: <https://k2-fsa.github.io/sherpa/onnx/vad/silero-vad.html>
