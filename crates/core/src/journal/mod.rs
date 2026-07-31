@@ -1,6 +1,7 @@
 //! Durable, append-only per-run event journal.
 
 pub mod compaction;
+pub mod content_disclosure;
 pub mod export;
 pub mod reducer;
 pub mod retention;
