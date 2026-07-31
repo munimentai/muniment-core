@@ -2,14 +2,14 @@
 
 use std::ops::Range;
 
-const MAX_PROVIDER_TOKEN_SPAN: usize = 512;
-
 /// A rule in the `assistant-text-v1` rule set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rule {
     /// A provider credential such as a GitHub or OpenAI token.
     SecretProviderToken,
 }
+
+const RULE_ORDER: [Rule; 1] = [Rule::SecretProviderToken];
 
 /// One non-overlapping byte range selected by the scanner.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,30 +78,28 @@ pub fn scan(content: &str, complete: bool) -> Scan {
     let mut start = 0;
 
     while start < bytes.len() {
-        if has_start_boundary(bytes, start) {
-            let mut longest = None;
-            let mut over_span = false;
-            for alternative in alternatives_at(bytes, start) {
-                match scan_alternative(bytes, start, alternative, complete) {
-                    Candidate::Matched(end) if longest.is_none_or(|current| end > current) => {
-                        longest = Some(end);
-                    }
-                    Candidate::OverSpan => over_span = true,
-                    Candidate::Matched(_) | Candidate::None => {}
-                }
-            }
-            if over_span {
-                withhold_from = Some(start);
-                break;
-            }
-            if let Some(end) = longest {
-                matches.push(Match {
-                    range: start..end,
-                    rule: Rule::SecretProviderToken,
+        let candidates = RULE_ORDER.map(|rule| rule.candidate(bytes, start, complete));
+        if candidates.contains(&RuleCandidate::OverSpan) {
+            withhold_from = Some(start);
+            break;
+        }
+        let candidates =
+            candidates
+                .into_iter()
+                .enumerate()
+                .filter_map(|(rule_order, candidate)| {
+                    let RuleCandidate::Matched(end) = candidate else {
+                        return None;
+                    };
+                    Some(Candidate { end, rule_order })
                 });
-                start = end;
-                continue;
-            }
+        if let Some(candidate) = arbitrate(candidates) {
+            matches.push(Match {
+                range: start..candidate.end,
+                rule: RULE_ORDER[candidate.rule_order],
+            });
+            start = candidate.end;
+            continue;
         }
         start += 1;
     }
@@ -109,9 +107,14 @@ pub fn scan(content: &str, complete: bool) -> Scan {
     let retention_offset = if complete {
         content.len()
     } else {
+        let max_span = RULE_ORDER
+            .iter()
+            .map(|rule| rule.max_span())
+            .max()
+            .unwrap_or(0);
         scalar_boundary_at_or_before(
             content,
-            content.len().saturating_sub(MAX_PROVIDER_TOKEN_SPAN - 1),
+            content.len().saturating_sub(max_span.saturating_sub(1)),
         )
     };
     Scan {
@@ -119,6 +122,70 @@ pub fn scan(content: &str, complete: bool) -> Scan {
         retention_offset,
         withhold_from,
     }
+}
+
+impl Rule {
+    fn candidate(self, bytes: &[u8], start: usize, complete: bool) -> RuleCandidate {
+        match self {
+            Self::SecretProviderToken => provider_token_candidate(bytes, start, complete),
+        }
+    }
+
+    const fn max_span(self) -> usize {
+        match self {
+            Self::SecretProviderToken => 512,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuleCandidate {
+    Matched(usize),
+    OverSpan,
+    None,
+}
+
+fn provider_token_candidate(bytes: &[u8], start: usize, complete: bool) -> RuleCandidate {
+    if !has_provider_token_start_boundary(bytes, start) {
+        return RuleCandidate::None;
+    }
+    let mut longest = None;
+    let mut over_span = false;
+    for alternative in alternatives_at(bytes, start) {
+        match scan_alternative(bytes, start, alternative, complete) {
+            RuleCandidate::Matched(end) if longest.is_none_or(|current| end > current) => {
+                longest = Some(end);
+            }
+            RuleCandidate::OverSpan => over_span = true,
+            RuleCandidate::Matched(_) | RuleCandidate::None => {}
+        }
+    }
+    if over_span {
+        RuleCandidate::OverSpan
+    } else if let Some(end) = longest {
+        RuleCandidate::Matched(end)
+    } else {
+        RuleCandidate::None
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Candidate {
+    end: usize,
+    rule_order: usize,
+}
+
+fn arbitrate(candidates: impl IntoIterator<Item = Candidate>) -> Option<Candidate> {
+    let mut selected: Option<Candidate> = None;
+    for candidate in candidates {
+        if selected.is_none_or(|current| {
+            candidate.end > current.end
+                || candidate.end == current.end && candidate.rule_order < current.rule_order
+        }) {
+            selected = Some(candidate);
+        }
+    }
+    selected
 }
 
 fn alternatives_at(bytes: &[u8], start: usize) -> impl Iterator<Item = Alternative> + '_ {
@@ -132,18 +199,12 @@ fn alternatives_at(bytes: &[u8], start: usize) -> impl Iterator<Item = Alternati
         .filter(move |alternative| bytes[start..].starts_with(alternative.prefix))
 }
 
-enum Candidate {
-    Matched(usize),
-    OverSpan,
-    None,
-}
-
 fn scan_alternative(
     bytes: &[u8],
     start: usize,
     alternative: Alternative,
     complete: bool,
-) -> Candidate {
+) -> RuleCandidate {
     let body_start = start + alternative.prefix.len();
     let mut end = body_start;
     while end < bytes.len()
@@ -157,19 +218,19 @@ fn scan_alternative(
         && (end < bytes.len() && (alternative.alphabet)(bytes[end])
             || end == bytes.len() && !complete)
     {
-        return Candidate::OverSpan;
+        return RuleCandidate::OverSpan;
     }
     if end == bytes.len() && !complete {
-        return Candidate::None;
+        return RuleCandidate::None;
     }
     if body_len >= alternative.min_body {
-        Candidate::Matched(end)
+        RuleCandidate::Matched(end)
     } else {
-        Candidate::None
+        RuleCandidate::None
     }
 }
 
-fn has_start_boundary(bytes: &[u8], start: usize) -> bool {
+fn has_provider_token_start_boundary(bytes: &[u8], start: usize) -> bool {
     start == 0 || !is_alnum_underscore(bytes[start - 1])
 }
 
@@ -215,5 +276,31 @@ mod tests {
         let content = format!("sk-{}", "a".repeat(20));
         assert!(scan(&content, false).matches.is_empty());
         assert_eq!(scan(&content, true).matches[0].range, 0..content.len());
+    }
+
+    #[test]
+    fn arbitration_selects_the_longest_candidate_then_rule_order() {
+        let shorter_first = Candidate {
+            end: 20,
+            rule_order: 0,
+        };
+        let longer_second = Candidate {
+            end: 30,
+            rule_order: 1,
+        };
+        assert_eq!(
+            arbitrate([shorter_first, longer_second]),
+            Some(longer_second)
+        );
+
+        let later_rule = Candidate {
+            end: 30,
+            rule_order: 1,
+        };
+        let earlier_rule = Candidate {
+            end: 30,
+            rule_order: 0,
+        };
+        assert_eq!(arbitrate([later_rule, earlier_rule]), Some(earlier_rule));
     }
 }
