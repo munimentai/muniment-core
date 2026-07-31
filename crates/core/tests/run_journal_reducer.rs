@@ -2,7 +2,10 @@ use muniment_core::journal::reducer::{
     project_chat, reduce, AttentionReason, ChatProjector, PermissionGate, PermissionRequest,
     ReduceError, RunReducer, RunStatus, ToolActivity, ToolActivityStatus,
 };
-use muniment_core::journal::{EventEnvelope, EventPayload, Provenance, RunJournal};
+use muniment_core::journal::{
+    split_model_stream_delta, EventEnvelope, EventPayload, Provenance, RunJournal,
+    MAX_MODEL_STREAM_DELTA_BYTES,
+};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -39,6 +42,62 @@ fn stream(spec: &[(&str, Value)]) -> Vec<EventEnvelope> {
         .enumerate()
         .map(|(i, (k, p))| event(i as u64 + 1, k, p.clone()))
         .collect()
+}
+
+#[test]
+fn model_stream_delta_slices_respect_the_utf8_byte_bound() {
+    let exact = "a".repeat(MAX_MODEL_STREAM_DELTA_BYTES);
+    assert_eq!(
+        split_model_stream_delta(&exact).collect::<Vec<_>>(),
+        vec![exact.as_str()]
+    );
+
+    let oversized = "a".repeat(MAX_MODEL_STREAM_DELTA_BYTES + 1);
+    let slices = split_model_stream_delta(&oversized).collect::<Vec<_>>();
+    assert_eq!(
+        slices.iter().map(|slice| slice.len()).collect::<Vec<_>>(),
+        vec![MAX_MODEL_STREAM_DELTA_BYTES, 1]
+    );
+    assert!(slices.iter().all(|slice| !slice.is_empty()));
+}
+
+#[test]
+fn model_stream_delta_slices_move_a_crossing_scalar_and_round_trip() {
+    let mut text = "a".repeat(MAX_MODEL_STREAM_DELTA_BYTES - 1);
+    text.push('é');
+    text.push_str(&"界".repeat(MAX_MODEL_STREAM_DELTA_BYTES));
+
+    let slices = split_model_stream_delta(&text).collect::<Vec<_>>();
+    assert_eq!(slices[0].len(), MAX_MODEL_STREAM_DELTA_BYTES - 1);
+    assert!(slices[1].starts_with('é'));
+    assert!(slices
+        .iter()
+        .all(|slice| !slice.is_empty() && slice.len() <= MAX_MODEL_STREAM_DELTA_BYTES));
+    assert_eq!(slices.concat().as_bytes(), text.as_bytes());
+}
+
+#[test]
+fn model_stream_delta_slices_emit_nothing_for_empty_text() {
+    assert_eq!(split_model_stream_delta("").next(), None);
+}
+
+#[test]
+fn reducer_reassembles_a_split_oversized_model_delta() {
+    let text = "reply🙂".repeat(MAX_MODEL_STREAM_DELTA_BYTES / 4);
+    let mut events = vec![event(1, "run.started", json!({}))];
+    events.extend(
+        split_model_stream_delta(&text)
+            .enumerate()
+            .map(|(index, slice)| {
+                event(
+                    index as u64 + 2,
+                    "model.stream.delta",
+                    json!({"text": slice}),
+                )
+            }),
+    );
+
+    assert_eq!(project_chat(&events).unwrap().text, text);
 }
 
 #[test]

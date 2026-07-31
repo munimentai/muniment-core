@@ -7,7 +7,24 @@ pub mod retention;
 pub mod summaries;
 pub mod thread_summaries;
 
+pub const MAX_MODEL_STREAM_DELTA_BYTES: usize = 65_536;
 pub const MAX_THREAD_TITLE_CHARS: usize = summaries::MAX_TITLE_CHARS;
+
+pub fn split_model_stream_delta(text: &str) -> impl Iterator<Item = &str> {
+    let mut remaining = text;
+    std::iter::from_fn(move || {
+        if remaining.is_empty() {
+            return None;
+        }
+        let mut end = remaining.len().min(MAX_MODEL_STREAM_DELTA_BYTES);
+        while !remaining.is_char_boundary(end) {
+            end -= 1;
+        }
+        let (slice, rest) = remaining.split_at(end);
+        remaining = rest;
+        Some(slice)
+    })
+}
 
 use crate::attachment::ChatAttachment;
 use crate::cas::ContentHash;
