@@ -130,12 +130,20 @@ impl RunJournal {
                 WHERE scoped.thread_id=tt.thread_id AND rw.workspace=?1)))";
 
         if let Some(boundary) = &boundary {
-            let sql = format!(
-                "{summary_rows} SELECT EXISTS(SELECT 1 FROM summaries \
-                 WHERE thread_id=?2 AND updated_at=?3)"
-            );
             let exists: bool = connection.query_row(
-                &sql,
+                "WITH thread_time AS (\
+                    SELECT MAX(recorded_at) AS updated_at FROM thread_events \
+                    WHERE thread_id=?2), run_time AS (\
+                    SELECT MAX((SELECT e.recorded_at FROM events e \
+                        WHERE e.run_id=rt.run_id ORDER BY e.run_seq DESC LIMIT 1)) AS updated_at \
+                    FROM run_threads rt WHERE rt.thread_id=?2) \
+                 SELECT EXISTS(SELECT 1 FROM thread_time tt CROSS JOIN run_time rt \
+                    WHERE MAX(tt.updated_at, COALESCE(rt.updated_at, tt.updated_at))=?3 \
+                    AND NOT EXISTS(SELECT 1 FROM thread_events deleted \
+                        WHERE deleted.thread_id=?2 AND deleted.event_type='thread.deleted') \
+                    AND (?1 IS NULL OR EXISTS(SELECT 1 FROM run_threads scoped \
+                        JOIN run_workspaces rw ON rw.run_id=scoped.run_id \
+                        WHERE scoped.thread_id=?2 AND rw.workspace=?1)))",
                 rusqlite::params![workspace, boundary.thread_id, boundary.updated_at],
                 |row| row.get(0),
             )?;
