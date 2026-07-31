@@ -7,9 +7,11 @@ use std::ops::Range;
 pub enum Rule {
     /// A provider credential such as a GitHub or OpenAI token.
     SecretProviderToken,
+    /// A PEM private key block.
+    SecretPemPrivateKey,
 }
 
-const RULE_ORDER: [Rule; 1] = [Rule::SecretProviderToken];
+const RULE_ORDER: [Rule; 2] = [Rule::SecretProviderToken, Rule::SecretPemPrivateKey];
 
 /// One non-overlapping byte range selected by the scanner.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,12 +130,14 @@ impl Rule {
     fn candidate(self, bytes: &[u8], start: usize, complete: bool) -> RuleCandidate {
         match self {
             Self::SecretProviderToken => provider_token_candidate(bytes, start, complete),
+            Self::SecretPemPrivateKey => pem_private_key_candidate(bytes, start, complete),
         }
     }
 
     const fn max_span(self) -> usize {
         match self {
             Self::SecretProviderToken => 512,
+            Self::SecretPemPrivateKey => 65_536,
         }
     }
 }
@@ -167,6 +171,11 @@ fn provider_token_candidate(bytes: &[u8], start: usize, complete: bool) -> RuleC
     } else {
         RuleCandidate::None
     }
+}
+
+/// The next slice adds the `secret.pem-private-key` grammar.
+fn pem_private_key_candidate(_bytes: &[u8], _start: usize, _complete: bool) -> RuleCandidate {
+    RuleCandidate::None
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

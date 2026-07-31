@@ -76,10 +76,11 @@ fn overlapping_openai_and_anthropic_alternatives_make_one_match() {
 
 #[test]
 fn reports_complete_and_incomplete_retention() {
-    let content = format!("{}é", "x".repeat(600));
+    let content = format!("{}é", "x".repeat(65_536));
     let incomplete = scan(&content, false);
+    assert!(incomplete.retention_offset > 0);
     assert!(content.is_char_boundary(incomplete.retention_offset));
-    assert!(content.len() - incomplete.retention_offset <= 512);
+    assert!(content.len() - incomplete.retention_offset <= 65_536);
     assert_eq!(scan(&content, true).retention_offset, content.len());
 }
 
