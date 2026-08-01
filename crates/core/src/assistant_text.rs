@@ -183,7 +183,7 @@ fn pem_private_key_candidate(bytes: &[u8], start: usize, _complete: bool) -> Rul
         b"OPENSSH PRIVATE KEY",
     ];
     const BEGIN_PREFIX: &[u8] = b"-----BEGIN ";
-    const BEGIN_SUFFIX: &[u8] = b"-----\n";
+    const BEGIN_SUFFIX: &[u8] = b"-----";
     const END_PREFIX: &[u8] = b"-----END ";
     const END_SUFFIX: &[u8] = b"-----";
     const MAX_BODY: usize = 65_460;
@@ -201,13 +201,26 @@ fn pem_private_key_candidate(bytes: &[u8], start: usize, _complete: bool) -> Rul
         return RuleCandidate::None;
     };
 
-    let body_start = start + BEGIN_PREFIX.len() + header_name.len() + BEGIN_SUFFIX.len();
+    let begin_end = start + BEGIN_PREFIX.len() + header_name.len() + BEGIN_SUFFIX.len();
+    let body_start = if bytes[begin_end..].starts_with(b"\r\n") {
+        begin_end + 2
+    } else if bytes[begin_end..].starts_with(b"\n") {
+        begin_end + 1
+    } else {
+        return RuleCandidate::None;
+    };
     let mut end = body_start;
-    while end < bytes.len()
-        && end - body_start < MAX_BODY
-        && (bytes[end].is_ascii_alphanumeric() || matches!(bytes[end], b'+' | b'/' | b'=' | b'\n'))
-    {
-        end += 1;
+    while end < bytes.len() && end - body_start < MAX_BODY {
+        if bytes[end].is_ascii_alphanumeric() || matches!(bytes[end], b'+' | b'/' | b'=' | b'\n') {
+            end += 1;
+        } else if bytes[end] == b'\r' {
+            if end - body_start + 2 > MAX_BODY || !bytes[end..].starts_with(b"\r\n") {
+                return RuleCandidate::None;
+            }
+            end += 2;
+        } else {
+            break;
+        }
     }
 
     if end == body_start
@@ -218,7 +231,7 @@ fn pem_private_key_candidate(bytes: &[u8], start: usize, _complete: bool) -> Rul
         return RuleCandidate::None;
     }
     end += END_PREFIX.len() + header_name.len() + END_SUFFIX.len();
-    if end < bytes.len() && bytes[end] != b'\n' {
+    if end < bytes.len() && bytes[end] != b'\n' && !bytes[end..].starts_with(b"\r\n") {
         return RuleCandidate::None;
     }
     RuleCandidate::Matched(end)

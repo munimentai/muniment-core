@@ -12,6 +12,10 @@ fn named_private_key(header_name: &str, body: &str) -> String {
     format!("-----BEGIN {header_name}-----\n{body}-----END {header_name}-----")
 }
 
+fn named_crlf_private_key(header_name: &str, body: &str) -> String {
+    format!("-----BEGIN {header_name}-----\r\n{body}-----END {header_name}-----")
+}
+
 #[test]
 fn matches_each_provider_alternative() {
     let cases = [
@@ -140,6 +144,26 @@ fn matches_each_private_key_header_name() {
 }
 
 #[test]
+fn matches_each_private_key_header_name_with_crlf() {
+    let header_names = [
+        "PRIVATE KEY",
+        "ENCRYPTED PRIVATE KEY",
+        "RSA PRIVATE KEY",
+        "DSA PRIVATE KEY",
+        "EC PRIVATE KEY",
+        "OPENSSH PRIVATE KEY",
+    ];
+    for header_name in header_names {
+        let block = named_crlf_private_key(header_name, "YQ==\r\n");
+        let content = format!("{block}\r\n");
+        let result = scan(&content, true);
+        assert_eq!(result.matches.len(), 1, "{header_name}");
+        assert_eq!(result.matches[0].range, 0..block.len(), "{header_name}");
+        assert_eq!(result.matches[0].rule, Rule::SecretPemPrivateKey);
+    }
+}
+
+#[test]
 fn private_key_end_name_must_match_begin_name() {
     let content = format!(
         "{}\nYQ==\n{}",
@@ -162,18 +186,18 @@ fn private_key_requires_a_line_start_boundary() {
 }
 
 #[test]
-fn private_key_rejects_carriage_returns() {
+fn private_key_rejects_carriage_returns_without_line_feeds() {
     let cases = [
         format!(
-            "{}\r\nYQ==\n{}",
+            "{}\rYQ==\n{}",
             concat!("-----BEGIN ", "PRIVATE KEY-----"),
             concat!("-----END ", "PRIVATE KEY-----")
         ),
-        private_key("YQ==\r\n"),
+        private_key("YQ==\r"),
         format!(
-            "{}\nYQ==\n{}\r-----",
+            "{}\nYQ==\n{}\rX",
             concat!("-----BEGIN ", "PRIVATE KEY-----"),
-            concat!("-----END ", "PRIVATE KEY")
+            concat!("-----END ", "PRIVATE KEY-----")
         ),
     ];
     for content in cases {
