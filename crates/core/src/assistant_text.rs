@@ -173,7 +173,7 @@ fn provider_token_candidate(bytes: &[u8], start: usize, complete: bool) -> RuleC
     }
 }
 
-fn pem_private_key_candidate(bytes: &[u8], start: usize, complete: bool) -> RuleCandidate {
+fn pem_private_key_candidate(bytes: &[u8], start: usize, _complete: bool) -> RuleCandidate {
     const HEADER_NAMES: [&[u8]; 6] = [
         b"PRIVATE KEY",
         b"ENCRYPTED PRIVATE KEY",
@@ -215,7 +215,7 @@ fn pem_private_key_candidate(bytes: &[u8], start: usize, complete: bool) -> Rule
             end += 1;
         } else if bytes[end] == b'\r' {
             if end - body_start + 2 > MAX_BODY || !bytes[end..].starts_with(b"\r\n") {
-                return over_span_if_complete(complete);
+                return RuleCandidate::OverSpan;
             }
             end += 2;
         } else {
@@ -228,21 +228,13 @@ fn pem_private_key_candidate(bytes: &[u8], start: usize, complete: bool) -> Rule
         || !bytes[end + END_PREFIX.len()..].starts_with(header_name)
         || !bytes[end + END_PREFIX.len() + header_name.len()..].starts_with(END_SUFFIX)
     {
-        return over_span_if_complete(complete);
+        return RuleCandidate::OverSpan;
     }
     end += END_PREFIX.len() + header_name.len() + END_SUFFIX.len();
     if end < bytes.len() && bytes[end] != b'\n' && !bytes[end..].starts_with(b"\r\n") {
-        return over_span_if_complete(complete);
+        return RuleCandidate::OverSpan;
     }
     RuleCandidate::Matched(end)
-}
-
-fn over_span_if_complete(complete: bool) -> RuleCandidate {
-    if complete {
-        RuleCandidate::OverSpan
-    } else {
-        RuleCandidate::None
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

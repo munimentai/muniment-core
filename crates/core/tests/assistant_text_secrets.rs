@@ -248,15 +248,57 @@ fn private_key_rejects_carriage_returns_without_line_feeds() {
 }
 
 #[test]
-fn incomplete_private_key_withholds_only_when_complete() {
-    let content = format!("{}\nYQ==\n", concat!("-----BEGIN ", "PRIVATE KEY-----"));
-    let complete = scan(&content, true);
-    assert!(complete.matches.is_empty());
-    assert_eq!(complete.withhold_from, Some(0));
+fn streamed_private_key_withholds_after_a_valid_begin_line() {
+    for line_ending in ["\n", "\r\n"] {
+        let content = format!(
+            "before\n{}{line_ending}YQ=={line_ending}",
+            concat!("-----BEGIN ", "PRIVATE KEY-----")
+        );
+        let result = scan(&content, false);
+        assert!(result.matches.is_empty(), "{line_ending:?}");
+        assert_eq!(
+            result.withhold_from,
+            Some("before\n".len()),
+            "{line_ending:?}"
+        );
+    }
+}
 
-    let incomplete = scan(&content, false);
-    assert!(incomplete.matches.is_empty());
-    assert_eq!(incomplete.withhold_from, None);
+#[test]
+fn unmatched_streamed_private_key_begin_lines_withhold_nothing() {
+    let cases = [
+        "-----BEGIN ",
+        "-----BEGIN PRIVATE KEY",
+        "-----BEGIN CERTIFICATE-----\n",
+        "-----BEGIN PRIVATE KEY-----",
+    ];
+    for content in cases {
+        let result = scan(content, false);
+        assert!(result.matches.is_empty(), "{content:?}");
+        assert_eq!(result.withhold_from, None, "{content:?}");
+    }
+}
+
+#[test]
+fn completed_streamed_private_key_returns_the_match() {
+    let block = private_key("YQ==\n");
+    let result = scan(&block, false);
+    assert_eq!(result.matches.len(), 1);
+    assert_eq!(result.matches[0].range, 0..block.len());
+    assert_eq!(result.matches[0].rule, Rule::SecretPemPrivateKey);
+    assert_eq!(result.withhold_from, None);
+}
+
+#[test]
+fn overlong_streamed_private_key_body_stays_withheld() {
+    let content = format!(
+        "before\n{}\n{}",
+        concat!("-----BEGIN ", "PRIVATE KEY-----"),
+        "A".repeat(65_461)
+    );
+    let result = scan(&content, false);
+    assert!(result.matches.is_empty());
+    assert_eq!(result.withhold_from, Some("before\n".len()));
 }
 
 #[test]
