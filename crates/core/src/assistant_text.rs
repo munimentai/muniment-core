@@ -174,15 +174,34 @@ fn provider_token_candidate(bytes: &[u8], start: usize, complete: bool) -> RuleC
 }
 
 fn pem_private_key_candidate(bytes: &[u8], start: usize, _complete: bool) -> RuleCandidate {
-    const BEGIN: &[u8] = concat!("-----BEGIN ", "PRIVATE KEY-----\n").as_bytes();
-    const END: &[u8] = concat!("-----END ", "PRIVATE KEY-----").as_bytes();
+    const HEADER_NAMES: [&[u8]; 6] = [
+        b"PRIVATE KEY",
+        b"ENCRYPTED PRIVATE KEY",
+        b"RSA PRIVATE KEY",
+        b"DSA PRIVATE KEY",
+        b"EC PRIVATE KEY",
+        b"OPENSSH PRIVATE KEY",
+    ];
+    const BEGIN_PREFIX: &[u8] = b"-----BEGIN ";
+    const BEGIN_SUFFIX: &[u8] = b"-----\n";
+    const END_PREFIX: &[u8] = b"-----END ";
+    const END_SUFFIX: &[u8] = b"-----";
     const MAX_BODY: usize = 65_460;
 
-    if start != 0 && bytes[start - 1] != b'\n' || !bytes[start..].starts_with(BEGIN) {
+    if start != 0 && bytes[start - 1] != b'\n' {
         return RuleCandidate::None;
     }
 
-    let body_start = start + BEGIN.len();
+    let Some(header_name) = HEADER_NAMES.into_iter().find(|header_name| {
+        let candidate = &bytes[start..];
+        candidate.starts_with(BEGIN_PREFIX)
+            && candidate[BEGIN_PREFIX.len()..].starts_with(header_name)
+            && candidate[BEGIN_PREFIX.len() + header_name.len()..].starts_with(BEGIN_SUFFIX)
+    }) else {
+        return RuleCandidate::None;
+    };
+
+    let body_start = start + BEGIN_PREFIX.len() + header_name.len() + BEGIN_SUFFIX.len();
     let mut end = body_start;
     while end < bytes.len()
         && end - body_start < MAX_BODY
@@ -191,10 +210,14 @@ fn pem_private_key_candidate(bytes: &[u8], start: usize, _complete: bool) -> Rul
         end += 1;
     }
 
-    if end == body_start || !bytes[end..].starts_with(END) {
+    if end == body_start
+        || !bytes[end..].starts_with(END_PREFIX)
+        || !bytes[end + END_PREFIX.len()..].starts_with(header_name)
+        || !bytes[end + END_PREFIX.len() + header_name.len()..].starts_with(END_SUFFIX)
+    {
         return RuleCandidate::None;
     }
-    end += END.len();
+    end += END_PREFIX.len() + header_name.len() + END_SUFFIX.len();
     if end < bytes.len() && bytes[end] != b'\n' {
         return RuleCandidate::None;
     }

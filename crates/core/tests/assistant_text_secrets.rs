@@ -5,11 +5,11 @@ fn token(prefix: &str, body: char, length: usize) -> String {
 }
 
 fn private_key(body: &str) -> String {
-    format!(
-        "{}\n{body}{}",
-        concat!("-----BEGIN ", "PRIVATE KEY-----"),
-        concat!("-----END ", "PRIVATE KEY-----")
-    )
+    named_private_key("PRIVATE KEY", body)
+}
+
+fn named_private_key(header_name: &str, body: &str) -> String {
+    format!("-----BEGIN {header_name}-----\n{body}-----END {header_name}-----")
 }
 
 #[test]
@@ -118,6 +118,35 @@ fn matches_an_lf_private_key_block_without_its_trailing_lf() {
     assert_eq!(result.matches.len(), 1);
     assert_eq!(result.matches[0].range, 0..block.len());
     assert_eq!(result.matches[0].rule, Rule::SecretPemPrivateKey);
+}
+
+#[test]
+fn matches_each_private_key_header_name() {
+    let header_names = [
+        "PRIVATE KEY",
+        "ENCRYPTED PRIVATE KEY",
+        "RSA PRIVATE KEY",
+        "DSA PRIVATE KEY",
+        "EC PRIVATE KEY",
+        "OPENSSH PRIVATE KEY",
+    ];
+    for header_name in header_names {
+        let block = named_private_key(header_name, "AKIAAAAAAAAAAAAAAAAA\n");
+        let result = scan(&block, true);
+        assert_eq!(result.matches.len(), 1, "{header_name}");
+        assert_eq!(result.matches[0].range, 0..block.len(), "{header_name}");
+        assert_eq!(result.matches[0].rule, Rule::SecretPemPrivateKey);
+    }
+}
+
+#[test]
+fn private_key_end_name_must_match_begin_name() {
+    let content = format!(
+        "{}\nYQ==\n{}",
+        concat!("-----BEGIN EC ", "PRIVATE KEY-----"),
+        concat!("-----END RSA ", "PRIVATE KEY-----")
+    );
+    assert!(scan(&content, true).matches.is_empty());
 }
 
 #[test]
