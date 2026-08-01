@@ -186,6 +186,48 @@ fn private_key_requires_a_line_start_boundary() {
 }
 
 #[test]
+fn unmatched_private_key_line_start_withholds_nothing() {
+    let content = format!("x{}", private_key("YQ==\n"));
+    let result = scan(&content, true);
+    assert!(result.matches.is_empty());
+    assert_eq!(result.withhold_from, None);
+}
+
+#[test]
+fn unmatched_private_key_header_name_withholds_nothing() {
+    let content = named_private_key("CERTIFICATE", "YQ==\n");
+    let result = scan(&content, true);
+    assert!(result.matches.is_empty());
+    assert_eq!(result.withhold_from, None);
+}
+
+#[test]
+fn unmatched_private_key_begin_line_without_line_ending_withholds_nothing() {
+    let content = concat!(
+        "-----BEGIN ",
+        "PRIVATE KEY-----YQ==\n-----END PRIVATE KEY-----"
+    );
+    let result = scan(content, true);
+    assert!(result.matches.is_empty());
+    assert_eq!(result.withhold_from, None);
+}
+
+#[test]
+fn provider_token_matches_beside_an_unmatched_private_key_begin_line() {
+    let provider_token = token("hf_", 'a', 20);
+    let unmatched_private_key = named_private_key("CERTIFICATE", "YQ==\n");
+    let content = format!("{unmatched_private_key}\n{provider_token}");
+    let result = scan(&content, true);
+    assert_eq!(result.matches.len(), 1);
+    assert_eq!(
+        result.matches[0].range,
+        content.len() - provider_token.len()..content.len()
+    );
+    assert_eq!(result.matches[0].rule, Rule::SecretProviderToken);
+    assert_eq!(result.withhold_from, None);
+}
+
+#[test]
 fn private_key_rejects_carriage_returns_without_line_feeds() {
     let cases = [
         format!(
