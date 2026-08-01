@@ -6,6 +6,10 @@
 
 const STORAGE_MARGIN_BYTES: u64 = 256 * 1024 * 1024;
 
+pub fn required_free_bytes(download_bytes: u64) -> Option<u64> {
+    download_bytes.checked_add(STORAGE_MARGIN_BYTES)
+}
+
 pub trait InstallCancellation {
     fn is_cancelled(&self) -> bool;
 }
@@ -142,9 +146,8 @@ fn check_space<A, P>(
     space: &mut impl AvailableSpace,
     remaining: u64,
 ) -> Result<(), ModelInstallError<A, P>> {
-    let required = remaining
-        .checked_add(STORAGE_MARGIN_BYTES)
-        .ok_or(ModelInstallError::StorageRequirementOverflow)?;
+    let required =
+        required_free_bytes(remaining).ok_or(ModelInstallError::StorageRequirementOverflow)?;
     let available = space
         .available_bytes()
         .map_err(|_| ModelInstallError::StorageUnknown)?
