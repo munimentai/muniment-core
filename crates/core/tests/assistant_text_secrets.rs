@@ -206,13 +206,15 @@ fn private_key_rejects_carriage_returns_without_line_feeds() {
 }
 
 #[test]
-fn incomplete_private_key_returns_no_match_or_withhold() {
+fn incomplete_private_key_withholds_only_when_complete() {
     let content = format!("{}\nYQ==\n", concat!("-----BEGIN ", "PRIVATE KEY-----"));
-    for complete in [true, false] {
-        let result = scan(&content, complete);
-        assert!(result.matches.is_empty());
-        assert_eq!(result.withhold_from, None);
-    }
+    let complete = scan(&content, true);
+    assert!(complete.matches.is_empty());
+    assert_eq!(complete.withhold_from, Some(0));
+
+    let incomplete = scan(&content, false);
+    assert!(incomplete.matches.is_empty());
+    assert_eq!(incomplete.withhold_from, None);
 }
 
 #[test]
@@ -241,5 +243,5 @@ fn private_key_enforces_body_length_bounds() {
     let over_limit = private_key(&"A".repeat(65_461));
     let result = scan(&over_limit, true);
     assert!(result.matches.is_empty());
-    assert_eq!(result.withhold_from, None);
+    assert_eq!(result.withhold_from, Some(0));
 }
