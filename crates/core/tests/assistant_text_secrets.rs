@@ -4,6 +4,14 @@ fn token(prefix: &str, body: char, length: usize) -> String {
     format!("{prefix}{}", body.to_string().repeat(length))
 }
 
+fn private_key(body: &str) -> String {
+    format!(
+        "{}\n{body}{}",
+        concat!("-----BEGIN ", "PRIVATE KEY-----"),
+        concat!("-----END ", "PRIVATE KEY-----")
+    )
+}
+
 #[test]
 fn matches_each_provider_alternative() {
     let cases = [
@@ -100,4 +108,85 @@ fn returns_ordered_non_overlapping_ranges() {
     let result = scan(&content, true);
     assert_eq!(result.matches[0].range, 0..first.len());
     assert_eq!(result.matches[1].range, first.len() + 1..content.len());
+}
+
+#[test]
+fn matches_an_lf_private_key_block_without_its_trailing_lf() {
+    let block = private_key("YWJjZA==\n");
+    let content = format!("{block}\n");
+    let result = scan(&content, true);
+    assert_eq!(result.matches.len(), 1);
+    assert_eq!(result.matches[0].range, 0..block.len());
+    assert_eq!(result.matches[0].rule, Rule::SecretPemPrivateKey);
+}
+
+#[test]
+fn private_key_requires_a_line_start_boundary() {
+    let block = private_key("YQ==\n");
+    let after_lf = format!("before\n{block}");
+    assert_eq!(scan(&block, true).matches[0].range, 0..block.len());
+    assert_eq!(
+        scan(&after_lf, true).matches[0].range,
+        "before\n".len()..after_lf.len()
+    );
+    assert!(scan(&format!("x{block}"), true).matches.is_empty());
+}
+
+#[test]
+fn private_key_rejects_carriage_returns() {
+    let cases = [
+        format!(
+            "{}\r\nYQ==\n{}",
+            concat!("-----BEGIN ", "PRIVATE KEY-----"),
+            concat!("-----END ", "PRIVATE KEY-----")
+        ),
+        private_key("YQ==\r\n"),
+        format!(
+            "{}\nYQ==\n{}\r-----",
+            concat!("-----BEGIN ", "PRIVATE KEY-----"),
+            concat!("-----END ", "PRIVATE KEY")
+        ),
+    ];
+    for content in cases {
+        assert!(scan(&content, true).matches.is_empty(), "{content:?}");
+    }
+}
+
+#[test]
+fn incomplete_private_key_returns_no_match_or_withhold() {
+    let content = format!("{}\nYQ==\n", concat!("-----BEGIN ", "PRIVATE KEY-----"));
+    for complete in [true, false] {
+        let result = scan(&content, complete);
+        assert!(result.matches.is_empty());
+        assert_eq!(result.withhold_from, None);
+    }
+}
+
+#[test]
+fn private_key_rejects_invalid_end_body_and_empty_body() {
+    let cases = [
+        format!(
+            "{}\nYQ==\n{}",
+            concat!("-----BEGIN ", "PRIVATE KEY-----"),
+            concat!("-----END RSA ", "PRIVATE KEY-----")
+        ),
+        private_key("YQ?=\n"),
+        private_key(""),
+    ];
+    for content in cases {
+        assert!(scan(&content, true).matches.is_empty(), "{content:?}");
+    }
+}
+
+#[test]
+fn private_key_enforces_body_length_bounds() {
+    for length in [1, 65_460] {
+        let block = private_key(&"A".repeat(length));
+        assert_eq!(scan(&block, true).matches[0].range, 0..block.len());
+    }
+
+    let over_limit = private_key(&"A".repeat(65_461));
+    let result = scan(&over_limit, true);
+    assert!(result.matches.is_empty());
+    assert_eq!(result.withhold_from, None);
 }

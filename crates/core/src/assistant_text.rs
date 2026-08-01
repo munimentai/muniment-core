@@ -173,9 +173,32 @@ fn provider_token_candidate(bytes: &[u8], start: usize, complete: bool) -> RuleC
     }
 }
 
-/// The next slice adds the `secret.pem-private-key` grammar.
-fn pem_private_key_candidate(_bytes: &[u8], _start: usize, _complete: bool) -> RuleCandidate {
-    RuleCandidate::None
+fn pem_private_key_candidate(bytes: &[u8], start: usize, _complete: bool) -> RuleCandidate {
+    const BEGIN: &[u8] = concat!("-----BEGIN ", "PRIVATE KEY-----\n").as_bytes();
+    const END: &[u8] = concat!("-----END ", "PRIVATE KEY-----").as_bytes();
+    const MAX_BODY: usize = 65_460;
+
+    if start != 0 && bytes[start - 1] != b'\n' || !bytes[start..].starts_with(BEGIN) {
+        return RuleCandidate::None;
+    }
+
+    let body_start = start + BEGIN.len();
+    let mut end = body_start;
+    while end < bytes.len()
+        && end - body_start < MAX_BODY
+        && (bytes[end].is_ascii_alphanumeric() || matches!(bytes[end], b'+' | b'/' | b'=' | b'\n'))
+    {
+        end += 1;
+    }
+
+    if end == body_start || !bytes[end..].starts_with(END) {
+        return RuleCandidate::None;
+    }
+    end += END.len();
+    if end < bytes.len() && bytes[end] != b'\n' {
+        return RuleCandidate::None;
+    }
+    RuleCandidate::Matched(end)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
