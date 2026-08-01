@@ -150,6 +150,7 @@ fn resumes_multiple_artifacts_and_publishes_under_one_coordinator_lock() {
         checks.push(value);
         Ok(Some(value))
     };
+    let mut progress = Vec::new();
 
     let installed = install_parakeet_revision(
         &root.join("staging"),
@@ -166,12 +167,15 @@ fn resumes_multiple_artifacts_and_publishes_under_one_coordinator_lock() {
         &mut space,
         &lifecycle,
         &Boundary,
+        &mut |completed, total| progress.push((completed, total)),
     )
     .unwrap();
 
     assert_eq!(installed, root.join("revisions/revision"));
     assert_eq!(checks, [MARGIN + 8, MARGIN]);
     assert_eq!(lock.0, 1);
+    assert_eq!(progress.first(), Some(&(4, 12)));
+    assert_eq!(progress.last(), Some(&(12, 12)));
     for (filename, contents) in [
         ("encoder", b"a".as_slice()),
         ("decoder", b"bc"),
@@ -209,6 +213,7 @@ fn cancellation_and_unavailable_space_preserve_the_resumable_stage() {
             &mut space,
             &lifecycle,
             &Boundary,
+            &mut |_, _| {},
         )
         .unwrap_err();
 

@@ -162,6 +162,7 @@ fn resumes_files_and_returns_only_the_verified_complete_set() {
         Reply::Bytes(b"ef"),
         Reply::Bytes(b"k"),
     ]);
+    let mut progress = Vec::new();
     let stage = acquire_parakeet_stage(
         &root,
         "install",
@@ -173,6 +174,7 @@ fn resumes_files_and_returns_only_the_verified_complete_set() {
             retry_wait: &mut no_wait,
         },
         &|| false,
+        &mut |completed, total| progress.push((completed, total)),
     )
     .unwrap();
     assert_eq!(
@@ -193,6 +195,44 @@ fn resumes_files_and_returns_only_the_verified_complete_set() {
         .all(|artifact| stage.join(artifact.filename).is_file()));
     assert!(stage.join("silero_vad.onnx").is_file());
     assert!(!stage.join("decoder.part").exists());
+    assert_eq!(progress, [(2, 8), (3, 8), (4, 8), (5, 8), (7, 8), (8, 8)]);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn reports_fresh_retried_and_completed_progress_without_double_counting() {
+    let root = root();
+    let mut transport = Transport::new([
+        Reply::Bytes(b"a"),
+        Reply::Bytes(b"b"),
+        Reply::Bytes(b"c"),
+        Reply::Bytes(b"d"),
+        Reply::Bytes(b"ef"),
+        Reply::Bytes(b"vk"),
+    ]);
+    let mut progress = Vec::new();
+
+    acquire_parakeet_stage(
+        &root,
+        "install",
+        &MANIFEST,
+        AsrAcquisitionLimits::default(),
+        &mut transport,
+        AsrAcquisitionRuntime {
+            clock: &|| Duration::ZERO,
+            retry_wait: &mut no_wait,
+        },
+        &|| false,
+        &mut |completed, total| progress.push((completed, total)),
+    )
+    .unwrap();
+
+    assert_eq!(
+        progress,
+        [(0, 8), (1, 8), (2, 8), (3, 8), (4, 8), (6, 8), (8, 8)]
+    );
+    assert_eq!(transport.requests[1].1, 0);
+    assert_eq!(transport.requests[2].1, 1);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -211,7 +251,8 @@ fn checksum_failure_does_not_expose_the_bad_artifact_as_complete() {
                 clock: &|| Duration::ZERO,
                 retry_wait: &mut no_wait
             },
-            &|| false
+            &|| false,
+            &mut |_, _| {}
         ),
         Err(AsrAcquisitionError::Verification(_))
     ));
@@ -239,7 +280,8 @@ fn vad_checksum_failure_keeps_the_complete_stage_unpublished() {
                 clock: &|| Duration::ZERO,
                 retry_wait: &mut no_wait
             },
-            &|| false
+            &|| false,
+            &mut |_, _| {}
         ),
         Err(AsrAcquisitionError::Verification(_))
     ));
@@ -280,6 +322,7 @@ fn one_deadline_is_shared_across_files_and_retries() {
             retry_wait: &mut wait,
         },
         &|| false,
+        &mut |_, _| {},
     )
     .unwrap();
     assert_eq!(
@@ -306,6 +349,7 @@ fn cancellation_preserves_resumable_bytes() {
     fs::create_dir(root.join("install")).unwrap();
     fs::write(root.join("install/encoder.part"), b"a").unwrap();
     let mut transport = Transport::new([]);
+    let mut progress = Vec::new();
     assert_eq!(
         acquire_parakeet_stage(
             &root,
@@ -317,10 +361,12 @@ fn cancellation_preserves_resumable_bytes() {
                 clock: &|| Duration::ZERO,
                 retry_wait: &mut no_wait
             },
-            &|| true
+            &|| true,
+            &mut |completed, total| progress.push((completed, total))
         ),
         Err(AsrAcquisitionError::Cancelled)
     );
+    assert_eq!(progress, [(1, 8)]);
     assert_eq!(fs::read(root.join("install/encoder.part")).unwrap(), b"a");
     fs::remove_dir_all(root).unwrap();
 }

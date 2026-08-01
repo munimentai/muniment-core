@@ -8,8 +8,8 @@ use crate::model_install::{
 
 use super::acquisition::{
     acquire_parakeet_stage, remaining_stage_bytes, AsrAcquisitionClock, AsrAcquisitionError,
-    AsrAcquisitionLimits, AsrAcquisitionRuntime, AsrCancellation, AsrDownloadTransport,
-    AsrRetryWait,
+    AsrAcquisitionLimits, AsrAcquisitionProgress, AsrAcquisitionRuntime, AsrCancellation,
+    AsrDownloadTransport, AsrRetryWait,
 };
 use super::{AsrArtifactManifest, AsrLifecycleBoundary, AsrLifecycleError, AsrRevisionLifecycle};
 
@@ -18,7 +18,7 @@ pub type ParakeetInstallError = ModelInstallError<AsrAcquisitionError, AsrLifecy
 /// Acquires and publishes one pinned Parakeet revision under the shared
 /// install lock and exact resumable-stage storage checks.
 #[allow(clippy::too_many_arguments)]
-pub fn install_parakeet_revision<T, C, K, W, L, S, B>(
+pub fn install_parakeet_revision<T, C, K, W, L, S, B, P>(
     staging_root: &Path,
     install_id: &str,
     manifest: &'static AsrArtifactManifest,
@@ -30,6 +30,7 @@ pub fn install_parakeet_revision<T, C, K, W, L, S, B>(
     space: &mut S,
     lifecycle: &AsrRevisionLifecycle,
     lifecycle_boundary: &B,
+    progress: &mut P,
 ) -> Result<PathBuf, ParakeetInstallError>
 where
     T: AsrDownloadTransport,
@@ -39,6 +40,7 @@ where
     L: InstallLock,
     S: AvailableSpace,
     B: AsrLifecycleBoundary,
+    P: AsrAcquisitionProgress,
 {
     install_model(
         lock,
@@ -54,6 +56,7 @@ where
                 transport,
                 runtime,
                 cancellation,
+                progress,
             )
         },
         |stage| lifecycle.publish_lock_held(&stage, lifecycle_boundary),

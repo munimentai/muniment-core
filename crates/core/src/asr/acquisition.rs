@@ -103,6 +103,16 @@ impl<F: Fn() -> Duration> AsrAcquisitionClock for F {
 pub trait AsrRetryWait {
     fn wait(&mut self, maximum_delay: Duration, cancellation: &dyn AsrCancellation) -> bool;
 }
+
+/// Receives aggregate progress for the pinned manifest.
+pub trait AsrAcquisitionProgress {
+    fn report(&mut self, completed_bytes: u64, total_bytes: u64);
+}
+impl<F: FnMut(u64, u64)> AsrAcquisitionProgress for F {
+    fn report(&mut self, completed_bytes: u64, total_bytes: u64) {
+        self(completed_bytes, total_bytes)
+    }
+}
 impl<F> AsrRetryWait for F
 where
     F: FnMut(Duration, &dyn AsrCancellation) -> bool,
@@ -221,7 +231,8 @@ pub fn remaining_stage_bytes(
 }
 
 /// Returns `staging/<id>` only after every pinned artifact verifies.
-pub fn acquire_parakeet_stage<T, C, K, W>(
+#[allow(clippy::too_many_arguments)]
+pub fn acquire_parakeet_stage<T, C, K, W, P>(
     staging_root: &Path,
     install_id: &str,
     manifest: &'static AsrArtifactManifest,
@@ -229,12 +240,14 @@ pub fn acquire_parakeet_stage<T, C, K, W>(
     transport: &mut T,
     runtime: AsrAcquisitionRuntime<'_, K, W>,
     cancellation: &C,
+    progress: &mut P,
 ) -> Result<PathBuf, AsrAcquisitionError>
 where
     T: AsrDownloadTransport,
     C: AsrCancellation,
     K: AsrAcquisitionClock,
     W: AsrRetryWait,
+    P: AsrAcquisitionProgress,
 {
     if !safe_component(install_id) {
         return Err(AsrAcquisitionError::InvalidStage);
@@ -256,6 +269,9 @@ where
         }
         Err(_) => return Err(AsrAcquisitionError::Persistence),
     }
+
+    let mut progress_state = AcquisitionProgress::from_stage(&stage, manifest)?;
+    progress_state.report(progress);
 
     for (artifact_index, artifact) in manifest
         .artifacts
@@ -279,14 +295,88 @@ where
             runtime.retry_wait,
             started_at,
             cancellation,
+            &mut progress_state,
+            progress,
         )?;
     }
     verify_model_set(&stage, manifest).map_err(AsrAcquisitionError::Verification)?;
+    progress_state.complete(progress);
     Ok(stage)
 }
 
+struct AcquisitionProgress {
+    total: u64,
+    artifacts: Vec<u64>,
+    reported: u64,
+}
+
+impl AcquisitionProgress {
+    fn from_stage(
+        stage: &Path,
+        manifest: &AsrArtifactManifest,
+    ) -> Result<Self, AsrAcquisitionError> {
+        let mut total = 0_u64;
+        let mut artifacts = Vec::new();
+        for artifact in manifest.artifacts.iter().chain(
+            manifest
+                .additional_artifact
+                .as_ref()
+                .map(|additional| &additional.artifact),
+        ) {
+            total = total
+                .checked_add(artifact.byte_size)
+                .ok_or(AsrAcquisitionError::TooLarge)?;
+            let completed = stage.join(artifact.filename);
+            let bytes = match fs::symlink_metadata(&completed) {
+                Ok(metadata) if !metadata.file_type().is_file() => {
+                    return Err(AsrAcquisitionError::InvalidStage)
+                }
+                Ok(_) if verify_artifact(&completed, artifact).is_ok() => artifact.byte_size,
+                Ok(_) => strict_part_length(
+                    &stage.join(format!("{}.part", artifact.filename)),
+                    artifact.byte_size,
+                )?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => strict_part_length(
+                    &stage.join(format!("{}.part", artifact.filename)),
+                    artifact.byte_size,
+                )?,
+                Err(_) => return Err(AsrAcquisitionError::Persistence),
+            };
+            artifacts.push(bytes);
+        }
+        let reported = artifacts.iter().try_fold(0_u64, |sum, bytes| {
+            sum.checked_add(*bytes).ok_or(AsrAcquisitionError::TooLarge)
+        })?;
+        Ok(Self {
+            total,
+            artifacts,
+            reported,
+        })
+    }
+
+    fn update<P: AsrAcquisitionProgress>(&mut self, index: usize, bytes: u64, progress: &mut P) {
+        self.artifacts[index] = self.artifacts[index].max(bytes);
+        let completed = self.artifacts.iter().sum::<u64>().min(self.total);
+        if completed > self.reported {
+            self.reported = completed;
+            progress.report(completed, self.total);
+        }
+    }
+
+    fn report<P: AsrAcquisitionProgress>(&self, progress: &mut P) {
+        progress.report(self.reported, self.total);
+    }
+
+    fn complete<P: AsrAcquisitionProgress>(&mut self, progress: &mut P) {
+        if self.reported < self.total {
+            self.reported = self.total;
+            progress.report(self.total, self.total);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn acquire_artifact<T, C, K, W>(
+fn acquire_artifact<T, C, K, W, P>(
     stage: &Path,
     artifact_index: usize,
     artifact: &AsrArtifactDescriptor,
@@ -297,12 +387,15 @@ fn acquire_artifact<T, C, K, W>(
     retry_wait: &mut W,
     started_at: Duration,
     cancellation: &C,
+    progress_state: &mut AcquisitionProgress,
+    progress: &mut P,
 ) -> Result<(), AsrAcquisitionError>
 where
     T: AsrDownloadTransport,
     C: AsrCancellation,
     K: AsrAcquisitionClock,
     W: AsrRetryWait,
+    P: AsrAcquisitionProgress,
 {
     let completed = stage.join(artifact.filename);
     match fs::symlink_metadata(&completed) {
@@ -324,7 +417,11 @@ where
         let remaining = remaining_budget(clock, started_at, limits.deadline)?;
         let offset = part_length(&part, artifact.byte_size)?;
         if offset == artifact.byte_size {
-            return finish_artifact(&part, &completed, artifact);
+            let result = finish_artifact(&part, &completed, artifact);
+            if result.is_ok() {
+                progress_state.update(artifact_index, artifact.byte_size, progress);
+            }
+            return result;
         }
         let request = AsrDownloadRequest {
             url: source_url(manifest, artifact_index, artifact),
@@ -395,8 +492,17 @@ where
             started_at,
             limits.deadline,
             cancellation,
+            artifact_index,
+            progress_state,
+            progress,
         ) {
-            Ok(true) => return finish_artifact(&part, &completed, artifact),
+            Ok(true) => {
+                let result = finish_artifact(&part, &completed, artifact);
+                if result.is_ok() {
+                    progress_state.update(artifact_index, artifact.byte_size, progress);
+                }
+                return result;
+            }
             Ok(false) | Err(AsrAcquisitionError::Retryable)
                 if attempt + 1 < limits.max_attempts =>
             {
@@ -443,7 +549,13 @@ fn validate_response<R>(
     }
 }
 
-fn stream_response<R: Read, C: AsrCancellation, K: AsrAcquisitionClock>(
+#[allow(clippy::too_many_arguments)]
+fn stream_response<
+    R: Read,
+    C: AsrCancellation,
+    K: AsrAcquisitionClock,
+    P: AsrAcquisitionProgress,
+>(
     mut body: R,
     part: &Path,
     expected: u64,
@@ -451,6 +563,9 @@ fn stream_response<R: Read, C: AsrCancellation, K: AsrAcquisitionClock>(
     started_at: Duration,
     deadline: Duration,
     cancellation: &C,
+    artifact_index: usize,
+    progress_state: &mut AcquisitionProgress,
+    progress: &mut P,
 ) -> Result<bool, AsrAcquisitionError> {
     let mut file = OpenOptions::new()
         .create(true)
@@ -486,6 +601,7 @@ fn stream_response<R: Read, C: AsrCancellation, K: AsrAcquisitionClock>(
         }
         file.write_all(&buffer[..count])
             .map_err(|_| AsrAcquisitionError::Persistence)?;
+        progress_state.update(artifact_index, total, progress);
     }
 }
 
