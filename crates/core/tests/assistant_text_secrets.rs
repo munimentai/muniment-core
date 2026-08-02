@@ -80,6 +80,54 @@ fn streamed_assignment_waits_when_value_reaches_buffer_end() {
     assert!(scan("key=0123456789", false).matches.is_empty());
 }
 
+#[test]
+fn overlong_assignment_stays_withheld() {
+    let assignment = format!("key={}", "a".repeat(151));
+    for (content, complete) in [
+        (format!("safe {assignment};"), true),
+        (format!("safe {assignment}"), false),
+    ] {
+        let result = scan(&content, complete);
+        assert!(result.matches.is_empty(), "{complete}");
+        assert_eq!(result.withhold_from, Some(5), "{complete}");
+    }
+}
+
+#[test]
+fn overlong_assignment_withholds_later_provider_token() {
+    let content = format!("key={} {}", "a".repeat(151), token("hf_", 'a', 20));
+    let result = scan(&content, true);
+    assert!(result.matches.is_empty());
+    assert_eq!(result.withhold_from, Some(0));
+}
+
+#[test]
+fn assignment_accepts_value_length_ceiling() {
+    let value = "a".repeat(150);
+    let complete = format!("key={value}");
+    assert_eq!(scan(&complete, true).matches[0].range, 0..complete.len());
+    assert!(scan(&complete, false).matches.is_empty());
+
+    let terminated = format!("key={value};");
+    assert_eq!(
+        scan(&terminated, false).matches[0].range,
+        0..terminated.len() - 1
+    );
+}
+
+#[test]
+fn overlong_assignment_near_misses_withhold_nothing() {
+    for content in [
+        format!("xkey={}", "a".repeat(151)),
+        format!("key_x={}", "a".repeat(151)),
+        format!("key!{}", "a".repeat(151)),
+    ] {
+        let result = scan(&content, true);
+        assert!(result.matches.is_empty(), "{content:?}");
+        assert_eq!(result.withhold_from, None, "{content:?}");
+    }
+}
+
 fn private_key(body: &str) -> String {
     named_private_key("PRIVATE KEY", body)
 }
