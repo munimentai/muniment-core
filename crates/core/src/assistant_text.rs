@@ -1,6 +1,7 @@
 //! Pure scanning for the `assistant-text-v1` assistant reply rules.
 
 pub mod ledger;
+pub mod projector;
 
 use std::{
     ops::Range,
