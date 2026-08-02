@@ -1,6 +1,10 @@
 use muniment_core::assistant_text::{
-    posix_absolute_path_candidate, scan, windows_absolute_path_candidate, PathCandidate,
+    classify_posix_absolute_path, posix_absolute_path_candidate, scan,
+    windows_absolute_path_candidate, PathCandidate, PathClassification,
 };
+#[cfg(unix)]
+use std::fs;
+use std::{io, path::Path};
 
 #[test]
 fn matches_root_and_components() {
@@ -74,6 +78,83 @@ fn scan_does_not_apply_the_path_candidate() {
     let result = scan(content, true);
     assert!(result.matches.is_empty());
     assert_eq!(result.withhold_from, None);
+}
+
+#[test]
+#[cfg(unix)]
+fn releases_the_workspace_root_descendants_and_non_ascii_paths() {
+    let root = std::env::temp_dir().join(format!("muniment-path-scope-{}", uuid::Uuid::new_v4()));
+    let descendant = root.join("資料").join("é.txt");
+    fs::create_dir_all(descendant.parent().unwrap()).unwrap();
+    fs::write(&descendant, b"test").unwrap();
+
+    for path in [&root, &descendant] {
+        let content = path.to_str().unwrap();
+        assert_eq!(
+            classify_posix_absolute_path(content, 0, &root, |path| path.canonicalize()),
+            PathClassification::Released(0..content.len())
+        );
+    }
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn withholds_traversal_symlink_escape_missing_paths_and_validation_errors() {
+    let base = std::env::temp_dir().join(format!("muniment-path-scope-{}", uuid::Uuid::new_v4()));
+    let root = base.join("workspace");
+    let outside = base.join("outside.txt");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(&outside, b"test").unwrap();
+
+    let traversal = root.join("..").join("outside.txt");
+    let missing = root.join("missing.txt");
+    for path in [&outside, &traversal, &missing] {
+        let content = path.to_str().unwrap();
+        assert_eq!(
+            classify_posix_absolute_path(content, 0, &root, |path| path.canonicalize()),
+            PathClassification::Withheld(0)
+        );
+    }
+
+    std::os::unix::fs::symlink(&outside, root.join("escape.txt")).unwrap();
+    let escape = root.join("escape.txt");
+    let content = escape.to_str().unwrap();
+    assert_eq!(
+        classify_posix_absolute_path(content, 0, &root, |path| path.canonicalize()),
+        PathClassification::Withheld(0)
+    );
+
+    assert_eq!(
+        classify_posix_absolute_path(root.to_str().unwrap(), 0, &root, |_| {
+            Err::<std::path::PathBuf, _>("error")
+        }),
+        PathClassification::Withheld(0)
+    );
+
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn withholds_over_span_candidates_without_scope_validation() {
+    let content = format!("/{}", "a".repeat(4_096));
+    assert_eq!(
+        classify_posix_absolute_path(&content, 0, Path::new("/workspace"), |_| -> io::Result<_> {
+            panic!("an over-span candidate must not reach scope validation")
+        }),
+        PathClassification::Withheld(0)
+    );
+
+    assert_eq!(
+        classify_posix_absolute_path(
+            "not a path",
+            0,
+            Path::new("/workspace"),
+            |_| -> io::Result<_> { panic!("a non-candidate must not reach scope validation") }
+        ),
+        PathClassification::None
+    );
 }
 
 #[test]
