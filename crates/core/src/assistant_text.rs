@@ -179,7 +179,8 @@ enum RuleCandidate {
 
 fn assignment_candidate(bytes: &[u8], start: usize, _complete: bool) -> RuleCandidate {
     let _ = assignment_label_end(bytes, start)
-        .and_then(|label_end| assignment_delimiter_end(bytes, label_end));
+        .and_then(|label_end| assignment_delimiter_end(bytes, label_end))
+        .map(|delimiter_end| assignment_value_prefix_end(bytes, delimiter_end));
     RuleCandidate::None
 }
 
@@ -225,6 +226,18 @@ fn assignment_delimiter_end(bytes: &[u8], start: usize) -> Option<usize> {
                 .is_some_and(|remaining| remaining.starts_with(delimiter))
         })
         .map(|delimiter| end + delimiter.len())
+}
+
+fn assignment_value_prefix_end(bytes: &[u8], start: usize) -> usize {
+    let mut end = start;
+    while end - start < 5
+        && bytes
+            .get(end)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'=' | b'\'' | b'"' | b'`'))
+    {
+        end += 1;
+    }
+    end
 }
 
 fn jwt_candidate(bytes: &[u8], start: usize, complete: bool) -> RuleCandidate {
@@ -592,7 +605,11 @@ mod tests {
 
     #[test]
     fn assignment_candidate_releases_recognized_prefixes() {
-        for content in ["key=", "API_KEY filler :=", "token                    ||"] {
+        for content in [
+            "key=",
+            "API_KEY filler :=\t='`",
+            "token                    || \t'\"`=",
+        ] {
             assert_eq!(
                 assignment_candidate(content.as_bytes(), 0, true),
                 RuleCandidate::None
@@ -602,6 +619,18 @@ mod tests {
                 RuleCandidate::None
             );
         }
+    }
+
+    #[test]
+    fn assignment_value_prefix_advances_at_most_five_bytes() {
+        assert_eq!(assignment_value_prefix_end(b"value", 0), 0);
+        assert_eq!(assignment_value_prefix_end(b"\t='`value", 0), 4);
+        assert_eq!(assignment_value_prefix_end(b" \t'\"`value", 0), 5);
+
+        let six_prefix_bytes = b"= \t'\"`value";
+        let end = assignment_value_prefix_end(six_prefix_bytes, 0);
+        assert_eq!(end, 5);
+        assert_eq!(six_prefix_bytes.get(end), Some(&b'`'));
     }
 
     #[test]
