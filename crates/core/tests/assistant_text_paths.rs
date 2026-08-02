@@ -1,4 +1,6 @@
-use muniment_core::assistant_text::{posix_absolute_path_candidate, scan, PathCandidate};
+use muniment_core::assistant_text::{
+    posix_absolute_path_candidate, scan, windows_absolute_path_candidate, PathCandidate,
+};
 
 #[test]
 fn matches_root_and_components() {
@@ -70,6 +72,101 @@ fn classifies_only_candidates_beyond_the_span_as_over_span() {
 fn scan_does_not_apply_the_path_candidate() {
     let content = "/workspace/secret.txt";
     let result = scan(content, true);
+    assert!(result.matches.is_empty());
+    assert_eq!(result.withhold_from, None);
+}
+
+#[test]
+fn matches_each_windows_root_and_components() {
+    for path in [
+        "C:\\",
+        "z:\\src\\main.rs",
+        "\\\\server\\share\\",
+        "\\\\server\\share\\資料\\é",
+        "\\\\?\\C:\\",
+        "\\\\?\\z:\\src\\main.rs",
+        "\\\\?\\UNC\\server\\share\\",
+        "\\\\?\\UNC\\server\\share\\.\\..",
+    ] {
+        assert_eq!(
+            windows_absolute_path_candidate(path, 0),
+            PathCandidate::Matched(0..path.len()),
+            "{path:?}"
+        );
+    }
+}
+
+#[test]
+fn windows_paths_require_a_boundary_and_stop_before_terminators() {
+    for boundary in ["", "(", "[", "{", ":", "=", ",", ";", " ", "\t", "\r", "\n"] {
+        let content = format!("{boundary}C:\\tmp");
+        assert_eq!(
+            windows_absolute_path_candidate(&content, boundary.len()),
+            PathCandidate::Matched(boundary.len()..content.len()),
+            "{boundary:?}"
+        );
+    }
+    assert_eq!(
+        windows_absolute_path_candidate("xC:\\tmp", 1),
+        PathCandidate::None
+    );
+
+    for terminator in *b"\0 \t\r\n'\"`<>|" {
+        let content = format!("C:\\tmp{}tail", char::from(terminator));
+        assert_eq!(
+            windows_absolute_path_candidate(&content, 0),
+            PathCandidate::Matched(0..6),
+            "{terminator:?}"
+        );
+    }
+}
+
+#[test]
+fn windows_paths_reject_invalid_roots_and_components() {
+    for content in [
+        "C:/tmp",
+        "C:\\tmp/child",
+        "C:\\tmp\\",
+        "C:\\\\tmp",
+        "\\\\server\\share",
+        "\\\\server\\\\",
+        "\\\\?\\C:/tmp",
+        "\\\\?\\UNC\\server\\share",
+        "\\\\?\\unc\\server\\share\\",
+    ] {
+        assert_eq!(
+            windows_absolute_path_candidate(content, 0),
+            PathCandidate::None,
+            "{content:?}"
+        );
+    }
+}
+
+#[test]
+fn windows_paths_exceed_the_span_only_after_the_limit() {
+    let maximum = format!("C:\\{}", "a".repeat(131_065));
+    assert_eq!(maximum.len(), 131_068);
+    assert_eq!(
+        windows_absolute_path_candidate(&maximum, 0),
+        PathCandidate::Matched(0..131_068)
+    );
+
+    let terminated = format!("{maximum} ");
+    assert_eq!(
+        windows_absolute_path_candidate(&terminated, 0),
+        PathCandidate::Matched(0..131_068)
+    );
+
+    let over_span = format!("{maximum}a");
+    assert_eq!(
+        windows_absolute_path_candidate(&over_span, 0),
+        PathCandidate::OverSpan
+    );
+}
+
+#[test]
+fn scan_does_not_apply_the_windows_path_candidate() {
+    let result = scan("C:\\workspace\\secret.txt", true);
     assert!(result.matches.is_empty());
     assert_eq!(result.withhold_from, None);
 }

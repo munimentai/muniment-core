@@ -103,6 +103,121 @@ pub fn posix_absolute_path_candidate(content: &str, start: usize) -> PathCandida
     }
 }
 
+/// Recognizes a bounded Windows absolute path at `start`.
+pub fn windows_absolute_path_candidate(content: &str, start: usize) -> PathCandidate {
+    const MAX_SPAN: usize = 131_068;
+
+    let bytes = content.as_bytes();
+    if !content.is_char_boundary(start)
+        || start != 0
+            && !bytes
+                .get(start - 1)
+                .is_some_and(|byte| is_path_boundary(*byte))
+    {
+        return PathCandidate::None;
+    }
+
+    let mut end = start;
+    if bytes.get(end).is_some_and(u8::is_ascii_alphabetic)
+        && bytes.get(end + 1) == Some(&b':')
+        && bytes.get(end + 2) == Some(&b'\\')
+    {
+        end += 3;
+    } else if bytes.get(end..end + 4) == Some(b"\\\\?\\") {
+        end += 4;
+        if bytes.get(end).is_some_and(u8::is_ascii_alphabetic)
+            && bytes.get(end + 1) == Some(&b':')
+            && bytes.get(end + 2) == Some(&b'\\')
+        {
+            end += 3;
+        } else if bytes.get(end..end + 4) == Some(b"UNC\\") {
+            end += 4;
+            end = match windows_root_component(bytes, start, end, MAX_SPAN) {
+                Ok(end) => end,
+                Err(result) => return result,
+            };
+            end = match windows_root_component(bytes, start, end, MAX_SPAN) {
+                Ok(end) => end,
+                Err(result) => return result,
+            };
+        } else {
+            return PathCandidate::None;
+        }
+    } else if bytes.get(end..end + 2) == Some(b"\\\\") {
+        end += 2;
+        end = match windows_root_component(bytes, start, end, MAX_SPAN) {
+            Ok(end) => end,
+            Err(result) => return result,
+        };
+        end = match windows_root_component(bytes, start, end, MAX_SPAN) {
+            Ok(end) => end,
+            Err(result) => return result,
+        };
+    } else {
+        return PathCandidate::None;
+    }
+
+    if end - start > MAX_SPAN {
+        return PathCandidate::OverSpan;
+    }
+    if bytes.get(end).is_none_or(|byte| is_path_end(*byte)) {
+        return PathCandidate::Matched(start..end);
+    }
+
+    loop {
+        let component_start = end;
+        while let Some(byte) = bytes.get(end) {
+            if is_path_end(*byte) || matches!(byte, b'/' | b'\\') {
+                break;
+            }
+            end += 1;
+            if end - start > MAX_SPAN {
+                return PathCandidate::OverSpan;
+            }
+        }
+        if end == component_start {
+            return PathCandidate::None;
+        }
+        match bytes.get(end) {
+            None => return PathCandidate::Matched(start..end),
+            Some(byte) if is_path_end(*byte) => return PathCandidate::Matched(start..end),
+            Some(b'\\') => {
+                end += 1;
+                if end - start > MAX_SPAN {
+                    return PathCandidate::OverSpan;
+                }
+            }
+            Some(b'/') | Some(_) => return PathCandidate::None,
+        }
+    }
+}
+
+fn windows_root_component(
+    bytes: &[u8],
+    start: usize,
+    mut end: usize,
+    max_span: usize,
+) -> Result<usize, PathCandidate> {
+    let component_start = end;
+    while let Some(byte) = bytes.get(end) {
+        if is_path_end(*byte) || matches!(byte, b'/' | b'\\') {
+            break;
+        }
+        end += 1;
+        if end - start > max_span {
+            return Err(PathCandidate::OverSpan);
+        }
+    }
+    if end == component_start || bytes.get(end) != Some(&b'\\') {
+        return Err(PathCandidate::None);
+    }
+    end += 1;
+    if end - start > max_span {
+        return Err(PathCandidate::OverSpan);
+    }
+    Ok(end)
+}
+
 #[derive(Clone, Copy)]
 struct Alternative {
     prefix: &'static [u8],
