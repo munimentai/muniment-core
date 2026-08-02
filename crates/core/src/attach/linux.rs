@@ -1,6 +1,6 @@
 //! Linux filesystem boundary for the companion attach endpoint.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::ffi::{CString, OsStr};
 use std::fmt;
@@ -682,15 +682,49 @@ impl ThreadListService for RunJournal {
                 RunEventPageError::NotFoundOrInaccessible => ProtocolError::invalid_request(),
                 _ => ProtocolError::persistence_failed(),
             })?;
+        let mut assistant_text = BTreeMap::new();
+        for entry in &projected {
+            if entry.kind == "assistant_message"
+                && !assistant_text.contains_key(&(entry.run_id.clone(), entry.snapshot_seq))
+            {
+                let ordinals = projected
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.kind == "assistant_message"
+                            && candidate.run_id == entry.run_id
+                            && candidate.snapshot_seq == entry.snapshot_seq
+                    })
+                    .map(|candidate| candidate.entry_ordinal)
+                    .collect::<Vec<_>>();
+                let projection = self
+                    .projected_assistant_text(
+                        workspace,
+                        &entry.run_id,
+                        entry.snapshot_seq,
+                        &ordinals,
+                    )
+                    .map_err(|_| ProtocolError::persistence_failed())?;
+                assistant_text.insert((entry.run_id.clone(), entry.snapshot_seq), projection);
+            }
+        }
         let mut expanded = projected
             .into_iter()
             .map(|entry| {
+                let text = if entry.kind == "assistant_message" {
+                    assistant_text
+                        .get(&(entry.run_id.clone(), entry.snapshot_seq))
+                        .and_then(|projection| projection.get(&entry.entry_ordinal))
+                        .cloned()
+                        .flatten()
+                } else {
+                    entry.text
+                };
                 (
                     (entry.run_ordinal, entry.run_seq, entry.entry_ordinal),
                     RedactedThreadEntry {
                         run_seq: entry.run_seq,
                         kind: entry.kind,
-                        text: entry.text,
+                        text,
                     },
                 )
             })
@@ -702,21 +736,22 @@ impl ThreadListService for RunJournal {
         expanded.truncate(usize::from(request.limit));
         let mut entries = Vec::new();
         let mut emitted_position = None;
+        let mut page_length = serde_json::to_vec(&ThreadOpenPage {
+            thread_id: request.thread_id.clone(),
+            entries: Vec::new(),
+            next_cursor: Some("x".repeat(MAX_CURSOR_LENGTH)),
+        })
+        .map_err(|_| ProtocolError::persistence_failed())?
+        .len();
         for (position, entry) in expanded.iter() {
-            let mut candidate = entries.clone();
-            candidate.push(entry.clone());
-            let candidate_page = ThreadOpenPage {
-                thread_id: request.thread_id.clone(),
-                entries: candidate,
-                next_cursor: Some("x".repeat(MAX_CURSOR_LENGTH)),
-            };
-            if serde_json::to_vec(&candidate_page)
+            let entry_length = serde_json::to_vec(entry)
                 .map_err(|_| ProtocolError::persistence_failed())?
-                .len()
-                > MAX_RESPONSE_BODY_LENGTH
-            {
+                .len();
+            let separator_length = usize::from(!entries.is_empty());
+            if page_length + separator_length + entry_length > MAX_RESPONSE_BODY_LENGTH {
                 break;
             }
+            page_length += separator_length + entry_length;
             entries.push(entry.clone());
             emitted_position = Some(*position);
         }

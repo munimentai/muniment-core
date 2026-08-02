@@ -170,6 +170,14 @@ pub struct RunJournal {
     pub(crate) path: Option<PathBuf>,
     pub(crate) coordination: Option<Arc<JournalCoordination>>,
     pub(crate) generation: u64,
+    pub(crate) assistant_projection_cache: Option<AssistantProjectionCache>,
+}
+
+pub(crate) struct AssistantProjectionCache {
+    pub(crate) workspace: String,
+    pub(crate) run_id: String,
+    pub(crate) snapshot_seq: u64,
+    pub(crate) entries: BTreeMap<i64, Option<String>>,
 }
 
 /// A bounded, sequence-ordered slice of one run. Callers must project these
@@ -682,6 +690,7 @@ impl RunJournal {
             path: file_path,
             generation,
             coordination,
+            assistant_projection_cache: None,
         })
     }
 

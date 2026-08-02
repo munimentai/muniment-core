@@ -1,9 +1,10 @@
 //! Pure reconstruction of user-visible run state from journal events.
 
 use super::{EventEnvelope, EventPayload};
+use crate::assistant_text::projector::Projector;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectedThreadEntry {
@@ -15,6 +16,8 @@ pub struct ProjectedThreadEntry {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StampedThreadEntry {
+    pub run_id: String,
+    pub snapshot_seq: u64,
     pub run_ordinal: i64,
     pub entry_ordinal: i64,
     pub run_seq: u64,
@@ -64,7 +67,7 @@ impl super::RunJournal {
                     JOIN events e ON e.run_id=rt.run_id AND e.rowid<=?3 \
                     WHERE rt.thread_id=?1 AND rw.workspace=?2 \
                     GROUP BY rt.run_id, rt.thread_run_ordinal) \
-                 SELECT rs.thread_run_ordinal,p.ordinal,p.run_seq,p.kind,p.text \
+                 SELECT rs.run_id,rs.snapshot_seq,rs.thread_run_ordinal,p.ordinal,p.run_seq,p.kind,p.text \
                  FROM run_snapshots rs JOIN thread_projection_versions p ON p.run_id=rs.run_id \
                  WHERE p.valid_from_seq<=rs.snapshot_seq \
                  AND (p.valid_until_seq IS NULL OR p.valid_until_seq>rs.snapshot_seq) \
@@ -87,16 +90,18 @@ impl super::RunJournal {
                 ],
                 |row| {
                     Ok(StampedThreadEntry {
-                        run_ordinal: row.get(0)?,
-                        entry_ordinal: row.get(1)?,
-                        run_seq: row.get(2)?,
+                        run_id: row.get(0)?,
+                        snapshot_seq: row.get(1)?,
+                        run_ordinal: row.get(2)?,
+                        entry_ordinal: row.get(3)?,
+                        run_seq: row.get(4)?,
                         kind: row
-                            .get::<_, String>(3)?
+                            .get::<_, String>(5)?
                             .split(':')
                             .next()
                             .unwrap_or_default()
                             .to_owned(),
-                        text: row.get(4)?,
+                        text: row.get(6)?,
                     })
                 },
             )
@@ -105,6 +110,148 @@ impl super::RunJournal {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(super::JournalError::from)
             .map_err(super::RunEventPageError::Journal)
+    }
+
+    /// Reprojects assistant deltas for one stable run snapshot.
+    pub fn projected_assistant_text(
+        &mut self,
+        workspace: &str,
+        run_id: &str,
+        snapshot_seq: u64,
+        ordinals: &[i64],
+    ) -> Result<BTreeMap<i64, Option<String>>, super::RunEventPageError> {
+        if let Some(cached) = &self.assistant_projection_cache {
+            if cached.workspace == workspace
+                && cached.run_id == run_id
+                && cached.snapshot_seq == snapshot_seq
+            {
+                return Ok(ordinals
+                    .iter()
+                    .filter_map(|ordinal| {
+                        cached
+                            .entries
+                            .get(ordinal)
+                            .cloned()
+                            .map(|text| (*ordinal, text))
+                    })
+                    .collect());
+            }
+        }
+        let owned = self
+            .run_belongs_to_workspace(run_id, workspace)
+            .map_err(super::RunEventPageError::Journal)?;
+        if !owned {
+            return Err(super::RunEventPageError::NotFoundOrInaccessible);
+        }
+        let events = self
+            .events(run_id)
+            .map_err(super::RunEventPageError::Journal)?;
+        let mut projector = Projector::new(workspace, |path: &std::path::Path| {
+            std::fs::canonicalize(path)
+        });
+        let mut released = String::new();
+        let terminal = events.iter().any(|event| {
+            event.run_seq <= snapshot_seq
+                && matches!(
+                    event.event_type.as_str(),
+                    "run.completed" | "run.cancelled" | "run.failed"
+                )
+        });
+        for event in events.iter().filter(|event| {
+            event.run_seq <= snapshot_seq && event.event_type == "model.stream.delta"
+        }) {
+            let EventPayload::Inline { payload_json } = &event.payload else {
+                continue;
+            };
+            let text = payload_json
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let projections = projector
+                .push(event.run_seq, text, payload_json)
+                .map_err(|_| {
+                    super::RunEventPageError::Journal(super::JournalError::Corrupt(
+                        "assistant text projection failed".into(),
+                    ))
+                })?;
+            for projection in projections {
+                if let Some(text) = projection.text {
+                    released.push_str(&text);
+                }
+            }
+        }
+        let projections = if terminal {
+            projector.finish::<std::io::Error>()
+        } else {
+            projector.flush::<std::io::Error>()
+        }
+        .map_err(|_| {
+            super::RunEventPageError::Journal(super::JournalError::Corrupt(
+                "assistant text projection failed".into(),
+            ))
+        })?;
+        for projection in projections {
+            if let Some(text) = projection.text {
+                released.push_str(&text);
+            }
+        }
+
+        let coordination = self.coordination.clone();
+        let _operation = coordination
+            .as_ref()
+            .map(|state| state.operation.lock().unwrap());
+        self.refresh_after_compaction()
+            .map_err(super::RunEventPageError::Journal)?;
+        let connection = self
+            .connection
+            .as_ref()
+            .expect("journal connection is always present outside compaction");
+        let mut statement = connection
+            .prepare(
+                "SELECT ordinal,COALESCE(text,'') FROM thread_projection_versions \
+                 WHERE run_id=?1 AND kind='assistant_message' AND valid_from_seq<=?2 \
+                 AND (valid_until_seq IS NULL OR valid_until_seq>?2) ORDER BY ordinal",
+            )
+            .map_err(super::JournalError::from)
+            .map_err(super::RunEventPageError::Journal)?;
+        let rows = statement
+            .query_map(rusqlite::params![run_id, snapshot_seq], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?.len()))
+            })
+            .map_err(super::JournalError::from)
+            .map_err(super::RunEventPageError::Journal)?;
+        let mut released_offset = 0;
+        let mut original_offset = 0;
+        let mut result = BTreeMap::new();
+        for row in rows {
+            let (ordinal, original_len) = row
+                .map_err(super::JournalError::from)
+                .map_err(super::RunEventPageError::Journal)?;
+            original_offset += original_len;
+            let mut end = original_offset.min(released.len());
+            while !released.is_char_boundary(end) {
+                end -= 1;
+            }
+            let text = (end > released_offset).then(|| released[released_offset..end].to_owned());
+            result.insert(ordinal, text);
+            released_offset = end;
+        }
+        self.assistant_projection_cache = Some(super::AssistantProjectionCache {
+            workspace: workspace.to_owned(),
+            run_id: run_id.to_owned(),
+            snapshot_seq,
+            entries: result,
+        });
+        let projection = &self.assistant_projection_cache.as_ref().unwrap().entries;
+        Ok(ordinals
+            .iter()
+            .filter_map(|ordinal| {
+                projection
+                    .get(ordinal)
+                    .cloned()
+                    .map(|text| (*ordinal, text))
+            })
+            .collect())
     }
 
     /// Replays a stable run snapshot one row at a time. This keeps reducer

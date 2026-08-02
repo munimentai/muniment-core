@@ -168,6 +168,29 @@ fn an_overlong_assignment_withholds_everything_from_its_label() {
 }
 
 #[test]
+fn later_delta_cannot_release_an_overlong_candidate() {
+    let mut projector = projector();
+    let candidate = format!("safe token={}", "a".repeat(151));
+    assert_eq!(
+        projector.push(10, &candidate, &released()).unwrap(),
+        vec![Projection {
+            run_seq: 10,
+            text: Some("safe ".into()),
+            withheld: false,
+        }]
+    );
+    assert_eq!(
+        projector.push(11, "! near-miss text", &released()).unwrap(),
+        vec![Projection {
+            run_seq: 11,
+            text: None,
+            withheld: true,
+        }]
+    );
+    assert!(projector.finish().unwrap().is_empty());
+}
+
+#[test]
 fn rejects_empty_deltas_and_input_after_finish() {
     let mut projector = projector();
     assert_eq!(
