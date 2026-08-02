@@ -54,6 +54,55 @@ pub struct Scan {
     pub withhold_from: Option<usize>,
 }
 
+/// A lexical path candidate found outside workspace policy validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathCandidate {
+    Matched(Range<usize>),
+    OverSpan,
+    None,
+}
+
+/// Recognizes a bounded POSIX absolute path at `start`.
+pub fn posix_absolute_path_candidate(content: &str, start: usize) -> PathCandidate {
+    const MAX_SPAN: usize = 4_096;
+
+    let bytes = content.as_bytes();
+    if bytes.get(start) != Some(&b'/')
+        || !content.is_char_boundary(start)
+        || start != 0 && !is_path_boundary(bytes[start - 1])
+    {
+        return PathCandidate::None;
+    }
+
+    let mut end = start + 1;
+    if bytes.get(end).is_none_or(|byte| is_path_end(*byte)) {
+        return PathCandidate::Matched(start..end);
+    }
+
+    loop {
+        let component_start = end;
+        while let Some(byte) = bytes.get(end) {
+            if is_path_end(*byte) || matches!(byte, b'/' | b'\\') {
+                break;
+            }
+            end += 1;
+            if end - start > MAX_SPAN {
+                return PathCandidate::OverSpan;
+            }
+        }
+        if end == component_start {
+            return PathCandidate::None;
+        }
+        match bytes.get(end) {
+            None => return PathCandidate::Matched(start..end),
+            Some(byte) if is_path_end(*byte) => return PathCandidate::Matched(start..end),
+            Some(b'/') if end - start < MAX_SPAN => end += 1,
+            Some(b'/') => return PathCandidate::OverSpan,
+            Some(b'\\') | Some(_) => return PathCandidate::None,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Alternative {
     prefix: &'static [u8],
@@ -513,6 +562,17 @@ const fn is_assignment_filler(byte: u8) -> bool {
 
 const fn is_assignment_value_byte(byte: u8) -> bool {
     is_ascii_identifier_byte(byte) || matches!(byte, b'.' | b'/' | b'+' | b'=')
+}
+
+const fn is_path_boundary(byte: u8) -> bool {
+    byte.is_ascii_whitespace() || matches!(byte, b'(' | b'[' | b'{' | b':' | b'=' | b',' | b';')
+}
+
+const fn is_path_end(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'\0' | b' ' | b'\t' | b'\r' | b'\n' | b'\'' | b'"' | b'`' | b'<' | b'>' | b'|'
+    )
 }
 
 const fn is_alnum_hyphen(byte: u8) -> bool {
