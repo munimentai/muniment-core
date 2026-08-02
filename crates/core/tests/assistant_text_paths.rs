@@ -1,6 +1,7 @@
 use muniment_core::assistant_text::{
     classify_posix_absolute_path, classify_windows_absolute_path, posix_absolute_path_candidate,
-    scan, windows_absolute_path_candidate, PathCandidate, PathClassification,
+    scan, scan_with_workspace, windows_absolute_path_candidate, PathCandidate, PathClassification,
+    Rule,
 };
 #[cfg(unix)]
 use std::fs;
@@ -73,11 +74,93 @@ fn classifies_only_candidates_beyond_the_span_as_over_span() {
 }
 
 #[test]
-fn scan_does_not_apply_the_path_candidate() {
-    let content = "/workspace/secret.txt";
-    let result = scan(content, true);
+fn workspace_scan_releases_an_in_scope_path() {
+    let content = "open /workspace/secret.txt now";
+    let result = scan_with_workspace(content, true, Path::new("/workspace"), |path| {
+        Ok::<_, io::Error>(path.to_path_buf())
+    });
     assert!(result.matches.is_empty());
     assert_eq!(result.withhold_from, None);
+}
+
+#[test]
+fn workspace_scan_preserves_a_secret_inside_a_released_path() {
+    let content = format!("/workspace/sk-{}", "a".repeat(20));
+    let expected = scan(&content, true);
+    let actual = scan_with_workspace(&content, true, Path::new("/workspace"), |path| {
+        Ok::<_, io::Error>(path.to_path_buf())
+    });
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn workspace_scan_withholds_an_escape_and_a_validation_error() {
+    let content = "open /workspace/../outside.txt now";
+    let result = scan_with_workspace(content, true, Path::new("/workspace"), |path| {
+        Ok::<_, io::Error>(match path.to_str().unwrap() {
+            "/workspace" => "/canonical/workspace".into(),
+            "/workspace/../outside.txt" => "/canonical/outside.txt".into(),
+            path => panic!("unexpected path: {path}"),
+        })
+    });
+    assert_eq!(result.matches.len(), 1);
+    assert_eq!(result.matches[0].range, 5..30);
+    assert_eq!(result.matches[0].rule, Rule::PathPosixAbsolute);
+    assert_eq!(result.withhold_from, None);
+
+    let content = "open /workspace/missing.txt now";
+    let result = scan_with_workspace(content, true, Path::new("/workspace"), |_| {
+        Err::<std::path::PathBuf, _>(io::Error::other("validation failed"))
+    });
+    assert_eq!(result.matches.len(), 1);
+    assert_eq!(result.matches[0].range, 5..27);
+    assert_eq!(result.matches[0].rule, Rule::PathPosixAbsolute);
+    assert_eq!(result.withhold_from, None);
+}
+
+#[test]
+fn workspace_scan_withholds_an_over_span_path_without_validation() {
+    let content = format!("safe /{}", "a".repeat(4_096));
+    let result = scan_with_workspace(
+        &content,
+        true,
+        Path::new("/workspace"),
+        |_| -> io::Result<std::path::PathBuf> {
+            panic!("an over-span candidate must not reach scope validation")
+        },
+    );
+    assert!(result.matches.is_empty());
+    assert_eq!(result.withhold_from, Some(5));
+}
+
+#[test]
+fn workspace_scan_leaves_safe_text_and_secret_behavior_unchanged() {
+    let safe = "ordinary safe text";
+    let result = scan_with_workspace(
+        safe,
+        true,
+        Path::new("/workspace"),
+        |_| -> io::Result<std::path::PathBuf> {
+            panic!("safe text must not reach scope validation")
+        },
+    );
+    assert!(result.matches.is_empty());
+    assert_eq!(result.withhold_from, None);
+
+    let content = "safe token=0123456789 text";
+    for complete in [false, true] {
+        let expected = scan(content, complete);
+        let actual = scan_with_workspace(
+            content,
+            complete,
+            Path::new("/workspace"),
+            |_| -> io::Result<std::path::PathBuf> {
+                panic!("secret text must not reach scope validation")
+            },
+        );
+        assert_eq!(actual, expected, "{complete}");
+    }
 }
 
 #[test]

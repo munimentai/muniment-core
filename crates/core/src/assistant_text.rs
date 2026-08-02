@@ -16,6 +16,8 @@ pub enum Rule {
     SecretPemPrivateKey,
     /// A secret in an assignment.
     SecretAssignment,
+    /// A POSIX absolute path outside the approved workspace.
+    PathPosixAbsolute,
 }
 
 const RULE_ORDER: [Rule; 4] = [
@@ -320,6 +322,28 @@ const fn alternative(
 ///
 /// `complete` states that no later bytes can extend the supplied content.
 pub fn scan(content: &str, complete: bool) -> Scan {
+    scan_with_path_candidate(content, complete, |_, _| PathClassification::None)
+}
+
+/// Scans assistant reply content and applies POSIX workspace path policy.
+///
+/// `complete` states that no later bytes can extend the supplied content.
+pub fn scan_with_workspace<E>(
+    content: &str,
+    complete: bool,
+    approved_workspace: &Path,
+    mut canonicalize: impl FnMut(&Path) -> Result<PathBuf, E>,
+) -> Scan {
+    scan_with_path_candidate(content, complete, |content, start| {
+        classify_posix_absolute_path(content, start, approved_workspace, &mut canonicalize)
+    })
+}
+
+fn scan_with_path_candidate(
+    content: &str,
+    complete: bool,
+    mut classify_path: impl FnMut(&str, usize) -> PathClassification,
+) -> Scan {
     let bytes = content.as_bytes();
     let mut matches = Vec::new();
     let mut withhold_from = None;
@@ -348,6 +372,30 @@ pub fn scan(content: &str, complete: bool) -> Scan {
             });
             start = candidate.end;
             continue;
+        }
+        match classify_path(content, start) {
+            PathClassification::Released(_) => {
+                start += 1;
+                continue;
+            }
+            PathClassification::Withheld(withheld_start) => {
+                match posix_absolute_path_candidate(content, start) {
+                    PathCandidate::Matched(range) => {
+                        start = range.end;
+                        matches.push(Match {
+                            range,
+                            rule: Rule::PathPosixAbsolute,
+                        });
+                        continue;
+                    }
+                    PathCandidate::OverSpan => {
+                        withhold_from = Some(withheld_start);
+                        break;
+                    }
+                    PathCandidate::None => {}
+                }
+            }
+            PathClassification::None => {}
         }
         start += 1;
     }
@@ -379,6 +427,7 @@ impl Rule {
             Self::SecretJwt => jwt_candidate(bytes, start, complete),
             Self::SecretPemPrivateKey => pem_private_key_candidate(bytes, start, complete),
             Self::SecretAssignment => assignment_candidate(bytes, start, complete),
+            Self::PathPosixAbsolute => RuleCandidate::None,
         }
     }
 
@@ -388,6 +437,7 @@ impl Rule {
             Self::SecretJwt => 8_192,
             Self::SecretPemPrivateKey => 65_536,
             Self::SecretAssignment => 192,
+            Self::PathPosixAbsolute => 4_096,
         }
     }
 }
