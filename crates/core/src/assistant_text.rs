@@ -1,5 +1,7 @@
 //! Pure scanning for the `assistant-text-v1` assistant reply rules.
 
+pub mod ledger;
+
 use std::{
     ops::Range,
     path::{Path, PathBuf},
