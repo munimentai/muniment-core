@@ -180,7 +180,8 @@ enum RuleCandidate {
 fn assignment_candidate(bytes: &[u8], start: usize, _complete: bool) -> RuleCandidate {
     let _ = assignment_label_end(bytes, start)
         .and_then(|label_end| assignment_delimiter_end(bytes, label_end))
-        .map(|delimiter_end| assignment_value_prefix_end(bytes, delimiter_end));
+        .map(|delimiter_end| assignment_value_prefix_end(bytes, delimiter_end))
+        .and_then(|value_start| assignment_value_end(bytes, value_start));
     RuleCandidate::None
 }
 
@@ -238,6 +239,21 @@ fn assignment_value_prefix_end(bytes: &[u8], start: usize) -> usize {
         end += 1;
     }
     end
+}
+
+fn assignment_value_end(bytes: &[u8], start: usize) -> Option<usize> {
+    const MIN_VALUE: usize = 10;
+    const MAX_VALUE: usize = 150;
+
+    let mut end = start;
+    while end - start < MAX_VALUE
+        && bytes
+            .get(end)
+            .is_some_and(|byte| is_assignment_value_byte(*byte))
+    {
+        end += 1;
+    }
+    (end - start >= MIN_VALUE).then_some(end)
 }
 
 fn jwt_candidate(bytes: &[u8], start: usize, complete: bool) -> RuleCandidate {
@@ -474,6 +490,10 @@ const fn is_assignment_filler(byte: u8) -> bool {
     is_ascii_identifier_byte(byte) || matches!(byte, b'.' | b' ' | b'\t')
 }
 
+const fn is_assignment_value_byte(byte: u8) -> bool {
+    is_ascii_identifier_byte(byte) || matches!(byte, b'.' | b'/' | b'+' | b'=')
+}
+
 const fn is_alnum_hyphen(byte: u8) -> bool {
     is_alnum(byte) || byte == b'-'
 }
@@ -631,6 +651,29 @@ mod tests {
         let end = assignment_value_prefix_end(six_prefix_bytes, 0);
         assert_eq!(end, 5);
         assert_eq!(six_prefix_bytes.get(end), Some(&b'`'));
+    }
+
+    #[test]
+    fn assignment_value_accepts_each_allowed_byte() {
+        for byte in *b"aZ0_./+=-" {
+            let value = vec![byte; 10];
+            assert_eq!(assignment_value_end(&value, 0), Some(value.len()));
+        }
+    }
+
+    #[test]
+    fn assignment_value_requires_ten_bytes() {
+        assert_eq!(assignment_value_end(b"123456789", 0), None);
+        assert_eq!(assignment_value_end(b"!1234567890", 0), None);
+        assert_eq!(assignment_value_end(b"x1234567890", 1), Some(11));
+    }
+
+    #[test]
+    fn assignment_value_stops_at_invalid_or_max_byte() {
+        assert_eq!(assignment_value_end(b"1234567890!more", 0), Some(10));
+
+        let value = vec![b'a'; 151];
+        assert_eq!(assignment_value_end(&value, 0), Some(150));
     }
 
     #[test]
