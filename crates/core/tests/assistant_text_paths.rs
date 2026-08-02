@@ -308,17 +308,17 @@ fn windows_paths_reject_invalid_roots_and_components() {
 
 #[test]
 fn windows_paths_exceed_the_span_only_after_the_limit() {
-    let maximum = format!("C:\\{}", "a".repeat(131_065));
-    assert_eq!(maximum.len(), 131_068);
+    let maximum = format!("C:\\{}", "a".repeat(4_093));
+    assert_eq!(maximum.len(), 4_096);
     assert_eq!(
         windows_absolute_path_candidate(&maximum, 0),
-        PathCandidate::Matched(0..131_068)
+        PathCandidate::Matched(0..4_096)
     );
 
     let terminated = format!("{maximum} ");
     assert_eq!(
         windows_absolute_path_candidate(&terminated, 0),
-        PathCandidate::Matched(0..131_068)
+        PathCandidate::Matched(0..4_096)
     );
 
     let over_span = format!("{maximum}a");
@@ -333,6 +333,57 @@ fn scan_does_not_apply_the_windows_path_candidate() {
     let result = scan("C:\\workspace\\secret.txt", true);
     assert!(result.matches.is_empty());
     assert_eq!(result.withhold_from, None);
+}
+
+#[test]
+fn workspace_scan_releases_an_in_scope_windows_path_and_preserves_its_secret() {
+    let content = format!("C:\\workspace\\sk-{}", "a".repeat(20));
+    let expected = scan(&content, true);
+    let actual = scan_with_workspace(&content, true, Path::new("C:\\workspace"), |path| {
+        let canonical = if path == Path::new("C:\\workspace") {
+            Path::new("/canonical/workspace").to_path_buf()
+        } else {
+            Path::new("/canonical/workspace/file").to_path_buf()
+        };
+        Ok::<_, io::Error>(canonical)
+    });
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn workspace_scan_withholds_windows_scope_and_validation_failures() {
+    for fail_validation in [false, true] {
+        let content = "open C:\\outside.txt now";
+        let result = scan_with_workspace(content, true, Path::new("C:\\workspace"), |path| {
+            if fail_validation {
+                Err(io::Error::other("validation failed"))
+            } else if path == Path::new("C:\\workspace") {
+                Ok(Path::new("/canonical/workspace").to_path_buf())
+            } else {
+                Ok(Path::new("/canonical/outside.txt").to_path_buf())
+            }
+        });
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].range, 5..19);
+        assert_eq!(result.matches[0].rule, Rule::PathWindowsAbsolute);
+        assert_eq!(result.withhold_from, None);
+    }
+}
+
+#[test]
+fn workspace_scan_withholds_an_over_span_windows_path_without_validation() {
+    let content = format!("safe C:\\{}", "a".repeat(4_094));
+    let result = scan_with_workspace(
+        &content,
+        true,
+        Path::new("C:\\workspace"),
+        |_| -> io::Result<std::path::PathBuf> {
+            panic!("an over-span candidate must not reach scope validation")
+        },
+    );
+    assert!(result.matches.is_empty());
+    assert_eq!(result.withhold_from, Some(5));
 }
 
 #[test]
@@ -400,7 +451,7 @@ fn withholds_windows_scope_failures() {
 
 #[test]
 fn withholds_over_span_windows_candidates_without_scope_validation() {
-    let content = format!("C:\\{}", "a".repeat(131_066));
+    let content = format!("C:\\{}", "a".repeat(4_094));
     assert_eq!(
         classify_windows_absolute_path(
             &content,

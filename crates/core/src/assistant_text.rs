@@ -18,6 +18,8 @@ pub enum Rule {
     SecretAssignment,
     /// A POSIX absolute path outside the approved workspace.
     PathPosixAbsolute,
+    /// A Windows absolute path outside the approved workspace.
+    PathWindowsAbsolute,
 }
 
 const RULE_ORDER: [Rule; 4] = [
@@ -165,7 +167,7 @@ pub fn posix_absolute_path_candidate(content: &str, start: usize) -> PathCandida
 
 /// Recognizes a bounded Windows absolute path at `start`.
 pub fn windows_absolute_path_candidate(content: &str, start: usize) -> PathCandidate {
-    const MAX_SPAN: usize = 131_068;
+    const MAX_SPAN: usize = 4_096;
 
     let bytes = content.as_bytes();
     if !content.is_char_boundary(start)
@@ -325,7 +327,7 @@ pub fn scan(content: &str, complete: bool) -> Scan {
     scan_with_path_candidate(content, complete, |_, _| PathClassification::None)
 }
 
-/// Scans assistant reply content and applies POSIX workspace path policy.
+/// Scans assistant reply content and applies workspace path policy.
 ///
 /// `complete` states that no later bytes can extend the supplied content.
 pub fn scan_with_workspace<E>(
@@ -335,7 +337,13 @@ pub fn scan_with_workspace<E>(
     mut canonicalize: impl FnMut(&Path) -> Result<PathBuf, E>,
 ) -> Scan {
     scan_with_path_candidate(content, complete, |content, start| {
-        classify_posix_absolute_path(content, start, approved_workspace, &mut canonicalize)
+        let posix =
+            classify_posix_absolute_path(content, start, approved_workspace, &mut canonicalize);
+        if posix == PathClassification::None {
+            classify_windows_absolute_path(content, start, approved_workspace, &mut canonicalize)
+        } else {
+            posix
+        }
     })
 }
 
@@ -379,13 +387,17 @@ fn scan_with_path_candidate(
                 continue;
             }
             PathClassification::Withheld(withheld_start) => {
-                match posix_absolute_path_candidate(content, start) {
+                let (candidate, rule) = match posix_absolute_path_candidate(content, start) {
+                    PathCandidate::None => (
+                        windows_absolute_path_candidate(content, start),
+                        Rule::PathWindowsAbsolute,
+                    ),
+                    candidate => (candidate, Rule::PathPosixAbsolute),
+                };
+                match candidate {
                     PathCandidate::Matched(range) => {
                         start = range.end;
-                        matches.push(Match {
-                            range,
-                            rule: Rule::PathPosixAbsolute,
-                        });
+                        matches.push(Match { range, rule });
                         continue;
                     }
                     PathCandidate::OverSpan => {
@@ -427,7 +439,7 @@ impl Rule {
             Self::SecretJwt => jwt_candidate(bytes, start, complete),
             Self::SecretPemPrivateKey => pem_private_key_candidate(bytes, start, complete),
             Self::SecretAssignment => assignment_candidate(bytes, start, complete),
-            Self::PathPosixAbsolute => RuleCandidate::None,
+            Self::PathPosixAbsolute | Self::PathWindowsAbsolute => RuleCandidate::None,
         }
     }
 
@@ -438,6 +450,7 @@ impl Rule {
             Self::SecretPemPrivateKey => 65_536,
             Self::SecretAssignment => 192,
             Self::PathPosixAbsolute => 4_096,
+            Self::PathWindowsAbsolute => 4_096,
         }
     }
 }
