@@ -97,6 +97,29 @@ pub fn classify_posix_absolute_path<E>(
     }
 }
 
+/// Classifies a Windows path through injected current filesystem resolution.
+pub fn classify_windows_absolute_path<E>(
+    content: &str,
+    start: usize,
+    approved_workspace: &Path,
+    mut canonicalize: impl FnMut(&Path) -> Result<PathBuf, E>,
+) -> PathClassification {
+    match windows_absolute_path_candidate(content, start) {
+        PathCandidate::Matched(range) => {
+            let path = Path::new(&content[range.clone()]);
+            let in_scope = canonicalize(approved_workspace).and_then(|workspace| {
+                canonicalize(path).map(|candidate| candidate.starts_with(workspace))
+            });
+            match in_scope {
+                Ok(true) => PathClassification::Released(range),
+                Ok(false) | Err(_) => PathClassification::Withheld(start),
+            }
+        }
+        PathCandidate::OverSpan => PathClassification::Withheld(start),
+        PathCandidate::None => PathClassification::None,
+    }
+}
+
 /// Recognizes a bounded POSIX absolute path at `start`.
 pub fn posix_absolute_path_candidate(content: &str, start: usize) -> PathCandidate {
     const MAX_SPAN: usize = 4_096;

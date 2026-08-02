@@ -1,6 +1,6 @@
 use muniment_core::assistant_text::{
-    classify_posix_absolute_path, posix_absolute_path_candidate, scan,
-    windows_absolute_path_candidate, PathCandidate, PathClassification,
+    classify_posix_absolute_path, classify_windows_absolute_path, posix_absolute_path_candidate,
+    scan, windows_absolute_path_candidate, PathCandidate, PathClassification,
 };
 #[cfg(unix)]
 use std::fs;
@@ -250,4 +250,93 @@ fn scan_does_not_apply_the_windows_path_candidate() {
     let result = scan("C:\\workspace\\secret.txt", true);
     assert!(result.matches.is_empty());
     assert_eq!(result.withhold_from, None);
+}
+
+#[test]
+#[cfg(windows)]
+fn classifies_each_windows_path_form_inside_the_canonical_workspace() {
+    let workspace = Path::new("C:\\workspace");
+    for candidate in [
+        "C:\\workspace\\drive.txt",
+        "\\\\server\\share\\workspace\\unc.txt",
+        "\\\\?\\C:\\workspace\\extended.txt",
+        "\\\\?\\UNC\\server\\share\\workspace\\extended-unc.txt",
+    ] {
+        assert_eq!(
+            classify_windows_absolute_path(candidate, 0, workspace, |path| {
+                let canonical = match path.to_str().unwrap() {
+                    "C:\\workspace" => "C:\\canonical-workspace",
+                    "C:\\workspace\\drive.txt" => "C:\\canonical-workspace\\drive.txt",
+                    "\\\\server\\share\\workspace\\unc.txt" => "C:\\canonical-workspace\\unc.txt",
+                    "\\\\?\\C:\\workspace\\extended.txt" => "C:\\canonical-workspace\\extended.txt",
+                    "\\\\?\\UNC\\server\\share\\workspace\\extended-unc.txt" => {
+                        "C:\\canonical-workspace\\extended-unc.txt"
+                    }
+                    path => panic!("unexpected path: {path}"),
+                };
+                Ok::<_, io::Error>(canonical.into())
+            }),
+            PathClassification::Released(0..candidate.len()),
+            "{candidate:?}"
+        );
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn withholds_windows_scope_failures() {
+    let workspace = Path::new("C:\\workspace");
+    for candidate in [
+        "C:\\outside.txt",
+        "C:\\workspace\\..\\outside.txt",
+        "C:\\workspace\\reparse.txt",
+        "C:\\workspace\\missing.txt",
+    ] {
+        assert_eq!(
+            classify_windows_absolute_path(candidate, 0, workspace, |path| {
+                match path.to_str().unwrap() {
+                    "C:\\workspace" => Ok("C:\\canonical-workspace".into()),
+                    "C:\\workspace\\missing.txt" => {
+                        Err(io::Error::new(io::ErrorKind::NotFound, "missing path"))
+                    }
+                    _ => Ok("C:\\outside\\file.txt".into()),
+                }
+            }),
+            PathClassification::Withheld(0),
+            "{candidate:?}"
+        );
+    }
+
+    assert_eq!(
+        classify_windows_absolute_path("C:\\workspace\\file.txt", 0, workspace, |_| {
+            Err::<std::path::PathBuf, _>(io::Error::other("validation failed"))
+        }),
+        PathClassification::Withheld(0)
+    );
+}
+
+#[test]
+fn withholds_over_span_windows_candidates_without_scope_validation() {
+    let content = format!("C:\\{}", "a".repeat(131_066));
+    assert_eq!(
+        classify_windows_absolute_path(
+            &content,
+            0,
+            Path::new("C:\\workspace"),
+            |_| -> io::Result<_> {
+                panic!("an over-span candidate must not reach scope validation")
+            }
+        ),
+        PathClassification::Withheld(0)
+    );
+
+    assert_eq!(
+        classify_windows_absolute_path(
+            "not a path",
+            0,
+            Path::new("C:\\workspace"),
+            |_| -> io::Result<_> { panic!("a non-candidate must not reach scope validation") }
+        ),
+        PathClassification::None
+    );
 }
