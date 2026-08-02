@@ -253,7 +253,11 @@ fn assignment_value_end(bytes: &[u8], start: usize) -> Option<usize> {
     {
         end += 1;
     }
-    (end - start >= MIN_VALUE).then_some(end)
+    (end - start >= MIN_VALUE
+        && bytes.get(end).is_none_or(|byte| {
+            byte.is_ascii_whitespace() || matches!(byte, b'\'' | b'"' | b'`' | b';' | b'\\')
+        }))
+    .then_some(end)
 }
 
 fn jwt_candidate(bytes: &[u8], start: usize, complete: bool) -> RuleCandidate {
@@ -669,11 +673,31 @@ mod tests {
     }
 
     #[test]
-    fn assignment_value_stops_at_invalid_or_max_byte() {
-        assert_eq!(assignment_value_end(b"1234567890!more", 0), Some(10));
+    fn assignment_value_accepts_each_terminator() {
+        for terminator in *b" \t\n\x0c\r'\"`;\\" {
+            let content = [b"1234567890".as_slice(), &[terminator]].concat();
+            assert_eq!(assignment_value_end(&content, 0), Some(10));
+        }
+    }
 
-        let value = vec![b'a'; 151];
-        assert_eq!(assignment_value_end(&value, 0), Some(150));
+    #[test]
+    fn assignment_value_accepts_content_end() {
+        assert_eq!(assignment_value_end(b"1234567890", 0), Some(10));
+    }
+
+    #[test]
+    fn assignment_value_rejects_unrecognized_terminator() {
+        assert_eq!(assignment_value_end(b"1234567890!more", 0), None);
+    }
+
+    #[test]
+    fn assignment_value_enforces_maximum_before_terminator() {
+        let mut maximum = vec![b'a'; 150];
+        maximum.push(b';');
+        assert_eq!(assignment_value_end(&maximum, 0), Some(150));
+
+        let over_maximum = vec![b'a'; 151];
+        assert_eq!(assignment_value_end(&over_maximum, 0), None);
     }
 
     #[test]
