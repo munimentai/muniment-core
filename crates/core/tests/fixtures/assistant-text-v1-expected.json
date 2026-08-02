@@ -1,0 +1,50 @@
+{
+  "rule_set": "assistant-text-v1",
+  "boundary_cases": [
+    {
+      "name": "secret.provider-token",
+      "projections": [
+        { "run_seq": 100, "text": "provider before ", "withheld": false },
+        { "run_seq": 101, "text": " provider after", "withheld": false }
+      ]
+    },
+    {
+      "name": "secret.jwt",
+      "projections": [
+        { "run_seq": 100, "text": "jwt before ", "withheld": false },
+        { "run_seq": 101, "text": " jwt after", "withheld": false }
+      ]
+    },
+    {
+      "name": "secret.pem-private-key",
+      "projections": [
+        { "run_seq": 100, "text": "pem before\n", "withheld": false },
+        { "run_seq": 101, "text": "\npem after", "withheld": false }
+      ]
+    },
+    {
+      "name": "secret.assignment",
+      "projections": [
+        { "run_seq": 100, "text": "assignment before ", "withheld": false },
+        { "run_seq": 101, "text": " assignment after", "withheld": false }
+      ]
+    }
+  ],
+  "three_delta": [
+    { "run_seq": 200, "text": "three before ", "withheld": false },
+    { "run_seq": 201, "text": null, "withheld": true },
+    { "run_seq": 202, "text": " three after", "withheld": false }
+  ],
+  "terminal": [
+    { "run_seq": 300, "text": "terminal before ", "withheld": false },
+    { "run_seq": 301, "text": null, "withheld": true }
+  ],
+  "paths": {
+    "inside": [
+      { "run_seq": 400, "text": "inside /workspace/file.txt done", "withheld": false }
+    ],
+    "outside": [
+      { "run_seq": 401, "text": "outside  done", "withheld": false }
+    ]
+  }
+}

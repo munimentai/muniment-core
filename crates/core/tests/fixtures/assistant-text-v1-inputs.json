@@ -1,0 +1,44 @@
+{
+  "rule_set": "assistant-text-v1",
+  "approved_workspace": "/workspace",
+  "boundary_cases": [
+    {
+      "name": "secret.provider-token",
+      "secret": "AKIAAAAAAAAAAAAAAAAA",
+      "safe_before": "provider before ",
+      "safe_after": " provider after"
+    },
+    {
+      "name": "secret.jwt",
+      "secret": "AAAAAAAAAAAAAAAAA._________________.-----------------",
+      "safe_before": "jwt before ",
+      "safe_after": " jwt after"
+    },
+    {
+      "name": "secret.pem-private-key",
+      "secret": "-----BEGIN PRIVATE KEY-----\nQUJDREVGR0hJSktMTU5PUA==\n-----END PRIVATE KEY-----",
+      "safe_before": "pem before\n",
+      "safe_after": "\npem after"
+    },
+    {
+      "name": "secret.assignment",
+      "secret": "token=0123456789",
+      "safe_before": "assignment before ",
+      "safe_after": " assignment after"
+    }
+  ],
+  "three_delta": {
+    "secret": "AKIAAAAAAAAAAAAAAAAA",
+    "safe_before": "three before ",
+    "safe_after": " three after",
+    "split_after": [5, 12]
+  },
+  "terminal": {
+    "secret": "token=0123456789",
+    "safe_before": "terminal before "
+  },
+  "paths": {
+    "inside": "inside /workspace/file.txt done",
+    "outside": "outside /private/file.txt done"
+  }
+}

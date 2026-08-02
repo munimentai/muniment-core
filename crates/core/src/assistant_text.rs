@@ -327,7 +327,7 @@ const fn alternative(
 ///
 /// `complete` states that no later bytes can extend the supplied content.
 pub fn scan(content: &str, complete: bool) -> Scan {
-    scan_with_path_candidate(content, complete, |_, _| PathClassification::None)
+    scan_with_path_candidate(content, complete, |_, _| PathClassification::None, false)
 }
 
 /// Scans assistant reply content and applies workspace path policy.
@@ -339,21 +339,63 @@ pub fn scan_with_workspace<E>(
     approved_workspace: &Path,
     mut canonicalize: impl FnMut(&Path) -> Result<PathBuf, E>,
 ) -> Scan {
-    scan_with_path_candidate(content, complete, |content, start| {
-        let posix =
-            classify_posix_absolute_path(content, start, approved_workspace, &mut canonicalize);
-        if posix == PathClassification::None {
-            classify_windows_absolute_path(content, start, approved_workspace, &mut canonicalize)
-        } else {
-            posix
-        }
-    })
+    scan_with_workspace_mode(
+        content,
+        complete,
+        approved_workspace,
+        &mut canonicalize,
+        false,
+    )
+}
+
+pub(super) fn scan_with_workspace_for_projector<E>(
+    content: &str,
+    complete: bool,
+    approved_workspace: &Path,
+    mut canonicalize: impl FnMut(&Path) -> Result<PathBuf, E>,
+) -> Scan {
+    scan_with_workspace_mode(
+        content,
+        complete,
+        approved_workspace,
+        &mut canonicalize,
+        true,
+    )
+}
+
+fn scan_with_workspace_mode<E>(
+    content: &str,
+    complete: bool,
+    approved_workspace: &Path,
+    mut canonicalize: impl FnMut(&Path) -> Result<PathBuf, E>,
+    wait_for_incomplete_pem: bool,
+) -> Scan {
+    scan_with_path_candidate(
+        content,
+        complete,
+        |content, start| {
+            let posix =
+                classify_posix_absolute_path(content, start, approved_workspace, &mut canonicalize);
+            if posix == PathClassification::None {
+                classify_windows_absolute_path(
+                    content,
+                    start,
+                    approved_workspace,
+                    &mut canonicalize,
+                )
+            } else {
+                posix
+            }
+        },
+        wait_for_incomplete_pem,
+    )
 }
 
 fn scan_with_path_candidate(
     content: &str,
     complete: bool,
     mut classify_path: impl FnMut(&str, usize) -> PathClassification,
+    wait_for_incomplete_pem: bool,
 ) -> Scan {
     let bytes = content.as_bytes();
     let mut matches = Vec::new();
@@ -361,7 +403,8 @@ fn scan_with_path_candidate(
     let mut start = 0;
 
     while start < bytes.len() {
-        let candidates = RULE_ORDER.map(|rule| rule.candidate(bytes, start, complete));
+        let candidates =
+            RULE_ORDER.map(|rule| rule.candidate(bytes, start, complete, wait_for_incomplete_pem));
         if candidates.contains(&RuleCandidate::OverSpan) {
             withhold_from = Some(start);
             break;
@@ -436,11 +479,19 @@ fn scan_with_path_candidate(
 }
 
 impl Rule {
-    fn candidate(self, bytes: &[u8], start: usize, complete: bool) -> RuleCandidate {
+    fn candidate(
+        self,
+        bytes: &[u8],
+        start: usize,
+        complete: bool,
+        wait_for_incomplete_pem: bool,
+    ) -> RuleCandidate {
         match self {
             Self::SecretProviderToken => provider_token_candidate(bytes, start, complete),
             Self::SecretJwt => jwt_candidate(bytes, start, complete),
-            Self::SecretPemPrivateKey => pem_private_key_candidate(bytes, start, complete),
+            Self::SecretPemPrivateKey => {
+                pem_private_key_candidate(bytes, start, complete, wait_for_incomplete_pem)
+            }
             Self::SecretAssignment => assignment_candidate(bytes, start, complete),
             Self::PathPosixAbsolute | Self::PathWindowsAbsolute => RuleCandidate::None,
         }
@@ -643,7 +694,12 @@ fn provider_token_candidate(bytes: &[u8], start: usize, complete: bool) -> RuleC
     }
 }
 
-fn pem_private_key_candidate(bytes: &[u8], start: usize, _complete: bool) -> RuleCandidate {
+fn pem_private_key_candidate(
+    bytes: &[u8],
+    start: usize,
+    complete: bool,
+    wait_for_incomplete: bool,
+) -> RuleCandidate {
     const HEADER_NAMES: [&[u8]; 6] = [
         b"PRIVATE KEY",
         b"ENCRYPTED PRIVATE KEY",
@@ -684,6 +740,9 @@ fn pem_private_key_candidate(bytes: &[u8], start: usize, _complete: bool) -> Rul
         if bytes[end].is_ascii_alphanumeric() || matches!(bytes[end], b'+' | b'/' | b'=' | b'\n') {
             end += 1;
         } else if bytes[end] == b'\r' {
+            if wait_for_incomplete && !complete && end + 1 == bytes.len() {
+                return RuleCandidate::None;
+            }
             if end - body_start + 2 > MAX_BODY || !bytes[end..].starts_with(b"\r\n") {
                 return RuleCandidate::OverSpan;
             }
@@ -693,14 +752,18 @@ fn pem_private_key_candidate(bytes: &[u8], start: usize, _complete: bool) -> Rul
         }
     }
 
-    if end == body_start
-        || !bytes[end..].starts_with(END_PREFIX)
-        || !bytes[end + END_PREFIX.len()..].starts_with(header_name)
-        || !bytes[end + END_PREFIX.len() + header_name.len()..].starts_with(END_SUFFIX)
+    let expected_end = [END_PREFIX, header_name, END_SUFFIX].concat();
+    if wait_for_incomplete
+        && !complete
+        && bytes[end..].len() < expected_end.len()
+        && expected_end.starts_with(&bytes[end..])
     {
+        return RuleCandidate::None;
+    }
+    if end == body_start || !bytes[end..].starts_with(&expected_end) {
         return RuleCandidate::OverSpan;
     }
-    end += END_PREFIX.len() + header_name.len() + END_SUFFIX.len();
+    end += expected_end.len();
     if end < bytes.len() && bytes[end] != b'\n' && !bytes[end..].starts_with(b"\r\n") {
         return RuleCandidate::OverSpan;
     }
