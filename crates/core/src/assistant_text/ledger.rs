@@ -23,7 +23,13 @@ pub enum LedgerError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Envelope {
     run_seq: u64,
-    span: Range<u64>,
+    kind: EnvelopeKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EnvelopeKind {
+    Spanned(Range<u64>),
+    Withheld,
 }
 
 /// Records envelope spans and attributes resolved bytes back to them.
@@ -51,10 +57,18 @@ impl Ledger {
             .ok_or(LedgerError::StreamOffsetOverflow)?;
         self.envelopes.push_back(Envelope {
             run_seq,
-            span: self.stream_end..end,
+            kind: EnvelopeKind::Spanned(self.stream_end..end),
         });
         self.stream_end = end;
         Ok(())
+    }
+
+    /// Records a withheld envelope without adding bytes to the stream.
+    pub fn push_withheld(&mut self, run_seq: u64) {
+        self.envelopes.push_back(Envelope {
+            run_seq,
+            kind: EnvelopeKind::Withheld,
+        });
     }
 
     /// Resolves a stream prefix and emits every envelope completed by it.
@@ -72,18 +86,28 @@ impl Ledger {
         let completed = self
             .envelopes
             .iter()
-            .take_while(|envelope| envelope.span.end <= released_up_to)
+            .take_while(|envelope| match &envelope.kind {
+                EnvelopeKind::Spanned(span) => span.end <= released_up_to,
+                EnvelopeKind::Withheld => true,
+            })
             .count();
         let mut projections = Vec::with_capacity(completed);
         for envelope in self.envelopes.drain(..completed) {
             projections.push(Projection {
                 run_seq: envelope.run_seq,
-                released_ranges: released_parts(&envelope.span, &self.withheld_ranges),
+                released_ranges: match envelope.kind {
+                    EnvelopeKind::Spanned(span) => released_parts(&span, &self.withheld_ranges),
+                    EnvelopeKind::Withheld => Vec::new(),
+                },
             });
         }
         if let Some(first_pending) = self.envelopes.front() {
+            let pending_start = match &first_pending.kind {
+                EnvelopeKind::Spanned(span) => span.start,
+                EnvelopeKind::Withheld => self.resolved_up_to,
+            };
             self.withheld_ranges
-                .retain(|range| range.end > first_pending.span.start);
+                .retain(|range| range.end > pending_start);
         } else {
             self.withheld_ranges.clear();
         }

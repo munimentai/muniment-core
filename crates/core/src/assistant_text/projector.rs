@@ -4,6 +4,8 @@ use super::{
     ledger::{Ledger, LedgerError, Projection as LedgerProjection},
     scan_with_workspace, Match,
 };
+use crate::journal::content_disclosure::{read_content_disclosure, ContentDisclosure};
+use serde_json::Value;
 use std::{
     collections::BTreeMap,
     ops::Range,
@@ -61,12 +63,27 @@ impl<C> Projector<C> {
     }
 
     /// Appends one committed delta and returns newly completed projections.
-    pub fn push<E>(&mut self, run_seq: u64, text: &str) -> Result<Vec<Projection>, ProjectorError>
+    pub fn push<E>(
+        &mut self,
+        run_seq: u64,
+        text: &str,
+        payload: &Value,
+    ) -> Result<Vec<Projection>, ProjectorError>
     where
         C: FnMut(&Path) -> Result<PathBuf, E>,
     {
         if self.finished {
             return Err(ProjectorError::Finished);
+        }
+        if matches!(
+            read_content_disclosure(payload),
+            ContentDisclosure::Withheld(_)
+        ) {
+            self.ledger.push_withheld(run_seq);
+            if self.withhold_from.is_some() {
+                return self.resolve(self.stream_end, &[]);
+            }
+            return self.scan_and_resolve(false);
         }
         let byte_len =
             u64::try_from(text.len()).map_err(|_| ProjectorError::InvalidStreamOffset)?;
