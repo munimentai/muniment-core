@@ -2,6 +2,7 @@
 
 pub mod ledger;
 pub mod projector;
+pub mod stream;
 
 use std::{
     ops::Range,
