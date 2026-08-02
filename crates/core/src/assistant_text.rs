@@ -7,11 +7,17 @@ use std::ops::Range;
 pub enum Rule {
     /// A provider credential such as a GitHub or OpenAI token.
     SecretProviderToken,
+    /// A JSON Web Token.
+    SecretJwt,
     /// A PEM private key block.
     SecretPemPrivateKey,
 }
 
-const RULE_ORDER: [Rule; 2] = [Rule::SecretProviderToken, Rule::SecretPemPrivateKey];
+const RULE_ORDER: [Rule; 3] = [
+    Rule::SecretProviderToken,
+    Rule::SecretJwt,
+    Rule::SecretPemPrivateKey,
+];
 
 /// One non-overlapping byte range selected by the scanner.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +136,7 @@ impl Rule {
     fn candidate(self, bytes: &[u8], start: usize, complete: bool) -> RuleCandidate {
         match self {
             Self::SecretProviderToken => provider_token_candidate(bytes, start, complete),
+            Self::SecretJwt => jwt_candidate(bytes, start, complete),
             Self::SecretPemPrivateKey => pem_private_key_candidate(bytes, start, complete),
         }
     }
@@ -137,6 +144,7 @@ impl Rule {
     const fn max_span(self) -> usize {
         match self {
             Self::SecretProviderToken => 512,
+            Self::SecretJwt => 8_192,
             Self::SecretPemPrivateKey => 65_536,
         }
     }
@@ -147,6 +155,60 @@ enum RuleCandidate {
     Matched(usize),
     OverSpan,
     None,
+}
+
+fn jwt_candidate(bytes: &[u8], start: usize, complete: bool) -> RuleCandidate {
+    const FIRST_MIN: usize = 17;
+    const FIRST_MAX: usize = 2_726;
+    const THIRD_MAX: usize = 2_724;
+
+    if start != 0 && is_b64(bytes[start - 1]) {
+        return RuleCandidate::None;
+    }
+
+    let Some(first_end) = jwt_segment_end(bytes, start, FIRST_MAX) else {
+        return RuleCandidate::OverSpan;
+    };
+    if first_end - start < FIRST_MIN || bytes.get(first_end) != Some(&b'.') {
+        return RuleCandidate::None;
+    }
+
+    let second_start = first_end + 1;
+    let Some(second_end) = jwt_segment_end(bytes, second_start, FIRST_MAX) else {
+        return RuleCandidate::OverSpan;
+    };
+    if second_end - second_start < FIRST_MIN || bytes.get(second_end) != Some(&b'.') {
+        return RuleCandidate::None;
+    }
+
+    let third_start = second_end + 1;
+    let Some(mut end) = jwt_segment_end(bytes, third_start, THIRD_MAX) else {
+        return RuleCandidate::OverSpan;
+    };
+    for _ in 0..2 {
+        if bytes.get(end) == Some(&b'=') {
+            end += 1;
+        }
+    }
+    if bytes.get(end) == Some(&b'=') || end < bytes.len() && is_b64(bytes[end]) {
+        return RuleCandidate::None;
+    }
+    if end == bytes.len() && !complete {
+        return RuleCandidate::None;
+    }
+    RuleCandidate::Matched(end)
+}
+
+fn jwt_segment_end(bytes: &[u8], start: usize, max: usize) -> Option<usize> {
+    let mut end = start;
+    while end < bytes.len() && end - start < max && is_b64(bytes[end]) {
+        end += 1;
+    }
+    if end < bytes.len() && is_b64(bytes[end]) {
+        None
+    } else {
+        Some(end)
+    }
 }
 
 fn provider_token_candidate(bytes: &[u8], start: usize, complete: bool) -> RuleCandidate {

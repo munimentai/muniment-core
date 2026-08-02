@@ -4,6 +4,16 @@ fn token(prefix: &str, body: char, length: usize) -> String {
     format!("{prefix}{}", body.to_string().repeat(length))
 }
 
+fn jwt(first: usize, second: usize, third: usize, padding: usize) -> String {
+    format!(
+        "{}.{}.{}{}",
+        "A".repeat(first),
+        "_".repeat(second),
+        "-".repeat(third),
+        "=".repeat(padding)
+    )
+}
+
 fn private_key(body: &str) -> String {
     named_private_key("PRIVATE KEY", body)
 }
@@ -45,6 +55,50 @@ fn matches_each_provider_alternative() {
         assert_eq!(result.matches[0].range, 0..value.len(), "{prefix}");
         assert_eq!(result.matches[0].rule, Rule::SecretProviderToken);
     }
+}
+
+#[test]
+fn jwt_accepts_segment_and_padding_boundaries() {
+    let cases = [
+        jwt(17, 17, 0, 0),
+        jwt(17, 17, 0, 1),
+        jwt(17, 17, 0, 2),
+        jwt(2_726, 2_726, 2_724, 0),
+        jwt(2_726, 2_726, 2_724, 2),
+    ];
+    for value in cases {
+        let result = scan(&value, true);
+        assert_eq!(result.matches.len(), 1, "{}", value.len());
+        assert_eq!(result.matches[0].range, 0..value.len());
+        assert_eq!(result.matches[0].rule, Rule::SecretJwt);
+    }
+}
+
+#[test]
+fn jwt_rejects_invalid_candidates() {
+    let cases = [
+        jwt(16, 17, 0, 0),
+        jwt(17, 16, 0, 0),
+        jwt(2_727, 17, 0, 0),
+        jwt(17, 2_727, 0, 0),
+        jwt(17, 17, 2_725, 0),
+        jwt(17, 17, 0, 3),
+        format!("{}.{}", "A".repeat(17), "A".repeat(17)),
+        format!("{}.?.", "A".repeat(17)),
+    ];
+    for value in cases {
+        assert!(scan(&value, true).matches.is_empty(), "{}", value.len());
+    }
+}
+
+#[test]
+fn jwt_requires_base64_token_boundaries() {
+    let value = jwt(2_726, 17, 2_724, 0);
+    assert!(scan(&format!("A{value}"), true).matches.is_empty());
+    assert!(scan(&format!("{value}_"), true).matches.is_empty());
+
+    let delimited = format!("!{value}?");
+    assert_eq!(scan(&delimited, true).matches[0].range, 1..value.len() + 1);
 }
 
 #[test]
