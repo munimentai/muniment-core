@@ -14,6 +14,15 @@ fn jwt(first: usize, second: usize, third: usize, padding: usize) -> String {
     )
 }
 
+#[test]
+fn releases_assignment_shaped_text_while_the_candidate_is_a_stub() {
+    let content = "password = 'abcdefghijklmnop'";
+    let result = scan(content, true);
+    assert!(result.matches.is_empty());
+    assert_eq!(result.retention_offset, content.len());
+    assert_eq!(result.withhold_from, None);
+}
+
 fn private_key(body: &str) -> String {
     named_private_key("PRIVATE KEY", body)
 }

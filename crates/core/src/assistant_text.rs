@@ -11,12 +11,15 @@ pub enum Rule {
     SecretJwt,
     /// A PEM private key block.
     SecretPemPrivateKey,
+    /// A secret in an assignment.
+    SecretAssignment,
 }
 
-const RULE_ORDER: [Rule; 3] = [
+const RULE_ORDER: [Rule; 4] = [
     Rule::SecretProviderToken,
     Rule::SecretJwt,
     Rule::SecretPemPrivateKey,
+    Rule::SecretAssignment,
 ];
 
 /// One non-overlapping byte range selected by the scanner.
@@ -138,6 +141,7 @@ impl Rule {
             Self::SecretProviderToken => provider_token_candidate(bytes, start, complete),
             Self::SecretJwt => jwt_candidate(bytes, start, complete),
             Self::SecretPemPrivateKey => pem_private_key_candidate(bytes, start, complete),
+            Self::SecretAssignment => assignment_candidate(bytes, start, complete),
         }
     }
 
@@ -146,6 +150,7 @@ impl Rule {
             Self::SecretProviderToken => 512,
             Self::SecretJwt => 8_192,
             Self::SecretPemPrivateKey => 65_536,
+            Self::SecretAssignment => 192,
         }
     }
 }
@@ -155,6 +160,10 @@ enum RuleCandidate {
     Matched(usize),
     OverSpan,
     None,
+}
+
+fn assignment_candidate(_bytes: &[u8], _start: usize, _complete: bool) -> RuleCandidate {
+    RuleCandidate::None
 }
 
 fn jwt_candidate(bytes: &[u8], start: usize, complete: bool) -> RuleCandidate {
