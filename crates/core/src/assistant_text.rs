@@ -178,7 +178,8 @@ enum RuleCandidate {
 }
 
 fn assignment_candidate(bytes: &[u8], start: usize, _complete: bool) -> RuleCandidate {
-    let _ = assignment_label_end(bytes, start);
+    let _ = assignment_label_end(bytes, start)
+        .and_then(|label_end| assignment_delimiter_end(bytes, label_end));
     RuleCandidate::None
 }
 
@@ -203,6 +204,27 @@ fn assignment_label_end(bytes: &[u8], start: usize) -> Option<usize> {
             None
         }
     })
+}
+
+fn assignment_delimiter_end(bytes: &[u8], start: usize) -> Option<usize> {
+    const DELIMITERS: [&[u8]; 9] = [b":=", b"=>", b"<=", b"?=", b"||", b"=", b">", b":", b","];
+
+    let mut end = start;
+    while end - start < 20
+        && bytes
+            .get(end)
+            .is_some_and(|byte| is_assignment_filler(*byte))
+    {
+        end += 1;
+    }
+    DELIMITERS
+        .into_iter()
+        .find(|delimiter| {
+            bytes
+                .get(end..)
+                .is_some_and(|remaining| remaining.starts_with(delimiter))
+        })
+        .map(|delimiter| end + delimiter.len())
 }
 
 fn jwt_candidate(bytes: &[u8], start: usize, complete: bool) -> RuleCandidate {
@@ -435,6 +457,10 @@ const fn is_ascii_identifier_byte(byte: u8) -> bool {
     is_alnum_underscore(byte) || byte == b'-'
 }
 
+const fn is_assignment_filler(byte: u8) -> bool {
+    is_ascii_identifier_byte(byte) || matches!(byte, b'.' | b' ' | b'\t')
+}
+
 const fn is_alnum_hyphen(byte: u8) -> bool {
     is_alnum(byte) || byte == b'-'
 }
@@ -516,6 +542,65 @@ mod tests {
 
             let invalid_after = [b'k', b'e', b'y', identifier];
             assert_eq!(assignment_label_end(&invalid_after, 0), None);
+        }
+    }
+
+    #[test]
+    fn assignment_accepts_bounded_filler_and_each_delimiter() {
+        for filler in *b"aZ0_. \t-" {
+            for filler_len in 0..=20 {
+                let content = [vec![filler; filler_len], b"=".to_vec()].concat();
+                assert_eq!(assignment_delimiter_end(&content, 0), Some(content.len()));
+            }
+        }
+
+        for delimiter in [
+            b"=".as_slice(),
+            b">",
+            b":",
+            b":=",
+            b"=>",
+            b"<=",
+            b"?=",
+            b",",
+            b"||",
+        ] {
+            assert_eq!(
+                assignment_delimiter_end(delimiter, 0),
+                Some(delimiter.len())
+            );
+        }
+    }
+
+    #[test]
+    fn assignment_prefers_two_byte_delimiters() {
+        for delimiter in [b":=".as_slice(), b"=>"] {
+            assert_eq!(assignment_delimiter_end(delimiter, 0), Some(2));
+        }
+    }
+
+    #[test]
+    fn assignment_rejects_invalid_filler_and_delimiters() {
+        assert_eq!(assignment_delimiter_end(b"                     =", 0), None);
+        assert_eq!(assignment_delimiter_end(b" !=", 0), None);
+        assert_eq!(assignment_delimiter_end(b" ", 0), None);
+
+        for incomplete in [b"?".as_slice(), b"<", b"|"] {
+            assert_eq!(assignment_delimiter_end(incomplete, 0), None);
+        }
+    }
+
+    #[test]
+    fn assignment_candidate_releases_recognized_prefixes() {
+        for content in ["key=", "API_KEY filler :=", "token                    ||"] {
+            assert_eq!(
+                assignment_candidate(content.as_bytes(), 0, true),
+                RuleCandidate::None
+            );
+            assert_eq!(
+                assignment_candidate(content.as_bytes(), 0, false),
+                RuleCandidate::None
+            );
         }
     }
 
