@@ -15,12 +15,60 @@ fn jwt(first: usize, second: usize, third: usize, padding: usize) -> String {
 }
 
 #[test]
-fn releases_assignment_shaped_text_while_the_candidate_is_a_stub() {
-    let content = "password = 'abcdefghijklmnop'";
-    let result = scan(content, true);
-    assert!(result.matches.is_empty());
-    assert_eq!(result.retention_offset, content.len());
-    assert_eq!(result.withhold_from, None);
+fn matches_assignments_beside_safe_text() {
+    let cases = [
+        "KeY=0123456789",
+        "API_KEY filler > 0123456789",
+        "apikey.:0123456789",
+        "api-token := '0123456789",
+        "token=>\"0123456789",
+        "secret<=`0123456789",
+        "client_secret?==0123456789",
+        "passwd,0123456789",
+        "password||0123456789",
+    ];
+    for assignment in cases {
+        let content = format!("safe {assignment} text");
+        let result = scan(&content, true);
+        assert_eq!(result.matches.len(), 1, "{assignment:?}");
+        assert_eq!(result.matches[0].range, 5..5 + assignment.len());
+        assert_eq!(result.matches[0].rule, Rule::SecretAssignment);
+        assert_eq!(result.withhold_from, None);
+    }
+}
+
+#[test]
+fn assignment_accepts_content_end_and_prefix_bytes() {
+    let assignment = "AUTH= \t'\"`0123456789";
+    let result = scan(assignment, true);
+    assert_eq!(result.matches[0].range, 0..assignment.len());
+    assert_eq!(result.matches[0].rule, Rule::SecretAssignment);
+
+    let terminated = "authorization=0123456789;";
+    assert_eq!(
+        scan(terminated, true).matches[0].range,
+        0..terminated.len() - 1
+    );
+}
+
+#[test]
+fn rejects_invalid_assignments() {
+    for content in [
+        "xkey=0123456789",
+        "key_x=0123456789",
+        "key=123456789",
+        "key=123456789!",
+        "key=0123456789!more",
+    ] {
+        assert!(scan(content, true).matches.is_empty(), "{content:?}");
+    }
+}
+
+#[test]
+fn streamed_assignment_behavior_stays_unchanged() {
+    for content in ["key=0123456789", "key=0123456789;"] {
+        assert!(scan(content, false).matches.is_empty(), "{content:?}");
+    }
 }
 
 fn private_key(body: &str) -> String {
