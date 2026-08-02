@@ -178,13 +178,11 @@ enum RuleCandidate {
 }
 
 fn assignment_candidate(bytes: &[u8], start: usize, complete: bool) -> RuleCandidate {
-    if !complete {
-        return RuleCandidate::None;
-    }
     assignment_label_end(bytes, start)
         .and_then(|label_end| assignment_delimiter_end(bytes, label_end))
         .map(|delimiter_end| assignment_value_prefix_end(bytes, delimiter_end))
         .and_then(|value_start| assignment_value_end(bytes, value_start))
+        .filter(|end| complete || *end < bytes.len())
         .map_or(RuleCandidate::None, RuleCandidate::Matched)
 }
 

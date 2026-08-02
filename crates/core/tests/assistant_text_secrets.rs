@@ -65,10 +65,19 @@ fn rejects_invalid_assignments() {
 }
 
 #[test]
-fn streamed_assignment_behavior_stays_unchanged() {
-    for content in ["key=0123456789", "key=0123456789;"] {
-        assert!(scan(content, false).matches.is_empty(), "{content:?}");
+fn streamed_assignment_matches_each_terminator() {
+    for terminator in *b" \t\n\x0c\r'\"`;\\" {
+        let content = format!("key=0123456789{}tail", char::from(terminator));
+        let result = scan(&content, false);
+        assert_eq!(result.matches.len(), 1, "{terminator:?}");
+        assert_eq!(result.matches[0].range, 0..14, "{terminator:?}");
+        assert_eq!(result.matches[0].rule, Rule::SecretAssignment);
     }
+}
+
+#[test]
+fn streamed_assignment_waits_when_value_reaches_buffer_end() {
+    assert!(scan("key=0123456789", false).matches.is_empty());
 }
 
 fn private_key(body: &str) -> String {
