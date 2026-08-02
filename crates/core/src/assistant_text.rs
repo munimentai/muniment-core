@@ -22,6 +22,21 @@ const RULE_ORDER: [Rule; 4] = [
     Rule::SecretAssignment,
 ];
 
+const ASSIGNMENT_LABELS: [&[u8]; 12] = [
+    b"key",
+    b"api_key",
+    b"apikey",
+    b"api-token",
+    b"token",
+    b"secret",
+    b"client_secret",
+    b"passwd",
+    b"password",
+    b"auth",
+    b"authorization",
+    b"access_token",
+];
+
 /// One non-overlapping byte range selected by the scanner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Match {
@@ -162,8 +177,32 @@ enum RuleCandidate {
     None,
 }
 
-fn assignment_candidate(_bytes: &[u8], _start: usize, _complete: bool) -> RuleCandidate {
+fn assignment_candidate(bytes: &[u8], start: usize, _complete: bool) -> RuleCandidate {
+    let _ = assignment_label_end(bytes, start);
     RuleCandidate::None
+}
+
+fn assignment_label_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if start
+        .checked_sub(1)
+        .and_then(|index| bytes.get(index))
+        .is_some_and(|byte| is_ascii_identifier_byte(*byte))
+    {
+        return None;
+    }
+    ASSIGNMENT_LABELS.into_iter().find_map(|label| {
+        let end = start.checked_add(label.len())?;
+        let candidate = bytes.get(start..end)?;
+        if candidate.eq_ignore_ascii_case(label)
+            && bytes
+                .get(end)
+                .is_none_or(|byte| !is_ascii_identifier_byte(*byte))
+        {
+            Some(end)
+        } else {
+            None
+        }
+    })
 }
 
 fn jwt_candidate(bytes: &[u8], start: usize, complete: bool) -> RuleCandidate {
@@ -389,6 +428,10 @@ const fn is_alnum_underscore(byte: u8) -> bool {
 }
 
 const fn is_b64(byte: u8) -> bool {
+    is_ascii_identifier_byte(byte)
+}
+
+const fn is_ascii_identifier_byte(byte: u8) -> bool {
     is_alnum_underscore(byte) || byte == b'-'
 }
 
@@ -415,6 +458,65 @@ mod tests {
         let content = format!("sk-{}", "a".repeat(20));
         assert!(scan(&content, false).matches.is_empty());
         assert_eq!(scan(&content, true).matches[0].range, 0..content.len());
+    }
+
+    #[test]
+    fn assignment_recognizes_each_label_at_content_boundaries() {
+        for label in ASSIGNMENT_LABELS {
+            assert_eq!(assignment_label_end(label, 0), Some(label.len()));
+
+            let label = std::str::from_utf8(label).unwrap();
+            let after_boundary = format!("{label}!");
+            assert_eq!(
+                assignment_label_end(after_boundary.as_bytes(), 0),
+                Some(label.len())
+            );
+
+            let before_boundary = format!("!{label}");
+            assert_eq!(
+                assignment_label_end(before_boundary.as_bytes(), 1),
+                Some(before_boundary.len())
+            );
+        }
+    }
+
+    #[test]
+    fn assignment_labels_ignore_mixed_ascii_case() {
+        for label in ASSIGNMENT_LABELS {
+            let mixed_case: Vec<u8> = label
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| {
+                    if index % 2 == 0 {
+                        byte.to_ascii_uppercase()
+                    } else {
+                        byte.to_ascii_lowercase()
+                    }
+                })
+                .collect();
+            assert_eq!(assignment_label_end(&mixed_case, 0), Some(mixed_case.len()));
+        }
+    }
+
+    #[test]
+    fn assignment_rejects_identifier_bytes_on_either_side() {
+        for label in ASSIGNMENT_LABELS {
+            let mut invalid_before = vec![b'x'];
+            invalid_before.extend_from_slice(label);
+            assert_eq!(assignment_label_end(&invalid_before, 1), None);
+
+            let mut invalid_after = label.to_vec();
+            invalid_after.push(b'x');
+            assert_eq!(assignment_label_end(&invalid_after, 0), None);
+        }
+
+        for identifier in *b"aZ0_-" {
+            let invalid_before = [identifier, b'k', b'e', b'y'];
+            assert_eq!(assignment_label_end(&invalid_before, 1), None);
+
+            let invalid_after = [b'k', b'e', b'y', identifier];
+            assert_eq!(assignment_label_end(&invalid_after, 0), None);
+        }
     }
 
     #[test]
