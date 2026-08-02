@@ -83,7 +83,15 @@ fn project(workspace: &str, deltas: &[(u64, String)]) -> Vec<Projection> {
     let mut projector = Projector::new(workspace, |path: &Path| Ok::<_, ()>(path.to_path_buf()));
     let mut projections = Vec::new();
     for (run_seq, text) in deltas {
-        projections.extend(projector.push(*run_seq, text).unwrap());
+        projections.extend(
+            projector
+                .push(
+                    *run_seq,
+                    text,
+                    &serde_json::json!({"content_disclosure": "released"}),
+                )
+                .unwrap(),
+        );
     }
     projections.extend(projector.finish().unwrap());
     projections
