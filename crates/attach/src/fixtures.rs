@@ -522,6 +522,19 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
             }),
         },
     )?;
+    insert(
+        &mut fixtures,
+        "response-run-cancel.json",
+        &Response {
+            protocol: Protocol,
+            request_id: id(108)?,
+            ok: Success,
+            body: json!({
+                "run_id": "00000000000000000000000000000191",
+                "accepted_at": "2026-07-17T00:00:00Z"
+            }),
+        },
+    )?;
 
     let errors = [
         crate::ErrorCode::ProtocolIncompatible,
@@ -833,7 +846,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            39,
+            40,
             "every canonical fixture must be inventoried"
         );
     }

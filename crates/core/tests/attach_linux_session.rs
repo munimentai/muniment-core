@@ -5,10 +5,10 @@ use muniment_core::attach::linux::{
     run_authenticated_session_with_authorization,
     run_authenticated_session_with_service_and_approvals, ApprovalDecision, AttachSessionError,
     AuthorizationSessionDependencies, CompanionProvenance, PeerCredentials,
-    PermissionAnswerAccepted, PermissionAnswerRequest, RedactedThreadSummary, RunStartAccepted,
-    RunStartRequest, RunStreamPage, ThreadListPage, ThreadListRequest, ThreadListService,
-    ThreadOpenRequest, MAX_PERMISSION_GATE_ID_LENGTH, MAX_RUN_START_CONTEXT_LENGTH,
-    MAX_RUN_START_TEXT_LENGTH,
+    PermissionAnswerAccepted, PermissionAnswerRequest, RedactedThreadSummary, RunCancelAccepted,
+    RunCancelRequest, RunStartAccepted, RunStartRequest, RunStreamPage, ThreadListPage,
+    ThreadListRequest, ThreadListService, ThreadOpenRequest, MAX_PERMISSION_GATE_ID_LENGTH,
+    MAX_RUN_START_CONTEXT_LENGTH, MAX_RUN_START_TEXT_LENGTH,
 };
 use muniment_core::attach::{
     decode_frame, encode_frame, Approval, AuthorizationClock, AuthorizationTokenGenerator,
@@ -270,6 +270,37 @@ impl ThreadListService for OnboardingStartService {
 struct PermissionService {
     calls: Vec<(String, PermissionAnswerRequest, Id, Id, CompanionProvenance)>,
     fail: bool,
+}
+
+#[derive(Default)]
+struct CancelService {
+    calls: Vec<(String, RunCancelRequest, Id)>,
+}
+
+impl ThreadListService for CancelService {
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, muniment_core::attach::ProtocolError> {
+        panic!("thread reads must not dispatch")
+    }
+
+    fn cancel_run(
+        &mut self,
+        workspace: &str,
+        request: RunCancelRequest,
+        _: &Id,
+        idempotency_key: &Id,
+        _: CompanionProvenance,
+    ) -> Result<RunCancelAccepted, muniment_core::attach::ProtocolError> {
+        self.calls
+            .push((workspace.into(), request.clone(), idempotency_key.clone()));
+        Ok(RunCancelAccepted {
+            run_id: request.run_id,
+            accepted_at: "2026-07-18T00:00:00Z".into(),
+        })
+    }
 }
 
 impl ThreadListService for PermissionService {
@@ -4278,6 +4309,92 @@ fn authorized_permission_answers_dispatch_allow_and_deny_once() {
         assert_eq!(service.calls.len(), 1);
         assert_eq!(service.calls[0].1.gate_id, "gate-private");
         assert_eq!(service.calls[0].4.profile, "profile-1");
+    }
+}
+
+#[test]
+fn authorized_run_cancel_dispatches_once() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello(1, 1)).unwrap();
+    client
+        .write_all(&request_with_idempotency(
+            168,
+            Operation::RunCancel,
+            json!({"run_id":"0190a100-0000-7000-8000-000000000001"}),
+        ))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut approved = approval();
+    approved.scopes.insert("run.write".into());
+    let mut service = CancelService::default();
+    assert_eq!(
+        dispatch_session_with_approval(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            approved,
+            &mut service,
+        ),
+        Ok(())
+    );
+    let response: Response = read_frame(&mut client);
+    assert_eq!(
+        response.body["run_id"],
+        "0190a100-0000-7000-8000-000000000001"
+    );
+    assert_eq!(service.calls.len(), 1);
+}
+
+#[test]
+fn run_cancel_rejects_invalid_requests_without_dispatch() {
+    for (has_scope, frame) in [
+        (
+            false,
+            request_with_idempotency(
+                160,
+                Operation::RunCancel,
+                json!({"run_id":"0190a100-0000-7000-8000-000000000001"}),
+            ),
+        ),
+        (
+            true,
+            request(
+                161,
+                Operation::RunCancel,
+                json!({"run_id":"0190a100-0000-7000-8000-000000000001"}),
+            ),
+        ),
+        (
+            true,
+            request_with_idempotency(162, Operation::RunCancel, json!({"run_id":"bad"})),
+        ),
+        (
+            true,
+            request_with_idempotency(
+                163,
+                Operation::RunCancel,
+                json!({"run_id":"0190a100-0000-7000-8000-000000000001", "extra":true}),
+            ),
+        ),
+    ] {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&hello(1, 1)).unwrap();
+        client.write_all(&frame).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut approved = approval();
+        if has_scope {
+            approved.scopes.insert("run.write".into());
+        }
+        let mut service = CancelService::default();
+        let _ = dispatch_session_with_approval(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            approved,
+            &mut service,
+        );
+        let _: ErrorEnvelope = read_frame(&mut client);
+        assert!(service.calls.is_empty());
     }
 }
 

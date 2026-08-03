@@ -453,6 +453,17 @@ pub struct RunStartAccepted {
     pub accepted_at: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunCancelRequest {
+    pub run_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct RunCancelAccepted {
+    pub run_id: String,
+    pub accepted_at: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionDecision {
@@ -551,6 +562,17 @@ pub trait ThreadListService {
         _idempotency_key: &super::Id,
         _provenance: CompanionProvenance,
     ) -> Result<PermissionAnswerAccepted, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn cancel_run(
+        &mut self,
+        _workspace: &str,
+        _request: RunCancelRequest,
+        _request_id: &super::Id,
+        _idempotency_key: &super::Id,
+        _provenance: CompanionProvenance,
+    ) -> Result<RunCancelAccepted, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
 
@@ -1281,7 +1303,9 @@ where
             | Operation::ThreadOpen
             | Operation::RunStream
             | Operation::RunCursorAck => Some("thread.read"),
-            Operation::RunStart | Operation::PermissionAnswer => Some("run.write"),
+            Operation::RunStart | Operation::RunCancel | Operation::PermissionAnswer => {
+                Some("run.write")
+            }
             _ => None,
         };
         if authorization
@@ -1758,6 +1782,42 @@ fn dispatch_request<S: ThreadListService>(
             "run_id": accepted.run_id,
             "thread_id": accepted.thread_id,
             "committed_seq": accepted.committed_seq,
+            "accepted_at": accepted.accepted_at,
+        })));
+    }
+    if request.operation == Operation::RunCancel {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            run_id: String,
+        }
+        let body: Body =
+            serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
+        super::Id::new(body.run_id.clone()).map_err(|_| ProtocolError::invalid_request())?;
+        let idempotency_key = request
+            .idempotency_key
+            .as_ref()
+            .ok_or_else(ProtocolError::idempotency_key_required)?;
+        let requested_run_id = body.run_id.clone();
+        let accepted = service.cancel_run(
+            workspace,
+            RunCancelRequest {
+                run_id: body.run_id,
+            },
+            &request.request_id,
+            idempotency_key,
+            provenance,
+        )?;
+        if accepted.run_id != requested_run_id
+            || super::Id::new(accepted.run_id.clone()).is_err()
+            || accepted.accepted_at.is_empty()
+            || accepted.accepted_at.len() > MAX_TEXT_LENGTH
+            || chrono::DateTime::parse_from_rfc3339(&accepted.accepted_at).is_err()
+        {
+            return Err(ProtocolError::persistence_failed().into());
+        }
+        return Ok(response_only(serde_json::json!({
+            "run_id": accepted.run_id,
             "accepted_at": accepted.accepted_at,
         })));
     }

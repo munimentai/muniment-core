@@ -59,6 +59,13 @@ pub struct RunStartAccepted {
     pub accepted_at: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunCancelAccepted {
+    pub run_id: String,
+    pub accepted_at: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionDecision {
@@ -255,8 +262,8 @@ impl fmt::Debug for ThreadListPage {
 mod linux {
     use super::{
         AuthorizationSummary, ClientError, PendingPermission, PermissionAnswerAccepted,
-        PermissionDecision, RedactedRunEvent, RunStartAccepted, RunStreamMessage,
-        RunStreamSubscription, ThreadListPage, ThreadOpenPage,
+        PermissionDecision, RedactedRunEvent, RunCancelAccepted, RunStartAccepted,
+        RunStreamMessage, RunStreamSubscription, ThreadListPage, ThreadOpenPage,
     };
     use crate::{
         decode_frame, encode_frame, Authorization, Authorized, Client, Envelope, ErrorCode,
@@ -664,6 +671,51 @@ mod linux {
                 || accepted.gate_id != gate_id
                 || accepted.decision != decision
                 || accepted.committed_seq == 0
+                || accepted.accepted_at.is_empty()
+                || accepted.accepted_at.len() > MAX_TEXT_LENGTH
+                || !is_rfc3339(&accepted.accepted_at)
+            {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            Ok(accepted)
+        }
+
+        pub fn run_cancel(&mut self, run_id: &str) -> Result<RunCancelAccepted, ClientError> {
+            let run_id = Id::new(run_id.to_owned()).map_err(|_| ClientError::UnexpectedMessage)?;
+            let request_id = fresh_request_id()?;
+            let request = Request {
+                protocol: Protocol,
+                request_id: request_id.clone(),
+                operation: Operation::RunCancel,
+                capability: self.capability.clone(),
+                idempotency_key: Some(fresh_request_id()?),
+                body: serde_json::json!({"run_id": run_id.as_str()}),
+            };
+            let deadline = deadline(self.io_timeout);
+            write_all_before(
+                &mut self.stream,
+                &encode_frame(&request).map_err(map_frame_error)?,
+                deadline,
+            )?;
+            let value = read_value(&mut self.stream, deadline)?;
+            if value
+                .get("protocol")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value != PROTOCOL)
+            {
+                return Err(ClientError::ProtocolIncompatible);
+            }
+            let response =
+                match serde_json::from_value(value).map_err(|_| ClientError::UnexpectedMessage)? {
+                    Envelope::Response(response) if response.request_id == request_id => response,
+                    Envelope::Error(error) if error.request_id.as_ref() == Some(&request_id) => {
+                        return Err(map_protocol_error(error.error.code()));
+                    }
+                    _ => return Err(ClientError::UnexpectedMessage),
+                };
+            let accepted: RunCancelAccepted = serde_json::from_value(response.body)
+                .map_err(|_| ClientError::UnexpectedMessage)?;
+            if accepted.run_id != run_id.as_str()
                 || accepted.accepted_at.is_empty()
                 || accepted.accepted_at.len() > MAX_TEXT_LENGTH
                 || !is_rfc3339(&accepted.accepted_at)
@@ -1459,6 +1511,10 @@ impl AuthorizedClient {
         Err(ClientError::UnsupportedPlatform)
     }
 
+    pub fn run_cancel(&mut self, _run_id: &str) -> Result<RunCancelAccepted, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+
     pub fn subscribe_run(
         &mut self,
         _run_id: &str,
@@ -1515,6 +1571,28 @@ pub fn handshake_as_with_credential(
         authorized_client_credential,
         pairing_pending,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RunCancelAccepted;
+    use serde_json::json;
+
+    #[test]
+    fn run_cancel_accepted_decode_rejects_unknown_fields() {
+        let accepted: RunCancelAccepted = serde_json::from_value(json!({
+            "run_id": "00000000000000000000000000000191",
+            "accepted_at": "2026-07-17T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(accepted.run_id, "00000000000000000000000000000191");
+        assert!(serde_json::from_value::<RunCancelAccepted>(json!({
+            "run_id": accepted.run_id,
+            "accepted_at": accepted.accepted_at,
+            "extra": true
+        }))
+        .is_err());
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
