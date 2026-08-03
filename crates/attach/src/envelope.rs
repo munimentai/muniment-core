@@ -563,6 +563,7 @@ impl<'de> Deserialize<'de> for ProtocolError {
             (ErrorCode::InvalidCursor, None, None) => Self::invalid_cursor(),
             (ErrorCode::InvalidArtifactCursor, None, None) => Self::invalid_artifact_cursor(),
             (ErrorCode::InvalidRequest, None, None) => Self::invalid_request(),
+            (ErrorCode::ThreadNotFound, None, None) => Self::thread_not_found(),
             (ErrorCode::Unauthorized, None, None) => Self::unauthorized(),
             (ErrorCode::UnsupportedOperation, None, None) => Self::unsupported_operation(),
             _ => return Err(de::Error::custom("invalid error schema")),
