@@ -209,11 +209,39 @@ impl fmt::Debug for RedactedRunEvent {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum RunStreamMessage {
     Event(RedactedRunEvent),
     PermissionPending(PendingPermission),
     CaughtUp { current_run_seq: u64 },
+    StreamClosed { code: String, resumable: bool },
+    CapabilityRevoked { capability: String, reason: String },
+}
+
+impl fmt::Debug for RunStreamMessage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Event(event) => formatter.debug_tuple("Event").field(event).finish(),
+            Self::PermissionPending(permission) => formatter
+                .debug_tuple("PermissionPending")
+                .field(permission)
+                .finish(),
+            Self::CaughtUp { current_run_seq } => formatter
+                .debug_struct("CaughtUp")
+                .field("current_run_seq", current_run_seq)
+                .finish(),
+            Self::StreamClosed { code, resumable } => formatter
+                .debug_struct("StreamClosed")
+                .field("code", code)
+                .field("resumable", resumable)
+                .finish(),
+            Self::CapabilityRevoked { reason, .. } => formatter
+                .debug_struct("CapabilityRevoked")
+                .field("capability", &"[redacted]")
+                .field("reason", reason)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
@@ -1099,6 +1127,44 @@ mod linux {
                     active.caught_up = true;
                     Ok(RunStreamMessage::CaughtUp {
                         current_run_seq: active.current_run_seq,
+                    })
+                }
+                EventName::StreamClosed => {
+                    #[derive(serde::Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct Body {
+                        code: String,
+                        resumable: bool,
+                    }
+                    let body: Body = serde_json::from_value(event.body)
+                        .map_err(|_| ClientError::UnexpectedMessage)?;
+                    if body.code.trim().is_empty() || body.code.len() > MAX_TEXT_LENGTH {
+                        return Err(ClientError::UnexpectedMessage);
+                    }
+                    Ok(RunStreamMessage::StreamClosed {
+                        code: body.code,
+                        resumable: body.resumable,
+                    })
+                }
+                EventName::CapabilityRevoked => {
+                    #[derive(serde::Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct Body {
+                        capability: String,
+                        reason: String,
+                    }
+                    let body: Body = serde_json::from_value(event.body)
+                        .map_err(|_| ClientError::UnexpectedMessage)?;
+                    if body.capability.trim().is_empty()
+                        || body.capability.len() > MAX_TEXT_LENGTH
+                        || body.reason.trim().is_empty()
+                        || body.reason.len() > MAX_TEXT_LENGTH
+                    {
+                        return Err(ClientError::UnexpectedMessage);
+                    }
+                    Ok(RunStreamMessage::CapabilityRevoked {
+                        capability: body.capability,
+                        reason: body.reason,
                     })
                 }
                 _ => Err(ClientError::UnexpectedMessage),

@@ -371,6 +371,116 @@ fn run_stream_decodes_pending_permissions_and_counts_them_for_acknowledgement() 
 }
 
 #[test]
+fn run_stream_decodes_closed_and_revoked_events() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let run_id = "01900000-0000-7000-8000-000000000001";
+    let subscription_id = "01900000-0000-7000-8000-000000000002";
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        let request = read_client_value(&mut server);
+        server
+            .write_all(
+                &encode_frame(&Response {
+                    protocol: Protocol,
+                    request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+                    ok: Success,
+                    body: valid_run_stream_summary(run_id, subscription_id),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        for event in [
+            run_stream_event(
+                subscription_id,
+                run_id,
+                2,
+                "stream.closed",
+                serde_json::json!({"code": "invalid_cursor", "resumable": true}),
+            ),
+            run_stream_event(
+                subscription_id,
+                run_id,
+                2,
+                "capability.revoked",
+                serde_json::json!({
+                    "capability": "fixture-capability", "reason": "authorization_revoked"
+                }),
+            ),
+        ] {
+            server.write_all(&encode_frame(&event).unwrap()).unwrap();
+        }
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    client.subscribe_run(run_id, 0).unwrap();
+    assert_eq!(
+        client.read_run_stream_message().unwrap(),
+        RunStreamMessage::StreamClosed {
+            code: "invalid_cursor".to_owned(),
+            resumable: true,
+        }
+    );
+    let revoked = client.read_run_stream_message().unwrap();
+    assert_eq!(
+        revoked,
+        RunStreamMessage::CapabilityRevoked {
+            capability: "fixture-capability".to_owned(),
+            reason: "authorization_revoked".to_owned(),
+        }
+    );
+    assert!(!format!("{revoked:?}").contains("fixture-capability"));
+    worker.join().unwrap();
+}
+
+#[test]
+fn run_stream_rejects_malformed_closed_and_revoked_bodies() {
+    let run_id = "01900000-0000-7000-8000-000000000001";
+    let subscription_id = "01900000-0000-7000-8000-000000000002";
+    for malformed in [
+        run_stream_event(
+            subscription_id,
+            run_id,
+            2,
+            "stream.closed",
+            serde_json::json!({"code": "invalid_cursor", "resumable": "yes"}),
+        ),
+        run_stream_event(
+            subscription_id,
+            run_id,
+            2,
+            "capability.revoked",
+            serde_json::json!({"capability": "fixture-capability"}),
+        ),
+    ] {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            complete_pairing(&mut server);
+            let request = read_client_value(&mut server);
+            server
+                .write_all(
+                    &encode_frame(&Response {
+                        protocol: Protocol,
+                        request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+                        ok: Success,
+                        body: valid_run_stream_summary(run_id, subscription_id),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            server
+                .write_all(&encode_frame(&malformed).unwrap())
+                .unwrap();
+        });
+        let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+        client.subscribe_run(run_id, 0).unwrap();
+        assert_eq!(
+            client.read_run_stream_message(),
+            Err(ClientError::UnexpectedMessage)
+        );
+        worker.join().unwrap();
+    }
+}
+
+#[test]
 fn canonical_run_event_fixture_passes_client_validation() {
     let (client, mut server) = UnixStream::pair().unwrap();
     let fixture: Event = serde_json::from_str(include_str!(
