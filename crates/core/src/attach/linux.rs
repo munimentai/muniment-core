@@ -453,6 +453,12 @@ pub struct RunStartAccepted {
     pub accepted_at: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadCreateAccepted {
+    pub thread_id: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunCancelRequest {
     pub run_id: String,
@@ -540,6 +546,16 @@ pub trait ThreadListService {
         _workspace: &str,
         _request: ThreadOpenRequest,
     ) -> Result<ThreadOpenPage, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn create_thread(
+        &mut self,
+        _workspace: &str,
+        _request_id: &super::Id,
+        _idempotency_key: &super::Id,
+        _provenance: CompanionProvenance,
+    ) -> Result<ThreadCreateAccepted, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
 
@@ -1304,9 +1320,10 @@ where
             | Operation::ThreadOpen
             | Operation::RunStream
             | Operation::RunCursorAck => Some("thread.read"),
-            Operation::RunStart | Operation::RunCancel | Operation::PermissionAnswer => {
-                Some("run.write")
-            }
+            Operation::ThreadCreate
+            | Operation::RunStart
+            | Operation::RunCancel
+            | Operation::PermissionAnswer => Some("run.write"),
             _ => None,
         };
         if authorization
@@ -1657,6 +1674,23 @@ fn dispatch_request<S: ThreadListService>(
         }
         service.ensure_home()?;
         return Ok(response_only(serde_json::json!({})));
+    }
+    if request.operation == Operation::ThreadCreate {
+        if request.body != serde_json::json!({}) {
+            return Err(ProtocolError::invalid_request().into());
+        }
+        let idempotency_key = request
+            .idempotency_key
+            .as_ref()
+            .ok_or_else(ProtocolError::idempotency_key_required)?;
+        let accepted =
+            service.create_thread(workspace, &request.request_id, idempotency_key, provenance)?;
+        if super::Id::new(accepted.thread_id.clone()).is_err() {
+            return Err(ProtocolError::persistence_failed().into());
+        }
+        return Ok(response_only(serde_json::json!({
+            "thread_id": accepted.thread_id,
+        })));
     }
     if request.operation == Operation::RunCursorAck {
         #[derive(serde::Deserialize)]

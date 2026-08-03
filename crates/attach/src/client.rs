@@ -61,6 +61,12 @@ pub struct RunStartAccepted {
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ThreadCreateAccepted {
+    pub thread_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunCancelAccepted {
     pub run_id: String,
     pub accepted_at: String,
@@ -263,7 +269,8 @@ mod linux {
     use super::{
         AuthorizationSummary, ClientError, PendingPermission, PermissionAnswerAccepted,
         PermissionDecision, RedactedRunEvent, RunCancelAccepted, RunStartAccepted,
-        RunStreamMessage, RunStreamSubscription, ThreadListPage, ThreadOpenPage,
+        RunStreamMessage, RunStreamSubscription, ThreadCreateAccepted, ThreadListPage,
+        ThreadOpenPage,
     };
     use crate::{
         decode_frame, encode_frame, Authorization, Authorized, Client, Envelope, ErrorCode,
@@ -463,6 +470,25 @@ mod linux {
                 return Err(ClientError::UnexpectedMessage);
             }
             Ok(page)
+        }
+
+        pub fn create_thread(&mut self) -> Result<ThreadCreateAccepted, ClientError> {
+            let request_id = fresh_request_id()?;
+            let request = Request {
+                protocol: Protocol,
+                request_id: request_id.clone(),
+                operation: Operation::ThreadCreate,
+                capability: self.capability.clone(),
+                idempotency_key: Some(fresh_request_id()?),
+                body: serde_json::json!({}),
+            };
+            let response = self.send_request(request, &request_id)?;
+            let accepted: ThreadCreateAccepted = serde_json::from_value(response.body)
+                .map_err(|_| ClientError::UnexpectedMessage)?;
+            if Id::new(accepted.thread_id.clone()).is_err() {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            Ok(accepted)
         }
 
         pub fn open_thread(
@@ -1472,6 +1498,10 @@ impl AuthorizedClient {
         Err(ClientError::UnsupportedPlatform)
     }
     pub fn list_threads(&mut self, _cursor: Option<&str>) -> Result<ThreadListPage, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+
+    pub fn create_thread(&mut self) -> Result<ThreadCreateAccepted, ClientError> {
         Err(ClientError::UnsupportedPlatform)
     }
 

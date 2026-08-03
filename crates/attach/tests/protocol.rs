@@ -123,6 +123,27 @@ fn canonical_run_start_fixtures_match_client_contracts() {
 }
 
 #[test]
+fn canonical_thread_create_fixtures_match_client_contracts() {
+    let request: Envelope =
+        serde_json::from_value(canonical_fixture("request-thread-create.json")).unwrap();
+    let Envelope::Request(request) = request else {
+        panic!("expected request fixture");
+    };
+    assert_eq!(request.operation, Operation::ThreadCreate);
+    assert_eq!(request.body, json!({}));
+    assert!(request.idempotency_key.is_some());
+
+    let response: Envelope =
+        serde_json::from_value(canonical_fixture("response-thread-create.json")).unwrap();
+    let Envelope::Response(response) = response else {
+        panic!("expected response fixture");
+    };
+    assert_eq!(response.request_id, request.request_id);
+    #[cfg(feature = "client")]
+    serde_json::from_value::<muniment_attach::ThreadCreateAccepted>(response.body).unwrap();
+}
+
+#[test]
 fn canonical_cursor_ack_and_permission_fixtures_match_client_contracts() {
     let request: Envelope =
         serde_json::from_value(canonical_fixture("request-run-cursor-ack.json")).unwrap();

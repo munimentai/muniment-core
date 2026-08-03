@@ -1049,6 +1049,47 @@ impl RunJournal {
         Ok(thread_id)
     }
 
+    /// Atomically creates a run-less thread for an authorized attach profile.
+    pub fn create_thread(
+        &mut self,
+        workspace: &str,
+        recorded_at: &str,
+        provenance: Provenance,
+    ) -> Result<String, JournalError> {
+        if workspace.is_empty()
+            || !provenance
+                .extra
+                .get("attach_profile")
+                .and_then(Value::as_str)
+                .is_some_and(|profile| !profile.is_empty())
+        {
+            return Err(JournalError::InvalidEnvelope(
+                "thread workspace and attach profile must be valid".into(),
+            ));
+        }
+        let coordination = self.coordination.clone();
+        let _operation = coordination
+            .as_ref()
+            .map(|state| state.operation.lock().unwrap());
+        self.refresh_after_compaction()?;
+        let tx = self
+            .connection
+            .as_mut()
+            .expect("journal connection is always present outside compaction")
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let thread_id = Uuid::now_v7().to_string();
+        append_thread_created_with_provenance(
+            &tx,
+            &thread_id,
+            Some(workspace),
+            recorded_at,
+            false,
+            provenance,
+        )?;
+        tx.commit()?;
+        Ok(thread_id)
+    }
+
     /// Atomically creates a run in an existing thread at its next ordinal.
     pub fn append_new_run_in_thread(
         &mut self,
@@ -1129,9 +1170,12 @@ impl RunJournal {
             ));
         }
         let thread_profile: Option<String> = tx.query_row(
-            "SELECT json_extract(e.envelope_json,'$.provenance.attach_profile') \
-             FROM run_threads rt JOIN events e ON e.run_id=rt.run_id AND e.run_seq=1 \
-             WHERE rt.thread_id=?1 ORDER BY rt.thread_run_ordinal LIMIT 1",
+            "SELECT COALESCE(\
+               (SELECT json_extract(e.envelope_json,'$.provenance.attach_profile') \
+                FROM run_threads rt JOIN events e ON e.run_id=rt.run_id AND e.run_seq=1 \
+                WHERE rt.thread_id=?1 ORDER BY rt.thread_run_ordinal LIMIT 1),\
+               (SELECT json_extract(te.envelope_json,'$.provenance.attach_profile') \
+                FROM thread_events te WHERE te.thread_id=?1 AND te.thread_seq=1))",
             [thread_id],
             |row| row.get(0),
         )?;
@@ -2304,6 +2348,38 @@ fn append_thread_created(
     recorded_at: &str,
     migration_backfill: bool,
 ) -> Result<(), JournalError> {
+    let provenance = Provenance {
+        source: if migration_backfill {
+            "schema-v3-migration"
+        } else {
+            "run-journal"
+        }
+        .into(),
+        source_version: "1".into(),
+        actor_id: None,
+        device_id: None,
+        rpc_request_id: None,
+        capability_versions: None,
+        extra: BTreeMap::new(),
+    };
+    append_thread_created_with_provenance(
+        tx,
+        thread_id,
+        workspace,
+        recorded_at,
+        migration_backfill,
+        provenance,
+    )
+}
+
+fn append_thread_created_with_provenance(
+    tx: &rusqlite::Transaction<'_>,
+    thread_id: &str,
+    workspace: Option<&str>,
+    recorded_at: &str,
+    migration_backfill: bool,
+    provenance: Provenance,
+) -> Result<(), JournalError> {
     let envelope = ThreadEventEnvelope {
         event_id: Uuid::now_v7().to_string(),
         thread_id: thread_id.to_owned(),
@@ -2316,20 +2392,7 @@ fn append_thread_created(
             "migration_backfill": migration_backfill,
             "workspace": workspace,
         }),
-        provenance: Provenance {
-            source: if migration_backfill {
-                "schema-v3-migration"
-            } else {
-                "run-journal"
-            }
-            .into(),
-            source_version: "1".into(),
-            actor_id: None,
-            device_id: None,
-            rpc_request_id: None,
-            capability_versions: None,
-            extra: BTreeMap::new(),
-        },
+        provenance,
     };
     validate_thread_envelope(&envelope)?;
     let canonical = canonical_thread_envelope(&envelope)?;
@@ -2606,9 +2669,10 @@ fn validate_thread_identity(connection: &Connection) -> Result<(), JournalError>
             "thread deletion must be the last event".into(),
         ));
     }
-    let unstamped_threads: i64 = connection.query_row(
+    let invalid_unstamped_threads: i64 = connection.query_row(
         "SELECT COUNT(*) FROM (SELECT DISTINCT te.thread_id FROM thread_events te \
-         WHERE NOT EXISTS(SELECT 1 FROM run_threads rt WHERE rt.thread_id=te.thread_id))",
+         WHERE NOT EXISTS(SELECT 1 FROM run_threads rt WHERE rt.thread_id=te.thread_id) \
+         AND json_type(te.envelope_json,'$.provenance.attach_profile') IS NOT 'text')",
         [],
         |row| row.get(0),
     )?;
@@ -2619,7 +2683,7 @@ fn validate_thread_identity(connection: &Connection) -> Result<(), JournalError>
         [],
         |row| row.get(0),
     )?;
-    if unstamped_threads != 0 || stamps_without_threads != 0 {
+    if invalid_unstamped_threads != 0 || stamps_without_threads != 0 {
         return Err(JournalError::Corrupt(
             "thread ledger and run stamps are inconsistent".into(),
         ));

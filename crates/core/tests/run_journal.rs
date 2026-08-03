@@ -1048,6 +1048,43 @@ fn new_run_in_thread_uses_next_ordinal_and_mirrors_run_creation() {
 }
 
 #[test]
+fn run_less_thread_validates_and_accepts_its_first_run() {
+    let db = TestDb::new();
+    let mut journal = RunJournal::open(db.as_ref()).unwrap();
+    let mut provenance = test_provenance();
+    provenance
+        .extra
+        .insert("attach_profile".into(), json!("profile-a"));
+    let thread_id = journal
+        .create_thread("workspace-a", "2026-07-10T12:00:00Z", provenance.clone())
+        .unwrap();
+
+    drop(journal);
+    let mut journal = RunJournal::open(db.as_ref()).unwrap();
+    let mut first_run = event_for(
+        "0190a100-0000-7000-8000-000000000002",
+        "0190a100-0000-7000-8000-000000000102",
+        1,
+        "user.prompt.submitted",
+    );
+    first_run.provenance = provenance;
+    journal
+        .append_new_run_in_thread("workspace-a", &thread_id, &first_run)
+        .unwrap();
+
+    let raw = Connection::open(db.as_ref()).unwrap();
+    assert_eq!(
+        raw.query_row(
+            "SELECT thread_run_ordinal FROM run_threads WHERE thread_id=?1",
+            [&thread_id],
+            |row| row.get::<_, u64>(0)
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
 fn new_run_in_thread_rejections_write_nothing() {
     let db = TestDb::new();
     let mut journal = RunJournal::open(db.as_ref()).unwrap();

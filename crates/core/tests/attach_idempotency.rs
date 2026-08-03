@@ -29,6 +29,7 @@ fn path(name: &str) -> PathBuf {
 #[test]
 fn key_policy_covers_every_operation() {
     let effectful = [
+        Operation::ThreadCreate,
         Operation::RunStart,
         Operation::RunSteer,
         Operation::RunFollowUp,
@@ -72,6 +73,7 @@ fn ledger_identity_includes_each_effectful_operation() {
     let path = path("operations");
     let mut store = IdempotencyStore::open(&path).unwrap();
     for (index, operation) in [
+        Operation::ThreadCreate,
         Operation::RunStart,
         Operation::RunSteer,
         Operation::RunFollowUp,

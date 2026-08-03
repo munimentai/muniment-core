@@ -1754,6 +1754,44 @@ fn thread_list_uses_exact_envelope_and_accepts_fragmented_page() {
 }
 
 #[test]
+fn thread_create_uses_exact_envelope_and_rejects_unknown_accept_fields() {
+    for unknown_field in [false, true] {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            complete_pairing(&mut server);
+            let request = read_client_value(&mut server);
+            assert_eq!(request["operation"], "thread.create");
+            assert_eq!(request["body"], serde_json::json!({}));
+            assert!(request["idempotency_key"].as_str().is_some());
+            let mut body = serde_json::json!({
+                "thread_id": "0190a100-0000-7000-8000-000000000001"
+            });
+            if unknown_field {
+                body["extra"] = serde_json::json!(true);
+            }
+            let response = Response {
+                protocol: Protocol,
+                request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+                ok: Success,
+                body,
+            };
+            server.write_all(&encode_frame(&response).unwrap()).unwrap();
+        });
+        let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+        let result = client.create_thread();
+        if unknown_field {
+            assert_eq!(result, Err(ClientError::UnexpectedMessage));
+        } else {
+            assert_eq!(
+                result.unwrap().thread_id,
+                "0190a100-0000-7000-8000-000000000001"
+            );
+        }
+        worker.join().unwrap();
+    }
+}
+
+#[test]
 fn thread_open_uses_exact_envelope_and_accepts_fragmented_pages() {
     let (client, mut server) = UnixStream::pair().unwrap();
     let worker = thread::spawn(move || {

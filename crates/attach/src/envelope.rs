@@ -247,6 +247,8 @@ pub enum Operation {
     ThreadList,
     #[serde(rename = "thread.open")]
     ThreadOpen,
+    #[serde(rename = "thread.create")]
+    ThreadCreate,
     #[serde(rename = "run.open")]
     RunOpen,
     #[serde(rename = "run.start")]
@@ -275,7 +277,8 @@ impl Operation {
     pub fn requires_idempotency_key(self) -> bool {
         matches!(
             self,
-            Self::RunStart
+            Self::ThreadCreate
+                | Self::RunStart
                 | Self::RunSteer
                 | Self::RunFollowUp
                 | Self::RunCancel
@@ -289,6 +292,7 @@ impl Operation {
             Self::HomeEnsure => "home.ensure",
             Self::ThreadList => "thread.list",
             Self::ThreadOpen => "thread.open",
+            Self::ThreadCreate => "thread.create",
             Self::RunOpen => "run.open",
             Self::RunStart => "run.start",
             Self::RunStream => "run.stream",
