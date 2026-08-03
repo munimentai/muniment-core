@@ -610,6 +610,23 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
             },
         )?;
     }
+    insert(
+        &mut fixtures,
+        "event-run-stream-tool-effect.json",
+        &Event {
+            protocol: Protocol,
+            subscription_id: id(400)?,
+            event: EventName::RunEvent,
+            run_id: Some(id(401)?),
+            run_seq: Some(1),
+            body: json!({
+                "event_type": "tool.effect.started",
+                "event_version": 1,
+                "recorded_at": "2026-07-17T00:00:01Z",
+                "payload": {"effect_id": "tool-1", "display_name": "Search"}
+            }),
+        },
+    )?;
     Ok(fixtures)
 }
 
@@ -847,6 +864,7 @@ mod tests {
 
         for name in [
             "event-run-stream.json",
+            "event-run-stream-tool-effect.json",
             "event-subscription-caught-up.json",
             "event-permission-pending.json",
             "event-artifact-chunk.json",
@@ -860,7 +878,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            42,
+            43,
             "every canonical fixture must be inventoried"
         );
     }

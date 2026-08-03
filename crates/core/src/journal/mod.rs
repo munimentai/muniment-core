@@ -222,6 +222,9 @@ pub struct RunEventProjection {
     pub event_version: u32,
     pub recorded_at: String,
     pub text: Option<String>,
+    pub effect_id: Option<String>,
+    pub display_name: Option<String>,
+    pub tool_effect_valid: bool,
     pub pending_permission: Option<PendingPermissionProjection>,
     pub receipt: Option<ReceiptProjection>,
 }
@@ -495,8 +498,20 @@ impl RunJournal {
                  length(CAST(e.run_id AS BLOB))+length(CAST(e.event_type AS BLOB))+ \
                  length(CAST(e.recorded_at AS BLOB))+COALESCE(length(CAST(p.gate_id AS BLOB)),0)+ \
                  COALESCE(length(CAST(p.kind AS BLOB)),0)+COALESCE(length(CAST(p.title AS BLOB)),0)+ \
-                 COALESCE(length(CAST(p.message AS BLOB)),0)+COALESCE(length(CAST(r.receipt_json AS BLOB)),0), \
-                 p.gate_id,p.kind,p.title,p.message,p.valid,r.receipt_json,r.valid \
+                 COALESCE(length(CAST(p.message AS BLOB)),0)+COALESCE(length(CAST(r.receipt_json AS BLOB)),0)+ \
+                 CASE WHEN e.event_type LIKE 'tool.effect.%' THEN \
+                 COALESCE(length(CAST(json_extract(e.envelope_json,'$.payload_json.effect_id') AS BLOB)),0)+ \
+                 COALESCE(length(CAST(json_extract(e.envelope_json,'$.payload_json.display_name') AS BLOB)),0) ELSE 0 END, \
+                 p.gate_id,p.kind,p.title,p.message,p.valid,r.receipt_json,r.valid, \
+                 CASE WHEN e.event_type LIKE 'tool.effect.%' THEN \
+                 json_extract(e.envelope_json,'$.payload_json.effect_id') END, \
+                 CASE WHEN e.event_type LIKE 'tool.effect.%' THEN \
+                 json_extract(e.envelope_json,'$.payload_json.display_name') END, \
+                 CASE WHEN e.event_type LIKE 'tool.effect.%' THEN \
+                 json_type(e.envelope_json,'$.payload_json.effect_id')='text' AND \
+                 (json_type(e.envelope_json,'$.payload_json.display_name') IS NULL OR \
+                 json_type(e.envelope_json,'$.payload_json.display_name')='null' OR \
+                 json_type(e.envelope_json,'$.payload_json.display_name')='text') ELSE 0 END \
                  FROM events e LEFT JOIN permission_pending_projection p \
                  ON p.run_id=e.run_id AND p.run_seq=e.run_seq \
                  LEFT JOIN receipt_projection r ON r.run_id=e.run_id AND r.run_seq=e.run_seq \
@@ -529,6 +544,9 @@ impl RunJournal {
                 event_version: row.get(3).map_err(JournalError::from)?,
                 recorded_at: row.get(4).map_err(JournalError::from)?,
                 text: None,
+                effect_id: row.get(13).map_err(JournalError::from)?,
+                display_name: row.get(14).map_err(JournalError::from)?,
+                tool_effect_valid: row.get(15).map_err(JournalError::from)?,
                 pending_permission: if row.get::<_, String>(2).map_err(JournalError::from)?
                     == "permission.requested"
                 {

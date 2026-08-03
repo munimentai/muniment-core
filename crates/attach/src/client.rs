@@ -128,6 +128,8 @@ pub struct RedactedRunEvent {
     pub event_version: u32,
     pub recorded_at: String,
     pub text: Option<String>,
+    pub effect_id: Option<String>,
+    pub display_name: Option<String>,
     pub receipt: Option<RunReceipt>,
 }
 
@@ -197,6 +199,11 @@ impl fmt::Debug for RedactedRunEvent {
             .field("event_version", &self.event_version)
             .field("recorded_at", &self.recorded_at)
             .field("text", &self.text.as_ref().map(|_| "[redacted]"))
+            .field("effect_id", &self.effect_id.as_ref().map(|_| "[redacted]"))
+            .field(
+                "display_name",
+                &self.display_name.as_ref().map(|_| "[redacted]"),
+            )
             .field("receipt", &self.receipt.as_ref().map(|_| "[redacted]"))
             .finish()
     }
@@ -995,6 +1002,10 @@ mod linux {
                         #[serde(default)]
                         text: Option<String>,
                         #[serde(default)]
+                        effect_id: Option<String>,
+                        #[serde(default)]
+                        display_name: Option<String>,
+                        #[serde(default)]
                         receipt: Option<crate::RunReceipt>,
                     }
                     let body: Body = serde_json::from_value(event.body)
@@ -1006,9 +1017,35 @@ mod linux {
                         || body.recorded_at.len() > MAX_TEXT_LENGTH
                         || !is_rfc3339(&body.recorded_at)
                         || (body.event_type == "model.stream.delta"
-                            && (body.payload.withheld == body.payload.text.is_some()))
-                        || (body.event_type != "model.stream.delta"
-                            && (!body.payload.withheld || body.payload.text.is_some()))
+                            && (body.payload.withheld == body.payload.text.is_some()
+                                || body.payload.effect_id.is_some()
+                                || body.payload.display_name.is_some()))
+                        || (matches!(
+                            body.event_type.as_str(),
+                            "tool.effect.started" | "tool.effect.completed" | "tool.effect.failed"
+                        ) && (body.payload.withheld
+                            || body.payload.text.is_some()
+                            || body.payload.effect_id.as_ref().is_none_or(|effect_id| {
+                                effect_id.is_empty() || effect_id.len() > 65_536
+                            })
+                            || body
+                                .payload
+                                .display_name
+                                .as_ref()
+                                .is_some_and(|display_name| {
+                                    display_name.len() > 65_536
+                                        || body.event_type != "tool.effect.started"
+                                })))
+                        || (!matches!(
+                            body.event_type.as_str(),
+                            "model.stream.delta"
+                                | "tool.effect.started"
+                                | "tool.effect.completed"
+                                | "tool.effect.failed"
+                        ) && (!body.payload.withheld
+                            || body.payload.text.is_some()
+                            || body.payload.effect_id.is_some()
+                            || body.payload.display_name.is_some()))
                         || body
                             .payload
                             .text
@@ -1046,6 +1083,8 @@ mod linux {
                         event_version: body.event_version,
                         recorded_at: body.recorded_at,
                         text: body.payload.text,
+                        effect_id: body.payload.effect_id,
+                        display_name: body.payload.display_name,
                         receipt: body.payload.receipt,
                     }))
                 }

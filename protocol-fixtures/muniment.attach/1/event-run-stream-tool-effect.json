@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","subscription_id":"00000000000000000000000000000190","event":"run.event","run_id":"00000000000000000000000000000191","run_seq":1,"body":{"event_type":"tool.effect.started","event_version":1,"payload":{"display_name":"Search","effect_id":"tool-1"},"recorded_at":"2026-07-17T00:00:01Z"}}

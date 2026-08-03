@@ -406,6 +406,128 @@ fn canonical_run_event_fixture_passes_client_validation() {
 }
 
 #[test]
+fn canonical_tool_effect_fixture_passes_client_validation() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let fixture: Event = serde_json::from_str(include_str!(
+        "../../../protocol-fixtures/muniment.attach/1/event-run-stream-tool-effect.json"
+    ))
+    .unwrap();
+    let run_id = fixture.run_id.as_ref().unwrap().as_str().to_owned();
+    let subscription_id = fixture.subscription_id.as_str().to_owned();
+    let server_run_id = run_id.clone();
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        let request = read_client_value(&mut server);
+        server
+            .write_all(
+                &encode_frame(&Response {
+                    protocol: Protocol,
+                    request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+                    ok: Success,
+                    body: valid_run_stream_summary(&server_run_id, &subscription_id),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        server.write_all(&encode_frame(&fixture).unwrap()).unwrap();
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    client.subscribe_run(&run_id, 0).unwrap();
+    let RunStreamMessage::Event(event) = client.read_run_stream_message().unwrap() else {
+        panic!("expected tool effect fixture");
+    };
+    assert_eq!(event.event_type, "tool.effect.started");
+    assert_eq!(event.effect_id.as_deref(), Some("tool-1"));
+    assert_eq!(event.display_name.as_deref(), Some("Search"));
+    worker.join().unwrap();
+}
+
+#[test]
+fn run_stream_client_enforces_tool_effect_identity_bounds() {
+    let run_id = "01900000-0000-7000-8000-000000000001";
+    let subscription_id = "01900000-0000-7000-8000-000000000002";
+    let boundary = "x".repeat(65_536);
+    let valid = serde_json::json!({
+        "event_type": "tool.effect.started", "event_version": 1,
+        "recorded_at": "2026-07-17T00:00:02Z",
+        "payload": { "effect_id": boundary, "display_name": boundary }
+    });
+    let invalid = [
+        serde_json::json!({"effect_id": ""}),
+        serde_json::json!({"effect_id": "x".repeat(65_537)}),
+        serde_json::json!({"effect_id": "tool-1", "display_name": "x".repeat(65_537)}),
+        serde_json::json!({"effect_id": "tool-1", "display_name": "terminal-name"}),
+    ];
+
+    for (event_type, payload, expected) in [("tool.effect.started", valid["payload"].clone(), None)]
+        .into_iter()
+        .chain(invalid.into_iter().enumerate().map(|(index, payload)| {
+            let event_type = if index == 3 {
+                "tool.effect.completed"
+            } else {
+                "tool.effect.started"
+            };
+            let error = if index == 1 || index == 2 {
+                ClientError::MalformedFrame
+            } else {
+                ClientError::UnexpectedMessage
+            };
+            (event_type, payload, Some(error))
+        }))
+        .chain([(
+            "tool.effect.failed",
+            serde_json::json!({"effect_id": "tool-1", "display_name": "terminal-name"}),
+            Some(ClientError::UnexpectedMessage),
+        )])
+    {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            complete_pairing(&mut server);
+            let request = read_client_value(&mut server);
+            server
+                .write_all(
+                    &encode_frame(&Response {
+                        protocol: Protocol,
+                        request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+                        ok: Success,
+                        body: valid_run_stream_summary(run_id, subscription_id),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            let body = serde_json::json!({
+                "event_type": event_type, "event_version": 1,
+                "recorded_at": "2026-07-17T00:00:02Z", "payload": payload
+            });
+            let event = serde_json::to_vec(&run_stream_event(
+                subscription_id,
+                run_id,
+                1,
+                "run.event",
+                body,
+            ))
+            .unwrap();
+            server
+                .write_all(&(event.len() as u32).to_be_bytes())
+                .unwrap();
+            server.write_all(&event).unwrap();
+        });
+        let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+        client.subscribe_run(run_id, 0).unwrap();
+        if let Some(expected) = expected {
+            assert_eq!(client.read_run_stream_message(), Err(expected));
+        } else {
+            let RunStreamMessage::Event(event) = client.read_run_stream_message().unwrap() else {
+                panic!("expected boundary tool effect")
+            };
+            assert_eq!(event.effect_id.as_ref().unwrap().len(), 65_536);
+            assert_eq!(event.display_name.as_ref().unwrap().len(), 65_536);
+        }
+        worker.join().unwrap();
+    }
+}
+
+#[test]
 fn run_stream_reads_and_acknowledges_live_events_after_catch_up() {
     let (client, mut server) = UnixStream::pair().unwrap();
     let run_id = "01900000-0000-7000-8000-000000000001";

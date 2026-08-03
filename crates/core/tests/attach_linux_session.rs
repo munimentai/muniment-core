@@ -482,6 +482,9 @@ fn stream_projection(run_id: &str, run_seq: u64, event_type: String) -> RunEvent
         event_version: 1,
         recorded_at: "2026-07-16T03:00:00Z".into(),
         text: None,
+        effect_id: None,
+        display_name: None,
+        tool_effect_valid: false,
         pending_permission: None,
         receipt: None,
     }
@@ -1298,9 +1301,28 @@ fn authorized_run_stream_catches_up_in_order_with_redacted_projection() {
         payload_json: json!({"text":"legacy reply"}),
     };
     journal.append(2, &withheld).unwrap();
+    for (seq, event_type, payload) in [
+        (
+            4,
+            "tool.effect.started",
+            json!({"effect_id":"tool-1","display_name":"Search"}),
+        ),
+        (5, "tool.effect.completed", json!({"effect_id":"tool-1"})),
+        (6, "tool.effect.started", json!({"effect_id":"tool-2"})),
+        (7, "tool.effect.failed", json!({"effect_id":"tool-2"})),
+    ] {
+        let mut tool = prompt(RUN, "unused", "2026-07-16T03:00:01Z");
+        tool.event_id = format!("0190a200-0000-7000-8001-{seq:012}");
+        tool.run_seq = seq;
+        tool.event_type = event_type.into();
+        tool.payload = EventPayload::Inline {
+            payload_json: payload,
+        };
+        journal.append(seq - 1, &tool).unwrap();
+    }
     let mut completed = prompt(RUN, "unused", "2026-07-16T03:00:01Z");
     completed.event_id = "0190a200-0000-7000-8000-000000000012".into();
-    completed.run_seq = 4;
+    completed.run_seq = 8;
     completed.event_type = "run.completed".into();
     completed.payload = EventPayload::Inline {
         payload_json: json!({
@@ -1308,7 +1330,7 @@ fn authorized_run_stream_catches_up_in_order_with_redacted_projection() {
             "private": "must remain withheld"
         }),
     };
-    journal.append(3, &completed).unwrap();
+    journal.append(7, &completed).unwrap();
     journal.bind_run_workspace(RUN, "workspace-1").unwrap();
 
     let (mut client, server) = UnixStream::pair().unwrap();
@@ -1333,7 +1355,7 @@ fn authorized_run_stream_catches_up_in_order_with_redacted_projection() {
     let response: Response = read_frame(&mut client);
     assert_eq!(response.body["run_id"], RUN);
     assert_eq!(response.body["first_available_run_seq"], 1);
-    assert_eq!(response.body["current_run_seq"], 4);
+    assert_eq!(response.body["current_run_seq"], 8);
     let subscription = response.body["subscription_id"].as_str().unwrap();
     let Envelope::Event(event) = read_frame::<Envelope>(&mut client) else {
         panic!("expected run event")
@@ -1354,10 +1376,36 @@ fn authorized_run_stream_catches_up_in_order_with_redacted_projection() {
     assert_eq!(withheld.run_seq, Some(3));
     assert_eq!(withheld.body["payload"], json!({"withheld":true}));
     assert!(!withheld.body.to_string().contains("legacy reply"));
+    let Envelope::Event(tool_started) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected started tool effect")
+    };
+    assert_eq!(tool_started.run_seq, Some(4));
+    assert_eq!(
+        tool_started.body["payload"],
+        json!({"effect_id":"tool-1","display_name":"Search"})
+    );
+    let Envelope::Event(tool_completed) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected completed tool effect")
+    };
+    assert_eq!(tool_completed.run_seq, Some(5));
+    assert_eq!(
+        tool_completed.body["payload"],
+        json!({"effect_id":"tool-1"})
+    );
+    let Envelope::Event(tool_started) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected second started tool effect")
+    };
+    assert_eq!(tool_started.run_seq, Some(6));
+    assert_eq!(tool_started.body["payload"], json!({"effect_id":"tool-2"}));
+    let Envelope::Event(tool_failed) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected failed tool effect")
+    };
+    assert_eq!(tool_failed.run_seq, Some(7));
+    assert_eq!(tool_failed.body["payload"], json!({"effect_id":"tool-2"}));
     let Envelope::Event(completed) = read_frame::<Envelope>(&mut client) else {
         panic!("expected completed event")
     };
-    assert_eq!(completed.run_seq, Some(4));
+    assert_eq!(completed.run_seq, Some(8));
     assert_eq!(completed.body["payload"]["withheld"], true);
     assert_eq!(completed.body["payload"]["receipt"]["route"], "cloud");
     assert!(completed.body["payload"]["receipt"].get("model").is_none());
@@ -3338,6 +3386,166 @@ fn run_stream_text_matches_thread_open_and_replay_skips_the_cursor() {
             .collect::<String>(),
         " end"
     );
+}
+
+#[test]
+fn run_stream_page_projects_tool_effect_fields() {
+    const RUN: &str = "0190a105-0000-7000-8000-000000000003";
+    let mut events = Vec::new();
+    for (seq, event_type, payload) in [
+        (
+            1,
+            "tool.effect.started",
+            json!({"effect_id":"tool-1","display_name":"Search"}),
+        ),
+        (2, "tool.effect.completed", json!({"effect_id":"tool-1"})),
+        (3, "tool.effect.failed", json!({"effect_id":"tool-2"})),
+    ] {
+        let mut event = prompt(RUN, "unused", "2026-07-16T03:00:00Z");
+        event.event_id = format!("0190a205-0000-7000-8001-{seq:012}");
+        event.run_seq = seq;
+        event.event_type = event_type.into();
+        event.payload = EventPayload::Inline {
+            payload_json: payload,
+        };
+        events.push(event);
+    }
+    let mut journal = RunJournal::open(":memory:").unwrap();
+    journal.append_batch(0, &events).unwrap();
+    journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+
+    let stream = journal.stream_run("workspace-1", RUN, 0).unwrap();
+    assert_eq!(stream.events[0].effect_id.as_deref(), Some("tool-1"));
+    assert_eq!(stream.events[0].display_name.as_deref(), Some("Search"));
+    assert!(stream.events[0].tool_effect_valid);
+    assert_eq!(stream.events[1].effect_id.as_deref(), Some("tool-1"));
+    assert_eq!(stream.events[1].display_name, None);
+    assert!(stream.events[1].tool_effect_valid);
+    assert_eq!(stream.events[2].effect_id.as_deref(), Some("tool-2"));
+    assert_eq!(stream.events[2].display_name, None);
+    assert!(stream.events[2].tool_effect_valid);
+}
+
+#[test]
+fn run_stream_tool_effect_projection_enforces_identity_bounds() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000044";
+    let boundary = "x".repeat(65_536);
+    let valid = RunEventProjection {
+        effect_id: Some(boundary.clone()),
+        display_name: Some(boundary.clone()),
+        tool_effect_valid: true,
+        ..stream_projection(RUN, 1, "tool.effect.started".into())
+    };
+    let invalid = [
+        RunEventProjection {
+            effect_id: Some(String::new()),
+            tool_effect_valid: true,
+            ..stream_projection(RUN, 1, "tool.effect.started".into())
+        },
+        RunEventProjection {
+            effect_id: Some("x".repeat(65_537)),
+            tool_effect_valid: true,
+            ..stream_projection(RUN, 1, "tool.effect.started".into())
+        },
+        RunEventProjection {
+            effect_id: Some("private-effect".into()),
+            display_name: Some("x".repeat(65_537)),
+            tool_effect_valid: true,
+            ..stream_projection(RUN, 1, "tool.effect.started".into())
+        },
+        RunEventProjection {
+            effect_id: Some("private-effect".into()),
+            display_name: Some("private-name".into()),
+            tool_effect_valid: true,
+            ..stream_projection(RUN, 1, "tool.effect.completed".into())
+        },
+        RunEventProjection {
+            effect_id: Some("private-effect".into()),
+            display_name: Some("private-name".into()),
+            tool_effect_valid: true,
+            ..stream_projection(RUN, 1, "tool.effect.failed".into())
+        },
+    ];
+
+    let mut valid_service = StreamService {
+        page: RunStreamPage {
+            run_id: RUN.into(),
+            first_available_run_seq: 1,
+            current_run_seq: 1,
+            events: vec![valid],
+            exhausted: true,
+        },
+    };
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello(1, 1)).unwrap();
+    client
+        .write_all(&request(
+            45,
+            Operation::RunStream,
+            json!({"run_id": RUN, "after_run_seq": 0}),
+        ))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(
+        dispatch_session(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            &mut valid_service,
+        ),
+        Ok(())
+    );
+    let _: Response = read_frame(&mut client);
+    let Envelope::Event(event) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected boundary tool effect")
+    };
+    assert_eq!(event.body["payload"]["effect_id"], boundary);
+    assert_eq!(event.body["payload"]["display_name"], boundary);
+
+    for projection in invalid {
+        let mut service = StreamService {
+            page: RunStreamPage {
+                run_id: RUN.into(),
+                first_available_run_seq: 1,
+                current_run_seq: 2,
+                events: vec![
+                    projection,
+                    RunEventProjection {
+                        effect_id: Some("later-private-effect".into()),
+                        tool_effect_valid: true,
+                        ..stream_projection(RUN, 2, "tool.effect.completed".into())
+                    },
+                ],
+                exhausted: true,
+            },
+        };
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&hello(1, 1)).unwrap();
+        client
+            .write_all(&request(
+                46,
+                Operation::RunStream,
+                json!({"run_id": RUN, "after_run_seq": 0}),
+            ))
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        assert_eq!(
+            dispatch_session(
+                &mut client,
+                server,
+                TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                &mut service,
+            ),
+            Ok(())
+        );
+        let error: ErrorEnvelope = read_frame(&mut client);
+        assert_eq!(error.error.code(), ErrorCode::PersistenceFailed);
+        let encoded = serde_json::to_string(&error).unwrap();
+        assert!(!encoded.contains("private-effect"));
+        assert!(!encoded.contains("private-name"));
+        assert!(!encoded.contains("later-private-effect"));
+        assert_eq!(client.read(&mut [0]).unwrap(), 0);
+    }
 }
 
 #[test]

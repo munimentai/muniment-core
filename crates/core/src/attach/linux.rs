@@ -1534,10 +1534,34 @@ fn append_run_stream_page(
             (EventName::PermissionPending, body)
         } else {
             let mut payload = serde_json::json!({ "withheld": true });
-            if journal_event.event_type == "model.stream.delta" {
-                if let Some(text) = &journal_event.text {
-                    payload = serde_json::json!({ "text": text });
+            match journal_event.event_type.as_str() {
+                "model.stream.delta" => {
+                    if let Some(text) = &journal_event.text {
+                        payload = serde_json::json!({ "text": text });
+                    }
                 }
+                "tool.effect.started" | "tool.effect.completed" | "tool.effect.failed" => {
+                    let effect_id = journal_event
+                        .effect_id
+                        .as_ref()
+                        .filter(|effect_id| !effect_id.is_empty() && effect_id.len() <= 65_536)
+                        .filter(|_| journal_event.tool_effect_valid)
+                        .ok_or_else(ProtocolError::persistence_failed)?;
+                    if journal_event
+                        .display_name
+                        .as_ref()
+                        .is_some_and(|display_name| display_name.len() > 65_536)
+                        || (journal_event.event_type != "tool.effect.started"
+                            && journal_event.display_name.is_some())
+                    {
+                        return Err(ProtocolError::persistence_failed());
+                    }
+                    payload = serde_json::json!({ "effect_id": effect_id });
+                    if let Some(display_name) = &journal_event.display_name {
+                        payload["display_name"] = serde_json::json!(display_name);
+                    }
+                }
+                _ => {}
             }
             if let Some(receipt) = &journal_event.receipt {
                 payload["receipt"] = serde_json::to_value(receipt)
