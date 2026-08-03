@@ -58,7 +58,7 @@ fn a_later_delta_resolves_a_pending_safe_delta() {
         .push(2, "model.stream.delta", &delta("ordinary candidate"))
         .unwrap()
         .is_empty());
-    let continuation = "z ".repeat(40_000);
+    let continuation = "z ".repeat(70_000);
     assert_eq!(
         stream
             .push(3, "model.stream.delta", &delta(&continuation))

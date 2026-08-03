@@ -33,6 +33,9 @@ const RULE_ORDER: [Rule; 4] = [
     Rule::SecretAssignment,
 ];
 
+const PATH_RULE_ORDER: [Rule; 2] = [Rule::PathPosixAbsolute, Rule::PathWindowsAbsolute];
+const WINDOWS_ABSOLUTE_MAX_SPAN: usize = 131_068;
+
 const ASSIGNMENT_LABELS: [&[u8]; 12] = [
     b"key",
     b"api_key",
@@ -171,7 +174,7 @@ pub fn posix_absolute_path_candidate(content: &str, start: usize) -> PathCandida
 
 /// Recognizes a bounded Windows absolute path at `start`.
 pub fn windows_absolute_path_candidate(content: &str, start: usize) -> PathCandidate {
-    const MAX_SPAN: usize = 4_096;
+    const MAX_SPAN: usize = WINDOWS_ABSOLUTE_MAX_SPAN;
 
     let bytes = content.as_bytes();
     if !content.is_char_boundary(start)
@@ -226,6 +229,9 @@ pub fn windows_absolute_path_candidate(content: &str, start: usize) -> PathCandi
     if end - start > MAX_SPAN {
         return PathCandidate::OverSpan;
     }
+    if end - start == MAX_SPAN && bytes.get(end).is_none() {
+        return PathCandidate::OverSpan;
+    }
     if bytes.get(end).is_none_or(|byte| is_path_end(*byte)) {
         return PathCandidate::Matched(start..end);
     }
@@ -245,6 +251,7 @@ pub fn windows_absolute_path_candidate(content: &str, start: usize) -> PathCandi
             return PathCandidate::None;
         }
         match bytes.get(end) {
+            None if end - start == MAX_SPAN => return PathCandidate::OverSpan,
             None => return PathCandidate::Matched(start..end),
             Some(byte) if is_path_end(*byte) => return PathCandidate::Matched(start..end),
             Some(b'\\') => {
@@ -273,6 +280,9 @@ fn windows_root_component(
         if end - start > max_span {
             return Err(PathCandidate::OverSpan);
         }
+    }
+    if end - start == max_span && bytes.get(end).is_none() {
+        return Err(PathCandidate::OverSpan);
     }
     if end == component_start || bytes.get(end) != Some(&b'\\') {
         return Err(PathCandidate::None);
@@ -328,7 +338,13 @@ const fn alternative(
 ///
 /// `complete` states that no later bytes can extend the supplied content.
 pub fn scan(content: &str, complete: bool) -> Scan {
-    scan_with_path_candidate(content, complete, |_, _| PathClassification::None, false)
+    scan_with_path_candidate(
+        content,
+        complete,
+        |_, _| PathClassification::None,
+        false,
+        false,
+    )
 }
 
 /// Scans assistant reply content and applies workspace path policy.
@@ -389,6 +405,7 @@ fn scan_with_workspace_mode<E>(
             }
         },
         wait_for_incomplete_pem,
+        true,
     )
 }
 
@@ -397,6 +414,7 @@ fn scan_with_path_candidate(
     complete: bool,
     mut classify_path: impl FnMut(&str, usize) -> PathClassification,
     wait_for_incomplete_pem: bool,
+    scan_paths: bool,
 ) -> Scan {
     let bytes = content.as_bytes();
     let mut matches = Vec::new();
@@ -464,6 +482,12 @@ fn scan_with_path_candidate(
     } else {
         let max_span = RULE_ORDER
             .iter()
+            .chain(
+                scan_paths
+                    .then_some(PATH_RULE_ORDER.iter())
+                    .into_iter()
+                    .flatten(),
+            )
             .map(|rule| rule.max_span())
             .max()
             .unwrap_or(0);
@@ -505,7 +529,7 @@ impl Rule {
             Self::SecretPemPrivateKey => 65_536,
             Self::SecretAssignment => 192,
             Self::PathPosixAbsolute => 4_096,
-            Self::PathWindowsAbsolute => 4_096,
+            Self::PathWindowsAbsolute => WINDOWS_ABSOLUTE_MAX_SPAN,
         }
     }
 }

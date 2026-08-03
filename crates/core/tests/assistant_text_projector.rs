@@ -235,3 +235,28 @@ fn applies_workspace_scope_through_the_injected_canonicalizer() {
         ]
     );
 }
+
+#[test]
+fn withholds_a_long_windows_path_split_across_deltas() {
+    let mut projector = projector();
+    let first = format!("safe C:\\{}", "a".repeat(2_500));
+    let second = format!("{} end", "a".repeat(2_500));
+
+    assert!(projector.push(1, &first, &released()).unwrap().is_empty());
+    assert!(projector.push(2, &second, &released()).unwrap().is_empty());
+    assert_eq!(
+        projector.finish().unwrap(),
+        vec![
+            Projection {
+                run_seq: 1,
+                text: Some("safe ".into()),
+                withheld: false,
+            },
+            Projection {
+                run_seq: 2,
+                text: Some(" end".into()),
+                withheld: false,
+            },
+        ]
+    );
+}

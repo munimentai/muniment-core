@@ -307,23 +307,21 @@ fn windows_paths_reject_invalid_roots_and_components() {
 }
 
 #[test]
-fn windows_paths_exceed_the_span_only_after_the_limit() {
-    let maximum = format!("C:\\{}", "a".repeat(4_093));
-    assert_eq!(maximum.len(), 4_096);
+fn windows_paths_require_path_end_at_the_span_limit() {
+    let below_limit = format!("C:\\{}", "a".repeat(131_064));
+    assert_eq!(below_limit.len(), 131_067);
     assert_eq!(
-        windows_absolute_path_candidate(&maximum, 0),
-        PathCandidate::Matched(0..4_096)
+        windows_absolute_path_candidate(&below_limit, 0),
+        PathCandidate::Matched(0..131_067)
     );
 
-    let terminated = format!("{maximum} ");
+    let at_limit = format!("{below_limit}a");
     assert_eq!(
-        windows_absolute_path_candidate(&terminated, 0),
-        PathCandidate::Matched(0..4_096)
+        windows_absolute_path_candidate(&format!("{at_limit} "), 0),
+        PathCandidate::Matched(0..131_068)
     );
-
-    let over_span = format!("{maximum}a");
     assert_eq!(
-        windows_absolute_path_candidate(&over_span, 0),
+        windows_absolute_path_candidate(&at_limit, 0),
         PathCandidate::OverSpan
     );
 }
@@ -373,7 +371,7 @@ fn workspace_scan_withholds_windows_scope_and_validation_failures() {
 
 #[test]
 fn workspace_scan_withholds_an_over_span_windows_path_without_validation() {
-    let content = format!("safe C:\\{}", "a".repeat(4_094));
+    let content = format!("safe C:\\{}", "a".repeat(131_065));
     let result = scan_with_workspace(
         &content,
         true,
@@ -384,6 +382,37 @@ fn workspace_scan_withholds_an_over_span_windows_path_without_validation() {
     );
     assert!(result.matches.is_empty());
     assert_eq!(result.withhold_from, Some(5));
+}
+
+#[test]
+fn workspace_scan_withholds_a_windows_path_longer_than_the_posix_span() {
+    let content = format!("safe C:\\{} end", "a".repeat(5_000));
+    let result = scan_with_workspace(&content, true, Path::new("C:\\workspace"), |path| {
+        Ok::<_, io::Error>(if path == Path::new("C:\\workspace") {
+            Path::new("/canonical/workspace").to_path_buf()
+        } else {
+            Path::new("/canonical/outside").to_path_buf()
+        })
+    });
+
+    assert_eq!(result.matches.len(), 1);
+    assert_eq!(result.matches[0].range, 5..5_008);
+    assert_eq!(result.matches[0].rule, Rule::PathWindowsAbsolute);
+    assert_eq!(result.withhold_from, None);
+}
+
+#[test]
+fn workspace_scan_retains_the_windows_path_span() {
+    let content = "x".repeat(131_068);
+    let result = scan_with_workspace(
+        &content,
+        false,
+        Path::new("C:\\workspace"),
+        |_| -> io::Result<std::path::PathBuf> { panic!("safe text must not reach validation") },
+    );
+
+    assert_eq!(result.retention_offset, 1);
+    assert_eq!(content.len() - result.retention_offset, 131_067);
 }
 
 #[test]
@@ -451,7 +480,7 @@ fn withholds_windows_scope_failures() {
 
 #[test]
 fn withholds_over_span_windows_candidates_without_scope_validation() {
-    let content = format!("C:\\{}", "a".repeat(4_094));
+    let content = format!("C:\\{}", "a".repeat(131_065));
     assert_eq!(
         classify_windows_absolute_path(
             &content,
