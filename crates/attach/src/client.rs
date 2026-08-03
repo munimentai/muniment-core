@@ -110,6 +110,7 @@ pub struct RedactedRunEvent {
     pub event_type: String,
     pub event_version: u32,
     pub recorded_at: String,
+    pub text: Option<String>,
     pub receipt: Option<RunReceipt>,
 }
 
@@ -178,6 +179,7 @@ impl fmt::Debug for RedactedRunEvent {
             .field("event_type", &self.event_type)
             .field("event_version", &self.event_version)
             .field("recorded_at", &self.recorded_at)
+            .field("text", &self.text.as_ref().map(|_| "[redacted]"))
             .field("receipt", &self.receipt.as_ref().map(|_| "[redacted]"))
             .finish()
     }
@@ -883,7 +885,10 @@ mod linux {
                     #[derive(serde::Deserialize)]
                     #[serde(deny_unknown_fields)]
                     struct Withheld {
+                        #[serde(default)]
                         withheld: bool,
+                        #[serde(default)]
+                        text: Option<String>,
                         #[serde(default)]
                         receipt: Option<crate::RunReceipt>,
                     }
@@ -895,7 +900,15 @@ mod linux {
                         || body.recorded_at.is_empty()
                         || body.recorded_at.len() > MAX_TEXT_LENGTH
                         || !is_rfc3339(&body.recorded_at)
-                        || !body.payload.withheld
+                        || (body.event_type == "model.stream.delta"
+                            && (body.payload.withheld == body.payload.text.is_some()))
+                        || (body.event_type != "model.stream.delta"
+                            && (!body.payload.withheld || body.payload.text.is_some()))
+                        || body
+                            .payload
+                            .text
+                            .as_ref()
+                            .is_some_and(|text| text.is_empty() || text.len() > 65_536)
                         || (body.payload.receipt.is_some() && body.event_type != "run.completed")
                         || body.payload.receipt.as_ref().is_some_and(|receipt| {
                             let valid = |value: &Option<String>| {
@@ -927,6 +940,7 @@ mod linux {
                         event_type: body.event_type,
                         event_version: body.event_version,
                         recorded_at: body.recorded_at,
+                        text: body.payload.text,
                         receipt: body.payload.receipt,
                     }))
                 }

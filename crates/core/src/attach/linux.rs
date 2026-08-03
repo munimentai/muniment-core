@@ -600,7 +600,7 @@ impl ThreadListService for RunJournal {
         run_id: &str,
         after_run_seq: u64,
     ) -> Result<RunStreamPage, ProtocolError> {
-        let page = self
+        let mut page = self
             .workspace_catch_up(
                 workspace,
                 run_id,
@@ -614,6 +614,28 @@ impl ThreadListService for RunJournal {
                 RunEventPageError::InvalidLimit => ProtocolError::invalid_request(),
                 RunEventPageError::Journal(_) => ProtocolError::persistence_failed(),
             })?;
+        let projected = self
+            .projected_run_stream_text(workspace, run_id, page.current_run_seq)
+            .map_err(|_| ProtocolError::persistence_failed())?;
+        let projected_len = page
+            .events
+            .iter()
+            .take_while(|event| projected.contains_key(&event.run_seq))
+            .count();
+        if projected_len != page.events.len() {
+            page.events.truncate(projected_len);
+            page.exhausted = false;
+        }
+        for event in &mut page.events {
+            if event.event_type == "model.stream.delta" {
+                event.text = match projected.get(&event.run_seq) {
+                    Some(crate::assistant_text::stream::AssistantText::Released(text)) => {
+                        Some(text.clone())
+                    }
+                    _ => None,
+                };
+            }
+        }
         Ok(RunStreamPage {
             run_id: run_id.to_owned(),
             first_available_run_seq: page.first_available_run_seq,
@@ -1381,8 +1403,7 @@ fn poll_run_streams<S: ThreadListService>(
     let mut events = Vec::new();
     for stream in subscriptions {
         let window = stream.cursor.window();
-        if !stream.caught_up
-            || !stream.pending.is_empty()
+        if !stream.pending.is_empty()
             || stream.cursor.outstanding_events() == window.max_events
             || stream.cursor.outstanding_bytes() == window.max_bytes
         {
@@ -1434,7 +1455,6 @@ fn append_run_stream_page(
     {
         return Err(ProtocolError::persistence_failed());
     }
-    let page_was_empty = page.events.is_empty();
     for journal_event in page.events {
         if journal_event.run_seq > stream.snapshot_run_seq {
             break;
@@ -1468,6 +1488,11 @@ fn append_run_stream_page(
             (EventName::PermissionPending, body)
         } else {
             let mut payload = serde_json::json!({ "withheld": true });
+            if journal_event.event_type == "model.stream.delta" {
+                if let Some(text) = &journal_event.text {
+                    payload = serde_json::json!({ "text": text });
+                }
+            }
             if let Some(receipt) = &journal_event.receipt {
                 payload["receipt"] = serde_json::to_value(receipt)
                     .map_err(|_| ProtocolError::persistence_failed())?;
@@ -1501,9 +1526,6 @@ fn append_run_stream_page(
         stream.pending.push_back(event);
     }
     stream.exhausted = stream.fetched_through_run_seq == stream.snapshot_run_seq;
-    if !stream.exhausted && page_was_empty {
-        return Err(ProtocolError::persistence_failed());
-    }
     Ok(())
 }
 
@@ -1641,12 +1663,16 @@ fn dispatch_request<S: ThreadListService>(
             });
         }
         while subscriptions[index].pending.is_empty() && !subscriptions[index].exhausted {
+            let fetched_through_run_seq = subscriptions[index].fetched_through_run_seq;
             let page = service.stream_run(
                 &subscriptions[index].workspace,
                 subscriptions[index].cursor.run_id().as_str(),
                 subscriptions[index].fetched_through_run_seq,
             )?;
             append_run_stream_page(&mut subscriptions[index], page)?;
+            if subscriptions[index].fetched_through_run_seq == fetched_through_run_seq {
+                break;
+            }
         }
         let events = drain_run_stream(&mut subscriptions[index])?;
         return Ok(DispatchResult {

@@ -2,6 +2,7 @@
 
 use super::{EventEnvelope, EventPayload};
 use crate::assistant_text::projector::Projector;
+use crate::assistant_text::stream::{AssistantText, RunStreamProjector};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, fmt};
@@ -26,6 +27,48 @@ pub struct StampedThreadEntry {
 }
 
 impl super::RunJournal {
+    /// Rebuilds the assistant-text stream projection through one stable snapshot.
+    pub fn projected_run_stream_text(
+        &mut self,
+        workspace: &str,
+        run_id: &str,
+        snapshot_seq: u64,
+    ) -> Result<BTreeMap<u64, AssistantText>, super::RunEventPageError> {
+        let owned = self
+            .run_belongs_to_workspace(run_id, workspace)
+            .map_err(super::RunEventPageError::Journal)?;
+        if !owned {
+            return Err(super::RunEventPageError::NotFoundOrInaccessible);
+        }
+        let events = self
+            .events(run_id)
+            .map_err(super::RunEventPageError::Journal)?;
+        let mut projector = RunStreamProjector::new(workspace, |path: &std::path::Path| {
+            std::fs::canonicalize(path)
+        });
+        let mut projected = BTreeMap::new();
+        let empty_payload = Value::Null;
+        for event in events.iter().filter(|event| event.run_seq <= snapshot_seq) {
+            let payload = match &event.payload {
+                EventPayload::Inline { payload_json } => payload_json,
+                EventPayload::Cas { .. } | EventPayload::Attachment { .. } => &empty_payload,
+            };
+            let emittable = projector
+                .push(event.run_seq, &event.event_type, payload)
+                .map_err(|_| {
+                    super::RunEventPageError::Journal(super::JournalError::Corrupt(
+                        "assistant text stream projection failed".into(),
+                    ))
+                })?;
+            projected.extend(
+                emittable
+                    .into_iter()
+                    .map(|event| (event.run_seq, event.assistant_text)),
+            );
+        }
+        Ok(projected)
+    }
+
     pub fn ledger_thread_projection_entries(
         &mut self,
         workspace: &str,

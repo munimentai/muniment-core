@@ -215,6 +215,7 @@ pub struct RunEventProjection {
     pub event_type: String,
     pub event_version: u32,
     pub recorded_at: String,
+    pub text: Option<String>,
     pub pending_permission: Option<PendingPermissionProjection>,
     pub receipt: Option<ReceiptProjection>,
 }
@@ -521,6 +522,7 @@ impl RunJournal {
                 event_type: row.get(2).map_err(JournalError::from)?,
                 event_version: row.get(3).map_err(JournalError::from)?,
                 recorded_at: row.get(4).map_err(JournalError::from)?,
+                text: None,
                 pending_permission: if row.get::<_, String>(2).map_err(JournalError::from)?
                     == "permission.requested"
                 {
