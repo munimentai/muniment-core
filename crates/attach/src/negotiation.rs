@@ -167,6 +167,7 @@ impl fmt::Debug for Welcome {
 /// values are deliberately local to the authorization policy.
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct Authorized {
+    pub profile_id: String,
     pub capability: String,
     pub expires_at: u64,
     pub idle_timeout_seconds: u64,
@@ -178,6 +179,7 @@ impl<'de> Deserialize<'de> for Authorized {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         struct AuthorizedFields {
+            profile_id: String,
             capability: String,
             expires_at: u64,
             idle_timeout_seconds: u64,
@@ -212,6 +214,7 @@ impl<'de> Deserialize<'de> for Authorized {
         let fields = AuthorizedFields::deserialize(deserializer)?;
         reject_conflicting_fields::<D::Error>(&fields.extra, CONFLICTING_FIELDS, "authorized")?;
         Ok(Self {
+            profile_id: fields.profile_id,
             capability: fields.capability,
             expires_at: fields.expires_at,
             idle_timeout_seconds: fields.idle_timeout_seconds,
@@ -324,12 +327,14 @@ pub fn reconnect_welcome(
 }
 
 pub fn authorized(
+    profile_id: impl Into<String>,
     capability: impl Into<String>,
     expires_at: u64,
     idle_timeout_seconds: u64,
     workspace_scopes: BTreeMap<String, BTreeSet<String>>,
 ) -> Authorized {
     authorized_with_client_credential(
+        profile_id,
         capability,
         expires_at,
         idle_timeout_seconds,
@@ -339,6 +344,7 @@ pub fn authorized(
 }
 
 pub fn authorized_with_client_credential(
+    profile_id: impl Into<String>,
     capability: impl Into<String>,
     expires_at: u64,
     idle_timeout_seconds: u64,
@@ -346,6 +352,7 @@ pub fn authorized_with_client_credential(
     authorized_client_credential: impl Into<String>,
 ) -> Authorized {
     Authorized {
+        profile_id: profile_id.into(),
         capability: capability.into(),
         expires_at,
         idle_timeout_seconds,

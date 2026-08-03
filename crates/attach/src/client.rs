@@ -315,6 +315,7 @@ mod linux {
     /// An authorization bound to the connection on which pairing completed.
     pub struct AuthorizedClient {
         stream: UnixStream,
+        profile_id: String,
         capability: String,
         summary: AuthorizationSummary,
         authorized_at: Instant,
@@ -330,6 +331,10 @@ mod linux {
     }
 
     impl AuthorizedClient {
+        pub fn profile_id(&self) -> &str {
+            &self.profile_id
+        }
+
         pub fn authorization_summary(&self) -> AuthorizationSummary {
             self.summary.clone()
         }
@@ -1277,6 +1282,7 @@ mod linux {
         }
         Ok(AuthorizedClient {
             stream,
+            profile_id: authorized.profile_id,
             capability: authorized.capability,
             summary: AuthorizationSummary {
                 expires_in_seconds: authorized.expires_at,

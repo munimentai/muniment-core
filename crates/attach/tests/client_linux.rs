@@ -37,6 +37,7 @@ fn reconnect_welcome_does_not_report_pairing_pending() {
         server
             .write_all(
                 &encode_frame(&muniment_attach::authorized_with_client_credential(
+                    "profile-id",
                     "33".repeat(32),
                     3600,
                     900,
@@ -119,6 +120,7 @@ fn pathname_socket_handles_fragmented_success_frames() {
             stream.write_all(&[byte]).unwrap();
         }
         let grant = authorized(
+            "profile-id",
             "33".repeat(32),
             3600,
             900,
@@ -134,6 +136,7 @@ fn pathname_socket_handles_fragmented_success_frames() {
     let client = handshake_stream(stream, "0.0.1", SHORT, SHORT, || prompted = true).unwrap();
     let summary = client.authorization_summary();
     assert!(prompted);
+    assert_eq!(client.profile_id(), "profile-id");
     assert_eq!(summary.expires_in_seconds, 3600);
     assert_eq!(summary.idle_timeout_seconds, 900);
     server.join().unwrap();
@@ -148,6 +151,7 @@ fn complete_pairing(server: &mut UnixStream) {
     server
         .write_all(
             &encode_frame(&authorized(
+                "profile-id",
                 "33".repeat(32),
                 3600,
                 900,
@@ -1943,7 +1947,14 @@ fn thread_list_timeout_is_absolute_and_client_debug_is_redacted() {
 #[test]
 fn continuous_partial_progress_cannot_extend_receive_deadlines() {
     let welcome = encode_frame(&welcome(1, "0.0.1", "11".repeat(16), "22".repeat(16))).unwrap();
-    let grant = encode_frame(&authorized("33".repeat(32), 3600, 900, BTreeMap::new())).unwrap();
+    let grant = encode_frame(&authorized(
+        "profile-id",
+        "33".repeat(32),
+        3600,
+        900,
+        BTreeMap::new(),
+    ))
+    .unwrap();
 
     for (first, drip) in [(None, welcome.clone()), (Some(welcome), grant)] {
         let (client, mut server) = UnixStream::pair().unwrap();
@@ -2111,7 +2122,7 @@ fn errors_and_handshake_debug_output_do_not_expose_secrets() {
         assert!(!text.contains(secret));
     }
     let welcome = welcome(1, "0.0.1", "nonce-secret", "challenge-secret");
-    let grant = authorized("capability-secret", 1, 1, BTreeMap::new());
+    let grant = authorized("profile-id", "capability-secret", 1, 1, BTreeMap::new());
     assert!(!format!("{welcome:?}").contains("nonce-secret"));
     assert!(!format!("{welcome:?}").contains("challenge-secret"));
     assert!(!format!("{grant:?}").contains("capability-secret"));

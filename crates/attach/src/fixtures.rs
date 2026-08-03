@@ -466,6 +466,7 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         &mut fixtures,
         "authorization-authorized.json",
         &crate::authorized(
+            "018f0000-0000-7000-8000-000000000098",
             "fixture-capability",
             3600,
             900,

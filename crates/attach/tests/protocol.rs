@@ -418,6 +418,7 @@ fn hello_welcome_and_version_overlap() {
 #[test]
 fn authorized_round_trips_and_ignores_future_optional_fields() {
     let message = authorized(
+        "profile-id",
         "connection-capability",
         3600,
         900,
@@ -443,7 +444,13 @@ fn authorized_round_trips_and_ignores_future_optional_fields() {
 #[test]
 fn handshake_wire_debug_redacts_secrets() {
     let welcome = welcome(1, "0.1.0", "server-nonce", "secret-challenge");
-    let authorized = authorized("secret-capability", 3600, 900, Default::default());
+    let authorized = authorized(
+        "profile-id",
+        "secret-capability",
+        3600,
+        900,
+        Default::default(),
+    );
     let request = Request {
         protocol: Protocol,
         request_id: id(1),

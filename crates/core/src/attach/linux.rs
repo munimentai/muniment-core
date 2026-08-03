@@ -1138,6 +1138,7 @@ where
             }
         };
         let response = super::authorized_with_client_credential(
+            &grant.profile,
             capability.as_str(),
             remaining,
             grant.idle_timeout.as_secs(),

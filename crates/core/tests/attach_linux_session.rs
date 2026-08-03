@@ -849,6 +849,7 @@ fn approval_after_hello_timeout_but_before_challenge_expiry_is_sent() {
     assert_eq!(result, Ok(()));
     let _: Welcome = read_frame(&mut client);
     let authorized: Authorized = read_frame(&mut client);
+    assert_eq!(authorized.profile_id, "profile-1");
     assert_eq!(authorized.capability, "02".repeat(32));
     assert_eq!(client.read(&mut [0]).unwrap(), 0);
 }
@@ -924,7 +925,8 @@ fn denial_and_expired_challenge_close_without_authorized() {
                 Ok(())
             }
         );
-        let _: Welcome = read_frame(&mut client);
+        let welcome: serde_json::Value = read_frame(&mut client);
+        assert!(welcome.get("profile_id").is_none());
         assert_eq!(client.read(&mut [0]).unwrap(), 0);
     }
 }
