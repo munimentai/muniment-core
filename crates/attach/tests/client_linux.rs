@@ -432,24 +432,12 @@ fn run_stream_decodes_closed_and_revoked_events() {
 }
 
 #[test]
-fn run_stream_rejects_malformed_closed_and_revoked_bodies() {
+fn run_stream_decodes_malformed_resumable_as_false() {
     let run_id = "01900000-0000-7000-8000-000000000001";
     let subscription_id = "01900000-0000-7000-8000-000000000002";
-    for malformed in [
-        run_stream_event(
-            subscription_id,
-            run_id,
-            2,
-            "stream.closed",
-            serde_json::json!({"code": "invalid_cursor", "resumable": "yes"}),
-        ),
-        run_stream_event(
-            subscription_id,
-            run_id,
-            2,
-            "capability.revoked",
-            serde_json::json!({"capability": "fixture-capability"}),
-        ),
+    for body in [
+        serde_json::json!({"code": "invalid_cursor"}),
+        serde_json::json!({"code": "invalid_cursor", "resumable": "yes"}),
     ] {
         let (client, mut server) = UnixStream::pair().unwrap();
         let worker = thread::spawn(move || {
@@ -467,17 +455,68 @@ fn run_stream_rejects_malformed_closed_and_revoked_bodies() {
                 )
                 .unwrap();
             server
-                .write_all(&encode_frame(&malformed).unwrap())
+                .write_all(
+                    &encode_frame(&run_stream_event(
+                        subscription_id,
+                        run_id,
+                        2,
+                        "stream.closed",
+                        body,
+                    ))
+                    .unwrap(),
+                )
                 .unwrap();
         });
         let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
         client.subscribe_run(run_id, 0).unwrap();
-        assert_eq!(
+        assert!(matches!(
             client.read_run_stream_message(),
-            Err(ClientError::UnexpectedMessage)
-        );
+            Ok(RunStreamMessage::StreamClosed {
+                resumable: false,
+                ..
+            })
+        ));
         worker.join().unwrap();
     }
+}
+
+#[test]
+fn run_stream_rejects_malformed_revoked_bodies() {
+    let run_id = "01900000-0000-7000-8000-000000000001";
+    let subscription_id = "01900000-0000-7000-8000-000000000002";
+    let malformed = run_stream_event(
+        subscription_id,
+        run_id,
+        2,
+        "capability.revoked",
+        serde_json::json!({"capability": "fixture-capability"}),
+    );
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        let request = read_client_value(&mut server);
+        server
+            .write_all(
+                &encode_frame(&Response {
+                    protocol: Protocol,
+                    request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+                    ok: Success,
+                    body: valid_run_stream_summary(run_id, subscription_id),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        server
+            .write_all(&encode_frame(&malformed).unwrap())
+            .unwrap();
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    client.subscribe_run(run_id, 0).unwrap();
+    assert_eq!(
+        client.read_run_stream_message(),
+        Err(ClientError::UnexpectedMessage)
+    );
+    worker.join().unwrap();
 }
 
 #[test]
@@ -1213,7 +1252,6 @@ fn run_stream_rejects_hostile_event_envelopes_without_leaking_bodies() {
             valid_body.clone(),
         ),
         run_stream_event(subscription_id, run_id, 0, "run.event", valid_body.clone()),
-        run_stream_event(subscription_id, run_id, 2, "run.event", valid_body.clone()),
         run_stream_event(subscription_id, run_id, 3, "run.event", valid_body.clone()),
         run_stream_event(
             subscription_id,
@@ -1366,7 +1404,6 @@ fn run_stream_rejects_hostile_live_events_after_catch_up() {
     });
     let cases = [
         run_stream_event(subscription_id, run_id, 4, "run.event", valid_body.clone()),
-        run_stream_event(subscription_id, run_id, 2, "run.event", valid_body.clone()),
         run_stream_event(
             "01900000-0000-7000-8000-000000000003",
             run_id,

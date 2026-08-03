@@ -987,7 +987,8 @@ mod linux {
             match event.event {
                 EventName::RunEvent | EventName::PermissionPending => {
                     let run_seq = event.run_seq.ok_or(ClientError::UnexpectedMessage)?;
-                    if active.highest_run_seq.checked_add(1) != Some(run_seq)
+                    if run_seq == 0
+                        || run_seq > active.highest_run_seq.saturating_add(1)
                         || (!active.caught_up && run_seq > active.current_run_seq)
                         || run_seq.saturating_sub(active.acknowledged_run_seq)
                             > active.max_unacknowledged_events as u64
@@ -1008,7 +1009,7 @@ mod linux {
                             return Err(ClientError::UnexpectedMessage);
                         }
                         body.run_seq = run_seq;
-                        active.highest_run_seq = run_seq;
+                        active.highest_run_seq = active.highest_run_seq.max(run_seq);
                         if active.caught_up {
                             active.current_run_seq = run_seq;
                         }
@@ -1101,7 +1102,7 @@ mod linux {
                     {
                         return Err(ClientError::UnexpectedMessage);
                     }
-                    active.highest_run_seq = run_seq;
+                    active.highest_run_seq = active.highest_run_seq.max(run_seq);
                     if active.caught_up {
                         active.current_run_seq = run_seq;
                     }
@@ -1134,7 +1135,8 @@ mod linux {
                     #[serde(deny_unknown_fields)]
                     struct Body {
                         code: String,
-                        resumable: bool,
+                        #[serde(default)]
+                        resumable: Value,
                     }
                     let body: Body = serde_json::from_value(event.body)
                         .map_err(|_| ClientError::UnexpectedMessage)?;
@@ -1143,7 +1145,7 @@ mod linux {
                     }
                     Ok(RunStreamMessage::StreamClosed {
                         code: body.code,
-                        resumable: body.resumable,
+                        resumable: body.resumable.as_bool().unwrap_or(false),
                     })
                 }
                 EventName::CapabilityRevoked => {
