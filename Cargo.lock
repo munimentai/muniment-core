@@ -2650,6 +2650,7 @@ version = "0.0.1"
 dependencies = [
  "agent-client-protocol",
  "muniment-attach",
+ "serde",
  "serde_json",
  "uuid",
 ]
