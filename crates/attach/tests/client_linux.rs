@@ -1374,6 +1374,7 @@ fn run_start_uses_exact_envelope_fresh_ids_and_accepts_receipts() {
                         ok: Success,
                         body: serde_json::json!({
                             "run_id": "01900000-0000-7000-8000-000000000001",
+                            "thread_id": "01900000-0000-7000-8000-000000000002",
                             "committed_seq": 2,
                             "accepted_at": "2026-07-17T00:00:00Z"
                         }),
@@ -1390,6 +1391,55 @@ fn run_start_uses_exact_envelope_fresh_ids_and_accepts_receipts() {
     assert_eq!(accepted.committed_seq, 2);
     assert!(!format!("{accepted:?}").contains("first prompt"));
     client.start_run("second prompt", None).unwrap();
+    worker.join().unwrap();
+}
+
+#[test]
+fn run_start_in_workspace_thread_sends_the_thread_binding() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let thread_id = "01900000-0000-7000-8000-000000000003";
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        let request = read_client_value(&mut server);
+        let request_id = request["request_id"].as_str().unwrap().to_owned();
+        let idempotency_key = request["idempotency_key"].as_str().unwrap().to_owned();
+        assert_eq!(
+            request,
+            serde_json::json!({
+                "protocol": "muniment.attach/1",
+                "request_id": request_id,
+                "operation": "run.start",
+                "capability": "33".repeat(32),
+                "idempotency_key": idempotency_key,
+                "body": {
+                    "text": "continued prompt",
+                    "workspace": "workspace",
+                    "thread_id": thread_id
+                }
+            })
+        );
+        server
+            .write_all(
+                &encode_frame(&Response {
+                    protocol: Protocol,
+                    request_id: Id::new(request_id).unwrap(),
+                    ok: Success,
+                    body: serde_json::json!({
+                        "run_id": "01900000-0000-7000-8000-000000000001",
+                        "thread_id": thread_id,
+                        "committed_seq": 1,
+                        "accepted_at": "2026-07-17T00:00:00Z"
+                    }),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    let accepted = client
+        .start_run_in_workspace_thread("continued prompt", None, Some("workspace"), Some(thread_id))
+        .unwrap();
+    assert_eq!(accepted.thread_id, thread_id);
     worker.join().unwrap();
 }
 
@@ -1426,31 +1476,31 @@ fn run_start_rejects_hostile_receipts_and_maps_errors() {
     for (body, expected) in [
         (
             Some(
-                serde_json::json!({"run_id":"bad", "committed_seq":2, "accepted_at":"2026-07-17T00:00:00Z"}),
+                serde_json::json!({"run_id":"bad", "thread_id":"01900000-0000-7000-8000-000000000002", "committed_seq":2, "accepted_at":"2026-07-17T00:00:00Z"}),
             ),
             ClientError::UnexpectedMessage,
         ),
         (
             Some(
-                serde_json::json!({"run_id":"01900000-0000-7000-8000-000000000001", "committed_seq":0, "accepted_at":"2026-07-17T00:00:00Z"}),
+                serde_json::json!({"run_id":"01900000-0000-7000-8000-000000000001", "thread_id":"01900000-0000-7000-8000-000000000002", "committed_seq":0, "accepted_at":"2026-07-17T00:00:00Z"}),
             ),
             ClientError::UnexpectedMessage,
         ),
         (
             Some(
-                serde_json::json!({"run_id":"01900000-0000-7000-8000-000000000001", "committed_seq":2, "accepted_at":"not a timestamp"}),
+                serde_json::json!({"run_id":"01900000-0000-7000-8000-000000000001", "thread_id":"01900000-0000-7000-8000-000000000002", "committed_seq":2, "accepted_at":"not a timestamp"}),
             ),
             ClientError::UnexpectedMessage,
         ),
         (
             Some(
-                serde_json::json!({"run_id":"x".repeat(65), "committed_seq":2, "accepted_at":"2026-07-17T00:00:00Z"}),
+                serde_json::json!({"run_id":"x".repeat(65), "thread_id":"01900000-0000-7000-8000-000000000002", "committed_seq":2, "accepted_at":"2026-07-17T00:00:00Z"}),
             ),
             ClientError::UnexpectedMessage,
         ),
         (
             Some(
-                serde_json::json!({"run_id":"01900000-0000-7000-8000-000000000001", "committed_seq":2, "accepted_at":"2026-07-17T00:00:00Z", "prompt":"leaked"}),
+                serde_json::json!({"run_id":"01900000-0000-7000-8000-000000000001", "thread_id":"01900000-0000-7000-8000-000000000002", "committed_seq":2, "accepted_at":"2026-07-17T00:00:00Z", "prompt":"leaked"}),
             ),
             ClientError::UnexpectedMessage,
         ),

@@ -232,6 +232,7 @@ pub enum ErrorCode {
     InvalidCursor,
     InvalidArtifactCursor,
     InvalidRequest,
+    ThreadNotFound,
     Unauthorized,
     UnsupportedOperation,
 }
@@ -412,6 +413,8 @@ pub enum ErrorMessage {
     InvalidArtifactCursor,
     #[serde(rename = "The request is invalid.")]
     InvalidRequest,
+    #[serde(rename = "The thread was not found.")]
+    ThreadNotFound,
     #[serde(rename = "The capability is not authorized.")]
     Unauthorized,
     #[serde(rename = "The operation is not supported.")]
@@ -488,6 +491,10 @@ impl ProtocolError {
 
     pub fn invalid_request() -> Self {
         Self::simple(ErrorCode::InvalidRequest, ErrorMessage::InvalidRequest)
+    }
+
+    pub fn thread_not_found() -> Self {
+        Self::simple(ErrorCode::ThreadNotFound, ErrorMessage::ThreadNotFound)
     }
 
     pub fn unauthorized() -> Self {

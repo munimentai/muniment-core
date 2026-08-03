@@ -259,6 +259,7 @@ impl ThreadListService for OnboardingStartService {
         ));
         Ok(RunStartAccepted {
             run_id: "0190a100-0000-7000-8000-000000000001".into(),
+            thread_id: "0190a100-0000-7000-8000-000000000002".into(),
             committed_seq: 2,
             accepted_at: "2026-07-17T00:00:00Z".into(),
         })
@@ -499,6 +500,7 @@ impl ThreadListService for StartService {
         ));
         Ok(self.output.clone().unwrap_or_else(|| RunStartAccepted {
             run_id: "0190a100-0000-7000-8000-000000000001".into(),
+            thread_id: "0190a100-0000-7000-8000-000000000002".into(),
             committed_seq: 2,
             accepted_at: "2026-07-17T00:00:00Z".into(),
         }))
@@ -4054,7 +4056,11 @@ fn authorized_run_start_dispatches_once_with_bounded_input_and_provenance() {
         .write_all(&request_with_idempotency(
             70,
             Operation::RunStart,
-            json!({"text": "Do the work", "context": {"selection": "safe"}}),
+            json!({
+                "text": "Do the work",
+                "context": {"selection": "safe"},
+                "thread_id": "0190a100-0000-7000-8000-000000000099"
+            }),
         ))
         .unwrap();
     client.shutdown(Shutdown::Write).unwrap();
@@ -4076,6 +4082,7 @@ fn authorized_run_start_dispatches_once_with_bounded_input_and_provenance() {
         response.body,
         json!({
             "run_id": "0190a100-0000-7000-8000-000000000001",
+            "thread_id": "0190a100-0000-7000-8000-000000000002",
             "committed_seq": 2,
             "accepted_at": "2026-07-17T00:00:00Z"
         })
@@ -4085,6 +4092,10 @@ fn authorized_run_start_dispatches_once_with_bounded_input_and_provenance() {
     assert_eq!(workspace, "workspace-1");
     assert_eq!(body.text, "Do the work");
     assert_eq!(body.context, Some(json!({"selection": "safe"})));
+    assert_eq!(
+        body.thread_id.as_deref(),
+        Some("0190a100-0000-7000-8000-000000000099")
+    );
     assert_eq!(request_id, &Id::new(format!("{:032x}", 70)).unwrap());
     assert_eq!(key, &Id::new(format!("{:032x}", 1070)).unwrap());
     assert_eq!(provenance.profile, "profile-1");
@@ -4463,6 +4474,22 @@ fn run_start_rejects_missing_scope_key_and_hostile_bodies_without_dispatch() {
                 json!({"text": "x", "context": vec!["x".repeat(40_000); MAX_RUN_START_CONTEXT_LENGTH / 40_000 + 1]}),
             ),
         ),
+        (
+            true,
+            request_with_idempotency(
+                77,
+                Operation::RunStart,
+                json!({"text": "x", "thread_id": "not-a-uuid"}),
+            ),
+        ),
+        (
+            true,
+            request_with_idempotency(
+                78,
+                Operation::RunStart,
+                json!({"text": "x", "thread_id": "0190a100-0000-7000-8000-000000000099x"}),
+            ),
+        ),
     ];
     for (has_scope, frame) in cases {
         let (mut client, server) = UnixStream::pair().unwrap();
@@ -4496,29 +4523,35 @@ fn run_start_rejects_missing_scope_key_and_hostile_bodies_without_dispatch() {
 #[test]
 fn malformed_run_start_service_output_is_a_redacted_closed_error() {
     let valid_run_id = "0190a100-0000-7000-8000-000000000001";
+    let valid_thread_id = "0190a100-0000-7000-8000-000000000002";
     let cases = [
         RunStartAccepted {
             run_id: "not-a-run-id".into(),
+            thread_id: valid_thread_id.into(),
             committed_seq: 2,
             accepted_at: "2026-07-17T00:00:00Z".into(),
         },
         RunStartAccepted {
             run_id: valid_run_id.into(),
+            thread_id: valid_thread_id.into(),
             committed_seq: 0,
             accepted_at: "2026-07-17T00:00:00Z".into(),
         },
         RunStartAccepted {
             run_id: valid_run_id.into(),
+            thread_id: valid_thread_id.into(),
             committed_seq: 2,
             accepted_at: String::new(),
         },
         RunStartAccepted {
             run_id: valid_run_id.into(),
+            thread_id: valid_thread_id.into(),
             committed_seq: 2,
             accepted_at: "private malformed timestamp".into(),
         },
         RunStartAccepted {
             run_id: valid_run_id.into(),
+            thread_id: valid_thread_id.into(),
             committed_seq: 2,
             accepted_at: "private oversized timestamp".repeat(MAX_FRAME_LENGTH),
         },

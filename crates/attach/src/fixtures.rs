@@ -516,6 +516,7 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
             ok: Success,
             body: json!({
                 "run_id": "00000000000000000000000000000191",
+                "thread_id": "00000000000000000000000000000192",
                 "committed_seq": 1,
                 "accepted_at": "2026-07-17T00:00:00Z"
             }),
@@ -535,6 +536,7 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         crate::ErrorCode::InvalidRequest,
         crate::ErrorCode::Unauthorized,
         crate::ErrorCode::UnsupportedOperation,
+        crate::ErrorCode::ThreadNotFound,
     ];
     for (index, code) in errors.into_iter().enumerate() {
         let (name, error) = error_fixture(code);
@@ -661,6 +663,7 @@ fn error_fixture(code: crate::ErrorCode) -> (&'static str, ProtocolError) {
             ProtocolError::invalid_artifact_cursor(),
         ),
         InvalidRequest => ("invalid-request", ProtocolError::invalid_request()),
+        ThreadNotFound => ("thread-not-found", ProtocolError::thread_not_found()),
         Unauthorized => ("unauthorized", ProtocolError::unauthorized()),
         UnsupportedOperation => (
             "unsupported-operation",
@@ -806,6 +809,7 @@ mod tests {
             crate::ErrorCode::InvalidCursor,
             crate::ErrorCode::InvalidArtifactCursor,
             crate::ErrorCode::InvalidRequest,
+            crate::ErrorCode::ThreadNotFound,
             crate::ErrorCode::Unauthorized,
             crate::ErrorCode::UnsupportedOperation,
         ];
@@ -829,7 +833,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            38,
+            39,
             "every canonical fixture must be inventoried"
         );
     }

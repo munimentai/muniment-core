@@ -52,6 +52,7 @@ pub struct AuthorizationSummary {
 #[serde(deny_unknown_fields)]
 pub struct RunStartAccepted {
     pub run_id: String,
+    pub thread_id: String,
     pub committed_seq: u64,
     pub accepted_at: String,
 }
@@ -534,6 +535,16 @@ mod linux {
             context: Option<Value>,
             workspace: Option<&str>,
         ) -> Result<RunStartAccepted, ClientError> {
+            self.start_run_in_workspace_thread(text, context, workspace, None)
+        }
+
+        pub fn start_run_in_workspace_thread(
+            &mut self,
+            text: &str,
+            context: Option<Value>,
+            workspace: Option<&str>,
+            thread_id: Option<&str>,
+        ) -> Result<RunStartAccepted, ClientError> {
             let context_length = context
                 .as_ref()
                 .map(|context| serde_json::to_vec(context).map(|bytes| bytes.len()))
@@ -543,6 +554,7 @@ mod linux {
             if text.trim().is_empty()
                 || text.len() > MAX_RUN_START_TEXT_LENGTH
                 || workspace.is_some_and(|value| value.is_empty() || value.len() > MAX_TEXT_LENGTH)
+                || thread_id.is_some_and(|value| value.len() > 36 || Id::new(value).is_err())
                 || context_length > MAX_RUN_START_CONTEXT_LENGTH
             {
                 return Err(ClientError::UnexpectedMessage);
@@ -556,6 +568,9 @@ mod linux {
             }
             if let Some(workspace) = workspace {
                 body["workspace"] = Value::String(workspace.to_owned());
+            }
+            if let Some(thread_id) = thread_id {
+                body["thread_id"] = Value::String(thread_id.to_owned());
             }
             let request = Request {
                 protocol: Protocol,
@@ -587,6 +602,7 @@ mod linux {
             let accepted: RunStartAccepted = serde_json::from_value(response.body)
                 .map_err(|_| ClientError::UnexpectedMessage)?;
             if Id::new(accepted.run_id.clone()).is_err()
+                || Id::new(accepted.thread_id.clone()).is_err()
                 || accepted.committed_seq == 0
                 || accepted.accepted_at.is_empty()
                 || accepted.accepted_at.len() > MAX_TEXT_LENGTH
@@ -1418,6 +1434,15 @@ impl AuthorizedClient {
         _text: &str,
         _context: Option<serde_json::Value>,
         _workspace: Option<&str>,
+    ) -> Result<RunStartAccepted, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+    pub fn start_run_in_workspace_thread(
+        &mut self,
+        _text: &str,
+        _context: Option<serde_json::Value>,
+        _workspace: Option<&str>,
+        _thread_id: Option<&str>,
     ) -> Result<RunStartAccepted, ClientError> {
         Err(ClientError::UnsupportedPlatform)
     }

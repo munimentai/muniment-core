@@ -433,6 +433,7 @@ pub struct ThreadOpenPage {
 pub struct RunStartRequest {
     pub text: String,
     pub context: Option<serde_json::Value>,
+    pub thread_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -447,6 +448,7 @@ pub struct CompanionProvenance {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 pub struct RunStartAccepted {
     pub run_id: String,
+    pub thread_id: String,
     pub committed_seq: u64,
     pub accepted_at: String,
 }
@@ -1696,6 +1698,8 @@ fn dispatch_request<S: ThreadListService>(
             workspace: Option<String>,
             #[serde(default)]
             context: Option<serde_json::Value>,
+            #[serde(default)]
+            thread_id: Option<String>,
         }
         let body: Body =
             serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
@@ -1712,6 +1716,10 @@ fn dispatch_request<S: ThreadListService>(
                 .workspace
                 .as_ref()
                 .is_some_and(|value| value.is_empty() || value.len() > MAX_TEXT_LENGTH)
+            || body
+                .thread_id
+                .as_ref()
+                .is_some_and(|value| value.len() > 36 || super::Id::new(value.clone()).is_err())
             || context_length > MAX_RUN_START_CONTEXT_LENGTH
         {
             return Err(ProtocolError::invalid_request().into());
@@ -1731,12 +1739,14 @@ fn dispatch_request<S: ThreadListService>(
             RunStartRequest {
                 text: body.text,
                 context: body.context,
+                thread_id: body.thread_id,
             },
             &request.request_id,
             idempotency_key,
             provenance,
         )?;
         if super::Id::new(accepted.run_id.clone()).is_err()
+            || super::Id::new(accepted.thread_id.clone()).is_err()
             || accepted.committed_seq == 0
             || accepted.accepted_at.is_empty()
             || accepted.accepted_at.len() > MAX_TEXT_LENGTH
@@ -1746,6 +1756,7 @@ fn dispatch_request<S: ThreadListService>(
         }
         return Ok(response_only(serde_json::json!({
             "run_id": accepted.run_id,
+            "thread_id": accepted.thread_id,
             "committed_seq": accepted.committed_seq,
             "accepted_at": accepted.accepted_at,
         })));
