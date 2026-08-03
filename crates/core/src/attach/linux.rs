@@ -23,6 +23,7 @@ use super::{
 };
 use super::{
     RunEventAdmission, RunStreamCursor, MAX_RUN_STREAM_WINDOW_BYTES, MAX_RUN_STREAM_WINDOW_EVENTS,
+    MAX_RUN_STREAM_WINDOW_TEXT_BYTES,
 };
 use crate::journal::{
     thread_summaries::ThreadSummaryListError, JournalCommitHint, RunEventPageError, RunJournal,
@@ -1406,6 +1407,7 @@ fn poll_run_streams<S: ThreadListService>(
         if !stream.pending.is_empty()
             || stream.cursor.outstanding_events() == window.max_events
             || stream.cursor.outstanding_bytes() == window.max_bytes
+            || stream.cursor.outstanding_text_bytes() == window.max_text_bytes
         {
             continue;
         }
@@ -1538,6 +1540,7 @@ fn drain_run_stream(stream: &mut ActiveRunStream) -> Result<Vec<Event>, Protocol
         let bytes = encode_frame(event)
             .map_err(|_| ProtocolError::persistence_failed())?
             .len();
+        let text_bytes = event.body["payload"]["text"].as_str().map_or(0, str::len);
         match stream
             .cursor
             .admit_event(
@@ -1547,6 +1550,7 @@ fn drain_run_stream(stream: &mut ActiveRunStream) -> Result<Vec<Event>, Protocol
                     .ok_or_else(ProtocolError::persistence_failed)?,
                 run_seq,
                 bytes,
+                text_bytes,
             )
             .map_err(|_| ProtocolError::invalid_cursor())?
         {
@@ -1842,6 +1846,7 @@ fn dispatch_request<S: ThreadListService>(
             body.after_run_seq,
             MAX_RUN_STREAM_WINDOW_EVENTS,
             MAX_RUN_STREAM_WINDOW_BYTES,
+            MAX_RUN_STREAM_WINDOW_TEXT_BYTES,
         )
         .map_err(|_| ProtocolError::invalid_cursor())?;
         let snapshot_run_seq = page.current_run_seq;
@@ -1865,7 +1870,11 @@ fn dispatch_request<S: ThreadListService>(
                 "run_id": run_id,
                 "first_available_run_seq": first_available_run_seq,
                 "current_run_seq": snapshot_run_seq,
-                "window": { "max_events": MAX_RUN_STREAM_WINDOW_EVENTS, "max_bytes": MAX_RUN_STREAM_WINDOW_BYTES }
+                "window": {
+                    "max_events": MAX_RUN_STREAM_WINDOW_EVENTS,
+                    "max_bytes": MAX_RUN_STREAM_WINDOW_BYTES,
+                    "max_text_bytes": MAX_RUN_STREAM_WINDOW_TEXT_BYTES
+                }
             }),
             events,
         });

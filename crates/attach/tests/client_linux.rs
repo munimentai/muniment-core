@@ -194,7 +194,7 @@ fn run_stream_uses_exact_envelope_and_reads_fragmented_catch_up() {
                 "run_id": run_id,
                 "first_available_run_seq": 1,
                 "current_run_seq": 5,
-                "window": { "max_events": 1024, "max_bytes": 4194304 }
+                "window": { "max_events": 1024, "max_bytes": 4194304, "max_text_bytes": 262144 }
             }),
         })
         .unwrap();
@@ -533,7 +533,7 @@ fn run_stream_waits_past_the_request_timeout_for_a_live_event() {
                     body: serde_json::json!({
                         "subscription_id": subscription_id, "run_id": run_id,
                         "first_available_run_seq": 1, "current_run_seq": 1,
-                        "window": { "max_events": 1024, "max_bytes": 4194304 }
+                        "window": { "max_events": 1024, "max_bytes": 4194304, "max_text_bytes": 262144 }
                     }),
                 })
                 .unwrap(),
@@ -632,7 +632,7 @@ fn run_stream_acknowledges_paused_window_and_resumes_without_duplicates() {
                     body: serde_json::json!({
                         "subscription_id": subscription_id, "run_id": run_id,
                         "first_available_run_seq": 1, "current_run_seq": 2,
-                        "window": { "max_events": 1, "max_bytes": 4194304 }
+                        "window": { "max_events": 1, "max_bytes": 4194304, "max_text_bytes": 262144 }
                     }),
                 })
                 .unwrap(),
@@ -817,7 +817,7 @@ fn valid_run_stream_summary(run_id: &str, subscription_id: &str) -> serde_json::
         "run_id": run_id,
         "first_available_run_seq": 1,
         "current_run_seq": 2,
-        "window": { "max_events": 1024, "max_bytes": 4194304 }
+        "window": { "max_events": 1024, "max_bytes": 4194304, "max_text_bytes": 262144 }
     })
 }
 
@@ -861,7 +861,7 @@ fn run_stream_rejects_hostile_subscription_responses_and_maps_errors() {
             Some(serde_json::json!({
                 "subscription_id": "x".repeat(65), "run_id": run_id,
                 "first_available_run_seq": 1, "current_run_seq": 2,
-                "window": { "max_events": 1, "max_bytes": 1 }
+                "window": { "max_events": 1, "max_bytes": 1, "max_text_bytes": 1 }
             })),
             false,
             None,
@@ -872,7 +872,7 @@ fn run_stream_rejects_hostile_subscription_responses_and_maps_errors() {
             Some(serde_json::json!({
                 "subscription_id": subscription_id, "run_id": run_id,
                 "first_available_run_seq": 3, "current_run_seq": 2,
-                "window": { "max_events": 1, "max_bytes": 1 }
+                "window": { "max_events": 1, "max_bytes": 1, "max_text_bytes": 1 }
             })),
             false,
             None,
@@ -882,7 +882,7 @@ fn run_stream_rejects_hostile_subscription_responses_and_maps_errors() {
             Some(serde_json::json!({
                 "subscription_id": subscription_id, "run_id": run_id,
                 "first_available_run_seq": 1, "current_run_seq": 2,
-                "window": { "max_events": 0, "max_bytes": 4194305 }
+                "window": { "max_events": 0, "max_bytes": 4194305, "max_text_bytes": 1 }
             })),
             false,
             None,
@@ -892,7 +892,27 @@ fn run_stream_rejects_hostile_subscription_responses_and_maps_errors() {
             Some(serde_json::json!({
                 "subscription_id": subscription_id, "run_id": run_id,
                 "first_available_run_seq": 1, "current_run_seq": 2,
-                "window": { "max_events": 1025, "max_bytes": 1 }
+                "window": { "max_events": 1025, "max_bytes": 1, "max_text_bytes": 1 }
+            })),
+            false,
+            None,
+            ClientError::UnexpectedMessage,
+        ),
+        (
+            Some(serde_json::json!({
+                "subscription_id": subscription_id, "run_id": run_id,
+                "first_available_run_seq": 1, "current_run_seq": 2,
+                "window": { "max_events": 1, "max_bytes": 1, "max_text_bytes": 0 }
+            })),
+            false,
+            None,
+            ClientError::UnexpectedMessage,
+        ),
+        (
+            Some(serde_json::json!({
+                "subscription_id": subscription_id, "run_id": run_id,
+                "first_available_run_seq": 1, "current_run_seq": 2,
+                "window": { "max_events": 1, "max_bytes": 1, "max_text_bytes": 262145 }
             })),
             false,
             None,

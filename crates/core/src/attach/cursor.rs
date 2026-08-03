@@ -5,11 +5,13 @@ use super::{Id, ProtocolError};
 /// Hard caps keep every subscription bounded even when its caller chooses limits.
 pub const MAX_RUN_STREAM_WINDOW_EVENTS: usize = 1_024;
 pub const MAX_RUN_STREAM_WINDOW_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_RUN_STREAM_WINDOW_TEXT_BYTES: usize = 262_144;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunStreamWindow {
     pub max_events: usize,
     pub max_bytes: usize,
+    pub max_text_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +63,7 @@ pub enum RunEventAdmission {
 struct OutstandingEvent {
     run_seq: u64,
     projected_bytes: usize,
+    text_bytes: usize,
 }
 
 /// SQLite-free flow-control state for one `run.stream` subscription.
@@ -74,6 +77,7 @@ pub struct RunStreamCursor {
     highest_sent_run_seq: u64,
     window: RunStreamWindow,
     outstanding_bytes: usize,
+    outstanding_text_bytes: usize,
     outstanding: VecDeque<OutstandingEvent>,
 }
 
@@ -87,6 +91,7 @@ impl RunStreamCursor {
         resume_after_run_seq: u64,
         max_events: usize,
         max_bytes: usize,
+        max_text_bytes: usize,
     ) -> Result<Self, RunStreamError> {
         let empty = first_available_run_seq == current_run_seq.saturating_add(1);
         let bounds_valid = first_available_run_seq > 0
@@ -96,7 +101,9 @@ impl RunStreamCursor {
         let window_valid = max_events > 0
             && max_events <= MAX_RUN_STREAM_WINDOW_EVENTS
             && max_bytes > 0
-            && max_bytes <= MAX_RUN_STREAM_WINDOW_BYTES;
+            && max_bytes <= MAX_RUN_STREAM_WINDOW_BYTES
+            && max_text_bytes > 0
+            && max_text_bytes <= MAX_RUN_STREAM_WINDOW_TEXT_BYTES;
         if !bounds_valid || !window_valid {
             return Err(RunStreamError::invalid_cursor());
         }
@@ -110,8 +117,10 @@ impl RunStreamCursor {
             window: RunStreamWindow {
                 max_events,
                 max_bytes,
+                max_text_bytes,
             },
             outstanding_bytes: 0,
+            outstanding_text_bytes: 0,
             outstanding: VecDeque::with_capacity(max_events),
         })
     }
@@ -143,12 +152,16 @@ impl RunStreamCursor {
     pub fn outstanding_bytes(&self) -> usize {
         self.outstanding_bytes
     }
+    pub fn outstanding_text_bytes(&self) -> usize {
+        self.outstanding_text_bytes
+    }
 
     pub fn admit_event(
         &mut self,
         run_id: &Id,
         run_seq: u64,
         projected_bytes: usize,
+        text_bytes: usize,
     ) -> Result<RunEventAdmission, RunStreamError> {
         let next_run_seq = self.highest_sent_run_seq.checked_add(1);
         if run_id != &self.run_id || Some(run_seq) != next_run_seq {
@@ -156,14 +169,21 @@ impl RunStreamCursor {
         }
         if self.outstanding.len() == self.window.max_events
             || projected_bytes > self.window.max_bytes.saturating_sub(self.outstanding_bytes)
+            || text_bytes
+                > self
+                    .window
+                    .max_text_bytes
+                    .saturating_sub(self.outstanding_text_bytes)
         {
             return Ok(RunEventAdmission::Paused);
         }
         self.outstanding.push_back(OutstandingEvent {
             run_seq,
             projected_bytes,
+            text_bytes,
         });
         self.outstanding_bytes += projected_bytes;
+        self.outstanding_text_bytes += text_bytes;
         self.highest_sent_run_seq = run_seq;
         self.current_run_seq = self.current_run_seq.max(run_seq);
         Ok(RunEventAdmission::Sent)
@@ -185,6 +205,7 @@ impl RunStreamCursor {
         {
             let event = self.outstanding.pop_front().expect("front existed");
             self.outstanding_bytes -= event.projected_bytes;
+            self.outstanding_text_bytes -= event.text_bytes;
         }
         self.acknowledged_run_seq = through_run_seq;
         Ok(())

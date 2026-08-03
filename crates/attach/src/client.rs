@@ -91,6 +91,7 @@ impl fmt::Debug for PermissionAnswerAccepted {
 pub struct RunStreamWindow {
     pub max_events: usize,
     pub max_bytes: usize,
+    pub max_text_bytes: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
@@ -282,6 +283,7 @@ mod linux {
     const MAX_PERMISSION_MESSAGE_LENGTH: usize = 4_096;
     const MAX_RUN_STREAM_WINDOW_EVENTS: usize = 1_024;
     const MAX_RUN_STREAM_WINDOW_BYTES: usize = 4 * 1024 * 1024;
+    const MAX_RUN_STREAM_WINDOW_TEXT_BYTES: usize = 262_144;
 
     struct ActiveRunStream {
         subscription_id: Id,
@@ -706,6 +708,8 @@ mod linux {
                 || summary.window.max_events > MAX_RUN_STREAM_WINDOW_EVENTS
                 || summary.window.max_bytes == 0
                 || summary.window.max_bytes > MAX_RUN_STREAM_WINDOW_BYTES
+                || summary.window.max_text_bytes == 0
+                || summary.window.max_text_bytes > MAX_RUN_STREAM_WINDOW_TEXT_BYTES
             {
                 return Err(ClientError::UnexpectedMessage);
             }

@@ -15,7 +15,7 @@ use muniment_core::attach::{
     Authorized, Envelope, ErrorAction, ErrorCode, ErrorEnvelope, Event, EventName, Hello, Id,
     Operation, Protocol, Request, Response, VersionRange, Welcome, WorkspaceOnboardRequest,
     WorkspaceOnboarded, CHALLENGE_LIFETIME, MAX_FRAME_LENGTH, MAX_JSON_DEPTH,
-    MAX_RUN_STREAM_WINDOW_BYTES, MAX_RUN_STREAM_WINDOW_EVENTS,
+    MAX_RUN_STREAM_WINDOW_BYTES, MAX_RUN_STREAM_WINDOW_EVENTS, MAX_RUN_STREAM_WINDOW_TEXT_BYTES,
 };
 use muniment_core::journal::{
     EventEnvelope, EventPayload, JournalCommitHint, Provenance, RunEventProjection, RunJournal,
@@ -2866,6 +2866,106 @@ fn run_stream_byte_window_counts_exact_framed_bytes_and_pauses_one_byte_over() {
         panic!("expected caught-up event")
     };
     assert_eq!(caught_up.event, EventName::SubscriptionCaughtUp);
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(server_thread.join().unwrap(), Ok(()));
+}
+
+#[test]
+fn run_stream_text_window_pauses_before_excess_and_ack_resumes_without_repeating() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000018";
+    const CHUNK_BYTES: usize = 65_536;
+    let events = (1..=5)
+        .map(|run_seq| RunEventProjection {
+            text: Some(
+                char::from(b'a' + run_seq as u8)
+                    .to_string()
+                    .repeat(CHUNK_BYTES),
+            ),
+            ..stream_projection(RUN, run_seq, "model.stream.delta".into())
+        })
+        .collect();
+    let mut service = StreamService {
+        page: RunStreamPage {
+            run_id: RUN.into(),
+            first_available_run_seq: 1,
+            current_run_seq: 5,
+            events,
+            exhausted: true,
+        },
+    };
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let server_thread = thread::spawn(move || {
+        run_authenticated_session_with_authorization(
+            server,
+            credentials(),
+            "0.1.0",
+            Duration::from_secs(30),
+            AuthorizationSessionDependencies {
+                fill_random: |bytes: &mut [u8]| {
+                    bytes.fill(9);
+                    Ok(())
+                },
+                clock: TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                tokens: TestTokens(1),
+                approvals: |_: &muniment_core::attach::PairingChallenge, _: Duration| {
+                    Some(ApprovalDecision::Approve(approval()))
+                },
+            },
+            &mut service,
+        )
+    });
+    client.write_all(&hello(1, 1)).unwrap();
+    let _: Welcome = read_frame(&mut client);
+    let _: Authorized = read_frame(&mut client);
+    client
+        .write_all(&request(
+            50,
+            Operation::RunStream,
+            json!({"run_id": RUN, "after_run_seq": 0}),
+        ))
+        .unwrap();
+    let response: Response = read_frame(&mut client);
+    assert_eq!(
+        response.body["window"]["max_text_bytes"],
+        MAX_RUN_STREAM_WINDOW_TEXT_BYTES
+    );
+    let subscription = response.body["subscription_id"].clone();
+    let mut sequences = Vec::new();
+    for expected in 1..=4 {
+        let Envelope::Event(event) = read_frame::<Envelope>(&mut client) else {
+            panic!("expected text event")
+        };
+        sequences.push(event.run_seq.unwrap());
+        assert_eq!(
+            event.body["payload"]["text"].as_str().unwrap().len(),
+            CHUNK_BYTES
+        );
+        assert_eq!(
+            event.body["payload"]["text"].as_str().unwrap().as_bytes()[0],
+            b'a' + expected as u8
+        );
+    }
+    client
+        .write_all(&request(
+            51,
+            Operation::RunCursorAck,
+            json!({"subscription_id": subscription, "through_run_seq": 4}),
+        ))
+        .unwrap();
+    let _: Response = read_frame(&mut client);
+    let Envelope::Event(last) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected resumed text event")
+    };
+    sequences.push(last.run_seq.unwrap());
+    assert_eq!(
+        last.body["payload"]["text"].as_str().unwrap().len(),
+        CHUNK_BYTES
+    );
+    let Envelope::Event(caught_up) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected caught-up event")
+    };
+    assert_eq!(caught_up.event, EventName::SubscriptionCaughtUp);
+    assert_eq!(sequences, vec![1, 2, 3, 4, 5]);
     client.shutdown(Shutdown::Write).unwrap();
     assert_eq!(server_thread.join().unwrap(), Ok(()));
 }
