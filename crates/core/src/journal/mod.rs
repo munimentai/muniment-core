@@ -774,6 +774,113 @@ impl RunJournal {
         )
     }
 
+    pub fn active_thread_permission_policies(
+        &mut self,
+        thread_id: &str,
+    ) -> Result<Vec<ThreadPermissionPolicyDecided>, JournalError> {
+        let coordination = self.coordination.clone();
+        let _operation = coordination
+            .as_ref()
+            .map(|state| state.operation.lock().unwrap());
+        self.refresh_after_compaction()?;
+        let connection = self
+            .connection
+            .as_ref()
+            .expect("journal connection is always present outside compaction");
+        let tombstoned: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM thread_events WHERE thread_id=?1 AND event_type='thread.deleted')",
+            [thread_id],
+            |row| row.get(0),
+        )?;
+        if tombstoned {
+            return Ok(Vec::new());
+        }
+
+        let mut statement = connection.prepare(
+            "SELECT thread_id,thread_seq,event_type,envelope_json FROM thread_events WHERE thread_id=?1 \
+             AND event_type IN ('thread.permission.policy.decided', \
+             'thread.permission.policy.revoked') ORDER BY thread_seq",
+        )?;
+        let rows = statement.query_map([thread_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut active = Vec::<ThreadPermissionPolicyDecided>::new();
+        let mut known = HashMap::new();
+        for row in rows {
+            let (stored_thread_id, stored_thread_seq, stored_event_type, raw) = row?;
+            let envelope: ThreadEventEnvelope = serde_json::from_str(&raw).map_err(|error| {
+                JournalError::Corrupt(format!("invalid thread permission envelope JSON: {error}"))
+            })?;
+            validate_thread_envelope(&envelope)
+                .map_err(|error| JournalError::Corrupt(error.to_string()))?;
+            let canonical = canonical_thread_envelope(&envelope)
+                .map_err(|error| JournalError::Corrupt(error.to_string()))?;
+            if envelope.thread_id != stored_thread_id
+                || envelope.thread_seq != stored_thread_seq
+                || envelope.event_type != stored_event_type
+                || raw != canonical
+            {
+                return Err(JournalError::Corrupt(
+                    "stored thread permission envelope/index mismatch".into(),
+                ));
+            }
+            match envelope.event_type.as_str() {
+                "thread.permission.policy.decided" => {
+                    let payload: ThreadPermissionPolicyDecided =
+                        serde_json::from_value(envelope.payload_json).map_err(|_| {
+                            JournalError::Corrupt(
+                                "stored thread permission decision is invalid".into(),
+                            )
+                        })?;
+                    if known
+                        .insert(payload.policy_id.clone(), payload.clone())
+                        .is_some_and(|existing| existing != payload)
+                    {
+                        return Err(JournalError::Corrupt(
+                            "policy_id names different decisions in one thread".into(),
+                        ));
+                    }
+                    active.retain(|decision| decision.policy_id != payload.policy_id);
+                    active.push(payload);
+                }
+                "thread.permission.policy.revoked" => {
+                    let payload: ThreadPermissionPolicyRevoked =
+                        serde_json::from_value(envelope.payload_json).map_err(|_| {
+                            JournalError::Corrupt(
+                                "stored thread permission revocation is invalid".into(),
+                            )
+                        })?;
+                    if !known.contains_key(&payload.policy_id) {
+                        return Err(JournalError::Corrupt(
+                            "thread permission revocation names no earlier decision".into(),
+                        ));
+                    }
+                    active.retain(|decision| decision.policy_id != payload.policy_id);
+                }
+                _ => unreachable!(),
+            }
+        }
+        Ok(active)
+    }
+
+    pub fn lookup_thread_permission_policy(
+        &mut self,
+        thread_id: &str,
+        request_kind: &ThreadPermissionRequestKind,
+        resource: &ThreadPermissionResource,
+    ) -> Result<Option<ThreadPermissionPolicyDecided>, JournalError> {
+        Ok(self
+            .active_thread_permission_policies(thread_id)?
+            .into_iter()
+            .rev()
+            .find(|policy| &policy.request_kind == request_kind && &policy.resource == resource))
+    }
+
     pub fn last_thread_seq(&mut self, thread_id: &str) -> Result<u64, JournalError> {
         let coordination = self.coordination.clone();
         let _operation = coordination

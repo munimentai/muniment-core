@@ -71,6 +71,38 @@ fn path_decision(policy_id: String) -> ThreadPermissionPolicyDecided {
     }
 }
 
+fn command_decision(policy_id: String) -> ThreadPermissionPolicyDecided {
+    ThreadPermissionPolicyDecided {
+        policy_id,
+        decision: ThreadPermissionDecision::Allow,
+        request_kind: ThreadPermissionRequestKind::Command,
+        resource: ThreadPermissionResource::Command {
+            arguments: vec!["git".into(), "status".into()],
+            working_directory: "/workspace".into(),
+        },
+        actor: "user-1".into(),
+        answer_source: ThreadPermissionAnswerSource::Native,
+        gate_id: Some("gate-2".into()),
+    }
+}
+
+fn append_decision(
+    journal: &mut RunJournal,
+    thread_id: &str,
+    sequence: u64,
+    decision: &ThreadPermissionPolicyDecided,
+) {
+    journal
+        .append_thread_permission_policy_decided(
+            sequence,
+            thread_id,
+            decision,
+            "2026-08-02T10:01:00Z",
+            &provenance(),
+        )
+        .unwrap();
+}
+
 #[test]
 fn codecs_cover_both_resources_and_reject_invalid_payloads() {
     let policy_id = Uuid::now_v7().to_string();
@@ -234,6 +266,192 @@ fn append_checks_thread_tail_and_policy_history_without_partial_writes() {
         Err(JournalError::InvalidEnvelope(_))
     ));
     assert_eq!(journal.last_thread_seq(&thread_id).unwrap(), 4);
+}
+
+#[test]
+fn projection_matches_exact_resources_and_latest_active_decision() {
+    let path = journal_path();
+    let mut journal = RunJournal::open(&path).unwrap();
+    let first_run = run_started();
+    let thread_id = journal.append_new_run("workspace", &first_run).unwrap();
+    let allow = path_decision(Uuid::now_v7().to_string());
+    let mut deny = path_decision(Uuid::now_v7().to_string());
+    deny.decision = ThreadPermissionDecision::Deny;
+    let command = command_decision(Uuid::now_v7().to_string());
+    append_decision(&mut journal, &thread_id, 1, &allow);
+    append_decision(&mut journal, &thread_id, 2, &deny);
+    append_decision(&mut journal, &thread_id, 3, &command);
+
+    let path_resource = allow.resource.clone();
+    assert_eq!(
+        journal
+            .lookup_thread_permission_policy(
+                &thread_id,
+                &ThreadPermissionRequestKind::Path,
+                &path_resource,
+            )
+            .unwrap(),
+        Some(deny.clone())
+    );
+    assert_eq!(
+        journal
+            .active_thread_permission_policies(&thread_id)
+            .unwrap()
+            .len(),
+        3
+    );
+
+    for near_miss in [
+        ThreadPermissionResource::Path {
+            path: "/workspace/other.txt".into(),
+            operation: "write".into(),
+        },
+        ThreadPermissionResource::Path {
+            path: "/workspace/file.txt".into(),
+            operation: "read".into(),
+        },
+    ] {
+        assert!(journal
+            .lookup_thread_permission_policy(
+                &thread_id,
+                &ThreadPermissionRequestKind::Path,
+                &near_miss,
+            )
+            .unwrap()
+            .is_none());
+    }
+    assert!(journal
+        .lookup_thread_permission_policy(
+            &thread_id,
+            &ThreadPermissionRequestKind::Command,
+            &path_resource,
+        )
+        .unwrap()
+        .is_none());
+
+    assert_eq!(
+        journal
+            .lookup_thread_permission_policy(
+                &thread_id,
+                &ThreadPermissionRequestKind::Command,
+                &command.resource,
+            )
+            .unwrap(),
+        Some(command.clone())
+    );
+
+    for near_miss in [
+        ThreadPermissionResource::Command {
+            arguments: vec!["git".into(), "status".into(), "--short".into()],
+            working_directory: "/workspace".into(),
+        },
+        ThreadPermissionResource::Command {
+            arguments: vec!["git".into(), "status".into()],
+            working_directory: "/other".into(),
+        },
+    ] {
+        assert!(journal
+            .lookup_thread_permission_policy(
+                &thread_id,
+                &ThreadPermissionRequestKind::Command,
+                &near_miss,
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    let second_run = run_started();
+    let foreign_thread = journal.append_new_run("workspace", &second_run).unwrap();
+    let foreign = path_decision(Uuid::now_v7().to_string());
+    append_decision(&mut journal, &foreign_thread, 1, &foreign);
+    assert_eq!(
+        journal
+            .lookup_thread_permission_policy(
+                &thread_id,
+                &ThreadPermissionRequestKind::Path,
+                &path_resource,
+            )
+            .unwrap(),
+        Some(deny.clone())
+    );
+
+    journal
+        .append_thread_permission_policy_revoked(
+            4,
+            &thread_id,
+            &ThreadPermissionPolicyRevoked {
+                policy_id: allow.policy_id.clone(),
+                actor: "user-1".into(),
+                reason: "Changed choice".into(),
+            },
+            "2026-08-02T10:02:00Z",
+            &provenance(),
+        )
+        .unwrap();
+    journal
+        .append_thread_permission_policy_revoked(
+            5,
+            &thread_id,
+            &ThreadPermissionPolicyRevoked {
+                policy_id: deny.policy_id,
+                actor: "user-1".into(),
+                reason: "Changed choice".into(),
+            },
+            "2026-08-02T10:03:00Z",
+            &provenance(),
+        )
+        .unwrap();
+    assert!(journal
+        .lookup_thread_permission_policy(
+            &thread_id,
+            &ThreadPermissionRequestKind::Path,
+            &path_resource,
+        )
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn projection_fails_closed_for_malformed_events_and_ignores_tombstones() {
+    let path = journal_path();
+    let mut journal = RunJournal::open(&path).unwrap();
+    let started = run_started();
+    let thread_id = journal.append_new_run("workspace", &started).unwrap();
+    append_decision(
+        &mut journal,
+        &thread_id,
+        1,
+        &path_decision(Uuid::now_v7().to_string()),
+    );
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE thread_events SET envelope_json='{}' WHERE thread_id=?1 AND thread_seq=2",
+            [&thread_id],
+        )
+        .unwrap();
+    assert!(matches!(
+        journal.active_thread_permission_policies(&thread_id),
+        Err(JournalError::Corrupt(_))
+    ));
+
+    let tombstone_path = journal_path();
+    let mut tombstoned = RunJournal::open(&tombstone_path).unwrap();
+    let started = run_started();
+    let tombstoned_thread = tombstoned.append_new_run("workspace", &started).unwrap();
+    append_decision(
+        &mut tombstoned,
+        &tombstoned_thread,
+        1,
+        &path_decision(Uuid::now_v7().to_string()),
+    );
+    tombstoned
+        .append_thread_deleted(2, &tombstoned_thread, "2026-08-02T10:04:00Z", &provenance())
+        .unwrap();
+    assert!(tombstoned
+        .active_thread_permission_policies(&tombstoned_thread)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
