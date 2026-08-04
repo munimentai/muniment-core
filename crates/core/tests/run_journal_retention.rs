@@ -122,6 +122,58 @@ fn skips_runs_that_fail_reduction_or_timestamp_parsing() {
 }
 
 #[test]
+fn skips_full_event_reads_for_fresh_and_nonterminal_runs() {
+    let (db, _) = paths();
+    let mut journal = RunJournal::open(&db).unwrap();
+    let fresh = append_run(&mut journal, 1, "run.completed", "2026-07-01T00:00:00Z");
+    let active = event(2, 1, "run.started", "2026-05-01T00:00:00Z");
+    let active_id = active.run_id.clone();
+    journal.append(0, &active).unwrap();
+
+    let raw = Connection::open(&db).unwrap();
+    for run_id in [&fresh, &active_id] {
+        raw.execute(
+            "UPDATE events SET envelope_json='invalid' WHERE run_id=?1",
+            [run_id],
+        )
+        .unwrap();
+    }
+    drop(raw);
+
+    let outcome = apply_retention(&mut journal, None, &policy(), now()).unwrap();
+    assert!(outcome.deleted_run_ids.is_empty());
+    let run_ids = journal.run_ids().unwrap();
+    assert_eq!(run_ids.len(), 2);
+    assert!(run_ids.contains(&fresh));
+    assert!(run_ids.contains(&active_id));
+    let _ = fs::remove_file(db);
+}
+
+#[test]
+fn keeps_expired_run_that_reduces_to_a_kept_status() {
+    let (db, _) = paths();
+    let mut journal = RunJournal::open(&db).unwrap();
+    let old = "2026-05-01T00:00:00Z";
+    journal
+        .append_batch(
+            0,
+            &[
+                event(1, 1, "run.started", old),
+                event(1, 2, "run.completed", old),
+                event(1, 3, "run.needs_attention", old),
+            ],
+        )
+        .unwrap();
+    let run_id = event(1, 1, "run.started", old).run_id;
+
+    let outcome = apply_retention(&mut journal, None, &policy(), now()).unwrap();
+
+    assert!(outcome.deleted_run_ids.is_empty());
+    assert_eq!(journal.events(&run_id).unwrap().len(), 3);
+    let _ = fs::remove_file(db);
+}
+
+#[test]
 fn collects_deleted_only_objects_and_preserves_surviving_references() {
     let (db, cas_root) = paths();
     let store = LocalCas::open(&cas_root).unwrap();

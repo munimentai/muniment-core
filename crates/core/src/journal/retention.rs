@@ -66,9 +66,27 @@ pub fn apply_retention(
         .ok_or(RetentionError::InvalidPolicy)?;
     let mut deleted_run_ids = Vec::new();
 
-    for run_id in journal.run_ids()? {
-        let events = journal.events(&run_id)?;
-        let Some(newest) = events.last() else {
+    let event_types = journal.run_event_types_with_newest_recorded_at()?;
+    for run in event_types.chunk_by(|left, right| left.run_id == right.run_id) {
+        if !run.iter().any(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "run.completed" | "run.cancelled" | "run.failed"
+            )
+        }) {
+            continue;
+        }
+        let Some(newest) = run.last() else {
+            continue;
+        };
+        let Ok(recorded_at) = DateTime::parse_from_rfc3339(&newest.newest_recorded_at) else {
+            continue;
+        };
+        if recorded_at.with_timezone(&Utc) >= cutoff {
+            continue;
+        }
+        let events = journal.events(&newest.run_id)?;
+        let Some(newest_event) = events.last() else {
             continue;
         };
         let Ok(state) = reduce(&events) else {
@@ -80,13 +98,14 @@ pub fn apply_retention(
         ) {
             continue;
         }
-        let Ok(recorded_at) = DateTime::parse_from_rfc3339(&newest.recorded_at) else {
+        let Ok(recorded_at) = DateTime::parse_from_rfc3339(&newest_event.recorded_at) else {
             continue;
         };
-        if recorded_at.with_timezone(&Utc) < cutoff {
-            journal.delete_run(&run_id)?;
-            deleted_run_ids.push(run_id);
+        if recorded_at.with_timezone(&Utc) >= cutoff {
+            continue;
         }
+        journal.delete_run(&newest.run_id)?;
+        deleted_run_ids.push(newest.run_id.clone());
     }
 
     let mut collected_hashes = if let Some(cas) = cas {

@@ -70,6 +70,14 @@ pub struct RunEventType {
     pub event_type: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunEventTypeWithNewestRecordedAt {
+    pub run_id: String,
+    pub run_seq: u64,
+    pub event_type: String,
+    pub newest_recorded_at: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CasReference {
     pub sha256: String,
@@ -1489,6 +1497,35 @@ impl RunJournal {
                 run_id: row.get(0)?,
                 run_seq: row.get(1)?,
                 event_type: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Reads run event types and each run's newest event time without loading envelopes.
+    pub fn run_event_types_with_newest_recorded_at(
+        &mut self,
+    ) -> Result<Vec<RunEventTypeWithNewestRecordedAt>, JournalError> {
+        let coordination = self.coordination.clone();
+        let _operation = coordination
+            .as_ref()
+            .map(|state| state.operation.lock().unwrap());
+        self.refresh_after_compaction()?;
+        let mut statement = self
+            .connection
+            .as_ref()
+            .expect("journal connection is always present outside compaction")
+            .prepare(
+                "SELECT run_id,run_seq,event_type,\
+                 FIRST_VALUE(recorded_at) OVER (PARTITION BY run_id ORDER BY run_seq DESC) \
+                 FROM events ORDER BY run_id,run_seq",
+            )?;
+        let rows = statement.query_map([], |row| {
+            Ok(RunEventTypeWithNewestRecordedAt {
+                run_id: row.get(0)?,
+                run_seq: row.get(1)?,
+                event_type: row.get(2)?,
+                newest_recorded_at: row.get(3)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
