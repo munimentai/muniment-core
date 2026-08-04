@@ -1,6 +1,6 @@
 //! Linux filesystem boundary for the companion attach endpoint.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::env;
 use std::ffi::{CString, OsStr};
 use std::fmt;
@@ -12,6 +12,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::{
@@ -306,6 +307,137 @@ pub enum AttachSessionError {
     ProtocolIncompatible,
     Randomness,
     Authorization,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LiveConnectionState {
+    Active,
+    Blocked,
+    Revoked,
+}
+
+struct LiveConnection {
+    capability: String,
+    connection_event_id: super::Id,
+    state: Mutex<LiveConnectionState>,
+}
+
+struct CredentialConnections {
+    gate: Arc<Mutex<()>>,
+    state: LiveConnectionState,
+    connections: HashMap<super::Id, Arc<LiveConnection>>,
+}
+
+impl Default for CredentialConnections {
+    fn default() -> Self {
+        Self {
+            gate: Arc::new(Mutex::new(())),
+            state: LiveConnectionState::Active,
+            connections: HashMap::new(),
+        }
+    }
+}
+
+type ConnectionsByCredential = HashMap<String, CredentialConnections>;
+
+/// Tracks authorized attach connections by the client credential that authenticated them.
+#[derive(Clone, Default)]
+pub struct LiveConnectionRegistry {
+    connections: Arc<Mutex<ConnectionsByCredential>>,
+}
+
+impl LiveConnectionRegistry {
+    /// Stops request admission for every live connection authenticated by `credential`.
+    pub fn block(&self, credential: &str) -> usize {
+        self.set_state(credential, |state| {
+            if *state == LiveConnectionState::Active {
+                *state = LiveConnectionState::Blocked;
+            }
+        })
+    }
+
+    /// Restarts request admission for every blocked connection authenticated by `credential`.
+    pub fn resume(&self, credential: &str) -> usize {
+        self.set_state(credential, |state| {
+            if *state == LiveConnectionState::Blocked {
+                *state = LiveConnectionState::Active;
+            }
+        })
+    }
+
+    /// Revokes every live connection authenticated by `credential`.
+    pub fn revoke(&self, credential: &str) -> usize {
+        self.set_state(credential, |state| *state = LiveConnectionState::Revoked)
+    }
+
+    fn set_state(&self, credential: &str, update: impl Fn(&mut LiveConnectionState)) -> usize {
+        let mut connections = self.connections.lock().expect("live connection registry");
+        let entries = connections.entry(credential.to_owned()).or_default();
+        let gate = Arc::clone(&entries.gate);
+        let _gate = gate.lock().expect("credential admission gate");
+        update(&mut entries.state);
+        for connection in entries.connections.values() {
+            let mut state = connection.state.lock().expect("live connection state");
+            *state = entries.state;
+        }
+        entries.connections.len()
+    }
+
+    fn register(
+        &self,
+        credential: String,
+        capability: String,
+        connection_event_id: super::Id,
+    ) -> RegisteredConnection {
+        let mut connections = self.connections.lock().expect("live connection registry");
+        let entries = connections.entry(credential.clone()).or_default();
+        let gate = Arc::clone(&entries.gate);
+        let _gate = gate.lock().expect("credential admission gate");
+        let connection = Arc::new(LiveConnection {
+            capability,
+            connection_event_id: connection_event_id.clone(),
+            state: Mutex::new(entries.state),
+        });
+        entries
+            .connections
+            .insert(connection_event_id.clone(), Arc::clone(&connection));
+        drop(_gate);
+        RegisteredConnection {
+            registry: self.clone(),
+            credential,
+            connection_event_id,
+            connection,
+            gate,
+        }
+    }
+}
+
+struct RegisteredConnection {
+    registry: LiveConnectionRegistry,
+    credential: String,
+    connection_event_id: super::Id,
+    connection: Arc<LiveConnection>,
+    gate: Arc<Mutex<()>>,
+}
+
+struct AuthorizedSession<'a> {
+    binding: &'a ConnectionBinding,
+    provenance: &'a CompanionProvenance,
+    workspace: &'a str,
+    connection: &'a RegisteredConnection,
+}
+
+impl Drop for RegisteredConnection {
+    fn drop(&mut self) {
+        let mut connections = self
+            .registry
+            .connections
+            .lock()
+            .expect("live connection registry");
+        if let Some(entries) = connections.get_mut(&self.credential) {
+            entries.connections.remove(&self.connection_event_id);
+        }
+    }
 }
 
 impl fmt::Display for AttachSessionError {
@@ -890,8 +1022,30 @@ pub fn run_authenticated_session_with_service_and_approvals<
     service: &mut S,
     approvals: W,
 ) -> Result<(), AttachSessionError> {
+    run_authenticated_session_with_service_approvals_and_registry(
+        stream,
+        credentials,
+        desktop_version,
+        service,
+        approvals,
+        &LiveConnectionRegistry::default(),
+    )
+}
+
+/// Runs the concrete request service with approvals and a shared live-connection registry.
+pub fn run_authenticated_session_with_service_approvals_and_registry<
+    S: ThreadListService,
+    W: ApprovalWaiter,
+>(
+    stream: UnixStream,
+    credentials: PeerCredentials,
+    desktop_version: &str,
+    service: &mut S,
+    approvals: W,
+    registry: &LiveConnectionRegistry,
+) -> Result<(), AttachSessionError> {
     let mut random = |bytes: &mut [u8]| getrandom::fill(bytes).map_err(|_| ());
-    run_authenticated_session_with_authorization(
+    run_authenticated_session_with_authorization_and_registry(
         stream,
         credentials,
         desktop_version,
@@ -903,6 +1057,7 @@ pub fn run_authenticated_session_with_service_and_approvals<
             approvals,
         },
         service,
+        registry,
     )
 }
 
@@ -967,6 +1122,35 @@ where
     W: ApprovalWaiter,
     S: ThreadListService,
 {
+    run_authenticated_session_with_authorization_and_registry(
+        stream,
+        credentials,
+        desktop_version,
+        timeout,
+        dependencies,
+        service,
+        &LiveConnectionRegistry::default(),
+    )
+}
+
+/// Runs an authenticated session tracked by a shared live-connection registry.
+#[doc(hidden)]
+pub fn run_authenticated_session_with_authorization_and_registry<R, C, G, W, S>(
+    stream: UnixStream,
+    credentials: PeerCredentials,
+    desktop_version: &str,
+    timeout: Duration,
+    dependencies: AuthorizationSessionDependencies<R, C, G, W>,
+    service: &mut S,
+    registry: &LiveConnectionRegistry,
+) -> Result<(), AttachSessionError>
+where
+    R: FnMut(&mut [u8]) -> Result<(), ()>,
+    C: AuthorizationClock + Clone,
+    G: AuthorizationTokenGenerator,
+    W: ApprovalWaiter,
+    S: ThreadListService,
+{
     run_session(
         stream,
         credentials,
@@ -974,6 +1158,7 @@ where
         timeout,
         dependencies,
         service,
+        registry,
     )
 }
 
@@ -984,6 +1169,7 @@ fn run_session<R, C, G, W, S>(
     timeout: Duration,
     dependencies: AuthorizationSessionDependencies<R, C, G, W>,
     service: &mut S,
+    registry: &LiveConnectionRegistry,
 ) -> Result<(), AttachSessionError>
 where
     R: FnMut(&mut [u8]) -> Result<(), ()>,
@@ -1159,7 +1345,14 @@ where
             remaining,
             grant.idle_timeout.as_secs(),
             workspace_scopes,
+            client_credential.clone(),
+        );
+        let connection_event_id = super::Id::new(uuid::Uuid::new_v4().to_string())
+            .map_err(|_| AttachSessionError::Randomness)?;
+        let connection = registry.register(
             client_credential,
+            capability.as_str().to_owned(),
+            connection_event_id,
         );
         write_before(
             &mut stream,
@@ -1176,9 +1369,12 @@ where
         serve_requests(
             &mut stream,
             timeout,
-            &binding,
-            &provenance,
-            &grant.workspace,
+            AuthorizedSession {
+                binding: &binding,
+                provenance: &provenance,
+                workspace: &grant.workspace,
+                connection: &connection,
+            },
             &mut authorization,
             service,
         )?;
@@ -1220,9 +1416,7 @@ fn read_before(
 fn serve_requests<C, G, S>(
     stream: &mut UnixStream,
     timeout: Duration,
-    binding: &ConnectionBinding,
-    provenance: &CompanionProvenance,
-    workspace: &str,
+    session: AuthorizedSession<'_>,
     authorization: &mut AuthorizationState<C, G>,
     service: &mut S,
 ) -> Result<(), AttachSessionError>
@@ -1233,6 +1427,29 @@ where
 {
     let mut subscriptions = Vec::new();
     loop {
+        let gate = session
+            .connection
+            .gate
+            .lock()
+            .expect("credential admission gate");
+        let state = session
+            .connection
+            .connection
+            .state
+            .lock()
+            .expect("live connection state");
+        match *state {
+            LiveConnectionState::Blocked => {
+                drop(state);
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            LiveConnectionState::Revoked => {
+                send_revocation(stream, timeout, session.connection)?;
+                return Ok(());
+            }
+            LiveConnectionState::Active => {}
+        }
         // Give an already-buffered request a chance to supply its correlation ID even when
         // the grant has just expired. Validation below still prevents stale dispatch.
         let (authorization_expired, idle_remaining) = match authorization.remaining_lifetime() {
@@ -1261,6 +1478,8 @@ where
                 (Instant::now() + timeout).min(idle_deadline),
             )?;
         }
+        drop(state);
+        drop(gate);
         let poll_deadline = (Instant::now() + Duration::from_millis(50)).min(idle_deadline);
         let mut prefix = [0; 4];
         match wait_until_readable(stream, poll_deadline) {
@@ -1305,6 +1524,33 @@ where
                 return Err(AttachSessionError::MalformedFrame);
             }
         };
+        let (admission_gate, admission) = loop {
+            let gate = session
+                .connection
+                .gate
+                .lock()
+                .expect("credential admission gate");
+            let state = session
+                .connection
+                .connection
+                .state
+                .lock()
+                .expect("live connection state");
+            match *state {
+                LiveConnectionState::Active => break (gate, state),
+                LiveConnectionState::Blocked => {
+                    drop(state);
+                    drop(gate);
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                LiveConnectionState::Revoked => {
+                    drop(state);
+                    drop(gate);
+                    send_revocation(stream, timeout, session.connection)?;
+                    return Ok(());
+                }
+            }
+        };
         if authorization_expired {
             write_request_error(
                 stream,
@@ -1329,9 +1575,9 @@ where
         if authorization
             .validate_request_with_scope(
                 &request.capability,
-                binding,
-                &provenance.profile,
-                workspace,
+                session.binding,
+                &session.provenance.profile,
+                session.workspace,
                 required_scope,
             )
             .is_err()
@@ -1347,8 +1593,8 @@ where
         let request_id = request.request_id.clone();
         match dispatch_request(
             request,
-            workspace,
-            provenance.clone(),
+            session.workspace,
+            session.provenance.clone(),
             service,
             &mut subscriptions,
         ) {
@@ -1377,7 +1623,30 @@ where
                 }
             }
         }
+        drop(admission);
+        drop(admission_gate);
     }
+}
+
+fn send_revocation(
+    stream: &mut UnixStream,
+    timeout: Duration,
+    connection: &RegisteredConnection,
+) -> Result<(), AttachSessionError> {
+    let event = Event {
+        protocol: Protocol,
+        subscription_id: connection.connection.connection_event_id.clone(),
+        event: EventName::CapabilityRevoked,
+        run_id: None,
+        run_seq: None,
+        body: serde_json::json!({
+            "capability": &connection.connection.capability,
+            "reason": "companion_revoked",
+        }),
+    };
+    let frame = encode_frame(&event).map_err(|_| AttachSessionError::MalformedFrame)?;
+    write_before(stream, &frame, Instant::now() + timeout)?;
+    stream.flush().map_err(|_| AttachSessionError::Closed)
 }
 
 fn wait_until_readable(stream: &UnixStream, deadline: Instant) -> Result<(), AttachSessionError> {
