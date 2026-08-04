@@ -3,6 +3,7 @@
 pub mod compaction;
 pub mod content_disclosure;
 pub mod export;
+pub mod reconciliation;
 pub mod reducer;
 pub mod retention;
 pub mod summaries;
