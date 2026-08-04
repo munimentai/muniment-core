@@ -32,7 +32,9 @@ use crate::journal::{
 
 const ATTACH_DIRECTORY: &[u8] = b"muniment\0";
 const ENDPOINT_NAME: &str = "attach-v1.sock";
+const INSTANCE_LOCK_NAME: &[u8] = b"instance.lock\0";
 const PRIVATE_MODE: libc::mode_t = 0o700;
+const PRIVATE_FILE_MODE: libc::mode_t = 0o600;
 const SOCKET_MODE: libc::mode_t = 0o600;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const DESKTOP_PROTOCOL: VersionRange = VersionRange { min: 1, max: 1 };
@@ -144,7 +146,60 @@ impl AttachFilesystem {
     pub fn attach_directory(&self) -> BorrowedFd<'_> {
         self.attach_directory.as_fd()
     }
+
+    /// Acquires the non-blocking exclusive lock for this attach directory.
+    pub fn acquire_instance_lock(&self) -> Result<InstanceLock, InstanceLockError> {
+        let descriptor = unsafe {
+            libc::openat(
+                self.attach_directory.as_raw_fd(),
+                INSTANCE_LOCK_NAME.as_ptr().cast(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                PRIVATE_FILE_MODE,
+            )
+        };
+        if descriptor < 0 {
+            return Err(InstanceLockError::Open);
+        }
+        let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        if unsafe { libc::flock(descriptor.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = io::Error::last_os_error();
+            return Err(if error.kind() == io::ErrorKind::WouldBlock {
+                InstanceLockError::AlreadyHeld
+            } else {
+                InstanceLockError::Lock
+            });
+        }
+        Ok(InstanceLock {
+            _descriptor: descriptor,
+        })
+    }
 }
+
+/// An owned instance lock that releases when dropped.
+#[derive(Debug)]
+pub struct InstanceLock {
+    _descriptor: OwnedFd,
+}
+
+/// Reasons an instance lock cannot be acquired.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstanceLockError {
+    Open,
+    AlreadyHeld,
+    Lock,
+}
+
+impl fmt::Display for InstanceLockError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Open => "instance lock file could not be opened safely",
+            Self::AlreadyHeld => "instance lock is already held",
+            Self::Lock => "instance lock could not be acquired",
+        })
+    }
+}
+
+impl std::error::Error for InstanceLockError {}
 
 /// A pathname Unix listener published inside a verified [`AttachFilesystem`].
 #[derive(Debug)]

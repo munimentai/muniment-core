@@ -1,6 +1,6 @@
 #![cfg(target_os = "linux")]
 
-use muniment_core::attach::linux::{AttachFilesystem, AttachFilesystemError};
+use muniment_core::attach::linux::{AttachFilesystem, AttachFilesystemError, InstanceLockError};
 use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -44,6 +44,40 @@ fn derives_exact_endpoint_and_reopens_private_directory() {
 
     let second = AttachFilesystem::from_runtime_directory(&runtime.0).unwrap();
     assert_eq!(second.endpoint_path(), first.endpoint_path());
+}
+
+#[test]
+fn instance_lock_conflicts_across_independent_opens_and_releases_on_drop() {
+    let runtime = TestDirectory::new();
+    let first_filesystem = AttachFilesystem::from_runtime_directory(&runtime.0).unwrap();
+    let second_filesystem = AttachFilesystem::from_runtime_directory(&runtime.0).unwrap();
+
+    let first_lock = first_filesystem.acquire_instance_lock().unwrap();
+    assert_eq!(
+        second_filesystem.acquire_instance_lock().unwrap_err(),
+        InstanceLockError::AlreadyHeld
+    );
+    assert_ne!(
+        runtime.0.join("muniment/instance.lock"),
+        first_filesystem.endpoint_path()
+    );
+
+    drop(first_lock);
+    second_filesystem.acquire_instance_lock().unwrap();
+}
+
+#[test]
+fn instance_lock_does_not_follow_a_symlink() {
+    let runtime = TestDirectory::new();
+    let filesystem = AttachFilesystem::from_runtime_directory(&runtime.0).unwrap();
+    let target = runtime.0.join("target");
+    fs::write(&target, []).unwrap();
+    symlink(&target, runtime.0.join("muniment/instance.lock")).unwrap();
+
+    assert_eq!(
+        filesystem.acquire_instance_lock().unwrap_err(),
+        InstanceLockError::Open
+    );
 }
 
 #[test]
