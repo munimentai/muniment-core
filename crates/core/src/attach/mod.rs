@@ -1,5 +1,6 @@
 //! Companion attach server support.
 
+mod approval;
 mod artifact;
 mod authorization;
 mod cursor;
@@ -7,6 +8,7 @@ mod idempotency;
 #[cfg(target_os = "linux")]
 pub mod linux;
 
+pub use approval::*;
 pub use artifact::*;
 pub use authorization::*;
 pub use cursor::{
