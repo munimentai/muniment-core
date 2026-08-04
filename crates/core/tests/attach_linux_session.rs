@@ -94,6 +94,7 @@ fn hello_with_claims(
 struct CredentialService {
     expected: String,
     bound: bool,
+    claims: Option<(String, String)>,
 }
 
 impl ThreadListService for CredentialService {
@@ -106,7 +107,10 @@ impl ThreadListService for CredentialService {
         _: &str,
         presented_credential: Option<&str>,
         issued_credential: &str,
+        claimed_kind: &str,
+        claimed_version: &str,
     ) -> Result<String, muniment_core::attach::ProtocolError> {
+        self.claims = Some((claimed_kind.into(), claimed_version.into()));
         if presented_credential == Some(self.expected.as_str()) {
             self.bound = true;
             Ok(self.expected.clone())
@@ -881,6 +885,7 @@ fn authorized_client_reconnects_without_waiting_for_pairing() {
     let mut service = CredentialService {
         expected: credential.clone(),
         bound: false,
+        claims: None,
     };
     assert_eq!(
         run_authenticated_session_with_authorization(
@@ -911,6 +916,7 @@ fn authorized_client_reconnects_without_waiting_for_pairing() {
     let authorized: Authorized = read_frame(&mut client);
     assert_eq!(authorized.authorized_client_credential, credential);
     assert!(service.bound);
+    assert_eq!(service.claims, Some(("cli".into(), "1.0.0".into())));
 }
 
 #[test]
@@ -932,6 +938,7 @@ fn invalid_reconnect_credential_still_requires_pairing_and_is_not_replaced() {
     let mut service = CredentialService {
         expected: expected.clone(),
         bound: false,
+        claims: None,
     };
     assert_eq!(
         run_authenticated_session_with_authorization(

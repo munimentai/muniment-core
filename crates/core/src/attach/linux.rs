@@ -647,6 +647,8 @@ pub trait ThreadListService {
         client_identity: &str,
         _presented_credential: Option<&str>,
         issued_credential: &str,
+        _claimed_kind: &str,
+        _claimed_version: &str,
     ) -> Result<String, ProtocolError> {
         self.bind_authorized_client(client_identity);
         Ok(issued_credential.to_owned())
@@ -1252,7 +1254,13 @@ where
             .and_then(|credential| {
                 let approval = service.reconnect_approval()?;
                 service
-                    .authorize_client(&authorized_client_id, Some(credential), "")
+                    .authorize_client(
+                        &authorized_client_id,
+                        Some(credential),
+                        "",
+                        &companion_kind,
+                        &companion_version,
+                    )
                     .ok()
                     .map(|credential| (approval, credential))
             });
@@ -1330,6 +1338,8 @@ where
                     &authorized_client_id,
                     authorized_client_credential.as_deref(),
                     &issued_credential,
+                    &companion_kind,
+                    &companion_version,
                 ) {
                     Ok(credential) => credential,
                     Err(error) => {
