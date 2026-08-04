@@ -397,15 +397,17 @@ fn run_stream_decodes_closed_and_revoked_events() {
                 "stream.closed",
                 serde_json::json!({"code": "invalid_cursor", "resumable": true}),
             ),
-            run_stream_event(
-                subscription_id,
-                run_id,
-                2,
-                "capability.revoked",
-                serde_json::json!({
+            serde_json::to_value(Event {
+                protocol: Protocol,
+                subscription_id: Id::new("01900000-0000-7000-8000-000000000003").unwrap(),
+                event: EventName::CapabilityRevoked,
+                run_id: None,
+                run_seq: None,
+                body: serde_json::json!({
                     "capability": "fixture-capability", "reason": "authorization_revoked"
                 }),
-            ),
+            })
+            .unwrap(),
         ] {
             server.write_all(&encode_frame(&event).unwrap()).unwrap();
         }
