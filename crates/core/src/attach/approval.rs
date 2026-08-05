@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
@@ -7,6 +7,8 @@ pub struct ApprovalRequest {
     pub challenge: String,
     pub claimed_kind: String,
     pub claimed_version: String,
+    pub workspace: String,
+    pub scopes: BTreeSet<String>,
 }
 
 type Presenter = dyn Fn(&ApprovalRequest) -> bool + Send + Sync;
@@ -102,6 +104,8 @@ mod tests {
             challenge: challenge.into(),
             claimed_kind: "cli".into(),
             claimed_version: "1".into(),
+            workspace: "workspace-a".into(),
+            scopes: BTreeSet::from(["thread.read".into(), "run.write".into()]),
         }
     }
 
