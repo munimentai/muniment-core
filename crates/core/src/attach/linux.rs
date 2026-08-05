@@ -746,6 +746,7 @@ pub trait ThreadListService {
 
     fn onboard_workspace(
         &mut self,
+        _workspace: &str,
         _request: WorkspaceOnboardRequest,
     ) -> Result<WorkspaceOnboarded, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
@@ -755,7 +756,7 @@ pub trait ThreadListService {
         Err(ProtocolError::unsupported_operation())
     }
 
-    fn authorized_workspace(&self, _workspace: &str) -> Option<String> {
+    fn authorized_workspace(&self, _session_workspace: &str, _workspace: &str) -> Option<String> {
         None
     }
 
@@ -2042,10 +2043,13 @@ fn dispatch_request<S: ThreadListService>(
         {
             return Err(ProtocolError::invalid_request().into());
         }
-        let result = service.onboard_workspace(WorkspaceOnboardRequest {
-            opened_directory: body.opened_directory,
-            memory_location: body.memory_location,
-        })?;
+        let result = service.onboard_workspace(
+            workspace,
+            WorkspaceOnboardRequest {
+                opened_directory: body.opened_directory,
+                memory_location: body.memory_location,
+            },
+        )?;
         if result.opened_directory.len() > MAX_TEXT_LENGTH
             || result.memory_location.len() > MAX_TEXT_LENGTH
             || result
@@ -2181,8 +2185,8 @@ fn dispatch_request<S: ThreadListService>(
             .as_ref()
             .ok_or_else(ProtocolError::idempotency_key_required)?;
         let selected_workspace = match body.workspace.as_deref() {
-            Some(workspace) => service
-                .authorized_workspace(workspace)
+            Some(requested_workspace) => service
+                .authorized_workspace(workspace, requested_workspace)
                 .ok_or_else(ProtocolError::unauthorized)?,
             None => workspace.to_owned(),
         };

@@ -211,6 +211,7 @@ impl ThreadListService for OnboardingStartService {
 
     fn onboard_workspace(
         &mut self,
+        _session_workspace: &str,
         request: WorkspaceOnboardRequest,
     ) -> Result<WorkspaceOnboarded, muniment_core::attach::ProtocolError> {
         let instructions = format!("instructions for {}", request.opened_directory);
@@ -227,7 +228,7 @@ impl ThreadListService for OnboardingStartService {
         })
     }
 
-    fn authorized_workspace(&self, workspace: &str) -> Option<String> {
+    fn authorized_workspace(&self, _session_workspace: &str, workspace: &str) -> Option<String> {
         self.client_identity.as_ref().and_then(|identity| {
             self.instructions
                 .lock()
