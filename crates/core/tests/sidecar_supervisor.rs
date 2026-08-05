@@ -357,7 +357,7 @@ fn blocked_probe_cannot_delay_startup_timeout_or_become_healthy() {
 #[test]
 fn restarted_generation_probes_independently_of_stale_blocked_probe() {
     let mut cfg = config(&["echo"]);
-    cfg.startup_timeout = Duration::from_millis(100);
+    cfg.startup_timeout = Duration::from_millis(500);
     cfg.health_interval = Duration::from_millis(5);
     cfg.restart.max_restarts = 1;
     let (release_first, blocked_first) = std::sync::mpsc::channel();

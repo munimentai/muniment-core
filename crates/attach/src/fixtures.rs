@@ -491,6 +491,7 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         ("artifact-window", Operation::ArtifactWindow),
         ("request-cancel", Operation::RequestCancel),
         ("thread-create", Operation::ThreadCreate),
+        ("migration-control", Operation::MigrationControl),
     ];
     for (index, (name, operation)) in operations.into_iter().enumerate() {
         insert(
@@ -672,6 +673,9 @@ fn request_body(operation: Operation) -> serde_json::Value {
         Operation::RequestCancel => {
             json!({"kind": "request", "request_id": "00000000000000000000000000000064"})
         }
+        Operation::MigrationControl => {
+            json!({"handoff_nonce": "fixture-handoff-nonce", "deadline_ms": 30_000})
+        }
     }
 }
 
@@ -835,6 +839,7 @@ mod tests {
             Operation::ArtifactFetch,
             Operation::ArtifactWindow,
             Operation::RequestCancel,
+            Operation::MigrationControl,
         ];
         for operation in operations {
             let name = operation.as_str().replace(['.', '_'], "-");
@@ -878,7 +883,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            43,
+            44,
             "every canonical fixture must be inventoried"
         );
     }

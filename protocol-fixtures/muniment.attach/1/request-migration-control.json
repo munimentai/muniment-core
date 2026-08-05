@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"00000000000000000000000000000072","operation":"migration.control","capability":"fixture-capability","body":{"deadline_ms":30000,"handoff_nonce":"fixture-handoff-nonce"}}
