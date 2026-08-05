@@ -22,6 +22,7 @@ pub mod kokoro;
 pub mod model_acquisition_transport;
 pub mod model_install;
 pub mod model_install_native;
+pub mod session_thread;
 pub mod sidecar;
 
 pub use muniment_attach::{
