@@ -6,6 +6,7 @@ mod authorization;
 #[cfg(target_os = "linux")]
 mod credential;
 mod cursor;
+mod handoff;
 mod idempotency;
 #[cfg(target_os = "linux")]
 pub mod linux;
@@ -23,6 +24,7 @@ pub use cursor::{
     StreamCloseCode, MAX_RUN_STREAM_WINDOW_BYTES, MAX_RUN_STREAM_WINDOW_EVENTS,
     MAX_RUN_STREAM_WINDOW_TEXT_BYTES,
 };
+pub use handoff::*;
 pub use idempotency::*;
 #[cfg(target_os = "linux")]
 pub use migration_authority::*;
