@@ -7,6 +7,7 @@ pub mod pi_translation;
 pub mod reconciliation;
 pub mod reducer;
 pub mod retention;
+pub mod run_append;
 pub mod summaries;
 pub mod thread_permission_policy;
 pub mod thread_summaries;
