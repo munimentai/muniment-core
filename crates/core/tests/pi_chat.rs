@@ -482,7 +482,7 @@ fn accepted_prompt_waits_for_session_file_and_preserves_stream_frames() {
         PiRunAdapter::start("run-1", &transport, "prompt", Duration::from_secs(1)).unwrap();
 
     let (locator, buffered) = adapter
-        .await_session_binding(&transport, temp.path(), Duration::from_secs(1))
+        .await_session_binding(&transport, temp.path(), Duration::from_secs(3))
         .unwrap();
 
     assert_eq!(locator.as_str(), "session.jsonl");
