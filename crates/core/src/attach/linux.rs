@@ -787,6 +787,7 @@ pub trait ThreadListService {
     fn start_run(
         &mut self,
         _workspace: &str,
+        _execution_root: &str,
         _request: RunStartRequest,
         _request_id: &super::Id,
         _idempotency_key: &super::Id,
@@ -2184,14 +2185,15 @@ fn dispatch_request<S: ThreadListService>(
             .idempotency_key
             .as_ref()
             .ok_or_else(ProtocolError::idempotency_key_required)?;
-        let selected_workspace = match body.workspace.as_deref() {
+        let execution_root = match body.workspace.as_deref() {
             Some(requested_workspace) => service
                 .authorized_workspace(workspace, requested_workspace)
                 .ok_or_else(ProtocolError::unauthorized)?,
             None => workspace.to_owned(),
         };
         let accepted = service.start_run(
-            &selected_workspace,
+            workspace,
+            &execution_root,
             RunStartRequest {
                 text: body.text,
                 context: body.context,

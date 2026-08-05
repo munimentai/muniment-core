@@ -193,14 +193,14 @@ fn unavailable_service(
 
 #[derive(Default)]
 struct StartService {
-    calls: Vec<(String, RunStartRequest, Id, Id, CompanionProvenance)>,
+    calls: Vec<(String, String, RunStartRequest, Id, Id, CompanionProvenance)>,
     output: Option<RunStartAccepted>,
 }
 
 #[derive(Clone, Default)]
 struct OnboardingStartService {
     instructions: Arc<std::sync::Mutex<HashMap<String, HashMap<String, String>>>>,
-    runs: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    runs: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
     client_identity: Option<String>,
 }
 
@@ -253,6 +253,7 @@ impl ThreadListService for OnboardingStartService {
     fn start_run(
         &mut self,
         workspace: &str,
+        execution_root: &str,
         _: RunStartRequest,
         _: &Id,
         _: &Id,
@@ -260,7 +261,9 @@ impl ThreadListService for OnboardingStartService {
     ) -> Result<RunStartAccepted, muniment_core::attach::ProtocolError> {
         self.runs.lock().unwrap().push((
             workspace.to_owned(),
-            self.instructions.lock().unwrap()[self.client_identity.as_ref().unwrap()][workspace]
+            execution_root.to_owned(),
+            self.instructions.lock().unwrap()[self.client_identity.as_ref().unwrap()]
+                [execution_root]
                 .clone(),
         ));
         Ok(RunStartAccepted {
@@ -526,6 +529,7 @@ impl ThreadListService for StartService {
     fn start_run(
         &mut self,
         workspace: &str,
+        execution_root: &str,
         request: RunStartRequest,
         request_id: &Id,
         idempotency_key: &Id,
@@ -533,6 +537,7 @@ impl ThreadListService for StartService {
     ) -> Result<RunStartAccepted, muniment_core::attach::ProtocolError> {
         self.calls.push((
             workspace.into(),
+            execution_root.into(),
             request,
             request_id.clone(),
             idempotency_key.clone(),
@@ -4530,8 +4535,9 @@ fn authorized_run_start_dispatches_once_with_bounded_input_and_provenance() {
         })
     );
     assert_eq!(service.calls.len(), 1);
-    let (workspace, body, request_id, key, provenance) = &service.calls[0];
+    let (workspace, execution_root, body, request_id, key, provenance) = &service.calls[0];
     assert_eq!(workspace, "workspace-1");
+    assert_eq!(execution_root, "workspace-1");
     assert_eq!(body.text, "Do the work");
     assert_eq!(body.context, Some(json!({"selection": "safe"})));
     assert_eq!(
@@ -4602,8 +4608,11 @@ fn onboarding_authorizes_only_opened_and_memory_workspaces_for_run_start() {
     assert_eq!(error.error.code(), ErrorCode::Unauthorized);
     let runs = service.runs.lock().unwrap();
     assert_eq!(runs.len(), workspaces.len());
-    for ((selected, instructions), (opened, memory)) in runs.iter().zip(workspaces.iter()) {
-        assert_eq!(selected, memory);
+    for ((workspace, execution_root, instructions), (opened, memory)) in
+        runs.iter().zip(workspaces.iter())
+    {
+        assert_eq!(workspace, "workspace-1");
+        assert_eq!(execution_root, memory);
         assert_eq!(instructions, &format!("instructions for {opened}"));
     }
 }
