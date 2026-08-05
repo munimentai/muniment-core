@@ -11,6 +11,7 @@ mod idempotency;
 pub mod linux;
 #[cfg(target_os = "linux")]
 mod migration_authority;
+mod quiesce;
 
 pub use approval::*;
 pub use artifact::*;
@@ -26,3 +27,4 @@ pub use idempotency::*;
 #[cfg(target_os = "linux")]
 pub use migration_authority::*;
 pub use muniment_attach::*;
+pub use quiesce::*;
