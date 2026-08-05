@@ -24,6 +24,7 @@ pub mod model_install;
 pub mod model_install_native;
 pub mod session_thread;
 pub mod sidecar;
+pub mod thread_ownership;
 
 pub use muniment_attach::{
     ensure_cross_project_home, ensure_scaffold_directory, onboard_companion_workspace,
