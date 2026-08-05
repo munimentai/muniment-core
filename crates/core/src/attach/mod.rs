@@ -9,6 +9,8 @@ mod cursor;
 mod idempotency;
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(target_os = "linux")]
+mod migration_authority;
 
 pub use approval::*;
 pub use artifact::*;
@@ -21,4 +23,6 @@ pub use cursor::{
     MAX_RUN_STREAM_WINDOW_TEXT_BYTES,
 };
 pub use idempotency::*;
+#[cfg(target_os = "linux")]
+pub use migration_authority::*;
 pub use muniment_attach::*;
