@@ -12,6 +12,7 @@ pub mod auth;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub mod browser_control;
 pub mod cas;
+pub mod chat_profile;
 pub mod home;
 pub mod import_preview;
 pub mod journal;

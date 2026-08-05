@@ -1621,7 +1621,7 @@ where
                 stream,
                 Some(request.request_id),
                 ProtocolError::unauthorized(),
-                deadline,
+                Instant::now() + timeout,
             );
             return Err(AttachSessionError::Authorization);
         }
