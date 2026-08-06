@@ -2812,6 +2812,7 @@ dependencies = [
  "hmac",
  "hound",
  "image",
+ "keyring",
  "libc",
  "muniment-attach",
  "rusqlite",

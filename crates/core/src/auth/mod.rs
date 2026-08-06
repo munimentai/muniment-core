@@ -15,6 +15,8 @@
 pub mod discovery;
 pub mod entitlement_snapshot;
 pub mod flow;
+#[cfg(feature = "keyring")]
+pub mod keychain;
 pub mod loopback;
 pub mod native_authorization;
 pub mod native_credentials_store;
@@ -34,6 +36,8 @@ pub use flow::{
     build_authorization_url, ensure_fresh, exchange_code, refresh_tokens, revoke_token,
     run_sign_in, sign_out, OidcConfig,
 };
+#[cfg(feature = "keyring")]
+pub use keychain::KeyringNativeCredentialStore;
 pub use loopback::RedirectCatcher;
 pub use native_authorization::{
     begin_native_authorization, run_native_browser_authorization, AuthorizationTransport,
