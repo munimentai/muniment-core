@@ -1085,7 +1085,14 @@ fn normalized_absolute(path: &Path) -> Result<PathBuf, HomeError> {
 pub fn scaffold_home(home: &Path) -> Result<(), HomeError> {
     create_visible_directory(home)?;
     for name in HOME_DIRECTORIES {
-        create_visible_directory(&home.join(name))?;
+        let directory = home.join(name);
+        create_visible_directory(&directory)?;
+        let heading = format!("# {}\n", name[..1].to_uppercase() + &name[1..]);
+        muniment_attach::write_scaffold_file_if_missing(
+            &directory.join("README.md"),
+            heading.as_bytes(),
+        )
+        .map_err(|error| HomeError::io("Muniment Home README could not be created.", error))?;
     }
     Ok(())
 }

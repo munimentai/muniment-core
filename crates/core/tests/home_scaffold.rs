@@ -68,6 +68,10 @@ fn scaffolds_the_visible_home_layout_idempotently() {
 
     for directory in ["memory", "agents", "projects", "sessions"] {
         assert!(home.join(directory).is_dir());
+        assert_eq!(
+            fs::read_to_string(home.join(directory).join("README.md")).unwrap(),
+            format!("# {}\n", directory[..1].to_uppercase() + &directory[1..])
+        );
     }
     assert!(!home.join(".memory").exists());
     fs::remove_dir_all(root).unwrap();
