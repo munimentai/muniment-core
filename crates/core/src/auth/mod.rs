@@ -65,7 +65,7 @@ pub use native_revocation::{
     UreqRevocationTransport,
 };
 pub use native_session::{
-    ensure_fresh_native_session, inspect_native_session, native_status,
+    ensure_fresh_native_session, ensure_native_session, inspect_native_session, native_status,
     EntitlementSnapshotAlgorithm, EntitlementSnapshotView, FreshNativeSession,
     FreshNativeSessionError, NativeEntitlementGroup, NativeEntitlementPayload,
     NativeEntitlementSnapshot, NativeSession, NativeSessionError, NativeSessionIdentity,

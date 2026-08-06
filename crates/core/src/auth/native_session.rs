@@ -9,11 +9,13 @@ use uuid::Uuid;
 use super::native_registration::CLIENT_ROLE;
 use super::native_token::{
     refresh_native_credentials, NativeCredentialStore, NativeCredentials, NativeTokenError,
-    TokenTransport,
+    TokenTransport, UreqTokenTransport,
 };
 use super::AuthStatus;
 
 const SESSION_PATH: &str = "/v1/auth/native/session";
+const NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
+const REFRESH_SKEW: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct NativeSessionRequest {
@@ -297,6 +299,22 @@ pub fn native_status(
         credentials.as_ref(),
         now_unix_seconds,
     ))
+}
+
+/// Compose the production transports and return a fresh native session.
+pub fn ensure_native_session(
+    store: &dyn NativeCredentialStore,
+    base_url: &str,
+    now_unix_seconds: u64,
+) -> Result<FreshNativeSession, FreshNativeSessionError> {
+    ensure_fresh_native_session(
+        store,
+        &UreqTokenTransport::new(NETWORK_TIMEOUT),
+        &UreqSessionTransport::new(NETWORK_TIMEOUT),
+        base_url,
+        now_unix_seconds,
+        REFRESH_SKEW,
+    )
 }
 
 /// Refresh a near-expiry native access credential, atomically persist any

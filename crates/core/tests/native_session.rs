@@ -5,10 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use muniment_core::auth::{
-    ensure_fresh_native_session, inspect_native_session, native_status, InstallationRecord,
-    NativeCredentialStore, NativeCredentials, NativeSession, NativeSessionError,
-    NativeSessionRequest, NativeTokenError, NativeTokenRequest, NativeTokenResponse,
-    SessionTransport, TokenSet, TokenTransport, UreqSessionTransport,
+    ensure_fresh_native_session, ensure_native_session, inspect_native_session, native_status,
+    InstallationRecord, NativeCredentialStore, NativeCredentials, NativeSession,
+    NativeSessionError, NativeSessionRequest, NativeTokenError, NativeTokenRequest,
+    NativeTokenResponse, SessionTransport, TokenSet, TokenTransport, UreqSessionTransport,
 };
 use uuid::Uuid;
 
@@ -131,6 +131,21 @@ fn exact_authenticated_get_decodes_typed_contract() {
             .count(),
         1
     );
+    assert!(request
+        .to_ascii_lowercase()
+        .contains("authorization: bearer access-secret\r\n"));
+}
+
+#[test]
+fn composed_native_session_uses_the_local_server() {
+    let server = Server::spawn(200, success());
+    let result =
+        ensure_native_session(&orchestration_store(2_000, 4_000), &server.base_url, 1_000).unwrap();
+
+    assert!(result.status.signed_in);
+    assert_eq!(result.status.expires_at, Some(2_000));
+    let request = server.request.lock().unwrap().clone().unwrap();
+    assert!(request.starts_with("GET /v1/auth/native/session HTTP/1.1\r\n"));
     assert!(request
         .to_ascii_lowercase()
         .contains("authorization: bearer access-secret\r\n"));
