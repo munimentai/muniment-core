@@ -4,6 +4,8 @@ mod approval;
 mod artifact;
 mod authorization;
 #[cfg(target_os = "linux")]
+mod companion_registry;
+#[cfg(target_os = "linux")]
 mod credential;
 mod cursor;
 mod handoff;
@@ -18,6 +20,8 @@ mod workspace_context;
 pub use approval::*;
 pub use artifact::*;
 pub use authorization::*;
+#[cfg(target_os = "linux")]
+pub use companion_registry::*;
 #[cfg(target_os = "linux")]
 pub use credential::*;
 pub use cursor::{
