@@ -4,10 +4,10 @@ use std::fmt;
 use std::time::Duration;
 
 use super::{
-    exchange_native_code, register_installation, run_native_browser_authorization, AuthStatus,
-    AuthorizationTransport, BrowserOpener, InstallationStore, NativeBrowserAuthorizationError,
-    NativeCredentialStore, NativeRegistrationError, NativeTokenError, RegistrationTransport,
-    TokenTransport,
+    exchange_native_code, register_installation_with_retry, run_native_browser_authorization,
+    AuthStatus, AuthorizationTransport, BrowserOpener, InstallationStore,
+    NativeBrowserAuthorizationError, NativeCredentialStore, NativeRegistrationError,
+    NativeTokenError, RegistrationTransport, TokenTransport,
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -49,8 +49,10 @@ pub fn run_native_sign_in(
     base_url: &str,
     clock: &dyn Fn() -> u64,
     timeout: Duration,
+    registration_wait: &dyn Fn(Duration),
 ) -> Result<AuthStatus, NativeSignInError> {
-    register_installation(store, registration, base_url, clock()).map_err(map_registration)?;
+    register_installation_with_retry(store, registration, base_url, clock(), registration_wait)
+        .map_err(map_registration)?;
     let code = run_native_browser_authorization(
         store,
         authorization,

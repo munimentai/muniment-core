@@ -51,9 +51,9 @@ pub use native_devices::{
     UreqNativeDeviceListTransport,
 };
 pub use native_registration::{
-    register_installation, InstallationRecord, InstallationStore, NativeDeviceRegistrationRequest,
-    NativeDeviceRegistrationResponse, NativeRegistrationError, RegistrationTransport,
-    UreqRegistrationTransport,
+    register_installation, register_installation_with_retry, InstallationRecord, InstallationStore,
+    NativeDeviceRegistrationRequest, NativeDeviceRegistrationResponse, NativeRegistrationError,
+    RegistrationTransport, UreqRegistrationTransport, MAX_REGISTRATION_RETRY_WAIT,
 };
 pub use native_revocation::{
     revoke_current_native_session, sign_out_native_session, NativeRevocationError,

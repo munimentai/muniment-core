@@ -234,6 +234,7 @@ fn run_with_clock(
         &server.base_url,
         &|| clock.load(Ordering::SeqCst),
         Duration::from_secs(2),
+        &std::thread::sleep,
     );
     (result, server)
 }

@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use muniment_core::auth::{
-    register_installation, InstallationRecord, InstallationStore, NativeDeviceRegistrationResponse,
-    NativeRegistrationError, UreqRegistrationTransport,
+    register_installation, register_installation_with_retry, InstallationRecord, InstallationStore,
+    NativeDeviceRegistrationResponse, NativeRegistrationError, UreqRegistrationTransport,
+    MAX_REGISTRATION_RETRY_WAIT,
 };
 
 #[derive(Default)]
@@ -38,6 +39,10 @@ struct MockServer {
 
 impl MockServer {
     fn spawn(status: u16, body: &'static str) -> Self {
+        Self::spawn_responses(vec![(status, body, None)])
+    }
+
+    fn spawn_responses(responses: Vec<(u16, &'static str, Option<&'static str>)>) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let hits = Arc::new(AtomicUsize::new(0));
@@ -45,15 +50,18 @@ impl MockServer {
         let thread_hits = hits.clone();
         let thread_request = request.clone();
         std::thread::spawn(move || {
-            for stream in listener.incoming() {
+            for (stream, (status, body, retry_after)) in listener.incoming().zip(responses) {
                 let mut stream = stream.unwrap();
                 let (head, request_body) = read_request(&mut stream);
                 thread_hits.fetch_add(1, Ordering::SeqCst);
                 *thread_request.lock().unwrap() = Some((head, request_body));
                 let reason = if status == 201 { "Created" } else { "Error" };
+                let retry_after = retry_after
+                    .map(|value| format!("Retry-After: {value}\r\n"))
+                    .unwrap_or_default();
                 write!(
                     stream,
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n{retry_after}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 )
                 .unwrap();
@@ -65,6 +73,74 @@ impl MockServer {
             request,
         }
     }
+}
+
+#[test]
+fn rate_limit_waits_for_server_delay_then_completes_without_user_action() {
+    let server = MockServer::spawn_responses(vec![
+        (429, r#"{"error":{"code":"rate_limited"}}"#, Some("7")),
+        (429, r#"{"error":{"code":"rate_limited"}}"#, None),
+        (
+            429,
+            r#"{"error":{"code":"rate_limited"}}"#,
+            Some("Thu, 01 Jan 1970 00:00:00 GMT"),
+        ),
+        (201, SUCCESS, None),
+    ]);
+    let waits = Mutex::new(Vec::new());
+
+    let installation = register_installation_with_retry(
+        &MemoryStore::default(),
+        &UreqRegistrationTransport::new(Duration::from_secs(2)),
+        &server.base_url,
+        1_000,
+        &|delay| waits.lock().unwrap().push(delay),
+    )
+    .unwrap();
+
+    assert_eq!(installation.registration_expires_at, 1_600);
+    assert_eq!(server.hits.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        *waits.lock().unwrap(),
+        vec![
+            Duration::from_secs(7),
+            Duration::from_secs(30),
+            Duration::from_secs(1),
+        ]
+    );
+}
+
+struct AlwaysRateLimited;
+
+impl muniment_core::auth::RegistrationTransport for AlwaysRateLimited {
+    fn register(
+        &self,
+        _: &str,
+        _: &muniment_core::auth::NativeDeviceRegistrationRequest,
+    ) -> Result<NativeDeviceRegistrationResponse, NativeRegistrationError> {
+        Err(NativeRegistrationError::RateLimited(Duration::from_secs(
+            200,
+        )))
+    }
+}
+
+#[test]
+fn rate_limit_wait_is_bounded_before_terminal_failure() {
+    let waits = Mutex::new(Vec::new());
+    let error = register_installation_with_retry(
+        &MemoryStore::default(),
+        &AlwaysRateLimited,
+        "https://api.muniment.ai",
+        0,
+        &|delay| waits.lock().unwrap().push(delay),
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, NativeRegistrationError::RateLimited(_)));
+    assert_eq!(
+        waits.lock().unwrap().iter().sum::<Duration>(),
+        MAX_REGISTRATION_RETRY_WAIT
+    );
 }
 
 fn read_request(stream: &mut TcpStream) -> (String, String) {

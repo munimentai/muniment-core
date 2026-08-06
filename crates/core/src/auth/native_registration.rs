@@ -12,6 +12,10 @@ pub const CLIENT_ID: &str = "muniment-desktop";
 pub const CLIENT_ROLE: &str = "desktop";
 pub const PLATFORM: &str = "desktop";
 const REGISTRATION_PATH: &str = "/v1/auth/native/devices";
+const DEFAULT_RETRY_DELAY: Duration = Duration::from_secs(30);
+const MIN_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// Registration retries can wait for at most five minutes across one sign-in attempt.
+pub const MAX_REGISTRATION_RETRY_WAIT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NativeDeviceRegistrationRequest {
@@ -81,6 +85,7 @@ pub enum NativeRegistrationError {
     Config(String),
     Transport(String),
     HttpStatus(u16),
+    RateLimited(Duration),
     MalformedResponse(String),
     Persistence(String),
     KeyGeneration,
@@ -96,6 +101,7 @@ impl fmt::Display for NativeRegistrationError {
             Self::HttpStatus(status) => {
                 write!(f, "native registration rejected with HTTP {status}")
             }
+            Self::RateLimited(_) => write!(f, "native registration rate limit persisted"),
             Self::MalformedResponse(message) => {
                 write!(f, "malformed native registration response: {message}")
             }
@@ -128,6 +134,9 @@ impl RegistrationTransport for UreqRegistrationTransport {
             .set("Content-Type", "application/json")
             .send_json(request)
             .map_err(|error| match error {
+                ureq::Error::Status(429, response) => NativeRegistrationError::RateLimited(
+                    retry_delay(response.header("Retry-After")),
+                ),
                 ureq::Error::Status(status, _) => NativeRegistrationError::HttpStatus(status),
                 ureq::Error::Transport(_) => {
                     NativeRegistrationError::Transport("request failed".into())
@@ -141,12 +150,38 @@ impl RegistrationTransport for UreqRegistrationTransport {
     }
 }
 
+fn retry_delay(header: Option<&str>) -> Duration {
+    let seconds = header
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .or_else(|| {
+            let retry_at = chrono::DateTime::parse_from_rfc2822(header?).ok()?;
+            let now: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
+            let seconds = retry_at.signed_duration_since(now).num_seconds();
+            u64::try_from(seconds.max(0)).ok()
+        });
+    Duration::from_secs(seconds.unwrap_or(DEFAULT_RETRY_DELAY.as_secs()))
+        .clamp(MIN_RETRY_DELAY, MAX_REGISTRATION_RETRY_WAIT)
+}
+
 /// Return a usable persisted installation, registering when it is missing or expired.
 pub fn register_installation(
     store: &dyn InstallationStore,
     transport: &dyn RegistrationTransport,
     base_url: &str,
     now_unix_seconds: u64,
+) -> Result<InstallationRecord, NativeRegistrationError> {
+    register_installation_with_retry(store, transport, base_url, now_unix_seconds, &|delay| {
+        std::thread::sleep(delay)
+    })
+}
+
+/// Register an installation and report each rate-limit wait before it starts.
+pub fn register_installation_with_retry(
+    store: &dyn InstallationStore,
+    transport: &dyn RegistrationTransport,
+    base_url: &str,
+    now_unix_seconds: u64,
+    wait: &dyn Fn(Duration),
 ) -> Result<InstallationRecord, NativeRegistrationError> {
     if let Some(existing) = store.load()? {
         if !existing.registration_token.is_empty()
@@ -168,7 +203,23 @@ pub fn register_installation(
         installation_public_key: URL_SAFE_NO_PAD.encode(signing_key.verifying_key().as_bytes()),
     };
     let url = format!("{}{}", base_url.trim_end_matches('/'), REGISTRATION_PATH);
-    let response = transport.register(&url, &request)?;
+    let mut total_wait = Duration::ZERO;
+    let response = loop {
+        match transport.register(&url, &request) {
+            Ok(response) => break response,
+            Err(NativeRegistrationError::RateLimited(delay)) => {
+                if total_wait >= MAX_REGISTRATION_RETRY_WAIT {
+                    return Err(NativeRegistrationError::RateLimited(delay));
+                }
+                let delay = delay
+                    .clamp(MIN_RETRY_DELAY, MAX_REGISTRATION_RETRY_WAIT)
+                    .min(MAX_REGISTRATION_RETRY_WAIT - total_wait);
+                wait(delay);
+                total_wait += delay;
+            }
+            Err(error) => return Err(error),
+        }
+    };
     if response.expires_in != 600 {
         return Err(NativeRegistrationError::MalformedResponse(
             "registration expiry did not match the contract".into(),
