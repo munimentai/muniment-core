@@ -13,6 +13,7 @@ pub mod linux;
 #[cfg(target_os = "linux")]
 mod migration_authority;
 mod quiesce;
+mod workspace_context;
 
 pub use approval::*;
 pub use artifact::*;
@@ -30,3 +31,4 @@ pub use idempotency::*;
 pub use migration_authority::*;
 pub use muniment_attach::*;
 pub use quiesce::*;
+pub use workspace_context::*;
