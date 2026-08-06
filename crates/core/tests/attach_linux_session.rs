@@ -5,11 +5,11 @@ use muniment_core::attach::linux::{
     run_authenticated_session_with_authorization,
     run_authenticated_session_with_authorization_and_registry,
     run_authenticated_session_with_service_and_approvals, ApprovalDecision, AttachSessionError,
-    AuthorizationSessionDependencies, CompanionProvenance, LiveConnectionRegistry, PeerCredentials,
-    PermissionAnswerAccepted, PermissionAnswerRequest, RedactedThreadSummary, RunCancelAccepted,
-    RunCancelRequest, RunStartAccepted, RunStartRequest, RunStreamPage, ThreadListPage,
-    ThreadListRequest, ThreadListService, ThreadOpenRequest, MAX_PERMISSION_GATE_ID_LENGTH,
-    MAX_RUN_START_CONTEXT_LENGTH, MAX_RUN_START_TEXT_LENGTH,
+    AuthorizationSessionDependencies, CompanionProvenance, LiveConnectionRegistry,
+    MigrationControlRequest, PeerCredentials, PermissionAnswerAccepted, PermissionAnswerRequest,
+    RedactedThreadSummary, RunCancelAccepted, RunCancelRequest, RunStartAccepted, RunStartRequest,
+    RunStreamPage, ThreadListPage, ThreadListRequest, ThreadListService, ThreadOpenRequest,
+    MAX_PERMISSION_GATE_ID_LENGTH, MAX_RUN_START_CONTEXT_LENGTH, MAX_RUN_START_TEXT_LENGTH,
 };
 use muniment_core::attach::{
     decode_frame, encode_frame, Approval, AuthorizationClock, AuthorizationTokenGenerator,
@@ -195,6 +195,29 @@ fn unavailable_service(
 struct StartService {
     calls: Vec<(String, String, RunStartRequest, Id, Id, CompanionProvenance)>,
     output: Option<RunStartAccepted>,
+}
+
+#[derive(Default)]
+struct MigrationControlService {
+    calls: Vec<MigrationControlRequest>,
+}
+
+impl ThreadListService for MigrationControlService {
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, muniment_core::attach::ProtocolError> {
+        panic!("thread reads must not dispatch")
+    }
+
+    fn control_migration(
+        &mut self,
+        request: MigrationControlRequest,
+    ) -> Result<(), muniment_core::attach::ProtocolError> {
+        self.calls.push(request);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Default)]
@@ -4969,6 +4992,142 @@ fn operations_outside_run_start_remain_unsupported_without_dispatch() {
         );
         assert_eq!(error.error.code(), ErrorCode::UnsupportedOperation);
     }
+    assert!(service.calls.is_empty());
+}
+
+#[test]
+fn migration_control_uses_the_service_and_echoes_the_nonce() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello(1, 1)).unwrap();
+    client
+        .write_all(&request(
+            81,
+            Operation::MigrationControl,
+            json!({"deadline_ms": 30_000, "handoff_nonce": "fixture-handoff-nonce"}),
+        ))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut service = MigrationControlService::default();
+
+    assert_eq!(
+        dispatch_session(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            &mut service,
+        ),
+        Ok(())
+    );
+
+    let response: Response = read_frame(&mut client);
+    assert_eq!(
+        response.body,
+        json!({"handoff_nonce": "fixture-handoff-nonce"})
+    );
+    assert_eq!(
+        service.calls,
+        vec![MigrationControlRequest {
+            handoff_nonce: "fixture-handoff-nonce".into(),
+            deadline_ms: 30_000,
+        }]
+    );
+}
+
+#[test]
+fn migration_control_defaults_to_unsupported_operation() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello(1, 1)).unwrap();
+    client
+        .write_all(&request(
+            82,
+            Operation::MigrationControl,
+            json!({"deadline_ms": 30_000, "handoff_nonce": "handoff-nonce"}),
+        ))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut service = unavailable_service;
+
+    assert_eq!(
+        dispatch_session(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            &mut service,
+        ),
+        Ok(())
+    );
+
+    let error: ErrorEnvelope = read_frame(&mut client);
+    assert_eq!(error.error.code(), ErrorCode::UnsupportedOperation);
+}
+
+#[test]
+fn migration_control_rejects_invalid_bodies_without_dispatch() {
+    let cases = [
+        json!({"deadline_ms": 30_000, "handoff_nonce": ""}),
+        json!({"deadline_ms": 30_000, "handoff_nonce": "x".repeat(129)}),
+        json!({"deadline_ms": 30_000, "handoff_nonce": "line\nbreak"}),
+        json!({"deadline_ms": 30_000, "handoff_nonce": "non-ascii-é"}),
+        json!({"deadline_ms": 0, "handoff_nonce": "handoff-nonce"}),
+        json!({"deadline_ms": 60_001, "handoff_nonce": "handoff-nonce"}),
+        json!({"deadline_ms": 30_000, "handoff_nonce": "handoff-nonce", "extra": true}),
+    ];
+
+    for (index, body) in cases.into_iter().enumerate() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&hello(1, 1)).unwrap();
+        client
+            .write_all(&request(
+                90 + index as u128,
+                Operation::MigrationControl,
+                body,
+            ))
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut service = MigrationControlService::default();
+
+        assert_eq!(
+            dispatch_session(
+                &mut client,
+                server,
+                TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                &mut service,
+            ),
+            Ok(())
+        );
+
+        let error: ErrorEnvelope = read_frame(&mut client);
+        assert_eq!(error.error.code(), ErrorCode::InvalidRequest);
+        assert!(service.calls.is_empty());
+    }
+}
+
+#[test]
+fn migration_control_forbids_an_idempotency_key_without_dispatch() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello(1, 1)).unwrap();
+    client
+        .write_all(&request_with_idempotency(
+            100,
+            Operation::MigrationControl,
+            json!({"deadline_ms": 30_000, "handoff_nonce": "handoff-nonce"}),
+        ))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut service = MigrationControlService::default();
+
+    assert_eq!(
+        dispatch_session(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            &mut service,
+        ),
+        Ok(())
+    );
+
+    let error: ErrorEnvelope = read_frame(&mut client);
+    assert_eq!(error.error.code(), ErrorCode::IdempotencyKeyForbidden);
     assert!(service.calls.is_empty());
 }
 

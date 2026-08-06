@@ -41,6 +41,8 @@ const DESKTOP_PROTOCOL: VersionRange = VersionRange { min: 1, max: 1 };
 const MAX_THREAD_ID_LENGTH: usize = 36;
 const MAX_CURSOR_LENGTH: usize = 1024;
 const MAX_RESPONSE_BODY_LENGTH: usize = MAX_FRAME_LENGTH - 4096;
+const MAX_HANDOFF_NONCE_BYTES: usize = 128;
+const MAX_HANDOFF_DEADLINE_MS: u64 = 60_000;
 pub const MAX_RUN_START_TEXT_LENGTH: usize = 32 * 1024;
 pub const MAX_RUN_START_CONTEXT_LENGTH: usize = 64 * 1024;
 pub const MAX_PERMISSION_GATE_ID_LENGTH: usize = 256;
@@ -682,6 +684,12 @@ pub struct ThreadCreateAccepted {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MigrationControlRequest {
+    pub handoff_nonce: String,
+    pub deadline_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunCancelRequest {
     pub run_id: String,
 }
@@ -753,6 +761,13 @@ pub trait ThreadListService {
     }
 
     fn ensure_home(&mut self) -> Result<(), ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn control_migration(
+        &mut self,
+        _request: MigrationControlRequest,
+    ) -> Result<(), ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
 
@@ -2072,6 +2087,34 @@ fn dispatch_request<S: ThreadListService>(
         }
         service.ensure_home()?;
         return Ok(response_only(serde_json::json!({})));
+    }
+    if request.operation == Operation::MigrationControl {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            handoff_nonce: String,
+            deadline_ms: u64,
+        }
+        let body: Body =
+            serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
+        if body.handoff_nonce.is_empty()
+            || body.handoff_nonce.len() > MAX_HANDOFF_NONCE_BYTES
+            || !body
+                .handoff_nonce
+                .bytes()
+                .all(|byte| (b' '..=b'~').contains(&byte))
+            || !(1..=MAX_HANDOFF_DEADLINE_MS).contains(&body.deadline_ms)
+        {
+            return Err(ProtocolError::invalid_request().into());
+        }
+        let handoff_nonce = body.handoff_nonce.clone();
+        service.control_migration(MigrationControlRequest {
+            handoff_nonce: body.handoff_nonce,
+            deadline_ms: body.deadline_ms,
+        })?;
+        return Ok(response_only(serde_json::json!({
+            "handoff_nonce": handoff_nonce,
+        })));
     }
     if request.operation == Operation::ThreadCreate {
         if request.body != serde_json::json!({}) {
