@@ -13,6 +13,7 @@
 //!   surface to the webview.
 
 pub mod discovery;
+pub mod entitlement_snapshot;
 pub mod flow;
 pub mod loopback;
 pub mod native_authorization;
@@ -28,6 +29,7 @@ pub mod store;
 pub mod urlenc;
 
 pub use discovery::{discover, ProviderMetadata};
+pub use entitlement_snapshot::EntitlementSnapshotTracker;
 pub use flow::{
     build_authorization_url, ensure_fresh, exchange_code, refresh_tokens, revoke_token,
     run_sign_in, sign_out, OidcConfig,
