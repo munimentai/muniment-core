@@ -767,6 +767,7 @@ pub trait ThreadListService {
     fn control_migration(
         &mut self,
         _request: MigrationControlRequest,
+        _provenance: CompanionProvenance,
     ) -> Result<(), ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
@@ -2108,10 +2109,13 @@ fn dispatch_request<S: ThreadListService>(
             return Err(ProtocolError::invalid_request().into());
         }
         let handoff_nonce = body.handoff_nonce.clone();
-        service.control_migration(MigrationControlRequest {
-            handoff_nonce: body.handoff_nonce,
-            deadline_ms: body.deadline_ms,
-        })?;
+        service.control_migration(
+            MigrationControlRequest {
+                handoff_nonce: body.handoff_nonce,
+                deadline_ms: body.deadline_ms,
+            },
+            provenance,
+        )?;
         return Ok(response_only(serde_json::json!({
             "handoff_nonce": handoff_nonce,
         })));

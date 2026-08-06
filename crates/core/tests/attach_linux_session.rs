@@ -199,7 +199,7 @@ struct StartService {
 
 #[derive(Default)]
 struct MigrationControlService {
-    calls: Vec<MigrationControlRequest>,
+    calls: Vec<(MigrationControlRequest, CompanionProvenance)>,
 }
 
 impl ThreadListService for MigrationControlService {
@@ -214,8 +214,9 @@ impl ThreadListService for MigrationControlService {
     fn control_migration(
         &mut self,
         request: MigrationControlRequest,
+        provenance: CompanionProvenance,
     ) -> Result<(), muniment_core::attach::ProtocolError> {
-        self.calls.push(request);
+        self.calls.push((request, provenance));
         Ok(())
     }
 }
@@ -5024,13 +5025,17 @@ fn migration_control_uses_the_service_and_echoes_the_nonce() {
         response.body,
         json!({"handoff_nonce": "fixture-handoff-nonce"})
     );
+    assert_eq!(service.calls.len(), 1);
+    let (request, provenance) = &service.calls[0];
     assert_eq!(
-        service.calls,
-        vec![MigrationControlRequest {
+        request,
+        &MigrationControlRequest {
             handoff_nonce: "fixture-handoff-nonce".into(),
             deadline_ms: 30_000,
-        }]
+        }
     );
+    assert_eq!(provenance.peer_pid, std::process::id());
+    assert_eq!(provenance.peer_uid, unsafe { libc::geteuid() });
 }
 
 #[test]
