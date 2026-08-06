@@ -100,6 +100,15 @@ pub struct Welcome {
     pub server_nonce: String,
     pub authorization: Authorization,
     pub approval_challenge: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_nonce: Option<String>,
+}
+
+impl Welcome {
+    pub fn with_handoff_nonce(mut self, handoff_nonce: impl Into<String>) -> Self {
+        self.handoff_nonce = Some(handoff_nonce.into());
+        self
+    }
 }
 
 impl<'de> Deserialize<'de> for Welcome {
@@ -111,6 +120,8 @@ impl<'de> Deserialize<'de> for Welcome {
             server_nonce: String,
             authorization: Authorization,
             approval_challenge: String,
+            #[serde(default)]
+            handoff_nonce: Option<String>,
             #[serde(flatten)]
             extra: BTreeMap<String, serde_json::Value>,
         }
@@ -144,6 +155,7 @@ impl<'de> Deserialize<'de> for Welcome {
             server_nonce: fields.server_nonce,
             authorization: fields.authorization,
             approval_challenge: fields.approval_challenge,
+            handoff_nonce: fields.handoff_nonce,
         })
     }
 }
@@ -156,6 +168,7 @@ impl fmt::Debug for Welcome {
             .field("server_nonce", &"[REDACTED]")
             .field("authorization", &self.authorization)
             .field("approval_challenge", &"[REDACTED]")
+            .field("handoff_nonce", &"[REDACTED]")
             .finish()
     }
 }
@@ -199,6 +212,7 @@ impl<'de> Deserialize<'de> for Authorized {
             "server_nonce",
             "authorization",
             "approval_challenge",
+            "handoff_nonce",
             "request_id",
             "operation",
             "idempotency_key",
@@ -308,6 +322,7 @@ pub fn welcome(
         server_nonce: server_nonce.into(),
         authorization: Authorization::PairingRequired,
         approval_challenge: approval_challenge.into(),
+        handoff_nonce: None,
     }
 }
 
@@ -323,6 +338,7 @@ pub fn reconnect_welcome(
         server_nonce: server_nonce.into(),
         authorization: Authorization::Authorized,
         approval_challenge: approval_challenge.into(),
+        handoff_nonce: None,
     }
 }
 

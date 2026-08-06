@@ -464,7 +464,8 @@ fn authorized_round_trips_and_ignores_future_optional_fields() {
 
 #[test]
 fn handshake_wire_debug_redacts_secrets() {
-    let welcome = welcome(1, "0.1.0", "server-nonce", "secret-challenge");
+    let welcome = welcome(1, "0.1.0", "server-nonce", "secret-challenge")
+        .with_handoff_nonce("secret-handoff-nonce");
     let authorized = authorized(
         "profile-id",
         "secret-capability",
@@ -487,11 +488,34 @@ fn handshake_wire_debug_redacts_secrets() {
         body: json!({"next_cursor": "secret-cursor"}),
     };
 
-    assert!(!format!("{welcome:?}").contains("secret-challenge"));
+    let welcome_debug = format!("{welcome:?}");
+    assert!(!welcome_debug.contains("secret-challenge"));
+    assert!(!welcome_debug.contains("secret-handoff-nonce"));
+    assert!(welcome_debug.contains("handoff_nonce: \"[REDACTED]\""));
     assert!(!format!("{authorized:?}").contains("secret-capability"));
     assert!(!format!("{request:?}").contains("secret-capability"));
     assert!(!format!("{request:?}").contains("secret-cursor"));
     assert!(!format!("{response:?}").contains("secret-cursor"));
+}
+
+#[test]
+fn welcome_round_trips_with_and_without_a_handoff_nonce() {
+    let without_nonce = welcome(1, "0.1.0", "server-nonce", "challenge");
+    let encoded = serde_json::to_value(&without_nonce).unwrap();
+    assert!(encoded.get("handoff_nonce").is_none());
+    assert_eq!(
+        serde_json::from_value::<Welcome>(encoded).unwrap(),
+        without_nonce
+    );
+
+    let with_nonce =
+        welcome(1, "0.1.0", "server-nonce", "challenge").with_handoff_nonce("handoff-nonce");
+    let encoded = serde_json::to_value(&with_nonce).unwrap();
+    assert_eq!(encoded["handoff_nonce"], "handoff-nonce");
+    assert_eq!(
+        serde_json::from_value::<Welcome>(encoded).unwrap(),
+        with_nonce
+    );
 }
 
 #[test]

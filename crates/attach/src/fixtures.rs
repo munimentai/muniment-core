@@ -460,6 +460,19 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
             server_nonce: "fixture-server-nonce".into(),
             authorization: Authorization::PairingRequired,
             approval_challenge: "fixture-challenge".into(),
+            handoff_nonce: None,
+        },
+    )?;
+    insert(
+        &mut fixtures,
+        "negotiation-welcome-handoff.json",
+        &Welcome {
+            selected: 1,
+            desktop_version: "0.0.1".into(),
+            server_nonce: "fixture-server-nonce".into(),
+            authorization: Authorization::PairingRequired,
+            approval_challenge: "fixture-challenge".into(),
+            handoff_nonce: Some("fixture-handoff-nonce".into()),
         },
     )?;
     insert(
@@ -883,7 +896,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            44,
+            45,
             "every canonical fixture must be inventoried"
         );
     }
