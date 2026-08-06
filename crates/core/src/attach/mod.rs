@@ -15,6 +15,7 @@ pub mod linux;
 #[cfg(target_os = "linux")]
 mod migration_authority;
 mod quiesce;
+mod runtime_activity;
 mod workspace_context;
 
 pub use approval::*;
@@ -35,4 +36,5 @@ pub use idempotency::*;
 pub use migration_authority::*;
 pub use muniment_attach::*;
 pub use quiesce::*;
+pub use runtime_activity::*;
 pub use workspace_context::*;
