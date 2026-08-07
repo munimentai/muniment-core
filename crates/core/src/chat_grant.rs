@@ -14,6 +14,7 @@ pub struct ChatGrant {
     pub virtual_key: String,
     #[serde(default)]
     pub model: Option<String>,
+    pub minimum_cacheable_prefix_characters: usize,
     pub receipt_url: String,
 }
 
@@ -51,6 +52,7 @@ pub fn validate_grant(grant: &ChatGrant) -> Result<(), FetchGrantError> {
         || !grant.receipt_url.starts_with("https://")
         || grant.virtual_key.trim().is_empty()
         || grant.workspace.trim().is_empty()
+        || grant.minimum_cacheable_prefix_characters == 0
     {
         return Err(FetchGrantError::InvalidResponse);
     }
@@ -88,6 +90,7 @@ mod tests {
             gateway_url: "https://gateway.example.com".into(),
             virtual_key: "key".into(),
             model: None,
+            minimum_cacheable_prefix_characters: 8_192,
             receipt_url: "https://receipts.example.com".into(),
         }
     }
@@ -137,6 +140,18 @@ mod tests {
     fn rejects_blank_workspace() {
         let grant = ChatGrant {
             workspace: " \t".into(),
+            ..valid_grant()
+        };
+        assert_eq!(
+            validate_grant(&grant),
+            Err(FetchGrantError::InvalidResponse)
+        );
+    }
+
+    #[test]
+    fn rejects_zero_memory_character_budget() {
+        let grant = ChatGrant {
+            minimum_cacheable_prefix_characters: 0,
             ..valid_grant()
         };
         assert_eq!(

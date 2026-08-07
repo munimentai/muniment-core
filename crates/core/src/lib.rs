@@ -19,6 +19,7 @@ pub mod home;
 pub mod import_preview;
 pub mod journal;
 pub mod kokoro;
+pub mod memory_index;
 pub mod model_acquisition_transport;
 pub mod model_install;
 pub mod model_install_native;

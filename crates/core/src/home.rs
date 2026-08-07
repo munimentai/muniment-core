@@ -113,6 +113,7 @@ pub enum OnboardingHomePersistenceError {
     TooManyEntries,
     DocumentBytesExceeded,
     TotalBytesExceeded,
+    SecretRejected,
     DestinationConflict { relative_path: String },
     Io(io::Error),
 }
@@ -131,6 +132,7 @@ impl fmt::Display for OnboardingHomePersistenceError {
             Self::TotalBytesExceeded => {
                 formatter.write_str("The onboarding write plan is too large.")
             }
+            Self::SecretRejected => formatter.write_str("The memory record contains a secret."),
             Self::DestinationConflict { relative_path } => {
                 write!(
                     formatter,
@@ -326,6 +328,9 @@ fn validate_persistence_plan(
     let mut total_bytes = 0usize;
     let mut relative_paths = Vec::with_capacity(plan.writes.len());
     for write in &plan.writes {
+        if memory_record_contains_secret(&write.contents) {
+            return Err(OnboardingHomePersistenceError::SecretRejected);
+        }
         let path = Path::new(&write.relative_path);
         let mut segments = write.relative_path.split('/');
         if write.relative_path.is_empty()
@@ -357,6 +362,12 @@ fn validate_persistence_plan(
         relative_paths.push((write.relative_path.clone(), path.to_path_buf()));
     }
     Ok(relative_paths)
+}
+
+pub(crate) fn memory_record_contains_secret(content: &str) -> bool {
+    !crate::assistant_text::scan(content, true)
+        .matches
+        .is_empty()
 }
 
 fn validate_persistence_home(home: &Path) -> Result<PathBuf, OnboardingHomePersistenceError> {
@@ -807,6 +818,25 @@ mod onboarding_write_plan_tests {
             fs::read(home.join("memory/second.md")).unwrap(),
             b"planned second"
         );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn onboarding_write_rejects_a_credential_before_publication() {
+        let home = persistence_test_home("credential");
+        let plan = OnboardingHomeWritePlan {
+            writes: vec![HomeWrite {
+                relative_path: "memory/imports/credential.md".into(),
+                contents: "token = sk-proj-abcdefghijklmnopqrstuvwxyz123456".into(),
+            }],
+        };
+
+        let result = persist_onboarding_home_write_plan(&home, &plan);
+        assert!(matches!(
+            result,
+            Err(OnboardingHomePersistenceError::SecretRejected)
+        ));
+        assert!(!home.join("memory/imports/credential.md").exists());
         fs::remove_dir_all(home).unwrap();
     }
 
