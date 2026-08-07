@@ -23,6 +23,7 @@ pub mod journal;
 pub mod kokoro;
 pub mod memory_index;
 pub mod memory_scan;
+pub mod memory_secret;
 pub mod model_acquisition_transport;
 pub mod model_install;
 pub mod model_install_native;
