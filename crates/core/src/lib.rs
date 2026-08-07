@@ -14,6 +14,8 @@ pub mod browser_control;
 pub mod cas;
 pub mod chat_grant;
 pub mod chat_profile;
+#[cfg(feature = "keyring")]
+pub mod chat_prompt;
 pub mod chat_resume;
 pub mod home;
 pub mod import_preview;
