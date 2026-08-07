@@ -28,6 +28,7 @@ pub mod model_acquisition_transport;
 pub mod model_install;
 pub mod model_install_native;
 pub mod owned_threads;
+pub mod permission_gate;
 pub mod session_thread;
 pub mod sidecar;
 pub mod thread_ownership;
