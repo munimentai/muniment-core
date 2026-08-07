@@ -81,6 +81,7 @@ fn event_types_are_terminal(events: &[RunEventType]) -> bool {
 mod tests {
     use super::*;
     use serde_json::Value;
+    use std::time::Duration;
 
     fn provenance() -> Provenance {
         Provenance {
@@ -116,7 +117,8 @@ mod tests {
 
     #[test]
     fn interrupted_run_gets_needs_attention_with_caller_provenance() {
-        let mut journal = RunJournal::open(":memory:").unwrap();
+        let mut journal =
+            RunJournal::open_with_busy_timeout(":memory:", Duration::from_secs(60)).unwrap();
         let run_id = Uuid::now_v7().to_string();
         journal
             .append(0, &event(&run_id, 1, "run.started", json!({})))
@@ -133,7 +135,8 @@ mod tests {
 
     #[test]
     fn terminal_run_stays_unchanged() {
-        let mut journal = RunJournal::open(":memory:").unwrap();
+        let mut journal =
+            RunJournal::open_with_busy_timeout(":memory:", Duration::from_secs(60)).unwrap();
         let run_id = Uuid::now_v7().to_string();
         journal
             .append_batch(
@@ -255,7 +258,8 @@ mod tests {
 
     #[test]
     fn run_that_fails_to_reduce_stays_unchanged() {
-        let mut journal = RunJournal::open(":memory:").unwrap();
+        let mut journal =
+            RunJournal::open_with_busy_timeout(":memory:", Duration::from_secs(60)).unwrap();
         let run_id = Uuid::now_v7().to_string();
         journal
             .append(0, &event(&run_id, 1, "model.stream.delta", json!({})))

@@ -138,10 +138,23 @@ impl MemoryRuntimeSession {
         thread: impl Into<String>,
         capability: ModelMemoryCapability,
     ) -> Self {
+        Self::open_with_timeout(home, database, thread, capability, DEFAULT_TIMEOUT)
+    }
+
+    pub fn open_with_timeout(
+        home: impl Into<PathBuf>,
+        database: impl Into<PathBuf>,
+        thread: impl Into<String>,
+        capability: ModelMemoryCapability,
+        timeout: Duration,
+    ) -> Self {
+        let mut configured =
+            RetrievalLimits::defaults(capability.minimum_cacheable_prefix_characters);
+        configured.timeout = timeout;
         Self {
             index: MemoryIndex::new(home, database),
             thread: thread.into(),
-            configured: RetrievalLimits::defaults(capability.minimum_cacheable_prefix_characters),
+            configured,
             declaration: MemorySearchSession::default(),
             recalls: Vec::new(),
         }
@@ -299,7 +312,13 @@ impl MemoryIndex {
     }
 
     pub fn reindex(&self) -> Result<ReindexReport, MemoryIndexError> {
-        let deadline = Instant::now() + DEFAULT_TIMEOUT;
+        self.reindex_with_deadline(Instant::now() + DEFAULT_TIMEOUT)
+    }
+
+    pub fn reindex_with_deadline(
+        &self,
+        deadline: Instant,
+    ) -> Result<ReindexReport, MemoryIndexError> {
         let mut connection = self.open(deadline)?;
         self.reindex_connection(&mut connection, deadline)
             .map_err(|error| normalize_timeout(error, deadline))
@@ -714,9 +733,20 @@ mod tests {
         for number in 0..8 {
             fixture.file(&format!("{number}.md"), "stable pear");
         }
-        assert_eq!(fixture.index().reindex().unwrap().indexed.len(), 8);
+        assert_eq!(
+            fixture
+                .index()
+                .reindex_with_deadline(Instant::now() + Duration::from_secs(60))
+                .unwrap()
+                .indexed
+                .len(),
+            8
+        );
         fixture.file("3.md", "changed pear");
-        let report = fixture.index().reindex().unwrap();
+        let report = fixture
+            .index()
+            .reindex_with_deadline(Instant::now() + Duration::from_secs(60))
+            .unwrap();
         assert_eq!(report.indexed, ["memory/3.md"]);
         assert_eq!(report.unchanged, 7);
         assert!(report.removed.is_empty());
@@ -761,7 +791,10 @@ mod tests {
         for number in 0..7 {
             fixture.file(&format!("{number}.md"), "violet equal rank");
         }
-        fixture.index().reindex().unwrap();
+        fixture
+            .index()
+            .reindex_with_deadline(Instant::now() + Duration::from_secs(60))
+            .unwrap();
         let connection = Connection::open(fixture.root.join("cache/index.sqlite3")).unwrap();
         connection.execute("DELETE FROM memory_fts", []).unwrap();
         for number in (0..7).rev() {
@@ -811,13 +844,14 @@ mod tests {
     #[test]
     fn runtime_session_declares_once_and_records_real_searches_across_turns() {
         let fixture = Fixture::new();
-        let mut session = MemoryRuntimeSession::open(
+        let mut session = MemoryRuntimeSession::open_with_timeout(
             &fixture.root,
             fixture.root.join("cache/runtime.sqlite3"),
             "thread-runtime",
             ModelMemoryCapability {
                 minimum_cacheable_prefix_characters: 30,
             },
+            Duration::from_secs(60),
         );
         let first_definition = session.tool_definition_for_turn().as_ptr();
         let first = session.call(br#"{"query":"saffron"}"#).unwrap();

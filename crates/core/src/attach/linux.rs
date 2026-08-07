@@ -1106,12 +1106,29 @@ pub fn run_authenticated_session_with_service<S: ThreadListService>(
     desktop_version: &str,
     service: &mut S,
 ) -> Result<(), AttachSessionError> {
+    run_authenticated_session_with_service_and_timeout(
+        stream,
+        credentials,
+        desktop_version,
+        service,
+        HELLO_TIMEOUT,
+    )
+}
+
+#[doc(hidden)]
+pub fn run_authenticated_session_with_service_and_timeout<S: ThreadListService>(
+    stream: UnixStream,
+    credentials: PeerCredentials,
+    desktop_version: &str,
+    service: &mut S,
+    timeout: Duration,
+) -> Result<(), AttachSessionError> {
     let mut random = |bytes: &mut [u8]| getrandom::fill(bytes).map_err(|_| ());
     run_authenticated_session_with_authorization(
         stream,
         credentials,
         desktop_version,
-        HELLO_TIMEOUT,
+        timeout,
         AuthorizationSessionDependencies {
             fill_random: &mut random,
             clock: SessionClock(Instant::now()),
@@ -1154,12 +1171,36 @@ pub fn run_authenticated_session_with_service_approvals_and_registry<
     approvals: W,
     registry: &LiveConnectionRegistry,
 ) -> Result<(), AttachSessionError> {
+    run_authenticated_session_with_service_approvals_registry_and_timeout(
+        stream,
+        credentials,
+        desktop_version,
+        service,
+        approvals,
+        registry,
+        HELLO_TIMEOUT,
+    )
+}
+
+#[doc(hidden)]
+pub fn run_authenticated_session_with_service_approvals_registry_and_timeout<
+    S: ThreadListService,
+    W: ApprovalWaiter,
+>(
+    stream: UnixStream,
+    credentials: PeerCredentials,
+    desktop_version: &str,
+    service: &mut S,
+    approvals: W,
+    registry: &LiveConnectionRegistry,
+    timeout: Duration,
+) -> Result<(), AttachSessionError> {
     let mut random = |bytes: &mut [u8]| getrandom::fill(bytes).map_err(|_| ());
     run_authenticated_session_with_authorization_and_registry(
         stream,
         credentials,
         desktop_version,
-        HELLO_TIMEOUT,
+        timeout,
         AuthorizationSessionDependencies {
             fill_random: &mut random,
             clock: SessionClock(Instant::now()),

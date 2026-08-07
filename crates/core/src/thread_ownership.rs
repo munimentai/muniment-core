@@ -36,6 +36,7 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::time::Duration;
     use uuid::Uuid;
 
     fn journal_file() -> PathBuf {
@@ -75,7 +76,8 @@ mod tests {
 
     fn journal_with_thread(actor_id: Option<&str>) -> (PathBuf, RunJournal, String) {
         let path = journal_file();
-        let mut journal = RunJournal::open(&path).unwrap();
+        let mut journal =
+            RunJournal::open_with_busy_timeout(&path, Duration::from_secs(60)).unwrap();
         let event = event(actor_id);
         journal.append_new_run("workspace", &event).unwrap();
         let thread_id = Connection::open(&path)

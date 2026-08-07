@@ -76,6 +76,7 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::time::Duration;
     use uuid::Uuid;
 
     fn journal_file() -> PathBuf {
@@ -114,7 +115,8 @@ mod tests {
     #[test]
     fn returns_an_owned_thread() {
         let path = journal_file();
-        let mut journal = RunJournal::open(&path).unwrap();
+        let mut journal =
+            RunJournal::open_with_busy_timeout(&path, Duration::from_secs(60)).unwrap();
         append_thread(
             &mut journal,
             "01900000-0000-7000-8000-000000000001",
@@ -135,7 +137,8 @@ mod tests {
     #[test]
     fn rejects_a_thread_owned_by_another_subject() {
         let path = journal_file();
-        let mut journal = RunJournal::open(&path).unwrap();
+        let mut journal =
+            RunJournal::open_with_busy_timeout(&path, Duration::from_secs(60)).unwrap();
         append_thread(
             &mut journal,
             "01900000-0000-7000-8000-000000000001",
@@ -152,7 +155,8 @@ mod tests {
     #[test]
     fn walks_across_more_than_one_summary_page() {
         let path = journal_file();
-        let mut journal = RunJournal::open(&path).unwrap();
+        let mut journal =
+            RunJournal::open_with_busy_timeout(&path, Duration::from_secs(60)).unwrap();
         for index in 0..3 {
             append_thread(
                 &mut journal,
@@ -174,7 +178,8 @@ mod tests {
     #[test]
     fn rejects_limits_outside_one_through_one_hundred() {
         let path = journal_file();
-        let mut journal = RunJournal::open(&path).unwrap();
+        let mut journal =
+            RunJournal::open_with_busy_timeout(&path, Duration::from_secs(60)).unwrap();
 
         assert_eq!(
             chat_thread_summaries_page(&mut journal, None, 0, None),

@@ -198,8 +198,25 @@ pub fn revoke_token(
     token: &str,
     token_type_hint: &str,
 ) -> Result<(), AuthError> {
+    revoke_token_with_timeout(
+        revocation_endpoint,
+        client_id,
+        token,
+        token_type_hint,
+        HTTP_TIMEOUT,
+    )
+}
+
+#[doc(hidden)]
+pub fn revoke_token_with_timeout(
+    revocation_endpoint: &str,
+    client_id: &str,
+    token: &str,
+    token_type_hint: &str,
+    timeout: Duration,
+) -> Result<(), AuthError> {
     match ureq::post(revocation_endpoint)
-        .timeout(HTTP_TIMEOUT)
+        .timeout(timeout)
         .send_form(&[
             ("token", token),
             ("token_type_hint", token_type_hint),

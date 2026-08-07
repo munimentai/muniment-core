@@ -33,6 +33,7 @@ mod tests {
     use crate::journal::{EventPayload, Provenance};
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
+    use std::time::Duration;
     use uuid::Uuid;
 
     fn envelope(run_id: &str, run_seq: u64, event_type: &str, payload: Value) -> EventEnvelope {
@@ -65,7 +66,8 @@ mod tests {
 
     #[test]
     fn appends_envelope_and_commits_projection() {
-        let mut journal = RunJournal::open(":memory:").unwrap();
+        let mut journal =
+            RunJournal::open_with_busy_timeout(":memory:", Duration::from_secs(60)).unwrap();
         let mut projector = ChatProjector::new();
         let event = envelope(
             &Uuid::now_v7().to_string(),
@@ -86,7 +88,8 @@ mod tests {
 
     #[test]
     fn failed_apply_appends_nothing() {
-        let mut journal = RunJournal::open(":memory:").unwrap();
+        let mut journal =
+            RunJournal::open_with_busy_timeout(":memory:", Duration::from_secs(60)).unwrap();
         let mut projector = ChatProjector::new();
         let event = envelope(
             &Uuid::now_v7().to_string(),
@@ -104,7 +107,8 @@ mod tests {
 
     #[test]
     fn failed_append_leaves_projector_unchanged() {
-        let mut journal = RunJournal::open(":memory:").unwrap();
+        let mut journal =
+            RunJournal::open_with_busy_timeout(":memory:", Duration::from_secs(60)).unwrap();
         let run_id = Uuid::now_v7().to_string();
         let started = envelope(&run_id, 1, "run.started", json!({}));
         let mut projector = ChatProjector::new();

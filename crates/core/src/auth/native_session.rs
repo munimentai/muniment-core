@@ -307,10 +307,20 @@ pub fn ensure_native_session(
     base_url: &str,
     now_unix_seconds: u64,
 ) -> Result<FreshNativeSession, FreshNativeSessionError> {
+    ensure_native_session_with_timeout(store, base_url, now_unix_seconds, NETWORK_TIMEOUT)
+}
+
+#[doc(hidden)]
+pub fn ensure_native_session_with_timeout(
+    store: &dyn NativeCredentialStore,
+    base_url: &str,
+    now_unix_seconds: u64,
+    timeout: Duration,
+) -> Result<FreshNativeSession, FreshNativeSessionError> {
     ensure_fresh_native_session(
         store,
-        &UreqTokenTransport::new(NETWORK_TIMEOUT),
-        &UreqSessionTransport::new(NETWORK_TIMEOUT),
+        &UreqTokenTransport::new(timeout),
+        &UreqSessionTransport::new(timeout),
         base_url,
         now_unix_seconds,
         REFRESH_SKEW,

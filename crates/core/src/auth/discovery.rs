@@ -23,6 +23,14 @@ pub struct ProviderMetadata {
 /// Plain-HTTP issuers are allowed only on loopback (the in-test mock IdP);
 /// everything else must be HTTPS.
 pub fn discover(issuer: &str) -> Result<ProviderMetadata, AuthError> {
+    discover_with_timeout(issuer, HTTP_TIMEOUT)
+}
+
+#[doc(hidden)]
+pub fn discover_with_timeout(
+    issuer: &str,
+    timeout: Duration,
+) -> Result<ProviderMetadata, AuthError> {
     let issuer = issuer.trim_end_matches('/');
     if !issuer.starts_with("https://") && !is_loopback_http(issuer) {
         return Err(AuthError::Config(format!(
@@ -31,7 +39,7 @@ pub fn discover(issuer: &str) -> Result<ProviderMetadata, AuthError> {
     }
     let url = format!("{issuer}/.well-known/openid-configuration");
     let meta: ProviderMetadata = ureq::get(&url)
-        .timeout(HTTP_TIMEOUT)
+        .timeout(timeout)
         .call()
         .map_err(|e| AuthError::Discovery(format!("fetching {url}: {e}")))?
         .into_json()
@@ -73,7 +81,8 @@ mod tests {
 
     #[test]
     fn discover_rejects_non_loopback_http_without_touching_the_network() {
-        let err = discover("http://api.muniment.ai").unwrap_err();
+        let err =
+            discover_with_timeout("http://api.muniment.ai", Duration::from_secs(60)).unwrap_err();
         assert!(matches!(err, AuthError::Config(_)));
     }
 }

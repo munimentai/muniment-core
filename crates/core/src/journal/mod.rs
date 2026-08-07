@@ -683,6 +683,14 @@ impl RunJournal {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, JournalError> {
+        Self::open_with_busy_timeout(path, BUSY_TIMEOUT)
+    }
+
+    #[doc(hidden)]
+    pub fn open_with_busy_timeout(
+        path: impl AsRef<Path>,
+        busy_timeout: Duration,
+    ) -> Result<Self, JournalError> {
         let path = path.as_ref();
         let file_path = (path != Path::new(":memory:") && !path.as_os_str().is_empty())
             .then(|| normalized_path(path));
@@ -700,7 +708,7 @@ impl RunJournal {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
-        connection.busy_timeout(BUSY_TIMEOUT)?;
+        connection.busy_timeout(busy_timeout)?;
         let mut current_version = version;
         while current_version < SCHEMA_VERSION {
             let migration = MIGRATIONS
@@ -2064,11 +2072,18 @@ fn load_or_create_cursor_key(connection: &Connection) -> Result<[u8; 32], Journa
 }
 
 pub(crate) fn open_journal_connection(path: &Path) -> Result<Connection, JournalError> {
+    open_journal_connection_with_busy_timeout(path, BUSY_TIMEOUT)
+}
+
+pub(crate) fn open_journal_connection_with_busy_timeout(
+    path: &Path,
+    busy_timeout: Duration,
+) -> Result<Connection, JournalError> {
     let connection = Connection::open(path)?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "FULL")?;
-    connection.busy_timeout(BUSY_TIMEOUT)?;
+    connection.busy_timeout(busy_timeout)?;
     Ok(connection)
 }
 

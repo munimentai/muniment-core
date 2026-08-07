@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::cas::{CasError, LocalCas};
 use crate::journal::{JournalError, RunJournal};
@@ -42,6 +43,17 @@ impl ChatProfile {
         let cas = LocalCas::open(&self.cas_directory()).map_err(ChatProfileError::CasOpen)?;
         Ok((journal, cas))
     }
+
+    pub fn open_storage_with_busy_timeout(
+        &self,
+        busy_timeout: Duration,
+    ) -> Result<(RunJournal, LocalCas), ChatProfileError> {
+        self.create_directories()?;
+        let journal = RunJournal::open_with_busy_timeout(self.journal_path(), busy_timeout)
+            .map_err(ChatProfileError::JournalOpen)?;
+        let cas = LocalCas::open(&self.cas_directory()).map_err(ChatProfileError::CasOpen)?;
+        Ok((journal, cas))
+    }
 }
 
 #[derive(Debug)]
@@ -76,6 +88,8 @@ impl Error for ChatProfileError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_BUSY_TIMEOUT: Duration = Duration::from_secs(60);
 
     #[test]
     fn names_chat_storage_paths() {
@@ -131,7 +145,9 @@ mod tests {
         ));
         let profile = ChatProfile::new(&directory);
 
-        let (_journal, _cas) = profile.open_storage().unwrap();
+        let (_journal, _cas) = profile
+            .open_storage_with_busy_timeout(TEST_BUSY_TIMEOUT)
+            .unwrap();
 
         assert!(profile.journal_path().is_file());
         assert!(profile.cas_directory().join("objects").is_dir());
@@ -149,7 +165,7 @@ mod tests {
         std::fs::create_dir_all(profile.journal_path()).unwrap();
 
         assert!(matches!(
-            profile.open_storage(),
+            profile.open_storage_with_busy_timeout(TEST_BUSY_TIMEOUT),
             Err(ChatProfileError::JournalOpen(_))
         ));
         std::fs::remove_dir_all(directory).unwrap();
@@ -166,7 +182,7 @@ mod tests {
         std::fs::write(profile.cas_directory(), b"not a directory").unwrap();
 
         assert!(matches!(
-            profile.open_storage(),
+            profile.open_storage_with_busy_timeout(TEST_BUSY_TIMEOUT),
             Err(ChatProfileError::CasOpen(_))
         ));
         std::fs::remove_dir_all(directory).unwrap();
