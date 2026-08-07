@@ -1,5 +1,22 @@
-use muniment_core::attach::{PreparedHandoffError, PreparedHandoffSlot};
+use muniment_core::attach::{mint_handoff_nonce, PreparedHandoffError, PreparedHandoffSlot};
 use std::time::{Duration, Instant};
+
+#[test]
+fn minted_nonces_are_lowercase_hex_and_accepted() {
+    let nonce = mint_handoff_nonce().unwrap();
+
+    assert_eq!(nonce.len(), 64);
+    assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(nonce, nonce.to_ascii_lowercase());
+    PreparedHandoffSlot::new()
+        .prepare(nonce, 1, Instant::now())
+        .unwrap();
+}
+
+#[test]
+fn each_mint_returns_a_different_nonce() {
+    assert_ne!(mint_handoff_nonce().unwrap(), mint_handoff_nonce().unwrap());
+}
 
 #[test]
 fn accepts_a_valid_preparation_and_matches_only_its_nonce() {

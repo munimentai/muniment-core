@@ -6,6 +6,33 @@ use std::time::{Duration, Instant};
 const MAX_HANDOFF_NONCE_BYTES: usize = 128;
 const MAX_HANDOFF_DEADLINE_MS: u64 = 60_000;
 
+/// A failure to mint a migration handoff nonce.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HandoffNonceRandomnessError;
+
+impl fmt::Display for HandoffNonceRandomnessError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("handoff nonce randomness is unavailable")
+    }
+}
+
+impl std::error::Error for HandoffNonceRandomnessError {}
+
+/// Mints a single-use migration handoff nonce.
+pub fn mint_handoff_nonce() -> Result<String, HandoffNonceRandomnessError> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).map_err(|_| HandoffNonceRandomnessError)?;
+
+    let mut nonce = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        nonce.push(HEX[(byte >> 4) as usize] as char);
+        nonce.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(nonce)
+}
+
 /// A failure to prepare a migration handoff.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PreparedHandoffError {
