@@ -181,6 +181,24 @@ fn pi_resume(args: Vec<String>) {
                     "{}",
                     serde_json::json!({"type":"response", "command":"prompt", "success":true, "id":request["id"]})
                 );
+                if let Ok(query) = std::env::var("PI_RESUME_STUB_MEMORY_QUERY") {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "type":"extension_ui_request", "id":"memory-1", "method":"editor",
+                            "title":"muniment:memory-search",
+                            "prefill":serde_json::json!({"query":query}).to_string()
+                        })
+                    );
+                } else {
+                    println!(
+                        "{}",
+                        serde_json::json!({"type":"message_update", "assistantMessageEvent":{"type":"text_delta", "delta":" resumed"}})
+                    );
+                    println!("{}", serde_json::json!({"type":"agent_end"}));
+                }
+            }
+            "extension_ui_response" => {
                 println!(
                     "{}",
                     serde_json::json!({"type":"message_update", "assistantMessageEvent":{"type":"text_delta", "delta":" resumed"}})
