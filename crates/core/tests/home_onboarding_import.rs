@@ -1,5 +1,6 @@
 use chrono::NaiveDate;
 use muniment_core::{
+    assistant_text::Rule,
     home::{
         compile_onboarding_home_write_plan, persist_onboarding_home_write_plan, scaffold_home,
         HomeWrite, OnboardingHomePersistenceError, OnboardingHomeWritePlan,
@@ -7,6 +8,7 @@ use muniment_core::{
         ONBOARDING_IMPORT_MAX_ENTRIES, ONBOARDING_IMPORT_MAX_TOTAL_BYTES,
     },
     import_preview::{EntryKind, ExtractedEntry},
+    memory_secret::reject_memory_secret,
 };
 use std::{
     fs,
@@ -147,6 +149,56 @@ fn enforces_entry_count_and_total_byte_bounds() {
         compile_onboarding_home_write_plan(&oversized_aggregate, date),
         Err(OnboardingHomeWritePlanError::DocumentBytesExceeded)
     );
+}
+
+#[test]
+fn rejects_an_approved_entry_that_carries_a_json_web_token() {
+    let date = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+    // The segments repeat one character each, so no scanner reads this file as a secret.
+    let token = format!("{}.{}.{}", "A".repeat(20), "B".repeat(18), "C".repeat(22));
+    let text = format!("{token}\n");
+    let carrier = entry("notes.md", "assistant-export:notes.md", &text);
+    assert_eq!(
+        reject_memory_secret(&text).unwrap_err().rule(),
+        Some(Rule::SecretJwt)
+    );
+
+    let error =
+        compile_onboarding_home_write_plan(std::slice::from_ref(&carrier), date).unwrap_err();
+
+    assert_eq!(error, OnboardingHomeWritePlanError::SecretRejected);
+    let message = error.to_string();
+    for segment in token.split('.') {
+        assert!(!message.contains(segment), "{message}");
+    }
+
+    let clean = entry(
+        "clean.md",
+        "assistant-export:clean.md",
+        "The archive closes.\n",
+    );
+    assert_eq!(
+        compile_onboarding_home_write_plan(&[clean, carrier], date),
+        Err(OnboardingHomeWritePlanError::SecretRejected)
+    );
+}
+
+#[test]
+fn compiles_an_approved_entry_that_carries_no_secret() {
+    let date = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+    let clean = entry(
+        "clean.md",
+        "assistant-export:clean.md",
+        "The archive closes.\n",
+    );
+
+    let plan = compile_onboarding_home_write_plan(&[clean], date).unwrap();
+
+    assert_eq!(plan.writes().len(), 1);
+    assert!(plan.writes()[0]
+        .relative_path
+        .starts_with("memory/imports/"));
+    assert!(plan.writes()[0].contents.ends_with("The archive closes.\n"));
 }
 
 #[test]

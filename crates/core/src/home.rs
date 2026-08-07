@@ -11,7 +11,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use crate::import_preview::ExtractedEntry;
+use crate::{import_preview::ExtractedEntry, memory_secret::reject_memory_secret};
 
 const CONFIG_FILE: &str = "home.json";
 const HOME_DIRECTORIES: [&str; 4] = ["memory", "agents", "projects", "sessions"];
@@ -86,6 +86,7 @@ pub enum OnboardingHomeWritePlanError {
     DocumentBytesExceeded,
     DestinationCollision,
     TotalBytesExceeded,
+    SecretRejected,
 }
 
 impl fmt::Display for OnboardingHomeWritePlanError {
@@ -98,6 +99,8 @@ impl fmt::Display for OnboardingHomeWritePlanError {
             Self::DocumentBytesExceeded => "An onboarding import document is too large.",
             Self::DestinationCollision => "The onboarding import destinations collide.",
             Self::TotalBytesExceeded => "The onboarding import plan is too large.",
+            // The message names no matched text, so no secret reaches a log.
+            Self::SecretRejected => "An onboarding import entry contains a secret.",
         };
         formatter.write_str(message)
     }
@@ -527,6 +530,12 @@ pub fn compile_onboarding_home_write_plan<T: OnboardingImportTimestamp>(
                 .checked_add(entry.text.len())
                 .ok_or(OnboardingHomeWritePlanError::DocumentBytesExceeded)?,
         )?;
+    }
+
+    // Every byte bound holds by now, so each scan reads a bounded document.
+    for entry in approved_entries {
+        reject_memory_secret(&entry.text)
+            .map_err(|_| OnboardingHomeWritePlanError::SecretRejected)?;
     }
 
     let mut unique_destinations = BTreeSet::new();
