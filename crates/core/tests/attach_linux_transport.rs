@@ -1,8 +1,9 @@
 #![cfg(target_os = "linux")]
 
 use muniment_core::attach::linux::{
-    run_authenticated_session_with, AttachAcceptError, AttachFilesystem, AttachTransport,
-    AttachTransportError, PeerCredentials,
+    attach_listener_start_diagnostic, run_authenticated_session_with, AttachAcceptError,
+    AttachFilesystem, AttachListenerStartFailure, AttachTransport, AttachTransportError,
+    PeerCredentials,
 };
 use muniment_core::attach::{
     decode_frame, encode_frame, Client, Hello, Id, Protocol, VersionRange, Welcome,
@@ -18,6 +19,31 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn maps_attach_listener_start_failures_to_distinct_diagnostics() {
+    let diagnostics = [
+        attach_listener_start_diagnostic(AttachListenerStartFailure::Filesystem),
+        attach_listener_start_diagnostic(AttachListenerStartFailure::InstanceLock),
+        attach_listener_start_diagnostic(AttachListenerStartFailure::Bind),
+    ];
+
+    assert_eq!(
+        diagnostics,
+        [
+            "muniment-desktop: attach listener filesystem setup failed",
+            "muniment-desktop: attach listener did not get the instance lock. This is expected for a second desktop instance",
+            "muniment-desktop: attach listener bind failed",
+        ]
+    );
+    assert_eq!(
+        diagnostics
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        3
+    );
+}
 
 struct TestDirectory(PathBuf);
 

@@ -48,6 +48,27 @@ pub const MAX_RUN_START_TEXT_LENGTH: usize = 32 * 1024;
 pub const MAX_RUN_START_CONTEXT_LENGTH: usize = 64 * 1024;
 pub const MAX_PERMISSION_GATE_ID_LENGTH: usize = 256;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachListenerStartFailure {
+    Filesystem,
+    InstanceLock,
+    Bind,
+}
+
+pub fn attach_listener_start_diagnostic(reason: AttachListenerStartFailure) -> &'static str {
+    match reason {
+        AttachListenerStartFailure::Filesystem => {
+            "muniment-desktop: attach listener filesystem setup failed"
+        }
+        AttachListenerStartFailure::InstanceLock => {
+            "muniment-desktop: attach listener did not get the instance lock. This is expected for a second desktop instance"
+        }
+        AttachListenerStartFailure::Bind => {
+            "muniment-desktop: attach listener bind failed"
+        }
+    }
+}
+
 /// A verified, pinned filesystem boundary for the Linux attach endpoint.
 #[derive(Debug)]
 pub struct AttachFilesystem {
