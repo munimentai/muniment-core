@@ -12,7 +12,7 @@ edition = "2021"
 # real HTTPS control plane.
 
 [features]
-# rustls (ring provider) via ureq — turned on by the desktop crate.
+# The desktop crate turns on rustls with the ring provider through ureq.
 tls = ["ureq/tls", "ureq/native-certs", "ureq/proxy-from-env"]
 keyring = ["dep:keyring"]
 network-tests = ["tls"]

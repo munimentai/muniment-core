@@ -154,8 +154,8 @@ fn refuses_a_live_listener_and_recovers_a_stale_socket() {
     drop(stale);
     // Running as root, the fork in `rejects_a_different_uid_peer_…` duplicates every
     // descriptor open in this process, so a listener dropped here stays connectable
-    // until that child exits and the stale probe reports it live. Retry the probe —
-    // which mutates nothing on that path — without weakening the production
+    // until that child exits and the stale probe reports it live. Retry the probe,
+    // which mutates nothing on that path, without weakening the production
     // live-listener check asserted above.
     let deadline = Instant::now() + Duration::from_secs(1);
     let mut recovered = None;

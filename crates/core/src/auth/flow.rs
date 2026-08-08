@@ -22,8 +22,8 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct OidcConfig {
     /// e.g. `https://api.muniment.ai`
     pub issuer: String,
-    /// Public-client id registered on the control plane (no secret — this
-    /// is a native app, PKCE is the proof).
+    /// Public-client id registered on the control plane. This native app has
+    /// no secret, so PKCE supplies the proof.
     pub client_id: String,
     /// Space-separated; `offline_access` requests a refresh token.
     pub scopes: String,
@@ -45,7 +45,7 @@ struct TokenResponse {
 /// Full interactive sign-in: discovery → loopback listener → browser →
 /// callback (state-checked) → code exchange. `open_browser` receives the
 /// authorization URL; the app hands it to the OS, tests drive it
-/// programmatically. Returns the tokens — persisting them is the caller's
+/// programmatically. Returns the tokens. Persisting them is the caller's
 /// job, via a [`TokenStore`].
 pub fn run_sign_in(
     cfg: &OidcConfig,

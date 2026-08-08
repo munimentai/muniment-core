@@ -83,7 +83,7 @@ pub use store::{status, AuthStatus, InMemoryTokenStore, TokenSet, TokenStore};
 use std::fmt;
 
 /// Everything that can go wrong during sign-in/out. Messages describe the
-/// failure only — by design they never embed token or code values.
+/// failure only. They never embed token or code values by design.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthError {
     /// Bad or unusable client configuration / local environment.

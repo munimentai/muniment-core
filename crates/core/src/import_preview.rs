@@ -3,7 +3,7 @@
 //! This slice deliberately does the *least* that a later import needs: it
 //! inspects one explicitly chosen archive and returns a deterministic manifest
 //! of its supported text entries. Nothing here extracts a member, writes to
-//! disk, walks parent or home directories, or invokes the required model —
+//! disk, walks parent or home directories, or invokes the required model.
 //! automatic discovery of `~/.claude`, `~/.codex`, Cursor, or Cline is
 //! intentionally out of scope so this cannot become a background disk walk.
 //!

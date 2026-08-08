@@ -1,6 +1,6 @@
 //! End-to-end auth-flow tests against an in-process mock IdP: a canned
 //! discovery document plus token/revocation endpoints that enforce PKCE the
-//! way a real provider would. The test itself plays the browser — it parses
+//! way a real provider would. The test itself plays the browser. It parses
 //! the authorization URL and performs the loopback redirect. No network
 //! beyond 127.0.0.1.
 
@@ -445,7 +445,7 @@ fn respond(stream: &mut TcpStream, code: u16, body: &str) {
     let _ = stream.flush();
 }
 
-/// Bare GET, ignoring the response — the loopback redirect leg.
+/// Bare GET that ignores the response for the loopback redirect leg.
 fn http_get(url: &str) {
     let rest = url.strip_prefix("http://").expect("http url");
     let (hostport, path_query) = rest.split_once('/').expect("path");

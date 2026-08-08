@@ -1,4 +1,4 @@
-//! Minimal percent-encoding helpers — enough for OAuth query strings
+//! Minimal percent-encoding helpers for OAuth query strings
 //! without pulling a full URL crate into the dependency tree.
 
 /// Percent-encode a query component: everything except RFC 3986 unreserved

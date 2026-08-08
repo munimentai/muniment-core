@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::AuthError;
 
 /// Tokens held after a successful sign-in. Serialized as one JSON blob into
-/// the platform keychain — never onto disk, never into logs (the manual
+/// the platform keychain, never onto disk or into logs (the manual
 /// `Debug` impl redacts token material; keep it that way).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TokenSet {

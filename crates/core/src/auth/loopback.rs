@@ -13,7 +13,7 @@ pub struct RedirectCatcher {
 }
 
 impl RedirectCatcher {
-    /// Bind an ephemeral port on 127.0.0.1 only — nothing off-machine can
+    /// Bind an ephemeral port on 127.0.0.1 only. Nothing off-machine can
     /// reach the callback.
     pub fn bind() -> Result<Self, AuthError> {
         let listener = TcpListener::bind(("127.0.0.1", 0))

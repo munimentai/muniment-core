@@ -604,7 +604,7 @@ mod tests {
     const KNOWN_MANIFESTS: [&AsrArtifactManifest; 2] = [&MANIFEST, &UPDATE_MANIFEST];
 
     // A shared identity and revision published first without, then with, an
-    // additional VAD artifact — modelling a legacy four-file install upgraded to
+    // additional VAD artifact. This models a legacy four-file install upgraded to
     // the complete VAD-bearing set by a newer application version.
     const LEGACY_MANIFEST: AsrArtifactManifest = AsrArtifactManifest {
         identity: "parakeet-legacy",
