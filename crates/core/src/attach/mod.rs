@@ -9,6 +9,7 @@ mod companion_registry;
 mod credential;
 mod cursor;
 mod handoff;
+mod handoff_probe;
 mod idempotency;
 #[cfg(target_os = "linux")]
 pub mod linux;
@@ -31,6 +32,7 @@ pub use cursor::{
     MAX_RUN_STREAM_WINDOW_TEXT_BYTES,
 };
 pub use handoff::*;
+pub use handoff_probe::*;
 pub use idempotency::*;
 #[cfg(target_os = "linux")]
 pub use migration_authority::*;
