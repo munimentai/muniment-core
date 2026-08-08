@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 pub const DEFAULT_ITEM_CAP: usize = 5;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(250);
+pub const DEFAULT_BUILD_TIMEOUT: Duration = Duration::from_secs(5);
 const HOME_DIRECTORIES: [&str; 4] = ["agents", "memory", "projects", "sessions"];
 const MAX_FILES: usize = 10_000;
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
@@ -164,6 +165,14 @@ impl MemoryRuntimeSession {
         self.declaration.tool_definition_for_turn()
     }
 
+    pub fn build(&self) -> Result<ReindexReport, MemoryIndexError> {
+        self.build_with_timeout(DEFAULT_BUILD_TIMEOUT)
+    }
+
+    pub fn build_with_timeout(&self, timeout: Duration) -> Result<ReindexReport, MemoryIndexError> {
+        self.index.reindex_with_deadline(Instant::now() + timeout)
+    }
+
     pub fn tool_declaration_count(&self) -> usize {
         self.declaration.declaration_count()
     }
@@ -260,7 +269,7 @@ impl MemoryIndex {
         }
         let deadline = Instant::now() + limits.timeout;
         let (items, state) = self
-            .refreshed_cache(deadline, |connection, _| {
+            .read_cache(deadline, |connection| {
                 check_deadline(deadline)?;
                 let state =
                     source_state(connection).map_err(|error| sqlite_error(error, deadline))?;
@@ -284,7 +293,24 @@ impl MemoryIndex {
     }
 
     pub fn reindex(&self) -> Result<ReindexReport, MemoryIndexError> {
-        self.reindex_with_deadline(Instant::now() + DEFAULT_TIMEOUT)
+        self.reindex_with_deadline(Instant::now() + DEFAULT_BUILD_TIMEOUT)
+    }
+
+    /// Opens the cache and runs `read` without scanning the Home. If SQLite
+    /// reports damage, this replaces the rebuildable cache and retries once.
+    fn read_cache<T>(
+        &self,
+        deadline: Instant,
+        read: impl Fn(&Connection) -> Result<T, MemoryIndexError>,
+    ) -> Result<T, MemoryIndexError> {
+        match self.open(deadline).and_then(|connection| read(&connection)) {
+            Err(error) if damaged_cache(&error) => {
+                self.remove_cache()?;
+                let connection = self.open(deadline)?;
+                read(&connection)
+            }
+            result => result,
+        }
     }
 
     pub fn reindex_with_deadline(
@@ -307,14 +333,18 @@ impl MemoryIndex {
     ) -> Result<T, MemoryIndexError> {
         match self.open_reindex_and_read(deadline, &read) {
             Err(error) if damaged_cache(&error) => {
-                match fs::remove_file(&self.database) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(MemoryIndexError::Io(error)),
-                }
+                self.remove_cache()?;
                 self.open_reindex_and_read(deadline, &read)
             }
             result => result,
+        }
+    }
+
+    fn remove_cache(&self) -> Result<(), MemoryIndexError> {
+        match fs::remove_file(&self.database) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(MemoryIndexError::Io(error)),
         }
     }
 
@@ -405,9 +435,7 @@ impl MemoryIndex {
     }
 }
 
-/// Reads the ranked matches under both caps. This runs on the same connection
-/// the reindex just wrote, so a damaged fts5 index fails here and reaches the
-/// rebuild.
+/// Reads the ranked matches under both caps.
 fn matching_items(
     connection: &Connection,
     query: &str,
@@ -786,21 +814,18 @@ mod tests {
     }
 
     #[test]
-    fn deleted_database_rebuilds_from_files() {
+    fn deleted_database_reads_as_an_empty_cache() {
         let fixture = Fixture::new();
         fixture.file("one.md", "orchid fact");
         fixture.file("two.md", "another orchid fact");
-        let before = fixture
-            .index()
-            .search("thread", "orchid", Fixture::limits(5, 1000), None)
-            .unwrap();
+        fixture.index().reindex().unwrap();
         fs::remove_file(fixture.root.join("cache/index.sqlite3")).unwrap();
         let after = fixture
             .index()
             .search("thread", "orchid", Fixture::limits(5, 1000), None)
             .unwrap();
-        assert_eq!(before, after);
-        assert_eq!(after.items.len(), 2);
+        assert!(after.items.is_empty());
+        assert!(after.recall.files.is_empty());
     }
 
     #[test]
@@ -821,15 +846,16 @@ mod tests {
         let mut timeout = Duration::from_millis(1);
         let mut timeouts = 0;
         let result = loop {
-            let limits = RetrievalLimits {
-                timeout,
-                ..Fixture::limits(5, 1_000)
-            };
             match fixture
                 .index()
-                .search("thread", "lantern beacon", limits, None)
+                .reindex_with_deadline(Instant::now() + timeout)
             {
-                Ok(result) => break result,
+                Ok(_) => {
+                    break fixture
+                        .index()
+                        .search("thread", "lantern beacon", Fixture::limits(5, 1_000), None)
+                        .unwrap()
+                }
                 Err(MemoryIndexError::TimedOut) => {
                     timeouts += 1;
                     assert!(timeouts < 15, "the index never built within the ratchet");
@@ -889,6 +915,10 @@ mod tests {
             .query_row("SELECT count(*) FROM memory_files", [], |row| row.get(0))
             .unwrap();
         assert_eq!(rows, 1, "the stopped build committed part of its work");
+        let result = index
+            .search("thread", "lantern beacon", Fixture::limits(5, 1_000), None)
+            .unwrap();
+        assert_eq!(result.recall.files, ["memory/first.md"]);
 
         let report = index
             .reindex_with_deadline(Instant::now() + Duration::from_secs(60))
@@ -899,14 +929,11 @@ mod tests {
     }
 
     #[test]
-    fn damaged_cache_rebuilds_on_the_next_search() {
+    fn damaged_cache_recovers_as_an_empty_cache() {
         let fixture = Fixture::new();
         fixture.file("one.md", "cinnabar fact");
         let database = fixture.root.join("cache/index.sqlite3");
-        fixture
-            .index()
-            .search("thread", "cinnabar", Fixture::limits(5, 1_000), None)
-            .unwrap();
+        fixture.index().reindex().unwrap();
         fs::write(&database, b"this file is not a database").unwrap();
 
         let result = fixture
@@ -914,26 +941,16 @@ mod tests {
             .search("thread", "cinnabar", Fixture::limits(5, 1_000), None)
             .unwrap();
 
-        assert_eq!(
-            result
-                .items
-                .iter()
-                .map(|item| item.path.as_str())
-                .collect::<Vec<_>>(),
-            ["memory/one.md"]
-        );
+        assert!(result.items.is_empty());
         assert!(database.exists());
     }
 
     #[test]
-    fn damaged_search_index_rebuilds_on_the_next_search() {
+    fn damaged_search_index_recovers_as_an_empty_cache() {
         let fixture = Fixture::new();
         fixture.file("one.md", "juniper fact");
         let database = fixture.root.join("cache/index.sqlite3");
-        fixture
-            .index()
-            .search("thread", "juniper", Fixture::limits(5, 1_000), None)
-            .unwrap();
+        fixture.index().reindex().unwrap();
         // A crash can damage the fts5 shadow tables alone. Every hash then still
         // matches, so the reindex writes nothing and only the query fails.
         let connection = Connection::open(&database).unwrap();
@@ -947,15 +964,8 @@ mod tests {
             .search("thread", "juniper", Fixture::limits(5, 1_000), None)
             .unwrap();
 
-        assert_eq!(
-            result
-                .items
-                .iter()
-                .map(|item| item.path.as_str())
-                .collect::<Vec<_>>(),
-            ["memory/one.md"]
-        );
-        assert_eq!(result.recall.files, ["memory/one.md"]);
+        assert!(result.items.is_empty());
+        assert!(result.recall.files.is_empty());
         assert!(database.exists());
     }
 
@@ -993,6 +1003,7 @@ mod tests {
                 &format!("cobalt {}", "x".repeat(100)),
             );
         }
+        fixture.index().reindex().unwrap();
         let result = fixture
             .index()
             .search("thread", "cobalt", Fixture::limits(3, 47), None)
@@ -1096,6 +1107,33 @@ mod tests {
         assert!(first.items.is_empty());
         assert_eq!(session.recall_records(), &[first.recall, second.recall]);
         assert_eq!(session.recall_records()[0].character_budget, 30);
+    }
+
+    #[test]
+    fn session_search_does_not_index_a_file_written_after_build() {
+        let fixture = Fixture::new();
+        fixture.file("before.md", "saffron before build");
+        let mut session = MemoryRuntimeSession::open(
+            &fixture.root,
+            fixture.root.join("cache/runtime.sqlite3"),
+            "thread-runtime",
+            ModelMemoryCapability {
+                minimum_cacheable_prefix_characters: 1_000,
+            },
+        );
+        session.build().unwrap();
+        fixture.file("after.md", "saffron after build");
+
+        let result = session.call(br#"{"query":"saffron"}"#).unwrap();
+
+        assert_eq!(
+            result
+                .items
+                .iter()
+                .map(|item| item.path.as_str())
+                .collect::<Vec<_>>(),
+            ["memory/before.md"]
+        );
     }
 
     #[test]
