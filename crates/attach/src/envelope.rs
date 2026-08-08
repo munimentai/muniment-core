@@ -235,6 +235,7 @@ pub enum ErrorCode {
     ThreadNotFound,
     Unauthorized,
     UnsupportedOperation,
+    MigrationNotReady,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -426,6 +427,8 @@ pub enum ErrorMessage {
     Unauthorized,
     #[serde(rename = "The operation is not supported.")]
     UnsupportedOperation,
+    #[serde(rename = "The desktop cannot hand off ownership yet.")]
+    MigrationNotReady,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -515,6 +518,15 @@ impl ProtocolError {
         )
     }
 
+    pub fn migration_not_ready() -> Self {
+        let mut error = Self::simple(
+            ErrorCode::MigrationNotReady,
+            ErrorMessage::MigrationNotReady,
+        );
+        error.retryable = true;
+        error
+    }
+
     fn simple(code: ErrorCode, message: ErrorMessage) -> Self {
         Self {
             code,
@@ -573,6 +585,7 @@ impl<'de> Deserialize<'de> for ProtocolError {
             (ErrorCode::ThreadNotFound, None, None) => Self::thread_not_found(),
             (ErrorCode::Unauthorized, None, None) => Self::unauthorized(),
             (ErrorCode::UnsupportedOperation, None, None) => Self::unsupported_operation(),
+            (ErrorCode::MigrationNotReady, None, None) => Self::migration_not_ready(),
             _ => return Err(de::Error::custom("invalid error schema")),
         };
         if wire.message != expected.message || wire.retryable != expected.retryable {

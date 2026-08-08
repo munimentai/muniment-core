@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"00000000000000000000000000000139","ok":false,"error":{"code":"migration_not_ready","message":"The desktop cannot hand off ownership yet.","retryable":true}}
