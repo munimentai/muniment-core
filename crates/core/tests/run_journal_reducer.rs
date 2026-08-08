@@ -1,6 +1,6 @@
 use muniment_core::journal::reducer::{
     project_chat, reduce, AttentionReason, ChatProjector, PermissionGate, PermissionRequest,
-    ReduceError, RunReducer, RunStatus, ToolActivity, ToolActivityStatus,
+    ProjectedRecall, ReduceError, RunReducer, RunStatus, ToolActivity, ToolActivityStatus,
 };
 use muniment_core::journal::{
     split_model_stream_delta, EventEnvelope, EventPayload, Provenance, RunJournal,
@@ -642,6 +642,58 @@ fn chat_projection_replays_completed_and_failed_runs() {
         Some(RunStatus::Failed {
             reason: Some("runtime".into())
         })
+    );
+}
+
+#[test]
+fn chat_projection_carries_memory_recalls_in_event_order() {
+    let no_recall = project_chat(&stream(&[("run.started", json!({}))])).unwrap();
+    assert!(no_recall.recalls.is_empty());
+
+    let events = stream(&[
+        ("run.started", json!({})),
+        (
+            "memory.recalled",
+            json!({
+                "files": ["memory/first.md"], "item_cap": 5,
+                "character_budget": 4000, "timeout_milliseconds": 200,
+                "query": "first query", "thread": "thread-1",
+                "source_file_state": "current"
+            }),
+        ),
+        (
+            "memory.recalled",
+            json!({
+                "files": ["memory/second.md", "memory/third.md"], "item_cap": 5,
+                "character_budget": 4000, "timeout_milliseconds": 200,
+                "query": "second query", "thread": "thread-1",
+                "source_file_state": "current"
+            }),
+        ),
+    ]);
+    let expected = vec![
+        ProjectedRecall {
+            query: "first query".into(),
+            files: vec!["memory/first.md".into()],
+        },
+        ProjectedRecall {
+            query: "second query".into(),
+            files: vec!["memory/second.md".into(), "memory/third.md".into()],
+        },
+    ];
+
+    assert_eq!(project_chat(&events[..2]).unwrap().recalls, expected[..1]);
+    assert_eq!(project_chat(&events).unwrap().recalls, expected);
+    assert_eq!(
+        muniment_core::journal::reducer::project_chat_fragment(&events[1..])
+            .unwrap()
+            .recalls,
+        expected
+    );
+    let serialized = serde_json::to_value(&expected[0]).unwrap();
+    assert_eq!(
+        serialized,
+        json!({"query": "first query", "files": ["memory/first.md"]})
     );
 }
 

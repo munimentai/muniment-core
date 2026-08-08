@@ -1759,6 +1759,31 @@ fn catch_up_projects_only_a_bounded_authoritative_completion_receipt() {
 }
 
 #[test]
+fn catch_up_does_not_project_memory_recall_payloads() {
+    let mut recalled = event(1);
+    recalled.event_type = "memory.recalled".into();
+    recalled.payload = EventPayload::Inline {
+        payload_json: json!({
+            "files": ["memory/private.md"], "item_cap": 5,
+            "character_budget": 4000, "timeout_milliseconds": 200,
+            "query": "private query", "thread": "thread-1",
+            "source_file_state": "current"
+        }),
+    };
+    let mut journal = RunJournal::open(":memory:").unwrap();
+    journal.append(0, &recalled).unwrap();
+    journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+
+    let page = journal
+        .workspace_catch_up("workspace-1", RUN, 0, 10, 64 * 1024)
+        .unwrap();
+    let projection = &page.events[0];
+    assert_eq!(projection.event_type, "memory.recalled");
+    assert!(!format!("{projection:?}").contains("private query"));
+    assert!(!format!("{projection:?}").contains("memory/private.md"));
+}
+
+#[test]
 fn completion_receipt_projection_rejects_malformed_and_oversized_values() {
     let payloads = [
         json!({"receipt": {"route": 7}}),

@@ -3,6 +3,7 @@
 use super::{EventEnvelope, EventPayload};
 use crate::assistant_text::projector::Projector;
 use crate::assistant_text::stream::{AssistantText, RunStreamProjector};
+use crate::memory_index::RecallRecord;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, fmt};
@@ -439,6 +440,14 @@ pub struct ChatProjection {
     pub pending_permission: Option<PermissionGate>,
     pub tool_activity: Vec<ToolActivity>,
     pub attachments: Vec<ProjectedAttachment>,
+    pub recalls: Vec<ProjectedRecall>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectedRecall {
+    pub query: String,
+    pub files: Vec<String>,
 }
 
 /// Safe attachment metadata for display outside the journal/CAS boundary.
@@ -498,6 +507,7 @@ pub fn project_chat_fragment(events: &[EventEnvelope]) -> Result<ChatProjection,
                 });
             }
             "model.stream.delta" => chat.text.push_str(&field(event, "text")?),
+            "memory.recalled" => chat.recalls.push(projected_recall(event)?),
             "tool.effect.started" => chat.tool_activity.push(ToolActivity {
                 effect_id: field(event, "effect_id")?,
                 display_name: optional_field(event, "display_name")?,
@@ -552,6 +562,7 @@ impl ChatProjector {
             }
             "model.prompt.accepted" => self.chat.prompt_accepted = true,
             "model.stream.delta" => self.chat.text.push_str(&field(event, "text")?),
+            "memory.recalled" => self.chat.recalls.push(projected_recall(event)?),
             "tool.effect.started" => self.chat.tool_activity.push(ToolActivity {
                 effect_id: field(event, "effect_id")?,
                 display_name: optional_field(event, "display_name")?,
@@ -895,6 +906,14 @@ fn payload(event: &EventEnvelope) -> Result<&Value, ReduceError> {
             })
         }
     }
+}
+fn projected_recall(event: &EventEnvelope) -> Result<ProjectedRecall, ReduceError> {
+    let recall: RecallRecord = serde_json::from_value(payload(event)?.clone())
+        .map_err(|_| invalid(event, "memory recall payload is invalid"))?;
+    Ok(ProjectedRecall {
+        query: recall.query,
+        files: recall.files,
+    })
 }
 fn field(event: &EventEnvelope, name: &'static str) -> Result<String, ReduceError> {
     optional_field(event, name)?.ok_or_else(|| ReduceError::MissingField {
