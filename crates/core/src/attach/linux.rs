@@ -11,6 +11,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -243,7 +244,37 @@ impl std::error::Error for InstanceLockError {}
 pub struct AttachTransport<'a> {
     filesystem: &'a AttachFilesystem,
     listener: Option<UnixListener>,
+    stop: AttachStopHandle,
     identity: EndpointIdentity,
+}
+
+/// A shared request to stop an attach listener.
+#[derive(Clone, Debug)]
+pub struct AttachStopHandle {
+    state: Arc<AttachStopState>,
+}
+
+#[derive(Debug)]
+struct AttachStopState {
+    requested: AtomicBool,
+    event: OwnedFd,
+}
+
+impl AttachStopHandle {
+    /// Stops the listener. This method may be called more than once.
+    pub fn stop(&self) {
+        if self.state.requested.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let value = 1_u64.to_ne_bytes();
+        unsafe {
+            libc::write(
+                self.state.event.as_raw_fd(),
+                value.as_ptr().cast(),
+                value.len(),
+            );
+        }
+    }
 }
 
 impl<'a> AttachTransport<'a> {
@@ -312,6 +343,11 @@ impl<'a> AttachTransport<'a> {
                 return Err(AttachTransportError::EndpointMetadata);
             }
         };
+        if listener.set_nonblocking(true).is_err() {
+            drop(listener);
+            remove_if_identity(filesystem, created_identity);
+            return Err(AttachTransportError::Bind);
+        }
         after_bind();
         if apply_socket_permissions(filesystem, created_identity).is_err() {
             drop(listener);
@@ -332,26 +368,73 @@ impl<'a> AttachTransport<'a> {
             remove_if_identity(filesystem, created_identity);
             return Err(AttachTransportError::EndpointMetadata);
         }
+        let event = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if event < 0 {
+            drop(listener);
+            remove_if_identity(filesystem, created_identity);
+            return Err(AttachTransportError::Bind);
+        }
         Ok(Self {
             filesystem,
             listener: Some(listener),
+            stop: AttachStopHandle {
+                state: Arc::new(AttachStopState {
+                    requested: AtomicBool::new(false),
+                    event: unsafe { OwnedFd::from_raw_fd(event) },
+                }),
+            },
             identity,
         })
     }
 
     /// Accepts and authenticates one connection using Linux `SO_PEERCRED`.
     pub fn accept(&self) -> Result<(UnixStream, PeerCredentials), AttachAcceptError> {
-        let (stream, _) = self
-            .listener
-            .as_ref()
-            .ok_or(AttachAcceptError::Closed)?
-            .accept()
-            .map_err(|_| AttachAcceptError::Accept)?;
+        let listener = self.listener.as_ref().ok_or(AttachAcceptError::Closed)?;
+        let (stream, _) = loop {
+            if self.stop.state.requested.load(Ordering::Acquire) {
+                return Err(AttachAcceptError::Closed);
+            }
+            let mut descriptors = [
+                libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: self.stop.state.event.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let result =
+                unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, -1) };
+            if result < 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(AttachAcceptError::Accept);
+            }
+            if self.stop.state.requested.load(Ordering::Acquire) {
+                return Err(AttachAcceptError::Closed);
+            }
+            if descriptors[0].revents != 0 {
+                match listener.accept() {
+                    Ok(accepted) => break accepted,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(_) => return Err(AttachAcceptError::Accept),
+                }
+            }
+        };
         let credentials = peer_credentials(&stream)?;
         if credentials.uid != unsafe { libc::geteuid() } {
             return Err(AttachAcceptError::WrongUid(credentials));
         }
         Ok((stream, credentials))
+    }
+
+    /// Returns a handle that may stop this listener from another thread.
+    pub fn stop_handle(&self) -> AttachStopHandle {
+        self.stop.clone()
     }
 
     pub fn local_path(&self) -> &Path {

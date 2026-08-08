@@ -13,6 +13,8 @@ use std::os::unix::fs::{symlink, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -55,6 +57,38 @@ fn publishes_authenticates_and_removes_a_private_socket() {
     drop(client);
 
     drop(transport);
+    assert!(!filesystem.endpoint_path().exists());
+}
+
+#[test]
+fn stop_wakes_a_blocked_accept_and_closes_future_accepts() {
+    let runtime = TestDirectory::new();
+    let filesystem = AttachFilesystem::from_runtime_directory(&runtime.0).unwrap();
+    let transport = AttachTransport::bind(&filesystem).unwrap();
+    let stop = transport.stop_handle();
+    let shared_stop = stop.clone();
+    let (started_tx, started_rx) = mpsc::channel();
+
+    thread::scope(|scope| {
+        let accepting = scope.spawn(|| {
+            started_tx.send(()).unwrap();
+            transport.accept()
+        });
+        started_rx.recv().unwrap();
+        thread::sleep(Duration::from_millis(25));
+        let started = Instant::now();
+        shared_stop.stop();
+        assert!(matches!(
+            accepting.join().unwrap(),
+            Err(AttachAcceptError::Closed)
+        ));
+        assert!(started.elapsed() < Duration::from_millis(250));
+    });
+
+    stop.stop();
+    assert!(matches!(transport.accept(), Err(AttachAcceptError::Closed)));
+    assert!(filesystem.endpoint_path().exists());
+    transport.shutdown();
     assert!(!filesystem.endpoint_path().exists());
 }
 
