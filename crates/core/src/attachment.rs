@@ -13,6 +13,7 @@ pub const ATTACHMENT_EVENT_VERSION: u32 = 1;
 pub const MAX_PI_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 pub const MAX_PI_IMAGE_COUNT: usize = 10;
 pub const MAX_PI_IMAGE_TOTAL_BYTES: u64 = 20 * 1024 * 1024;
+pub const MAX_DELIVERY_DISPLAY_NAME_CHARS: usize = 80;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PiAttachmentImage {
@@ -24,8 +25,10 @@ pub struct PiAttachmentImage {
 pub enum AttachmentDeliveryError {
     Storage(CasError),
     InvalidStoredLength,
-    ImageLimit,
-    AmbiguousFormat,
+    ImageSizeLimit { display_name: String },
+    ImageCountLimit { display_name: String },
+    ImageTotalSizeLimit { display_name: String },
+    AmbiguousFormat { display_name: String },
 }
 
 /// Resolves durable attachment events in journal order without exposing their
@@ -43,24 +46,41 @@ pub fn prepare_pi_images(
         let bytes = cas
             .get_verified(attachment.sha256())
             .map_err(AttachmentDeliveryError::Storage)?;
+        let display_name = || bounded_delivery_display_name(attachment.display_name());
         let byte_length =
-            u64::try_from(bytes.len()).map_err(|_| AttachmentDeliveryError::ImageLimit)?;
+            u64::try_from(bytes.len()).map_err(|_| AttachmentDeliveryError::ImageSizeLimit {
+                display_name: display_name(),
+            })?;
         if byte_length != attachment.byte_length() {
             return Err(AttachmentDeliveryError::InvalidStoredLength);
         }
         let Some(format) = supported_image_format(&bytes) else {
             continue;
         };
-        if byte_length > MAX_PI_IMAGE_BYTES || decoded.len() == MAX_PI_IMAGE_COUNT {
-            return Err(AttachmentDeliveryError::ImageLimit);
+        if byte_length > MAX_PI_IMAGE_BYTES {
+            return Err(AttachmentDeliveryError::ImageSizeLimit {
+                display_name: display_name(),
+            });
         }
-        let mime_type =
-            validated_image_type(&bytes, format).ok_or(AttachmentDeliveryError::AmbiguousFormat)?;
-        total = total
-            .checked_add(byte_length)
-            .ok_or(AttachmentDeliveryError::ImageLimit)?;
+        if decoded.len() == MAX_PI_IMAGE_COUNT {
+            return Err(AttachmentDeliveryError::ImageCountLimit {
+                display_name: display_name(),
+            });
+        }
+        let mime_type = validated_image_type(&bytes, format).ok_or_else(|| {
+            AttachmentDeliveryError::AmbiguousFormat {
+                display_name: display_name(),
+            }
+        })?;
+        total = total.checked_add(byte_length).ok_or_else(|| {
+            AttachmentDeliveryError::ImageTotalSizeLimit {
+                display_name: display_name(),
+            }
+        })?;
         if total > MAX_PI_IMAGE_TOTAL_BYTES {
-            return Err(AttachmentDeliveryError::ImageLimit);
+            return Err(AttachmentDeliveryError::ImageTotalSizeLimit {
+                display_name: display_name(),
+            });
         }
         decoded.push((bytes, mime_type));
     }
@@ -72,6 +92,19 @@ pub fn prepare_pi_images(
             mime_type,
         })
         .collect())
+}
+
+fn bounded_delivery_display_name(display_name: &str) -> String {
+    let mut characters = display_name.chars();
+    let mut bounded: String = characters
+        .by_ref()
+        .take(MAX_DELIVERY_DISPLAY_NAME_CHARS)
+        .collect();
+    if characters.next().is_some() {
+        bounded.pop();
+        bounded.push('…');
+    }
+    bounded
 }
 
 fn supported_image_format(bytes: &[u8]) -> Option<ImageFormat> {

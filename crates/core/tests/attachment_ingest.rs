@@ -1,6 +1,8 @@
 use muniment_core::attachment::{
-    ingest_attachment, AttachmentIngestError, AttachmentMetadata, AttachmentValidationError,
-    ChatAttachment, ATTACHMENT_EVENT_TYPE, ATTACHMENT_EVENT_VERSION,
+    ingest_attachment, prepare_pi_images, AttachmentDeliveryError, AttachmentIngestError,
+    AttachmentMetadata, AttachmentValidationError, ChatAttachment, ATTACHMENT_EVENT_TYPE,
+    ATTACHMENT_EVENT_VERSION, MAX_DELIVERY_DISPLAY_NAME_CHARS, MAX_PI_IMAGE_BYTES,
+    MAX_PI_IMAGE_COUNT, MAX_PI_IMAGE_TOTAL_BYTES,
 };
 use muniment_core::cas::LocalCas;
 use muniment_core::journal::reducer::{project_chat, ReduceError};
@@ -91,6 +93,39 @@ fn attachment_event(seq: u64) -> EventEnvelope {
     event.event_type = ATTACHMENT_EVENT_TYPE.into();
     event.event_version = ATTACHMENT_EVENT_VERSION;
     event
+}
+
+fn stored_attachment_event(
+    fixture: &Fixture,
+    seq: u64,
+    display_name: &str,
+    bytes: &[u8],
+    declared_length: u64,
+) -> EventEnvelope {
+    let hash = fixture.cas.put(bytes).unwrap();
+    let attachment = serde_json::from_value(json!({
+        "sha256": hash,
+        "display_name": display_name,
+        "byte_length": declared_length
+    }))
+    .unwrap();
+    event(seq, attachment)
+}
+
+fn jpeg_with_size(minimum_size: usize) -> Vec<u8> {
+    let mut jpeg = vec![0xff, 0xd8];
+    while jpeg.len() + 4 < minimum_size {
+        let payload_length = (minimum_size - jpeg.len() - 4).min(65_533);
+        jpeg.extend_from_slice(&[0xff, 0xfe]);
+        jpeg.extend_from_slice(&u16::try_from(payload_length + 2).unwrap().to_be_bytes());
+        jpeg.resize(jpeg.len() + payload_length, b'x');
+    }
+    let mut encoded = Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(1, 1)
+        .write_to(&mut encoded, image::ImageFormat::Jpeg)
+        .unwrap();
+    jpeg.extend_from_slice(&encoded.into_inner()[2..]);
+    jpeg
 }
 
 struct GeneratedReader {
@@ -374,4 +409,72 @@ fn attachment_hash_deserialization_is_validated() {
         "byte_length": 1
     });
     assert!(serde_json::from_value::<ChatAttachment>(invalid).is_err());
+}
+
+#[test]
+fn delivery_errors_name_each_image_that_crosses_a_limit() {
+    let fixture = Fixture::new();
+    let long_name = format!("{}.jpg", "x".repeat(MAX_DELIVERY_DISPLAY_NAME_CHARS + 20));
+    let oversized = jpeg_with_size(usize::try_from(MAX_PI_IMAGE_BYTES + 1).unwrap());
+    let oversized_event =
+        stored_attachment_event(&fixture, 1, &long_name, &oversized, oversized.len() as u64);
+    let error = prepare_pi_images(&fixture.cas, &[oversized_event]).unwrap_err();
+    let AttachmentDeliveryError::ImageSizeLimit { display_name } = error else {
+        panic!("expected the image size limit")
+    };
+    assert_eq!(
+        display_name.chars().count(),
+        MAX_DELIVERY_DISPLAY_NAME_CHARS
+    );
+    assert!(display_name.ends_with('…'));
+
+    let small = jpeg_with_size(1);
+    let mut count_events = Vec::new();
+    for index in 0..=MAX_PI_IMAGE_COUNT {
+        let name = format!("image-{}.jpg", index + 1);
+        count_events.push(stored_attachment_event(
+            &fixture,
+            index as u64 + 1,
+            &name,
+            &small,
+            small.len() as u64,
+        ));
+    }
+    assert!(matches!(
+        prepare_pi_images(&fixture.cas, &count_events),
+        Err(AttachmentDeliveryError::ImageCountLimit { display_name })
+            if display_name == "image-11.jpg"
+    ));
+
+    let image_size = usize::try_from(MAX_PI_IMAGE_TOTAL_BYTES / 3 + 1).unwrap();
+    let medium = jpeg_with_size(image_size);
+    let total_events = (1..=3)
+        .map(|index| {
+            stored_attachment_event(
+                &fixture,
+                index,
+                &format!("scan-{index}.jpg"),
+                &medium,
+                medium.len() as u64,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        prepare_pi_images(&fixture.cas, &total_events),
+        Err(AttachmentDeliveryError::ImageTotalSizeLimit { display_name })
+            if display_name == "scan-3.jpg"
+    ));
+}
+
+#[test]
+fn ambiguous_image_error_carries_its_display_name() {
+    let fixture = Fixture::new();
+    let bytes = b"\xff\xd8\xffmalformed\xff\xd9";
+    let candidate = stored_attachment_event(&fixture, 1, "unclear.jpg", bytes, bytes.len() as u64);
+
+    assert!(matches!(
+        prepare_pi_images(&fixture.cas, &[candidate]),
+        Err(AttachmentDeliveryError::AmbiguousFormat { display_name })
+            if display_name == "unclear.jpg"
+    ));
 }
