@@ -34,6 +34,8 @@ pub mod permission_gate;
 pub mod run_start;
 pub mod session_thread;
 pub mod sidecar;
+#[cfg(feature = "keyring")]
+pub mod thread_history;
 pub mod thread_ownership;
 
 pub use muniment_attach::{
