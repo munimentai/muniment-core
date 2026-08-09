@@ -87,6 +87,12 @@ pub enum DiffLineSegmentKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationError {
     UnsupportedSchemaVersion,
+    AddedFilePathMismatch,
+    DeletedFilePathMismatch,
+    ModifiedFilePathMismatch,
+    RenamedFilePathMismatch,
+    RenamedFilePathsMatch,
+    ModeWithoutPath,
     BinaryFileHasHunks,
     LineNumberOnMissingSide,
     HunkLineCountMismatch,
@@ -96,6 +102,12 @@ impl fmt::Display for ValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::UnsupportedSchemaVersion => "schemaVersion must equal 1",
+            Self::AddedFilePathMismatch => "an added file must carry only a new path",
+            Self::DeletedFilePathMismatch => "a deleted file must carry only an old path",
+            Self::ModifiedFilePathMismatch => "a modified file must carry both paths",
+            Self::RenamedFilePathMismatch => "a renamed file must carry both paths",
+            Self::RenamedFilePathsMatch => "a renamed file must carry two different paths",
+            Self::ModeWithoutPath => "a mode must not exist without its path",
             Self::BinaryFileHasHunks => "a binary file must not contain hunks",
             Self::LineNumberOnMissingSide => "a line must not number a missing side",
             Self::HunkLineCountMismatch => "a hunk count must match its lines",
@@ -111,6 +123,29 @@ impl CodeDiff {
             return Err(ValidationError::UnsupportedSchemaVersion);
         }
         for file in &self.files {
+            match file.status {
+                DiffStatus::Added if file.old_path.is_some() || file.new_path.is_none() => {
+                    return Err(ValidationError::AddedFilePathMismatch);
+                }
+                DiffStatus::Deleted if file.old_path.is_none() || file.new_path.is_some() => {
+                    return Err(ValidationError::DeletedFilePathMismatch);
+                }
+                DiffStatus::Modified if file.old_path.is_none() || file.new_path.is_none() => {
+                    return Err(ValidationError::ModifiedFilePathMismatch);
+                }
+                DiffStatus::Renamed if file.old_path.is_none() || file.new_path.is_none() => {
+                    return Err(ValidationError::RenamedFilePathMismatch);
+                }
+                DiffStatus::Renamed if file.old_path == file.new_path => {
+                    return Err(ValidationError::RenamedFilePathsMatch);
+                }
+                _ => {}
+            }
+            if (file.old_path.is_none() && file.old_mode.is_some())
+                || (file.new_path.is_none() && file.new_mode.is_some())
+            {
+                return Err(ValidationError::ModeWithoutPath);
+            }
             if file.binary && !file.hunks.is_empty() {
                 return Err(ValidationError::BinaryFileHasHunks);
             }

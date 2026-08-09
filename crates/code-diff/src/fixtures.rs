@@ -49,6 +49,34 @@ fn fixture_bytes() -> io::Result<BTreeMap<&'static str, Vec<u8>>> {
         )],
         truncated: false,
     };
+    let added = CodeDiff {
+        schema_version: 1,
+        id: "fixture-added".into(),
+        files: vec![DiffFile {
+            old_path: None,
+            new_path: Some("new.txt".into()),
+            status: DiffStatus::Added,
+            old_mode: None,
+            new_mode: Some("100644".into()),
+            binary: false,
+            hunks: vec![],
+        }],
+        truncated: false,
+    };
+    let deleted = CodeDiff {
+        schema_version: 1,
+        id: "fixture-deleted".into(),
+        files: vec![DiffFile {
+            old_path: Some("old.txt".into()),
+            new_path: None,
+            status: DiffStatus::Deleted,
+            old_mode: Some("100644".into()),
+            new_mode: None,
+            binary: false,
+            hunks: vec![],
+        }],
+        truncated: false,
+    };
     let renamed = CodeDiff {
         schema_version: 1,
         id: "fixture-renamed".into(),
@@ -84,6 +112,8 @@ fn fixture_bytes() -> io::Result<BTreeMap<&'static str, Vec<u8>>> {
         truncated: true,
     };
     let values = [
+        ("added.json", added),
+        ("deleted.json", deleted),
         ("empty.json", empty),
         ("modified.json", modified),
         ("renamed.json", renamed),

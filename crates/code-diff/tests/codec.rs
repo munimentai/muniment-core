@@ -77,6 +77,101 @@ fn rejects_each_contradictory_value_with_its_named_error() {
 }
 
 #[test]
+fn rejects_paths_that_contradict_the_file_status() {
+    let cases = [
+        (
+            DiffStatus::Added,
+            None,
+            None,
+            ValidationError::AddedFilePathMismatch,
+        ),
+        (
+            DiffStatus::Added,
+            Some("old.txt"),
+            Some("new.txt"),
+            ValidationError::AddedFilePathMismatch,
+        ),
+        (
+            DiffStatus::Deleted,
+            None,
+            None,
+            ValidationError::DeletedFilePathMismatch,
+        ),
+        (
+            DiffStatus::Deleted,
+            Some("old.txt"),
+            Some("new.txt"),
+            ValidationError::DeletedFilePathMismatch,
+        ),
+        (
+            DiffStatus::Modified,
+            None,
+            Some("new.txt"),
+            ValidationError::ModifiedFilePathMismatch,
+        ),
+        (
+            DiffStatus::Modified,
+            Some("old.txt"),
+            None,
+            ValidationError::ModifiedFilePathMismatch,
+        ),
+        (
+            DiffStatus::Renamed,
+            None,
+            Some("new.txt"),
+            ValidationError::RenamedFilePathMismatch,
+        ),
+        (
+            DiffStatus::Renamed,
+            Some("old.txt"),
+            None,
+            ValidationError::RenamedFilePathMismatch,
+        ),
+        (
+            DiffStatus::Renamed,
+            Some("same.txt"),
+            Some("same.txt"),
+            ValidationError::RenamedFilePathsMatch,
+        ),
+    ];
+
+    for (status, old_path, new_path, expected) in cases {
+        let mut value = valid();
+        value.files[0].status = status;
+        value.files[0].old_path = old_path.map(Into::into);
+        value.files[0].new_path = new_path.map(Into::into);
+        assert_eq!(value.validate(), Err(expected));
+        assert!(matches!(
+            decode(&serde_json::to_vec(&value).unwrap()),
+            Err(DecodeError::Validation(error)) if error == expected
+        ));
+    }
+}
+
+#[test]
+fn rejects_a_mode_without_its_path() {
+    for old_side in [true, false] {
+        let mut value = valid();
+        if old_side {
+            value.files[0].old_path = None;
+        } else {
+            value.files[0].new_path = None;
+        }
+        value.files[0].status = if old_side {
+            DiffStatus::Added
+        } else {
+            DiffStatus::Deleted
+        };
+
+        assert_eq!(value.validate(), Err(ValidationError::ModeWithoutPath));
+        assert!(matches!(
+            decode(&serde_json::to_vec(&value).unwrap()),
+            Err(DecodeError::Validation(ValidationError::ModeWithoutPath))
+        ));
+    }
+}
+
+#[test]
 fn decode_checks_the_schema_and_model() {
     let bytes = serde_json::to_vec(&valid()).unwrap();
     assert_eq!(decode(&bytes).unwrap(), valid());
