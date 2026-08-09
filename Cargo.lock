@@ -2794,6 +2794,7 @@ name = "muniment-cli"
 version = "0.0.1"
 dependencies = [
  "muniment-attach",
+ "muniment-code-diff",
  "serde_json",
 ]
 
