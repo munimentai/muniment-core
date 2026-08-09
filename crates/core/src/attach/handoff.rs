@@ -20,10 +20,15 @@ impl std::error::Error for HandoffNonceRandomnessError {}
 
 /// Mints a single-use migration handoff nonce.
 pub fn mint_handoff_nonce() -> Result<String, HandoffNonceRandomnessError> {
+    mint_hex_nonce(32).map_err(|_| HandoffNonceRandomnessError)
+}
+
+/// Mints a lowercase hexadecimal nonce from system randomness.
+pub(super) fn mint_hex_nonce(byte_len: usize) -> Result<String, getrandom::Error> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
 
-    let mut bytes = [0_u8; 32];
-    getrandom::fill(&mut bytes).map_err(|_| HandoffNonceRandomnessError)?;
+    let mut bytes = vec![0_u8; byte_len];
+    getrandom::fill(&mut bytes)?;
 
     let mut nonce = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

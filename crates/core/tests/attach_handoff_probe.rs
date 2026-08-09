@@ -62,6 +62,12 @@ fn reads_one_welcome_and_confirms_its_handoff_nonce() {
             let (mut stream, _) = listener.accept().unwrap();
             let hello = read_hello(&mut stream);
             assert_eq!(hello.client.kind, "desktop-handoff-probe");
+            assert_eq!(hello.client_nonce.len(), 32);
+            assert!(hello
+                .client_nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()));
+            assert_eq!(hello.client_nonce, hello.client_nonce.to_ascii_lowercase());
             assert!(hello.authorized_client_credential.is_none());
             stream
                 .write_all(&encode_frame(&welcome()).unwrap())

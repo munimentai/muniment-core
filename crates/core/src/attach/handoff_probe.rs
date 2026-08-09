@@ -1,5 +1,7 @@
 //! Runtime service handoff readiness probe and confirmation.
 
+#[cfg(target_os = "linux")]
+use super::handoff::mint_hex_nonce;
 use muniment_attach::Welcome;
 #[cfg(target_os = "linux")]
 use muniment_attach::{
@@ -135,15 +137,7 @@ pub fn read_handoff_probe_welcome(
 
 #[cfg(target_os = "linux")]
 fn mint_probe_nonce() -> Result<String, HandoffProbeError> {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut bytes = [0_u8; 16];
-    getrandom::fill(&mut bytes).map_err(|_| HandoffProbeError::RandomnessUnavailable)?;
-    let mut nonce = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        nonce.push(HEX[(byte >> 4) as usize] as char);
-        nonce.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    Ok(nonce)
+    mint_hex_nonce(16).map_err(|_| HandoffProbeError::RandomnessUnavailable)
 }
 
 #[cfg(target_os = "linux")]
