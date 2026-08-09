@@ -129,4 +129,17 @@ impl PreparedHandoffSlot {
     pub fn cancel(&mut self) {
         self.prepared = None;
     }
+
+    /// Cancels the preparation only when `nonce` identifies it.
+    pub fn cancel_if_matches(&mut self, nonce: &str) -> bool {
+        if self
+            .prepared
+            .as_ref()
+            .is_none_or(|prepared| prepared.nonce != nonce)
+        {
+            return false;
+        }
+        self.cancel();
+        true
+    }
 }

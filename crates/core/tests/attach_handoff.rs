@@ -116,6 +116,18 @@ fn cancel_clears_the_preparation_and_allows_another() {
 }
 
 #[test]
+fn conditional_cancellation_does_not_remove_another_preparation() {
+    let now = Instant::now();
+    let mut slot = PreparedHandoffSlot::new();
+    slot.prepare("new-nonce", 1_000, now).unwrap();
+
+    assert!(!slot.cancel_if_matches("old-nonce"));
+    assert!(slot.matches("new-nonce", now));
+    assert!(slot.cancel_if_matches("new-nonce"));
+    assert!(!slot.matches("new-nonce", now));
+}
+
+#[test]
 fn debug_output_does_not_disclose_nonces() {
     let now = Instant::now();
     let secret = "secret-handoff-nonce";
