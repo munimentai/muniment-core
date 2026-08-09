@@ -166,20 +166,23 @@ fn rejects_an_approved_entry_that_carries_a_json_web_token() {
     let error =
         compile_onboarding_home_write_plan(std::slice::from_ref(&carrier), date).unwrap_err();
 
-    assert_eq!(error, OnboardingHomeWritePlanError::SecretRejected);
+    assert_eq!(
+        error,
+        OnboardingHomeWritePlanError::SecretRejected {
+            source_name: "notes.md".to_owned(),
+        }
+    );
     let message = error.to_string();
     for segment in token.split('.') {
         assert!(!message.contains(segment), "{message}");
     }
 
-    let clean = entry(
-        "clean.md",
-        "assistant-export:clean.md",
-        "The archive closes.\n",
-    );
+    let later_carrier = entry("later.md", "assistant-export:later.md", &text);
     assert_eq!(
-        compile_onboarding_home_write_plan(&[clean, carrier], date),
-        Err(OnboardingHomeWritePlanError::SecretRejected)
+        compile_onboarding_home_write_plan(&[carrier, later_carrier], date),
+        Err(OnboardingHomeWritePlanError::SecretRejected {
+            source_name: "notes.md".to_owned(),
+        })
     );
 }
 

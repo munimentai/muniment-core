@@ -77,7 +77,7 @@ impl OnboardingImportTimestamp for &str {
 }
 
 /// Stable failure modes for compiling approved onboarding files.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OnboardingHomeWritePlanError {
     EmptyInput,
     InvalidTimestamp,
@@ -86,7 +86,7 @@ pub enum OnboardingHomeWritePlanError {
     DocumentBytesExceeded,
     DestinationCollision,
     TotalBytesExceeded,
-    SecretRejected,
+    SecretRejected { source_name: String },
 }
 
 impl fmt::Display for OnboardingHomeWritePlanError {
@@ -100,7 +100,12 @@ impl fmt::Display for OnboardingHomeWritePlanError {
             Self::DestinationCollision => "The onboarding import destinations collide.",
             Self::TotalBytesExceeded => "The onboarding import plan is too large.",
             // The message names no matched text, so no secret reaches a log.
-            Self::SecretRejected => "An onboarding import entry contains a secret.",
+            Self::SecretRejected { source_name } => {
+                return write!(
+                    formatter,
+                    "An onboarding import entry contains a secret: {source_name}"
+                );
+            }
         };
         formatter.write_str(message)
     }
@@ -534,8 +539,11 @@ pub fn compile_onboarding_home_write_plan<T: OnboardingImportTimestamp>(
 
     // Every byte bound holds by now, so each scan reads a bounded document.
     for entry in approved_entries {
-        reject_memory_secret(&entry.text)
-            .map_err(|_| OnboardingHomeWritePlanError::SecretRejected)?;
+        reject_memory_secret(&entry.text).map_err(|_| {
+            OnboardingHomeWritePlanError::SecretRejected {
+                source_name: entry.source_name.clone(),
+            }
+        })?;
     }
 
     let mut unique_destinations = BTreeSet::new();
