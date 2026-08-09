@@ -14,6 +14,7 @@ pub const MAX_PI_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 pub const MAX_PI_IMAGE_COUNT: usize = 10;
 pub const MAX_PI_IMAGE_TOTAL_BYTES: u64 = 20 * 1024 * 1024;
 pub const MAX_DELIVERY_DISPLAY_NAME_CHARS: usize = 80;
+const ATTACHMENT_SNIFF_BYTES: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PiAttachmentImage {
@@ -114,6 +115,19 @@ fn supported_image_format(bytes: &[u8]) -> Option<ImageFormat> {
         }
         _ => None,
     }
+}
+
+fn supported_image_media_type(bytes: &[u8]) -> Option<String> {
+    Some(
+        match supported_image_format(bytes)? {
+            ImageFormat::Png => "image/png",
+            ImageFormat::Jpeg => "image/jpeg",
+            ImageFormat::Gif => "image/gif",
+            ImageFormat::WebP => "image/webp",
+            _ => return None,
+        }
+        .into(),
+    )
 }
 
 fn validated_image_type(bytes: &[u8], format: ImageFormat) -> Option<&'static str> {
@@ -300,6 +314,7 @@ where
     let mut counted = CountingReader {
         inner: reader,
         count: 0,
+        leading_bytes: Vec::with_capacity(ATTACHMENT_SNIFF_BYTES),
     };
     let hash = cas
         .put_reader(&mut counted)
@@ -315,7 +330,7 @@ where
         sha256: hash,
         display_name,
         byte_length: counted.count,
-        media_type,
+        media_type: media_type.or_else(|| supported_image_media_type(&counted.leading_bytes)),
     };
     let mut event = event_with_attachment(attachment.clone());
     event.event_type = ATTACHMENT_EVENT_TYPE.into();
@@ -368,11 +383,15 @@ fn validate_media_type(value: &str) -> Result<String, AttachmentValidationError>
 struct CountingReader<'a, R> {
     inner: &'a mut R,
     count: u64,
+    leading_bytes: Vec<u8>,
 }
 
 impl<R: Read> Read for CountingReader<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         let count = self.inner.read(buffer)?;
+        let remaining = ATTACHMENT_SNIFF_BYTES.saturating_sub(self.leading_bytes.len());
+        self.leading_bytes
+            .extend_from_slice(&buffer[..count.min(remaining)]);
         self.count = self.count.checked_add(count as u64).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

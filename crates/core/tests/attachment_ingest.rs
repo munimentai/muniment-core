@@ -225,6 +225,55 @@ fn streams_multiple_buffers_and_round_trips_safe_metadata_and_reference() {
 }
 
 #[test]
+fn sniffs_supported_image_media_types_and_leaves_other_types_absent() {
+    let image = image::DynamicImage::new_rgb8(1, 1);
+    for (format, expected) in [
+        (image::ImageFormat::Png, Some("image/png")),
+        (image::ImageFormat::Jpeg, Some("image/jpeg")),
+        (image::ImageFormat::Gif, Some("image/gif")),
+        (image::ImageFormat::WebP, Some("image/webp")),
+    ] {
+        let mut encoded = Cursor::new(Vec::new());
+        image.write_to(&mut encoded, format).unwrap();
+        let bytes = encoded.into_inner();
+        let mut fixture = Fixture::new();
+        let attachment = ingest_attachment(
+            &fixture.cas,
+            &mut fixture.journal,
+            0,
+            &mut Cursor::new(&bytes),
+            AttachmentMetadata {
+                display_name: "image",
+                byte_length: bytes.len() as u64,
+                media_type: None,
+            },
+            |attachment| event(1, attachment),
+        )
+        .unwrap();
+
+        assert_eq!(attachment.media_type(), expected);
+    }
+
+    let mut fixture = Fixture::new();
+    let bytes = b"%PDF-1.7";
+    let attachment = ingest_attachment(
+        &fixture.cas,
+        &mut fixture.journal,
+        0,
+        &mut Cursor::new(bytes),
+        AttachmentMetadata {
+            display_name: "record.pdf",
+            byte_length: bytes.len() as u64,
+            media_type: None,
+        },
+        |attachment| event(1, attachment),
+    )
+    .unwrap();
+
+    assert_eq!(attachment.media_type(), None);
+}
+
+#[test]
 fn attachment_projection_rejects_non_executable_and_terminal_states() {
     let pending = vec![
         inline_event(1, "run.started", json!({})),
