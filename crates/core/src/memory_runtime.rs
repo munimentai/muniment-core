@@ -65,7 +65,7 @@ impl ApplicationMemoryRuntime {
         )
         .map_err(|_| MemoryIndexError::InvalidToolArguments)?;
         let source = format!(
-            "const definition = JSON.parse({encoded});\nexport default function (pi) {{\n  pi.registerTool({{\n    name: definition.name,\n    label: \"Memory search\",\n    description: definition.description,\n    parameters: definition.inputSchema,\n    async execute(_id, arguments, _signal, _update, context) {{\n      const value = await context.ui.editor(\"muniment:memory-search\", JSON.stringify(arguments));\n      if (value === undefined) throw new Error(\"The memory search failed.\");\n      const result = JSON.parse(value);\n      if (result.error) throw new Error(\"The memory search failed.\");\n      return {{ content: [{{ type: \"text\", text: JSON.stringify(result) }}], details: result.recall }};\n    }}\n  }});\n}}\n"
+            "const definition = JSON.parse({encoded});\nexport default function (pi) {{\n  pi.registerTool({{\n    name: definition.name,\n    label: \"Memory search\",\n    description: definition.description,\n    parameters: definition.inputSchema,\n    async execute(_id, arguments, _signal, _update, context) {{\n      const value = await context.ui.editor(\"muniment:memory-search\", JSON.stringify(arguments));\n      if (value === undefined) throw new Error(\"The memory search failed.\");\n      const result = JSON.parse(value);\n      return {{ content: [{{ type: \"text\", text: JSON.stringify(result) }}], details: result.recall }};\n    }}\n  }});\n}}\n"
         );
         std::fs::create_dir_all(&self.database_root).map_err(MemoryIndexError::Io)?;
         let temporary = self
@@ -223,6 +223,8 @@ mod tests {
         let source = fs::read_to_string(runtime.agent_extension_path()).unwrap();
         assert!(source.contains("pi.registerTool"));
         assert!(source.contains("memory-search"));
+        assert!(source.contains("text: JSON.stringify(result)"));
+        assert!(!source.contains("if (result.error)"));
         fs::remove_dir_all(root).unwrap();
     }
 

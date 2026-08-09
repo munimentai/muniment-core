@@ -23,6 +23,7 @@ pub mod home;
 pub mod import_preview;
 pub mod journal;
 pub mod kokoro;
+pub mod memory_failure;
 pub mod memory_index;
 pub mod memory_runtime;
 pub mod memory_scan;
