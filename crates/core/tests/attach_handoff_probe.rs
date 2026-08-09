@@ -1,8 +1,8 @@
 #![cfg(target_os = "linux")]
 
 use muniment_core::attach::{
-    confirm_handoff_probe, decode_frame, encode_frame, read_handoff_probe_welcome, Authorization,
-    HandoffProbeError, Hello, Welcome,
+    confirm_handoff_probe, decode_frame, encode_frame, probe_handoff, read_handoff_probe_welcome,
+    Authorization, HandoffProbeError, Hello, Welcome,
 };
 use std::fs;
 use std::io::{Read, Write};
@@ -145,6 +145,105 @@ fn times_out_when_a_listener_stays_silent() {
         assert_eq!(
             read_handoff_probe_welcome(&socket.0, Instant::now() + Duration::from_millis(25)),
             Err(HandoffProbeError::ReadinessDeadlineReached)
+        );
+        server.join().unwrap();
+    });
+}
+
+#[test]
+fn confirms_after_the_listener_binds() {
+    let socket = TestSocket::new();
+    thread::scope(|scope| {
+        let server = scope.spawn(|| {
+            thread::sleep(Duration::from_millis(30));
+            let listener = UnixListener::bind(&socket.0).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            read_hello(&mut stream);
+            stream
+                .write_all(&encode_frame(&welcome()).unwrap())
+                .unwrap();
+        });
+
+        assert!(probe_handoff(
+            &socket.0,
+            "handoff-nonce",
+            Instant::now() + Duration::from_secs(1),
+        )
+        .is_ok());
+        server.join().unwrap();
+    });
+}
+
+#[test]
+fn stops_retrying_when_an_endpoint_never_binds() {
+    let socket = TestSocket::new();
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(35);
+
+    assert_eq!(
+        probe_handoff(&socket.0, "handoff-nonce", deadline),
+        Err(HandoffProbeError::ReadinessDeadlineReached)
+    );
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(35));
+    assert!(elapsed < Duration::from_secs(1));
+}
+
+#[test]
+fn does_not_retry_a_mismatched_nonce() {
+    let socket = TestSocket::new();
+    let listener = UnixListener::bind(&socket.0).unwrap();
+    thread::scope(|scope| {
+        let server = scope.spawn(|| {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_hello(&mut stream);
+            let mut response = welcome();
+            response.handoff_nonce = Some("other-nonce".into());
+            stream
+                .write_all(&encode_frame(&response).unwrap())
+                .unwrap();
+            listener.set_nonblocking(true).unwrap();
+            thread::sleep(Duration::from_millis(30));
+            assert!(matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+        });
+
+        assert_eq!(
+            probe_handoff(
+                &socket.0,
+                "handoff-nonce",
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Err(HandoffProbeError::NonceMismatch)
+        );
+        server.join().unwrap();
+    });
+}
+
+#[test]
+fn does_not_retry_a_missing_nonce() {
+    let socket = TestSocket::new();
+    let listener = UnixListener::bind(&socket.0).unwrap();
+    thread::scope(|scope| {
+        let server = scope.spawn(|| {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_hello(&mut stream);
+            let mut response = welcome();
+            response.handoff_nonce = None;
+            stream
+                .write_all(&encode_frame(&response).unwrap())
+                .unwrap();
+            listener.set_nonblocking(true).unwrap();
+            thread::sleep(Duration::from_millis(30));
+            assert!(matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+        });
+
+        assert_eq!(
+            probe_handoff(
+                &socket.0,
+                "handoff-nonce",
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Err(HandoffProbeError::MissingNonce)
         );
         server.join().unwrap();
     });
