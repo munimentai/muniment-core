@@ -2798,6 +2798,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "muniment-code-diff"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "muniment-core"
 version = "0.0.1"
 dependencies = [
