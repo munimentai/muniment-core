@@ -17,6 +17,8 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(250);
 pub const DEFAULT_BUILD_TIMEOUT: Duration = Duration::from_secs(5);
 const HOME_DIRECTORIES: [&str; 4] = ["agents", "memory", "projects", "sessions"];
 const MAX_FILES: usize = 10_000;
+const MAX_QUERY_CHARACTERS: usize = 1_024;
+const MAX_QUERY_TERMS: usize = 64;
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DIRECTORY_DEPTH: usize = 32;
 
@@ -85,6 +87,7 @@ pub enum MemoryIndexError {
     Io(io::Error),
     Sqlite(rusqlite::Error),
     LimitRaised,
+    QueryTooLong,
     TimedOut,
     SecretRejected,
     InvalidPath,
@@ -263,6 +266,11 @@ impl MemoryIndex {
         configured: RetrievalLimits,
         requested: Option<RetrievalLimits>,
     ) -> Result<MemorySearchResult, MemoryIndexError> {
+        if query.chars().count() > MAX_QUERY_CHARACTERS
+            || query.split_whitespace().count() > MAX_QUERY_TERMS
+        {
+            return Err(MemoryIndexError::QueryTooLong);
+        }
         let limits = configured.lowered_by(requested)?;
         if limits.timeout.is_zero() {
             return Err(MemoryIndexError::TimedOut);
@@ -1392,6 +1400,57 @@ mod tests {
             ),
             Err(MemoryIndexError::TimedOut)
         ));
+    }
+
+    #[test]
+    fn query_length_boundaries_fail_closed() {
+        let fixture = Fixture::new();
+        let limits = Fixture::limits(5, 1_000);
+        let character_limit = "a".repeat(MAX_QUERY_CHARACTERS);
+        fixture
+            .index()
+            .search("thread", &character_limit, limits, None)
+            .unwrap();
+        let term_limit = (0..MAX_QUERY_TERMS)
+            .map(|number| format!("term{number}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        fixture
+            .index()
+            .search("thread", &term_limit, limits, None)
+            .unwrap();
+
+        let character_over_limit = "a".repeat(MAX_QUERY_CHARACTERS + 1);
+        assert!(matches!(
+            fixture
+                .index()
+                .search("thread", &character_over_limit, limits, None),
+            Err(MemoryIndexError::QueryTooLong)
+        ));
+        let term_over_limit = (0..=MAX_QUERY_TERMS)
+            .map(|number| format!("term{number}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(matches!(
+            fixture
+                .index()
+                .search("thread", &term_over_limit, limits, None),
+            Err(MemoryIndexError::QueryTooLong)
+        ));
+    }
+
+    #[test]
+    fn oversized_query_is_rejected_before_the_cache_opens() {
+        let fixture = Fixture::new();
+        let query = "term ".repeat(20_000);
+
+        assert!(matches!(
+            fixture
+                .index()
+                .search("thread", &query, Fixture::limits(5, 1_000), None),
+            Err(MemoryIndexError::QueryTooLong)
+        ));
+        assert!(!fixture.root.join("cache/index.sqlite3").exists());
     }
 
     #[test]
