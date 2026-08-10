@@ -5,14 +5,15 @@ use std::{
 };
 
 use muniment_code_diff::{
-    CodeDiff, DiffFile, DiffHunk, DiffLine, DiffLineKind, DiffLineSegment, DiffLineSegmentKind,
-    DiffStatus,
+    canonical_bytes, CodeDiff, DiffFile, DiffHunk, DiffLine, DiffLineKind, DiffLineSegment,
+    DiffLineSegmentKind, DiffStatus,
 };
 use uuid::Uuid;
 
 const CONTEXT_LINES: usize = 3;
 const MAX_CHANGED_FILES: usize = 200;
 const MAX_RENDERED_LINES: usize = 20_000;
+const MAX_CANONICAL_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComputeCodeDiffError {
@@ -129,14 +130,39 @@ pub fn compute_code_diff(
         }
     }
 
-    let diff = CodeDiff {
+    let mut diff = CodeDiff {
         schema_version: 1,
         id: Uuid::now_v7().to_string(),
         files,
         truncated,
     };
+    truncate_to_canonical_byte_limit(&mut diff);
     debug_assert!(diff.validate().is_ok());
     Ok(diff)
+}
+
+fn truncate_to_canonical_byte_limit(diff: &mut CodeDiff) {
+    if canonical_bytes(diff)
+        .expect("the producer creates a valid code diff")
+        .len()
+        <= MAX_CANONICAL_BYTES
+    {
+        return;
+    }
+
+    diff.truncated = true;
+    while canonical_bytes(diff)
+        .expect("the producer creates a valid code diff")
+        .len()
+        > MAX_CANONICAL_BYTES
+    {
+        let Some(last_file) = diff.files.last_mut() else {
+            break;
+        };
+        if last_file.hunks.pop().is_none() {
+            diff.files.pop();
+        }
+    }
 }
 
 fn is_binary(bytes: &[u8]) -> bool {
@@ -475,4 +501,101 @@ fn line_segments(
         }
     }
     segments
+}
+
+#[cfg(test)]
+mod canonical_byte_limit_tests {
+    use super::*;
+
+    fn added_hunk(text_len: usize) -> DiffHunk {
+        let text = "x".repeat(text_len);
+        DiffHunk {
+            old_start: 0,
+            old_count: 0,
+            new_start: 1,
+            new_count: 1,
+            header: String::new(),
+            lines: vec![DiffLine {
+                kind: DiffLineKind::Addition,
+                old_line_number: None,
+                new_line_number: Some(1),
+                text: text.clone(),
+                segments: vec![DiffLineSegment {
+                    kind: DiffLineSegmentKind::Addition,
+                    text,
+                }],
+            }],
+        }
+    }
+
+    fn added_file(path: String, hunks: Vec<DiffHunk>) -> DiffFile {
+        DiffFile {
+            old_path: None,
+            new_path: Some(path),
+            status: DiffStatus::Added,
+            old_mode: None,
+            new_mode: None,
+            binary: false,
+            hunks,
+        }
+    }
+
+    fn diff(files: Vec<DiffFile>) -> CodeDiff {
+        CodeDiff {
+            schema_version: 1,
+            id: "test".to_owned(),
+            files,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn keeps_every_file_and_hunk_near_the_canonical_byte_limit() {
+        let mut diff = diff(vec![added_file(
+            "a.txt".to_owned(),
+            vec![added_hunk((MAX_CANONICAL_BYTES - 1_000) / 2)],
+        )]);
+        let original = diff.clone();
+        let size = canonical_bytes(&diff).unwrap().len();
+        assert!(size <= MAX_CANONICAL_BYTES);
+        assert!(size > MAX_CANONICAL_BYTES - 2_000);
+
+        truncate_to_canonical_byte_limit(&mut diff);
+
+        assert_eq!(diff, original);
+    }
+
+    #[test]
+    fn oversized_multi_hunk_diff_keeps_fitting_leading_hunks() {
+        let hunks = vec![added_hunk(400_000); 3];
+        let mut diff = diff(vec![added_file("a.txt".to_owned(), hunks)]);
+
+        truncate_to_canonical_byte_limit(&mut diff);
+
+        assert!(diff.truncated);
+        assert_eq!(diff.files.len(), 1);
+        assert_eq!(diff.files[0].hunks.len(), 2);
+        assert!(canonical_bytes(&diff).unwrap().len() <= MAX_CANONICAL_BYTES);
+    }
+
+    #[test]
+    fn oversized_multi_file_diff_drops_only_trailing_files() {
+        let files = (0..3)
+            .map(|index| {
+                let path = format!("{index}-{}", "x".repeat(700_000));
+                let mut file = added_file(path, Vec::new());
+                file.binary = true;
+                file
+            })
+            .collect();
+        let mut diff = diff(files);
+
+        truncate_to_canonical_byte_limit(&mut diff);
+
+        assert!(diff.truncated);
+        assert_eq!(diff.files.len(), 2);
+        assert!(diff.files[0].new_path.as_ref().unwrap().starts_with("0-"));
+        assert!(diff.files[1].new_path.as_ref().unwrap().starts_with("1-"));
+        assert!(canonical_bytes(&diff).unwrap().len() <= MAX_CANONICAL_BYTES);
+    }
 }

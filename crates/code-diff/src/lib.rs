@@ -198,8 +198,88 @@ impl fmt::Display for DecodeError {
 
 impl Error for DecodeError {}
 
+#[derive(Debug)]
+pub enum CanonicalBytesError {
+    Validation(ValidationError),
+    Json(serde_json::Error),
+}
+
+impl fmt::Display for CanonicalBytesError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Validation(error) => error.fmt(formatter),
+            Self::Json(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for CanonicalBytesError {}
+
+/// Returns RFC 8785 canonical JSON bytes for a valid code diff.
+pub fn canonical_bytes(value: &CodeDiff) -> Result<Vec<u8>, CanonicalBytesError> {
+    value.validate().map_err(CanonicalBytesError::Validation)?;
+    let mut value = serde_json::to_value(value).map_err(CanonicalBytesError::Json)?;
+    sort_object_keys(&mut value);
+    serde_json::to_vec(&value).map_err(CanonicalBytesError::Json)
+}
+
+fn sort_object_keys(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                sort_object_keys(value);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            let mut entries: Vec<_> = std::mem::take(object).into_iter().collect();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            for (key, mut value) in entries {
+                sort_object_keys(&mut value);
+                object.insert(key, value);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn decode(bytes: &[u8]) -> Result<CodeDiff, DecodeError> {
     let value: CodeDiff = serde_json::from_slice(bytes).map_err(DecodeError::Json)?;
     value.validate().map_err(DecodeError::Validation)?;
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sort_object_keys;
+    use serde_json::{Map, Value};
+
+    #[test]
+    fn canonicalization_ignores_object_key_insertion_order() {
+        let mut first = Map::new();
+        first.insert("z".into(), Value::Bool(true));
+        first.insert(
+            "a".into(),
+            Value::Object(Map::from_iter([
+                ("y".into(), Value::from(2)),
+                ("b".into(), Value::from(1)),
+            ])),
+        );
+        let mut second = Map::new();
+        second.insert(
+            "a".into(),
+            Value::Object(Map::from_iter([
+                ("b".into(), Value::from(1)),
+                ("y".into(), Value::from(2)),
+            ])),
+        );
+        second.insert("z".into(), Value::Bool(true));
+        let (mut first, mut second) = (Value::Object(first), Value::Object(second));
+
+        sort_object_keys(&mut first);
+        sort_object_keys(&mut second);
+
+        let first = serde_json::to_vec(&first).unwrap();
+        assert_eq!(first, serde_json::to_vec(&second).unwrap());
+        assert_eq!(first, br#"{"a":{"b":1,"y":2},"z":true}"#);
+    }
 }

@@ -1,8 +1,8 @@
 use std::{collections::BTreeMap, fs, io, path::Path};
 
 use crate::{
-    CodeDiff, DiffFile, DiffHunk, DiffLine, DiffLineKind, DiffLineSegment, DiffLineSegmentKind,
-    DiffStatus,
+    canonical_bytes, CodeDiff, DiffFile, DiffHunk, DiffLine, DiffLineKind, DiffLineSegment,
+    DiffLineSegmentKind, DiffStatus,
 };
 
 pub const FIXTURE_DIRECTORY: &str = "code-diff/1";
@@ -32,7 +32,7 @@ pub fn export(root: &Path, mode: Mode) -> io::Result<()> {
     Ok(())
 }
 
-fn fixture_bytes() -> io::Result<BTreeMap<&'static str, Vec<u8>>> {
+fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
     let empty = CodeDiff {
         schema_version: 1,
         id: "fixture-empty".into(),
@@ -120,15 +120,18 @@ fn fixture_bytes() -> io::Result<BTreeMap<&'static str, Vec<u8>>> {
         ("binary.json", binary),
         ("truncated.json", truncated),
     ];
-    values
-        .into_iter()
-        .map(|(name, value)| {
-            value.validate().map_err(io::Error::other)?;
-            let mut bytes = serde_json::to_vec(&value).map_err(io::Error::other)?;
-            bytes.push(b'\n');
-            Ok((name, bytes))
-        })
-        .collect()
+    let mut fixtures = BTreeMap::new();
+    for (name, value) in values {
+        value.validate().map_err(io::Error::other)?;
+        let mut bytes = serde_json::to_vec(&value).map_err(io::Error::other)?;
+        bytes.push(b'\n');
+        fixtures.insert(name.into(), bytes);
+        fixtures.insert(
+            name.replace(".json", ".canonical.json"),
+            canonical_bytes(&value).map_err(io::Error::other)?,
+        );
+    }
+    Ok(fixtures)
 }
 
 fn text_file(old_path: &str, new_path: &str, status: DiffStatus) -> DiffFile {
@@ -183,7 +186,7 @@ fn text_file(old_path: &str, new_path: &str, status: DiffStatus) -> DiffFile {
     }
 }
 
-fn check(target: &Path, expected: &BTreeMap<&str, Vec<u8>>) -> io::Result<()> {
+fn check(target: &Path, expected: &BTreeMap<String, Vec<u8>>) -> io::Result<()> {
     let mut actual = BTreeMap::new();
     if target.exists() {
         for entry in fs::read_dir(target)? {
@@ -196,11 +199,7 @@ fn check(target: &Path, expected: &BTreeMap<&str, Vec<u8>>) -> io::Result<()> {
             }
         }
     }
-    let expected: BTreeMap<String, Vec<u8>> = expected
-        .iter()
-        .map(|(name, bytes)| ((*name).into(), bytes.clone()))
-        .collect();
-    if actual == expected {
+    if &actual == expected {
         Ok(())
     } else {
         Err(io::Error::other(

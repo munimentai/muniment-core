@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use muniment_code_diff::{DiffLineKind, DiffLineSegmentKind, DiffStatus};
+use muniment_code_diff::{canonical_bytes, DiffLineKind, DiffLineSegmentKind, DiffStatus};
 use muniment_core::code_diff::{compute_code_diff, ComputeCodeDiffError};
 use uuid::{Uuid, Version};
 
@@ -94,13 +94,40 @@ fn unchanged_files_do_not_count_toward_the_file_limit() {
 }
 
 #[test]
-fn keeps_exactly_twenty_thousand_rendered_lines() {
+fn canonical_byte_limit_can_precede_the_rendered_line_limit() {
     let staged = BTreeMap::from([("file.txt".to_owned(), lines(20_000))]);
 
     let diff = compute_code_diff(&BTreeMap::new(), &staged).unwrap();
 
-    assert_eq!(diff.files[0].hunks[0].lines.len(), 20_000);
+    assert!(diff.truncated);
+    assert_eq!(diff.files.len(), 1);
+    assert!(diff.files[0].hunks.is_empty());
+    assert!(canonical_bytes(&diff).unwrap().len() <= 2 * 1024 * 1024);
+}
+
+#[test]
+fn keeps_a_diff_that_fits_the_canonical_byte_limit() {
+    let staged = tree(&[("file.txt", b"small change\n")]);
+
+    let diff = compute_code_diff(&BTreeMap::new(), &staged).unwrap();
+
     assert!(!diff.truncated);
+    assert_eq!(diff.files.len(), 1);
+    assert_eq!(diff.files[0].hunks.len(), 1);
+}
+
+#[test]
+fn truncates_whole_hunks_to_the_canonical_byte_limit() {
+    let line = format!("{}\n", "x".repeat(240));
+    let contents = line.repeat(8_000).into_bytes();
+    let staged = BTreeMap::from([("file.txt".to_owned(), contents)]);
+
+    let diff = compute_code_diff(&BTreeMap::new(), &staged).unwrap();
+
+    assert!(diff.truncated);
+    assert_eq!(diff.files.len(), 1);
+    assert!(diff.files[0].hunks.is_empty());
+    assert!(canonical_bytes(&diff).unwrap().len() <= 2 * 1024 * 1024);
 }
 
 #[test]
@@ -122,10 +149,10 @@ fn truncates_at_complete_hunks_in_stable_path_order() {
 
     diff.validate().unwrap();
     assert!(diff.truncated);
-    assert_eq!(diff.files.len(), 2);
-    assert_eq!(diff.files[0].hunks[0].lines.len(), 19_995);
-    assert_eq!(diff.files[1].hunks.len(), 1);
-    assert_eq!(diff.files[1].hunks[0].lines.len(), 5);
+    assert_eq!(diff.files.len(), 1);
+    assert_eq!(diff.files[0].new_path.as_deref(), Some("a.txt"));
+    assert!(diff.files[0].hunks.is_empty());
+    assert!(canonical_bytes(&diff).unwrap().len() <= 2 * 1024 * 1024);
 }
 
 #[test]
