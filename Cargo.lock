@@ -2824,6 +2824,7 @@ dependencies = [
  "keyring",
  "libc",
  "muniment-attach",
+ "muniment-code-diff",
  "rusqlite",
  "same-file",
  "serde",

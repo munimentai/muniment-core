@@ -19,6 +19,7 @@ pub mod chat_profile;
 pub mod chat_prompt;
 pub mod chat_resume;
 pub mod chat_view;
+pub mod code_diff;
 pub mod home;
 pub mod import_preview;
 pub mod journal;
