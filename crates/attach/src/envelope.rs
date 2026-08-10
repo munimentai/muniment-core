@@ -567,7 +567,7 @@ impl<'de> Deserialize<'de> for ProtocolError {
             details: Option<ErrorDetails>,
         }
         let wire = Wire::deserialize(deserializer)?;
-        let expected = match (wire.code, wire.action, wire.details) {
+        let mut expected = match (wire.code, wire.action, wire.details) {
             (
                 ErrorCode::ProtocolIncompatible,
                 Some(action),
@@ -588,6 +588,9 @@ impl<'de> Deserialize<'de> for ProtocolError {
             (ErrorCode::MigrationNotReady, None, None) => Self::migration_not_ready(),
             _ => return Err(de::Error::custom("invalid error schema")),
         };
+        if wire.code == ErrorCode::MigrationNotReady {
+            expected.retryable = wire.retryable;
+        }
         if wire.message != expected.message || wire.retryable != expected.retryable {
             return Err(de::Error::custom("invalid error schema"));
         }
