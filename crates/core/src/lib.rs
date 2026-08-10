@@ -41,6 +41,7 @@ pub mod sidecar;
 #[cfg(feature = "keyring")]
 pub mod thread_history;
 pub mod thread_ownership;
+pub mod write_plan;
 
 pub use muniment_attach::{
     ensure_cross_project_home, ensure_scaffold_directory, onboard_companion_workspace,
