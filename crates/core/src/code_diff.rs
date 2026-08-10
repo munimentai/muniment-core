@@ -1,4 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+};
 
 use muniment_code_diff::{
     CodeDiff, DiffFile, DiffHunk, DiffLine, DiffLineKind, DiffLineSegment, DiffLineSegmentKind,
@@ -7,14 +11,42 @@ use muniment_code_diff::{
 use uuid::Uuid;
 
 const CONTEXT_LINES: usize = 3;
+const MAX_CHANGED_FILES: usize = 200;
+const MAX_RENDERED_LINES: usize = 20_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputeCodeDiffError {
+    TooManyChangedFiles,
+}
+
+impl fmt::Display for ComputeCodeDiffError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a code diff must not contain more than 200 changed files")
+    }
+}
+
+impl Error for ComputeCodeDiffError {}
 
 /// Computes the changed files between two in-memory trees.
 pub fn compute_code_diff(
     current: &BTreeMap<String, Vec<u8>>,
     staged: &BTreeMap<String, Vec<u8>>,
-) -> CodeDiff {
+) -> Result<CodeDiff, ComputeCodeDiffError> {
     let paths: BTreeSet<_> = current.keys().chain(staged.keys()).collect();
+    let changed_file_count = paths.iter().try_fold(0usize, |count, path| {
+        if current.get(*path) == staged.get(*path) {
+            Some(count)
+        } else {
+            count.checked_add(1)
+        }
+    });
+    if changed_file_count.is_none_or(|count| count > MAX_CHANGED_FILES) {
+        return Err(ComputeCodeDiffError::TooManyChangedFiles);
+    }
+
     let mut files = Vec::new();
+    let mut rendered_lines = 0usize;
+    let mut truncated = false;
 
     for path in paths {
         let old = current.get(path);
@@ -30,7 +62,7 @@ pub fn compute_code_diff(
             (None, None) => unreachable!(),
         };
         let binary = old.into_iter().chain(new).any(|bytes| is_binary(bytes));
-        let hunks = if binary {
+        let mut hunks = if binary {
             Vec::new()
         } else {
             text_hunks(
@@ -38,6 +70,25 @@ pub fn compute_code_diff(
                 new.map_or("", |bytes| std::str::from_utf8(bytes).unwrap()),
             )
         };
+
+        let included_hunks = hunks
+            .iter()
+            .take_while(|hunk| {
+                let Some(next_rendered_lines) = rendered_lines.checked_add(hunk.lines.len()) else {
+                    truncated = true;
+                    return false;
+                };
+                if next_rendered_lines > MAX_RENDERED_LINES {
+                    truncated = true;
+                    return false;
+                }
+                rendered_lines = next_rendered_lines;
+                true
+            })
+            .count();
+        if included_hunks < hunks.len() {
+            hunks.truncate(included_hunks);
+        }
 
         files.push(DiffFile {
             old_path,
@@ -48,16 +99,19 @@ pub fn compute_code_diff(
             binary,
             hunks,
         });
+        if truncated {
+            break;
+        }
     }
 
     let diff = CodeDiff {
         schema_version: 1,
         id: Uuid::now_v7().to_string(),
         files,
-        truncated: false,
+        truncated,
     };
     debug_assert!(diff.validate().is_ok());
-    diff
+    Ok(diff)
 }
 
 fn is_binary(bytes: &[u8]) -> bool {

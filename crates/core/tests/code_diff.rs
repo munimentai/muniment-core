@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use muniment_code_diff::{DiffLineKind, DiffLineSegmentKind, DiffStatus};
-use muniment_core::code_diff::compute_code_diff;
+use muniment_core::code_diff::{compute_code_diff, ComputeCodeDiffError};
 use uuid::{Uuid, Version};
 
 fn tree(files: &[(&str, &[u8])]) -> BTreeMap<String, Vec<u8>> {
@@ -28,12 +28,81 @@ fn assert_segments_match_lines(diff: &muniment_code_diff::CodeDiff) {
     }
 }
 
+fn added_files(count: usize) -> BTreeMap<String, Vec<u8>> {
+    (0..count)
+        .map(|index| (format!("{index:03}.txt"), Vec::new()))
+        .collect()
+}
+
+fn lines(count: usize) -> Vec<u8> {
+    (0..count)
+        .map(|index| format!("line {index}\n"))
+        .collect::<String>()
+        .into_bytes()
+}
+
+#[test]
+fn accepts_two_hundred_changed_files_and_rejects_more() {
+    let current = BTreeMap::new();
+    let diff = compute_code_diff(&current, &added_files(200)).unwrap();
+
+    assert_eq!(diff.files.len(), 200);
+    assert_eq!(
+        compute_code_diff(&current, &added_files(201)),
+        Err(ComputeCodeDiffError::TooManyChangedFiles)
+    );
+}
+
+#[test]
+fn unchanged_files_do_not_count_toward_the_file_limit() {
+    let unchanged = added_files(201);
+
+    let diff = compute_code_diff(&unchanged, &unchanged).unwrap();
+
+    assert!(diff.files.is_empty());
+}
+
+#[test]
+fn keeps_exactly_twenty_thousand_rendered_lines() {
+    let staged = BTreeMap::from([("file.txt".to_owned(), lines(20_000))]);
+
+    let diff = compute_code_diff(&BTreeMap::new(), &staged).unwrap();
+
+    assert_eq!(diff.files[0].hunks[0].lines.len(), 20_000);
+    assert!(!diff.truncated);
+}
+
+#[test]
+fn truncates_at_complete_hunks_in_stable_path_order() {
+    let current = BTreeMap::from([(
+        "b.txt".to_owned(),
+        b"0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14".to_vec(),
+    )]);
+    let staged = BTreeMap::from([
+        ("a.txt".to_owned(), lines(19_995)),
+        (
+            "b.txt".to_owned(),
+            b"changed\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\nchanged".to_vec(),
+        ),
+        ("c.txt".to_owned(), b"omitted line\n".to_vec()),
+    ]);
+
+    let diff = compute_code_diff(&current, &staged).unwrap();
+
+    diff.validate().unwrap();
+    assert!(diff.truncated);
+    assert_eq!(diff.files.len(), 2);
+    assert_eq!(diff.files[0].hunks[0].lines.len(), 19_995);
+    assert_eq!(diff.files[1].hunks.len(), 1);
+    assert_eq!(diff.files[1].hunks[0].lines.len(), 5);
+}
+
 #[test]
 fn computes_sorted_valid_files_with_a_uuid_v7() {
     let current = tree(&[("b.txt", b"old"), ("d.txt", b"gone"), ("same", b"x")]);
     let staged = tree(&[("a.txt", b"new"), ("b.txt", b"new"), ("same", b"x")]);
 
-    let diff = compute_code_diff(&current, &staged);
+    let diff = compute_code_diff(&current, &staged).unwrap();
 
     diff.validate().unwrap();
     assert_eq!(
@@ -54,7 +123,7 @@ fn treats_nul_and_invalid_utf8_as_binary() {
     let current = tree(&[("invalid", b"text"), ("nul", b"text")]);
     let staged = tree(&[("invalid", &[0xff]), ("nul", b"a\0b")]);
 
-    let diff = compute_code_diff(&current, &staged);
+    let diff = compute_code_diff(&current, &staged).unwrap();
 
     assert!(diff
         .files
@@ -66,7 +135,7 @@ fn treats_nul_and_invalid_utf8_as_binary() {
 fn emits_three_context_lines_and_consistent_hunk_metadata() {
     let old = b"zero\none\ntwo\nthree\nfour\nfive\nsix\nseven\neight";
     let new = b"zero\none\ntwo\nTHREE\nfour\nfive\nsix\nseven\neight";
-    let diff = compute_code_diff(&tree(&[("file", old)]), &tree(&[("file", new)]));
+    let diff = compute_code_diff(&tree(&[("file", old)]), &tree(&[("file", new)])).unwrap();
     let hunk = &diff.files[0].hunks[0];
 
     assert_eq!((hunk.old_start, hunk.old_count), (1, 7));
@@ -85,7 +154,7 @@ fn emits_three_context_lines_and_consistent_hunk_metadata() {
 fn emits_word_segments_for_paired_lines() {
     let old = b"context\nHello old wide world\ndeleted alone";
     let new = b"context\nHello new small world\nadded one\nadded two";
-    let diff = compute_code_diff(&tree(&[("file", old)]), &tree(&[("file", new)]));
+    let diff = compute_code_diff(&tree(&[("file", old)]), &tree(&[("file", new)])).unwrap();
     let lines = &diff.files[0].hunks[0].lines;
 
     diff.validate().unwrap();
@@ -127,7 +196,8 @@ fn matches_the_modified_fixture_segment_shape() {
     let diff = compute_code_diff(
         &tree(&[("file", b"Hello world")]),
         &tree(&[("file", b"Hello Muniment")]),
-    );
+    )
+    .unwrap();
     let lines = &diff.files[0].hunks[0].lines;
 
     assert_eq!(lines[0].segments[0].text, "Hello ");
@@ -166,7 +236,7 @@ fn emits_word_segments_when_only_one_line_has_middle_words() {
             ],
         ),
     ] {
-        let diff = compute_code_diff(&tree(&[("file", old)]), &tree(&[("file", new)]));
+        let diff = compute_code_diff(&tree(&[("file", old)]), &tree(&[("file", new)])).unwrap();
         let lines = &diff.files[0].hunks[0].lines;
 
         diff.validate().unwrap();
@@ -198,7 +268,7 @@ fn keeps_full_rewrites_plain_and_all_segments_match_their_lines() {
         ("spacing", b"same  words"),
         ("added", b"here"),
     ]);
-    let diff = compute_code_diff(&current, &staged);
+    let diff = compute_code_diff(&current, &staged).unwrap();
 
     diff.validate().unwrap();
     assert_segments_match_lines(&diff);
@@ -215,8 +285,8 @@ fn keeps_full_rewrites_plain_and_all_segments_match_their_lines() {
 
 #[test]
 fn reports_zero_start_for_an_empty_side() {
-    let added = compute_code_diff(&BTreeMap::new(), &tree(&[("file", b"one\ntwo")]));
-    let deleted = compute_code_diff(&tree(&[("file", b"one\ntwo")]), &BTreeMap::new());
+    let added = compute_code_diff(&BTreeMap::new(), &tree(&[("file", b"one\ntwo")])).unwrap();
+    let deleted = compute_code_diff(&tree(&[("file", b"one\ntwo")]), &BTreeMap::new()).unwrap();
 
     let added_hunk = &added.files[0].hunks[0];
     assert_eq!((added_hunk.old_start, added_hunk.old_count), (0, 0));
@@ -230,7 +300,7 @@ fn reports_zero_start_for_an_empty_side() {
 fn separates_distant_changes_into_hunks() {
     let old = b"0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14";
     let new = b"changed\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\nchanged";
-    let diff = compute_code_diff(&tree(&[("file", old)]), &tree(&[("file", new)]));
+    let diff = compute_code_diff(&tree(&[("file", old)]), &tree(&[("file", new)])).unwrap();
 
     assert_eq!(diff.files[0].hunks.len(), 2);
     assert_eq!(diff.files[0].hunks[0].lines.len(), 5);
@@ -239,7 +309,7 @@ fn separates_distant_changes_into_hunks() {
 
 #[test]
 fn reports_an_added_final_newline() {
-    let diff = compute_code_diff(&tree(&[("file", b"a")]), &tree(&[("file", b"a\n")]));
+    let diff = compute_code_diff(&tree(&[("file", b"a")]), &tree(&[("file", b"a\n")])).unwrap();
     let hunk = &diff.files[0].hunks[0];
 
     assert_eq!((hunk.old_start, hunk.old_count), (1, 1));
@@ -253,7 +323,7 @@ fn reports_an_added_final_newline() {
 
 #[test]
 fn reports_a_removed_final_newline() {
-    let diff = compute_code_diff(&tree(&[("file", b"a\n")]), &tree(&[("file", b"a")]));
+    let diff = compute_code_diff(&tree(&[("file", b"a\n")]), &tree(&[("file", b"a")])).unwrap();
     let hunk = &diff.files[0].hunks[0];
 
     assert_eq!((hunk.old_start, hunk.old_count), (1, 1));
