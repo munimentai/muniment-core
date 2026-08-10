@@ -1,12 +1,13 @@
 //! CAS storage and atomic journal publication for code-diff proposals.
 
-use crate::cas::{CasError, LocalCas};
+use crate::cas::{CasError, ContentHash, LocalCas};
 use crate::journal::{
     CasReference, EventEnvelope, EventPayload, JournalError, Provenance, RunJournal,
 };
 use crate::write_plan::{WritePlan, WritePlanError, MEDIA_TYPE as WRITE_PLAN_MEDIA_TYPE};
 use chrono::{SecondsFormat, Utc};
-use muniment_code_diff::{canonical_bytes, CanonicalBytesError, CodeDiff};
+use muniment_code_diff::{canonical_bytes, CanonicalBytesError, CodeDiff, ValidationError};
+use serde_json::Error as JsonError;
 use std::collections::BTreeMap;
 use std::fmt;
 use uuid::Uuid;
@@ -42,6 +43,158 @@ impl fmt::Display for StageCodeDiffError {
 }
 
 impl std::error::Error for StageCodeDiffError {}
+
+#[derive(Debug)]
+pub enum LoadCodeDiffError {
+    Journal(JournalError),
+    BrokenEventLink,
+    InvalidEventPayload,
+    WrongMediaType {
+        expected: &'static str,
+        actual: String,
+    },
+    InvalidCasReference(CasError),
+    MissingCasObject(ContentHash),
+    TamperedCasObject {
+        expected: ContentHash,
+        actual: ContentHash,
+    },
+    Cas(CasError),
+    StoredLengthMismatch,
+    WritePlan(WritePlanError),
+    CodeDiffJson(JsonError),
+    CodeDiffValidation(ValidationError),
+    NonCanonicalCodeDiff,
+    CodeDiffEncoding(CanonicalBytesError),
+}
+
+impl fmt::Display for LoadCodeDiffError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Journal(error) => write!(f, "proposal journal read failed: {error}"),
+            Self::BrokenEventLink => f.write_str("proposal events have a broken link"),
+            Self::InvalidEventPayload => {
+                f.write_str("proposal event does not contain a CAS reference")
+            }
+            Self::WrongMediaType { expected, actual } => {
+                write!(f, "proposal media type is {actual}, expected {expected}")
+            }
+            Self::InvalidCasReference(error) => {
+                write!(f, "proposal CAS reference is invalid: {error}")
+            }
+            Self::MissingCasObject(hash) => write!(f, "proposal CAS object is missing: {hash}"),
+            Self::TamperedCasObject { expected, actual } => {
+                write!(f, "proposal CAS object {expected} has hash {actual}")
+            }
+            Self::Cas(error) => write!(f, "proposal CAS read failed: {error}"),
+            Self::StoredLengthMismatch => {
+                f.write_str("proposal CAS object length does not match its reference")
+            }
+            Self::WritePlan(error) => write!(f, "stored write plan is invalid: {error}"),
+            Self::CodeDiffJson(error) => write!(f, "stored code diff JSON is invalid: {error}"),
+            Self::CodeDiffValidation(error) => write!(f, "stored code diff is invalid: {error}"),
+            Self::NonCanonicalCodeDiff => f.write_str("stored code diff is not canonical"),
+            Self::CodeDiffEncoding(error) => write!(f, "stored code diff encoding failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for LoadCodeDiffError {}
+
+/// Loads and verifies the proposal linked to an effect.
+pub fn load_code_diff_proposal(
+    journal: &mut RunJournal,
+    cas: &LocalCas,
+    run_id: &str,
+    effect_id: &str,
+) -> Result<Option<(WritePlan, CodeDiff)>, LoadCodeDiffError> {
+    let events = journal.events(run_id).map_err(LoadCodeDiffError::Journal)?;
+    let plan_events: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event.event_type == WRITE_PLAN_EVENT_TYPE
+                && event.correlation_id.as_deref() == Some(effect_id)
+        })
+        .collect();
+    let diff_event = events.iter().rev().find(|event| {
+        event.event_type == DIFF_EVENT_TYPE && event.correlation_id.as_deref() == Some(effect_id)
+    });
+
+    let Some(diff_event) = diff_event else {
+        return if plan_events.is_empty() {
+            Ok(None)
+        } else {
+            Err(LoadCodeDiffError::BrokenEventLink)
+        };
+    };
+    let plan_event = plan_events
+        .into_iter()
+        .find(|event| diff_event.causation_id.as_deref() == Some(event.event_id.as_str()))
+        .ok_or(LoadCodeDiffError::BrokenEventLink)?;
+
+    let (plan_bytes, plan_hash) = load_proposal_object(cas, plan_event, WRITE_PLAN_MEDIA_TYPE)?;
+    let write_plan = WritePlan::decode_verified(&plan_bytes, &hash_bytes(&plan_hash))
+        .map_err(LoadCodeDiffError::WritePlan)?;
+    let (diff_bytes, _) = load_proposal_object(cas, diff_event, DIFF_MEDIA_TYPE)?;
+    let code_diff: CodeDiff =
+        serde_json::from_slice(&diff_bytes).map_err(LoadCodeDiffError::CodeDiffJson)?;
+    code_diff
+        .validate()
+        .map_err(LoadCodeDiffError::CodeDiffValidation)?;
+    let encoded = canonical_bytes(&code_diff).map_err(LoadCodeDiffError::CodeDiffEncoding)?;
+    if encoded != diff_bytes {
+        return Err(LoadCodeDiffError::NonCanonicalCodeDiff);
+    }
+    Ok(Some((write_plan, code_diff)))
+}
+
+fn load_proposal_object(
+    cas: &LocalCas,
+    event: &EventEnvelope,
+    expected_media_type: &'static str,
+) -> Result<(Vec<u8>, ContentHash), LoadCodeDiffError> {
+    let EventPayload::Cas { payload_cas } = &event.payload else {
+        return Err(LoadCodeDiffError::InvalidEventPayload);
+    };
+    if payload_cas.media_type != expected_media_type {
+        return Err(LoadCodeDiffError::WrongMediaType {
+            expected: expected_media_type,
+            actual: payload_cas.media_type.clone(),
+        });
+    }
+    let hash = payload_cas
+        .sha256
+        .parse()
+        .map_err(LoadCodeDiffError::InvalidCasReference)?;
+    let bytes = match cas.get_verified(&hash) {
+        Ok(bytes) => bytes,
+        Err(CasError::NotFound(hash)) => return Err(LoadCodeDiffError::MissingCasObject(hash)),
+        Err(CasError::Corrupt { expected, actual }) => {
+            return Err(LoadCodeDiffError::TamperedCasObject { expected, actual });
+        }
+        Err(error) => return Err(LoadCodeDiffError::Cas(error)),
+    };
+    if u64::try_from(bytes.len()).ok() != Some(payload_cas.byte_length) {
+        return Err(LoadCodeDiffError::StoredLengthMismatch);
+    }
+    Ok((bytes, hash))
+}
+
+fn hash_bytes(hash: &ContentHash) -> [u8; 32] {
+    let mut bytes = [0; 32];
+    for (index, pair) in hash.as_str().as_bytes().chunks_exact(2).enumerate() {
+        bytes[index] = (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]);
+    }
+    bytes
+}
+
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        _ => unreachable!("ContentHash contains lowercase hexadecimal"),
+    }
+}
 
 /// Stores a validated proposal and appends its linked journal events atomically.
 pub fn stage_code_diff_proposal(

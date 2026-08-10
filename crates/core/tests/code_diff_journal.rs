@@ -1,8 +1,8 @@
 use muniment_code_diff::{canonical_bytes, CodeDiff};
 use muniment_core::cas::{ContentHash, LocalCas};
 use muniment_core::code_diff_journal::{
-    stage_code_diff_proposal, DIFF_EVENT_TYPE, DIFF_MEDIA_TYPE, EVENT_VERSION,
-    WRITE_PLAN_EVENT_TYPE,
+    load_code_diff_proposal, stage_code_diff_proposal, LoadCodeDiffError, DIFF_EVENT_TYPE,
+    DIFF_MEDIA_TYPE, EVENT_VERSION, WRITE_PLAN_EVENT_TYPE,
 };
 use muniment_core::journal::{EventEnvelope, EventPayload, Provenance, RunJournal};
 use muniment_core::write_plan::{WritePlan, MEDIA_TYPE as WRITE_PLAN_MEDIA_TYPE};
@@ -74,6 +74,107 @@ fn proposal() -> (WritePlan, CodeDiff) {
             truncated: false,
         },
     )
+}
+
+#[test]
+fn stages_and_loads_a_verified_proposal() {
+    let root = TestRoot::new();
+    let cas = LocalCas::open(&root.as_ref().join("cas")).unwrap();
+    let mut journal = RunJournal::open(root.as_ref().join("journal.sqlite3")).unwrap();
+    let run_id = Uuid::now_v7().to_string();
+    let effect_id = Uuid::now_v7().to_string();
+    journal.append(0, &initial_event(&run_id)).unwrap();
+    let expected = proposal();
+    stage_code_diff_proposal(
+        &mut journal,
+        &cas,
+        &run_id,
+        &effect_id,
+        &expected.0,
+        &expected.1,
+    )
+    .unwrap();
+
+    let loaded = load_code_diff_proposal(&mut journal, &cas, &run_id, &effect_id)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(loaded, expected);
+    assert!(
+        load_code_diff_proposal(&mut journal, &cas, &run_id, "other-effect")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn reports_missing_and_tampered_cas_objects_separately() {
+    for tamper in [false, true] {
+        let root = TestRoot::new();
+        let cas_root = root.as_ref().join("cas");
+        let cas = LocalCas::open(&cas_root).unwrap();
+        let mut journal = RunJournal::open(root.as_ref().join("journal.sqlite3")).unwrap();
+        let run_id = Uuid::now_v7().to_string();
+        let effect_id = Uuid::now_v7().to_string();
+        let (plan, diff) = proposal();
+        stage_code_diff_proposal(&mut journal, &cas, &run_id, &effect_id, &plan, &diff).unwrap();
+        let events = journal.events(&run_id).unwrap();
+        let EventPayload::Cas { payload_cas } = &events[0].payload else {
+            unreachable!();
+        };
+        let hash = ContentHash::from_str(&payload_cas.sha256).unwrap();
+        if tamper {
+            let path = cas_root
+                .join("objects")
+                .join(&payload_cas.sha256[..2])
+                .join(&payload_cas.sha256[2..]);
+            fs::write(path, b"tampered").unwrap();
+            assert!(matches!(
+                load_code_diff_proposal(&mut journal, &cas, &run_id, &effect_id),
+                Err(LoadCodeDiffError::TamperedCasObject { .. })
+            ));
+        } else {
+            cas.remove(&hash).unwrap();
+            assert!(matches!(
+                load_code_diff_proposal(&mut journal, &cas, &run_id, &effect_id),
+                Err(LoadCodeDiffError::MissingCasObject(found)) if found == hash
+            ));
+        }
+    }
+}
+
+#[test]
+fn reports_wrong_media_type_and_broken_event_link_separately() {
+    for media_type_error in [true, false] {
+        let root = TestRoot::new();
+        let database = root.as_ref().join("journal.sqlite3");
+        let cas = LocalCas::open(&root.as_ref().join("cas")).unwrap();
+        let mut journal = RunJournal::open(&database).unwrap();
+        let run_id = Uuid::now_v7().to_string();
+        let effect_id = Uuid::now_v7().to_string();
+        let (plan, diff) = proposal();
+        stage_code_diff_proposal(&mut journal, &cas, &run_id, &effect_id, &plan, &diff).unwrap();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let path = if media_type_error {
+            "$.payload_cas.media_type"
+        } else {
+            "$.causation_id"
+        };
+        connection
+            .execute(
+                "UPDATE events SET envelope_json=json_set(envelope_json, ?1, 'wrong') WHERE event_type=?2",
+                (path, DIFF_EVENT_TYPE),
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = load_code_diff_proposal(&mut journal, &cas, &run_id, &effect_id).unwrap_err();
+        if media_type_error {
+            assert!(matches!(error, LoadCodeDiffError::WrongMediaType { .. }));
+        } else {
+            assert!(matches!(error, LoadCodeDiffError::BrokenEventLink));
+        }
+    }
 }
 
 #[test]
