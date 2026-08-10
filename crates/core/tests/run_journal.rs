@@ -121,6 +121,12 @@ fn pending_permission_projection_is_bounded_and_hostile_inputs_are_invalid() {
         },
         EventPayload::Inline {
             payload_json: json!({
+                "gate_id": "code-gate", "kind": "code_diff", "effect_id": "effect-1",
+                "code_diff_id": "diff-1", "diff_sha256": "aa", "write_plan_sha256": "bb"
+            }),
+        },
+        EventPayload::Inline {
+            payload_json: json!({
                 "gate_id": "g", "kind": "confirm", "title": "x".repeat(1_025),
                 "message": "private"
             }),
@@ -142,7 +148,7 @@ fn pending_permission_projection_is_bounded_and_hostile_inputs_are_invalid() {
     let page = journal
         .workspace_catch_up("workspace-1", RUN, 0, 10, 16 * 1024)
         .unwrap();
-    assert_eq!(page.events.len(), 3);
+    assert_eq!(page.events.len(), 4);
     assert!(page.events.iter().all(|event| {
         event
             .pending_permission

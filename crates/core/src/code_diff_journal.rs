@@ -6,6 +6,7 @@ use crate::code_diff_staging::{
     stage_proposed_operations, ProposedOperation, StageProposedOperationsError,
 };
 use crate::journal::{
+    reducer::{PermissionGate, PermissionRequest},
     CasReference, EventEnvelope, EventPayload, JournalError, Provenance, RunJournal,
 };
 use crate::write_plan::{
@@ -125,6 +126,121 @@ impl fmt::Display for LoadCodeDiffError {
 }
 
 impl std::error::Error for LoadCodeDiffError {}
+
+#[derive(Debug)]
+pub enum AppendCodeDiffPermissionError {
+    Load(LoadCodeDiffError),
+    ProposalNotFound,
+    Truncated,
+    BrokenEventLink,
+    SequenceOverflow,
+    Journal(JournalError),
+}
+
+impl fmt::Display for AppendCodeDiffPermissionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Load(error) => write!(f, "stored proposal load failed: {error}"),
+            Self::ProposalNotFound => f.write_str("stored proposal was not found"),
+            Self::Truncated => f.write_str("a truncated code diff cannot open a permission gate"),
+            Self::BrokenEventLink => f.write_str("proposal events have a broken link"),
+            Self::SequenceOverflow => {
+                f.write_str("permission event sequence exceeds the journal limit")
+            }
+            Self::Journal(error) => write!(f, "permission journal append failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for AppendCodeDiffPermissionError {}
+
+/// Opens a permission gate bound to a stored proposal pair.
+pub fn append_code_diff_permission_request(
+    journal: &mut RunJournal,
+    cas: &LocalCas,
+    run_id: &str,
+    effect_id: &str,
+) -> Result<PermissionGate, AppendCodeDiffPermissionError> {
+    let (_, code_diff) = load_code_diff_proposal(journal, cas, run_id, effect_id)
+        .map_err(AppendCodeDiffPermissionError::Load)?
+        .ok_or(AppendCodeDiffPermissionError::ProposalNotFound)?;
+    if code_diff.truncated {
+        return Err(AppendCodeDiffPermissionError::Truncated);
+    }
+
+    let events = journal
+        .events(run_id)
+        .map_err(AppendCodeDiffPermissionError::Journal)?;
+    let diff_event = events
+        .iter()
+        .rev()
+        .find(|event| {
+            event.event_type == DIFF_EVENT_TYPE
+                && event.correlation_id.as_deref() == Some(effect_id)
+        })
+        .ok_or(AppendCodeDiffPermissionError::BrokenEventLink)?;
+    let plan_event = events
+        .iter()
+        .find(|event| {
+            event.event_type == WRITE_PLAN_EVENT_TYPE
+                && diff_event.causation_id.as_deref() == Some(event.event_id.as_str())
+        })
+        .ok_or(AppendCodeDiffPermissionError::BrokenEventLink)?;
+    let EventPayload::Cas {
+        payload_cas: diff_cas,
+    } = &diff_event.payload
+    else {
+        return Err(AppendCodeDiffPermissionError::BrokenEventLink);
+    };
+    let EventPayload::Cas {
+        payload_cas: plan_cas,
+    } = &plan_event.payload
+    else {
+        return Err(AppendCodeDiffPermissionError::BrokenEventLink);
+    };
+    let gate = PermissionGate {
+        gate_id: Uuid::now_v7().to_string(),
+        request: PermissionRequest::CodeDiff {
+            effect_id: effect_id.into(),
+            code_diff_id: code_diff.id,
+            diff_sha256: diff_cas.sha256.clone(),
+            write_plan_sha256: plan_cas.sha256.clone(),
+        },
+    };
+    let expected_last_seq = events.last().map_or(0, |event| event.run_seq);
+    let run_seq = expected_last_seq
+        .checked_add(1)
+        .ok_or(AppendCodeDiffPermissionError::SequenceOverflow)?;
+    let event = EventEnvelope {
+        event_id: Uuid::now_v7().to_string(),
+        run_id: run_id.into(),
+        run_seq,
+        event_type: "permission.requested".into(),
+        event_version: EVENT_VERSION,
+        envelope_version: 1,
+        recorded_at: Utc::now().to_rfc3339_opts(SecondsFormat::AutoSi, true),
+        occurred_at: None,
+        correlation_id: Some(effect_id.into()),
+        causation_id: Some(diff_event.event_id.clone()),
+        payload: EventPayload::Inline {
+            payload_json: serde_json::to_value(&gate).expect("permission gates serialize"),
+        },
+        provenance: Provenance {
+            source: "muniment-desktop".into(),
+            source_version: env!("CARGO_PKG_VERSION").into(),
+            actor_id: None,
+            device_id: None,
+            rpc_request_id: None,
+            capability_versions: None,
+            extra: BTreeMap::new(),
+        },
+        extra: BTreeMap::new(),
+    };
+    journal
+        .append(expected_last_seq, &event)
+        .map_err(AppendCodeDiffPermissionError::Journal)?;
+    Ok(gate)
+}
 
 /// Loads and verifies the proposal linked to an effect.
 pub fn load_code_diff_proposal(

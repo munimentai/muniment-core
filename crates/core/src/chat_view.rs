@@ -52,10 +52,11 @@ pub fn chat_attachments(attachments: &[ProjectedAttachment]) -> Vec<ChatAttachme
 }
 
 pub fn chat_pending_permission(gate: Option<PermissionGate>) -> Option<ChatPendingPermission> {
-    gate.map(|gate| ChatPendingPermission {
-        gate_id: gate.gate_id,
-        request: gate.request,
-    })
+    gate.filter(|gate| !matches!(&gate.request, PermissionRequest::CodeDiff { .. }))
+        .map(|gate| ChatPendingPermission {
+            gate_id: gate.gate_id,
+            request: gate.request,
+        })
 }
 
 pub fn chat_tool_activity(activity: &[ToolActivity]) -> Vec<ChatToolActivity> {

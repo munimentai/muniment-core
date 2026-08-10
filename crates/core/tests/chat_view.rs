@@ -65,6 +65,17 @@ fn pending_permission_uses_the_webview_contract() {
         })
     );
     assert!(chat_pending_permission(None).is_none());
+
+    assert!(chat_pending_permission(Some(PermissionGate {
+        gate_id: "code-gate".into(),
+        request: PermissionRequest::CodeDiff {
+            effect_id: "effect-1".into(),
+            code_diff_id: "diff-1".into(),
+            diff_sha256: "aa".into(),
+            write_plan_sha256: "bb".into(),
+        },
+    }))
+    .is_none());
 }
 
 #[test]

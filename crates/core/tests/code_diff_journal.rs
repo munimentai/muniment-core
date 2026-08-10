@@ -1,10 +1,13 @@
 use muniment_code_diff::{canonical_bytes, CodeDiff};
 use muniment_core::cas::{ContentHash, LocalCas};
 use muniment_core::code_diff_journal::{
-    load_code_diff_proposal, stage_code_diff_proposal, LoadCodeDiffError, DIFF_EVENT_TYPE,
-    DIFF_MEDIA_TYPE, EVENT_VERSION, WRITE_PLAN_EVENT_TYPE,
+    append_code_diff_permission_request, load_code_diff_proposal, stage_code_diff_proposal,
+    AppendCodeDiffPermissionError, LoadCodeDiffError, DIFF_EVENT_TYPE, DIFF_MEDIA_TYPE,
+    EVENT_VERSION, WRITE_PLAN_EVENT_TYPE,
 };
-use muniment_core::journal::{EventEnvelope, EventPayload, Provenance, RunJournal};
+use muniment_core::journal::{
+    reducer::PermissionRequest, EventEnvelope, EventPayload, Provenance, RunJournal,
+};
 use muniment_core::write_plan::{WritePlan, MEDIA_TYPE as WRITE_PLAN_MEDIA_TYPE};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -105,6 +108,78 @@ fn stages_and_loads_a_verified_proposal() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn appends_a_permission_bound_to_the_stored_proposal_pair() {
+    let root = TestRoot::new();
+    let cas = LocalCas::open(&root.as_ref().join("cas")).unwrap();
+    let mut journal = RunJournal::open(root.as_ref().join("journal.sqlite3")).unwrap();
+    let run_id = Uuid::now_v7().to_string();
+    let effect_id = Uuid::now_v7().to_string();
+    journal.append(0, &initial_event(&run_id)).unwrap();
+    let (plan, diff) = proposal();
+    stage_code_diff_proposal(&mut journal, &cas, &run_id, &effect_id, &plan, &diff).unwrap();
+    let proposal_events = journal.events(&run_id).unwrap();
+    let EventPayload::Cas {
+        payload_cas: plan_cas,
+    } = &proposal_events[1].payload
+    else {
+        panic!("write plan must use CAS");
+    };
+    let EventPayload::Cas {
+        payload_cas: diff_cas,
+    } = &proposal_events[2].payload
+    else {
+        panic!("code diff must use CAS");
+    };
+
+    let gate =
+        append_code_diff_permission_request(&mut journal, &cas, &run_id, &effect_id).unwrap();
+
+    assert_eq!(
+        Uuid::parse_str(&gate.gate_id).unwrap().get_version(),
+        Some(uuid::Version::SortRand)
+    );
+    assert_eq!(
+        gate.request,
+        PermissionRequest::CodeDiff {
+            effect_id: effect_id.clone(),
+            code_diff_id: diff.id,
+            diff_sha256: diff_cas.sha256.clone(),
+            write_plan_sha256: plan_cas.sha256.clone(),
+        }
+    );
+    let events = journal.events(&run_id).unwrap();
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[3].event_type, "permission.requested");
+    assert_eq!(
+        events[3].causation_id.as_deref(),
+        Some(events[2].event_id.as_str())
+    );
+    let EventPayload::Inline { payload_json } = &events[3].payload else {
+        panic!("permission request must use an inline payload");
+    };
+    assert_eq!(serde_json::to_value(&gate).unwrap(), *payload_json);
+}
+
+#[test]
+fn truncated_proposal_opens_no_permission_gate() {
+    let root = TestRoot::new();
+    let cas = LocalCas::open(&root.as_ref().join("cas")).unwrap();
+    let mut journal = RunJournal::open(root.as_ref().join("journal.sqlite3")).unwrap();
+    let run_id = Uuid::now_v7().to_string();
+    let effect_id = Uuid::now_v7().to_string();
+    journal.append(0, &initial_event(&run_id)).unwrap();
+    let (plan, mut diff) = proposal();
+    diff.truncated = true;
+    stage_code_diff_proposal(&mut journal, &cas, &run_id, &effect_id, &plan, &diff).unwrap();
+
+    assert!(matches!(
+        append_code_diff_permission_request(&mut journal, &cas, &run_id, &effect_id),
+        Err(AppendCodeDiffPermissionError::Truncated)
+    ));
+    assert_eq!(journal.events(&run_id).unwrap().len(), 3);
 }
 
 #[test]

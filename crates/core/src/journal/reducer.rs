@@ -394,6 +394,12 @@ pub enum PermissionRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout: Option<u64>,
     },
+    CodeDiff {
+        effect_id: String,
+        code_diff_id: String,
+        diff_sha256: String,
+        write_plan_sha256: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

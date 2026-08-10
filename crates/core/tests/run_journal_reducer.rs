@@ -214,6 +214,47 @@ fn permission_dialog_details_replay_and_resolution_clears_projection() {
 }
 
 #[test]
+fn code_diff_permission_replays_and_obeys_gate_rules() {
+    let payload = json!({
+        "gate_id": "gate-1", "kind": "code_diff", "effect_id": "effect-1",
+        "code_diff_id": "diff-1", "diff_sha256": "aa", "write_plan_sha256": "bb"
+    });
+    let gate: PermissionGate = serde_json::from_value(payload.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&gate).unwrap(), payload);
+
+    let resolved = stream(&[
+        ("run.started", json!({})),
+        ("permission.requested", payload.clone()),
+        ("permission.resolved", json!({"gate_id": "gate-1"})),
+    ]);
+    assert_eq!(reduce(&resolved).unwrap().status, RunStatus::Active);
+    let mismatched = stream(&[
+        ("run.started", json!({})),
+        ("permission.requested", payload.clone()),
+        ("permission.resolved", json!({"gate_id": "other-gate"})),
+    ]);
+    assert!(matches!(
+        reduce(&mismatched),
+        Err(ReduceError::InvalidTransition { .. })
+    ));
+
+    let inactive = stream(&[("permission.requested", payload.clone())]);
+    assert!(matches!(
+        reduce(&inactive),
+        Err(ReduceError::InvalidTransition { .. })
+    ));
+    let overlapping = stream(&[
+        ("run.started", json!({})),
+        ("permission.requested", payload.clone()),
+        ("permission.requested", payload),
+    ]);
+    assert!(matches!(
+        reduce(&overlapping),
+        Err(ReduceError::InvalidTransition { .. })
+    ));
+}
+
+#[test]
 fn overlapping_permission_gates_remain_a_hard_error() {
     let events = stream(&[
         ("run.started", json!({})),
