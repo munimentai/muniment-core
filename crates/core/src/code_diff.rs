@@ -33,14 +33,49 @@ pub fn compute_code_diff(
     staged: &BTreeMap<String, Vec<u8>>,
 ) -> Result<CodeDiff, ComputeCodeDiffError> {
     let paths: BTreeSet<_> = current.keys().chain(staged.keys()).collect();
-    let changed_file_count = paths.iter().try_fold(0usize, |count, path| {
-        if current.get(*path) == staged.get(*path) {
-            Some(count)
-        } else {
-            count.checked_add(1)
+    let deleted_paths: Vec<_> = current
+        .keys()
+        .filter(|path| !staged.contains_key(*path))
+        .collect();
+    let added_paths: Vec<_> = staged
+        .keys()
+        .filter(|path| !current.contains_key(*path))
+        .collect();
+    let mut paired_added_paths = BTreeSet::new();
+    let mut renamed_paths = BTreeMap::new();
+    for old_path in deleted_paths {
+        if let Some(new_path) = added_paths.iter().find(|new_path| {
+            !paired_added_paths.contains(*new_path)
+                && current.get(old_path) == staged.get(**new_path)
+        }) {
+            paired_added_paths.insert(*new_path);
+            renamed_paths.insert(old_path, *new_path);
         }
-    });
-    if changed_file_count.is_none_or(|count| count > MAX_CHANGED_FILES) {
+    }
+
+    let mut changes = BTreeMap::new();
+    for path in paths {
+        let old = current.get(path);
+        let new = staged.get(path);
+        if old == new || paired_added_paths.contains(path) {
+            continue;
+        }
+        if let Some(new_path) = renamed_paths.get(path) {
+            changes.insert(
+                *new_path,
+                (Some(path), Some(*new_path), DiffStatus::Renamed),
+            );
+            continue;
+        }
+        let change = match (old, new) {
+            (None, Some(_)) => (None, Some(path), DiffStatus::Added),
+            (Some(_), None) => (Some(path), None, DiffStatus::Deleted),
+            (Some(_), Some(_)) => (Some(path), Some(path), DiffStatus::Modified),
+            (None, None) => unreachable!(),
+        };
+        changes.insert(path, change);
+    }
+    if changes.len() > MAX_CHANGED_FILES {
         return Err(ComputeCodeDiffError::TooManyChangedFiles);
     }
 
@@ -48,21 +83,11 @@ pub fn compute_code_diff(
     let mut rendered_lines = 0usize;
     let mut truncated = false;
 
-    for path in paths {
-        let old = current.get(path);
-        let new = staged.get(path);
-        if old == new {
-            continue;
-        }
-
-        let (status, old_path, new_path) = match (old, new) {
-            (None, Some(_)) => (DiffStatus::Added, None, Some(path.clone())),
-            (Some(_), None) => (DiffStatus::Deleted, Some(path.clone()), None),
-            (Some(_), Some(_)) => (DiffStatus::Modified, Some(path.clone()), Some(path.clone())),
-            (None, None) => unreachable!(),
-        };
+    for (_, (old_path, new_path, status)) in changes {
+        let old = old_path.and_then(|path| current.get(path));
+        let new = new_path.and_then(|path| staged.get(path));
         let binary = old.into_iter().chain(new).any(|bytes| is_binary(bytes));
-        let mut hunks = if binary {
+        let mut hunks = if binary || status == DiffStatus::Renamed {
             Vec::new()
         } else {
             text_hunks(
@@ -91,8 +116,8 @@ pub fn compute_code_diff(
         }
 
         files.push(DiffFile {
-            old_path,
-            new_path,
+            old_path: old_path.cloned(),
+            new_path: new_path.cloned(),
             status,
             old_mode: None,
             new_mode: None,

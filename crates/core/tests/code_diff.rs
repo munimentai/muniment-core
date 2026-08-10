@@ -54,6 +54,37 @@ fn accepts_two_hundred_changed_files_and_rejects_more() {
 }
 
 #[test]
+fn counts_each_rename_as_one_changed_file() {
+    let current: BTreeMap<_, _> = (0..201)
+        .map(|index| (format!("old-{index:03}"), index.to_string().into_bytes()))
+        .collect();
+    let staged: BTreeMap<_, _> = (0..201)
+        .map(|index| (format!("new-{index:03}"), index.to_string().into_bytes()))
+        .collect();
+
+    let diff = compute_code_diff(
+        &current
+            .iter()
+            .take(200)
+            .map(|(path, bytes)| (path.clone(), bytes.clone()))
+            .collect(),
+        &staged
+            .iter()
+            .take(200)
+            .map(|(path, bytes)| (path.clone(), bytes.clone()))
+            .collect(),
+    )
+    .unwrap();
+
+    diff.validate().unwrap();
+    assert_eq!(diff.files.len(), 200);
+    assert_eq!(
+        compute_code_diff(&current, &staged),
+        Err(ComputeCodeDiffError::TooManyChangedFiles)
+    );
+}
+
+#[test]
 fn unchanged_files_do_not_count_toward_the_file_limit() {
     let unchanged = added_files(201);
 
@@ -116,6 +147,64 @@ fn computes_sorted_valid_files_with_a_uuid_v7() {
     assert_eq!(diff.files[2].old_path.as_deref(), Some("d.txt"));
     assert_eq!(diff.files[2].status, DiffStatus::Deleted);
     assert!(!diff.truncated);
+}
+
+#[test]
+fn reports_an_exact_content_rename_without_hunks() {
+    let diff = compute_code_diff(
+        &tree(&[("old.txt", b"same bytes")]),
+        &tree(&[("a.txt", b"added"), ("new.txt", b"same bytes")]),
+    )
+    .unwrap();
+
+    diff.validate().unwrap();
+    assert_eq!(diff.files.len(), 2);
+    assert_eq!(diff.files[0].new_path.as_deref(), Some("a.txt"));
+    assert_eq!(diff.files[1].status, DiffStatus::Renamed);
+    assert_eq!(diff.files[1].old_path.as_deref(), Some("old.txt"));
+    assert_eq!(diff.files[1].new_path.as_deref(), Some("new.txt"));
+    assert!(!diff.files[1].binary);
+    assert!(diff.files[1].hunks.is_empty());
+}
+
+#[test]
+fn pairs_identical_rename_candidates_once_in_path_order() {
+    let current = tree(&[("old-a", b"same"), ("old-b", b"same")]);
+    let staged = tree(&[("new-a", b"same"), ("new-b", b"same")]);
+
+    let diff = compute_code_diff(&current, &staged).unwrap();
+
+    diff.validate().unwrap();
+    assert_eq!(diff.files.len(), 2);
+    assert_eq!(diff.files[0].old_path.as_deref(), Some("old-a"));
+    assert_eq!(diff.files[0].new_path.as_deref(), Some("new-a"));
+    assert_eq!(diff.files[1].old_path.as_deref(), Some("old-b"));
+    assert_eq!(diff.files[1].new_path.as_deref(), Some("new-b"));
+    assert!(diff
+        .files
+        .iter()
+        .all(|file| file.status == DiffStatus::Renamed && file.hunks.is_empty()));
+}
+
+#[test]
+fn keeps_one_byte_changes_as_added_and_deleted_files() {
+    let diff = compute_code_diff(&tree(&[("old", b"abc")]), &tree(&[("new", b"abd")])).unwrap();
+
+    diff.validate().unwrap();
+    assert_eq!(diff.files.len(), 2);
+    assert_eq!(diff.files[0].status, DiffStatus::Added);
+    assert_eq!(diff.files[1].status, DiffStatus::Deleted);
+}
+
+#[test]
+fn reports_an_exact_binary_rename_without_hunks() {
+    let diff = compute_code_diff(&tree(&[("old", b"a\0b")]), &tree(&[("new", b"a\0b")])).unwrap();
+
+    diff.validate().unwrap();
+    assert_eq!(diff.files.len(), 1);
+    assert_eq!(diff.files[0].status, DiffStatus::Renamed);
+    assert!(diff.files[0].binary);
+    assert!(diff.files[0].hunks.is_empty());
 }
 
 #[test]
