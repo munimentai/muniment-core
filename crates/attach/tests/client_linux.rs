@@ -3,8 +3,9 @@
 use muniment_attach::{
     authorized, encode_frame, handshake_migration_control_stream, handshake_stream,
     handshake_stream_with_credential, reconnect_welcome, welcome, ClientError, ErrorAction,
-    ErrorEnvelope, Event, EventName, Failure, Id, PermissionDecision, PermissionKind, Protocol,
-    ProtocolError, Response, RunStreamMessage, Success, VersionRange, MAX_FRAME_LENGTH,
+    ErrorEnvelope, Event, EventName, Failure, Id, MigrationControlFailure, MigrationControlOutcome,
+    PermissionDecision, PermissionKind, Protocol, ProtocolError, Response, RunStreamMessage,
+    Success, VersionRange, MAX_FRAME_LENGTH,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -52,6 +53,138 @@ fn migration_handshake_accepts_only_a_credential_free_grant() {
         }
         sender.join().unwrap();
     }
+}
+
+fn complete_migration_handshake(server: &mut UnixStream) {
+    read_client_frame(server);
+    server
+        .write_all(&encode_frame(&reconnect_welcome(1, "0.0.1", "11".repeat(16), "")).unwrap())
+        .unwrap();
+    server
+        .write_all(
+            &encode_frame(&serde_json::json!({
+                "profile_id": "",
+                "capability": "33".repeat(32),
+                "expires_at": 60,
+                "idle_timeout_seconds": 60,
+                "workspace_scopes": {},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+}
+
+#[test]
+fn migration_control_sends_authorized_request_and_checks_echo() {
+    for response_nonce in ["handoff-nonce", "different-nonce"] {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            complete_migration_handshake(&mut server);
+            let request = read_client_value(&mut server);
+            let request_id = request["request_id"].as_str().unwrap().to_owned();
+            assert_eq!(
+                request,
+                serde_json::json!({
+                    "protocol": "muniment.attach/1",
+                    "request_id": request_id,
+                    "operation": "migration.control",
+                    "capability": "33".repeat(32),
+                    "body": { "handoff_nonce": "handoff-nonce", "deadline_ms": 30_000 }
+                })
+            );
+            server
+                .write_all(
+                    &encode_frame(&Response {
+                        protocol: Protocol,
+                        request_id: Id::new(request_id).unwrap(),
+                        ok: Success,
+                        body: serde_json::json!({ "handoff_nonce": response_nonce }),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        });
+        let mut client = handshake_migration_control_stream(client, "0.0.1", SHORT).unwrap();
+        let result = client.control_migration("handoff-nonce", 30_000);
+        if response_nonce == "handoff-nonce" {
+            assert_eq!(result.unwrap(), MigrationControlOutcome::Accepted);
+        } else {
+            assert_eq!(result.unwrap_err(), MigrationControlFailure::NonceMismatch);
+        }
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn migration_control_maps_expected_refusals() {
+    let cases = [
+        (
+            ProtocolError::migration_not_ready(),
+            MigrationControlOutcome::MigrationNotReady { retryable: true },
+        ),
+        (
+            ProtocolError::unauthorized(),
+            MigrationControlOutcome::Unauthorized,
+        ),
+        (
+            ProtocolError::unsupported_operation(),
+            MigrationControlOutcome::UnsupportedOperation,
+        ),
+    ];
+    for (error, expected) in cases {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            complete_migration_handshake(&mut server);
+            let request = read_client_value(&mut server);
+            server
+                .write_all(
+                    &encode_frame(&ErrorEnvelope {
+                        protocol: Protocol,
+                        request_id: Some(Id::new(request["request_id"].as_str().unwrap()).unwrap()),
+                        ok: Failure,
+                        error,
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        });
+        let mut client = handshake_migration_control_stream(client, "0.0.1", SHORT).unwrap();
+        assert_eq!(
+            client.control_migration("handoff-nonce", 30_000).unwrap(),
+            expected
+        );
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn migration_control_rejects_invalid_bounds_before_writing() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_migration_handshake(&mut server);
+        server.set_read_timeout(Some(SHORT)).unwrap();
+        let mut prefix = [0; 4];
+        assert!(matches!(
+            server.read_exact(&mut prefix).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+    });
+    let mut client = handshake_migration_control_stream(client, "0.0.1", SHORT).unwrap();
+    for nonce in ["", "bad\nnonce", &"x".repeat(129)] {
+        assert_eq!(
+            client.control_migration(nonce, 1).unwrap_err(),
+            MigrationControlFailure::InvalidNonce
+        );
+    }
+    for deadline_ms in [0, 60_001] {
+        assert_eq!(
+            client
+                .control_migration("handoff-nonce", deadline_ms)
+                .unwrap_err(),
+            MigrationControlFailure::InvalidDeadline
+        );
+    }
+    worker.join().unwrap();
 }
 
 #[test]

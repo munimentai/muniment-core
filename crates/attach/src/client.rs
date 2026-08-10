@@ -46,6 +46,41 @@ impl fmt::Display for ClientError {
 
 impl std::error::Error for ClientError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MigrationControlOutcome {
+    Accepted,
+    MigrationNotReady { retryable: bool },
+    Unauthorized,
+    UnsupportedOperation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MigrationControlFailure {
+    InvalidNonce,
+    InvalidDeadline,
+    NonceMismatch,
+    Client(ClientError),
+}
+
+impl fmt::Display for MigrationControlFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidNonce => "the handoff nonce is invalid",
+            Self::InvalidDeadline => "the handoff deadline is invalid",
+            Self::NonceMismatch => "the desktop returned a different handoff nonce",
+            Self::Client(error) => return error.fmt(formatter),
+        })
+    }
+}
+
+impl std::error::Error for MigrationControlFailure {}
+
+impl From<ClientError> for MigrationControlFailure {
+    fn from(error: ClientError) -> Self {
+        Self::Client(error)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthorizationSummary {
     pub expires_in_seconds: u64,
@@ -304,10 +339,10 @@ impl fmt::Debug for ThreadListPage {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::{
-        AuthorizationSummary, ClientError, PendingPermission, PermissionAnswerAccepted,
-        PermissionDecision, RedactedRunEvent, RunCancelAccepted, RunStartAccepted,
-        RunStreamMessage, RunStreamSubscription, ThreadCreateAccepted, ThreadListPage,
-        ThreadOpenPage,
+        AuthorizationSummary, ClientError, MigrationControlFailure, MigrationControlOutcome,
+        PendingPermission, PermissionAnswerAccepted, PermissionDecision, RedactedRunEvent,
+        RunCancelAccepted, RunStartAccepted, RunStreamMessage, RunStreamSubscription,
+        ThreadCreateAccepted, ThreadListPage, ThreadOpenPage,
     };
     use crate::{
         decode_frame, encode_frame, Authorization, Authorized, Client, Envelope, ErrorCode,
@@ -353,6 +388,8 @@ mod linux {
     const MAX_RUN_STREAM_WINDOW_EVENTS: usize = 1_024;
     const MAX_RUN_STREAM_WINDOW_BYTES: usize = 4 * 1024 * 1024;
     const MAX_RUN_STREAM_WINDOW_TEXT_BYTES: usize = 262_144;
+    const MAX_HANDOFF_NONCE_BYTES: usize = 128;
+    const MAX_HANDOFF_DEADLINE_MS: u64 = 60_000;
 
     struct ActiveRunStream {
         subscription_id: Id,
@@ -1293,6 +1330,7 @@ mod linux {
         stream: UnixStream,
         capability: String,
         summary: AuthorizationSummary,
+        io_timeout: Duration,
     }
 
     impl std::fmt::Debug for MigrationControlClient {
@@ -1308,6 +1346,73 @@ mod linux {
 
         pub fn authorization_summary(&self) -> AuthorizationSummary {
             self.summary.clone()
+        }
+
+        pub fn control_migration(
+            &mut self,
+            handoff_nonce: &str,
+            deadline_ms: u64,
+        ) -> Result<MigrationControlOutcome, MigrationControlFailure> {
+            if handoff_nonce.is_empty()
+                || handoff_nonce.len() > MAX_HANDOFF_NONCE_BYTES
+                || !handoff_nonce
+                    .bytes()
+                    .all(|byte| (b' '..=b'~').contains(&byte))
+            {
+                return Err(MigrationControlFailure::InvalidNonce);
+            }
+            if !(1..=MAX_HANDOFF_DEADLINE_MS).contains(&deadline_ms) {
+                return Err(MigrationControlFailure::InvalidDeadline);
+            }
+
+            let request_id = fresh_request_id()?;
+            let request = Request {
+                protocol: Protocol,
+                request_id: request_id.clone(),
+                operation: Operation::MigrationControl,
+                capability: self.capability.clone(),
+                idempotency_key: None,
+                body: serde_json::json!({
+                    "handoff_nonce": handoff_nonce,
+                    "deadline_ms": deadline_ms,
+                }),
+            };
+            let request_deadline = deadline(self.io_timeout);
+            let bytes = encode_frame(&request).map_err(map_frame_error)?;
+            write_all_before(&mut self.stream, &bytes, request_deadline)?;
+            let envelope: Envelope =
+                serde_json::from_value(read_value(&mut self.stream, request_deadline)?)
+                    .map_err(|_| ClientError::UnexpectedMessage)?;
+            match envelope {
+                Envelope::Response(response) if response.request_id == request_id => {
+                    #[derive(serde::Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct Body {
+                        handoff_nonce: String,
+                    }
+                    let body: Body = serde_json::from_value(response.body)
+                        .map_err(|_| ClientError::UnexpectedMessage)?;
+                    if body.handoff_nonce != handoff_nonce {
+                        return Err(MigrationControlFailure::NonceMismatch);
+                    }
+                    Ok(MigrationControlOutcome::Accepted)
+                }
+                Envelope::Error(error) if error.request_id.as_ref() == Some(&request_id) => {
+                    Ok(match error.error.code() {
+                        ErrorCode::MigrationNotReady => {
+                            MigrationControlOutcome::MigrationNotReady {
+                                retryable: error.error.retryable(),
+                            }
+                        }
+                        ErrorCode::Unauthorized => MigrationControlOutcome::Unauthorized,
+                        ErrorCode::UnsupportedOperation => {
+                            MigrationControlOutcome::UnsupportedOperation
+                        }
+                        code => return Err(map_protocol_error(code).into()),
+                    })
+                }
+                _ => Err(ClientError::UnexpectedMessage.into()),
+            }
         }
 
         pub fn into_stream(self) -> UnixStream {
@@ -1560,6 +1665,7 @@ mod linux {
                 expires_in_seconds: authorized.expires_at,
                 idle_timeout_seconds: authorized.idle_timeout_seconds,
             },
+            io_timeout,
         })
     }
 
