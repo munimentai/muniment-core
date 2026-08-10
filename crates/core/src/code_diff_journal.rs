@@ -1,10 +1,16 @@
 //! CAS storage and atomic journal publication for code-diff proposals.
 
 use crate::cas::{CasError, ContentHash, LocalCas};
+use crate::code_diff::{compute_code_diff, ComputeCodeDiffError};
+use crate::code_diff_staging::{
+    stage_proposed_operations, ProposedOperation, StageProposedOperationsError,
+};
 use crate::journal::{
     CasReference, EventEnvelope, EventPayload, JournalError, Provenance, RunJournal,
 };
-use crate::write_plan::{WritePlan, WritePlanError, MEDIA_TYPE as WRITE_PLAN_MEDIA_TYPE};
+use crate::write_plan::{
+    WriteOperation, WritePlan, WritePlanError, MEDIA_TYPE as WRITE_PLAN_MEDIA_TYPE,
+};
 use chrono::{SecondsFormat, Utc};
 use muniment_code_diff::{canonical_bytes, CanonicalBytesError, CodeDiff, ValidationError};
 use serde_json::Error as JsonError;
@@ -43,6 +49,25 @@ impl fmt::Display for StageCodeDiffError {
 }
 
 impl std::error::Error for StageCodeDiffError {}
+
+#[derive(Debug)]
+pub enum ComposeCodeDiffProposalError {
+    Staging(StageProposedOperationsError),
+    Diff(ComputeCodeDiffError),
+    Persistence(StageCodeDiffError),
+}
+
+impl fmt::Display for ComposeCodeDiffProposalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Staging(error) => write!(f, "proposal staging failed: {error}"),
+            Self::Diff(error) => write!(f, "code diff computation failed: {error}"),
+            Self::Persistence(error) => write!(f, "proposal persistence failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ComposeCodeDiffProposalError {}
 
 #[derive(Debug)]
 pub enum LoadCodeDiffError {
@@ -196,6 +221,41 @@ fn hex_nibble(byte: u8) -> u8 {
     }
 }
 
+/// Composes and stores a proposal from a validated write plan and current tree.
+pub fn compose_code_diff_proposal(
+    write_plan: &WritePlan,
+    current: &BTreeMap<String, Vec<u8>>,
+    journal: &mut RunJournal,
+    cas: &LocalCas,
+    run_id: &str,
+    effect_id: &str,
+) -> Result<CodeDiff, ComposeCodeDiffProposalError> {
+    let operations: Vec<_> = write_plan
+        .operations()
+        .iter()
+        .map(|operation| match operation {
+            WriteOperation::Write { target, output, .. } => ProposedOperation::Write {
+                path: target.path().to_owned(),
+                output: output.clone(),
+            },
+            WriteOperation::Rename { source, target } => ProposedOperation::Rename {
+                source: source.path().to_owned(),
+                target: target.path().to_owned(),
+            },
+            WriteOperation::Delete { target } => ProposedOperation::Delete {
+                path: target.path().to_owned(),
+            },
+        })
+        .collect();
+    let staged = stage_proposed_operations(current, &operations)
+        .map_err(ComposeCodeDiffProposalError::Staging)?;
+    let code_diff =
+        compute_code_diff(current, &staged).map_err(ComposeCodeDiffProposalError::Diff)?;
+    stage_code_diff_proposal(journal, cas, run_id, effect_id, write_plan, &code_diff)
+        .map_err(ComposeCodeDiffProposalError::Persistence)?;
+    Ok(code_diff)
+}
+
 /// Stores a validated proposal and appends its linked journal events atomically.
 pub fn stage_code_diff_proposal(
     journal: &mut RunJournal,
@@ -288,5 +348,148 @@ fn proposal_event(
             extra: BTreeMap::new(),
         },
         extra: BTreeMap::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::write_plan::{ObservedPath, ObservedState, StableFileIdentity};
+    use std::fs;
+    use std::path::PathBuf;
+
+    struct TestStore {
+        root: PathBuf,
+        journal: RunJournal,
+        cas: LocalCas,
+    }
+
+    impl TestStore {
+        fn new() -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("muniment-code-diff-producer-{}", Uuid::now_v7()));
+            fs::create_dir_all(&root).unwrap();
+            let journal = RunJournal::open(root.join("runs.sqlite3")).unwrap();
+            let cas = LocalCas::open(&root.join("cas")).unwrap();
+            Self { root, journal, cas }
+        }
+    }
+
+    impl Drop for TestStore {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    fn absent(path: impl Into<String>) -> ObservedPath {
+        ObservedPath::new(path, ObservedState::Absent, StableFileIdentity::new(1, 1))
+    }
+
+    fn write(path: impl Into<String>, output: &[u8]) -> WriteOperation {
+        WriteOperation::Write {
+            target: absent(path),
+            output: output.to_vec(),
+            mode: 0o644,
+        }
+    }
+
+    #[test]
+    fn composes_and_loads_the_stored_proposal_pair() {
+        let mut store = TestStore::new();
+        let plan = WritePlan::new(vec![
+            write("new.txt", b"new\n"),
+            WriteOperation::Rename {
+                source: ObservedPath::new(
+                    "old.txt",
+                    ObservedState::File {
+                        byte_length: 4,
+                        sha256: [1; 32],
+                        mode: 0o644,
+                        identity: StableFileIdentity::new(1, 2),
+                    },
+                    StableFileIdentity::new(1, 1),
+                ),
+                target: absent("moved.txt"),
+            },
+        ])
+        .unwrap();
+        let current = BTreeMap::from([("old.txt".to_owned(), b"old\n".to_vec())]);
+        let run_id = Uuid::now_v7().to_string();
+        let effect_id = Uuid::now_v7().to_string();
+
+        let diff = compose_code_diff_proposal(
+            &plan,
+            &current,
+            &mut store.journal,
+            &store.cas,
+            &run_id,
+            &effect_id,
+        )
+        .unwrap();
+        let loaded =
+            load_code_diff_proposal(&mut store.journal, &store.cas, &run_id, &effect_id).unwrap();
+
+        assert_eq!(loaded, Some((plan, diff)));
+    }
+
+    #[test]
+    fn reports_the_staging_failure() {
+        let mut store = TestStore::new();
+        let plan = WritePlan::new(vec![WriteOperation::Delete {
+            target: ObservedPath::new(
+                "missing.txt",
+                ObservedState::File {
+                    byte_length: 1,
+                    sha256: [1; 32],
+                    mode: 0o644,
+                    identity: StableFileIdentity::new(1, 2),
+                },
+                StableFileIdentity::new(1, 1),
+            ),
+        }])
+        .unwrap();
+
+        let error = compose_code_diff_proposal(
+            &plan,
+            &BTreeMap::new(),
+            &mut store.journal,
+            &store.cas,
+            "run",
+            "effect",
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ComposeCodeDiffProposalError::Staging(
+                StageProposedOperationsError::DeleteTargetMissing(path)
+            ) if path == "missing.txt"
+        ));
+    }
+
+    #[test]
+    fn reports_the_diff_failure() {
+        let mut store = TestStore::new();
+        let plan = WritePlan::new(
+            (0..201)
+                .map(|index| write(format!("{index}.txt"), b"new"))
+                .collect(),
+        )
+        .unwrap();
+
+        let error = compose_code_diff_proposal(
+            &plan,
+            &BTreeMap::new(),
+            &mut store.journal,
+            &store.cas,
+            "run",
+            "effect",
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ComposeCodeDiffProposalError::Diff(ComputeCodeDiffError::TooManyChangedFiles)
+        ));
     }
 }
