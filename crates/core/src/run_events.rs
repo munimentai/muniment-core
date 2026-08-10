@@ -161,7 +161,7 @@ pub fn fail_start(
     }
 }
 
-fn event_envelope(
+pub(crate) fn event_envelope(
     run_id: &str,
     run_seq: u64,
     kind: &str,
