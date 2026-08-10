@@ -22,6 +22,7 @@ pub mod chat_resume;
 pub mod chat_view;
 pub mod code_diff;
 pub mod code_diff_journal;
+pub mod code_diff_observe;
 pub mod code_diff_staging;
 pub mod home;
 pub mod import_preview;
