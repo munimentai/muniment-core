@@ -46,7 +46,7 @@ pub fn verify_migration_control_peer(
 pub fn verify_migration_control_peer_with_reader(
     peer_pid: u32,
     expected_executable: &Path,
-    reader: &impl LinuxProcReader,
+    reader: &(impl LinuxProcReader + ?Sized),
 ) -> Result<AuthorizedMigrationControlPeer, MigrationAuthorityError> {
     if !expected_executable.is_absolute() {
         return Err(MigrationAuthorityError::ExpectedExecutableInvalid);

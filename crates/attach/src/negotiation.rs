@@ -265,6 +265,16 @@ impl fmt::Debug for Authorized {
     }
 }
 
+/// A connection-bound migration control grant with no reconnect credential.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationControlAuthorized {
+    pub profile_id: String,
+    pub capability: String,
+    pub expires_at: u64,
+    pub idle_timeout_seconds: u64,
+    pub workspace_scopes: BTreeMap<String, BTreeSet<String>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum FirstMessage {

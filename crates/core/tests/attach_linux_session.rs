@@ -4,12 +4,14 @@ use muniment_core::attach::linux::{
     approval_waiter_with_claims, run_authenticated_session_with,
     run_authenticated_session_with_authorization,
     run_authenticated_session_with_authorization_and_registry,
+    run_authenticated_session_with_authorization_registry_and_migration,
     run_authenticated_session_with_service_and_approvals, ApprovalDecision, AttachSessionError,
     AuthorizationSessionDependencies, CompanionProvenance, LiveConnectionRegistry,
-    MigrationControlRequest, PeerCredentials, PermissionAnswerAccepted, PermissionAnswerRequest,
-    RedactedThreadSummary, RunCancelAccepted, RunCancelRequest, RunStartAccepted, RunStartRequest,
-    RunStreamPage, ThreadListPage, ThreadListRequest, ThreadListService, ThreadOpenRequest,
-    MAX_PERMISSION_GATE_ID_LENGTH, MAX_RUN_START_CONTEXT_LENGTH, MAX_RUN_START_TEXT_LENGTH,
+    MigrationControlRequest, MigrationControlSessionDependencies, PeerCredentials,
+    PermissionAnswerAccepted, PermissionAnswerRequest, RedactedThreadSummary, RunCancelAccepted,
+    RunCancelRequest, RunStartAccepted, RunStartRequest, RunStreamPage, ThreadListPage,
+    ThreadListRequest, ThreadListService, ThreadOpenRequest, MAX_PERMISSION_GATE_ID_LENGTH,
+    MAX_RUN_START_CONTEXT_LENGTH, MAX_RUN_START_TEXT_LENGTH,
 };
 use muniment_core::attach::{
     decode_frame, encode_frame, Approval, AuthorizationClock, AuthorizationTokenGenerator,
@@ -18,6 +20,7 @@ use muniment_core::attach::{
     WorkspaceOnboarded, CHALLENGE_LIFETIME, MAX_FRAME_LENGTH, MAX_JSON_DEPTH,
     MAX_RUN_STREAM_WINDOW_BYTES, MAX_RUN_STREAM_WINDOW_EVENTS, MAX_RUN_STREAM_WINDOW_TEXT_BYTES,
 };
+use muniment_core::browser_control::{LinuxProcReader, ProcReadError};
 use muniment_core::journal::{
     EventEnvelope, EventPayload, JournalCommitHint, Provenance, RunEventProjection, RunJournal,
 };
@@ -27,6 +30,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc::Receiver;
 use std::sync::{
@@ -200,6 +204,21 @@ struct StartService {
 #[derive(Default)]
 struct MigrationControlService {
     calls: Vec<(MigrationControlRequest, CompanionProvenance)>,
+}
+
+#[derive(Clone)]
+struct MigrationProcessReader {
+    executable: Result<PathBuf, ProcReadError>,
+}
+
+impl LinuxProcReader for MigrationProcessReader {
+    fn start_identity(&self, _: u32) -> Result<u64, ProcReadError> {
+        self.executable.as_ref().map(|_| 42).map_err(|error| *error)
+    }
+
+    fn executable(&self, _: u32) -> Result<PathBuf, ProcReadError> {
+        self.executable.clone()
+    }
 }
 
 impl ThreadListService for MigrationControlService {
@@ -5036,6 +5055,179 @@ fn migration_control_uses_the_service_and_echoes_the_nonce() {
     );
     assert_eq!(provenance.peer_pid, std::process::id());
     assert_eq!(provenance.peer_uid, unsafe { libc::geteuid() });
+}
+
+#[test]
+fn verified_runtime_enters_a_migration_only_session_without_approval_or_credential() {
+    let executable =
+        std::env::temp_dir().join(format!("muniment-runtime-session-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&executable, b"runtime").unwrap();
+    let reader = MigrationProcessReader {
+        executable: Ok(executable.clone()),
+    };
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .write_all(&hello_with_claims(
+            1,
+            1,
+            "018f0000-0000-7000-8000-000000000099",
+            Some(&"ab".repeat(32)),
+            "hostile-claim",
+            "9.9.9",
+        ))
+        .unwrap();
+    let approvals = Arc::new(AtomicUsize::new(0));
+    let approval_calls = Arc::clone(&approvals);
+    let worker = thread::spawn(move || {
+        let mut service = MigrationControlService::default();
+        let result = run_authenticated_session_with_authorization_registry_and_migration(
+            server,
+            credentials(),
+            "0.1.0",
+            Duration::from_secs(1),
+            AuthorizationSessionDependencies {
+                fill_random: |bytes: &mut [u8]| {
+                    bytes.fill(9);
+                    Ok(())
+                },
+                clock: TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                tokens: TestTokens(1),
+                approvals: move |_: &muniment_core::attach::PairingChallenge, _: Duration| {
+                    approval_calls.fetch_add(1, Ordering::SeqCst);
+                    Some(ApprovalDecision::Approve(approval()))
+                },
+            },
+            &mut service,
+            muniment_core::attach::linux::SessionRegistryDependencies {
+                registry: &LiveConnectionRegistry::default(),
+                migration: Some(MigrationControlSessionDependencies {
+                    expected_executable: &executable,
+                    process_reader: &reader,
+                }),
+            },
+        );
+        std::fs::remove_file(executable).unwrap();
+        (result, service)
+    });
+
+    let welcome: Welcome = read_frame(&mut client);
+    assert_eq!(
+        welcome.authorization,
+        muniment_core::attach::Authorization::Authorized
+    );
+    let authorized: serde_json::Value = read_frame(&mut client);
+    assert_eq!(authorized["workspace_scopes"], json!({}));
+    assert!(authorized.get("authorized_client_credential").is_none());
+    let capability = authorized["capability"].as_str().unwrap();
+    let forbidden_operations = [
+        Operation::WorkspaceOnboard,
+        Operation::HomeEnsure,
+        Operation::ThreadList,
+        Operation::ThreadOpen,
+        Operation::ThreadCreate,
+        Operation::RunOpen,
+        Operation::RunStart,
+        Operation::RunStream,
+        Operation::RunCursorAck,
+        Operation::RunSteer,
+        Operation::RunFollowUp,
+        Operation::RunCancel,
+        Operation::PermissionAnswer,
+        Operation::ArtifactFetch,
+        Operation::ArtifactWindow,
+        Operation::RequestCancel,
+    ];
+    for (index, operation) in forbidden_operations.into_iter().enumerate() {
+        client
+            .write_all(
+                &encode_frame(&json!({
+                    "protocol": "muniment.attach/1",
+                    "request_id": format!("{:032x}", 811 + index),
+                    "operation": operation.as_str(),
+                    "capability": capability,
+                    "body": {}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let error: ErrorEnvelope = read_frame(&mut client);
+        assert_eq!(error.error.code(), ErrorCode::Unauthorized);
+    }
+    client
+        .write_all(
+            &encode_frame(&json!({
+                "protocol": "muniment.attach/1",
+                "request_id": format!("{:032x}", 900),
+                "operation": "migration.control",
+                "capability": capability,
+                "body": {"deadline_ms": 30_000, "handoff_nonce": "session-nonce"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    let response: Response = read_frame(&mut client);
+    assert_eq!(response.body, json!({"handoff_nonce": "session-nonce"}));
+    client.shutdown(Shutdown::Both).unwrap();
+    let (result, service) = worker.join().unwrap();
+    assert_eq!(result, Err(AttachSessionError::Closed));
+    assert_eq!(approvals.load(Ordering::SeqCst), 0);
+    assert_eq!(service.calls.len(), 1);
+}
+
+#[test]
+fn unresolved_runtime_peer_uses_the_ordinary_approval_path() {
+    let expected =
+        std::env::temp_dir().join(format!("muniment-runtime-missing-{}", uuid::Uuid::new_v4()));
+    let reader = MigrationProcessReader {
+        executable: Err(ProcReadError),
+    };
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello(1, 1)).unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let approvals = Rc::new(Cell::new(0));
+    let approval_calls = Rc::clone(&approvals);
+    let mut service = MigrationControlService::default();
+    let result = run_authenticated_session_with_authorization_registry_and_migration(
+        server,
+        credentials(),
+        "0.1.0",
+        Duration::from_millis(100),
+        AuthorizationSessionDependencies {
+            fill_random: |bytes: &mut [u8]| {
+                bytes.fill(9);
+                Ok(())
+            },
+            clock: TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            tokens: TestTokens(1),
+            approvals: move |_: &muniment_core::attach::PairingChallenge, _: Duration| {
+                approval_calls.set(approval_calls.get() + 1);
+                if approval_calls.get() == 1 {
+                    Some(ApprovalDecision::Approve(approval()))
+                } else {
+                    None
+                }
+            },
+        },
+        &mut service,
+        muniment_core::attach::linux::SessionRegistryDependencies {
+            registry: &LiveConnectionRegistry::default(),
+            migration: Some(MigrationControlSessionDependencies {
+                expected_executable: &expected,
+                process_reader: &reader,
+            }),
+        },
+    );
+    assert_eq!(result, Ok(()));
+    let welcome: Welcome = read_frame(&mut client);
+    assert_eq!(
+        welcome.authorization,
+        muniment_core::attach::Authorization::PairingRequired
+    );
+    let authorized: Authorized = read_frame(&mut client);
+    assert_eq!(authorized.workspace_scopes.len(), 1);
+    assert_eq!(authorized.authorized_client_credential, "09".repeat(32));
+    assert_eq!(approvals.get(), 2);
+    assert!(service.calls.is_empty());
 }
 
 #[test]

@@ -311,8 +311,9 @@ mod linux {
     };
     use crate::{
         decode_frame, encode_frame, Authorization, Authorized, Client, Envelope, ErrorCode,
-        ErrorEnvelope, EventName, FrameError, Hello, Id, Operation, Protocol, Request, Response,
-        VersionRange, Welcome, WorkspaceOnboarded, MAX_FRAME_LENGTH, MAX_TEXT_LENGTH, PROTOCOL,
+        ErrorEnvelope, EventName, FrameError, Hello, Id, MigrationControlAuthorized, Operation,
+        Protocol, Request, Response, VersionRange, Welcome, WorkspaceOnboarded, MAX_FRAME_LENGTH,
+        MAX_TEXT_LENGTH, PROTOCOL,
     };
     use serde::de::DeserializeOwned;
     use serde_json::Value;
@@ -1287,6 +1288,33 @@ mod linux {
         }
     }
 
+    /// A connection-bound client for the peer-authorized migration session.
+    pub struct MigrationControlClient {
+        stream: UnixStream,
+        capability: String,
+        summary: AuthorizationSummary,
+    }
+
+    impl std::fmt::Debug for MigrationControlClient {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("MigrationControlClient { .. }")
+        }
+    }
+
+    impl MigrationControlClient {
+        pub fn capability(&self) -> &str {
+            &self.capability
+        }
+
+        pub fn authorization_summary(&self) -> AuthorizationSummary {
+            self.summary.clone()
+        }
+
+        pub fn into_stream(self) -> UnixStream {
+            self.stream
+        }
+    }
+
     fn is_rfc3339(value: &str) -> bool {
         let bytes = value.as_bytes();
         if bytes.len() < 20
@@ -1473,6 +1501,66 @@ mod linux {
             approval_timeout,
             pairing_pending,
         )
+    }
+
+    #[doc(hidden)]
+    pub fn handshake_migration_control_stream(
+        mut stream: UnixStream,
+        client_version: &str,
+        io_timeout: Duration,
+    ) -> Result<MigrationControlClient, ClientError> {
+        let hello = Hello {
+            protocol: Protocol,
+            client: Client {
+                kind: "runtime".into(),
+                version: client_version.into(),
+            },
+            supported: VersionRange { min: 1, max: 1 },
+            client_nonce: fresh_nonce()?,
+            authorized_client_id: Id::new(fresh_request_id()?.as_str())
+                .map_err(|_| ClientError::UnexpectedMessage)?,
+            authorized_client_credential: None,
+        };
+        let bytes = encode_frame(&hello).map_err(map_frame_error)?;
+        write_all_before(&mut stream, &bytes, deadline(io_timeout))?;
+
+        let welcome_value = read_value(&mut stream, deadline(io_timeout))?;
+        reject_protocol_error(&welcome_value)?;
+        let welcome: Welcome = parse_message(welcome_value)?;
+        if welcome.selected != 1
+            || welcome.authorization != Authorization::Authorized
+            || !is_hex_secret(&welcome.server_nonce, 32)
+        {
+            return Err(ClientError::UnexpectedMessage);
+        }
+
+        let authorized_value = read_value(&mut stream, deadline(io_timeout))?;
+        reject_protocol_error(&authorized_value)?;
+        if authorized_value
+            .get("authorized_client_credential")
+            .is_some()
+        {
+            return Err(ClientError::UnexpectedMessage);
+        }
+        let authorized: MigrationControlAuthorized = parse_message(authorized_value)?;
+        if !authorized.profile_id.is_empty()
+            || !authorized.workspace_scopes.is_empty()
+            || !is_hex_secret(&authorized.capability, 64)
+            || authorized.expires_at == 0
+            || authorized.expires_at > 8 * 60 * 60
+            || authorized.idle_timeout_seconds == 0
+            || authorized.idle_timeout_seconds > 15 * 60
+        {
+            return Err(ClientError::UnexpectedMessage);
+        }
+        Ok(MigrationControlClient {
+            stream,
+            capability: authorized.capability,
+            summary: AuthorizationSummary {
+                expires_in_seconds: authorized.expires_at,
+                idle_timeout_seconds: authorized.idle_timeout_seconds,
+            },
+        })
     }
 
     fn handshake_stream_with_identity(
@@ -1699,7 +1787,10 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{handshake_stream, handshake_stream_with_credential, AuthorizedClient};
+pub use linux::{
+    handshake_migration_control_stream, handshake_stream, handshake_stream_with_credential,
+    AuthorizedClient, MigrationControlClient,
+};
 
 #[cfg(not(target_os = "linux"))]
 #[derive(Debug)]

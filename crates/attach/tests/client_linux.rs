@@ -1,10 +1,10 @@
 #![cfg(all(target_os = "linux", feature = "client"))]
 
 use muniment_attach::{
-    authorized, encode_frame, handshake_stream, handshake_stream_with_credential,
-    reconnect_welcome, welcome, ClientError, ErrorAction, ErrorEnvelope, Event, EventName, Failure,
-    Id, PermissionDecision, PermissionKind, Protocol, ProtocolError, Response, RunStreamMessage,
-    Success, VersionRange, MAX_FRAME_LENGTH,
+    authorized, encode_frame, handshake_migration_control_stream, handshake_stream,
+    handshake_stream_with_credential, reconnect_welcome, welcome, ClientError, ErrorAction,
+    ErrorEnvelope, Event, EventName, Failure, Id, PermissionDecision, PermissionKind, Protocol,
+    ProtocolError, Response, RunStreamMessage, Success, VersionRange, MAX_FRAME_LENGTH,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -17,6 +17,42 @@ use std::time::{Duration, Instant};
 
 const SHORT: Duration = Duration::from_millis(100);
 static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn migration_handshake_accepts_only_a_credential_free_grant() {
+    for include_credential in [false, true] {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let sender = thread::spawn(move || {
+            read_client_frame(&mut server);
+            server
+                .write_all(
+                    &encode_frame(&reconnect_welcome(1, "0.0.1", "11".repeat(16), "")).unwrap(),
+                )
+                .unwrap();
+            let mut grant = serde_json::json!({
+                "profile_id": "",
+                "capability": "33".repeat(32),
+                "expires_at": 60,
+                "idle_timeout_seconds": 60,
+                "workspace_scopes": {},
+            });
+            if include_credential {
+                grant["authorized_client_credential"] = serde_json::json!("44".repeat(32));
+            }
+            server.write_all(&encode_frame(&grant).unwrap()).unwrap();
+        });
+
+        let result = handshake_migration_control_stream(client, "0.0.1", SHORT);
+        if include_credential {
+            assert_eq!(result.unwrap_err(), ClientError::UnexpectedMessage);
+        } else {
+            let client = result.unwrap();
+            assert_eq!(client.capability(), "33".repeat(32));
+            assert_eq!(client.authorization_summary().expires_in_seconds, 60);
+        }
+        sender.join().unwrap();
+    }
+}
 
 #[test]
 fn reconnect_welcome_does_not_report_pairing_pending() {
