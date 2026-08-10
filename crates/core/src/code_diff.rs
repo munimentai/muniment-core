@@ -144,7 +144,7 @@ fn edit_script<'a>(old: Vec<TextLine<'a>>, new: Vec<TextLine<'a>>) -> Vec<Edit<'
             new_index += 1;
         } else if new_index < new.len()
             && (old_index == old.len()
-                || lengths[old_index][new_index + 1] >= lengths[old_index + 1][new_index])
+                || lengths[old_index][new_index + 1] > lengths[old_index + 1][new_index])
         {
             edits.push(Edit::Addition(new[new_index]));
             new_index += 1;
@@ -218,7 +218,7 @@ fn make_hunk(edits: &[Edit<'_>], position: (u64, u64)) -> DiffHunk {
     };
     let mut old_line = position.0;
     let mut new_line = position.1;
-    let lines = edits
+    let mut lines: Vec<_> = edits
         .iter()
         .map(|edit| {
             let (kind, text, old_number, new_number) = match edit {
@@ -251,6 +251,7 @@ fn make_hunk(edits: &[Edit<'_>], position: (u64, u64)) -> DiffHunk {
             }
         })
         .collect();
+    add_intra_line_segments(&mut lines);
 
     DiffHunk {
         old_start,
@@ -260,4 +261,139 @@ fn make_hunk(edits: &[Edit<'_>], position: (u64, u64)) -> DiffHunk {
         header: format!("@@ -{old_start},{old_count} +{new_start},{new_count} @@"),
         lines,
     }
+}
+
+fn add_intra_line_segments(lines: &mut [DiffLine]) {
+    let mut index = 0;
+    while index < lines.len() {
+        if lines[index].kind != DiffLineKind::Deletion {
+            index += 1;
+            continue;
+        }
+
+        let deletion_start = index;
+        while index < lines.len() && lines[index].kind == DiffLineKind::Deletion {
+            index += 1;
+        }
+        let addition_start = index;
+        while index < lines.len() && lines[index].kind == DiffLineKind::Addition {
+            index += 1;
+        }
+
+        let pair_count = (addition_start - deletion_start).min(index - addition_start);
+        for offset in 0..pair_count {
+            let deletion = deletion_start + offset;
+            let addition = addition_start + offset;
+            if let Some((deletion_segments, addition_segments)) =
+                changed_word_segments(&lines[deletion].text, &lines[addition].text)
+            {
+                lines[deletion].segments = deletion_segments;
+                lines[addition].segments = addition_segments;
+            }
+        }
+    }
+}
+
+fn changed_word_segments(
+    deletion: &str,
+    addition: &str,
+) -> Option<(Vec<DiffLineSegment>, Vec<DiffLineSegment>)> {
+    let deletion_words = word_spans(deletion);
+    let addition_words = word_spans(addition);
+    let mut leading = 0;
+    while leading < deletion_words.len()
+        && leading < addition_words.len()
+        && deletion[deletion_words[leading].0..deletion_words[leading].1]
+            == addition[addition_words[leading].0..addition_words[leading].1]
+    {
+        leading += 1;
+    }
+
+    if leading == deletion_words.len() && leading == addition_words.len() {
+        return None;
+    }
+
+    let mut trailing = 0;
+    while trailing < deletion_words.len() - leading
+        && trailing < addition_words.len() - leading
+        && deletion[deletion_words[deletion_words.len() - trailing - 1].0
+            ..deletion_words[deletion_words.len() - trailing - 1].1]
+            == addition[addition_words[addition_words.len() - trailing - 1].0
+                ..addition_words[addition_words.len() - trailing - 1].1]
+    {
+        trailing += 1;
+    }
+
+    if leading == 0 && trailing == 0 {
+        return None;
+    }
+
+    Some((
+        line_segments(
+            deletion,
+            &deletion_words,
+            leading,
+            trailing,
+            DiffLineSegmentKind::Deletion,
+        ),
+        line_segments(
+            addition,
+            &addition_words,
+            leading,
+            trailing,
+            DiffLineSegmentKind::Addition,
+        ),
+    ))
+}
+
+fn word_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut words = Vec::new();
+    let mut start = None;
+    for (index, character) in text.char_indices() {
+        if character.is_whitespace() {
+            if let Some(start) = start.take() {
+                words.push((start, index));
+            }
+        } else if start.is_none() {
+            start = Some(index);
+        }
+    }
+    if let Some(start) = start {
+        words.push((start, text.len()));
+    }
+    words
+}
+
+fn line_segments(
+    text: &str,
+    words: &[(usize, usize)],
+    leading: usize,
+    trailing: usize,
+    changed_kind: DiffLineSegmentKind,
+) -> Vec<DiffLineSegment> {
+    if leading + trailing == words.len() {
+        return vec![DiffLineSegment {
+            kind: DiffLineSegmentKind::Plain,
+            text: text.to_owned(),
+        }];
+    }
+
+    let changed_start = words.get(leading).map_or(text.len(), |word| word.0);
+    let changed_end = words
+        .get(words.len().saturating_sub(trailing + 1))
+        .map_or(changed_start, |word| word.1);
+    let mut segments = Vec::new();
+    for (kind, segment) in [
+        (DiffLineSegmentKind::Plain, &text[..changed_start]),
+        (changed_kind, &text[changed_start..changed_end]),
+        (DiffLineSegmentKind::Plain, &text[changed_end..]),
+    ] {
+        if !segment.is_empty() {
+            segments.push(DiffLineSegment {
+                kind,
+                text: segment.to_owned(),
+            });
+        }
+    }
+    segments
 }
