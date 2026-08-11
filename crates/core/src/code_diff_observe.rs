@@ -6,7 +6,9 @@ use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fmt, io, io::Read, path::Path};
 
 use crate::{
-    code_diff_staging::{validate_operations, ProposedOperation, StageProposedOperationsError},
+    code_diff_staging::{
+        validate_operations, validate_path, ProposedOperation, StageProposedOperationsError,
+    },
     write_plan::{
         ObservedPath, ObservedState, StableFileIdentity, WriteOperation, WritePlan, WritePlanError,
     },
@@ -56,12 +58,171 @@ pub fn observe_workspace_write_plan(
     Ok((plan, current))
 }
 
+/// Parent directories that still match every observation in a write plan.
+#[derive(Debug)]
+pub struct VerifiedWritePlan {
+    parents: BTreeMap<String, Dir>,
+}
+
+impl VerifiedWritePlan {
+    /// Returns the opened parent directory for an affected workspace path.
+    pub fn parent(&self, path: &str) -> Option<&Dir> {
+        self.parents.get(path)
+    }
+
+    /// Returns all opened parent directories, keyed by affected workspace path.
+    pub fn into_parents(self) -> BTreeMap<String, Dir> {
+        self.parents
+    }
+}
+
+/// Re-observes a write plan and returns the exact parent handles used by the check.
+pub fn verify_workspace_write_plan(
+    workspace_root: &Path,
+    plan: &WritePlan,
+) -> Result<VerifiedWritePlan, VerifyWritePlanError> {
+    let root = Dir::open_ambient_dir(workspace_root, ambient_authority()).map_err(|source| {
+        VerifyWritePlanError::Observation(ObserveWritePlanError::Workspace { source })
+    })?;
+    let mut current = BTreeMap::new();
+    let mut total = 0u64;
+    let mut parents = BTreeMap::new();
+
+    for operation in plan.operations() {
+        let paths: [Option<&ObservedPath>; 2] = match operation {
+            WriteOperation::Write { target, .. } | WriteOperation::Delete { target } => {
+                [Some(target), None]
+            }
+            WriteOperation::Rename { source, target } => [Some(source), Some(target)],
+        };
+        for expected in paths.into_iter().flatten() {
+            let (observed, parent) =
+                observe_path_with_parent(&root, expected.path(), &mut current, &mut total)
+                    .map_err(VerifyWritePlanError::Observation)?;
+            compare_observed_path(expected, &observed)?;
+            parents.insert(expected.path().to_owned(), parent);
+        }
+    }
+
+    Ok(VerifiedWritePlan { parents })
+}
+
+fn compare_observed_path(
+    expected: &ObservedPath,
+    observed: &ObservedPath,
+) -> Result<(), VerifyWritePlanError> {
+    let changed = match (expected.state(), observed.state()) {
+        (ObservedState::Absent, ObservedState::Absent) => None,
+        (ObservedState::Absent, ObservedState::File { .. })
+        | (ObservedState::File { .. }, ObservedState::Absent) => Some(StaleDimension::Existence),
+        (
+            ObservedState::File {
+                byte_length: expected_length,
+                sha256: expected_sha256,
+                mode: expected_mode,
+                identity: expected_identity,
+            },
+            ObservedState::File {
+                byte_length,
+                sha256,
+                mode,
+                identity,
+            },
+        ) => {
+            if expected_length != byte_length {
+                Some(StaleDimension::ByteLength)
+            } else if expected_sha256 != sha256 {
+                Some(StaleDimension::Sha256)
+            } else if expected_mode != mode {
+                Some(StaleDimension::Mode)
+            } else if expected_identity != identity {
+                Some(StaleDimension::Identity)
+            } else {
+                None
+            }
+        }
+    };
+    let changed = changed.or_else(|| {
+        (expected.parent_identity() != observed.parent_identity())
+            .then_some(StaleDimension::ParentIdentity)
+    });
+    match changed {
+        Some(dimension) => Err(VerifyWritePlanError::Stale {
+            path: expected.path().to_owned(),
+            dimension,
+        }),
+        None => Ok(()),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StaleDimension {
+    Existence,
+    ByteLength,
+    Sha256,
+    Mode,
+    Identity,
+    ParentIdentity,
+}
+
+impl fmt::Display for StaleDimension {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Existence => "existence",
+            Self::ByteLength => "byte length",
+            Self::Sha256 => "SHA-256",
+            Self::Mode => "mode",
+            Self::Identity => "stable file identity",
+            Self::ParentIdentity => "parent identity",
+        })
+    }
+}
+
+#[derive(Debug)]
+pub enum VerifyWritePlanError {
+    Observation(ObserveWritePlanError),
+    Stale {
+        path: String,
+        dimension: StaleDimension,
+    },
+}
+
+impl fmt::Display for VerifyWritePlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Observation(error) => write!(formatter, "write plan check failed: {error}"),
+            Self::Stale { path, dimension } => {
+                write!(formatter, "path {path:?} changed its {dimension}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VerifyWritePlanError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Observation(error) => Some(error),
+            Self::Stale { .. } => None,
+        }
+    }
+}
+
 fn observe_path(
     root: &Dir,
     path: &str,
     current: &mut BTreeMap<String, Vec<u8>>,
     total: &mut u64,
 ) -> Result<ObservedPath, ObserveWritePlanError> {
+    observe_path_with_parent(root, path, current, total).map(|(observed, _)| observed)
+}
+
+fn observe_path_with_parent(
+    root: &Dir,
+    path: &str,
+    current: &mut BTreeMap<String, Vec<u8>>,
+    total: &mut u64,
+) -> Result<(ObservedPath, Dir), ObserveWritePlanError> {
+    validate_path(path).map_err(ObserveWritePlanError::InvalidProposal)?;
     let relative = Path::new(path);
     let parent_path = relative.parent().unwrap_or_else(|| Path::new(""));
     let mut parent = root.try_clone().map_err(|source| path_io(path, source))?;
@@ -87,10 +248,9 @@ fn observe_path(
     let mut file = match parent.open_with(name, &options) {
         Ok(file) => file.into_std(),
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            return Ok(ObservedPath::new(
-                path,
-                ObservedState::Absent,
-                parent_identity,
+            return Ok((
+                ObservedPath::new(path, ObservedState::Absent, parent_identity),
+                parent,
             ));
         }
         Err(source) => return Err(classify_open_error(&parent, name, path, source)),
@@ -127,7 +287,7 @@ fn observe_path(
         identity: file_identity(&file, &metadata).map_err(|source| path_io(path, source))?,
     };
     current.insert(path.into(), bytes);
-    Ok(ObservedPath::new(path, state, parent_identity))
+    Ok((ObservedPath::new(path, state, parent_identity), parent))
 }
 
 #[cfg(unix)]
@@ -292,6 +452,25 @@ mod tests {
         file_identity(&fs::File::open(path).unwrap(), metadata).unwrap()
     }
 
+    fn delete_plan(workspace: &TestWorkspace, path: &str) -> WritePlan {
+        observe_workspace_write_plan(
+            &workspace.root,
+            &[ProposedOperation::Delete { path: path.into() }],
+        )
+        .unwrap()
+        .0
+    }
+
+    fn stale_dimension(error: VerifyWritePlanError) -> StaleDimension {
+        match error {
+            VerifyWritePlanError::Stale { path, dimension } => {
+                assert_eq!(path, "nested/file.txt");
+                dimension
+            }
+            error => panic!("expected stale path error, got {error}"),
+        }
+    }
+
     #[test]
     fn observes_operations_and_replays_the_stored_proposal() {
         let workspace = TestWorkspace::new();
@@ -401,6 +580,141 @@ mod tests {
             load_code_diff_proposal(&mut journal, &cas, &run_id, &effect_id).unwrap(),
             Some((plan, diff))
         );
+    }
+
+    #[test]
+    fn verifies_every_path_and_returns_the_observed_parent_handles() {
+        let workspace = TestWorkspace::new();
+        fs::create_dir(workspace.root.join("nested")).unwrap();
+        fs::write(workspace.root.join("nested/source.txt"), b"source").unwrap();
+        let proposed = [
+            ProposedOperation::Write {
+                path: "nested/new.txt".into(),
+                output: b"new".to_vec(),
+            },
+            ProposedOperation::Rename {
+                source: "nested/source.txt".into(),
+                target: "nested/target.txt".into(),
+            },
+        ];
+        let plan = observe_workspace_write_plan(&workspace.root, &proposed)
+            .unwrap()
+            .0;
+
+        let verified = verify_workspace_write_plan(&workspace.root, &plan).unwrap();
+        assert_eq!(verified.into_parents().len(), 3);
+        let verified = verify_workspace_write_plan(&workspace.root, &plan).unwrap();
+        let parent = verified.parent("nested/new.txt").unwrap();
+        assert!(parent.dir_metadata().unwrap().is_dir());
+        assert!(verified.parent("nested/source.txt").is_some());
+        assert!(verified.parent("nested/target.txt").is_some());
+    }
+
+    #[test]
+    fn rejects_changed_existence_byte_length_and_sha256() {
+        let workspace = TestWorkspace::new();
+        fs::create_dir(workspace.root.join("nested")).unwrap();
+        let path = workspace.root.join("nested/file.txt");
+
+        fs::write(&path, b"old").unwrap();
+        let plan = delete_plan(&workspace, "nested/file.txt");
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            stale_dimension(verify_workspace_write_plan(&workspace.root, &plan).unwrap_err()),
+            StaleDimension::Existence
+        );
+
+        let plan = observe_workspace_write_plan(
+            &workspace.root,
+            &[ProposedOperation::Write {
+                path: "nested/file.txt".into(),
+                output: Vec::new(),
+            }],
+        )
+        .unwrap()
+        .0;
+        fs::write(&path, b"now present").unwrap();
+        assert_eq!(
+            stale_dimension(verify_workspace_write_plan(&workspace.root, &plan).unwrap_err()),
+            StaleDimension::Existence
+        );
+
+        let plan = delete_plan(&workspace, "nested/file.txt");
+        fs::write(&path, b"longer contents").unwrap();
+        assert_eq!(
+            stale_dimension(verify_workspace_write_plan(&workspace.root, &plan).unwrap_err()),
+            StaleDimension::ByteLength
+        );
+
+        fs::write(&path, b"same").unwrap();
+        let plan = delete_plan(&workspace, "nested/file.txt");
+        fs::write(&path, b"size").unwrap();
+        assert_eq!(
+            stale_dimension(verify_workspace_write_plan(&workspace.root, &plan).unwrap_err()),
+            StaleDimension::Sha256
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_changed_mode_file_identity_and_parent_identity() {
+        let workspace = TestWorkspace::new();
+        fs::create_dir(workspace.root.join("nested")).unwrap();
+        let path = workspace.root.join("nested/file.txt");
+        fs::write(&path, b"same").unwrap();
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let plan = delete_plan(&workspace, "nested/file.txt");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            stale_dimension(verify_workspace_write_plan(&workspace.root, &plan).unwrap_err()),
+            StaleDimension::Mode
+        );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let plan = delete_plan(&workspace, "nested/file.txt");
+        fs::rename(&path, workspace.root.join("nested/old-file.txt")).unwrap();
+        fs::write(&path, b"same").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            stale_dimension(verify_workspace_write_plan(&workspace.root, &plan).unwrap_err()),
+            StaleDimension::Identity
+        );
+
+        let plan = delete_plan(&workspace, "nested/file.txt");
+        fs::rename(
+            workspace.root.join("nested"),
+            workspace.root.join("old-parent"),
+        )
+        .unwrap();
+        fs::create_dir(workspace.root.join("nested")).unwrap();
+        fs::hard_link(
+            workspace.root.join("old-parent/file.txt"),
+            workspace.root.join("nested/file.txt"),
+        )
+        .unwrap();
+        assert_eq!(
+            stale_dimension(verify_workspace_write_plan(&workspace.root, &plan).unwrap_err()),
+            StaleDimension::ParentIdentity
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_check_rejects_new_links() {
+        let workspace = TestWorkspace::new();
+        fs::create_dir(workspace.root.join("nested")).unwrap();
+        fs::write(workspace.root.join("nested/file.txt"), b"same").unwrap();
+        let plan = delete_plan(&workspace, "nested/file.txt");
+        fs::remove_file(workspace.root.join("nested/file.txt")).unwrap();
+        symlink("../outside.txt", workspace.root.join("nested/file.txt")).unwrap();
+
+        assert!(matches!(
+            verify_workspace_write_plan(&workspace.root, &plan),
+            Err(VerifyWritePlanError::Observation(
+                ObserveWritePlanError::Symlink { path }
+            )) if path == "nested/file.txt"
+        ));
     }
 
     #[test]

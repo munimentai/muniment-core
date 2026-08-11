@@ -112,7 +112,7 @@ impl ProposedOperation {
     }
 }
 
-fn validate_path(path: &str) -> Result<(), StageProposedOperationsError> {
+pub(crate) fn validate_path(path: &str) -> Result<(), StageProposedOperationsError> {
     if path.is_empty() {
         return Err(StageProposedOperationsError::EmptyPath(path.to_owned()));
     }
