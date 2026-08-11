@@ -3,6 +3,11 @@ use keyring::Entry;
 const PROMPT_SERVICE: &str = "ai.muniment.desktop.chat";
 const PROMPT_USER: &str = "protected-prompts";
 
+#[doc(hidden)]
+pub fn use_mock_keyring_for_tests() {
+    keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
+}
+
 #[derive(Debug)]
 pub enum ChatPromptError {
     Entry(keyring::Error),
