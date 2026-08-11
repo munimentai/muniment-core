@@ -26,17 +26,25 @@ pub enum ChatPermissionAnswer {
     Input(String),
     Editor(String),
     Cancelled,
+    CodeDiff {
+        gate_id: String,
+        effect_id: String,
+        code_diff_id: String,
+        diff_sha256: String,
+        write_plan_sha256: String,
+    },
 }
 
 impl ChatPermissionAnswer {
-    pub fn pi_answer(&self) -> ExtensionUiAnswer {
-        match self {
+    pub fn pi_answer(&self) -> Option<ExtensionUiAnswer> {
+        Some(match self {
             Self::Select(value) => ExtensionUiAnswer::Selection(value.clone()),
             Self::Confirm(value) => ExtensionUiAnswer::Confirmation(*value),
             Self::Input(value) => ExtensionUiAnswer::Input(value.clone()),
             Self::Editor(value) => ExtensionUiAnswer::Editor(value.clone()),
             Self::Cancelled => ExtensionUiAnswer::Cancelled,
-        }
+            Self::CodeDiff { .. } => return None,
+        })
     }
 
     pub fn decision(&self) -> Value {
@@ -92,7 +100,12 @@ pub fn coordinate_permission_answer(
         }
         return Ok(());
     };
-    let answer = queued.answer.pi_answer();
+    let Some(answer) = queued.answer.pi_answer() else {
+        if let Some(resolved) = resolved {
+            let _ = resolved.send(None);
+        }
+        return Ok(());
+    };
     if ExtensionUiResponse::new(request, answer.clone()).is_err() {
         if let Some(resolved) = resolved {
             let _ = resolved.send(None);

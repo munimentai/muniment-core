@@ -51,6 +51,24 @@ fn select_gate(gate_id: &str) -> ExtensionUiRequest {
 }
 
 #[test]
+fn code_diff_answer_matches_the_apply_control_payload() {
+    let payload = json!({
+        "type": "codeDiff",
+        "value": {
+            "gate_id": "gate-1",
+            "effect_id": "effect-1",
+            "code_diff_id": "diff-1",
+            "diff_sha256": "diff-hash",
+            "write_plan_sha256": "plan-hash"
+        }
+    });
+
+    let answer: ChatPermissionAnswer = serde_json::from_value(payload.clone()).unwrap();
+
+    assert_eq!(answer.decision(), payload);
+}
+
+#[test]
 fn extension_ui_requests_journal_the_gate_before_the_projector_accepts_it() {
     let directory =
         std::env::temp_dir().join(format!("muniment-permission-gate-{}", Uuid::now_v7()));
@@ -252,6 +270,44 @@ fn permission_answers_resolve_only_for_a_matching_gate_and_a_valid_shape() {
     );
     assert_eq!(matched_resolved.recv().unwrap(), Some(7));
     assert!(pending.is_none());
+}
+
+#[test]
+fn code_diff_answer_mismatches_an_extension_ui_gate() {
+    let request = select_gate("gate-1");
+    let mut pending = Some(request.clone());
+    let mut sent = false;
+    let mut appended = false;
+    let (sender, resolved) = std::sync::mpsc::sync_channel(1);
+
+    coordinate_permission_answer(
+        &mut pending,
+        PendingPermissionAnswer {
+            gate_id: "gate-1".into(),
+            answer: ChatPermissionAnswer::CodeDiff {
+                gate_id: "gate-1".into(),
+                effect_id: "effect-1".into(),
+                code_diff_id: "diff-1".into(),
+                diff_sha256: "diff-hash".into(),
+                write_plan_sha256: "plan-hash".into(),
+            },
+            resolved: Some(sender),
+        },
+        |_, _| {
+            sent = true;
+            Ok(())
+        },
+        |_, _| {
+            appended = true;
+            Ok(1)
+        },
+    )
+    .unwrap();
+
+    assert_eq!(resolved.recv().unwrap(), None);
+    assert!(!sent);
+    assert!(!appended);
+    assert_eq!(pending, Some(request));
 }
 
 #[test]
