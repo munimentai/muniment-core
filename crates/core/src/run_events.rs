@@ -13,7 +13,9 @@ use crate::chat_view::{
 };
 use crate::code_diff_journal::load_pending_code_diff;
 use crate::journal::pi_translation::close_open_effects;
-use crate::journal::reducer::{ChatProjection, ChatProjector, ProjectedRecall};
+use crate::journal::reducer::{
+    ChatProjection, ChatProjector, ProjectedAppliedDiff, ProjectedRecall,
+};
 use crate::journal::run_append::append_run_event;
 use crate::journal::{EventEnvelope, EventPayload, Provenance, RunJournal};
 use muniment_code_diff::CodeDiff;
@@ -29,6 +31,7 @@ pub struct ChatEvent {
     pub tool_activity: Vec<ChatToolActivity>,
     pub attachments: Vec<ChatAttachment>,
     pub recalls: Vec<ProjectedRecall>,
+    pub applied_diffs: Vec<ProjectedAppliedDiff>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_permission: Option<ChatPendingPermission>,
 }
@@ -58,6 +61,7 @@ pub fn chat_event(
         tool_activity: chat_tool_activity(&projection.tool_activity),
         attachments: chat_attachments(&projection.attachments),
         recalls: projection.recalls,
+        applied_diffs: projection.applied_diffs,
         pending_permission: chat_pending_permission(projection.pending_permission, code_diff),
     }
 }

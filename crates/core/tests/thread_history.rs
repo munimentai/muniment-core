@@ -83,6 +83,7 @@ fn open_page_uses_the_webview_contract() {
             .map(String::as_str)
             .collect::<Vec<_>>(),
         [
+            "appliedDiffs",
             "attachments",
             "phase",
             "prompt",

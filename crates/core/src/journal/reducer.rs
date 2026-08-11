@@ -447,6 +447,16 @@ pub struct ChatProjection {
     pub tool_activity: Vec<ToolActivity>,
     pub attachments: Vec<ProjectedAttachment>,
     pub recalls: Vec<ProjectedRecall>,
+    pub applied_diffs: Vec<ProjectedAppliedDiff>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProjectedAppliedDiff {
+    pub effect_id: String,
+    pub code_diff_id: String,
+    pub diff_sha256: String,
+    pub write_plan_sha256: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -514,6 +524,7 @@ pub fn project_chat_fragment(events: &[EventEnvelope]) -> Result<ChatProjection,
             }
             "model.stream.delta" => chat.text.push_str(&field(event, "text")?),
             "memory.recalled" => chat.recalls.push(projected_recall(event)?),
+            "code.diff.applied" => chat.applied_diffs.push(projected_applied_diff(event)?),
             "tool.effect.started" => chat.tool_activity.push(ToolActivity {
                 effect_id: field(event, "effect_id")?,
                 display_name: optional_field(event, "display_name")?,
@@ -569,6 +580,7 @@ impl ChatProjector {
             "model.prompt.accepted" => self.chat.prompt_accepted = true,
             "model.stream.delta" => self.chat.text.push_str(&field(event, "text")?),
             "memory.recalled" => self.chat.recalls.push(projected_recall(event)?),
+            "code.diff.applied" => self.chat.applied_diffs.push(projected_applied_diff(event)?),
             "tool.effect.started" => self.chat.tool_activity.push(ToolActivity {
                 effect_id: field(event, "effect_id")?,
                 display_name: optional_field(event, "display_name")?,
@@ -919,6 +931,14 @@ fn projected_recall(event: &EventEnvelope) -> Result<ProjectedRecall, ReduceErro
     Ok(ProjectedRecall {
         query: recall.query,
         files: recall.files,
+    })
+}
+fn projected_applied_diff(event: &EventEnvelope) -> Result<ProjectedAppliedDiff, ReduceError> {
+    Ok(ProjectedAppliedDiff {
+        effect_id: field(event, "effect_id")?,
+        code_diff_id: field(event, "code_diff_id")?,
+        diff_sha256: field(event, "diff_sha256")?,
+        write_plan_sha256: field(event, "write_plan_sha256")?,
     })
 }
 fn field(event: &EventEnvelope, name: &'static str) -> Result<String, ReduceError> {

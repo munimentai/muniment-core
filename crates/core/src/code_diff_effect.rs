@@ -123,7 +123,12 @@ pub fn apply_code_diff_approval(
         APPLIED_EVENT_TYPE,
         effect_id,
         &request_event_id,
-        json!({"effect_id": effect_id, "code_diff_id": answer.code_diff_id}),
+        json!({
+            "effect_id": effect_id,
+            "code_diff_id": answer.code_diff_id,
+            "diff_sha256": answer.diff_sha256,
+            "write_plan_sha256": answer.write_plan_sha256,
+        }),
         false,
     )
 }

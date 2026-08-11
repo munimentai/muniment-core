@@ -739,6 +739,42 @@ fn chat_projection_carries_memory_recalls_in_event_order() {
 }
 
 #[test]
+fn chat_projection_carries_applied_diffs_in_event_order() {
+    let events = stream(&[
+        ("run.started", json!({})),
+        (
+            "code.diff.applied",
+            json!({
+                "effect_id": "effect-1",
+                "code_diff_id": "diff-1",
+                "diff_sha256": "diff-hash-1",
+                "write_plan_sha256": "plan-hash-1"
+            }),
+        ),
+        (
+            "code.diff.applied",
+            json!({
+                "effect_id": "effect-2",
+                "code_diff_id": "diff-2",
+                "diff_sha256": "diff-hash-2",
+                "write_plan_sha256": "plan-hash-2"
+            }),
+        ),
+    ]);
+    let projection = project_chat(&events).unwrap();
+
+    assert_eq!(projection.applied_diffs.len(), 2);
+    assert_eq!(projection.applied_diffs[0].effect_id, "effect-1");
+    assert_eq!(projection.applied_diffs[1].code_diff_id, "diff-2");
+    assert_eq!(
+        muniment_core::journal::reducer::project_chat_fragment(&events[1..])
+            .unwrap()
+            .applied_diffs,
+        projection.applied_diffs
+    );
+}
+
+#[test]
 fn chat_projection_tracks_tool_activity_in_start_order() {
     let cases = [
         (

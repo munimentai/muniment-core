@@ -5,8 +5,10 @@ use std::fs;
 
 use muniment_code_diff::CodeDiff;
 use muniment_core::cas::LocalCas;
+use muniment_core::code_diff_effect::apply_code_diff_approval;
 use muniment_core::code_diff_journal::{
     append_code_diff_permission_request, load_pending_code_diff, stage_code_diff_proposal,
+    CodeDiffPermissionAnswer,
 };
 use muniment_core::journal::reducer::{ChatProjector, PermissionGate, PermissionRequest};
 use muniment_core::journal::{EventEnvelope, EventPayload, Provenance, RunJournal};
@@ -207,6 +209,60 @@ fn live_and_history_payloads_carry_the_verified_diff() {
         assert_eq!(payload["pendingPermission"]["kind"], "code_diff");
         assert_eq!(payload["pendingPermission"]["diff"], json!(fixture.diff));
     }
+}
+
+#[test]
+fn applied_approval_reopens_with_the_applied_diff_record() {
+    let mut fixture = Fixture::new();
+    let gate = projection(&mut fixture).pending_permission.unwrap();
+    let PermissionRequest::CodeDiff {
+        effect_id,
+        code_diff_id,
+        diff_sha256,
+        write_plan_sha256,
+    } = &gate.request
+    else {
+        unreachable!()
+    };
+    apply_code_diff_approval(
+        &mut fixture.journal,
+        &fixture.cas,
+        &fixture.root,
+        &fixture.run_id,
+        &gate,
+        CodeDiffPermissionAnswer {
+            gate_id: &gate.gate_id,
+            effect_id,
+            code_diff_id,
+            diff_sha256,
+            write_plan_sha256,
+        },
+    )
+    .unwrap();
+
+    let applied_projection = projection(&mut fixture);
+    let live = serde_json::to_value(chat_event(&fixture.run_id, applied_projection, None)).unwrap();
+    let mut reopened = RunJournal::open(fixture.root.join("journal.sqlite3")).unwrap();
+    let history = serde_json::to_value(
+        project_history_entry(
+            &mut reopened,
+            Some(&fixture.cas),
+            fixture.run_id.clone(),
+            None,
+            &fixture.root,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let expected = json!([{
+        "effectId": effect_id,
+        "codeDiffId": code_diff_id,
+        "diffSha256": diff_sha256,
+        "writePlanSha256": write_plan_sha256,
+    }]);
+
+    assert_eq!(live["appliedDiffs"], expected);
+    assert_eq!(history["appliedDiffs"], expected);
 }
 
 #[test]
