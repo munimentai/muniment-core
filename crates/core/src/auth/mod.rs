@@ -30,6 +30,13 @@ pub mod pkce;
 pub mod store;
 pub mod urlenc;
 
+/// Resolves the Muniment API base URL from the process environment.
+pub fn api_base_url() -> String {
+    std::env::var("MUNIMENT_API_BASE_URL")
+        .or_else(|_| std::env::var("MUNIMENT_ISSUER"))
+        .unwrap_or_else(|_| "https://api.muniment.ai".into())
+}
+
 pub use discovery::{discover, ProviderMetadata};
 pub use entitlement_snapshot::EntitlementSnapshotTracker;
 pub use flow::{
