@@ -964,6 +964,10 @@ mod tests {
     struct FakeChatEventSink;
 
     impl ChatEventSink for FakeChatEventSink {
+        fn provenance(&self) -> (&str, &str) {
+            ("test", "0.0.0")
+        }
+
         fn deliver(&self, _event: crate::run_events::ChatEvent) -> Result<(), ()> {
             Ok(())
         }
@@ -973,6 +977,10 @@ mod tests {
     struct RecordingChatEventSink(Mutex<Vec<crate::run_events::ChatEvent>>);
 
     impl ChatEventSink for RecordingChatEventSink {
+        fn provenance(&self) -> (&str, &str) {
+            ("test", "0.0.0")
+        }
+
         fn deliver(&self, event: crate::run_events::ChatEvent) -> Result<(), ()> {
             self.0.lock().unwrap().push(event);
             Ok(())
@@ -1214,7 +1222,14 @@ mod tests {
         journal
             .append(
                 seq - 1,
-                &crate::run_events::event_envelope(run_id, seq, kind, payload, subject),
+                &crate::run_events::event_envelope(
+                    &FakeChatEventSink,
+                    run_id,
+                    seq,
+                    kind,
+                    payload,
+                    subject,
+                ),
             )
             .unwrap();
     }

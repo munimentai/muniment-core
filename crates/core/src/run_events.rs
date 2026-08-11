@@ -42,6 +42,8 @@ pub struct ChatStorage {
 pub type SharedStorage = Arc<Mutex<ChatStorage>>;
 
 pub trait ChatEventSink {
+    fn provenance(&self) -> (&str, &str);
+
     #[allow(clippy::result_unit_err)]
     fn deliver(&self, event: ChatEvent) -> Result<(), ()>;
 }
@@ -77,7 +79,7 @@ pub fn append_emit(
     subject: Option<&str>,
 ) -> Result<(), ()> {
     *seq += 1;
-    let envelope = event_envelope(run_id, *seq, kind, payload, subject);
+    let envelope = event_envelope(sink, run_id, *seq, kind, payload, subject);
     let (projection, code_diff, applied_diffs) = {
         let mut storage = storage.lock().map_err(|_| ())?;
         let projection =
@@ -176,12 +178,14 @@ pub fn fail_start(
 }
 
 pub(crate) fn event_envelope(
+    sink: &impl ChatEventSink,
     run_id: &str,
     run_seq: u64,
     kind: &str,
     payload: Value,
     subject: Option<&str>,
 ) -> EventEnvelope {
+    let (source, source_version) = sink.provenance();
     EventEnvelope {
         event_id: Uuid::now_v7().to_string(),
         run_id: run_id.into(),
@@ -197,8 +201,8 @@ pub(crate) fn event_envelope(
             payload_json: payload,
         },
         provenance: Provenance {
-            source: "muniment-desktop".into(),
-            source_version: env!("CARGO_PKG_VERSION").into(),
+            source: source.into(),
+            source_version: source_version.into(),
             actor_id: subject.map(str::to_owned),
             device_id: None,
             rpc_request_id: None,
@@ -220,6 +224,10 @@ mod tests {
     }
 
     impl ChatEventSink for RecordingSink {
+        fn provenance(&self) -> (&str, &str) {
+            ("test", "0.0.0")
+        }
+
         fn deliver(&self, event: ChatEvent) -> Result<(), ()> {
             self.events.lock().unwrap().push(event);
             Ok(())

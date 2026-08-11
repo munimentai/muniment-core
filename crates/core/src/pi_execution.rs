@@ -154,6 +154,10 @@ mod tests {
     struct TestSink;
 
     impl ChatEventSink for TestSink {
+        fn provenance(&self) -> (&str, &str) {
+            ("test", "0.0.0")
+        }
+
         fn deliver(&self, _event: ChatEvent) -> Result<(), ()> {
             Ok(())
         }
