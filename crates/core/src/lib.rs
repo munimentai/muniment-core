@@ -41,6 +41,7 @@ pub mod permission_gate;
 pub mod pi_execution;
 pub mod pi_launch;
 pub mod run_events;
+pub mod run_preparation;
 pub mod run_start;
 pub mod session_thread;
 pub mod sidecar;
