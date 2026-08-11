@@ -15,6 +15,7 @@ use crate::write_plan::{
 use chrono::{SecondsFormat, Utc};
 use muniment_code_diff::{canonical_bytes, CanonicalBytesError, CodeDiff, ValidationError};
 use serde_json::Error as JsonError;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 use uuid::Uuid;
@@ -153,6 +154,151 @@ impl fmt::Display for AppendCodeDiffPermissionError {
 }
 
 impl std::error::Error for AppendCodeDiffPermissionError {}
+
+#[derive(Debug)]
+pub enum VerifyCodeDiffPermissionError {
+    NotCodeDiffGate,
+    GateIdMismatch { expected: String, actual: String },
+    EffectIdMismatch { expected: String, actual: String },
+    CodeDiffIdMismatch { expected: String, actual: String },
+    DiffHashMismatch { expected: String, actual: String },
+    WritePlanHashMismatch { expected: String, actual: String },
+    WritePlanEncoding(WritePlanError),
+    CodeDiffEncoding(CanonicalBytesError),
+    Load(LoadCodeDiffError),
+    ProposalNotFound,
+    Truncated,
+}
+
+impl fmt::Display for VerifyCodeDiffPermissionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotCodeDiffGate => f.write_str("pending permission gate is not a code diff"),
+            Self::GateIdMismatch { expected, actual } => {
+                write!(f, "permission gate id is {actual}, expected {expected}")
+            }
+            Self::EffectIdMismatch { expected, actual } => {
+                write!(f, "effect id is {actual}, expected {expected}")
+            }
+            Self::CodeDiffIdMismatch { expected, actual } => {
+                write!(f, "code diff id is {actual}, expected {expected}")
+            }
+            Self::DiffHashMismatch { expected, actual } => {
+                write!(f, "code diff hash is {actual}, expected {expected}")
+            }
+            Self::WritePlanHashMismatch { expected, actual } => {
+                write!(f, "write plan hash is {actual}, expected {expected}")
+            }
+            Self::WritePlanEncoding(error) => {
+                write!(f, "loaded write plan encoding failed: {error}")
+            }
+            Self::CodeDiffEncoding(error) => {
+                write!(f, "loaded code diff encoding failed: {error}")
+            }
+            Self::Load(error) => write!(f, "stored proposal load failed: {error}"),
+            Self::ProposalNotFound => f.write_str("stored proposal was not found"),
+            Self::Truncated => f.write_str("a truncated code diff cannot authorize a write"),
+        }
+    }
+}
+
+impl std::error::Error for VerifyCodeDiffPermissionError {}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CodeDiffPermissionAnswer<'a> {
+    pub gate_id: &'a str,
+    pub effect_id: &'a str,
+    pub code_diff_id: &'a str,
+    pub diff_sha256: &'a str,
+    pub write_plan_sha256: &'a str,
+}
+
+/// Verifies a code-diff permission answer against its pending stored proposal.
+pub fn verify_code_diff_permission_answer(
+    journal: &mut RunJournal,
+    cas: &LocalCas,
+    run_id: &str,
+    pending_gate: &PermissionGate,
+    answer: CodeDiffPermissionAnswer<'_>,
+) -> Result<(WritePlan, CodeDiff), VerifyCodeDiffPermissionError> {
+    if answer.gate_id != pending_gate.gate_id {
+        return Err(VerifyCodeDiffPermissionError::GateIdMismatch {
+            expected: pending_gate.gate_id.clone(),
+            actual: answer.gate_id.into(),
+        });
+    }
+    let PermissionRequest::CodeDiff {
+        effect_id,
+        code_diff_id,
+        diff_sha256,
+        write_plan_sha256,
+    } = &pending_gate.request
+    else {
+        return Err(VerifyCodeDiffPermissionError::NotCodeDiffGate);
+    };
+    if answer.effect_id != effect_id {
+        return Err(VerifyCodeDiffPermissionError::EffectIdMismatch {
+            expected: effect_id.clone(),
+            actual: answer.effect_id.into(),
+        });
+    }
+    if answer.code_diff_id != code_diff_id {
+        return Err(VerifyCodeDiffPermissionError::CodeDiffIdMismatch {
+            expected: code_diff_id.clone(),
+            actual: answer.code_diff_id.into(),
+        });
+    }
+    if answer.diff_sha256 != diff_sha256 {
+        return Err(VerifyCodeDiffPermissionError::DiffHashMismatch {
+            expected: diff_sha256.clone(),
+            actual: answer.diff_sha256.into(),
+        });
+    }
+    if answer.write_plan_sha256 != write_plan_sha256 {
+        return Err(VerifyCodeDiffPermissionError::WritePlanHashMismatch {
+            expected: write_plan_sha256.clone(),
+            actual: answer.write_plan_sha256.into(),
+        });
+    }
+
+    let (write_plan, code_diff) = load_code_diff_proposal(journal, cas, run_id, effect_id)
+        .map_err(VerifyCodeDiffPermissionError::Load)?
+        .ok_or(VerifyCodeDiffPermissionError::ProposalNotFound)?;
+    let loaded_plan_hash = encoded_sha256(
+        &write_plan
+            .encode()
+            .map_err(VerifyCodeDiffPermissionError::WritePlanEncoding)?,
+    );
+    if loaded_plan_hash != answer.write_plan_sha256 {
+        return Err(VerifyCodeDiffPermissionError::WritePlanHashMismatch {
+            expected: loaded_plan_hash,
+            actual: answer.write_plan_sha256.into(),
+        });
+    }
+    let loaded_diff_hash = encoded_sha256(
+        &canonical_bytes(&code_diff).map_err(VerifyCodeDiffPermissionError::CodeDiffEncoding)?,
+    );
+    if loaded_diff_hash != answer.diff_sha256 {
+        return Err(VerifyCodeDiffPermissionError::DiffHashMismatch {
+            expected: loaded_diff_hash,
+            actual: answer.diff_sha256.into(),
+        });
+    }
+    if code_diff.truncated {
+        return Err(VerifyCodeDiffPermissionError::Truncated);
+    }
+    if code_diff.id != answer.code_diff_id {
+        return Err(VerifyCodeDiffPermissionError::CodeDiffIdMismatch {
+            expected: code_diff.id,
+            actual: answer.code_diff_id.into(),
+        });
+    }
+    Ok((write_plan, code_diff))
+}
+
+fn encoded_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
 
 /// Opens a permission gate bound to a stored proposal pair.
 pub fn append_code_diff_permission_request(
@@ -507,6 +653,327 @@ mod tests {
             output: output.to_vec(),
             mode: 0o644,
         }
+    }
+
+    fn proposal() -> (
+        TestStore,
+        WritePlan,
+        CodeDiff,
+        PermissionGate,
+        String,
+        String,
+    ) {
+        let mut store = TestStore::new();
+        let plan = WritePlan::new(vec![write("new.txt", b"new\n")]).unwrap();
+        let run_id = Uuid::now_v7().to_string();
+        let effect_id = Uuid::now_v7().to_string();
+        let diff = compose_code_diff_proposal(
+            &plan,
+            &BTreeMap::new(),
+            &mut store.journal,
+            &store.cas,
+            &run_id,
+            &effect_id,
+        )
+        .unwrap();
+        let gate = append_code_diff_permission_request(
+            &mut store.journal,
+            &store.cas,
+            &run_id,
+            &effect_id,
+        )
+        .unwrap();
+        (store, plan, diff, gate, run_id, effect_id)
+    }
+
+    fn code_diff_answers(gate: &PermissionGate) -> (String, String, String, String, String) {
+        let PermissionRequest::CodeDiff {
+            effect_id,
+            code_diff_id,
+            diff_sha256,
+            write_plan_sha256,
+        } = &gate.request
+        else {
+            panic!("expected a code diff gate");
+        };
+        (
+            gate.gate_id.clone(),
+            effect_id.clone(),
+            code_diff_id.clone(),
+            diff_sha256.clone(),
+            write_plan_sha256.clone(),
+        )
+    }
+
+    fn verify(
+        store: &mut TestStore,
+        run_id: &str,
+        gate: &PermissionGate,
+    ) -> Result<(WritePlan, CodeDiff), VerifyCodeDiffPermissionError> {
+        let (gate_id, effect_id, code_diff_id, diff_hash, plan_hash) = code_diff_answers(gate);
+        verify_code_diff_permission_answer(
+            &mut store.journal,
+            &store.cas,
+            run_id,
+            gate,
+            CodeDiffPermissionAnswer {
+                gate_id: &gate_id,
+                effect_id: &effect_id,
+                code_diff_id: &code_diff_id,
+                diff_sha256: &diff_hash,
+                write_plan_sha256: &plan_hash,
+            },
+        )
+    }
+
+    fn object_path(store: &TestStore, hash: &str) -> PathBuf {
+        store
+            .root
+            .join("cas/objects")
+            .join(&hash[..2])
+            .join(&hash[2..])
+    }
+
+    #[test]
+    fn verifies_a_permission_answer_and_returns_the_stored_pair() {
+        let (mut store, plan, diff, gate, run_id, _) = proposal();
+
+        assert_eq!(verify(&mut store, &run_id, &gate).unwrap(), (plan, diff));
+    }
+
+    #[test]
+    fn rejects_each_answered_identifier_mismatch() {
+        let (mut store, _, _, gate, run_id, _) = proposal();
+        let (gate_id, effect_id, diff_id, diff_hash, plan_hash) = code_diff_answers(&gate);
+        let cases = [
+            (
+                "wrong",
+                effect_id.as_str(),
+                diff_id.as_str(),
+                diff_hash.as_str(),
+                plan_hash.as_str(),
+                0,
+            ),
+            (
+                gate_id.as_str(),
+                "wrong",
+                diff_id.as_str(),
+                diff_hash.as_str(),
+                plan_hash.as_str(),
+                1,
+            ),
+            (
+                gate_id.as_str(),
+                effect_id.as_str(),
+                "wrong",
+                diff_hash.as_str(),
+                plan_hash.as_str(),
+                2,
+            ),
+            (
+                gate_id.as_str(),
+                effect_id.as_str(),
+                diff_id.as_str(),
+                "wrong",
+                plan_hash.as_str(),
+                3,
+            ),
+            (
+                gate_id.as_str(),
+                effect_id.as_str(),
+                diff_id.as_str(),
+                diff_hash.as_str(),
+                "wrong",
+                4,
+            ),
+        ];
+
+        for (
+            answered_gate,
+            answered_effect,
+            answered_diff,
+            answered_diff_hash,
+            answered_plan_hash,
+            kind,
+        ) in cases
+        {
+            let error = verify_code_diff_permission_answer(
+                &mut store.journal,
+                &store.cas,
+                &run_id,
+                &gate,
+                CodeDiffPermissionAnswer {
+                    gate_id: answered_gate,
+                    effect_id: answered_effect,
+                    code_diff_id: answered_diff,
+                    diff_sha256: answered_diff_hash,
+                    write_plan_sha256: answered_plan_hash,
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(
+                (kind, error),
+                (0, VerifyCodeDiffPermissionError::GateIdMismatch { .. })
+                    | (1, VerifyCodeDiffPermissionError::EffectIdMismatch { .. })
+                    | (2, VerifyCodeDiffPermissionError::CodeDiffIdMismatch { .. })
+                    | (3, VerifyCodeDiffPermissionError::DiffHashMismatch { .. })
+                    | (
+                        4,
+                        VerifyCodeDiffPermissionError::WritePlanHashMismatch { .. }
+                    )
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_a_non_code_diff_pending_gate() {
+        let (mut store, _, _, mut gate, run_id, _) = proposal();
+        gate.request = PermissionRequest::Confirm {
+            title: "Confirm".into(),
+            message: "Confirm".into(),
+            timeout: None,
+        };
+
+        let error = verify_code_diff_permission_answer(
+            &mut store.journal,
+            &store.cas,
+            &run_id,
+            &gate,
+            CodeDiffPermissionAnswer {
+                gate_id: &gate.gate_id,
+                effect_id: "effect",
+                code_diff_id: "diff",
+                diff_sha256: "diff-hash",
+                write_plan_sha256: "plan-hash",
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            VerifyCodeDiffPermissionError::NotCodeDiffGate
+        ));
+    }
+
+    #[test]
+    fn rejects_a_missing_proposal_object() {
+        let (mut store, _, _, gate, run_id, _) = proposal();
+        let (_, _, _, diff_hash, _) = code_diff_answers(&gate);
+        store.cas.remove(&diff_hash.parse().unwrap()).unwrap();
+
+        let error = verify(&mut store, &run_id, &gate).unwrap_err();
+
+        assert!(matches!(
+            error,
+            VerifyCodeDiffPermissionError::Load(LoadCodeDiffError::MissingCasObject(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_a_tampered_proposal_object() {
+        let (mut store, _, _, gate, run_id, _) = proposal();
+        let (_, _, _, _, plan_hash) = code_diff_answers(&gate);
+        fs::write(object_path(&store, &plan_hash), b"tampered").unwrap();
+
+        let error = verify(&mut store, &run_id, &gate).unwrap_err();
+
+        assert!(matches!(
+            error,
+            VerifyCodeDiffPermissionError::Load(LoadCodeDiffError::TamperedCasObject { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_truncated_proposal() {
+        let mut store = TestStore::new();
+        let plan = WritePlan::new(vec![write("new.txt", b"new\n")]).unwrap();
+        let run_id = Uuid::now_v7().to_string();
+        let effect_id = Uuid::now_v7().to_string();
+        let mut diff = compute_code_diff(
+            &BTreeMap::new(),
+            &BTreeMap::from([("new.txt".into(), b"new\n".to_vec())]),
+        )
+        .unwrap();
+        diff.truncated = true;
+        stage_code_diff_proposal(
+            &mut store.journal,
+            &store.cas,
+            &run_id,
+            &effect_id,
+            &plan,
+            &diff,
+        )
+        .unwrap();
+        let events = store.journal.events(&run_id).unwrap();
+        let EventPayload::Cas {
+            payload_cas: plan_cas,
+        } = &events[0].payload
+        else {
+            unreachable!();
+        };
+        let EventPayload::Cas {
+            payload_cas: diff_cas,
+        } = &events[1].payload
+        else {
+            unreachable!();
+        };
+        let gate = PermissionGate {
+            gate_id: Uuid::now_v7().to_string(),
+            request: PermissionRequest::CodeDiff {
+                effect_id,
+                code_diff_id: diff.id,
+                diff_sha256: diff_cas.sha256.clone(),
+                write_plan_sha256: plan_cas.sha256.clone(),
+            },
+        };
+
+        let error = verify(&mut store, &run_id, &gate).unwrap_err();
+
+        assert!(matches!(error, VerifyCodeDiffPermissionError::Truncated));
+    }
+
+    #[test]
+    fn rejects_a_decoded_code_diff_id_mismatch() {
+        let (mut store, _, _, mut gate, run_id, _) = proposal();
+        let PermissionRequest::CodeDiff { code_diff_id, .. } = &mut gate.request else {
+            unreachable!();
+        };
+        *code_diff_id = "different-diff".into();
+
+        let error = verify(&mut store, &run_id, &gate).unwrap_err();
+
+        assert!(matches!(
+            error,
+            VerifyCodeDiffPermissionError::CodeDiffIdMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_gate_hashes_that_do_not_name_the_loaded_pair() {
+        let (mut store, _, _, mut gate, run_id, _) = proposal();
+        let PermissionRequest::CodeDiff { diff_sha256, .. } = &mut gate.request else {
+            unreachable!();
+        };
+        *diff_sha256 = "different-diff-hash".into();
+        let error = verify(&mut store, &run_id, &gate).unwrap_err();
+        assert!(matches!(
+            error,
+            VerifyCodeDiffPermissionError::DiffHashMismatch { .. }
+        ));
+
+        let (mut store, _, _, mut gate, run_id, _) = proposal();
+        let PermissionRequest::CodeDiff {
+            write_plan_sha256, ..
+        } = &mut gate.request
+        else {
+            unreachable!();
+        };
+        *write_plan_sha256 = "different-plan-hash".into();
+        let error = verify(&mut store, &run_id, &gate).unwrap_err();
+        assert!(matches!(
+            error,
+            VerifyCodeDiffPermissionError::WritePlanHashMismatch { .. }
+        ));
     }
 
     #[test]
