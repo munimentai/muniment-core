@@ -1,12 +1,15 @@
 use std::path::{Path, PathBuf};
 
 use crate::chat_grant::ChatGrant;
-use crate::sidecar::pi_install::resolve_current;
+use crate::sidecar::pi_install::{resolve_current_for, PiArtifactDescriptor, PI_ARTIFACT};
 use crate::sidecar::{pi_sidecar_config, PiSessionLocator, SidecarConfig};
 
 pub trait PiLaunchBoundaries {
     fn pi_session_root(&self) -> Result<PathBuf, PiLaunchError>;
     fn memory_agent_extension_path(&self) -> Option<PathBuf>;
+    fn pi_artifact(&self) -> PiArtifactDescriptor {
+        PI_ARTIFACT
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,7 +27,8 @@ pub fn pi_launch_config(
     reopen: Option<&PiSessionLocator>,
 ) -> Result<SidecarConfig, PiLaunchError> {
     let root = root.ok_or(PiLaunchError::MissingRoot)?;
-    let executable = resolve_current(root).map_err(|_| PiLaunchError::UnresolvableExecutable)?;
+    let executable = resolve_current_for(root, boundaries.pi_artifact())
+        .map_err(|_| PiLaunchError::UnresolvableExecutable)?;
     pi_launch_config_for_executable(boundaries, executable, grant, reopen)
 }
 

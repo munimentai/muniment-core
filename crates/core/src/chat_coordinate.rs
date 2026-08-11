@@ -21,8 +21,6 @@ use crate::pi_execution::{
     coordinate_prepared_prompt, prepared_pi_prompt, PiRuntime, PreparedPromptError, ResumeAttempt,
     RPC_TIMEOUT,
 };
-#[cfg(test)]
-use crate::pi_launch::pi_launch_config_for_executable;
 use crate::pi_launch::{pi_launch_config, PiLaunchBoundaries, PiLaunchError};
 use crate::run_events::{
     append_emit, append_terminal as core_append_terminal, chat_event, fail, fail_start,
@@ -290,33 +288,12 @@ pub fn coordinate(
     *runtime = None;
     {
         let root = std::env::var("MUNIMENT_PI_ROOT").ok();
-        let config = if root.is_none() {
-            Err(PiLaunchError::MissingRoot)
-        } else {
-            #[cfg(test)]
-            if let Some(executable) = std::env::var_os("MUNIMENT_PI_TEST_EXECUTABLE") {
-                pi_launch_config_for_executable(
-                    &app,
-                    executable.into(),
-                    &grant,
-                    resume.as_ref().map(|resume| &resume.locator),
-                )
-            } else {
-                pi_launch_config(
-                    &app,
-                    root.as_deref().map(std::path::Path::new),
-                    &grant,
-                    resume.as_ref().map(|resume| &resume.locator),
-                )
-            }
-            #[cfg(not(test))]
-            pi_launch_config(
-                &app,
-                root.as_deref().map(std::path::Path::new),
-                &grant,
-                resume.as_ref().map(|resume| &resume.locator),
-            )
-        };
+        let config = pi_launch_config(
+            &app,
+            root.as_deref().map(std::path::Path::new),
+            &grant,
+            resume.as_ref().map(|resume| &resume.locator),
+        );
         let config = match config {
             Ok(config) => config,
             Err(PiLaunchError::MissingRoot) => {
