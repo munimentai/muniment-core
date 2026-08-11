@@ -3,11 +3,13 @@ use std::path::Path;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::cas::LocalCas;
 use crate::chat_resume::resumable_locator;
 use crate::chat_view::{
     chat_attachments, chat_pending_permission, chat_tool_activity, projection_phase,
     ChatAttachment, ChatPendingPermission, ChatToolActivity,
 };
+use crate::code_diff_journal::load_pending_code_diff;
 use crate::journal::reducer::{project_chat_with_state, ProjectedRecall, RunState};
 use crate::journal::{EventEnvelope, RunJournal};
 use crate::thread_ownership::subject_owns_first_run;
@@ -56,6 +58,7 @@ pub fn load_prompt(
 
 pub fn project_history_entry(
     journal: &mut RunJournal,
+    cas: Option<&LocalCas>,
     run_id: String,
     subject: Option<&str>,
     session_root: &Path,
@@ -66,6 +69,9 @@ pub fn project_history_entry(
     let (projection, state) =
         project_chat_with_state(&events).map_err(|_| ThreadHistoryError::ProjectionUnavailable)?;
     let resumable = history_resumable(&events, &state, subject, session_root);
+    let code_diff = cas.and_then(|cas| {
+        load_pending_code_diff(journal, cas, &run_id, &projection.pending_permission)
+    });
     Ok(HistoryEntry {
         prompt: load_prompt(&run_id, subject)?,
         phase: projection_phase(&projection.status).into(),
@@ -74,7 +80,7 @@ pub fn project_history_entry(
         tool_activity: chat_tool_activity(&projection.tool_activity),
         attachments: chat_attachments(&projection.attachments),
         recalls: projection.recalls,
-        pending_permission: chat_pending_permission(projection.pending_permission),
+        pending_permission: chat_pending_permission(projection.pending_permission, code_diff),
         resumable,
         run_id,
     })
@@ -91,6 +97,7 @@ pub fn history_resumable(
 
 pub fn chat_thread_open_page(
     journal: &mut RunJournal,
+    cas: Option<&LocalCas>,
     subject: Option<&str>,
     session_root: &Path,
     thread_id: &str,
@@ -108,7 +115,7 @@ pub fn chat_thread_open_page(
     let entries = page
         .run_ids
         .into_iter()
-        .map(|run_id| project_history_entry(journal, run_id, subject, session_root))
+        .map(|run_id| project_history_entry(journal, cas, run_id, subject, session_root))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ChatThreadOpenPage {
         entries,

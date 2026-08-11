@@ -46,14 +46,17 @@ fn attachments_use_the_webview_contract() {
 
 #[test]
 fn pending_permission_uses_the_webview_contract() {
-    let permission = chat_pending_permission(Some(PermissionGate {
-        gate_id: "gate-1".into(),
-        request: PermissionRequest::Confirm {
-            title: "Allow?".into(),
-            message: "Run the tool?".into(),
-            timeout: None,
-        },
-    }));
+    let permission = chat_pending_permission(
+        Some(PermissionGate {
+            gate_id: "gate-1".into(),
+            request: PermissionRequest::Confirm {
+                title: "Allow?".into(),
+                message: "Run the tool?".into(),
+                timeout: None,
+            },
+        }),
+        None,
+    );
 
     assert_eq!(
         serde_json::to_value(permission).unwrap(),
@@ -64,18 +67,32 @@ fn pending_permission_uses_the_webview_contract() {
             "message": "Run the tool?"
         })
     );
-    assert!(chat_pending_permission(None).is_none());
+    assert!(chat_pending_permission(None, None).is_none());
 
-    assert!(chat_pending_permission(Some(PermissionGate {
-        gate_id: "code-gate".into(),
-        request: PermissionRequest::CodeDiff {
-            effect_id: "effect-1".into(),
-            code_diff_id: "diff-1".into(),
-            diff_sha256: "aa".into(),
-            write_plan_sha256: "bb".into(),
-        },
-    }))
-    .is_none());
+    let code_diff = chat_pending_permission(
+        Some(PermissionGate {
+            gate_id: "code-gate".into(),
+            request: PermissionRequest::CodeDiff {
+                effect_id: "effect-1".into(),
+                code_diff_id: "diff-1".into(),
+                diff_sha256: "aa".into(),
+                write_plan_sha256: "bb".into(),
+            },
+        }),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(code_diff).unwrap(),
+        json!({
+            "gateId": "code-gate",
+            "kind": "code_diff",
+            "effect_id": "effect-1",
+            "code_diff_id": "diff-1",
+            "diff_sha256": "aa",
+            "write_plan_sha256": "bb"
+        })
+    );
 }
 
 #[test]

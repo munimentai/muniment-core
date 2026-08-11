@@ -55,6 +55,7 @@ fn open_page_uses_the_webview_contract() {
 
     let page = chat_thread_open_page(
         &mut journal,
+        None,
         Some("owner"),
         std::path::Path::new("."),
         &thread_id,
@@ -112,6 +113,7 @@ fn open_page_rejects_a_thread_owned_by_another_subject() {
     assert_eq!(
         chat_thread_open_page(
             &mut journal,
+            None,
             Some("owner"),
             std::path::Path::new("."),
             &thread_id,

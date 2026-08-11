@@ -395,6 +395,18 @@ pub fn load_code_diff_proposal(
     run_id: &str,
     effect_id: &str,
 ) -> Result<Option<(WritePlan, CodeDiff)>, LoadCodeDiffError> {
+    Ok(
+        load_code_diff_proposal_with_references(journal, cas, run_id, effect_id)?
+            .map(|(write_plan, code_diff, _, _)| (write_plan, code_diff)),
+    )
+}
+
+fn load_code_diff_proposal_with_references(
+    journal: &mut RunJournal,
+    cas: &LocalCas,
+    run_id: &str,
+    effect_id: &str,
+) -> Result<Option<(WritePlan, CodeDiff, ContentHash, ContentHash)>, LoadCodeDiffError> {
     let events = journal.events(run_id).map_err(LoadCodeDiffError::Journal)?;
     let plan_events: Vec<_> = events
         .iter()
@@ -422,7 +434,7 @@ pub fn load_code_diff_proposal(
     let (plan_bytes, plan_hash) = load_proposal_object(cas, plan_event, WRITE_PLAN_MEDIA_TYPE)?;
     let write_plan = WritePlan::decode_verified(&plan_bytes, &hash_bytes(&plan_hash))
         .map_err(LoadCodeDiffError::WritePlan)?;
-    let (diff_bytes, _) = load_proposal_object(cas, diff_event, DIFF_MEDIA_TYPE)?;
+    let (diff_bytes, diff_hash) = load_proposal_object(cas, diff_event, DIFF_MEDIA_TYPE)?;
     let code_diff: CodeDiff =
         serde_json::from_slice(&diff_bytes).map_err(LoadCodeDiffError::CodeDiffJson)?;
     code_diff
@@ -432,7 +444,38 @@ pub fn load_code_diff_proposal(
     if encoded != diff_bytes {
         return Err(LoadCodeDiffError::NonCanonicalCodeDiff);
     }
-    Ok(Some((write_plan, code_diff)))
+    Ok(Some((write_plan, code_diff, diff_hash, plan_hash)))
+}
+
+/// Loads a verified diff for a pending code-diff gate.
+pub fn load_pending_code_diff(
+    journal: &mut RunJournal,
+    cas: &LocalCas,
+    run_id: &str,
+    gate: &Option<PermissionGate>,
+) -> Option<CodeDiff> {
+    let Some(PermissionGate {
+        request:
+            PermissionRequest::CodeDiff {
+                effect_id,
+                code_diff_id,
+                diff_sha256,
+                write_plan_sha256,
+            },
+        ..
+    }) = gate
+    else {
+        return None;
+    };
+    load_code_diff_proposal_with_references(journal, cas, run_id, effect_id)
+        .ok()
+        .flatten()
+        .and_then(|(_, diff, diff_hash, plan_hash)| {
+            (diff.id == *code_diff_id
+                && diff_hash.to_string() == *diff_sha256
+                && plan_hash.to_string() == *write_plan_sha256)
+                .then_some(diff)
+        })
 }
 
 fn load_proposal_object(

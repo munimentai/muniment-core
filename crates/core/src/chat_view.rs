@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use muniment_code_diff::CodeDiff;
 use serde::{Deserialize, Serialize};
 
 use crate::journal::reducer::{
@@ -29,6 +30,8 @@ pub struct ChatPendingPermission {
     pub gate_id: String,
     #[serde(flatten)]
     pub request: PermissionRequest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<CodeDiff>,
 }
 
 #[derive(Clone, Serialize)]
@@ -51,12 +54,20 @@ pub fn chat_attachments(attachments: &[ProjectedAttachment]) -> Vec<ChatAttachme
         .collect()
 }
 
-pub fn chat_pending_permission(gate: Option<PermissionGate>) -> Option<ChatPendingPermission> {
-    gate.filter(|gate| !matches!(&gate.request, PermissionRequest::CodeDiff { .. }))
-        .map(|gate| ChatPendingPermission {
+pub fn chat_pending_permission(
+    gate: Option<PermissionGate>,
+    code_diff: Option<CodeDiff>,
+) -> Option<ChatPendingPermission> {
+    gate.map(|gate| {
+        let diff = matches!(&gate.request, PermissionRequest::CodeDiff { .. })
+            .then_some(code_diff)
+            .flatten();
+        ChatPendingPermission {
             gate_id: gate.gate_id,
             request: gate.request,
-        })
+            diff,
+        }
+    })
 }
 
 pub fn chat_tool_activity(activity: &[ToolActivity]) -> Vec<ChatToolActivity> {
