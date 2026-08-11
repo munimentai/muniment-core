@@ -98,6 +98,8 @@ pub fn apply_code_diff_approval(
         _ => answer.effect_id,
     };
 
+    apply_workspace_write_plan(&plan, verified).map_err(ApplyCodeDiffApprovalError::Apply)?;
+
     append_effect_event(
         journal,
         run_id,
@@ -114,8 +116,6 @@ pub fn apply_code_diff_approval(
         }),
         true,
     )?;
-
-    apply_workspace_write_plan(&plan, verified).map_err(ApplyCodeDiffApprovalError::Apply)?;
 
     append_effect_event(
         journal,
@@ -405,7 +405,7 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn reports_apply_failure_after_resolution_without_applied_event() {
+    fn apply_failure_appends_no_outcome_event() {
         let mut store = TestStore::new();
         store.workspace = "/sys/kernel".into();
         let (plan, current) = observe_workspace_write_plan(
@@ -435,17 +435,7 @@ mod tests {
         let error = store.apply(&gate).unwrap_err();
 
         assert!(matches!(error, ApplyCodeDiffApprovalError::Apply(_)));
-        let events = store.events();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| event.event_type == "permission.resolved")
-                .count(),
-            1
-        );
-        assert!(!events
-            .iter()
-            .any(|event| event.event_type == APPLIED_EVENT_TYPE));
+        assert_no_outcome(&mut store);
     }
 
     fn assert_no_outcome(store: &mut TestStore) {

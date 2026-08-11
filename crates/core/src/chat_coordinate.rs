@@ -6,13 +6,16 @@ use std::time::Duration;
 use crate::attach::{RuntimeActivityGuard, RuntimeActivityRegistry};
 use crate::chat_grant::{fetch_receipt, ChatGrant};
 use crate::chat_resume::ResumeContext;
+use crate::code_diff_effect::apply_code_diff_approval;
+use crate::code_diff_journal::CodeDiffPermissionAnswer;
 use crate::journal::pi_translation::{model_stream_delta_payload, tool_journal_entry};
 use crate::journal::reducer::ChatProjector;
 use crate::journal::split_model_stream_delta;
 use crate::memory_failure::{MemoryFailure, MemoryFailureAnswer};
 use crate::memory_runtime::ApplicationMemoryRuntime;
 use crate::permission_gate::{
-    coordinate_extension_ui_request, coordinate_permission_answer, PendingPermissionAnswer,
+    coordinate_extension_ui_request, coordinate_permission_answer, ChatPermissionAnswer,
+    PendingPermissionAnswer,
 };
 use crate::pi_execution::{
     coordinate_prepared_prompt, prepared_pi_prompt, PiRuntime, PreparedPromptError, ResumeAttempt,
@@ -22,7 +25,7 @@ use crate::pi_execution::{
 use crate::pi_launch::pi_launch_config_for_executable;
 use crate::pi_launch::{pi_launch_config, PiLaunchBoundaries, PiLaunchError};
 use crate::run_events::{
-    append_emit, append_terminal as core_append_terminal, fail, fail_start,
+    append_emit, append_terminal as core_append_terminal, chat_event, fail, fail_start,
     fail_with_open_effects as core_fail_with_open_effects, ChatEventSink, SharedStorage,
 };
 use crate::sidecar::pi_chat::{
@@ -46,6 +49,93 @@ struct MarkedState<T> {
 
 type MarkedEffects = MarkedState<BTreeSet<String>>;
 type MarkedGate = MarkedState<Option<ExtensionUiRequest>>;
+
+#[allow(clippy::too_many_arguments)]
+fn coordinate_code_diff_answer(
+    sink: &impl ChatEventSink,
+    storage: &SharedStorage,
+    projector: &mut ChatProjector,
+    seq: &mut u64,
+    workspace_root: &std::path::Path,
+    run_id: &str,
+    queued: PendingPermissionAnswer,
+) -> Result<(), ()> {
+    let resolved = queued.resolved;
+    let Some(gate) = projector
+        .projection()
+        .map_err(|_| ())?
+        .pending_permission
+        .filter(|gate| gate.gate_id == queued.gate_id)
+    else {
+        if let Some(resolved) = resolved {
+            let _ = resolved.send(None);
+        }
+        return Ok(());
+    };
+    let ChatPermissionAnswer::CodeDiff {
+        gate_id,
+        effect_id,
+        code_diff_id,
+        diff_sha256,
+        write_plan_sha256,
+    } = queued.answer
+    else {
+        if let Some(resolved) = resolved {
+            let _ = resolved.send(None);
+        }
+        return Ok(());
+    };
+
+    let appended = {
+        let mut storage = storage.lock().map_err(|_| ())?;
+        let crate::run_events::ChatStorage { journal, cas } = &mut *storage;
+        if apply_code_diff_approval(
+            journal,
+            cas,
+            workspace_root,
+            run_id,
+            &gate,
+            CodeDiffPermissionAnswer {
+                gate_id: &gate_id,
+                effect_id: &effect_id,
+                code_diff_id: &code_diff_id,
+                diff_sha256: &diff_sha256,
+                write_plan_sha256: &write_plan_sha256,
+            },
+        )
+        .is_err()
+        {
+            if let Some(resolved) = resolved {
+                let _ = resolved.send(None);
+            }
+            return Ok(());
+        }
+        journal
+            .events(run_id)
+            .map_err(|_| ())?
+            .into_iter()
+            .filter(|event| event.run_seq > *seq)
+            .collect::<Vec<_>>()
+    };
+    if appended.len() != 2
+        || appended[0].run_seq != seq.checked_add(1).ok_or(())?
+        || appended[1].run_seq != seq.checked_add(2).ok_or(())?
+    {
+        if let Some(resolved) = resolved {
+            let _ = resolved.send(None);
+        }
+        return Err(());
+    }
+    for event in &appended {
+        projector.apply(event).map_err(|_| ())?;
+    }
+    *seq = appended[1].run_seq;
+    sink.deliver(chat_event(run_id, projector.projection().map_err(|_| ())?))?;
+    if let Some(resolved) = resolved {
+        let _ = resolved.send(Some(*seq));
+    }
+    Ok(())
+}
 
 impl<T> MarkedState<T> {
     fn new(
@@ -498,6 +588,22 @@ pub fn coordinate(
             .drain(..)
             .collect();
         for answer in answers {
+            if matches!(&answer.answer, ChatPermissionAnswer::CodeDiff { .. }) {
+                if coordinate_code_diff_answer(
+                    &app,
+                    &journal,
+                    &mut projector,
+                    &mut seq,
+                    std::path::Path::new(&grant.workspace),
+                    &run_id,
+                    answer,
+                )
+                .is_err()
+                {
+                    break 'coordinate;
+                }
+                continue;
+            }
             if pending_permission
                 .with(|pending| {
                     coordinate_permission_answer(
@@ -858,12 +964,15 @@ fn fail_with_open_effects(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::code_diff_journal::{
+        append_code_diff_permission_request, compose_code_diff_proposal,
+    };
+    use crate::code_diff_observe::observe_workspace_write_plan;
+    use crate::code_diff_staging::ProposedOperation;
     use crate::journal::pi_translation::close_open_effects;
-    use crate::journal::reducer::ChatProjection;
-    use crate::journal::reducer::ProjectedRecall;
+    use crate::journal::reducer::{ChatProjection, PermissionRequest, ProjectedRecall};
     use crate::journal::RunJournal;
     use crate::memory_index::MemoryIndexError;
-    use crate::permission_gate::ChatPermissionAnswer;
     use std::cell::RefCell;
     use std::io;
     use uuid::Uuid;
@@ -875,6 +984,240 @@ mod tests {
         fn deliver(&self, _event: crate::run_events::ChatEvent) -> Result<(), ()> {
             Ok(())
         }
+    }
+
+    #[derive(Default)]
+    struct RecordingChatEventSink(Mutex<Vec<crate::run_events::ChatEvent>>);
+
+    impl ChatEventSink for RecordingChatEventSink {
+        fn deliver(&self, event: crate::run_events::ChatEvent) -> Result<(), ()> {
+            self.0.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
+
+    fn code_diff_fixture() -> (
+        std::path::PathBuf,
+        SharedStorage,
+        ChatProjector,
+        u64,
+        String,
+        crate::journal::reducer::PermissionGate,
+    ) {
+        let root =
+            std::env::temp_dir().join(format!("muniment-coordinate-diff-{}", Uuid::now_v7()));
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut journal = RunJournal::open(root.join("runs.sqlite3")).unwrap();
+        let cas = crate::cas::LocalCas::open(&root.join("cas")).unwrap();
+        let run_id = Uuid::now_v7().to_string();
+        append_test_event(&mut journal, &run_id, 1, "run.started", json!({}), None);
+        let (plan, current) = observe_workspace_write_plan(
+            &workspace,
+            &[ProposedOperation::Write {
+                path: "approved.txt".into(),
+                output: b"approved\n".to_vec(),
+            }],
+        )
+        .unwrap();
+        compose_code_diff_proposal(&plan, &current, &mut journal, &cas, &run_id, "effect-1")
+            .unwrap();
+        let gate =
+            append_code_diff_permission_request(&mut journal, &cas, &run_id, "effect-1").unwrap();
+        let events = journal.events(&run_id).unwrap();
+        let mut projector = ChatProjector::new();
+        for event in &events {
+            projector.apply(event).unwrap();
+        }
+        let seq = events.last().unwrap().run_seq;
+        (
+            root,
+            Arc::new(Mutex::new(crate::run_events::ChatStorage { journal, cas })),
+            projector,
+            seq,
+            run_id,
+            gate,
+        )
+    }
+
+    fn code_diff_answer(
+        queued_gate_id: &str,
+        gate: &crate::journal::reducer::PermissionGate,
+        resolved: std::sync::mpsc::SyncSender<Option<u64>>,
+    ) -> PendingPermissionAnswer {
+        let PermissionRequest::CodeDiff {
+            effect_id,
+            code_diff_id,
+            diff_sha256,
+            write_plan_sha256,
+        } = &gate.request
+        else {
+            unreachable!()
+        };
+        PendingPermissionAnswer {
+            gate_id: queued_gate_id.into(),
+            answer: ChatPermissionAnswer::CodeDiff {
+                gate_id: gate.gate_id.clone(),
+                effect_id: effect_id.clone(),
+                code_diff_id: code_diff_id.clone(),
+                diff_sha256: diff_sha256.clone(),
+                write_plan_sha256: write_plan_sha256.clone(),
+            },
+            resolved: Some(resolved),
+        }
+    }
+
+    #[test]
+    fn code_diff_answer_applies_and_projects_both_events() {
+        let (root, storage, mut projector, mut seq, run_id, gate) = code_diff_fixture();
+        let workspace = root.join("workspace");
+        let initial_seq = seq;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let sink = RecordingChatEventSink::default();
+
+        coordinate_code_diff_answer(
+            &sink,
+            &storage,
+            &mut projector,
+            &mut seq,
+            &workspace,
+            &run_id,
+            code_diff_answer(&gate.gate_id, &gate, sender),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(workspace.join("approved.txt")).unwrap(),
+            b"approved\n"
+        );
+        assert_eq!(seq, initial_seq + 2);
+        assert_eq!(receiver.recv().unwrap(), Some(seq));
+        assert!(projector.projection().unwrap().pending_permission.is_none());
+        let delivered = sink.0.lock().unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert!(delivered[0].pending_permission.is_none());
+        let events = storage.lock().unwrap().journal.events(&run_id).unwrap();
+        assert_eq!(events[events.len() - 2].event_type, "permission.resolved");
+        assert_eq!(events.last().unwrap().event_type, "code.diff.applied");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn code_diff_answer_for_another_gate_applies_nothing() {
+        let (root, storage, mut projector, mut seq, run_id, gate) = code_diff_fixture();
+        let workspace = root.join("workspace");
+        let initial_seq = seq;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+
+        coordinate_code_diff_answer(
+            &FakeChatEventSink,
+            &storage,
+            &mut projector,
+            &mut seq,
+            &workspace,
+            &run_id,
+            code_diff_answer("another-gate", &gate, sender),
+        )
+        .unwrap();
+
+        assert_eq!(receiver.recv().unwrap(), None);
+        assert_eq!(seq, initial_seq);
+        assert!(!workspace.join("approved.txt").exists());
+        assert_eq!(
+            projector.projection().unwrap().pending_permission,
+            Some(gate)
+        );
+        assert_eq!(
+            storage
+                .lock()
+                .unwrap()
+                .journal
+                .events(&run_id)
+                .unwrap()
+                .len(),
+            4
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn code_diff_apply_failure_keeps_the_gate_and_sequence() {
+        let root = std::env::temp_dir().join(format!(
+            "muniment-coordinate-diff-failure-{}",
+            Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = std::path::Path::new("/sys/kernel");
+        let mut journal = RunJournal::open(root.join("runs.sqlite3")).unwrap();
+        let cas = crate::cas::LocalCas::open(&root.join("cas")).unwrap();
+        let run_id = Uuid::now_v7().to_string();
+        append_test_event(&mut journal, &run_id, 1, "run.started", json!({}), None);
+        let (plan, current) = observe_workspace_write_plan(
+            workspace,
+            &[ProposedOperation::Delete {
+                path: "notes".into(),
+            }],
+        )
+        .unwrap();
+        compose_code_diff_proposal(&plan, &current, &mut journal, &cas, &run_id, "effect-1")
+            .unwrap();
+        let gate =
+            append_code_diff_permission_request(&mut journal, &cas, &run_id, "effect-1").unwrap();
+        let events = journal.events(&run_id).unwrap();
+        let mut projector = ChatProjector::new();
+        for event in &events {
+            projector.apply(event).unwrap();
+        }
+        let mut seq = events.last().unwrap().run_seq;
+        let initial_seq = seq;
+        let initial_event_count = events.len();
+        let storage = Arc::new(Mutex::new(crate::run_events::ChatStorage { journal, cas }));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+
+        coordinate_code_diff_answer(
+            &FakeChatEventSink,
+            &storage,
+            &mut projector,
+            &mut seq,
+            workspace,
+            &run_id,
+            code_diff_answer(&gate.gate_id, &gate, sender),
+        )
+        .unwrap();
+
+        assert_eq!(receiver.recv().unwrap(), None);
+        assert_eq!(seq, initial_seq);
+        assert_eq!(
+            projector.projection().unwrap().pending_permission,
+            Some(gate.clone())
+        );
+        let mut storage_guard = storage.lock().unwrap();
+        let events = storage_guard.journal.events(&run_id).unwrap();
+        assert_eq!(events.len(), initial_event_count);
+        assert!(!events.iter().any(|event| matches!(
+            event.event_type.as_str(),
+            "permission.resolved" | "code.diff.applied"
+        )));
+        drop(storage_guard);
+
+        append_emit(
+            &FakeChatEventSink,
+            &storage,
+            &mut projector,
+            &run_id,
+            &mut seq,
+            "test.continued",
+            json!({}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(seq, initial_seq + 1);
+        assert_eq!(
+            projector.projection().unwrap().pending_permission,
+            Some(gate)
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn append_test_event(
