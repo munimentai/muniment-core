@@ -7,8 +7,8 @@ use muniment_code_diff::CodeDiff;
 use muniment_core::cas::LocalCas;
 use muniment_core::code_diff_effect::apply_code_diff_approval;
 use muniment_core::code_diff_journal::{
-    append_code_diff_permission_request, load_pending_code_diff, stage_code_diff_proposal,
-    CodeDiffPermissionAnswer,
+    append_code_diff_permission_request, load_applied_code_diffs, load_pending_code_diff,
+    stage_code_diff_proposal, CodeDiffPermissionAnswer,
 };
 use muniment_core::journal::reducer::{ChatProjector, PermissionGate, PermissionRequest};
 use muniment_core::journal::{EventEnvelope, EventPayload, Provenance, RunJournal};
@@ -120,6 +120,16 @@ impl Fixture {
             .join(&payload_cas.sha256[2..]);
         fs::write(path, b"tampered").unwrap();
     }
+
+    fn remove_diff(&mut self) {
+        let events = self.journal.events(&self.run_id).unwrap();
+        let EventPayload::Cas { payload_cas } = &events[2].payload else {
+            panic!("code diff must use CAS");
+        };
+        self.cas
+            .remove(&payload_cas.sha256.parse().unwrap())
+            .unwrap();
+    }
 }
 
 fn mismatch_gate(gate: &mut PermissionGate, field: MismatchedField) {
@@ -192,7 +202,14 @@ fn live_and_history_payloads_carry_the_verified_diff() {
         &fixture.run_id,
         &projection.pending_permission,
     );
-    let live = serde_json::to_value(chat_event(&fixture.run_id, projection, diff)).unwrap();
+    let applied_diffs = load_applied_code_diffs(
+        &mut fixture.journal,
+        &fixture.cas,
+        &fixture.run_id,
+        projection.applied_diffs.clone(),
+    );
+    let live =
+        serde_json::to_value(chat_event(&fixture.run_id, projection, diff, applied_diffs)).unwrap();
     let history = serde_json::to_value(
         project_history_entry(
             &mut fixture.journal,
@@ -241,7 +258,19 @@ fn applied_approval_reopens_with_the_applied_diff_record() {
     .unwrap();
 
     let applied_projection = projection(&mut fixture);
-    let live = serde_json::to_value(chat_event(&fixture.run_id, applied_projection, None)).unwrap();
+    let applied_diffs = load_applied_code_diffs(
+        &mut fixture.journal,
+        &fixture.cas,
+        &fixture.run_id,
+        applied_projection.applied_diffs.clone(),
+    );
+    let live = serde_json::to_value(chat_event(
+        &fixture.run_id,
+        applied_projection,
+        None,
+        applied_diffs,
+    ))
+    .unwrap();
     let mut reopened = RunJournal::open(fixture.root.join("journal.sqlite3")).unwrap();
     let history = serde_json::to_value(
         project_history_entry(
@@ -259,10 +288,74 @@ fn applied_approval_reopens_with_the_applied_diff_record() {
         "codeDiffId": code_diff_id,
         "diffSha256": diff_sha256,
         "writePlanSha256": write_plan_sha256,
+        "diff": fixture.diff,
     }]);
 
     assert_eq!(live["appliedDiffs"], expected);
     assert_eq!(history["appliedDiffs"], expected);
+}
+
+#[test]
+fn missing_applied_diff_object_keeps_both_payload_records_without_a_diff() {
+    let mut fixture = Fixture::new();
+    let gate = projection(&mut fixture).pending_permission.unwrap();
+    let PermissionRequest::CodeDiff {
+        effect_id,
+        code_diff_id,
+        diff_sha256,
+        write_plan_sha256,
+    } = &gate.request
+    else {
+        unreachable!()
+    };
+    apply_code_diff_approval(
+        &mut fixture.journal,
+        &fixture.cas,
+        &fixture.root,
+        &fixture.run_id,
+        &gate,
+        CodeDiffPermissionAnswer {
+            gate_id: &gate.gate_id,
+            effect_id,
+            code_diff_id,
+            diff_sha256,
+            write_plan_sha256,
+        },
+    )
+    .unwrap();
+    fixture.remove_diff();
+
+    let applied_projection = projection(&mut fixture);
+    let applied_diffs = load_applied_code_diffs(
+        &mut fixture.journal,
+        &fixture.cas,
+        &fixture.run_id,
+        applied_projection.applied_diffs.clone(),
+    );
+    let live = serde_json::to_value(chat_event(
+        &fixture.run_id,
+        applied_projection,
+        None,
+        applied_diffs,
+    ))
+    .unwrap();
+    let history = serde_json::to_value(
+        project_history_entry(
+            &mut fixture.journal,
+            Some(&fixture.cas),
+            fixture.run_id.clone(),
+            None,
+            &fixture.root,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    for payload in [&live, &history] {
+        assert_eq!(payload["appliedDiffs"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["appliedDiffs"][0]["codeDiffId"], *code_diff_id);
+        assert!(payload["appliedDiffs"][0].get("diff").is_none());
+    }
 }
 
 #[test]
@@ -316,7 +409,15 @@ fn mismatched_gate_fields_keep_both_payload_gates_without_a_diff() {
             &fixture.run_id,
             &projection.pending_permission,
         );
-        let live = serde_json::to_value(chat_event(&fixture.run_id, projection, diff)).unwrap();
+        let applied_diffs = load_applied_code_diffs(
+            &mut fixture.journal,
+            &fixture.cas,
+            &fixture.run_id,
+            projection.applied_diffs.clone(),
+        );
+        let live =
+            serde_json::to_value(chat_event(&fixture.run_id, projection, diff, applied_diffs))
+                .unwrap();
         let history = serde_json::to_value(
             project_history_entry(
                 &mut fixture.journal,

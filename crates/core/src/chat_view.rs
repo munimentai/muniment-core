@@ -6,8 +6,8 @@ use muniment_code_diff::CodeDiff;
 use serde::{Deserialize, Serialize};
 
 use crate::journal::reducer::{
-    PermissionGate, PermissionRequest, ProjectedAttachment, RunStatus, ToolActivity,
-    ToolActivityStatus,
+    PermissionGate, PermissionRequest, ProjectedAppliedDiff, ProjectedAttachment, RunStatus,
+    ToolActivity, ToolActivityStatus,
 };
 
 #[derive(Debug, Deserialize)]
@@ -32,6 +32,29 @@ pub struct ChatPendingPermission {
     pub request: PermissionRequest,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<CodeDiff>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatAppliedDiff {
+    pub effect_id: String,
+    pub code_diff_id: String,
+    pub diff_sha256: String,
+    pub write_plan_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<CodeDiff>,
+}
+
+impl ChatAppliedDiff {
+    pub fn from_projected(record: ProjectedAppliedDiff, diff: Option<CodeDiff>) -> Self {
+        Self {
+            effect_id: record.effect_id,
+            code_diff_id: record.code_diff_id,
+            diff_sha256: record.diff_sha256,
+            write_plan_sha256: record.write_plan_sha256,
+            diff,
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]

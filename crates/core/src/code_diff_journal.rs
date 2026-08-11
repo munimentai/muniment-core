@@ -1,12 +1,13 @@
 //! CAS storage and atomic journal publication for code-diff proposals.
 
 use crate::cas::{CasError, ContentHash, LocalCas};
+use crate::chat_view::ChatAppliedDiff;
 use crate::code_diff::{compute_code_diff, ComputeCodeDiffError};
 use crate::code_diff_staging::{
     stage_proposed_operations, ProposedOperation, StageProposedOperationsError,
 };
 use crate::journal::{
-    reducer::{PermissionGate, PermissionRequest},
+    reducer::{PermissionGate, PermissionRequest, ProjectedAppliedDiff},
     CasReference, EventEnvelope, EventPayload, JournalError, Provenance, RunJournal,
 };
 use crate::write_plan::{
@@ -474,6 +475,39 @@ pub fn load_pending_code_diff(
             (diff.id == *code_diff_id
                 && diff_hash.to_string() == *diff_sha256
                 && plan_hash.to_string() == *write_plan_sha256)
+                .then_some(diff)
+        })
+}
+
+/// Loads verified diffs for applied code-diff records without dropping invalid records.
+pub fn load_applied_code_diffs(
+    journal: &mut RunJournal,
+    cas: &LocalCas,
+    run_id: &str,
+    records: Vec<ProjectedAppliedDiff>,
+) -> Vec<ChatAppliedDiff> {
+    records
+        .into_iter()
+        .map(|record| {
+            let diff = load_applied_code_diff(journal, cas, run_id, &record);
+            ChatAppliedDiff::from_projected(record, diff)
+        })
+        .collect()
+}
+
+fn load_applied_code_diff(
+    journal: &mut RunJournal,
+    cas: &LocalCas,
+    run_id: &str,
+    record: &ProjectedAppliedDiff,
+) -> Option<CodeDiff> {
+    load_code_diff_proposal_with_references(journal, cas, run_id, &record.effect_id)
+        .ok()
+        .flatten()
+        .and_then(|(_, diff, diff_hash, plan_hash)| {
+            (diff.id == record.code_diff_id
+                && diff_hash.to_string() == record.diff_sha256
+                && plan_hash.to_string() == record.write_plan_sha256)
                 .then_some(diff)
         })
 }

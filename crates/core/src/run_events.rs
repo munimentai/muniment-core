@@ -9,13 +9,11 @@ use uuid::Uuid;
 use crate::cas::LocalCas;
 use crate::chat_view::{
     chat_attachments, chat_pending_permission, chat_tool_activity, projection_phase,
-    ChatAttachment, ChatPendingPermission, ChatToolActivity,
+    ChatAppliedDiff, ChatAttachment, ChatPendingPermission, ChatToolActivity,
 };
-use crate::code_diff_journal::load_pending_code_diff;
+use crate::code_diff_journal::{load_applied_code_diffs, load_pending_code_diff};
 use crate::journal::pi_translation::close_open_effects;
-use crate::journal::reducer::{
-    ChatProjection, ChatProjector, ProjectedAppliedDiff, ProjectedRecall,
-};
+use crate::journal::reducer::{ChatProjection, ChatProjector, ProjectedRecall};
 use crate::journal::run_append::append_run_event;
 use crate::journal::{EventEnvelope, EventPayload, Provenance, RunJournal};
 use muniment_code_diff::CodeDiff;
@@ -31,7 +29,7 @@ pub struct ChatEvent {
     pub tool_activity: Vec<ChatToolActivity>,
     pub attachments: Vec<ChatAttachment>,
     pub recalls: Vec<ProjectedRecall>,
-    pub applied_diffs: Vec<ProjectedAppliedDiff>,
+    pub applied_diffs: Vec<ChatAppliedDiff>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_permission: Option<ChatPendingPermission>,
 }
@@ -52,6 +50,7 @@ pub fn chat_event(
     run_id: &str,
     projection: ChatProjection,
     code_diff: Option<CodeDiff>,
+    applied_diffs: Vec<ChatAppliedDiff>,
 ) -> ChatEvent {
     ChatEvent {
         run_id: run_id.into(),
@@ -61,7 +60,7 @@ pub fn chat_event(
         tool_activity: chat_tool_activity(&projection.tool_activity),
         attachments: chat_attachments(&projection.attachments),
         recalls: projection.recalls,
-        applied_diffs: projection.applied_diffs,
+        applied_diffs,
         pending_permission: chat_pending_permission(projection.pending_permission, code_diff),
     }
 }
@@ -79,16 +78,18 @@ pub fn append_emit(
 ) -> Result<(), ()> {
     *seq += 1;
     let envelope = event_envelope(run_id, *seq, kind, payload, subject);
-    let (projection, code_diff) = {
+    let (projection, code_diff, applied_diffs) = {
         let mut storage = storage.lock().map_err(|_| ())?;
         let projection =
             append_run_event(&mut storage.journal, projector, &envelope).map_err(|_| ())?;
         let gate = projection.pending_permission.clone();
         let ChatStorage { journal, cas } = &mut *storage;
         let code_diff = load_pending_code_diff(journal, cas, run_id, &gate);
-        (projection, code_diff)
+        let applied_diffs =
+            load_applied_code_diffs(journal, cas, run_id, projection.applied_diffs.clone());
+        (projection, code_diff, applied_diffs)
     };
-    sink.deliver(chat_event(run_id, projection, code_diff))
+    sink.deliver(chat_event(run_id, projection, code_diff, applied_diffs))
 }
 
 #[allow(clippy::result_unit_err, clippy::too_many_arguments)]

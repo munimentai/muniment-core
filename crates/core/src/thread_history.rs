@@ -7,12 +7,10 @@ use crate::cas::LocalCas;
 use crate::chat_resume::resumable_locator;
 use crate::chat_view::{
     chat_attachments, chat_pending_permission, chat_tool_activity, projection_phase,
-    ChatAttachment, ChatPendingPermission, ChatToolActivity,
+    ChatAppliedDiff, ChatAttachment, ChatPendingPermission, ChatToolActivity,
 };
-use crate::code_diff_journal::load_pending_code_diff;
-use crate::journal::reducer::{
-    project_chat_with_state, ProjectedAppliedDiff, ProjectedRecall, RunState,
-};
+use crate::code_diff_journal::{load_applied_code_diffs, load_pending_code_diff};
+use crate::journal::reducer::{project_chat_with_state, ProjectedRecall, RunState};
 use crate::journal::{EventEnvelope, RunJournal};
 use crate::thread_ownership::subject_owns_first_run;
 
@@ -28,7 +26,7 @@ pub struct HistoryEntry {
     pub tool_activity: Vec<ChatToolActivity>,
     pub attachments: Vec<ChatAttachment>,
     pub recalls: Vec<ProjectedRecall>,
-    pub applied_diffs: Vec<ProjectedAppliedDiff>,
+    pub applied_diffs: Vec<ChatAppliedDiff>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_permission: Option<ChatPendingPermission>,
     pub resumable: bool,
@@ -75,6 +73,14 @@ pub fn project_history_entry(
     let code_diff = cas.and_then(|cas| {
         load_pending_code_diff(journal, cas, &run_id, &projection.pending_permission)
     });
+    let applied_diffs = match cas {
+        Some(cas) => load_applied_code_diffs(journal, cas, &run_id, projection.applied_diffs),
+        None => projection
+            .applied_diffs
+            .into_iter()
+            .map(|record| ChatAppliedDiff::from_projected(record, None))
+            .collect(),
+    };
     Ok(HistoryEntry {
         prompt: load_prompt(&run_id, subject)?,
         phase: projection_phase(&projection.status).into(),
@@ -83,7 +89,7 @@ pub fn project_history_entry(
         tool_activity: chat_tool_activity(&projection.tool_activity),
         attachments: chat_attachments(&projection.attachments),
         recalls: projection.recalls,
-        applied_diffs: projection.applied_diffs,
+        applied_diffs,
         pending_permission: chat_pending_permission(projection.pending_permission, code_diff),
         resumable,
         run_id,

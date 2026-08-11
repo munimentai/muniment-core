@@ -7,7 +7,7 @@ use crate::attach::{RuntimeActivityGuard, RuntimeActivityRegistry};
 use crate::chat_grant::{fetch_receipt, ChatGrant};
 use crate::chat_resume::ResumeContext;
 use crate::code_diff_effect::apply_code_diff_approval;
-use crate::code_diff_journal::CodeDiffPermissionAnswer;
+use crate::code_diff_journal::{load_applied_code_diffs, CodeDiffPermissionAnswer};
 use crate::journal::pi_translation::{model_stream_delta_payload, tool_journal_entry};
 use crate::journal::reducer::ChatProjector;
 use crate::journal::split_model_stream_delta;
@@ -128,11 +128,13 @@ fn coordinate_code_diff_answer(
         projector.apply(event).map_err(|_| ())?;
     }
     *seq = appended[1].run_seq;
-    sink.deliver(chat_event(
-        run_id,
-        projector.projection().map_err(|_| ())?,
-        None,
-    ))?;
+    let projection = projector.projection().map_err(|_| ())?;
+    let applied_diffs = {
+        let mut storage = storage.lock().map_err(|_| ())?;
+        let crate::run_events::ChatStorage { journal, cas } = &mut *storage;
+        load_applied_code_diffs(journal, cas, run_id, projection.applied_diffs.clone())
+    };
+    sink.deliver(chat_event(run_id, projection, None, applied_diffs))?;
     if let Some(resolved) = resolved {
         let _ = resolved.send(Some(*seq));
     }
@@ -1357,6 +1359,7 @@ mod tests {
                 ..ChatProjection::default()
             },
             None,
+            Vec::new(),
         );
 
         assert_eq!(
