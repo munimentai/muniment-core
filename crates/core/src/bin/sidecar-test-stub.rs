@@ -183,6 +183,14 @@ fn pi_resume(args: Vec<String>) {
                 );
                 if std::env::var_os("PI_RESUME_STUB_STEER_CAPTURE").is_some() {
                     // Keep the run active until the test sends a steer command.
+                } else if std::env::var_os("PI_RESUME_STUB_PERMISSION_CAPTURE").is_some() {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "type":"extension_ui_request", "id":"permission-1", "method":"confirm",
+                            "title":"Allow this action?", "message":"The test stub needs permission."
+                        })
+                    );
                 } else if let Ok(query) = std::env::var("PI_RESUME_STUB_MEMORY_QUERY") {
                     println!(
                         "{}",
@@ -215,6 +223,14 @@ fn pi_resume(args: Vec<String>) {
                 println!("{}", serde_json::json!({"type":"agent_end"}));
             }
             "extension_ui_response" => {
+                if let Ok(path) = std::env::var("PI_RESUME_STUB_PERMISSION_CAPTURE") {
+                    let mut capture = fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .unwrap();
+                    writeln!(capture, "{request}").unwrap();
+                }
                 println!(
                     "{}",
                     serde_json::json!({"type":"message_update", "assistantMessageEvent":{"type":"text_delta", "delta":" resumed"}})
