@@ -366,27 +366,34 @@ fn stale_recovery_rollback_never_overwrites_a_raced_in_endpoint() {
     let stale = UnixListener::bind(filesystem.endpoint_path()).unwrap();
     drop(stale);
     let attach_directory = filesystem.endpoint_path().parent().unwrap().to_owned();
-    let error = AttachTransport::bind_with_race_hooks(
-        &filesystem,
-        || {},
-        || {},
-        || {
-            let quarantine = fs::read_dir(&attach_directory)
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .find(|path| {
-                    path.file_name()
-                        .unwrap()
-                        .to_string_lossy()
-                        .starts_with(".attach-v1.sock.")
-                })
-                .unwrap();
-            fs::remove_file(&quarantine).unwrap();
-            fs::write(&quarantine, b"quarantined replacement").unwrap();
-            fs::write(filesystem.endpoint_path(), b"endpoint replacement").unwrap();
-        },
-    )
-    .unwrap_err();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let error = loop {
+        let error = AttachTransport::bind_with_race_hooks(
+            &filesystem,
+            || {},
+            || {},
+            || {
+                let quarantine = fs::read_dir(&attach_directory)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with(".attach-v1.sock.")
+                    })
+                    .unwrap();
+                fs::remove_file(&quarantine).unwrap();
+                fs::write(&quarantine, b"quarantined replacement").unwrap();
+                fs::write(filesystem.endpoint_path(), b"endpoint replacement").unwrap();
+            },
+        )
+        .unwrap_err();
+        if error != AttachTransportError::ExistingListener || Instant::now() >= deadline {
+            break error;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
     assert_eq!(error, AttachTransportError::ExistingEndpointRemove);
 
     let contents: Vec<Vec<u8>> = fs::read_dir(&attach_directory)

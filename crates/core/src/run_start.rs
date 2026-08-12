@@ -293,6 +293,18 @@ pub fn prepare_desktop_run(
     let attachments = match boundaries.project_attachments(&prepared.1) {
         Ok(attachments) => attachments,
         Err(error) => {
+            let failed_launch = RunStartLaunch {
+                run_id: run_id.clone(),
+                prompt,
+                tokens,
+                grant,
+                cancelled,
+                transport,
+                adapter,
+                permission_answers,
+                prepared,
+            };
+            let _ = boundaries.fail_prepared_run(&failed_launch);
             boundaries.close_memory_session(&run_id);
             boundaries.clear_active_run(&run_id);
             return Err(error);
@@ -328,10 +340,12 @@ mod tests {
 
     struct FakeRunStartBoundaries {
         active: bool,
+        attachment_error: Option<String>,
         memory_error: Option<String>,
         thread_id_error: Option<String>,
         auth_calls: AtomicUsize,
         clear_calls: AtomicUsize,
+        close_calls: AtomicUsize,
         fail_calls: AtomicUsize,
         launch_calls: AtomicUsize,
         launched_run: Mutex<Option<String>>,
@@ -342,10 +356,12 @@ mod tests {
         fn accepting() -> Self {
             Self {
                 active: false,
+                attachment_error: None,
                 memory_error: None,
                 thread_id_error: None,
                 auth_calls: AtomicUsize::new(0),
                 clear_calls: AtomicUsize::new(0),
+                close_calls: AtomicUsize::new(0),
                 fail_calls: AtomicUsize::new(0),
                 launch_calls: AtomicUsize::new(0),
                 launched_run: Mutex::new(None),
@@ -458,7 +474,10 @@ mod tests {
             &self,
             _projector: &ChatProjector,
         ) -> Result<Vec<ChatAttachment>, RunStartError> {
-            Ok(Vec::new())
+            self.attachment_error.as_ref().map_or_else(
+                || Ok(Vec::new()),
+                |error| Err(RunStartError::Persistence(error.clone())),
+            )
         }
 
         fn run_thread_id(&self, _run_id: &str) -> Result<String, RunStartError> {
@@ -480,7 +499,9 @@ mod tests {
             )
         }
 
-        fn close_memory_session(&self, _run_id: &str) {}
+        fn close_memory_session(&self, _run_id: &str) {
+            self.close_calls.fetch_add(1, Ordering::SeqCst);
+        }
 
         fn fail_prepared_run(&self, _launch: &RunStartLaunch) -> Result<(), RunStartError> {
             self.fail_calls.fetch_add(1, Ordering::SeqCst);
@@ -550,6 +571,22 @@ mod tests {
 
         assert_eq!(error.into_message(), "memory unavailable");
         assert_eq!(boundaries.fail_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(boundaries.clear_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(boundaries.launch_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn attachment_projection_failure_marks_the_prepared_run_failed() {
+        let boundaries = FakeRunStartBoundaries {
+            attachment_error: Some("attachment projection unavailable".into()),
+            ..FakeRunStartBoundaries::accepting()
+        };
+
+        let error = start_desktop_run(&boundaries, request()).err().unwrap();
+
+        assert_eq!(error.into_message(), "attachment projection unavailable");
+        assert_eq!(boundaries.fail_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(boundaries.close_calls.load(Ordering::SeqCst), 1);
         assert_eq!(boundaries.clear_calls.load(Ordering::SeqCst), 1);
         assert_eq!(boundaries.launch_calls.load(Ordering::SeqCst), 0);
     }
