@@ -5,6 +5,9 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use uuid::Uuid;
 
+/// The companion credential store file name.
+pub const COMPANION_CREDENTIAL_FILE_NAME: &str = "attach-client-credentials.json";
+
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientCredential {
