@@ -237,10 +237,15 @@ fn pi_resume(args: Vec<String>) {
                 );
                 println!("{}", serde_json::json!({"type":"agent_end"}));
             }
-            "abort" => println!(
-                "{}",
-                serde_json::json!({"type":"response", "command":"abort", "success":true, "id":request["id"]})
-            ),
+            "abort" => {
+                if let Ok(path) = std::env::var("PI_RESUME_STUB_ABORT_CAPTURE") {
+                    fs::write(path, request.to_string()).unwrap();
+                }
+                println!(
+                    "{}",
+                    serde_json::json!({"type":"response", "command":"abort", "success":true, "id":request["id"]})
+                );
+            }
             command => panic!("unexpected command: {command}"),
         }
         io::stdout().flush().unwrap();
