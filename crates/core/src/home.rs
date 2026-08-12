@@ -26,6 +26,25 @@ pub const ONBOARDING_IMPORT_MAX_TOTAL_BYTES: usize = 256 * 1024;
 const ONBOARDING_IMPORT_LOCK_FILE: &str = ".onboarding-import.lock";
 const ONBOARDING_IMPORT_MAX_PLAN_WRITES: usize = ONBOARDING_IMPORT_MAX_ENTRIES + 4;
 
+pub fn choose_default_home(
+    documents: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Result<PathBuf, String> {
+    if let Some(documents) = documents {
+        return Ok(documents.join("Muniment"));
+    }
+
+    let home = home
+        .filter(|path| path.is_dir())
+        .ok_or_else(|| "The Documents folder is unavailable.".to_string())?;
+    let documents = home.join("Documents");
+    Ok(if documents.is_dir() {
+        documents.join("Muniment")
+    } else {
+        home.join("Muniment")
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HomeWrite {
@@ -1260,11 +1279,82 @@ fn sync_directory(_path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::replace_file;
+    use super::{choose_default_home, replace_file};
     use std::{
         fs,
+        path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    struct TempRoot(PathBuf);
+
+    impl TempRoot {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "muniment-home-default-{name}-{}",
+                uuid::Uuid::now_v7()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn default_home_uses_resolved_documents_directory() {
+        let root = TempRoot::new("resolved-documents");
+        let documents = root.0.join("Custom Documents");
+
+        assert_eq!(
+            choose_default_home(Some(documents.clone()), None).unwrap(),
+            documents.join("Muniment")
+        );
+    }
+
+    #[test]
+    fn default_home_uses_existing_documents_directory_under_home() {
+        let root = TempRoot::new("home-documents");
+        let documents = root.0.join("Documents");
+        fs::create_dir(&documents).unwrap();
+
+        assert_eq!(
+            choose_default_home(None, Some(root.0.clone())).unwrap(),
+            documents.join("Muniment")
+        );
+    }
+
+    #[test]
+    fn default_home_uses_home_when_documents_directory_is_absent() {
+        let root = TempRoot::new("home");
+
+        assert_eq!(
+            choose_default_home(None, Some(root.0.clone())).unwrap(),
+            root.0.join("Muniment")
+        );
+    }
+
+    #[test]
+    fn default_home_fails_when_documents_and_home_are_unavailable() {
+        assert_eq!(
+            choose_default_home(None, None).unwrap_err(),
+            "The Documents folder is unavailable."
+        );
+    }
+
+    #[test]
+    fn default_home_fails_when_resolved_home_is_not_a_directory() {
+        let root = TempRoot::new("missing-home");
+
+        assert_eq!(
+            choose_default_home(None, Some(root.0.join("missing"))).unwrap_err(),
+            "The Documents folder is unavailable."
+        );
+    }
 
     #[test]
     fn failed_replacement_preserves_the_previous_file() {
