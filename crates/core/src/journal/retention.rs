@@ -122,3 +122,13 @@ pub fn apply_retention(
         collected_hashes,
     })
 }
+
+/// Applies retention with the current time as the cutoff reference.
+pub fn apply_retention_now(
+    journal: &mut RunJournal,
+    cas: Option<&LocalCas>,
+    max_age_seconds: i64,
+) -> Result<RetentionOutcome, RetentionError> {
+    let max_age = Duration::try_seconds(max_age_seconds).ok_or(RetentionError::InvalidPolicy)?;
+    apply_retention(journal, cas, &RetentionPolicy { max_age }, Utc::now())
+}
