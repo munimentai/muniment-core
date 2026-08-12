@@ -1,10 +1,12 @@
 use keyring::Entry;
 use std::any::Any;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 const PROMPT_SERVICE: &str = "ai.muniment.desktop.chat";
 const PROMPT_USER: &str = "protected-prompts";
+static FAIL_NEXT_MOCK_DELETE: AtomicBool = AtomicBool::new(false);
 
 #[doc(hidden)]
 pub fn use_mock_keyring_for_tests() {
@@ -54,6 +56,11 @@ pub fn use_mock_keyring_for_tests() {
         }
 
         fn delete_credential(&self) -> keyring::Result<()> {
+            if FAIL_NEXT_MOCK_DELETE.swap(false, Ordering::SeqCst) {
+                return Err(keyring::Error::PlatformFailure(Box::new(
+                    std::io::Error::other("injected prompt delete failure"),
+                )));
+            }
             self.secrets
                 .lock()
                 .unwrap()
@@ -72,11 +79,17 @@ pub fn use_mock_keyring_for_tests() {
     ))));
 }
 
+#[doc(hidden)]
+pub fn fail_next_mock_prompt_delete_for_tests() {
+    FAIL_NEXT_MOCK_DELETE.store(true, Ordering::SeqCst);
+}
+
 #[derive(Debug)]
 pub enum ChatPromptError {
     Entry(keyring::Error),
     Store(keyring::Error),
     Load(keyring::Error),
+    Delete(keyring::Error),
 }
 
 pub fn prompt_user(subject: Option<&str>, run_id: &str) -> String {
@@ -103,5 +116,14 @@ pub fn load_prompt(run_id: &str, subject: Option<&str>) -> Result<Option<String>
         Ok(prompt) => Ok(Some(prompt)),
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(error) => Err(ChatPromptError::Load(error)),
+    }
+}
+
+pub fn delete_prompt(run_id: &str, subject: Option<&str>) -> Result<(), ChatPromptError> {
+    let user = prompt_user(subject, run_id);
+    let entry = Entry::new(PROMPT_SERVICE, &user).map_err(ChatPromptError::Entry)?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(ChatPromptError::Delete(error)),
     }
 }

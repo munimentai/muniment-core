@@ -1,6 +1,8 @@
 use chrono::{Duration, TimeZone, Utc};
 use muniment_core::cas::LocalCas;
-use muniment_core::journal::retention::{apply_retention, RetentionPolicy};
+use muniment_core::journal::retention::{
+    apply_retention, apply_retention_with, RetentionError, RetentionPolicy,
+};
 use muniment_core::journal::{CasReference, EventEnvelope, EventPayload, Provenance, RunJournal};
 use rusqlite::Connection;
 use serde_json::json;
@@ -35,7 +37,7 @@ fn event(run: u64, seq: u64, event_type: &str, recorded_at: &str) -> EventEnvelo
         provenance: Provenance {
             source: "test".into(),
             source_version: "1".into(),
-            actor_id: None,
+            actor_id: Some(format!("subject-{run}")),
             device_id: None,
             rpc_request_id: None,
             capability_versions: None,
@@ -84,7 +86,18 @@ fn deletes_only_expired_completed_cancelled_and_failed_runs() {
 
     let outcome = apply_retention(&mut journal, None, &policy(), now()).unwrap();
 
-    assert_eq!(outcome.deleted_run_ids, [completed, cancelled, failed]);
+    assert_eq!(
+        outcome
+            .deleted_runs
+            .iter()
+            .map(|run| (&run.run_id, run.subject.as_deref()))
+            .collect::<Vec<_>>(),
+        [
+            (&completed, Some("subject-1")),
+            (&cancelled, Some("subject-2")),
+            (&failed, Some("subject-3")),
+        ]
+    );
     assert!(journal.events(&fresh).unwrap().len() == 2);
     assert!(journal.events(&active_id).unwrap().len() == 1);
     assert!(journal.events(&attention).unwrap().len() == 2);
@@ -115,7 +128,7 @@ fn skips_runs_that_fail_reduction_or_timestamp_parsing() {
     drop(raw);
 
     let outcome = apply_retention(&mut journal, None, &policy(), now()).unwrap();
-    assert!(outcome.deleted_run_ids.is_empty());
+    assert!(outcome.deleted_runs.is_empty());
     assert_eq!(journal.events(&invalid_reduction).unwrap().len(), 2);
     assert_eq!(journal.events(&bad_time).unwrap().len(), 2);
     let _ = fs::remove_file(db);
@@ -141,7 +154,7 @@ fn skips_full_event_reads_for_fresh_and_nonterminal_runs() {
     drop(raw);
 
     let outcome = apply_retention(&mut journal, None, &policy(), now()).unwrap();
-    assert!(outcome.deleted_run_ids.is_empty());
+    assert!(outcome.deleted_runs.is_empty());
     let run_ids = journal.run_ids().unwrap();
     assert_eq!(run_ids.len(), 2);
     assert!(run_ids.contains(&fresh));
@@ -168,7 +181,7 @@ fn keeps_expired_run_that_reduces_to_a_kept_status() {
 
     let outcome = apply_retention(&mut journal, None, &policy(), now()).unwrap();
 
-    assert!(outcome.deleted_run_ids.is_empty());
+    assert!(outcome.deleted_runs.is_empty());
     assert_eq!(journal.events(&run_id).unwrap().len(), 3);
     let _ = fs::remove_file(db);
 }
@@ -214,6 +227,51 @@ fn collects_deleted_only_objects_and_preserves_surviving_references() {
     drop(store);
     let _ = fs::remove_file(db);
     let _ = fs::remove_dir_all(cas_root);
+}
+
+#[test]
+fn runs_pre_delete_action_before_a_cas_failure() {
+    let (db, cas_root) = paths();
+    let store = LocalCas::open(&cas_root).unwrap();
+    let mut journal = RunJournal::open(&db).unwrap();
+    let run_id = append_run(&mut journal, 1, "run.completed", "2026-05-01T00:00:00Z");
+    fs::remove_dir(cas_root.join("objects")).unwrap();
+    let mut prompt_exists = true;
+
+    let result = apply_retention_with(&mut journal, Some(&store), &policy(), now(), |_| {
+        prompt_exists = false;
+        Ok(())
+    });
+
+    assert!(matches!(result, Err(RetentionError::Cas(_))));
+    assert!(!prompt_exists);
+    assert!(journal.events(&run_id).unwrap().is_empty());
+    let _ = fs::remove_file(db);
+    let _ = fs::remove_dir_all(cas_root);
+}
+
+#[test]
+fn keeps_run_after_pre_delete_failure_so_a_later_call_can_retry() {
+    let (db, _) = paths();
+    let mut journal = RunJournal::open(&db).unwrap();
+    let run_id = append_run(&mut journal, 1, "run.completed", "2026-05-01T00:00:00Z");
+
+    let result = apply_retention_with(&mut journal, None, &policy(), now(), |_| {
+        Err(RetentionError::BeforeDelete)
+    });
+
+    assert!(matches!(result, Err(RetentionError::BeforeDelete)));
+    assert_eq!(journal.events(&run_id).unwrap().len(), 2);
+
+    let mut prompt_exists = true;
+    apply_retention_with(&mut journal, None, &policy(), now(), |_| {
+        prompt_exists = false;
+        Ok(())
+    })
+    .unwrap();
+    assert!(!prompt_exists);
+    assert!(journal.events(&run_id).unwrap().is_empty());
+    let _ = fs::remove_file(db);
 }
 
 fn cas_payload(hash: &muniment_core::cas::ContentHash) -> EventPayload {

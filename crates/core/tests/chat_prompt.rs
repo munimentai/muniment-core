@@ -1,6 +1,6 @@
 #![cfg(feature = "keyring")]
 
-use muniment_core::chat_prompt::{load_prompt, prompt_user, store_prompt};
+use muniment_core::chat_prompt::{delete_prompt, load_prompt, prompt_user, store_prompt};
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Once};
@@ -106,4 +106,16 @@ fn missing_entry_returns_none() {
     let run_id = Uuid::now_v7().to_string();
 
     assert_eq!(load_prompt(&run_id, None).unwrap(), None);
+}
+
+#[test]
+fn delete_removes_prompt_and_accepts_missing_entry() {
+    use_mock_keyring();
+    let run_id = Uuid::now_v7().to_string();
+
+    store_prompt(&run_id, "saved prompt", Some("subject-a")).unwrap();
+    delete_prompt(&run_id, Some("subject-a")).unwrap();
+
+    assert_eq!(load_prompt(&run_id, Some("subject-a")).unwrap(), None);
+    delete_prompt(&run_id, Some("subject-a")).unwrap();
 }
