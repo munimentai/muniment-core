@@ -3,6 +3,18 @@ use chrono::{SecondsFormat, Utc};
 
 use super::{JournalError, Provenance, RunJournal};
 
+pub fn create_thread_now(
+    journal: &mut RunJournal,
+    workspace: &str,
+    provenance: Provenance,
+) -> Result<String, JournalError> {
+    journal.create_thread(
+        workspace,
+        &Utc::now().to_rfc3339_opts(SecondsFormat::AutoSi, true),
+        provenance,
+    )
+}
+
 #[derive(Debug)]
 pub enum ThreadMutationError {
     Ownership(ThreadOwnershipError),

@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use muniment_core::journal::thread_mutation::{
     append_thread_delete, append_thread_delete_now, append_thread_rename, append_thread_rename_now,
-    ThreadMutationError,
+    create_thread_now, ThreadMutationError,
 };
 use muniment_core::journal::{EventEnvelope, EventPayload, Provenance, RunJournal};
 use rusqlite::Connection;
@@ -22,6 +22,14 @@ fn provenance(actor_id: Option<&str>) -> Provenance {
         capability_versions: None,
         extra: BTreeMap::new(),
     }
+}
+
+fn attach_provenance() -> Provenance {
+    let mut provenance = provenance(Some("owner"));
+    provenance
+        .extra
+        .insert("attach_profile".into(), json!("profile-a"));
+    provenance
 }
 
 fn run_started(actor_id: Option<&str>) -> EventEnvelope {
@@ -66,6 +74,39 @@ fn stored_thread_event(path: &PathBuf, thread_id: &str) -> (String, u64, String,
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap()
+}
+
+#[test]
+fn creates_thread_now_and_reads_it_from_the_journal() {
+    let path = std::env::temp_dir().join(format!(
+        "muniment-journal-thread-create-{}.sqlite3",
+        Uuid::new_v4()
+    ));
+    let mut journal = RunJournal::open(&path).unwrap();
+    let before = Utc::now();
+
+    let thread_id = create_thread_now(&mut journal, "workspace-a", attach_provenance()).unwrap();
+    let after = Utc::now();
+
+    let events = journal.thread_events(&thread_id).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, "thread.created");
+    let recorded_at = stored_thread_event(&path, &thread_id).2;
+    let parsed = DateTime::parse_from_rfc3339(&recorded_at).unwrap();
+    assert!(recorded_at.ends_with('Z'));
+    assert!(parsed >= before && parsed <= after);
+}
+
+#[test]
+fn create_thread_now_rejects_invalid_workspace_or_provenance() {
+    let path = std::env::temp_dir().join(format!(
+        "muniment-journal-thread-create-invalid-{}.sqlite3",
+        Uuid::new_v4()
+    ));
+    let mut journal = RunJournal::open(path).unwrap();
+
+    assert!(create_thread_now(&mut journal, "", attach_provenance()).is_err());
+    assert!(create_thread_now(&mut journal, "workspace-a", provenance(Some("owner"))).is_err());
 }
 
 #[test]
