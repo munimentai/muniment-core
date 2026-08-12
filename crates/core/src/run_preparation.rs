@@ -287,6 +287,29 @@ pub fn record_preparation_failure(
     }
 }
 
+pub fn record_persistence_failure(
+    journal: &mut RunJournal,
+    projector: &mut ChatProjector,
+    run_id: &str,
+    seq: u64,
+    subject: Option<&str>,
+    source: &str,
+    source_version: &str,
+) {
+    let failed = event_envelope(
+        run_id,
+        seq + 1,
+        "run.failed",
+        json!({"reason": "persistence"}),
+        subject,
+        source,
+        source_version,
+    );
+    if projector.apply(&failed).is_ok() {
+        let _ = journal.append(seq, &failed);
+    }
+}
+
 pub fn event_envelope(
     run_id: &str,
     run_seq: u64,
