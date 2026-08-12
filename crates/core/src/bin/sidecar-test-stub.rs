@@ -181,7 +181,9 @@ fn pi_resume(args: Vec<String>) {
                     "{}",
                     serde_json::json!({"type":"response", "command":"prompt", "success":true, "id":request["id"]})
                 );
-                if let Ok(query) = std::env::var("PI_RESUME_STUB_MEMORY_QUERY") {
+                if std::env::var_os("PI_RESUME_STUB_STEER_CAPTURE").is_some() {
+                    // Keep the run active until the test sends a steer command.
+                } else if let Ok(query) = std::env::var("PI_RESUME_STUB_MEMORY_QUERY") {
                     println!(
                         "{}",
                         serde_json::json!({
@@ -197,6 +199,20 @@ fn pi_resume(args: Vec<String>) {
                     );
                     println!("{}", serde_json::json!({"type":"agent_end"}));
                 }
+            }
+            "steer" => {
+                if let Ok(path) = std::env::var("PI_RESUME_STUB_STEER_CAPTURE") {
+                    fs::write(path, request.to_string()).unwrap();
+                }
+                println!(
+                    "{}",
+                    serde_json::json!({"type":"response", "command":"steer", "success":true, "id":request["id"]})
+                );
+                println!(
+                    "{}",
+                    serde_json::json!({"type":"message_update", "assistantMessageEvent":{"type":"text_delta", "delta":" steered"}})
+                );
+                println!("{}", serde_json::json!({"type":"agent_end"}));
             }
             "extension_ui_response" => {
                 println!(
