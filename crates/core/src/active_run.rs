@@ -1,4 +1,5 @@
 use std::sync::atomic::Ordering;
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -113,6 +114,32 @@ pub fn queue_permission_answer(
             resolved: None,
         });
     Ok(())
+}
+
+pub fn queue_permission_answer_with_commit(
+    active: &Mutex<Option<ActiveRun>>,
+    workspace: Option<&str>,
+    run_id: String,
+    gate_id: String,
+    answer: ChatPermissionAnswer,
+) -> Result<Receiver<Option<u64>>, String> {
+    let active = active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let run = active
+        .as_ref()
+        .filter(|run| run.id == run_id && workspace.is_none_or(|value| value == run.workspace))
+        .ok_or_else(|| "That reply is no longer active.".to_string())?;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    run.permission_answers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push_back(PendingPermissionAnswer {
+            gate_id,
+            answer,
+            resolved: Some(sender),
+        });
+    Ok(receiver)
 }
 
 #[cfg(test)]
@@ -244,5 +271,48 @@ mod tests {
             .unwrap();
         assert_eq!(queued.gate_id, "gate-1");
         assert!(matches!(queued.answer, ChatPermissionAnswer::Select(value) if value == "A"));
+    }
+
+    #[test]
+    fn permission_answer_with_commit_checks_workspace_and_returns_receiver() {
+        let runtime_activity = RuntimeActivityRegistry::new();
+        let active = Mutex::new(Some(inactive_transport_run(
+            "run-1",
+            "workspace-a",
+            &runtime_activity,
+        )));
+
+        assert_eq!(
+            queue_permission_answer_with_commit(
+                &active,
+                Some("workspace-b"),
+                "run-1".into(),
+                "gate-1".into(),
+                ChatPermissionAnswer::Confirm(true),
+            )
+            .unwrap_err(),
+            "That reply is no longer active."
+        );
+        let receiver = queue_permission_answer_with_commit(
+            &active,
+            Some("workspace-a"),
+            "run-1".into(),
+            "gate-1".into(),
+            ChatPermissionAnswer::Confirm(true),
+        )
+        .unwrap();
+        let queued = active
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .permission_answers
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap();
+
+        queued.resolved.unwrap().send(Some(7)).unwrap();
+        assert_eq!(receiver.recv().unwrap(), Some(7));
     }
 }
