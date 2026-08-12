@@ -136,16 +136,16 @@ pub struct EventEnvelope {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct ThreadEventEnvelope {
+pub struct ThreadEventEnvelope {
     event_id: String,
     thread_id: String,
     thread_seq: u64,
-    event_type: String,
+    pub event_type: String,
     event_version: u32,
     envelope_version: u32,
     recorded_at: String,
     payload_json: Value,
-    provenance: Provenance,
+    pub provenance: Provenance,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1487,6 +1487,32 @@ impl RunJournal {
             let raw = row?;
             serde_json::from_str(&raw)
                 .map_err(|e| JournalError::Corrupt(format!("invalid stored envelope JSON: {e}")))
+        })
+        .collect()
+    }
+
+    pub fn thread_events(
+        &mut self,
+        thread_id: &str,
+    ) -> Result<Vec<ThreadEventEnvelope>, JournalError> {
+        let coordination = self.coordination.clone();
+        let _operation = coordination
+            .as_ref()
+            .map(|state| state.operation.lock().unwrap());
+        self.refresh_after_compaction()?;
+        let mut statement = self
+            .connection
+            .as_ref()
+            .expect("journal connection is always present outside compaction")
+            .prepare(
+                "SELECT envelope_json FROM thread_events WHERE thread_id=?1 ORDER BY thread_seq",
+            )?;
+        let rows = statement.query_map([thread_id], |row| row.get::<_, String>(0))?;
+        rows.map(|row| {
+            let raw = row?;
+            serde_json::from_str(&raw).map_err(|error| {
+                JournalError::Corrupt(format!("invalid stored thread envelope JSON: {error}"))
+            })
         })
         .collect()
     }

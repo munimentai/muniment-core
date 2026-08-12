@@ -1,4 +1,5 @@
 use crate::thread_ownership::{subject_owns_first_run, ThreadOwnershipError};
+use chrono::{SecondsFormat, Utc};
 
 use super::{JournalError, Provenance, RunJournal};
 
@@ -39,6 +40,23 @@ pub fn append_thread_rename(
         .map_err(ThreadMutationError::Journal)
 }
 
+pub fn append_thread_rename_now(
+    journal: &mut RunJournal,
+    subject: Option<&str>,
+    thread_id: &str,
+    title: &str,
+    provenance: &Provenance,
+) -> Result<(), ThreadMutationError> {
+    append_thread_rename(
+        journal,
+        subject,
+        thread_id,
+        title,
+        &Utc::now().to_rfc3339_opts(SecondsFormat::AutoSi, true),
+        provenance,
+    )
+}
+
 pub fn append_thread_delete(
     journal: &mut RunJournal,
     subject: Option<&str>,
@@ -53,4 +71,19 @@ pub fn append_thread_delete(
     journal
         .append_thread_deleted(last_thread_seq, thread_id, recorded_at, provenance)
         .map_err(ThreadMutationError::Journal)
+}
+
+pub fn append_thread_delete_now(
+    journal: &mut RunJournal,
+    subject: Option<&str>,
+    thread_id: &str,
+    provenance: &Provenance,
+) -> Result<(), ThreadMutationError> {
+    append_thread_delete(
+        journal,
+        subject,
+        thread_id,
+        &Utc::now().to_rfc3339_opts(SecondsFormat::AutoSi, true),
+        provenance,
+    )
 }

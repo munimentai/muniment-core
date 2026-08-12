@@ -1,5 +1,7 @@
+use chrono::{DateTime, Utc};
 use muniment_core::journal::thread_mutation::{
-    append_thread_delete, append_thread_rename, ThreadMutationError,
+    append_thread_delete, append_thread_delete_now, append_thread_rename, append_thread_rename_now,
+    ThreadMutationError,
 };
 use muniment_core::journal::{EventEnvelope, EventPayload, Provenance, RunJournal};
 use rusqlite::Connection;
@@ -117,6 +119,49 @@ fn appends_delete_with_caller_fields() {
         serde_json::from_value::<Provenance>(envelope["provenance"].clone()).unwrap(),
         caller_provenance
     );
+}
+
+#[test]
+fn rename_now_stores_a_generated_utc_rfc3339_timestamp() {
+    let (path, mut journal, thread_id) = journal_with_thread(Some("owner"));
+    let before = Utc::now();
+
+    append_thread_rename_now(
+        &mut journal,
+        Some("owner"),
+        &thread_id,
+        "New title",
+        &provenance(Some("owner")),
+    )
+    .unwrap();
+    let after = Utc::now();
+
+    let recorded_at = stored_thread_event(&path, &thread_id).2;
+    let parsed = DateTime::parse_from_rfc3339(&recorded_at).unwrap();
+    assert_eq!(parsed.offset().local_minus_utc(), 0);
+    assert!(recorded_at.ends_with('Z'));
+    assert!(parsed >= before && parsed <= after);
+}
+
+#[test]
+fn delete_now_stores_a_generated_utc_rfc3339_timestamp() {
+    let (path, mut journal, thread_id) = journal_with_thread(Some("owner"));
+    let before = Utc::now();
+
+    append_thread_delete_now(
+        &mut journal,
+        Some("owner"),
+        &thread_id,
+        &provenance(Some("owner")),
+    )
+    .unwrap();
+    let after = Utc::now();
+
+    let recorded_at = stored_thread_event(&path, &thread_id).2;
+    let parsed = DateTime::parse_from_rfc3339(&recorded_at).unwrap();
+    assert_eq!(parsed.offset().local_minus_utc(), 0);
+    assert!(recorded_at.ends_with('Z'));
+    assert!(parsed >= before && parsed <= after);
 }
 
 #[test]
