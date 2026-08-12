@@ -20,6 +20,11 @@ use crate::permission_gate::{ChatPermissionAnswer, PendingPermissionAnswer};
 use crate::sidecar::pi_chat::PiRunAdapter;
 use crate::sidecar::PiRpcTransport;
 
+/// Returns the timestamp used when a run is accepted.
+pub fn accepted_time_now() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::AutoSi, true)
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubmitResult {
@@ -297,7 +302,7 @@ pub fn prepare_desktop_run(
         run_id: run_id.clone(),
         attachments,
         committed_seq: prepared.0,
-        accepted_at: Utc::now().to_rfc3339_opts(SecondsFormat::AutoSi, true),
+        accepted_at: accepted_time_now(),
     };
     let launch = RunStartLaunch {
         run_id,
