@@ -5107,6 +5107,7 @@ fn verified_runtime_enters_a_migration_only_session_without_approval_or_credenti
                     expected_executable: &executable,
                     process_reader: &reader,
                 }),
+                handoff_nonce: None,
             },
         );
         std::fs::remove_file(executable).unwrap();
@@ -5218,6 +5219,7 @@ fn unresolved_runtime_peer_uses_the_ordinary_approval_path() {
                 expected_executable: &expected,
                 process_reader: &reader,
             }),
+            handoff_nonce: None,
         },
     );
     assert_eq!(result, Ok(()));

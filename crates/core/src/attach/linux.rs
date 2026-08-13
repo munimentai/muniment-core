@@ -723,6 +723,7 @@ pub struct MigrationControlSessionDependencies<'a> {
 pub struct SessionRegistryDependencies<'a> {
     pub registry: &'a LiveConnectionRegistry,
     pub migration: Option<MigrationControlSessionDependencies<'a>>,
+    pub handoff_nonce: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1271,6 +1272,7 @@ pub fn run_authenticated_session_with_service_and_approvals<
         service,
         approvals,
         &LiveConnectionRegistry::default(),
+        None,
     )
 }
 
@@ -1285,6 +1287,7 @@ pub fn run_authenticated_session_with_service_approvals_and_registry<
     service: &mut S,
     approvals: W,
     registry: &LiveConnectionRegistry,
+    handoff_nonce: Option<&str>,
 ) -> Result<(), AttachSessionError> {
     run_authenticated_session_with_service_approvals_registry_and_timeout(
         stream,
@@ -1292,7 +1295,11 @@ pub fn run_authenticated_session_with_service_approvals_and_registry<
         desktop_version,
         service,
         approvals,
-        registry,
+        SessionRegistryDependencies {
+            registry,
+            migration: None,
+            handoff_nonce,
+        },
         HELLO_TIMEOUT,
     )
 }
@@ -1326,6 +1333,7 @@ pub fn run_authenticated_session_with_service_approvals_registry_and_migration<
         SessionRegistryDependencies {
             registry,
             migration: Some(migration),
+            handoff_nonce: None,
         },
     )
 }
@@ -1340,11 +1348,11 @@ pub fn run_authenticated_session_with_service_approvals_registry_and_timeout<
     desktop_version: &str,
     service: &mut S,
     approvals: W,
-    registry: &LiveConnectionRegistry,
+    session: SessionRegistryDependencies<'_>,
     timeout: Duration,
 ) -> Result<(), AttachSessionError> {
     let mut random = |bytes: &mut [u8]| getrandom::fill(bytes).map_err(|_| ());
-    run_authenticated_session_with_authorization_and_registry(
+    run_session(
         stream,
         credentials,
         desktop_version,
@@ -1356,7 +1364,7 @@ pub fn run_authenticated_session_with_service_approvals_registry_and_timeout<
             approvals,
         },
         service,
-        registry,
+        session,
     )
 }
 
@@ -1460,6 +1468,7 @@ where
         SessionRegistryDependencies {
             registry,
             migration: None,
+            handoff_nonce: None,
         },
     )
 }
@@ -1638,6 +1647,10 @@ where
             )
         } else {
             welcome(selected, desktop_version, server_nonce, challenge.as_str())
+        };
+        let response = match session.handoff_nonce {
+            Some(handoff_nonce) => response.with_handoff_nonce(handoff_nonce),
+            None => response,
         };
         write_before(
             &mut stream,
