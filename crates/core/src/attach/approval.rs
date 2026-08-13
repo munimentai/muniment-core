@@ -53,6 +53,7 @@ type Presenter = dyn Fn(&ApprovalRequest) -> bool + Send + Sync;
 #[derive(Default)]
 struct ApprovalState {
     presenter: Option<Arc<Presenter>>,
+    presenter_claimed: bool,
     pending: HashMap<String, PendingDecision>,
     next_id: u64,
 }
@@ -67,6 +68,10 @@ pub struct ApprovalCoordinator {
     state: Arc<Mutex<ApprovalState>>,
 }
 
+pub struct PresenterGuard {
+    state: Arc<Mutex<ApprovalState>>,
+}
+
 impl ApprovalCoordinator {
     pub fn register_presenter<F>(&self, presenter: F)
     where
@@ -75,6 +80,21 @@ impl ApprovalCoordinator {
         if let Ok(mut state) = self.state.lock() {
             state.presenter = Some(Arc::new(presenter));
         }
+    }
+
+    pub fn claim_presenter<F>(&self, presenter: F) -> Option<PresenterGuard>
+    where
+        F: Fn(&ApprovalRequest) -> bool + Send + Sync + 'static,
+    {
+        let mut state = self.state.lock().ok()?;
+        if state.presenter_claimed {
+            return None;
+        }
+        state.presenter = Some(Arc::new(presenter));
+        state.presenter_claimed = true;
+        Some(PresenterGuard {
+            state: self.state.clone(),
+        })
     }
 
     pub fn request(&self, request: ApprovalRequest, remaining: Duration) -> bool {
@@ -126,6 +146,23 @@ impl ApprovalCoordinator {
             {
                 state.pending.remove(challenge);
             }
+        }
+    }
+}
+
+impl Drop for PresenterGuard {
+    fn drop(&mut self) {
+        let pending = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.presenter = None;
+            state.presenter_claimed = false;
+            std::mem::take(&mut state.pending)
+        };
+        for decision in pending.into_values() {
+            let _ = decision.sender.try_send(false);
         }
     }
 }
@@ -230,5 +267,45 @@ mod tests {
         assert!(coordinator.decide("repeat", false));
         assert!(!coordinator.decide("repeat", true));
         assert!(!result.join().unwrap());
+    }
+
+    #[test]
+    fn rejects_a_second_presenter_claim() {
+        let coordinator = ApprovalCoordinator::default();
+        let guard = coordinator.claim_presenter(|_| true).unwrap();
+
+        assert!(coordinator.claim_presenter(|_| true).is_none());
+        drop(guard);
+        assert!(coordinator.claim_presenter(|_| true).is_some());
+    }
+
+    #[test]
+    fn releasing_a_presenter_clears_it() {
+        let coordinator = ApprovalCoordinator::default();
+        let guard = coordinator.claim_presenter(|_| true).unwrap();
+
+        drop(guard);
+
+        assert!(!coordinator.request(request("released"), Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn releasing_a_presenter_denies_a_waiting_request_at_once() {
+        let coordinator = ApprovalCoordinator::default();
+        let (presented_sender, presented) = channel();
+        let guard = coordinator
+            .claim_presenter(move |_| presented_sender.send(()).is_ok())
+            .unwrap();
+        let waiter = coordinator.clone();
+        let (result_sender, result) = channel();
+        thread::spawn(move || {
+            let decision = waiter.request(request("release"), Duration::from_secs(60));
+            result_sender.send(decision).unwrap();
+        });
+        presented.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        drop(guard);
+
+        assert!(!result.recv_timeout(Duration::from_secs(1)).unwrap());
     }
 }
