@@ -10,10 +10,10 @@ use super::linux::{
     ThreadOpenRequest,
 };
 use super::{
-    bounded_claim, save_client_credentials as persist_client_credentials, Approval,
-    ClientCredential, CommittedResult, Id, IdempotencyOutcome, IdempotencyStore, Operation,
-    Protocol, ProtocolError, Request as AttachRequest, WorkspaceContextMap,
-    WorkspaceOnboardRequest, WorkspaceOnboarded,
+    bounded_claim, onboard_workspace_context,
+    save_client_credentials as persist_client_credentials, Approval, ClientCredential,
+    CommittedResult, Id, IdempotencyOutcome, IdempotencyStore, Operation, Protocol, ProtocolError,
+    Request as AttachRequest, WorkspaceContextMap, WorkspaceOnboardRequest, WorkspaceOnboarded,
 };
 use crate::journal::Provenance;
 use crate::permission_gate::ChatPermissionAnswer;
@@ -137,34 +137,11 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         workspace: &str,
         request: WorkspaceOnboardRequest,
     ) -> Result<WorkspaceOnboarded, ProtocolError> {
-        let opened = PathBuf::from(&request.opened_directory);
-        let memory = PathBuf::from(&request.memory_location);
-        if !opened.is_absolute() || !memory.is_absolute() {
-            return Err(ProtocolError::invalid_request());
-        }
-        let instructions = crate::onboard_companion_workspace(&opened, &memory)
-            .map_err(|_| ProtocolError::persistence_failed())?;
-        let opened_canonical = opened
-            .canonicalize()
-            .map_err(|_| ProtocolError::persistence_failed())?;
-        let memory_canonical = memory
-            .canonicalize()
-            .map_err(|_| ProtocolError::persistence_failed())?;
-        let mut contexts = self
-            .workspace_contexts
-            .lock()
-            .map_err(|_| ProtocolError::persistence_failed())?;
         let identity = self
             .client_identity
             .as_ref()
             .ok_or_else(ProtocolError::unauthorized)?;
-        contexts.record(identity, workspace, opened_canonical, instructions.clone());
-        contexts.record(identity, workspace, memory_canonical, instructions.clone());
-        Ok(WorkspaceOnboarded {
-            opened_directory: opened.to_string_lossy().into_owned(),
-            memory_location: memory.to_string_lossy().into_owned(),
-            instructions,
-        })
+        onboard_workspace_context(&self.workspace_contexts, identity, workspace, request)
     }
 
     fn ensure_home(&mut self) -> Result<(), ProtocolError> {
