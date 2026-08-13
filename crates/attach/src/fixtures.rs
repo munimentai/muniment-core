@@ -562,6 +562,19 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
             }),
         },
     )?;
+    insert(
+        &mut fixtures,
+        "response-approval-present.json",
+        &Response {
+            protocol: Protocol,
+            request_id: id(115)?,
+            ok: Success,
+            body: json!({
+                "challenge": "fixture-challenge",
+                "decision": "approve"
+            }),
+        },
+    )?;
 
     let errors = [
         crate::ErrorCode::ProtocolIncompatible,
@@ -909,7 +922,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            47,
+            48,
             "every canonical fixture must be inventoried"
         );
     }

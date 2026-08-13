@@ -1,6 +1,8 @@
 //! Companion attach server support.
 
 mod approval;
+#[cfg(unix)]
+mod approval_present;
 mod artifact;
 mod authorization;
 #[cfg(target_os = "linux")]
@@ -24,6 +26,8 @@ mod runtime_activity;
 mod workspace_context;
 
 pub use approval::*;
+#[cfg(unix)]
+pub use approval_present::*;
 pub use artifact::*;
 pub use authorization::*;
 #[cfg(target_os = "linux")]
