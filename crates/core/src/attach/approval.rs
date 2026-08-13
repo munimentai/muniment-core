@@ -2,6 +2,43 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
+use super::Approval;
+
+#[derive(Clone, Default)]
+pub struct SignedWorkspaceApproval {
+    workspace: Arc<Mutex<Option<String>>>,
+}
+
+impl SignedWorkspaceApproval {
+    pub fn record(&self, workspace: String) {
+        *self
+            .workspace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(workspace);
+    }
+
+    pub fn clear(&self) {
+        *self
+            .workspace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    pub fn approval(&self) -> Option<Approval> {
+        let workspace = self
+            .workspace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        Some(Approval {
+            profile: "desktop-owner".into(),
+            workspace,
+            scopes: BTreeSet::from(["thread.read".into(), "run.write".into()]),
+            lifetime: Duration::from_secs(60 * 60),
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApprovalRequest {
     pub challenge: String,
@@ -107,6 +144,25 @@ mod tests {
             workspace: "workspace-a".into(),
             scopes: BTreeSet::from(["thread.read".into(), "run.write".into()]),
         }
+    }
+
+    #[test]
+    fn signed_workspace_approval_records_and_clears_the_owner_approval() {
+        let state = SignedWorkspaceApproval::default();
+        assert!(state.approval().is_none());
+
+        state.record("workspace-a".into());
+        let approval = state.approval().unwrap();
+        assert_eq!(approval.profile, "desktop-owner");
+        assert_eq!(approval.workspace, "workspace-a");
+        assert_eq!(
+            approval.scopes,
+            BTreeSet::from(["thread.read".into(), "run.write".into()])
+        );
+        assert_eq!(approval.lifetime, Duration::from_secs(60 * 60));
+
+        state.clear();
+        assert!(state.approval().is_none());
     }
 
     fn presented_coordinator() -> (ApprovalCoordinator, mpsc::Receiver<String>) {
