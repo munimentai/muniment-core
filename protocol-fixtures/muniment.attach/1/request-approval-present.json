@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"00000000000000000000000000000073","operation":"approval.present","capability":"fixture-capability","body":{"challenge":"fixture-challenge","claimed_kind":"editor-extension","claimed_version":"0.0.1","deadline_ms":120000,"scopes":["thread.read"],"workspace":"workspace-1"}}

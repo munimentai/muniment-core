@@ -274,6 +274,8 @@ pub enum Operation {
     RequestCancel,
     #[serde(rename = "migration.control")]
     MigrationControl,
+    #[serde(rename = "approval.present")]
+    ApprovalPresent,
 }
 
 impl Operation {
@@ -308,6 +310,7 @@ impl Operation {
             Self::ArtifactWindow => "artifact.window",
             Self::RequestCancel => "request.cancel",
             Self::MigrationControl => "migration.control",
+            Self::ApprovalPresent => "approval.present",
         }
     }
 }
