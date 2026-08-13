@@ -54,6 +54,23 @@ pub enum MigrationControlOutcome {
     UnsupportedOperation,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalDecision {
+    Approve,
+    Deny,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalPresentRequest {
+    pub challenge: String,
+    pub claimed_kind: String,
+    pub claimed_version: String,
+    pub workspace: String,
+    pub scopes: Vec<String>,
+    pub deadline_ms: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MigrationControlFailure {
     InvalidNonce,
@@ -339,10 +356,11 @@ impl fmt::Debug for ThreadListPage {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::{
-        AuthorizationSummary, ClientError, MigrationControlFailure, MigrationControlOutcome,
-        PendingPermission, PermissionAnswerAccepted, PermissionDecision, RedactedRunEvent,
-        RunCancelAccepted, RunStartAccepted, RunStreamMessage, RunStreamSubscription,
-        ThreadCreateAccepted, ThreadListPage, ThreadOpenPage,
+        ApprovalDecision, ApprovalPresentRequest, AuthorizationSummary, ClientError,
+        MigrationControlFailure, MigrationControlOutcome, PendingPermission,
+        PermissionAnswerAccepted, PermissionDecision, RedactedRunEvent, RunCancelAccepted,
+        RunStartAccepted, RunStreamMessage, RunStreamSubscription, ThreadCreateAccepted,
+        ThreadListPage, ThreadOpenPage,
     };
     use crate::{
         decode_frame, encode_frame, Authorization, Authorized, Client, Envelope, ErrorCode,
@@ -390,6 +408,7 @@ mod linux {
     const MAX_RUN_STREAM_WINDOW_TEXT_BYTES: usize = 262_144;
     const MAX_HANDOFF_NONCE_BYTES: usize = 128;
     const MAX_HANDOFF_DEADLINE_MS: u64 = 60_000;
+    const MAX_APPROVAL_DEADLINE_MS: u64 = 120_000;
 
     struct ActiveRunStream {
         subscription_id: Id,
@@ -1333,6 +1352,110 @@ mod linux {
         io_timeout: Duration,
     }
 
+    /// A connection-bound client for the peer-authorized approval presenter session.
+    pub struct ApprovalPresenterClient {
+        stream: UnixStream,
+        capability: String,
+        summary: AuthorizationSummary,
+        io_timeout: Duration,
+    }
+
+    impl std::fmt::Debug for ApprovalPresenterClient {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("ApprovalPresenterClient { .. }")
+        }
+    }
+
+    impl ApprovalPresenterClient {
+        pub fn capability(&self) -> &str {
+            &self.capability
+        }
+
+        pub fn authorization_summary(&self) -> AuthorizationSummary {
+            self.summary.clone()
+        }
+
+        pub fn present(
+            &mut self,
+            choose: impl FnOnce(&ApprovalPresentRequest) -> ApprovalDecision,
+        ) -> Result<(), ClientError> {
+            let request_deadline = deadline(self.io_timeout);
+            let envelope: Envelope =
+                serde_json::from_value(read_approval_value(&mut self.stream, request_deadline)?)
+                    .map_err(|_| ClientError::UnexpectedMessage)?;
+            let Envelope::Request(request) = envelope else {
+                return Err(ClientError::UnexpectedMessage);
+            };
+
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Body {
+                challenge: String,
+                claimed_kind: String,
+                claimed_version: String,
+                workspace: String,
+                scopes: Vec<String>,
+                deadline_ms: u64,
+            }
+
+            let body = serde_json::from_value::<Body>(request.body.clone());
+            let valid_text = |value: &str| {
+                !value.is_empty()
+                    && value.len() <= MAX_TEXT_LENGTH
+                    && !value.chars().any(char::is_control)
+            };
+            let valid = request.capability == self.capability
+                && request.operation == Operation::ApprovalPresent
+                && request.idempotency_key.is_none()
+                && body.as_ref().is_ok_and(|body| {
+                    valid_text(&body.challenge)
+                        && valid_text(&body.claimed_kind)
+                        && valid_text(&body.claimed_version)
+                        && valid_text(&body.workspace)
+                        && body.scopes.len() <= crate::MAX_JSON_COLLECTION_ENTRIES
+                        && body.scopes.iter().all(|scope| valid_text(scope))
+                        && (1..=MAX_APPROVAL_DEADLINE_MS).contains(&body.deadline_ms)
+                });
+            if !valid {
+                let error = ErrorEnvelope {
+                    protocol: Protocol,
+                    request_id: Some(request.request_id),
+                    ok: crate::Failure,
+                    error: crate::ProtocolError::unauthorized(),
+                };
+                let bytes = encode_frame(&error).map_err(map_frame_error)?;
+                write_all_before(&mut self.stream, &bytes, deadline(self.io_timeout))?;
+                return Err(ClientError::UnexpectedMessage);
+            }
+
+            let body = body.expect("validated approval request body");
+            let approval = ApprovalPresentRequest {
+                challenge: body.challenge,
+                claimed_kind: body.claimed_kind,
+                claimed_version: body.claimed_version,
+                workspace: body.workspace,
+                scopes: body.scopes,
+                deadline_ms: body.deadline_ms,
+            };
+            let decision = choose(&approval);
+            let response = Response {
+                protocol: Protocol,
+                request_id: request.request_id,
+                ok: crate::Success,
+                body: serde_json::json!({
+                    "challenge": approval.challenge,
+                    "decision": decision,
+                }),
+            };
+            let bytes = encode_frame(&response).map_err(map_frame_error)?;
+            write_all_before(&mut self.stream, &bytes, deadline(self.io_timeout))
+        }
+
+        pub fn into_stream(self) -> UnixStream {
+            self.stream
+        }
+    }
+
     impl std::fmt::Debug for MigrationControlClient {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             formatter.write_str("MigrationControlClient { .. }")
@@ -1669,6 +1792,67 @@ mod linux {
         })
     }
 
+    #[doc(hidden)]
+    pub fn handshake_approval_presenter_stream(
+        mut stream: UnixStream,
+        client_version: &str,
+        io_timeout: Duration,
+    ) -> Result<ApprovalPresenterClient, ClientError> {
+        let hello = Hello {
+            protocol: Protocol,
+            client: Client {
+                kind: "desktop".into(),
+                version: client_version.into(),
+            },
+            supported: VersionRange { min: 1, max: 1 },
+            client_nonce: fresh_nonce()?,
+            authorized_client_id: Id::new(fresh_request_id()?.as_str())
+                .map_err(|_| ClientError::UnexpectedMessage)?,
+            authorized_client_credential: None,
+        };
+        let bytes = encode_frame(&hello).map_err(map_frame_error)?;
+        write_all_before(&mut stream, &bytes, deadline(io_timeout))?;
+
+        let welcome_value = read_value(&mut stream, deadline(io_timeout))?;
+        reject_protocol_error(&welcome_value)?;
+        let welcome: Welcome = parse_message(welcome_value)?;
+        if welcome.selected != 1
+            || welcome.authorization != Authorization::Authorized
+            || !is_hex_secret(&welcome.server_nonce, 32)
+        {
+            return Err(ClientError::UnexpectedMessage);
+        }
+
+        let authorized_value = read_value(&mut stream, deadline(io_timeout))?;
+        reject_protocol_error(&authorized_value)?;
+        if authorized_value
+            .get("authorized_client_credential")
+            .is_some()
+        {
+            return Err(ClientError::UnexpectedMessage);
+        }
+        let authorized: MigrationControlAuthorized = parse_message(authorized_value)?;
+        if !authorized.profile_id.is_empty()
+            || !authorized.workspace_scopes.is_empty()
+            || !is_hex_secret(&authorized.capability, 64)
+            || authorized.expires_at == 0
+            || authorized.expires_at > 8 * 60 * 60
+            || authorized.idle_timeout_seconds == 0
+            || authorized.idle_timeout_seconds > 15 * 60
+        {
+            return Err(ClientError::UnexpectedMessage);
+        }
+        Ok(ApprovalPresenterClient {
+            stream,
+            capability: authorized.capability,
+            summary: AuthorizationSummary {
+                expires_in_seconds: authorized.expires_at,
+                idle_timeout_seconds: authorized.idle_timeout_seconds,
+            },
+            io_timeout,
+        })
+    }
+
     fn handshake_stream_with_identity(
         mut stream: UnixStream,
         client_version: &str,
@@ -1850,6 +2034,21 @@ mod linux {
             .ok_or(ClientError::MalformedFrame)
     }
 
+    fn read_approval_value(
+        stream: &mut UnixStream,
+        deadline: Instant,
+    ) -> Result<Value, ClientError> {
+        let mut prefix = [0u8; 4];
+        read_exact_before(stream, &mut prefix, deadline)?;
+        let length = u32::from_be_bytes(prefix) as usize;
+        if length > MAX_FRAME_LENGTH {
+            return Err(ClientError::PayloadTooLarge);
+        }
+        let mut frame = vec![0u8; length];
+        read_exact_before(stream, &mut frame, deadline)?;
+        serde_json::from_slice(&frame).map_err(|_| ClientError::MalformedFrame)
+    }
+
     fn reject_protocol_error(value: &Value) -> Result<(), ClientError> {
         if value
             .get("protocol")
@@ -1894,8 +2093,9 @@ mod linux {
 
 #[cfg(target_os = "linux")]
 pub use linux::{
-    handshake_migration_control_stream, handshake_stream, handshake_stream_with_credential,
-    AuthorizedClient, MigrationControlClient,
+    handshake_approval_presenter_stream, handshake_migration_control_stream, handshake_stream,
+    handshake_stream_with_credential, ApprovalPresenterClient, AuthorizedClient,
+    MigrationControlClient,
 };
 
 #[cfg(not(target_os = "linux"))]

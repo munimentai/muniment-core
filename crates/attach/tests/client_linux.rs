@@ -1,11 +1,12 @@
 #![cfg(all(target_os = "linux", feature = "client"))]
 
 use muniment_attach::{
-    authorized, encode_frame, handshake_migration_control_stream, handshake_stream,
-    handshake_stream_with_credential, reconnect_welcome, welcome, ClientError, ErrorAction,
-    ErrorEnvelope, Event, EventName, Failure, Id, MigrationControlFailure, MigrationControlOutcome,
-    PermissionDecision, PermissionKind, Protocol, ProtocolError, Response, RunStreamMessage,
-    Success, VersionRange, MAX_FRAME_LENGTH,
+    authorized, encode_frame, handshake_approval_presenter_stream,
+    handshake_migration_control_stream, handshake_stream, handshake_stream_with_credential,
+    reconnect_welcome, welcome, ApprovalDecision, ClientError, ErrorAction, ErrorEnvelope, Event,
+    EventName, Failure, Id, MigrationControlFailure, MigrationControlOutcome, PermissionDecision,
+    PermissionKind, Protocol, ProtocolError, Response, RunStreamMessage, Success, VersionRange,
+    MAX_FRAME_LENGTH,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -18,6 +19,296 @@ use std::time::{Duration, Instant};
 
 const SHORT: Duration = Duration::from_millis(100);
 static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
+
+fn complete_approval_presenter_handshake(server: &mut UnixStream) {
+    let hello = read_client_value(server);
+    assert_eq!(hello["client"]["kind"], "desktop");
+    assert!(hello.get("authorized_client_credential").is_none());
+    server
+        .write_all(&encode_frame(&reconnect_welcome(1, "0.0.1", "11".repeat(16), "")).unwrap())
+        .unwrap();
+    server
+        .write_all(
+            &encode_frame(&serde_json::json!({
+                "profile_id": "",
+                "capability": "33".repeat(32),
+                "expires_at": 60,
+                "idle_timeout_seconds": 60,
+                "workspace_scopes": {},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+}
+
+#[test]
+fn approval_presenter_handshake_accepts_only_a_credential_free_grant() {
+    for include_credential in [false, true] {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            let hello = read_client_value(&mut server);
+            assert_eq!(hello["client"]["kind"], "desktop");
+            assert!(hello.get("authorized_client_credential").is_none());
+            server
+                .write_all(
+                    &encode_frame(&reconnect_welcome(1, "0.0.1", "11".repeat(16), "")).unwrap(),
+                )
+                .unwrap();
+            let mut grant = serde_json::json!({
+                "profile_id": "",
+                "capability": "33".repeat(32),
+                "expires_at": 60,
+                "idle_timeout_seconds": 60,
+                "workspace_scopes": {},
+            });
+            if include_credential {
+                grant["authorized_client_credential"] = serde_json::json!("44".repeat(32));
+            }
+            server.write_all(&encode_frame(&grant).unwrap()).unwrap();
+        });
+        let result = handshake_approval_presenter_stream(client, "0.0.1", SHORT);
+        if include_credential {
+            assert_eq!(result.unwrap_err(), ClientError::UnexpectedMessage);
+        } else {
+            assert_eq!(result.unwrap().capability(), "33".repeat(32));
+        }
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn approval_presenter_hands_the_request_to_the_caller_and_sends_the_choice() {
+    for (decision, expected) in [
+        (ApprovalDecision::Approve, "approve"),
+        (ApprovalDecision::Deny, "deny"),
+    ] {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            complete_approval_presenter_handshake(&mut server);
+            server
+                .write_all(
+                    &encode_frame(&serde_json::json!({
+                        "protocol": "muniment.attach/1",
+                        "request_id": "00000000000000000000000000000073",
+                        "operation": "approval.present",
+                        "capability": "33".repeat(32),
+                        "body": {
+                            "challenge": "fixture-challenge",
+                            "claimed_kind": "editor-extension",
+                            "claimed_version": "0.0.1",
+                            "workspace": "workspace-1",
+                            "scopes": ["thread.read"],
+                            "deadline_ms": 120_000,
+                        }
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            let mut prefix = [0; 4];
+            server.read_exact(&mut prefix).unwrap();
+            let mut bytes = vec![0; u32::from_be_bytes(prefix) as usize];
+            server.read_exact(&mut bytes).unwrap();
+            if expected == "approve" {
+                assert_eq!(
+                    bytes,
+                    br#"{"protocol":"muniment.attach/1","request_id":"00000000000000000000000000000073","ok":true,"body":{"challenge":"fixture-challenge","decision":"approve"}}"#
+                );
+            }
+            let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(response["request_id"], "00000000000000000000000000000073");
+            assert_eq!(response["body"]["challenge"], "fixture-challenge");
+            assert_eq!(response["body"]["decision"], expected);
+        });
+        let mut presenter = handshake_approval_presenter_stream(client, "0.0.1", SHORT).unwrap();
+        presenter
+            .present(|request| {
+                assert_eq!(request.challenge, "fixture-challenge");
+                assert_eq!(request.claimed_kind, "editor-extension");
+                assert_eq!(request.claimed_version, "0.0.1");
+                assert_eq!(request.workspace, "workspace-1");
+                assert_eq!(request.scopes, ["thread.read"]);
+                assert_eq!(request.deadline_ms, 120_000);
+                decision
+            })
+            .unwrap();
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn approval_presenter_resets_the_io_deadline_after_a_delayed_choice() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_approval_presenter_handshake(&mut server);
+        server
+            .write_all(&encode_frame(&approval_present_request()).unwrap())
+            .unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let answer = read_client_value(&mut server);
+        assert_eq!(answer["body"]["decision"], "approve");
+    });
+    let mut presenter = handshake_approval_presenter_stream(client, "0.0.1", SHORT).unwrap();
+    presenter
+        .present(|_| {
+            thread::sleep(SHORT + SHORT);
+            ApprovalDecision::Approve
+        })
+        .unwrap();
+    worker.join().unwrap();
+}
+
+#[test]
+fn approval_presenter_resets_the_io_deadline_after_a_slow_invalid_request() {
+    let io_timeout = Duration::from_millis(400);
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let mut filler = client.try_clone().unwrap();
+    let (handshake_done_tx, handshake_done_rx) = std::sync::mpsc::channel();
+    let (filled_bytes_tx, filled_bytes_rx) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        complete_approval_presenter_handshake(&mut server);
+        handshake_done_tx.send(()).unwrap();
+        let filled_bytes = filled_bytes_rx.recv().unwrap();
+        let mut request = approval_present_request();
+        request["body"]["deadline_ms"] = serde_json::json!(0);
+        let frame = encode_frame(&request).unwrap();
+        let split = frame.len() - 1;
+        server.write_all(&frame[..split]).unwrap();
+        thread::sleep(io_timeout / 2);
+        server.write_all(&frame[split..]).unwrap();
+        thread::sleep(io_timeout * 3 / 4);
+        server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut filled = vec![0; filled_bytes];
+        server.read_exact(&mut filled).unwrap();
+        let answer = read_client_value(&mut server);
+        assert_eq!(answer["error"]["code"], "unauthorized");
+    });
+    let mut presenter = handshake_approval_presenter_stream(client, "0.0.1", io_timeout).unwrap();
+    handshake_done_rx.recv().unwrap();
+    filler.set_nonblocking(true).unwrap();
+    let bytes = [0; 4096];
+    let mut filled_bytes = 0;
+    loop {
+        match filler.write(&bytes) {
+            Ok(written) => filled_bytes += written,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            result => {
+                result.unwrap();
+            }
+        }
+    }
+    filler.set_nonblocking(false).unwrap();
+    filled_bytes_tx.send(filled_bytes).unwrap();
+    assert_eq!(
+        presenter.present(|_| panic!("invalid request reached the caller")),
+        Err(ClientError::UnexpectedMessage)
+    );
+    worker.join().unwrap();
+}
+
+#[test]
+fn approval_presenter_times_out_while_reading_a_request() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_approval_presenter_handshake(&mut server);
+        thread::sleep(SHORT + SHORT);
+    });
+    let mut presenter = handshake_approval_presenter_stream(client, "0.0.1", SHORT).unwrap();
+    assert_eq!(
+        presenter.present(|_| ApprovalDecision::Deny),
+        Err(ClientError::Timeout)
+    );
+    worker.join().unwrap();
+}
+
+fn approval_present_request() -> serde_json::Value {
+    serde_json::json!({
+        "protocol": "muniment.attach/1",
+        "request_id": "00000000000000000000000000000073",
+        "operation": "approval.present",
+        "capability": "33".repeat(32),
+        "body": {
+            "challenge": "fixture-challenge",
+            "claimed_kind": "editor-extension",
+            "claimed_version": "0.0.1",
+            "workspace": "workspace-1",
+            "scopes": ["thread.read"],
+            "deadline_ms": 120_000,
+        }
+    })
+}
+
+#[test]
+fn approval_presenter_rejects_unauthorized_requests_without_asking_the_caller() {
+    let mut cases = vec![
+        serde_json::json!({"capability": "44".repeat(32)}),
+        serde_json::json!({"operation": "migration.control"}),
+        serde_json::json!({"body": {"deadline_ms": 0}}),
+        serde_json::json!({"body": {"deadline_ms": 120_001}}),
+    ];
+    for field in ["challenge", "claimed_kind", "claimed_version", "workspace"] {
+        for value in [
+            String::new(),
+            "bad\nvalue".into(),
+            "x".repeat(64 * 1024 + 1),
+        ] {
+            cases.push(serde_json::json!({"body": {field: value}}));
+        }
+    }
+    for scope in [
+        String::new(),
+        "bad\nvalue".into(),
+        "x".repeat(64 * 1024 + 1),
+    ] {
+        cases.push(serde_json::json!({"body": {"scopes": [scope]}}));
+    }
+    for change in cases {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            complete_approval_presenter_handshake(&mut server);
+            let mut request = serde_json::json!({
+                "protocol": "muniment.attach/1",
+                "request_id": "00000000000000000000000000000073",
+                "operation": "approval.present",
+                "capability": "33".repeat(32),
+                "body": {
+                    "challenge": "challenge",
+                    "claimed_kind": "cli",
+                    "claimed_version": "0.0.1",
+                    "workspace": "workspace",
+                    "scopes": ["thread.read"],
+                    "deadline_ms": 1,
+                }
+            });
+            for (key, value) in change.as_object().unwrap() {
+                if key == "body" {
+                    for (body_key, body_value) in value.as_object().unwrap() {
+                        request["body"][body_key] = body_value.clone();
+                    }
+                } else {
+                    request[key] = value.clone();
+                }
+            }
+            let bytes = serde_json::to_vec(&request).unwrap();
+            server
+                .write_all(&(bytes.len() as u32).to_be_bytes())
+                .unwrap();
+            server.write_all(&bytes).unwrap();
+            let answer = read_client_value(&mut server);
+            assert_eq!(answer["request_id"], request["request_id"]);
+            assert_eq!(answer["error"]["code"], "unauthorized");
+        });
+        let mut presenter = handshake_approval_presenter_stream(client, "0.0.1", SHORT).unwrap();
+        assert_eq!(
+            presenter.present(|_| panic!("invalid request reached the caller")),
+            Err(ClientError::UnexpectedMessage)
+        );
+        worker.join().unwrap();
+    }
+}
 
 #[test]
 fn migration_handshake_accepts_only_a_credential_free_grant() {
