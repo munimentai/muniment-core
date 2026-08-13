@@ -66,9 +66,7 @@ pub struct RunStartLaunch {
     pub prepared: (u64, ChatProjector),
 }
 
-pub trait RunStartBoundaries {
-    fn mark_active_run(&self) -> RuntimeActivityGuard;
-
+pub trait RunAttachBoundaries {
     #[cfg(target_os = "linux")]
     fn list_threads(
         &self,
@@ -109,6 +107,11 @@ pub trait RunStartBoundaries {
         gate_id: &str,
         answer: ChatPermissionAnswer,
     ) -> Result<std::sync::mpsc::Receiver<Option<u64>>, RunStartError>;
+}
+
+pub trait RunStartBoundaries {
+    fn mark_active_run(&self) -> RuntimeActivityGuard;
+
     fn active_run_exists(&self) -> bool;
     fn fresh_tokens(&self) -> Result<TokenSet, RunStartError>;
     fn configure_run(
@@ -370,11 +373,7 @@ mod tests {
         }
     }
 
-    impl RunStartBoundaries for FakeRunStartBoundaries {
-        fn mark_active_run(&self) -> RuntimeActivityGuard {
-            self.runtime_activity.mark_active_run()
-        }
-
+    impl RunAttachBoundaries for FakeRunStartBoundaries {
         #[cfg(target_os = "linux")]
         fn list_threads(
             &self,
@@ -420,6 +419,12 @@ mod tests {
             _answer: ChatPermissionAnswer,
         ) -> Result<std::sync::mpsc::Receiver<Option<u64>>, RunStartError> {
             unreachable!()
+        }
+    }
+
+    impl RunStartBoundaries for FakeRunStartBoundaries {
+        fn mark_active_run(&self) -> RuntimeActivityGuard {
+            self.runtime_activity.mark_active_run()
         }
 
         fn active_run_exists(&self) -> bool {

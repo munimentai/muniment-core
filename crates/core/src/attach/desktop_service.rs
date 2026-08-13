@@ -17,7 +17,9 @@ use super::{
 };
 use crate::journal::{JournalCommitHint, Provenance};
 use crate::permission_gate::ChatPermissionAnswer;
-use crate::run_start::{prepare_desktop_run, RunStartBoundaries, RunStartRequest};
+use crate::run_start::{
+    prepare_desktop_run, RunAttachBoundaries, RunStartBoundaries, RunStartRequest,
+};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -76,7 +78,7 @@ pub struct DesktopAttachService<B, I = IdempotencyStore> {
 }
 
 #[cfg(target_os = "linux")]
-impl<B: RunStartBoundaries, I: RunStartIdempotency> ThreadListService
+impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> ThreadListService
     for DesktopAttachService<B, I>
 {
     fn bind_authorized_client(&mut self, client_identity: &str) {
@@ -574,7 +576,9 @@ mod tests {
     use serde_json::json;
     use serde_json::Value;
 
-    use crate::run_start::{ActiveRun, RunStartBoundaries, RunStartError, RunStartLaunch};
+    use crate::run_start::{
+        ActiveRun, RunAttachBoundaries, RunStartBoundaries, RunStartError, RunStartLaunch,
+    };
 
     use crate::pi_execution::attachment_error;
     use uuid::Uuid;
@@ -689,11 +693,7 @@ mod tests {
         }
     }
 
-    impl RunStartBoundaries for FakeRunStartBoundaries {
-        fn mark_active_run(&self) -> RuntimeActivityGuard {
-            self.runtime_activity.mark_active_run()
-        }
-
+    impl RunAttachBoundaries for FakeRunStartBoundaries {
         #[cfg(target_os = "linux")]
         fn list_threads(
             &self,
@@ -839,6 +839,12 @@ mod tests {
                 .send((!self.permission_competing_answer).then_some(seq))
                 .unwrap();
             Ok(resolved_receiver)
+        }
+    }
+
+    impl RunStartBoundaries for FakeRunStartBoundaries {
+        fn mark_active_run(&self) -> RuntimeActivityGuard {
+            self.runtime_activity.mark_active_run()
         }
 
         fn active_run_exists(&self) -> bool {
