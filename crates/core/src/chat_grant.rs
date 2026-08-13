@@ -59,6 +59,10 @@ pub fn validate_grant(grant: &ChatGrant) -> Result<(), FetchGrantError> {
     Ok(())
 }
 
+pub fn grant_authorizes_workspace(grant: &ChatGrant, requested_workspace: Option<&str>) -> bool {
+    requested_workspace.is_none_or(|workspace| workspace == grant.workspace)
+}
+
 pub fn fetch_receipt(
     endpoint_url: &str,
     access_token: &str,
@@ -105,6 +109,14 @@ mod tests {
     #[test]
     fn accepts_valid_grant() {
         assert_eq!(validate_grant(&valid_grant()), Ok(()));
+    }
+
+    #[test]
+    fn grant_workspace_authorizes_only_matching_and_missing_requests() {
+        let grant = valid_grant();
+        assert!(grant_authorizes_workspace(&grant, Some("/work")));
+        assert!(!grant_authorizes_workspace(&grant, Some("/other")));
+        assert!(grant_authorizes_workspace(&grant, None));
     }
 
     #[test]
