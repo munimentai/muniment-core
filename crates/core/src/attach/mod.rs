@@ -18,7 +18,7 @@ pub mod linux;
 #[cfg(target_os = "linux")]
 mod listener_lifecycle;
 #[cfg(target_os = "linux")]
-mod migration_authority;
+mod peer_authority;
 mod quiesce;
 mod runtime_activity;
 mod workspace_context;
@@ -42,9 +42,9 @@ pub use handoff_probe::*;
 pub use idempotency::*;
 #[cfg(target_os = "linux")]
 pub use listener_lifecycle::*;
-#[cfg(target_os = "linux")]
-pub use migration_authority::*;
 pub use muniment_attach::*;
+#[cfg(target_os = "linux")]
+pub use peer_authority::*;
 pub use quiesce::*;
 pub use runtime_activity::*;
 pub use workspace_context::*;
