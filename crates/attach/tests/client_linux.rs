@@ -1,12 +1,12 @@
 #![cfg(all(target_os = "linux", feature = "client"))]
 
 use muniment_attach::{
-    authorized, encode_frame, handshake_approval_presenter_stream,
+    authorized, connect_approval_presenter_at, encode_frame, handshake_approval_presenter_stream,
     handshake_migration_control_stream, handshake_stream, handshake_stream_with_credential,
-    reconnect_welcome, welcome, ApprovalDecision, ClientError, ErrorAction, ErrorEnvelope, Event,
-    EventName, Failure, Id, MigrationControlFailure, MigrationControlOutcome, PermissionDecision,
-    PermissionKind, Protocol, ProtocolError, Response, RunStreamMessage, Success, VersionRange,
-    MAX_FRAME_LENGTH,
+    reconnect_welcome, welcome, ApprovalDecision, ApprovalPresenterServeOutcome, ClientError,
+    ErrorAction, ErrorEnvelope, Event, EventName, Failure, Id, MigrationControlFailure,
+    MigrationControlOutcome, PermissionDecision, PermissionKind, Protocol, ProtocolError, Response,
+    RunStreamMessage, Success, VersionRange, MAX_FRAME_LENGTH,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -222,6 +222,50 @@ fn approval_presenter_times_out_while_reading_a_request() {
         Err(ClientError::Timeout)
     );
     worker.join().unwrap();
+}
+
+#[test]
+fn approval_presenter_connects_and_serves_until_the_peer_closes() {
+    let path = socket_path();
+    let listener = UnixListener::bind(&path).unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        complete_approval_presenter_handshake(&mut stream);
+        for (request_id, challenge, decision) in [
+            ("00000000000000000000000000000073", "first", "approve"),
+            ("00000000000000000000000000000074", "second", "deny"),
+        ] {
+            let mut request = approval_present_request();
+            request["request_id"] = serde_json::json!(request_id);
+            request["body"]["challenge"] = serde_json::json!(challenge);
+            stream.write_all(&encode_frame(&request).unwrap()).unwrap();
+            let response = read_client_value(&mut stream);
+            assert_eq!(response["request_id"], request_id);
+            assert_eq!(response["body"]["challenge"], challenge);
+            assert_eq!(response["body"]["decision"], decision);
+        }
+    });
+
+    let mut presenter = connect_approval_presenter_at(&path, "0.0.1", SHORT).unwrap();
+    let outcome = presenter
+        .serve(|request| match request.challenge.as_str() {
+            "first" => ApprovalDecision::Approve,
+            "second" => ApprovalDecision::Deny,
+            _ => panic!("unexpected challenge"),
+        })
+        .unwrap();
+    assert_eq!(outcome, ApprovalPresenterServeOutcome::ConnectionClosed);
+    server.join().unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn approval_presenter_maps_an_unreachable_endpoint() {
+    let path = socket_path();
+    assert_eq!(
+        connect_approval_presenter_at(&path, "0.0.1", SHORT).unwrap_err(),
+        ClientError::DesktopUnavailable
+    );
 }
 
 fn approval_present_request() -> serde_json::Value {

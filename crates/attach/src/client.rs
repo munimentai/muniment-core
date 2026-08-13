@@ -72,6 +72,11 @@ pub struct ApprovalPresentRequest {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalPresenterServeOutcome {
+    ConnectionClosed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MigrationControlFailure {
     InvalidNonce,
     InvalidDeadline,
@@ -356,11 +361,11 @@ impl fmt::Debug for ThreadListPage {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::{
-        ApprovalDecision, ApprovalPresentRequest, AuthorizationSummary, ClientError,
-        MigrationControlFailure, MigrationControlOutcome, PendingPermission,
-        PermissionAnswerAccepted, PermissionDecision, RedactedRunEvent, RunCancelAccepted,
-        RunStartAccepted, RunStreamMessage, RunStreamSubscription, ThreadCreateAccepted,
-        ThreadListPage, ThreadOpenPage,
+        ApprovalDecision, ApprovalPresentRequest, ApprovalPresenterServeOutcome,
+        AuthorizationSummary, ClientError, MigrationControlFailure, MigrationControlOutcome,
+        PendingPermission, PermissionAnswerAccepted, PermissionDecision, RedactedRunEvent,
+        RunCancelAccepted, RunStartAccepted, RunStreamMessage, RunStreamSubscription,
+        ThreadCreateAccepted, ThreadListPage, ThreadOpenPage,
     };
     use crate::{
         decode_frame, encode_frame, Authorization, Authorized, Client, Envelope, ErrorCode,
@@ -376,7 +381,7 @@ mod linux {
     use std::io::{self, Read, Write};
     use std::os::unix::io::AsRawFd;
     use std::os::unix::net::UnixStream;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[repr(C)]
@@ -1387,6 +1392,14 @@ mod linux {
                 return Err(ClientError::UnexpectedMessage);
             };
 
+            self.answer_present_request(request, choose)
+        }
+
+        fn answer_present_request(
+            &mut self,
+            request: Request,
+            choose: impl FnOnce(&ApprovalPresentRequest) -> ApprovalDecision,
+        ) -> Result<(), ClientError> {
             #[derive(serde::Deserialize)]
             #[serde(deny_unknown_fields)]
             struct Body {
@@ -1449,6 +1462,45 @@ mod linux {
             };
             let bytes = encode_frame(&response).map_err(map_frame_error)?;
             write_all_before(&mut self.stream, &bytes, deadline(self.io_timeout))
+        }
+
+        pub fn serve(
+            &mut self,
+            mut choose: impl FnMut(&ApprovalPresentRequest) -> ApprovalDecision,
+        ) -> Result<ApprovalPresenterServeOutcome, ClientError> {
+            loop {
+                self.stream
+                    .set_read_timeout(None)
+                    .map_err(|_| ClientError::DesktopUnavailable)?;
+                let mut first = [0u8; 1];
+                match self.stream.read(&mut first).map_err(map_io_error)? {
+                    0 => return Ok(ApprovalPresenterServeOutcome::ConnectionClosed),
+                    1 => {}
+                    _ => unreachable!("a one-byte read returned more than one byte"),
+                }
+
+                let request_deadline = deadline(self.io_timeout);
+                let mut prefix = [0u8; 4];
+                prefix[0] = first[0];
+                read_exact_before(&mut self.stream, &mut prefix[1..], request_deadline)?;
+                let value =
+                    read_approval_value_with_prefix(&mut self.stream, prefix, request_deadline)?;
+                self.present_value(value, &mut choose)?;
+            }
+        }
+
+        fn present_value(
+            &mut self,
+            value: Value,
+            choose: &mut impl FnMut(&ApprovalPresentRequest) -> ApprovalDecision,
+        ) -> Result<(), ClientError> {
+            let envelope: Envelope =
+                serde_json::from_value(value).map_err(|_| ClientError::UnexpectedMessage)?;
+            let Envelope::Request(request) = envelope else {
+                return Err(ClientError::UnexpectedMessage);
+            };
+
+            self.answer_present_request(request, |approval| choose(approval))
         }
 
         pub fn into_stream(self) -> UnixStream {
@@ -1656,6 +1708,23 @@ mod linux {
             APPROVAL_TIMEOUT,
             pairing_pending,
         )
+    }
+
+    pub fn connect_approval_presenter(
+        client_version: &str,
+    ) -> Result<ApprovalPresenterClient, ClientError> {
+        let endpoint = endpoint_from_environment()?;
+        connect_approval_presenter_at(&endpoint, client_version, IO_TIMEOUT)
+    }
+
+    #[doc(hidden)]
+    pub fn connect_approval_presenter_at(
+        endpoint: &Path,
+        client_version: &str,
+        io_timeout: Duration,
+    ) -> Result<ApprovalPresenterClient, ClientError> {
+        let stream = UnixStream::connect(endpoint).map_err(|_| ClientError::DesktopUnavailable)?;
+        handshake_approval_presenter_stream(stream, client_version, io_timeout)
     }
 
     fn endpoint_from_environment() -> Result<PathBuf, ClientError> {
@@ -2040,6 +2109,14 @@ mod linux {
     ) -> Result<Value, ClientError> {
         let mut prefix = [0u8; 4];
         read_exact_before(stream, &mut prefix, deadline)?;
+        read_approval_value_with_prefix(stream, prefix, deadline)
+    }
+
+    fn read_approval_value_with_prefix(
+        stream: &mut UnixStream,
+        prefix: [u8; 4],
+        deadline: Instant,
+    ) -> Result<Value, ClientError> {
         let length = u32::from_be_bytes(prefix) as usize;
         if length > MAX_FRAME_LENGTH {
             return Err(ClientError::PayloadTooLarge);
@@ -2093,9 +2170,9 @@ mod linux {
 
 #[cfg(target_os = "linux")]
 pub use linux::{
-    handshake_approval_presenter_stream, handshake_migration_control_stream, handshake_stream,
-    handshake_stream_with_credential, ApprovalPresenterClient, AuthorizedClient,
-    MigrationControlClient,
+    connect_approval_presenter, connect_approval_presenter_at, handshake_approval_presenter_stream,
+    handshake_migration_control_stream, handshake_stream, handshake_stream_with_credential,
+    ApprovalPresenterClient, AuthorizedClient, MigrationControlClient,
 };
 
 #[cfg(not(target_os = "linux"))]
