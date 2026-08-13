@@ -15,7 +15,7 @@ use super::{
     Protocol, ProtocolError, Request as AttachRequest, WorkspaceContextMap,
     WorkspaceOnboardRequest, WorkspaceOnboarded,
 };
-use crate::journal::{JournalCommitHint, Provenance};
+use crate::journal::Provenance;
 use crate::permission_gate::ChatPermissionAnswer;
 use crate::run_start::{
     prepare_desktop_run, RunAttachBoundaries, RunStartBoundaries, RunStartRequest,
@@ -408,8 +408,8 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
             &canonical_input,
             || Ok(()),
             || {
-                let (high_water, commits) =
-                    self.boundaries.subscribe_run_commits(&request.run_id)?;
+                let commits = self.boundaries.subscribe_run_commits(&request.run_id)?;
+                let high_water = commits.committed_high_water;
                 if high_water == 0 {
                     return Err(ProtocolError::invalid_request());
                 }
@@ -545,7 +545,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
     fn subscribe_run_commits(
         &mut self,
         run_id: &str,
-    ) -> Result<Option<(u64, std::sync::mpsc::Receiver<JournalCommitHint>)>, ProtocolError> {
+    ) -> Result<Option<crate::journal::CommitSubscription>, ProtocolError> {
         self.boundaries.subscribe_run_commits(run_id).map(Some)
     }
 }
@@ -755,7 +755,7 @@ mod tests {
         fn subscribe_run_commits(
             &self,
             run_id: &str,
-        ) -> Result<(u64, std::sync::mpsc::Receiver<JournalCommitHint>), ProtocolError> {
+        ) -> Result<crate::journal::CommitSubscription, ProtocolError> {
             let high_water = self
                 .journal
                 .lock()
@@ -767,7 +767,9 @@ mod tests {
                 .map_or(0, |event| event.run_seq);
             let (sender, receiver) = std::sync::mpsc::sync_channel(4);
             *self.permission_commit_sender.lock().unwrap() = Some(sender);
-            Ok((high_water, receiver))
+            Ok(crate::journal::CommitSubscription::detached(
+                high_water, receiver,
+            ))
         }
 
         #[cfg(target_os = "linux")]

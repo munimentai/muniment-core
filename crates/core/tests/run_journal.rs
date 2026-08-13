@@ -239,7 +239,8 @@ fn commit_subscription_registration_cannot_miss_a_racing_commit() {
     });
 
     barrier.wait();
-    let (high_water, receiver) = subscriber.subscribe_commits(RUN).unwrap();
+    let receiver = subscriber.subscribe_commits(RUN).unwrap();
+    let high_water = receiver.committed_high_water;
     handle.join().unwrap();
 
     if high_water == 0 {
@@ -254,7 +255,7 @@ fn commit_subscription_registration_cannot_miss_a_racing_commit() {
 fn batch_commit_publishes_only_its_final_high_water() {
     let db = TestDb::new();
     let mut journal = RunJournal::open(&db).unwrap();
-    let (_, receiver) = journal.subscribe_commits(RUN).unwrap();
+    let receiver = journal.subscribe_commits(RUN).unwrap();
 
     let batch = [event(1), event(2), event(3)];
     journal.append_batch(0, &batch).unwrap();
@@ -273,7 +274,8 @@ fn commit_hints_cross_file_backed_journal_handles() {
     let db = TestDb::new();
     let mut subscriber = RunJournal::open(&db).unwrap();
     let mut writer = RunJournal::open(&db).unwrap();
-    let (high_water, receiver) = subscriber.subscribe_commits(RUN).unwrap();
+    let receiver = subscriber.subscribe_commits(RUN).unwrap();
+    let high_water = receiver.committed_high_water;
     assert_eq!(high_water, 0);
 
     writer.append_new_run("workspace-a", &event(1)).unwrap();
@@ -284,8 +286,8 @@ fn commit_hints_cross_file_backed_journal_handles() {
 fn full_and_dropped_commit_subscribers_do_not_affect_appends() {
     let db = TestDb::new();
     let mut journal = RunJournal::open(&db).unwrap();
-    let (_, slow) = journal.subscribe_commits(RUN).unwrap();
-    let (_, dropped) = journal.subscribe_commits(RUN).unwrap();
+    let slow = journal.subscribe_commits(RUN).unwrap();
+    let dropped = journal.subscribe_commits(RUN).unwrap();
     drop(dropped);
 
     for seq in 1..=65 {

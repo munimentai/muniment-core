@@ -12,7 +12,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::TryRecvError;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,9 +28,7 @@ use super::{
     MAX_RUN_STREAM_WINDOW_TEXT_BYTES,
 };
 use crate::browser_control::LinuxProcReader;
-use crate::journal::{
-    thread_summaries::ThreadSummaryListError, JournalCommitHint, RunEventPageError, RunJournal,
-};
+use crate::journal::{thread_summaries::ThreadSummaryListError, RunEventPageError, RunJournal};
 
 const ATTACH_DIRECTORY: &[u8] = b"muniment\0";
 const ENDPOINT_NAME: &str = "attach-v1.sock";
@@ -963,7 +961,7 @@ pub trait ThreadListService {
     fn subscribe_run_commits(
         &mut self,
         _run_id: &str,
-    ) -> Result<Option<(u64, Receiver<JournalCommitHint>)>, ProtocolError> {
+    ) -> Result<Option<crate::journal::CommitSubscription>, ProtocolError> {
         Ok(None)
     }
 }
@@ -985,7 +983,7 @@ impl ThreadListService for RunJournal {
     fn subscribe_run_commits(
         &mut self,
         run_id: &str,
-    ) -> Result<Option<(u64, Receiver<JournalCommitHint>)>, ProtocolError> {
+    ) -> Result<Option<crate::journal::CommitSubscription>, ProtocolError> {
         if self.path.is_none() {
             return Ok(None);
         }
@@ -2184,7 +2182,7 @@ struct ActiveRunStream {
     fetched_through_run_seq: u64,
     exhausted: bool,
     caught_up: bool,
-    commit_hints: Option<Receiver<JournalCommitHint>>,
+    commit_hints: Option<crate::journal::CommitSubscription>,
 }
 
 fn poll_run_streams<S: ThreadListService>(
@@ -2724,8 +2722,8 @@ fn dispatch_request<S: ThreadListService>(
             super::Id::new(body.run_id.clone()).map_err(|_| ProtocolError::invalid_request())?;
         let subscription = service.subscribe_run_commits(run_id.as_str())?;
         let page = service.stream_run(workspace, run_id.as_str(), body.after_run_seq)?;
-        if let Some((high_water, _)) = subscription.as_ref() {
-            if page.current_run_seq < *high_water {
+        if let Some(subscription) = subscription.as_ref() {
+            if page.current_run_seq < subscription.committed_high_water {
                 return Err(ProtocolError::persistence_failed().into());
             }
         }
@@ -2770,7 +2768,7 @@ fn dispatch_request<S: ThreadListService>(
             fetched_through_run_seq: body.after_run_seq,
             exhausted: false,
             caught_up: false,
-            commit_hints: subscription.map(|(_, receiver)| receiver),
+            commit_hints: subscription,
         };
         append_run_stream_page(&mut active, page)?;
         let events = drain_run_stream(&mut active)?;

@@ -15,7 +15,7 @@ use crate::auth::TokenSet;
 use crate::chat_grant::ChatGrant;
 use crate::chat_view::{ChatAttachment, SelectedFile};
 use crate::journal::reducer::ChatProjector;
-use crate::journal::{JournalCommitHint, Provenance};
+use crate::journal::Provenance;
 use crate::permission_gate::{ChatPermissionAnswer, PendingPermissionAnswer};
 use crate::sidecar::pi_chat::PiRunAdapter;
 use crate::sidecar::PiRpcTransport;
@@ -98,7 +98,7 @@ pub trait RunAttachBoundaries {
     fn subscribe_run_commits(
         &self,
         run_id: &str,
-    ) -> Result<(u64, std::sync::mpsc::Receiver<JournalCommitHint>), ProtocolError>;
+    ) -> Result<crate::journal::CommitSubscription, ProtocolError>;
     #[cfg(target_os = "linux")]
     fn queue_attach_permission_answer(
         &self,
@@ -406,7 +406,7 @@ mod tests {
         fn subscribe_run_commits(
             &self,
             _run_id: &str,
-        ) -> Result<(u64, std::sync::mpsc::Receiver<JournalCommitHint>), ProtocolError> {
+        ) -> Result<crate::journal::CommitSubscription, ProtocolError> {
             unreachable!()
         }
 

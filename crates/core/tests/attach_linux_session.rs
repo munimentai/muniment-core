@@ -22,7 +22,7 @@ use muniment_core::attach::{
 };
 use muniment_core::browser_control::{LinuxProcReader, ProcReadError};
 use muniment_core::journal::{
-    EventEnvelope, EventPayload, JournalCommitHint, Provenance, RunEventProjection, RunJournal,
+    EventEnvelope, EventPayload, Provenance, RunEventProjection, RunJournal,
 };
 use serde_json::json;
 use std::cell::Cell;
@@ -32,7 +32,6 @@ use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::mpsc::Receiver;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -418,8 +417,10 @@ impl ThreadListService for CountingJournalService {
     fn subscribe_run_commits(
         &mut self,
         run_id: &str,
-    ) -> Result<Option<(u64, Receiver<JournalCommitHint>)>, muniment_core::attach::ProtocolError>
-    {
+    ) -> Result<
+        Option<muniment_core::journal::CommitSubscription>,
+        muniment_core::attach::ProtocolError,
+    > {
         self.journal
             .subscribe_commits(run_id)
             .map(Some)
@@ -465,8 +466,10 @@ impl ThreadListService for SubscribeRaceService {
     fn subscribe_run_commits(
         &mut self,
         run_id: &str,
-    ) -> Result<Option<(u64, Receiver<JournalCommitHint>)>, muniment_core::attach::ProtocolError>
-    {
+    ) -> Result<
+        Option<muniment_core::journal::CommitSubscription>,
+        muniment_core::attach::ProtocolError,
+    > {
         let subscription = self
             .journal
             .subscribe_commits(run_id)

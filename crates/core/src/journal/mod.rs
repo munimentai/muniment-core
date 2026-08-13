@@ -50,7 +50,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{
+    self, Receiver, RecvError, RecvTimeoutError, SyncSender, TryRecvError, TrySendError,
+};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 use uuid::{Uuid, Version};
@@ -357,8 +359,64 @@ pub(crate) struct JournalCoordination {
 }
 
 struct CommitSubscriber {
+    id: Uuid,
     run_id: String,
     sender: SyncSender<JournalCommitHint>,
+}
+
+/// A commit-hint receiver that unregisters itself when dropped.
+pub struct CommitSubscription {
+    pub committed_high_water: u64,
+    receiver: Receiver<JournalCommitHint>,
+    registration: Option<(Weak<JournalCoordination>, Uuid)>,
+}
+
+impl fmt::Debug for CommitSubscription {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CommitSubscription")
+            .field("committed_high_water", &self.committed_high_water)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CommitSubscription {
+    #[doc(hidden)]
+    pub fn detached(committed_high_water: u64, receiver: Receiver<JournalCommitHint>) -> Self {
+        Self {
+            committed_high_water,
+            receiver,
+            registration: None,
+        }
+    }
+
+    pub fn recv(&self) -> Result<JournalCommitHint, RecvError> {
+        self.receiver.recv()
+    }
+
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<JournalCommitHint, RecvTimeoutError> {
+        self.receiver.recv_timeout(timeout)
+    }
+
+    pub fn try_recv(&self) -> Result<JournalCommitHint, TryRecvError> {
+        self.receiver.try_recv()
+    }
+}
+
+impl Drop for CommitSubscription {
+    fn drop(&mut self) {
+        let Some((coordination, id)) = self.registration.take() else {
+            return;
+        };
+        let Some(coordination) = coordination.upgrade() else {
+            return;
+        };
+        coordination
+            .subscribers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|subscriber| subscriber.id != id);
+    }
 }
 
 fn coordination_for(path: &Path) -> Arc<JournalCoordination> {
@@ -433,11 +491,8 @@ impl RunJournal {
     /// Registers a bounded commit-hint receiver and returns the run's committed
     /// high-water sequence at the same coordination boundary. Hints may be
     /// dropped under backpressure; consumers recover by reading SQLite after
-    /// `high_water`.
-    pub fn subscribe_commits(
-        &mut self,
-        run_id: &str,
-    ) -> Result<(u64, Receiver<JournalCommitHint>), JournalError> {
+    /// `committed_high_water`.
+    pub fn subscribe_commits(&mut self, run_id: &str) -> Result<CommitSubscription, JournalError> {
         let coordination = self.coordination.clone().ok_or_else(|| {
             JournalError::InvalidEnvelope(
                 "commit subscriptions require a file-backed journal".into(),
@@ -455,15 +510,21 @@ impl RunJournal {
                 |row| row.get(0),
             )?;
         let (sender, receiver) = mpsc::sync_channel(COMMIT_HINT_CAPACITY);
+        let id = Uuid::new_v4();
         coordination
             .subscribers
             .lock()
             .unwrap()
             .push(CommitSubscriber {
+                id,
                 run_id: run_id.to_owned(),
                 sender,
             });
-        Ok((high_water, receiver))
+        Ok(CommitSubscription {
+            committed_high_water: high_water,
+            receiver,
+            registration: Some((Arc::downgrade(&coordination), id)),
+        })
     }
 
     /// Reads retained events after a committed sequence from a single bounded snapshot.
@@ -3336,4 +3397,47 @@ fn update_thread_projection(
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn dropped_commit_subscriptions_unregister_without_affecting_live_subscribers() {
+        let path = std::env::temp_dir().join(format!(
+            "muniment-commit-subscriptions-{}-{}.sqlite3",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let mut journal = RunJournal::open(&path).unwrap();
+        let coordination = journal.coordination.as_ref().unwrap().clone();
+        let earlier_len = coordination.subscribers.lock().unwrap().len();
+        let live = journal.subscribe_commits("live-run").unwrap();
+
+        for index in 0..100 {
+            let dropped = journal
+                .subscribe_commits(&format!("dropped-run-{index}"))
+                .unwrap();
+            drop(dropped);
+        }
+
+        assert_eq!(
+            coordination.subscribers.lock().unwrap().len(),
+            earlier_len + 1
+        );
+        publish_commit_hint(Some(&coordination), "live-run", 7);
+        assert_eq!(
+            live.recv_timeout(Duration::from_secs(1)).unwrap(),
+            JournalCommitHint {
+                run_id: "live-run".into(),
+                run_seq: 7,
+            }
+        );
+        drop(live);
+        assert_eq!(coordination.subscribers.lock().unwrap().len(), earlier_len);
+        drop(journal);
+        let _ = fs::remove_file(path);
+    }
 }
