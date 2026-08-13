@@ -24,6 +24,10 @@ impl ApprovalPresenterConnection {
         }
     }
 
+    pub(crate) fn try_clone_stream(&self) -> io::Result<UnixStream> {
+        self.stream.try_clone()
+    }
+
     pub fn present(&mut self, request: &ApprovalRequest, remaining: Duration) -> bool {
         let Some(deadline) = Instant::now().checked_add(remaining) else {
             return false;

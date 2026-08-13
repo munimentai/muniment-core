@@ -23,6 +23,8 @@ mod listener_lifecycle;
 mod peer_authority;
 #[cfg(target_os = "linux")]
 mod presenter_admission;
+#[cfg(unix)]
+mod presenter_session;
 mod quiesce;
 mod runtime_activity;
 mod workspace_context;
@@ -53,6 +55,8 @@ pub use muniment_attach::*;
 pub use peer_authority::*;
 #[cfg(target_os = "linux")]
 pub use presenter_admission::*;
+#[cfg(unix)]
+pub use presenter_session::*;
 pub use quiesce::*;
 pub use runtime_activity::*;
 pub use workspace_context::*;
