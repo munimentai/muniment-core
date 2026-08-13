@@ -108,4 +108,9 @@ impl CompanionRegistry {
     pub fn live_connections(&self) -> LiveConnectionRegistry {
         self.live_connections.clone()
     }
+
+    /// Returns the shared companion credential map.
+    pub fn credentials(&self) -> Arc<Mutex<HashMap<String, ClientCredential>>> {
+        Arc::clone(&self.credentials)
+    }
 }
