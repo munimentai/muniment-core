@@ -1,4 +1,6 @@
+use std::io;
 use std::net::Shutdown;
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::Mutex;
 use std::thread;
@@ -10,6 +12,28 @@ use super::{ApprovalCoordinator, ApprovalPresenterConnection, PresenterGuard, CH
 pub struct ApprovalPresenterSession {
     presenter: Option<PresenterGuard>,
     shutdown: UnixStream,
+}
+
+impl ApprovalPresenterSession {
+    /// Waits until the peer closes the presenter connection.
+    pub fn wait_until_closed(&self) {
+        let mut descriptor = libc::pollfd {
+            fd: self.shutdown.as_raw_fd(),
+            events: 0,
+            revents: 0,
+        };
+        loop {
+            let result = unsafe { libc::poll(&mut descriptor, 1, -1) };
+            if result > 0
+                && descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+            {
+                return;
+            }
+            if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return;
+            }
+        }
+    }
 }
 
 /// Claims the coordinator and serves its approval requests over the connection.

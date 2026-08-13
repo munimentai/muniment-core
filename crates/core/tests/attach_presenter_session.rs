@@ -100,6 +100,57 @@ fn rejects_a_second_session_and_allows_one_after_release() {
 }
 
 #[test]
+fn wait_returns_after_the_peer_closes_and_releases_the_coordinator() {
+    let coordinator = ApprovalCoordinator::default();
+    let (runtime, desktop) = UnixStream::pair().unwrap();
+    let session = serve_approval_presenter(
+        coordinator.clone(),
+        ApprovalPresenterConnection::new(runtime, "first"),
+    )
+    .unwrap();
+    let waiter = thread::spawn(move || session.wait_until_closed());
+
+    drop(desktop);
+    waiter.join().unwrap();
+
+    let (next, _next_peer) = UnixStream::pair().unwrap();
+    assert!(
+        serve_approval_presenter(coordinator, ApprovalPresenterConnection::new(next, "next"),)
+            .is_some()
+    );
+}
+
+#[test]
+fn wait_stays_blocked_while_a_presentation_completes() {
+    let coordinator = ApprovalCoordinator::default();
+    let (runtime, mut desktop) = UnixStream::pair().unwrap();
+    let session = serve_approval_presenter(
+        coordinator.clone(),
+        ApprovalPresenterConnection::new(runtime, "presenter-capability"),
+    )
+    .unwrap();
+    let (closed_sender, closed) = mpsc::channel();
+    let waiter = thread::spawn(move || {
+        session.wait_until_closed();
+        closed_sender.send(()).unwrap();
+    });
+
+    assert!(closed.recv_timeout(Duration::from_millis(50)).is_err());
+    let presenter = thread::spawn(move || {
+        let request = read_request(&mut desktop);
+        answer(&mut desktop, &request, "approve");
+        desktop
+    });
+    assert!(coordinator.request(approval_request("approve"), Duration::from_secs(1)));
+    let desktop = presenter.join().unwrap();
+    assert!(closed.recv_timeout(Duration::from_millis(50)).is_err());
+
+    drop(desktop);
+    closed.recv_timeout(Duration::from_secs(1)).unwrap();
+    waiter.join().unwrap();
+}
+
+#[test]
 fn a_closed_connection_denies_without_waiting_for_the_request_deadline() {
     let coordinator = ApprovalCoordinator::default();
     let (runtime, desktop) = UnixStream::pair().unwrap();
