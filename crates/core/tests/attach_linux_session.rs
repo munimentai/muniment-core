@@ -4980,7 +4980,7 @@ fn permission_answer_service_failure_is_redacted() {
 }
 
 #[test]
-fn operations_outside_run_start_remain_unsupported_without_dispatch() {
+fn unserved_operations_remain_unsupported_without_dispatch() {
     let (mut client, server) = UnixStream::pair().unwrap();
     client.write_all(&hello(1, 1)).unwrap();
     client
@@ -4991,6 +4991,20 @@ fn operations_outside_run_start_remain_unsupported_without_dispatch() {
             80,
             Operation::RunSteer,
             json!({"text": "private steer"}),
+        ))
+        .unwrap();
+    client
+        .write_all(&request_with_idempotency(
+            191,
+            Operation::ThreadRename,
+            json!({"thread_id": "thread-1", "title": "Renamed thread"}),
+        ))
+        .unwrap();
+    client
+        .write_all(&request_with_idempotency(
+            192,
+            Operation::ThreadDelete,
+            json!({"thread_id": "thread-1"}),
         ))
         .unwrap();
     client.shutdown(Shutdown::Write).unwrap();
@@ -5007,7 +5021,7 @@ fn operations_outside_run_start_remain_unsupported_without_dispatch() {
         ),
         Ok(())
     );
-    for id in [79, 80] {
+    for id in [79, 80, 191, 192] {
         let error: ErrorEnvelope = read_frame(&mut client);
         assert_eq!(
             error.request_id,

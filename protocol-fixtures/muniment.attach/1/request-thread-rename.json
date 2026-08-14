@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"00000000000000000000000000000074","operation":"thread.rename","capability":"fixture-capability","idempotency_key":"000000000000000000000000000000d8","body":{"thread_id":"thread-1","title":"Renamed thread"}}

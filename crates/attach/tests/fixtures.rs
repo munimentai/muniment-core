@@ -7,7 +7,7 @@ use std::{
 use std::sync::{atomic::AtomicBool, Arc};
 
 use muniment_attach::fixtures::{export, open_generation, Mode, FIXTURE_DIRECTORY};
-use muniment_attach::{Hello, MigrationControlAuthorized};
+use muniment_attach::{Hello, MigrationControlAuthorized, Operation, Request};
 
 static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
@@ -71,6 +71,23 @@ fn export_includes_desktop_client_admission_fixtures() {
     assert!(!grant.profile_id.is_empty());
     assert_eq!(grant.capability.len(), 64);
     assert_eq!(grant.workspace_scopes.len(), 1);
+}
+
+#[test]
+fn export_includes_thread_mutation_requests() {
+    let root = TestDirectory::new();
+    export(&root.0, Mode::Write).unwrap();
+    let directory = fixture_dir(&root.0);
+
+    for (name, operation) in [
+        ("request-thread-rename.json", Operation::ThreadRename),
+        ("request-thread-delete.json", Operation::ThreadDelete),
+    ] {
+        let request: Request =
+            serde_json::from_slice(&fs::read(directory.join(name)).unwrap()).unwrap();
+        assert_eq!(request.operation, operation);
+        assert!(request.idempotency_key.is_some());
+    }
 }
 
 #[test]

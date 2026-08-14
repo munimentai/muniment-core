@@ -2154,6 +2154,8 @@ where
             | Operation::RunStream
             | Operation::RunCursorAck => Some("thread.read"),
             Operation::ThreadCreate
+            | Operation::ThreadRename
+            | Operation::ThreadDelete
             | Operation::RunStart
             | Operation::RunCancel
             | Operation::PermissionAnswer => Some("run.write"),
@@ -2605,6 +2607,12 @@ fn dispatch_request<S: ThreadListService>(
         return Ok(response_only(serde_json::json!({
             "thread_id": accepted.thread_id,
         })));
+    }
+    if matches!(
+        request.operation,
+        Operation::ThreadRename | Operation::ThreadDelete
+    ) {
+        return Err(ProtocolError::unsupported_operation().into());
     }
     if request.operation == Operation::RunCursorAck {
         #[derive(serde::Deserialize)]

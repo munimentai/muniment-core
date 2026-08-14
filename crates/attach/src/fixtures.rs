@@ -538,6 +538,8 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         ("thread-create", Operation::ThreadCreate),
         ("migration-control", Operation::MigrationControl),
         ("approval-present", Operation::ApprovalPresent),
+        ("thread-rename", Operation::ThreadRename),
+        ("thread-delete", Operation::ThreadDelete),
     ];
     for (index, (name, operation)) in operations.into_iter().enumerate() {
         insert(
@@ -704,6 +706,8 @@ fn request_body(operation: Operation) -> serde_json::Value {
             json!({"thread_id": "thread-1", "cursor": "message-cursor-1", "limit": 100})
         }
         Operation::ThreadCreate => json!({}),
+        Operation::ThreadRename => json!({"thread_id": "thread-1", "title": "Renamed thread"}),
+        Operation::ThreadDelete => json!({"thread_id": "thread-1"}),
         Operation::RunOpen => json!({"run_id": "00000000000000000000000000000191"}),
         Operation::RunStart => {
             json!({"text": "Summarize the selected file.", "context": {"selected_file": "src/main.rs"}})
@@ -897,6 +901,8 @@ mod tests {
             Operation::ThreadList,
             Operation::ThreadOpen,
             Operation::ThreadCreate,
+            Operation::ThreadRename,
+            Operation::ThreadDelete,
             Operation::RunOpen,
             Operation::RunStart,
             Operation::RunStream,
@@ -954,7 +960,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            50,
+            52,
             "every canonical fixture must be inventoried"
         );
     }

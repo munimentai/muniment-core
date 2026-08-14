@@ -250,6 +250,10 @@ pub enum Operation {
     ThreadOpen,
     #[serde(rename = "thread.create")]
     ThreadCreate,
+    #[serde(rename = "thread.rename")]
+    ThreadRename,
+    #[serde(rename = "thread.delete")]
+    ThreadDelete,
     #[serde(rename = "run.open")]
     RunOpen,
     #[serde(rename = "run.start")]
@@ -283,6 +287,8 @@ impl Operation {
         matches!(
             self,
             Self::ThreadCreate
+                | Self::ThreadRename
+                | Self::ThreadDelete
                 | Self::RunStart
                 | Self::RunSteer
                 | Self::RunFollowUp
@@ -298,6 +304,8 @@ impl Operation {
             Self::ThreadList => "thread.list",
             Self::ThreadOpen => "thread.open",
             Self::ThreadCreate => "thread.create",
+            Self::ThreadRename => "thread.rename",
+            Self::ThreadDelete => "thread.delete",
             Self::RunOpen => "run.open",
             Self::RunStart => "run.start",
             Self::RunStream => "run.stream",
