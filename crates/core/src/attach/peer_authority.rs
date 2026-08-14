@@ -13,6 +13,10 @@ pub struct AuthorizedMigrationControlPeer(());
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AuthorizedApprovalPresenter(());
 
+/// Proof that an attach peer is the installed desktop client executable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AuthorizedDesktopClientPeer(());
+
 /// A bounded failure reason. Variants carry no peer values.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PeerAuthorityError {
@@ -73,6 +77,25 @@ pub fn verify_approval_presenter_peer_with_reader(
 ) -> Result<AuthorizedApprovalPresenter, PeerAuthorityError> {
     verify_peer_executable(peer_pid, expected_executable, reader)?;
     Ok(AuthorizedApprovalPresenter(()))
+}
+
+/// Verifies an attach peer against the installed desktop client executable.
+pub fn verify_desktop_client_peer(
+    peer_pid: u32,
+    expected_executable: &Path,
+) -> Result<AuthorizedDesktopClientPeer, PeerAuthorityError> {
+    verify_desktop_client_peer_with_reader(peer_pid, expected_executable, &ProcReader)
+}
+
+/// Verifies a desktop client peer using an injected procfs boundary.
+#[doc(hidden)]
+pub fn verify_desktop_client_peer_with_reader(
+    peer_pid: u32,
+    expected_executable: &Path,
+    reader: &(impl LinuxProcReader + ?Sized),
+) -> Result<AuthorizedDesktopClientPeer, PeerAuthorityError> {
+    verify_peer_executable(peer_pid, expected_executable, reader)?;
+    Ok(AuthorizedDesktopClientPeer(()))
 }
 
 fn verify_peer_executable(

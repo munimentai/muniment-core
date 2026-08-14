@@ -15,6 +15,8 @@ mod cursor;
 #[cfg(unix)]
 mod deadline_io;
 #[cfg(target_os = "linux")]
+mod desktop_client_admission;
+#[cfg(target_os = "linux")]
 mod desktop_service;
 mod handoff;
 mod handoff_probe;
@@ -51,6 +53,8 @@ pub use cursor::{
     StreamCloseCode, MAX_RUN_STREAM_WINDOW_BYTES, MAX_RUN_STREAM_WINDOW_EVENTS,
     MAX_RUN_STREAM_WINDOW_TEXT_BYTES,
 };
+#[cfg(target_os = "linux")]
+pub use desktop_client_admission::*;
 #[cfg(target_os = "linux")]
 pub use desktop_service::*;
 pub use handoff::*;
