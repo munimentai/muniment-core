@@ -1778,6 +1778,7 @@ mod linux {
         io_timeout: Duration,
         retry_interval: Duration,
         stop: ApprovalPresenterStopHandle,
+        mut observe: impl FnMut(bool),
         mut choose: impl FnMut(&ApprovalPresentRequest) -> ApprovalDecision,
     ) {
         loop {
@@ -1788,7 +1789,9 @@ mod linux {
                 if let Ok(mut presenter) =
                     handshake_approval_presenter_stream(stream, client_version, io_timeout)
                 {
+                    observe(true);
                     let _ = presenter.serve(&mut choose);
+                    observe(false);
                 }
                 let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
                 state.stream = None;

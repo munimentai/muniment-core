@@ -275,6 +275,7 @@ fn approval_presenter_reconnects_and_stops() {
     let worker_stop = stop.clone();
     let (connected_tx, connected) = mpsc::channel();
     let (check_tx, wait_for_stop) = mpsc::channel();
+    let (observed_tx, observed) = mpsc::channel();
     let server = thread::spawn(move || {
         for (request_id, challenge) in [
             ("00000000000000000000000000000073", "first"),
@@ -310,12 +311,17 @@ fn approval_presenter_reconnects_and_stops() {
             SHORT,
             Duration::from_millis(10),
             worker_stop,
+            move |presenting| observed_tx.send(presenting).unwrap(),
             |_| ApprovalDecision::Approve,
         );
     });
     connected.recv_timeout(SHORT + SHORT).unwrap();
     stop.stop();
     worker.join().unwrap();
+    assert_eq!(
+        observed.try_iter().collect::<Vec<_>>(),
+        [true, false, true, false]
+    );
     thread::sleep(Duration::from_millis(30));
     check_tx.send(()).unwrap();
     server.join().unwrap();
@@ -331,9 +337,15 @@ fn approval_presenter_retries_failed_connect_and_refused_handshake() {
     let path_for_worker = path.clone();
     let started_at = Instant::now();
     let worker = thread::spawn(move || {
-        serve_approval_presenter_at(&path_for_worker, "0.0.1", SHORT, retry, worker_stop, |_| {
-            ApprovalDecision::Approve
-        });
+        serve_approval_presenter_at(
+            &path_for_worker,
+            "0.0.1",
+            SHORT,
+            retry,
+            worker_stop,
+            |_| {},
+            |_| ApprovalDecision::Approve,
+        );
     });
 
     thread::sleep(Duration::from_millis(30));
@@ -375,9 +387,15 @@ fn approval_presenter_stop_interrupts_a_blocked_connect() {
     let path_for_worker = path.clone();
     let (returned_tx, returned) = mpsc::channel();
     let worker = thread::spawn(move || {
-        serve_approval_presenter_at(&path_for_worker, "0.0.1", SHORT, SHORT, worker_stop, |_| {
-            ApprovalDecision::Approve
-        });
+        serve_approval_presenter_at(
+            &path_for_worker,
+            "0.0.1",
+            SHORT,
+            SHORT,
+            worker_stop,
+            |_| {},
+            |_| ApprovalDecision::Approve,
+        );
         returned_tx.send(()).unwrap();
     });
     thread::sleep(Duration::from_millis(20));
@@ -413,9 +431,15 @@ fn approval_presenter_rejects_an_endpoint_with_a_nul_byte() {
     let stop = ApprovalPresenterStopHandle::new();
     let worker_stop = stop.clone();
     let worker = thread::spawn(move || {
-        serve_approval_presenter_at(&endpoint, "0.0.1", SHORT, SHORT, worker_stop, |_| {
-            ApprovalDecision::Approve
-        });
+        serve_approval_presenter_at(
+            &endpoint,
+            "0.0.1",
+            SHORT,
+            SHORT,
+            worker_stop,
+            |_| {},
+            |_| ApprovalDecision::Approve,
+        );
     });
 
     thread::sleep(Duration::from_millis(20));
