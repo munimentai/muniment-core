@@ -540,6 +540,12 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         ("approval-present", Operation::ApprovalPresent),
         ("thread-rename", Operation::ThreadRename),
         ("thread-delete", Operation::ThreadDelete),
+        ("session-status", Operation::SessionStatus),
+        ("entitlement-snapshot", Operation::EntitlementSnapshot),
+        ("device-list", Operation::DeviceList),
+        ("session-sign-out", Operation::SessionSignOut),
+        ("companion-list", Operation::CompanionList),
+        ("companion-revoke", Operation::CompanionRevoke),
     ];
     for (index, (name, operation)) in operations.into_iter().enumerate() {
         insert(
@@ -708,6 +714,12 @@ fn request_body(operation: Operation) -> serde_json::Value {
         Operation::ThreadCreate => json!({}),
         Operation::ThreadRename => json!({"thread_id": "thread-1", "title": "Renamed thread"}),
         Operation::ThreadDelete => json!({"thread_id": "thread-1"}),
+        Operation::SessionStatus
+        | Operation::EntitlementSnapshot
+        | Operation::DeviceList
+        | Operation::SessionSignOut
+        | Operation::CompanionList => json!({}),
+        Operation::CompanionRevoke => json!({"client_identity": "companion-1"}),
         Operation::RunOpen => json!({"run_id": "00000000000000000000000000000191"}),
         Operation::RunStart => {
             json!({"text": "Summarize the selected file.", "context": {"selected_file": "src/main.rs"}})
@@ -903,6 +915,12 @@ mod tests {
             Operation::ThreadCreate,
             Operation::ThreadRename,
             Operation::ThreadDelete,
+            Operation::SessionStatus,
+            Operation::EntitlementSnapshot,
+            Operation::DeviceList,
+            Operation::SessionSignOut,
+            Operation::CompanionList,
+            Operation::CompanionRevoke,
             Operation::RunOpen,
             Operation::RunStart,
             Operation::RunStream,
@@ -960,7 +978,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            52,
+            58,
             "every canonical fixture must be inventoried"
         );
     }

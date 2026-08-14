@@ -91,6 +91,39 @@ fn export_includes_thread_mutation_requests() {
 }
 
 #[test]
+fn export_includes_second_tranche_requests() {
+    let root = TestDirectory::new();
+    export(&root.0, Mode::Write).unwrap();
+    let directory = fixture_dir(&root.0);
+
+    for (wire_name, operation, requires_idempotency_key) in [
+        ("session.status", Operation::SessionStatus, false),
+        (
+            "entitlement.snapshot",
+            Operation::EntitlementSnapshot,
+            false,
+        ),
+        ("device.list", Operation::DeviceList, false),
+        ("session.sign_out", Operation::SessionSignOut, true),
+        ("companion.list", Operation::CompanionList, false),
+        ("companion.revoke", Operation::CompanionRevoke, true),
+    ] {
+        let name = wire_name.replace(['.', '_'], "-");
+        let request: Request = serde_json::from_slice(
+            &fs::read(directory.join(format!("request-{name}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(request.operation, operation);
+        assert_eq!(operation.as_str(), wire_name);
+        assert_eq!(
+            operation.requires_idempotency_key(),
+            requires_idempotency_key
+        );
+        assert_eq!(request.idempotency_key.is_some(), requires_idempotency_key);
+    }
+}
+
+#[test]
 fn export_repairs_a_stale_regular_checkout_directory() {
     let expected_root = TestDirectory::new();
     export(&expected_root.0, Mode::Write).unwrap();

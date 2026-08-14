@@ -254,6 +254,18 @@ pub enum Operation {
     ThreadRename,
     #[serde(rename = "thread.delete")]
     ThreadDelete,
+    #[serde(rename = "session.status")]
+    SessionStatus,
+    #[serde(rename = "entitlement.snapshot")]
+    EntitlementSnapshot,
+    #[serde(rename = "device.list")]
+    DeviceList,
+    #[serde(rename = "session.sign_out")]
+    SessionSignOut,
+    #[serde(rename = "companion.list")]
+    CompanionList,
+    #[serde(rename = "companion.revoke")]
+    CompanionRevoke,
     #[serde(rename = "run.open")]
     RunOpen,
     #[serde(rename = "run.start")]
@@ -289,6 +301,8 @@ impl Operation {
             Self::ThreadCreate
                 | Self::ThreadRename
                 | Self::ThreadDelete
+                | Self::SessionSignOut
+                | Self::CompanionRevoke
                 | Self::RunStart
                 | Self::RunSteer
                 | Self::RunFollowUp
@@ -306,6 +320,12 @@ impl Operation {
             Self::ThreadCreate => "thread.create",
             Self::ThreadRename => "thread.rename",
             Self::ThreadDelete => "thread.delete",
+            Self::SessionStatus => "session.status",
+            Self::EntitlementSnapshot => "entitlement.snapshot",
+            Self::DeviceList => "device.list",
+            Self::SessionSignOut => "session.sign_out",
+            Self::CompanionList => "companion.list",
+            Self::CompanionRevoke => "companion.revoke",
             Self::RunOpen => "run.open",
             Self::RunStart => "run.start",
             Self::RunStream => "run.stream",
