@@ -14,7 +14,10 @@ use muniment_attach::{
 
 use super::deadline_io::{is_timeout, read_exact_before, write_all_before};
 use super::linux::{CompanionProvenance, PeerCredentials};
-use super::{verify_desktop_client_peer_with_reader, Approval};
+use super::{
+    verify_desktop_client_peer_with_reader, Approval, CAPABILITY_IDLE_LIFETIME,
+    MAX_CAPABILITY_LIFETIME,
+};
 use crate::browser_control::LinuxProcReader;
 
 const DESKTOP_PROTOCOL: VersionRange = VersionRange { min: 1, max: 1 };
@@ -121,8 +124,8 @@ pub fn admit_desktop_client(
     let grant = MigrationControlAuthorized {
         profile_id: approval.profile.clone(),
         capability: capability.clone(),
-        expires_at: approval.lifetime.as_secs(),
-        idle_timeout_seconds: approval.lifetime.as_secs(),
+        expires_at: approval.lifetime.min(MAX_CAPABILITY_LIFETIME).as_secs(),
+        idle_timeout_seconds: CAPABILITY_IDLE_LIFETIME.as_secs(),
         workspace_scopes,
     };
     write_all_before(

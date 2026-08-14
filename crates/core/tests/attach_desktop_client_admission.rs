@@ -11,7 +11,8 @@ use muniment_core::attach::linux::PeerCredentials;
 use muniment_core::attach::{
     admit_desktop_client, decode_frame, encode_frame, Approval, Client,
     DesktopClientAdmissionError, ErrorCode, ErrorEnvelope, Hello, Id, MigrationControlAuthorized,
-    Protocol, VersionRange, Welcome, MAX_FRAME_LENGTH,
+    Protocol, VersionRange, Welcome, CAPABILITY_IDLE_LIFETIME, MAX_CAPABILITY_LIFETIME,
+    MAX_FRAME_LENGTH,
 };
 use muniment_core::browser_control::{LinuxProcReader, ProcReadError};
 
@@ -54,7 +55,7 @@ fn approval() -> Approval {
         profile: "profile-1".into(),
         workspace: "/work/signed".into(),
         scopes: BTreeSet::from(["run.write".into(), "thread.read".into()]),
-        lifetime: Duration::from_secs(90),
+        lifetime: MAX_CAPABILITY_LIFETIME + Duration::from_secs(1),
     }
 }
 
@@ -116,8 +117,11 @@ fn verified_peer_receives_workspace_grant_without_client_credential() {
     assert_hex(&grant.capability, 64);
     assert_eq!(grant.capability, session.capability);
     assert_eq!(grant.profile_id, "profile-1");
-    assert_eq!(grant.expires_at, 90);
-    assert_eq!(grant.idle_timeout_seconds, 90);
+    assert_eq!(grant.expires_at, MAX_CAPABILITY_LIFETIME.as_secs());
+    assert_eq!(
+        grant.idle_timeout_seconds,
+        CAPABILITY_IDLE_LIFETIME.as_secs()
+    );
     assert_eq!(grant.workspace_scopes.len(), 1);
     assert_eq!(grant.workspace_scopes["/work/signed"], approval().scopes);
     assert_eq!(session.workspace, "/work/signed");
