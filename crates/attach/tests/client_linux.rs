@@ -4,7 +4,8 @@ use muniment_attach::{
     authorized, connect_approval_presenter_at, connect_desktop_client, connect_desktop_client_at,
     encode_frame, handshake_approval_presenter_stream, handshake_desktop_client_stream,
     handshake_migration_control_stream, handshake_stream, handshake_stream_with_credential,
-    reconnect_welcome, welcome, ApprovalDecision, ApprovalPresenterServeOutcome, ClientError,
+    reconnect_welcome, serve_desktop_client_at, welcome, ApprovalDecision,
+    ApprovalPresenterServeOutcome, ClientError, DesktopClientHolder, DesktopClientStopHandle,
     ErrorAction, ErrorEnvelope, Event, EventName, Failure, Id, MigrationControlFailure,
     MigrationControlOutcome, Operation, PermissionDecision, PermissionKind, Protocol,
     ProtocolError, Response, RunStreamMessage, Success, VersionRange, MAX_FRAME_LENGTH,
@@ -623,6 +624,322 @@ fn complete_desktop_client_handshake(server: &mut UnixStream) {
             .unwrap(),
         )
         .unwrap();
+}
+
+#[test]
+fn desktop_client_holder_is_unavailable_without_a_connection() {
+    let holder = DesktopClientHolder::new();
+    assert_eq!(
+        holder.request(Operation::ThreadList, None, serde_json::json!({})),
+        Err(ClientError::DesktopUnavailable)
+    );
+}
+
+#[test]
+fn desktop_client_supervisor_publishes_reconnects_and_stops() {
+    let path = socket_path();
+    let listener = UnixListener::bind(&path).unwrap();
+    let stop = DesktopClientStopHandle::new();
+    let holder = DesktopClientHolder::new();
+    let worker_stop = stop.clone();
+    let worker_holder = holder.clone();
+    let (observed_tx, observed) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        complete_desktop_client_handshake(&mut first);
+        let request = read_client_value(&mut first);
+        assert_eq!(request["operation"], "thread.list");
+        drop(first);
+
+        let (mut second, _) = listener.accept().unwrap();
+        complete_desktop_client_handshake(&mut second);
+        let request = read_client_value(&mut second);
+        let request_id = request["request_id"].as_str().unwrap();
+        second
+            .write_all(
+                &encode_frame(&Response {
+                    protocol: Protocol,
+                    request_id: Id::new(request_id).unwrap(),
+                    ok: Success,
+                    body: serde_json::json!({"threads": []}),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let mut byte = [0];
+        assert_eq!(second.read(&mut byte).unwrap(), 0);
+    });
+    let path_for_worker = path.clone();
+    let worker = thread::spawn(move || {
+        serve_desktop_client_at(
+            &path_for_worker,
+            "0.0.1",
+            SHORT,
+            Duration::from_millis(10),
+            worker_stop,
+            worker_holder,
+            move |connected| observed_tx.send(connected).unwrap(),
+        );
+    });
+
+    observed.recv_timeout(SHORT).unwrap();
+    assert_eq!(
+        holder.request(Operation::ThreadList, None, serde_json::json!({})),
+        Err(ClientError::ConnectionClosed)
+    );
+    assert_eq!(observed.recv_timeout(SHORT), Ok(false));
+    assert_eq!(observed.recv_timeout(SHORT), Ok(true));
+    assert!(holder
+        .request(Operation::ThreadList, None, serde_json::json!({}))
+        .is_ok());
+    stop.stop();
+    worker.join().unwrap();
+    assert_eq!(observed.recv_timeout(SHORT), Ok(false));
+    server.join().unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn desktop_client_supervisor_retries_a_refused_handshake() {
+    let path = socket_path();
+    let listener = UnixListener::bind(&path).unwrap();
+    let stop = DesktopClientStopHandle::new();
+    let worker_stop = stop.clone();
+    let worker_holder = DesktopClientHolder::new();
+    let server = thread::spawn(move || {
+        let (mut refused, _) = listener.accept().unwrap();
+        read_client_frame(&mut refused);
+        refused
+            .write_all(
+                &encode_frame(&ErrorEnvelope {
+                    protocol: Protocol,
+                    request_id: None,
+                    ok: Failure,
+                    error: ProtocolError::unauthorized(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        drop(refused);
+        let (mut accepted, _) = listener.accept().unwrap();
+        complete_desktop_client_handshake(&mut accepted);
+        let mut byte = [0];
+        assert_eq!(accepted.read(&mut byte).unwrap(), 0);
+    });
+    let path_for_worker = path.clone();
+    let (connected_tx, connected) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        serve_desktop_client_at(
+            &path_for_worker,
+            "0.0.1",
+            SHORT,
+            Duration::from_millis(10),
+            worker_stop,
+            worker_holder,
+            move |state| {
+                if state {
+                    connected_tx.send(()).unwrap();
+                }
+            },
+        );
+    });
+    connected.recv_timeout(SHORT + SHORT).unwrap();
+    stop.stop();
+    worker.join().unwrap();
+    server.join().unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn desktop_client_stop_serializes_publication_and_notifications() {
+    let path = socket_path();
+    let listener = UnixListener::bind(&path).unwrap();
+    let stop = DesktopClientStopHandle::new();
+    let holder = DesktopClientHolder::new();
+    let worker_stop = stop.clone();
+    let worker_holder = holder.clone();
+    let (observed_tx, observed) = mpsc::channel();
+    let (publishing_tx, publishing) = mpsc::channel();
+    let (release_tx, release) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut client, _) = listener.accept().unwrap();
+        complete_desktop_client_handshake(&mut client);
+        let mut byte = [0];
+        assert_eq!(client.read(&mut byte).unwrap(), 0);
+    });
+    let path_for_worker = path.clone();
+    let worker = thread::spawn(move || {
+        serve_desktop_client_at(
+            &path_for_worker,
+            "0.0.1",
+            SHORT,
+            SHORT,
+            worker_stop,
+            worker_holder,
+            move |connected| {
+                if connected {
+                    publishing_tx.send(()).unwrap();
+                    release.recv().unwrap();
+                }
+                observed_tx.send(connected).unwrap();
+            },
+        );
+    });
+
+    publishing.recv_timeout(SHORT).unwrap();
+    let (stopped_tx, stopped) = mpsc::channel();
+    let stopper = thread::spawn(move || {
+        stop.stop();
+        stopped_tx.send(()).unwrap();
+    });
+    assert_eq!(
+        stopped.recv_timeout(SHORT),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    );
+    release_tx.send(()).unwrap();
+    assert_eq!(observed.recv_timeout(SHORT), Ok(true));
+    stopped.recv_timeout(SHORT).unwrap();
+    worker.join().unwrap();
+    stopper.join().unwrap();
+    assert_eq!(observed.recv_timeout(SHORT), Ok(false));
+    assert_eq!(observed.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+    assert_eq!(
+        holder.request(Operation::ThreadList, None, serde_json::json!({})),
+        Err(ClientError::DesktopUnavailable)
+    );
+    server.join().unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn desktop_client_connected_observer_can_stop_the_supervisor() {
+    let path = socket_path();
+    let listener = UnixListener::bind(&path).unwrap();
+    let stop = DesktopClientStopHandle::new();
+    let holder = DesktopClientHolder::new();
+    let worker_stop = stop.clone();
+    let observer_stop = stop.clone();
+    let worker_holder = holder.clone();
+    let server = thread::spawn(move || {
+        let (mut client, _) = listener.accept().unwrap();
+        complete_desktop_client_handshake(&mut client);
+        let mut byte = [0];
+        assert_eq!(client.read(&mut byte).unwrap(), 0);
+    });
+    let path_for_worker = path.clone();
+    let worker = thread::spawn(move || {
+        serve_desktop_client_at(
+            &path_for_worker,
+            "0.0.1",
+            SHORT,
+            SHORT,
+            worker_stop,
+            worker_holder,
+            move |connected| {
+                if connected {
+                    observer_stop.stop();
+                }
+            },
+        );
+    });
+
+    worker.join().unwrap();
+    assert_eq!(
+        holder.request(Operation::ThreadList, None, serde_json::json!({})),
+        Err(ClientError::DesktopUnavailable)
+    );
+    server.join().unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn desktop_client_supervisor_keeps_one_connection_until_failure() {
+    let path = socket_path();
+    let listener = UnixListener::bind(&path).unwrap();
+    let stop = DesktopClientStopHandle::new();
+    let holder = DesktopClientHolder::new();
+    let worker_stop = stop.clone();
+    let worker_holder = holder.clone();
+    let retry_interval = Duration::from_millis(60);
+    let (healthy_tx, healthy) = mpsc::channel();
+    let (fail_tx, fail) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        complete_desktop_client_handshake(&mut first);
+        listener.set_nonblocking(true).unwrap();
+        healthy_tx.send(()).unwrap();
+        thread::sleep(retry_interval + Duration::from_millis(20));
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        fail_tx.send(()).unwrap();
+        let request = read_client_value(&mut first);
+        assert_eq!(request["operation"], "thread.list");
+        let failed_at = Instant::now();
+        drop(first);
+        listener.set_nonblocking(false).unwrap();
+        let (mut second, _) = listener.accept().unwrap();
+        assert!(failed_at.elapsed() >= retry_interval);
+        complete_desktop_client_handshake(&mut second);
+        let mut byte = [0];
+        assert_eq!(second.read(&mut byte).unwrap(), 0);
+    });
+    let path_for_worker = path.clone();
+    let worker = thread::spawn(move || {
+        serve_desktop_client_at(
+            &path_for_worker,
+            "0.0.1",
+            SHORT,
+            retry_interval,
+            worker_stop,
+            worker_holder,
+            |_| {},
+        );
+    });
+
+    healthy.recv_timeout(SHORT).unwrap();
+    fail.recv_timeout(SHORT + SHORT).unwrap();
+    assert_eq!(
+        holder.request(Operation::ThreadList, None, serde_json::json!({})),
+        Err(ClientError::ConnectionClosed)
+    );
+    thread::sleep(retry_interval + SHORT);
+    stop.stop();
+    worker.join().unwrap();
+    server.join().unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn desktop_client_stop_interrupts_a_blocked_connect() {
+    let path = socket_path();
+    let listener = UnixListener::bind(&path).unwrap();
+    // SAFETY: The listener owns a valid socket descriptor for this call.
+    assert_eq!(unsafe { listen(listener.as_raw_fd(), 0) }, 0);
+    let queued = UnixStream::connect(&path).unwrap();
+    let stop = DesktopClientStopHandle::new();
+    let worker_stop = stop.clone();
+    let path_for_worker = path.clone();
+    let (returned_tx, returned) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        serve_desktop_client_at(
+            &path_for_worker,
+            "0.0.1",
+            SHORT,
+            SHORT,
+            worker_stop,
+            DesktopClientHolder::new(),
+            |_| {},
+        );
+        returned_tx.send(()).unwrap();
+    });
+    thread::sleep(Duration::from_millis(20));
+    stop.stop();
+    returned.recv_timeout(SHORT).unwrap();
+    worker.join().unwrap();
+    drop(queued);
+    drop(listener);
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]

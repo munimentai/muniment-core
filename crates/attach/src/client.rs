@@ -1385,6 +1385,79 @@ mod linux {
         io_timeout: Duration,
     }
 
+    #[derive(Clone, Debug, Default)]
+    pub struct DesktopClientHolder {
+        inner: Arc<(Mutex<Option<DesktopClient>>, Condvar)>,
+    }
+
+    impl DesktopClientHolder {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        pub fn request(
+            &self,
+            operation: Operation,
+            idempotency_key: Option<Id>,
+            body: Value,
+        ) -> Result<Response, ClientError> {
+            let (client, wake) = &*self.inner;
+            let mut client = client.lock().unwrap_or_else(|error| error.into_inner());
+            let result = client
+                .as_mut()
+                .ok_or(ClientError::DesktopUnavailable)?
+                .request(operation, idempotency_key, body);
+            if result.is_err() {
+                *client = None;
+                wake.notify_all();
+            }
+            result
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    pub struct DesktopClientStopHandle {
+        inner: Arc<(Mutex<DesktopClientStopState>, Condvar)>,
+        notification: Arc<(Mutex<Option<std::thread::ThreadId>>, Condvar)>,
+    }
+
+    #[derive(Debug, Default)]
+    struct DesktopClientStopState {
+        stopped: bool,
+        stream: Option<UnixStream>,
+        holder: Option<DesktopClientHolder>,
+    }
+
+    impl DesktopClientStopHandle {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        pub fn stop(&self) {
+            let current_thread = std::thread::current().id();
+            let (notification, notification_wake) = &*self.notification;
+            let notification = notification
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let _notification = notification_wake
+                .wait_while(notification, |thread| {
+                    thread.is_some_and(|thread| thread != current_thread)
+                })
+                .unwrap_or_else(|error| error.into_inner());
+            let (state, wake) = &*self.inner;
+            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+            state.stopped = true;
+            if let Some(stream) = state.stream.take() {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+            if let Some(holder) = state.holder.as_ref() {
+                let (_, client_wake) = &*holder.inner;
+                client_wake.notify_all();
+            }
+            wake.notify_all();
+        }
+    }
+
     /// A connection-bound client for the peer-authorized approval presenter session.
     pub struct ApprovalPresenterClient {
         stream: UnixStream,
@@ -1892,10 +1965,104 @@ mod linux {
         }
     }
 
+    pub fn serve_desktop_client_at(
+        endpoint: &Path,
+        client_version: &str,
+        io_timeout: Duration,
+        retry_interval: Duration,
+        stop: DesktopClientStopHandle,
+        holder: DesktopClientHolder,
+        mut observe: impl FnMut(bool),
+    ) {
+        {
+            let (state, _) = &*stop.inner;
+            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.stopped {
+                return;
+            }
+            state.holder = Some(holder.clone());
+        }
+        loop {
+            let connected = interruptible_desktop_connect(endpoint, &stop);
+            if let Some(stream) = connected {
+                if let Ok(client) =
+                    handshake_desktop_client_stream(stream, client_version, io_timeout)
+                {
+                    let (notification_lock, notification_wake) = &*stop.notification;
+                    let mut notification = notification_lock
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    let (stop_state, _) = &*stop.inner;
+                    let stop_state = stop_state.lock().unwrap_or_else(|error| error.into_inner());
+                    if stop_state.stopped {
+                        return;
+                    }
+                    let (held, wake) = &*holder.inner;
+                    *held.lock().unwrap_or_else(|error| error.into_inner()) = Some(client);
+                    *notification = Some(std::thread::current().id());
+                    drop(stop_state);
+                    drop(notification);
+                    observe(true);
+                    let mut notification = notification_lock
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    *notification = None;
+                    notification_wake.notify_all();
+                    drop(notification);
+                    let connection = held.lock().unwrap_or_else(|error| error.into_inner());
+                    let mut connection = wake
+                        .wait_while(connection, |client| {
+                            if client.is_none() {
+                                return false;
+                            }
+                            let (state, _) = &*stop.inner;
+                            !state
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .stopped
+                        })
+                        .unwrap_or_else(|error| error.into_inner());
+                    *connection = None;
+                    observe(false);
+                }
+                clear_desktop_stream(&stop);
+            }
+
+            let (state, wake) = &*stop.inner;
+            let state = state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.stopped {
+                return;
+            }
+            let (state, _) = wake
+                .wait_timeout_while(state, retry_interval, |state| !state.stopped)
+                .unwrap_or_else(|error| error.into_inner());
+            if state.stopped {
+                return;
+            }
+        }
+    }
+
+    fn interruptible_desktop_connect(
+        endpoint: &Path,
+        stop: &DesktopClientStopHandle,
+    ) -> Option<UnixStream> {
+        interruptible_connect_with_state(endpoint, &stop.inner)
+    }
+
     fn interruptible_connect(
         endpoint: &Path,
         stop: &ApprovalPresenterStopHandle,
     ) -> Option<UnixStream> {
+        interruptible_connect_with_state(endpoint, &stop.inner)
+    }
+
+    fn interruptible_connect_with_state<S>(
+        endpoint: &Path,
+        stop: &Arc<(Mutex<S>, Condvar)>,
+    ) -> Option<UnixStream>
+    where
+        S: InterruptibleConnectState,
+    {
         let path = endpoint.as_os_str().as_bytes();
         if path.is_empty() || path.len() >= 108 || path.contains(&0) {
             return None;
@@ -1915,12 +2082,12 @@ mod linux {
         address.path[..path.len()].copy_from_slice(path);
 
         let connect_result = {
-            let (state, _) = &*stop.inner;
+            let (state, _) = &**stop;
             let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
-            if state.stopped {
+            if state.stopped() {
                 return None;
             }
-            state.stream = Some(interrupt);
+            state.set_stream(Some(interrupt));
             // SAFETY: `address` has a valid AF_UNIX family and a terminated pathname.
             unsafe {
                 connect(
@@ -1931,7 +2098,7 @@ mod linux {
             }
         };
         if connect_result < 0 && io::Error::last_os_error().raw_os_error() != Some(115) {
-            clear_presenter_stream(stop);
+            clear_interruptible_stream(stop);
             return None;
         }
 
@@ -1944,20 +2111,20 @@ mod linux {
             loop {
                 // SAFETY: `ready` points to one valid pollfd for this call.
                 let result = unsafe { poll(&mut ready, 1, 50) };
-                let (state, _) = &*stop.inner;
+                let (state, _) = &**stop;
                 if state
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .stopped
+                    .stopped()
                 {
-                    clear_presenter_stream(stop);
+                    clear_interruptible_stream(stop);
                     return None;
                 }
                 if result > 0 {
                     break;
                 }
                 if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-                    clear_presenter_stream(stop);
+                    clear_interruptible_stream(stop);
                     return None;
                 }
             }
@@ -1965,23 +2132,50 @@ mod linux {
             let mut length = std::mem::size_of::<i32>() as u32;
             // SAFETY: `error` and `length` are valid output pointers for SO_ERROR.
             if unsafe { getsockopt(descriptor, 1, 4, &mut error, &mut length) } < 0 || error != 0 {
-                clear_presenter_stream(stop);
+                clear_interruptible_stream(stop);
                 return None;
             }
         }
         if stream.set_nonblocking(false).is_err() {
-            clear_presenter_stream(stop);
+            clear_interruptible_stream(stop);
             return None;
         }
         Some(stream)
     }
 
-    fn clear_presenter_stream(stop: &ApprovalPresenterStopHandle) {
-        let (state, _) = &*stop.inner;
+    trait InterruptibleConnectState {
+        fn stopped(&self) -> bool;
+        fn set_stream(&mut self, stream: Option<UnixStream>);
+    }
+
+    impl InterruptibleConnectState for ApprovalPresenterStopState {
+        fn stopped(&self) -> bool {
+            self.stopped
+        }
+        fn set_stream(&mut self, stream: Option<UnixStream>) {
+            self.stream = stream;
+        }
+    }
+
+    impl InterruptibleConnectState for DesktopClientStopState {
+        fn stopped(&self) -> bool {
+            self.stopped
+        }
+        fn set_stream(&mut self, stream: Option<UnixStream>) {
+            self.stream = stream;
+        }
+    }
+
+    fn clear_interruptible_stream<S: InterruptibleConnectState>(stop: &Arc<(Mutex<S>, Condvar)>) {
+        let (state, _) = &**stop;
         state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .stream = None;
+            .set_stream(None);
+    }
+
+    fn clear_desktop_stream(stop: &DesktopClientStopHandle) {
+        clear_interruptible_stream(&stop.inner);
     }
 
     fn endpoint_from_environment() -> Result<PathBuf, ClientError> {
@@ -2493,8 +2687,9 @@ pub use linux::{
     connect_approval_presenter, connect_approval_presenter_at, connect_desktop_client,
     connect_desktop_client_at, handshake_approval_presenter_stream,
     handshake_desktop_client_stream, handshake_migration_control_stream, handshake_stream,
-    handshake_stream_with_credential, serve_approval_presenter_at, ApprovalPresenterClient,
-    ApprovalPresenterStopHandle, AuthorizedClient, DesktopClient, MigrationControlClient,
+    handshake_stream_with_credential, serve_approval_presenter_at, serve_desktop_client_at,
+    ApprovalPresenterClient, ApprovalPresenterStopHandle, AuthorizedClient, DesktopClient,
+    DesktopClientHolder, DesktopClientStopHandle, MigrationControlClient,
 };
 
 #[cfg(not(target_os = "linux"))]
