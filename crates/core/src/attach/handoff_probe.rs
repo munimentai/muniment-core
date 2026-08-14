@@ -9,7 +9,7 @@ use muniment_attach::{
 };
 use std::fmt;
 #[cfg(target_os = "linux")]
-use std::io::{self, Read, Write};
+use std::io;
 #[cfg(target_os = "linux")]
 use std::os::unix::net::UnixStream;
 #[cfg(target_os = "linux")]
@@ -19,6 +19,9 @@ use std::thread;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 use std::time::Instant;
+
+#[cfg(target_os = "linux")]
+use super::deadline_io::{is_timeout, read_exact_before, remaining, write_all_before};
 
 #[cfg(target_os = "linux")]
 const PROBE_CLIENT_ID: &str = "018f0000-0000-7000-8000-000000000001";
@@ -111,7 +114,7 @@ pub fn read_handoff_probe_welcome(
     endpoint: impl AsRef<Path>,
     deadline: Instant,
 ) -> Result<Welcome, HandoffProbeError> {
-    remaining(deadline)?;
+    remaining(deadline).map_err(|_| HandoffProbeError::ReadinessDeadlineReached)?;
     let mut stream = UnixStream::connect(endpoint).map_err(|error| match error.kind() {
         io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound => {
             HandoffProbeError::ConnectionRefused
@@ -131,7 +134,7 @@ pub fn read_handoff_probe_welcome(
         authorized_client_credential: None,
     };
     let frame = encode_frame(&hello).map_err(|_| HandoffProbeError::WriteFailed)?;
-    write_all_before(&mut stream, &frame, deadline)?;
+    write_all_before(&mut stream, &frame, deadline).map_err(map_write_error)?;
     read_welcome_before(&mut stream, deadline)
 }
 
@@ -141,33 +144,12 @@ fn mint_probe_nonce() -> Result<String, HandoffProbeError> {
 }
 
 #[cfg(target_os = "linux")]
-fn remaining(deadline: Instant) -> Result<std::time::Duration, HandoffProbeError> {
-    deadline
-        .checked_duration_since(Instant::now())
-        .filter(|remaining| !remaining.is_zero())
-        .ok_or(HandoffProbeError::ReadinessDeadlineReached)
-}
-
-#[cfg(target_os = "linux")]
-fn write_all_before(
-    stream: &mut UnixStream,
-    mut bytes: &[u8],
-    deadline: Instant,
-) -> Result<(), HandoffProbeError> {
-    while !bytes.is_empty() {
-        stream
-            .set_write_timeout(Some(remaining(deadline)?))
-            .map_err(|_| HandoffProbeError::WriteFailed)?;
-        match stream.write(bytes) {
-            Ok(0) => return Err(HandoffProbeError::WriteFailed),
-            Ok(written) => bytes = &bytes[written..],
-            Err(error) if is_timeout(&error) => {
-                return Err(HandoffProbeError::ReadinessDeadlineReached)
-            }
-            Err(_) => return Err(HandoffProbeError::WriteFailed),
-        }
+fn map_write_error(error: io::Error) -> HandoffProbeError {
+    if is_timeout(&error) {
+        HandoffProbeError::ReadinessDeadlineReached
+    } else {
+        HandoffProbeError::WriteFailed
     }
-    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -176,14 +158,14 @@ fn read_welcome_before(
     deadline: Instant,
 ) -> Result<Welcome, HandoffProbeError> {
     let mut prefix = [0_u8; 4];
-    read_exact_before(stream, &mut prefix, deadline)?;
+    read_exact_before(stream, &mut prefix, deadline).map_err(map_read_error)?;
     let length = u32::from_be_bytes(prefix) as usize;
     if length > MAX_FRAME_LENGTH {
         return Err(HandoffProbeError::InvalidFrame);
     }
     let mut frame = vec![0_u8; length + 4];
     frame[..4].copy_from_slice(&prefix);
-    read_exact_before(stream, &mut frame[4..], deadline)?;
+    read_exact_before(stream, &mut frame[4..], deadline).map_err(map_read_error)?;
     let value: serde_json::Value = decode_frame(&frame)
         .map_err(|_| HandoffProbeError::InvalidFrame)?
         .map(|(value, _)| value)
@@ -192,33 +174,14 @@ fn read_welcome_before(
 }
 
 #[cfg(target_os = "linux")]
-fn read_exact_before(
-    stream: &mut UnixStream,
-    mut bytes: &mut [u8],
-    deadline: Instant,
-) -> Result<(), HandoffProbeError> {
-    while !bytes.is_empty() {
-        stream
-            .set_read_timeout(Some(remaining(deadline)?))
-            .map_err(|_| HandoffProbeError::ReadFailed)?;
-        match stream.read(bytes) {
-            Ok(0) => return Err(HandoffProbeError::ListenerClosed),
-            Ok(read) => bytes = &mut bytes[read..],
-            Err(error) if is_timeout(&error) => {
-                return Err(HandoffProbeError::ReadinessDeadlineReached)
-            }
-            Err(_) => return Err(HandoffProbeError::ReadFailed),
-        }
+fn map_read_error(error: io::Error) -> HandoffProbeError {
+    if is_timeout(&error) {
+        HandoffProbeError::ReadinessDeadlineReached
+    } else if error.kind() == io::ErrorKind::UnexpectedEof {
+        HandoffProbeError::ListenerClosed
+    } else {
+        HandoffProbeError::ReadFailed
     }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn is_timeout(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-    )
 }
 
 /// Confirms a completed handoff from the runtime service probe welcome.

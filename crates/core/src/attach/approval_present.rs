@@ -1,4 +1,4 @@
-use std::io::{self, Read, Write};
+use std::io;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
@@ -8,6 +8,7 @@ use muniment_attach::{
 use serde::Deserialize;
 use serde_json::json;
 
+use super::deadline_io::{read_exact_before, write_all_before};
 use super::ApprovalRequest;
 
 /// A claimed presenter session used to show approval challenges.
@@ -77,29 +78,6 @@ struct ApprovalDecision {
     decision: String,
 }
 
-fn remaining(deadline: Instant) -> io::Result<Duration> {
-    deadline
-        .checked_duration_since(Instant::now())
-        .filter(|remaining| !remaining.is_zero())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "approval deadline reached"))
-}
-
-fn write_all_before(
-    stream: &mut UnixStream,
-    mut bytes: &[u8],
-    deadline: Instant,
-) -> io::Result<()> {
-    while !bytes.is_empty() {
-        stream.set_write_timeout(Some(remaining(deadline)?))?;
-        match stream.write(bytes) {
-            Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
-            Ok(written) => bytes = &bytes[written..],
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
-}
-
 fn read_envelope_before(stream: &mut UnixStream, deadline: Instant) -> io::Result<Envelope> {
     let mut prefix = [0_u8; 4];
     read_exact_before(stream, &mut prefix, deadline)?;
@@ -117,20 +95,4 @@ fn read_envelope_before(stream: &mut UnixStream, deadline: Instant) -> io::Resul
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid frame"))?
         .map(|(envelope, _)| envelope)
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete frame"))
-}
-
-fn read_exact_before(
-    stream: &mut UnixStream,
-    mut bytes: &mut [u8],
-    deadline: Instant,
-) -> io::Result<()> {
-    while !bytes.is_empty() {
-        stream.set_read_timeout(Some(remaining(deadline)?))?;
-        match stream.read(bytes) {
-            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
-            Ok(read) => bytes = &mut bytes[read..],
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
 }
