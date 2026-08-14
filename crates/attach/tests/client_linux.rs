@@ -633,6 +633,147 @@ fn desktop_client_holder_is_unavailable_without_a_connection() {
         holder.request(Operation::ThreadList, None, serde_json::json!({})),
         Err(ClientError::DesktopUnavailable)
     );
+    assert_eq!(
+        holder.rename_thread("thread-1", "Renamed thread"),
+        Err(ClientError::DesktopUnavailable)
+    );
+    assert_eq!(
+        holder.delete_thread("thread-1"),
+        Err(ClientError::DesktopUnavailable)
+    );
+}
+
+#[test]
+fn desktop_thread_mutations_match_the_golden_request_bodies() {
+    let rename_fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../protocol-fixtures/muniment.attach/1/request-thread-rename.json"
+    ))
+    .unwrap();
+    let delete_fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../protocol-fixtures/muniment.attach/1/request-thread-delete.json"
+    ))
+    .unwrap();
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_desktop_client_handshake(&mut server);
+        let mut keys = BTreeSet::new();
+        for (operation, fixture) in [
+            ("thread.rename", rename_fixture),
+            ("thread.delete", delete_fixture),
+        ] {
+            let request = read_client_value(&mut server);
+            assert_eq!(request["operation"], operation);
+            assert_eq!(request["body"], fixture["body"]);
+            let request_id = request["request_id"].as_str().unwrap();
+            let key = request["idempotency_key"].as_str().unwrap();
+            assert_ne!(request_id, key);
+            assert_eq!(key.as_bytes()[14], b'7');
+            assert!(keys.insert(key.to_owned()));
+            server
+                .write_all(
+                    &encode_frame(&Response {
+                        protocol: Protocol,
+                        request_id: Id::new(request_id).unwrap(),
+                        ok: Success,
+                        body: serde_json::json!({}),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+    });
+    let mut client = handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap();
+    client.rename_thread("thread-1", "Renamed thread").unwrap();
+    client.delete_thread("thread-1").unwrap();
+    worker.join().unwrap();
+}
+
+#[test]
+fn desktop_thread_mutations_reject_invalid_input_before_writing() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_desktop_client_handshake(&mut server);
+        assert_eq!(server.read(&mut [0]).unwrap(), 0);
+    });
+    let mut client = handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap();
+    assert_eq!(
+        client.rename_thread("", "title"),
+        Err(ClientError::UnexpectedMessage)
+    );
+    assert_eq!(
+        client.rename_thread("thread-1", ""),
+        Err(ClientError::UnexpectedMessage)
+    );
+    assert_eq!(
+        client.delete_thread(""),
+        Err(ClientError::UnexpectedMessage)
+    );
+    drop(client);
+    worker.join().unwrap();
+}
+
+#[test]
+fn desktop_thread_mutations_reject_invalid_answers_and_map_errors() {
+    for rename in [true, false] {
+        for (answer, expected) in [
+            ("uncorrelated", ClientError::UnexpectedMessage),
+            ("hybrid", ClientError::UnexpectedMessage),
+            ("nonempty", ClientError::UnexpectedMessage),
+            ("error", ClientError::ThreadNotFound),
+        ] {
+            let (client, mut server) = UnixStream::pair().unwrap();
+            let worker = thread::spawn(move || {
+                complete_desktop_client_handshake(&mut server);
+                let request = read_client_value(&mut server);
+                let request_id = request["request_id"].as_str().unwrap();
+                if answer == "error" {
+                    server
+                        .write_all(
+                            &encode_frame(&ErrorEnvelope {
+                                protocol: Protocol,
+                                request_id: Some(Id::new(request_id).unwrap()),
+                                ok: Failure,
+                                error: ProtocolError::thread_not_found(),
+                            })
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    return;
+                }
+                let value = match answer {
+                    "uncorrelated" => serde_json::json!({
+                        "protocol": "muniment.attach/1",
+                        "request_id": "00000000000000000000000000000074",
+                        "ok": true,
+                        "body": {}
+                    }),
+                    "hybrid" => serde_json::json!({
+                        "protocol": "muniment.attach/1",
+                        "request_id": request_id,
+                        "ok": true,
+                        "body": {},
+                        "error": {"code": "thread_not_found", "message": "missing"}
+                    }),
+                    "nonempty" => serde_json::json!({
+                        "protocol": "muniment.attach/1",
+                        "request_id": request_id,
+                        "ok": true,
+                        "body": {"accepted": true}
+                    }),
+                    _ => unreachable!(),
+                };
+                server.write_all(&encode_frame(&value).unwrap()).unwrap();
+            });
+            let mut client = handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap();
+            let result = if rename {
+                client.rename_thread("thread-1", "Renamed thread")
+            } else {
+                client.delete_thread("thread-1")
+            };
+            assert_eq!(result, Err(expected));
+            worker.join().unwrap();
+        }
+    }
 }
 
 #[test]

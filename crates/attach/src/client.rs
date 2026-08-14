@@ -1413,6 +1413,34 @@ mod linux {
             }
             result
         }
+
+        pub fn rename_thread(&self, thread_id: &str, title: &str) -> Result<(), ClientError> {
+            let (client, wake) = &*self.inner;
+            let mut client = client.lock().unwrap_or_else(|error| error.into_inner());
+            let result = client
+                .as_mut()
+                .ok_or(ClientError::DesktopUnavailable)?
+                .rename_thread(thread_id, title);
+            if result.is_err() {
+                *client = None;
+                wake.notify_all();
+            }
+            result
+        }
+
+        pub fn delete_thread(&self, thread_id: &str) -> Result<(), ClientError> {
+            let (client, wake) = &*self.inner;
+            let mut client = client.lock().unwrap_or_else(|error| error.into_inner());
+            let result = client
+                .as_mut()
+                .ok_or(ClientError::DesktopUnavailable)?
+                .delete_thread(thread_id);
+            if result.is_err() {
+                *client = None;
+                wake.notify_all();
+            }
+            result
+        }
     }
 
     #[derive(Clone, Debug, Default)]
@@ -1692,6 +1720,36 @@ mod linux {
                 }
                 _ => Err(ClientError::UnexpectedMessage),
             }
+        }
+
+        pub fn rename_thread(&mut self, thread_id: &str, title: &str) -> Result<(), ClientError> {
+            if thread_id.is_empty() || thread_id.len() > MAX_THREAD_ID_LENGTH || title.is_empty() {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            let response = self.request(
+                Operation::ThreadRename,
+                Some(fresh_request_id()?),
+                serde_json::json!({"thread_id": thread_id, "title": title}),
+            )?;
+            if response.body != serde_json::json!({}) {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            Ok(())
+        }
+
+        pub fn delete_thread(&mut self, thread_id: &str) -> Result<(), ClientError> {
+            if thread_id.is_empty() || thread_id.len() > MAX_THREAD_ID_LENGTH {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            let response = self.request(
+                Operation::ThreadDelete,
+                Some(fresh_request_id()?),
+                serde_json::json!({"thread_id": thread_id}),
+            )?;
+            if response.body != serde_json::json!({}) {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            Ok(())
         }
 
         pub fn into_stream(self) -> UnixStream {
