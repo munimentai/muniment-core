@@ -24,6 +24,8 @@ mod listener_lifecycle;
 #[cfg(target_os = "linux")]
 mod peer_authority;
 #[cfg(target_os = "linux")]
+mod presented_approval;
+#[cfg(target_os = "linux")]
 mod presenter_admission;
 #[cfg(unix)]
 mod presenter_session;
@@ -57,6 +59,8 @@ pub use listener_lifecycle::*;
 pub use muniment_attach::*;
 #[cfg(target_os = "linux")]
 pub use peer_authority::*;
+#[cfg(target_os = "linux")]
+pub use presented_approval::*;
 #[cfg(target_os = "linux")]
 pub use presenter_admission::*;
 #[cfg(unix)]
