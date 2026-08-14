@@ -375,7 +375,7 @@ mod linux {
     };
     use serde::de::DeserializeOwned;
     use serde_json::Value;
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::env;
     use std::fs::File;
     use std::io::{self, Read, Write};
@@ -1375,6 +1375,16 @@ mod linux {
         io_timeout: Duration,
     }
 
+    /// A connection-bound client for the peer-authorized desktop session.
+    pub struct DesktopClient {
+        stream: UnixStream,
+        profile_id: String,
+        workspace_scopes: BTreeMap<String, BTreeSet<String>>,
+        capability: String,
+        summary: AuthorizationSummary,
+        io_timeout: Duration,
+    }
+
     /// A connection-bound client for the peer-authorized approval presenter session.
     pub struct ApprovalPresenterClient {
         stream: UnixStream,
@@ -1556,6 +1566,63 @@ mod linux {
     impl std::fmt::Debug for MigrationControlClient {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             formatter.write_str("MigrationControlClient { .. }")
+        }
+    }
+
+    impl std::fmt::Debug for DesktopClient {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("DesktopClient { .. }")
+        }
+    }
+
+    impl DesktopClient {
+        pub fn capability(&self) -> &str {
+            &self.capability
+        }
+
+        pub fn profile_id(&self) -> &str {
+            &self.profile_id
+        }
+
+        pub fn workspace_scopes(&self) -> &BTreeMap<String, BTreeSet<String>> {
+            &self.workspace_scopes
+        }
+
+        pub fn authorization_summary(&self) -> AuthorizationSummary {
+            self.summary.clone()
+        }
+
+        pub fn request(
+            &mut self,
+            operation: Operation,
+            idempotency_key: Option<Id>,
+            body: Value,
+        ) -> Result<Response, ClientError> {
+            let request_id = fresh_request_id()?;
+            let request = Request {
+                protocol: Protocol,
+                request_id: request_id.clone(),
+                operation,
+                capability: self.capability.clone(),
+                idempotency_key,
+                body,
+            };
+            let request_deadline = deadline(self.io_timeout);
+            let bytes = encode_frame(&request).map_err(map_frame_error)?;
+            write_all_before(&mut self.stream, &bytes, request_deadline)?;
+            match serde_json::from_value(read_value(&mut self.stream, request_deadline)?)
+                .map_err(|_| ClientError::UnexpectedMessage)?
+            {
+                Envelope::Response(response) if response.request_id == request_id => Ok(response),
+                Envelope::Error(error) if error.request_id.as_ref() == Some(&request_id) => {
+                    Err(map_protocol_error(error.error.code()))
+                }
+                _ => Err(ClientError::UnexpectedMessage),
+            }
+        }
+
+        pub fn into_stream(self) -> UnixStream {
+            self.stream
         }
     }
 
@@ -1760,6 +1827,21 @@ mod linux {
     ) -> Result<ApprovalPresenterClient, ClientError> {
         let endpoint = endpoint_from_environment()?;
         connect_approval_presenter_at(&endpoint, client_version, IO_TIMEOUT)
+    }
+
+    pub fn connect_desktop_client(client_version: &str) -> Result<DesktopClient, ClientError> {
+        let endpoint = endpoint_from_environment()?;
+        connect_desktop_client_at(&endpoint, client_version, IO_TIMEOUT)
+    }
+
+    #[doc(hidden)]
+    pub fn connect_desktop_client_at(
+        endpoint: &Path,
+        client_version: &str,
+        io_timeout: Duration,
+    ) -> Result<DesktopClient, ClientError> {
+        let stream = UnixStream::connect(endpoint).map_err(|_| ClientError::DesktopUnavailable)?;
+        handshake_desktop_client_stream(stream, client_version, io_timeout)
     }
 
     #[doc(hidden)]
@@ -2027,6 +2109,69 @@ mod linux {
         }
         Ok(MigrationControlClient {
             stream,
+            capability: authorized.capability,
+            summary: AuthorizationSummary {
+                expires_in_seconds: authorized.expires_at,
+                idle_timeout_seconds: authorized.idle_timeout_seconds,
+            },
+            io_timeout,
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn handshake_desktop_client_stream(
+        mut stream: UnixStream,
+        client_version: &str,
+        io_timeout: Duration,
+    ) -> Result<DesktopClient, ClientError> {
+        let hello = Hello {
+            protocol: Protocol,
+            client: Client {
+                kind: "desktop-client".into(),
+                version: client_version.into(),
+            },
+            supported: VersionRange { min: 1, max: 1 },
+            client_nonce: fresh_nonce()?,
+            authorized_client_id: Id::new(fresh_request_id()?.as_str())
+                .map_err(|_| ClientError::UnexpectedMessage)?,
+            authorized_client_credential: None,
+        };
+        let bytes = encode_frame(&hello).map_err(map_frame_error)?;
+        write_all_before(&mut stream, &bytes, deadline(io_timeout))?;
+
+        let welcome_value = read_value(&mut stream, deadline(io_timeout))?;
+        reject_protocol_error(&welcome_value)?;
+        let welcome: Welcome = parse_message(welcome_value)?;
+        if welcome.selected != 1
+            || welcome.authorization != Authorization::Authorized
+            || !is_hex_secret(&welcome.server_nonce, 32)
+        {
+            return Err(ClientError::UnexpectedMessage);
+        }
+
+        let authorized_value = read_value(&mut stream, deadline(io_timeout))?;
+        reject_protocol_error(&authorized_value)?;
+        if authorized_value
+            .get("authorized_client_credential")
+            .is_some()
+        {
+            return Err(ClientError::UnexpectedMessage);
+        }
+        let authorized: MigrationControlAuthorized = parse_message(authorized_value)?;
+        if authorized.profile_id.is_empty()
+            || authorized.workspace_scopes.len() != 1
+            || !is_hex_secret(&authorized.capability, 64)
+            || authorized.expires_at == 0
+            || authorized.expires_at > 8 * 60 * 60
+            || authorized.idle_timeout_seconds == 0
+            || authorized.idle_timeout_seconds > 15 * 60
+        {
+            return Err(ClientError::UnexpectedMessage);
+        }
+        Ok(DesktopClient {
+            stream,
+            profile_id: authorized.profile_id,
+            workspace_scopes: authorized.workspace_scopes,
             capability: authorized.capability,
             summary: AuthorizationSummary {
                 expires_in_seconds: authorized.expires_at,
@@ -2345,10 +2490,11 @@ mod linux {
 
 #[cfg(target_os = "linux")]
 pub use linux::{
-    connect_approval_presenter, connect_approval_presenter_at, handshake_approval_presenter_stream,
-    handshake_migration_control_stream, handshake_stream, handshake_stream_with_credential,
-    serve_approval_presenter_at, ApprovalPresenterClient, ApprovalPresenterStopHandle,
-    AuthorizedClient, MigrationControlClient,
+    connect_approval_presenter, connect_approval_presenter_at, connect_desktop_client,
+    connect_desktop_client_at, handshake_approval_presenter_stream,
+    handshake_desktop_client_stream, handshake_migration_control_stream, handshake_stream,
+    handshake_stream_with_credential, serve_approval_presenter_at, ApprovalPresenterClient,
+    ApprovalPresenterStopHandle, AuthorizedClient, DesktopClient, MigrationControlClient,
 };
 
 #[cfg(not(target_os = "linux"))]

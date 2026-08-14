@@ -1,12 +1,13 @@
 #![cfg(all(target_os = "linux", feature = "client"))]
 
 use muniment_attach::{
-    authorized, connect_approval_presenter_at, encode_frame, handshake_approval_presenter_stream,
+    authorized, connect_approval_presenter_at, connect_desktop_client, connect_desktop_client_at,
+    encode_frame, handshake_approval_presenter_stream, handshake_desktop_client_stream,
     handshake_migration_control_stream, handshake_stream, handshake_stream_with_credential,
     reconnect_welcome, welcome, ApprovalDecision, ApprovalPresenterServeOutcome, ClientError,
     ErrorAction, ErrorEnvelope, Event, EventName, Failure, Id, MigrationControlFailure,
-    MigrationControlOutcome, PermissionDecision, PermissionKind, Protocol, ProtocolError, Response,
-    RunStreamMessage, Success, VersionRange, MAX_FRAME_LENGTH,
+    MigrationControlOutcome, Operation, PermissionDecision, PermissionKind, Protocol,
+    ProtocolError, Response, RunStreamMessage, Success, VersionRange, MAX_FRAME_LENGTH,
 };
 use muniment_attach::{serve_approval_presenter_at, ApprovalPresenterStopHandle};
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,12 +18,13 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const SHORT: Duration = Duration::from_millis(100);
 static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
+static ENVIRONMENT: Mutex<()> = Mutex::new(());
 
 unsafe extern "C" {
     fn listen(socket: i32, backlog: i32) -> i32;
@@ -600,6 +602,209 @@ fn complete_migration_handshake(server: &mut UnixStream) {
             .unwrap(),
         )
         .unwrap();
+}
+
+fn complete_desktop_client_handshake(server: &mut UnixStream) {
+    let hello = read_client_value(server);
+    assert_eq!(hello["client"]["kind"], "desktop-client");
+    assert!(hello.get("authorized_client_credential").is_none());
+    server
+        .write_all(&encode_frame(&reconnect_welcome(1, "0.0.1", "11".repeat(16), "")).unwrap())
+        .unwrap();
+    server
+        .write_all(
+            &encode_frame(&serde_json::json!({
+                "profile_id": "profile-1",
+                "capability": "33".repeat(32),
+                "expires_at": 60,
+                "idle_timeout_seconds": 30,
+                "workspace_scopes": {"/work/signed": ["threads:read"]},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+}
+
+#[test]
+fn desktop_client_handshake_returns_the_admitted_grant() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || complete_desktop_client_handshake(&mut server));
+    let client = handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap();
+    assert_eq!(client.capability(), "33".repeat(32));
+    assert_eq!(client.profile_id(), "profile-1");
+    assert_eq!(client.workspace_scopes().len(), 1);
+    assert_eq!(
+        client.workspace_scopes()["/work/signed"],
+        BTreeSet::from(["threads:read".to_owned()])
+    );
+    assert_eq!(client.authorization_summary().expires_in_seconds, 60);
+    assert_eq!(client.authorization_summary().idle_timeout_seconds, 30);
+    worker.join().unwrap();
+}
+
+#[test]
+fn desktop_client_handshake_rejects_invalid_welcome_and_grant_fields() {
+    let cases = [
+        (2, "authorized", "profile-1", 1, 64, false),
+        (1, "pairing_required", "profile-1", 1, 64, false),
+        (1, "authorized", "", 1, 64, false),
+        (1, "authorized", "profile-1", 0, 64, false),
+        (1, "authorized", "profile-1", 2, 64, false),
+        (1, "authorized", "profile-1", 1, 63, false),
+        (1, "authorized", "profile-1", 1, 65, false),
+        (1, "authorized", "profile-1", 1, 64, true),
+    ];
+    for (selected, authorization, profile, scope_count, capability_len, credential) in cases {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            read_client_frame(&mut server);
+            let mut welcome =
+                serde_json::to_value(reconnect_welcome(selected, "0.0.1", "11".repeat(16), ""))
+                    .unwrap();
+            welcome["authorization"] = serde_json::json!(authorization);
+            server.write_all(&encode_frame(&welcome).unwrap()).unwrap();
+            if selected == 1 && authorization == "authorized" {
+                let scopes = match scope_count {
+                    0 => serde_json::json!({}),
+                    1 => serde_json::json!({"one": []}),
+                    _ => serde_json::json!({"one": [], "two": []}),
+                };
+                let mut grant = serde_json::json!({
+                    "profile_id": profile,
+                    "capability": "a".repeat(capability_len),
+                    "expires_at": 60,
+                    "idle_timeout_seconds": 30,
+                    "workspace_scopes": scopes,
+                });
+                if credential {
+                    grant["authorized_client_credential"] = serde_json::json!("44".repeat(32));
+                }
+                server.write_all(&encode_frame(&grant).unwrap()).unwrap();
+            }
+        });
+        assert_eq!(
+            handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap_err(),
+            ClientError::UnexpectedMessage
+        );
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn desktop_client_handshake_rejects_a_nonhex_capability() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        read_client_frame(&mut server);
+        server
+            .write_all(&encode_frame(&reconnect_welcome(1, "0.0.1", "11".repeat(16), "")).unwrap())
+            .unwrap();
+        server
+            .write_all(
+                &encode_frame(&serde_json::json!({
+                    "profile_id": "profile-1",
+                    "capability": "g".repeat(64),
+                    "expires_at": 60,
+                    "idle_timeout_seconds": 30,
+                    "workspace_scopes": {"one": []},
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+    });
+    assert_eq!(
+        handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap_err(),
+        ClientError::UnexpectedMessage
+    );
+    worker.join().unwrap();
+}
+
+#[test]
+fn desktop_client_sends_the_capability_and_checks_the_response_id() {
+    for matching_id in [true, false] {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            complete_desktop_client_handshake(&mut server);
+            let request = read_client_value(&mut server);
+            assert_eq!(request["operation"], "thread.list");
+            assert_eq!(request["capability"], "33".repeat(32));
+            assert_eq!(request["body"], serde_json::json!({"limit": 20}));
+            let request_id = if matching_id {
+                request["request_id"].as_str().unwrap()
+            } else {
+                "00000000000000000000000000000073"
+            };
+            server
+                .write_all(
+                    &encode_frame(&Response {
+                        protocol: Protocol,
+                        request_id: Id::new(request_id).unwrap(),
+                        ok: Success,
+                        body: serde_json::json!({"threads": []}),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        });
+        let mut client = handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap();
+        let result = client.request(
+            Operation::ThreadList,
+            None,
+            serde_json::json!({"limit": 20}),
+        );
+        if matching_id {
+            assert_eq!(result.unwrap().body, serde_json::json!({"threads": []}));
+        } else {
+            assert_eq!(result.unwrap_err(), ClientError::UnexpectedMessage);
+        }
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn desktop_client_connects_at_a_path() {
+    let path = socket_path();
+    let listener = UnixListener::bind(&path).unwrap();
+    let worker = thread::spawn(move || {
+        let (mut server, _) = listener.accept().unwrap();
+        complete_desktop_client_handshake(&mut server);
+    });
+    assert_eq!(
+        connect_desktop_client_at(&path, "0.0.1", SHORT)
+            .unwrap()
+            .profile_id(),
+        "profile-1"
+    );
+    worker.join().unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn desktop_client_connects_through_the_runtime_directory() {
+    let _environment = ENVIRONMENT.lock().unwrap();
+    let runtime = std::env::temp_dir().join(format!(
+        "muniment-client-runtime-test-{}-{}",
+        std::process::id(),
+        NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+    ));
+    let attach_directory = runtime.join("muniment");
+    std::fs::create_dir_all(&attach_directory).unwrap();
+    let path = attach_directory.join("attach-v1.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let previous_runtime = std::env::var_os("XDG_RUNTIME_DIR");
+    std::env::set_var("XDG_RUNTIME_DIR", &runtime);
+    let worker = thread::spawn(move || {
+        let (mut server, _) = listener.accept().unwrap();
+        complete_desktop_client_handshake(&mut server);
+    });
+
+    let client = connect_desktop_client("0.0.1");
+    match previous_runtime {
+        Some(value) => std::env::set_var("XDG_RUNTIME_DIR", value),
+        None => std::env::remove_var("XDG_RUNTIME_DIR"),
+    }
+    assert_eq!(client.unwrap().profile_id(), "profile-1");
+    worker.join().unwrap();
+    std::fs::remove_dir_all(runtime).unwrap();
 }
 
 #[test]
