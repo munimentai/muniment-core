@@ -379,9 +379,11 @@ mod linux {
     use std::env;
     use std::fs::File;
     use std::io::{self, Read, Write};
-    use std::os::unix::io::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[repr(C)]
@@ -393,9 +395,25 @@ mod linux {
 
     unsafe extern "C" {
         fn poll(descriptors: *mut PollFd, count: usize, timeout: i32) -> i32;
+        fn socket(domain: i32, socket_type: i32, protocol: i32) -> i32;
+        fn connect(socket: i32, address: *const UnixSocketAddress, length: u32) -> i32;
+        fn getsockopt(
+            socket: i32,
+            level: i32,
+            option: i32,
+            value: *mut i32,
+            length: *mut u32,
+        ) -> i32;
     }
 
     const POLLIN: i16 = 0x001;
+    const POLLOUT: i16 = 0x004;
+
+    #[repr(C)]
+    struct UnixSocketAddress {
+        family: u16,
+        path: [u8; 108],
+    }
 
     const IO_TIMEOUT: Duration = Duration::from_secs(5);
     const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1365,6 +1383,33 @@ mod linux {
         io_timeout: Duration,
     }
 
+    #[derive(Clone, Debug, Default)]
+    pub struct ApprovalPresenterStopHandle {
+        inner: Arc<(Mutex<ApprovalPresenterStopState>, Condvar)>,
+    }
+
+    #[derive(Debug, Default)]
+    struct ApprovalPresenterStopState {
+        stopped: bool,
+        stream: Option<UnixStream>,
+    }
+
+    impl ApprovalPresenterStopHandle {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        pub fn stop(&self) {
+            let (state, wake) = &*self.inner;
+            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+            state.stopped = true;
+            if let Some(stream) = state.stream.take() {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+            wake.notify_all();
+        }
+    }
+
     impl std::fmt::Debug for ApprovalPresenterClient {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             formatter.write_str("ApprovalPresenterClient { .. }")
@@ -1725,6 +1770,133 @@ mod linux {
     ) -> Result<ApprovalPresenterClient, ClientError> {
         let stream = UnixStream::connect(endpoint).map_err(|_| ClientError::DesktopUnavailable)?;
         handshake_approval_presenter_stream(stream, client_version, io_timeout)
+    }
+
+    pub fn serve_approval_presenter_at(
+        endpoint: &Path,
+        client_version: &str,
+        io_timeout: Duration,
+        retry_interval: Duration,
+        stop: ApprovalPresenterStopHandle,
+        mut choose: impl FnMut(&ApprovalPresentRequest) -> ApprovalDecision,
+    ) {
+        loop {
+            let (state, wake) = &*stop.inner;
+            let connected = interruptible_connect(endpoint, &stop);
+
+            if let Some(stream) = connected {
+                if let Ok(mut presenter) =
+                    handshake_approval_presenter_stream(stream, client_version, io_timeout)
+                {
+                    let _ = presenter.serve(&mut choose);
+                }
+                let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+                state.stream = None;
+            }
+
+            let state = state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.stopped {
+                return;
+            }
+            let (state, _) = wake
+                .wait_timeout_while(state, retry_interval, |state| !state.stopped)
+                .unwrap_or_else(|error| error.into_inner());
+            if state.stopped {
+                return;
+            }
+        }
+    }
+
+    fn interruptible_connect(
+        endpoint: &Path,
+        stop: &ApprovalPresenterStopHandle,
+    ) -> Option<UnixStream> {
+        let path = endpoint.as_os_str().as_bytes();
+        if path.is_empty() || path.len() >= 108 || path.contains(&0) {
+            return None;
+        }
+        // SAFETY: The constants and arguments match Linux's socket(2) interface.
+        let descriptor = unsafe { socket(1, 1 | 0x800 | 0x80000, 0) };
+        if descriptor < 0 {
+            return None;
+        }
+        // SAFETY: `descriptor` is a new owned descriptor from socket(2).
+        let stream = unsafe { UnixStream::from_raw_fd(descriptor) };
+        let interrupt = stream.try_clone().ok()?;
+        let mut address = UnixSocketAddress {
+            family: 1,
+            path: [0; 108],
+        };
+        address.path[..path.len()].copy_from_slice(path);
+
+        let connect_result = {
+            let (state, _) = &*stop.inner;
+            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.stopped {
+                return None;
+            }
+            state.stream = Some(interrupt);
+            // SAFETY: `address` has a valid AF_UNIX family and a terminated pathname.
+            unsafe {
+                connect(
+                    descriptor,
+                    &address,
+                    (std::mem::size_of::<u16>() + path.len() + 1) as u32,
+                )
+            }
+        };
+        if connect_result < 0 && io::Error::last_os_error().raw_os_error() != Some(115) {
+            clear_presenter_stream(stop);
+            return None;
+        }
+
+        if connect_result < 0 {
+            let mut ready = PollFd {
+                fd: descriptor,
+                events: POLLOUT,
+                revents: 0,
+            };
+            loop {
+                // SAFETY: `ready` points to one valid pollfd for this call.
+                let result = unsafe { poll(&mut ready, 1, 50) };
+                let (state, _) = &*stop.inner;
+                if state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .stopped
+                {
+                    clear_presenter_stream(stop);
+                    return None;
+                }
+                if result > 0 {
+                    break;
+                }
+                if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                    clear_presenter_stream(stop);
+                    return None;
+                }
+            }
+            let mut error = 0;
+            let mut length = std::mem::size_of::<i32>() as u32;
+            // SAFETY: `error` and `length` are valid output pointers for SO_ERROR.
+            if unsafe { getsockopt(descriptor, 1, 4, &mut error, &mut length) } < 0 || error != 0 {
+                clear_presenter_stream(stop);
+                return None;
+            }
+        }
+        if stream.set_nonblocking(false).is_err() {
+            clear_presenter_stream(stop);
+            return None;
+        }
+        Some(stream)
+    }
+
+    fn clear_presenter_stream(stop: &ApprovalPresenterStopHandle) {
+        let (state, _) = &*stop.inner;
+        state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .stream = None;
     }
 
     fn endpoint_from_environment() -> Result<PathBuf, ClientError> {
@@ -2172,7 +2344,8 @@ mod linux {
 pub use linux::{
     connect_approval_presenter, connect_approval_presenter_at, handshake_approval_presenter_stream,
     handshake_migration_control_stream, handshake_stream, handshake_stream_with_credential,
-    ApprovalPresenterClient, AuthorizedClient, MigrationControlClient,
+    serve_approval_presenter_at, ApprovalPresenterClient, ApprovalPresenterStopHandle,
+    AuthorizedClient, MigrationControlClient,
 };
 
 #[cfg(not(target_os = "linux"))]

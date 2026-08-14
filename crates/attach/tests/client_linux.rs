@@ -8,17 +8,25 @@ use muniment_attach::{
     MigrationControlOutcome, PermissionDecision, PermissionKind, Protocol, ProtocolError, Response,
     RunStreamMessage, Success, VersionRange, MAX_FRAME_LENGTH,
 };
+use muniment_attach::{serve_approval_presenter_at, ApprovalPresenterStopHandle};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::Shutdown;
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 const SHORT: Duration = Duration::from_millis(100);
 static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
+
+unsafe extern "C" {
+    fn listen(socket: i32, backlog: i32) -> i32;
+}
 
 fn complete_approval_presenter_handshake(server: &mut UnixStream) {
     let hello = read_client_value(server);
@@ -256,6 +264,167 @@ fn approval_presenter_connects_and_serves_until_the_peer_closes() {
         .unwrap();
     assert_eq!(outcome, ApprovalPresenterServeOutcome::ConnectionClosed);
     server.join().unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn approval_presenter_reconnects_and_stops() {
+    let path = socket_path();
+    let listener = UnixListener::bind(&path).unwrap();
+    let stop = ApprovalPresenterStopHandle::new();
+    let worker_stop = stop.clone();
+    let (connected_tx, connected) = mpsc::channel();
+    let (check_tx, wait_for_stop) = mpsc::channel();
+    let server = thread::spawn(move || {
+        for (request_id, challenge) in [
+            ("00000000000000000000000000000073", "first"),
+            ("00000000000000000000000000000074", "second"),
+        ] {
+            let (mut stream, _) = listener.accept().unwrap();
+            complete_approval_presenter_handshake(&mut stream);
+            let mut request = approval_present_request();
+            request["request_id"] = serde_json::json!(request_id);
+            request["body"]["challenge"] = serde_json::json!(challenge);
+            stream.write_all(&encode_frame(&request).unwrap()).unwrap();
+            let response = read_client_value(&mut stream);
+            assert_eq!(response["request_id"], request_id);
+            assert_eq!(response["body"]["challenge"], challenge);
+            if challenge == "second" {
+                connected_tx.send(()).unwrap();
+                let mut byte = [0];
+                assert_eq!(stream.read(&mut byte).unwrap(), 0);
+            }
+        }
+        listener.set_nonblocking(true).unwrap();
+        wait_for_stop.recv_timeout(SHORT).unwrap();
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    });
+
+    let path_for_worker = path.clone();
+    let worker = thread::spawn(move || {
+        serve_approval_presenter_at(
+            &path_for_worker,
+            "0.0.1",
+            SHORT,
+            Duration::from_millis(10),
+            worker_stop,
+            |_| ApprovalDecision::Approve,
+        );
+    });
+    connected.recv_timeout(SHORT + SHORT).unwrap();
+    stop.stop();
+    worker.join().unwrap();
+    thread::sleep(Duration::from_millis(30));
+    check_tx.send(()).unwrap();
+    server.join().unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn approval_presenter_retries_failed_connect_and_refused_handshake() {
+    let path = socket_path();
+    let retry = Duration::from_millis(100);
+    let stop = ApprovalPresenterStopHandle::new();
+    let worker_stop = stop.clone();
+    let path_for_worker = path.clone();
+    let started_at = Instant::now();
+    let worker = thread::spawn(move || {
+        serve_approval_presenter_at(&path_for_worker, "0.0.1", SHORT, retry, worker_stop, |_| {
+            ApprovalDecision::Approve
+        });
+    });
+
+    thread::sleep(Duration::from_millis(30));
+    let listener = UnixListener::bind(&path).unwrap();
+    let (mut refused, _) = listener.accept().unwrap();
+    assert!(started_at.elapsed() >= retry.saturating_sub(Duration::from_millis(5)));
+    read_client_frame(&mut refused);
+    refused
+        .write_all(
+            &encode_frame(&ErrorEnvelope {
+                protocol: Protocol,
+                request_id: None,
+                ok: Failure,
+                error: ProtocolError::unauthorized(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    drop(refused);
+    let refused_at = Instant::now();
+
+    let (mut accepted, _) = listener.accept().unwrap();
+    assert!(refused_at.elapsed() >= retry.saturating_sub(Duration::from_millis(5)));
+    complete_approval_presenter_handshake(&mut accepted);
+    stop.stop();
+    worker.join().unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn approval_presenter_stop_interrupts_a_blocked_connect() {
+    let path = socket_path();
+    let listener = UnixListener::bind(&path).unwrap();
+    // SAFETY: The listener owns a valid socket descriptor for this call.
+    assert_eq!(unsafe { listen(listener.as_raw_fd(), 0) }, 0);
+    let queued = UnixStream::connect(&path).unwrap();
+    let stop = ApprovalPresenterStopHandle::new();
+    let worker_stop = stop.clone();
+    let path_for_worker = path.clone();
+    let (returned_tx, returned) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        serve_approval_presenter_at(&path_for_worker, "0.0.1", SHORT, SHORT, worker_stop, |_| {
+            ApprovalDecision::Approve
+        });
+        returned_tx.send(()).unwrap();
+    });
+    thread::sleep(Duration::from_millis(20));
+
+    let (stopped, stopped_rx) = mpsc::channel();
+    let stopper = thread::spawn(move || {
+        stop.stop();
+        stopped.send(()).unwrap();
+    });
+    assert!(
+        stopped_rx.recv_timeout(SHORT).is_ok(),
+        "stop did not interrupt the blocked connection attempt"
+    );
+    assert!(
+        returned.recv_timeout(SHORT).is_ok(),
+        "serve did not return while the connection attempt was blocked"
+    );
+    stopper.join().unwrap();
+    worker.join().unwrap();
+    drop(queued);
+    drop(listener);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn approval_presenter_rejects_an_endpoint_with_a_nul_byte() {
+    let path = socket_path();
+    let listener = UnixListener::bind(&path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut endpoint = path.as_os_str().as_bytes().to_vec();
+    endpoint.extend_from_slice(b"\0ignored");
+    let endpoint = PathBuf::from(std::ffi::OsString::from_vec(endpoint));
+    let stop = ApprovalPresenterStopHandle::new();
+    let worker_stop = stop.clone();
+    let worker = thread::spawn(move || {
+        serve_approval_presenter_at(&endpoint, "0.0.1", SHORT, SHORT, worker_stop, |_| {
+            ApprovalDecision::Approve
+        });
+    });
+
+    thread::sleep(Duration::from_millis(20));
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    stop.stop();
+    worker.join().unwrap();
+    drop(listener);
     std::fs::remove_file(path).unwrap();
 }
 
