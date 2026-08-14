@@ -96,7 +96,7 @@ fn verified_peer_receives_workspace_grant_without_client_credential() {
     let (mut client, server) = UnixStream::pair().unwrap();
     client.write_all(&hello(1, 1)).unwrap();
 
-    let (returned_stream, capability) = admit_desktop_client(
+    let (returned_stream, session) = admit_desktop_client(
         server,
         credentials(),
         &executable,
@@ -114,12 +114,22 @@ fn verified_peer_receives_workspace_grant_without_client_credential() {
     assert!(welcome.approval_challenge.is_empty());
     let grant: MigrationControlAuthorized = read_frame(&mut client);
     assert_hex(&grant.capability, 64);
-    assert_eq!(grant.capability, capability);
+    assert_eq!(grant.capability, session.capability);
     assert_eq!(grant.profile_id, "profile-1");
     assert_eq!(grant.expires_at, 90);
     assert_eq!(grant.idle_timeout_seconds, 90);
     assert_eq!(grant.workspace_scopes.len(), 1);
     assert_eq!(grant.workspace_scopes["/work/signed"], approval().scopes);
+    assert_eq!(session.workspace, "/work/signed");
+    assert_eq!(
+        session.client_identity,
+        "018f0000-0000-7000-8000-000000000099"
+    );
+    assert_eq!(session.provenance.profile, "profile-1");
+    assert_eq!(session.provenance.companion_kind, "untrusted-claim");
+    assert_eq!(session.provenance.companion_version, "99.0.0");
+    assert_eq!(session.provenance.peer_uid, 1000);
+    assert_eq!(session.provenance.peer_pid, 424242);
     returned_stream.shutdown(std::net::Shutdown::Both).unwrap();
 }
 

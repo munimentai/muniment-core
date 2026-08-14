@@ -13,11 +13,20 @@ use muniment_attach::{
 };
 
 use super::deadline_io::{is_timeout, read_exact_before, write_all_before};
-use super::linux::PeerCredentials;
+use super::linux::{CompanionProvenance, PeerCredentials};
 use super::{verify_desktop_client_peer_with_reader, Approval};
 use crate::browser_control::LinuxProcReader;
 
 const DESKTOP_PROTOCOL: VersionRange = VersionRange { min: 1, max: 1 };
+
+/// Authority and provenance carried by an admitted desktop client session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopClientSession {
+    pub capability: String,
+    pub workspace: String,
+    pub client_identity: String,
+    pub provenance: CompanionProvenance,
+}
 
 /// Closed outcomes from desktop client admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,7 +49,7 @@ pub fn admit_desktop_client(
     runtime_version: &str,
     approval: Approval,
     timeout: Duration,
-) -> Result<(UnixStream, String), DesktopClientAdmissionError> {
+) -> Result<(UnixStream, DesktopClientSession), DesktopClientAdmissionError> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or(DesktopClientAdmissionError::Timeout)?;
@@ -74,6 +83,14 @@ pub fn admit_desktop_client(
             return Err(DesktopClientAdmissionError::MalformedFrame);
         }
     };
+    let (client_identity, companion_kind, companion_version) = match &message {
+        FirstMessage::Hello(hello) => (
+            hello.authorized_client_id.as_str().to_owned(),
+            hello.client.kind.clone(),
+            hello.client.version.clone(),
+        ),
+        FirstMessage::Other(_) => (String::new(), String::new(), String::new()),
+    };
     let selected = match muniment_attach::negotiate_first(message, DESKTOP_PROTOCOL) {
         Ok(selected) => selected,
         Err(NegotiationError::Incompatible(error)) => {
@@ -100,9 +117,9 @@ pub fn admit_desktop_client(
     getrandom::fill(&mut capability_bytes).map_err(|_| DesktopClientAdmissionError::Randomness)?;
     let capability = hex(&capability_bytes);
     let mut workspace_scopes = BTreeMap::new();
-    workspace_scopes.insert(approval.workspace, approval.scopes);
+    workspace_scopes.insert(approval.workspace.clone(), approval.scopes);
     let grant = MigrationControlAuthorized {
-        profile_id: approval.profile,
+        profile_id: approval.profile.clone(),
         capability: capability.clone(),
         expires_at: approval.lifetime.as_secs(),
         idle_timeout_seconds: approval.lifetime.as_secs(),
@@ -115,7 +132,21 @@ pub fn admit_desktop_client(
     )
     .map_err(map_io_error)?;
 
-    Ok((stream, capability))
+    Ok((
+        stream,
+        DesktopClientSession {
+            capability,
+            workspace: approval.workspace,
+            client_identity,
+            provenance: CompanionProvenance {
+                profile: approval.profile,
+                companion_kind,
+                companion_version,
+                peer_uid: peer_credentials.uid,
+                peer_pid: peer_credentials.pid as u32,
+            },
+        },
+    ))
 }
 
 fn write_protocol_error(stream: &mut UnixStream, error: ProtocolError, deadline: Instant) {
