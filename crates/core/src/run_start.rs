@@ -88,6 +88,23 @@ pub trait RunAttachBoundaries {
         Err(ProtocolError::unsupported_operation())
     }
     #[cfg(target_os = "linux")]
+    fn rename_thread(
+        &self,
+        _thread_id: &str,
+        _title: &str,
+        _provenance: Provenance,
+    ) -> Result<(), ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(target_os = "linux")]
+    fn delete_thread(
+        &self,
+        _thread_id: &str,
+        _provenance: Provenance,
+    ) -> Result<(), ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(target_os = "linux")]
     fn stream_run(
         &self,
         workspace: &str,

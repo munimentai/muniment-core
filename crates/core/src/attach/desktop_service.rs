@@ -240,6 +240,84 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
     }
 
+    fn rename_thread(
+        &mut self,
+        workspace: &str,
+        thread_id: &Id,
+        title: &str,
+        request_id: &Id,
+        idempotency_key: &Id,
+        companion: CompanionProvenance,
+    ) -> Result<(), ProtocolError> {
+        let canonical_input = json!({
+            "workspace": workspace,
+            "thread_id": thread_id.as_str(),
+            "title": title,
+        });
+        let ledger_request = AttachRequest {
+            protocol: Protocol,
+            request_id: request_id.clone(),
+            operation: Operation::ThreadRename,
+            capability: String::new(),
+            idempotency_key: Some(idempotency_key.clone()),
+            body: canonical_input.clone(),
+        };
+        let provenance = attach_provenance(request_id, idempotency_key, &companion);
+        self.idempotency.execute(
+            &companion.profile,
+            &ledger_request,
+            &canonical_input,
+            || Ok(()),
+            || {
+                self.boundaries
+                    .rename_thread(thread_id.as_str(), title, provenance)?;
+                Ok(CommittedResult {
+                    body: json!({}),
+                    cursor: None,
+                })
+            },
+        )?;
+        Ok(())
+    }
+
+    fn delete_thread(
+        &mut self,
+        workspace: &str,
+        thread_id: &Id,
+        request_id: &Id,
+        idempotency_key: &Id,
+        companion: CompanionProvenance,
+    ) -> Result<(), ProtocolError> {
+        let canonical_input = json!({
+            "workspace": workspace,
+            "thread_id": thread_id.as_str(),
+        });
+        let ledger_request = AttachRequest {
+            protocol: Protocol,
+            request_id: request_id.clone(),
+            operation: Operation::ThreadDelete,
+            capability: String::new(),
+            idempotency_key: Some(idempotency_key.clone()),
+            body: canonical_input.clone(),
+        };
+        let provenance = attach_provenance(request_id, idempotency_key, &companion);
+        self.idempotency.execute(
+            &companion.profile,
+            &ledger_request,
+            &canonical_input,
+            || Ok(()),
+            || {
+                self.boundaries
+                    .delete_thread(thread_id.as_str(), provenance)?;
+                Ok(CommittedResult {
+                    body: json!({}),
+                    cursor: None,
+                })
+            },
+        )?;
+        Ok(())
+    }
+
     fn start_run(
         &mut self,
         workspace: &str,
@@ -527,6 +605,32 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
     }
 }
 
+fn attach_provenance(
+    request_id: &Id,
+    idempotency_key: &Id,
+    companion: &CompanionProvenance,
+) -> Provenance {
+    let mut extra = BTreeMap::new();
+    extra.insert("attach_profile".into(), json!(&companion.profile));
+    extra.insert("companion_kind".into(), json!(&companion.companion_kind));
+    extra.insert(
+        "companion_version".into(),
+        json!(&companion.companion_version),
+    );
+    extra.insert("peer_uid".into(), json!(companion.peer_uid));
+    extra.insert("peer_pid".into(), json!(companion.peer_pid));
+    extra.insert("idempotency_key".into(), json!(idempotency_key.as_str()));
+    Provenance {
+        source: "muniment-attach".into(),
+        source_version: env!("CARGO_PKG_VERSION").into(),
+        actor_id: None,
+        device_id: None,
+        rpc_request_id: Some(request_id.as_str().to_owned()),
+        capability_versions: None,
+        extra,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,6 +812,48 @@ mod tests {
                 .map_err(|_| ProtocolError::persistence_failed())?
                 .create_thread(workspace, "2026-01-01T00:00:00Z", provenance)
                 .map_err(|_| ProtocolError::persistence_failed())
+        }
+
+        #[cfg(target_os = "linux")]
+        fn rename_thread(
+            &self,
+            thread_id: &str,
+            title: &str,
+            provenance: Provenance,
+        ) -> Result<(), ProtocolError> {
+            let mut journal = self
+                .journal
+                .lock()
+                .map_err(|_| ProtocolError::persistence_failed())?;
+            crate::journal::thread_mutation::append_thread_rename(
+                &mut journal,
+                Some("owner"),
+                thread_id,
+                title,
+                "2026-01-01T00:00:01Z",
+                &provenance,
+            )
+            .map_err(|_| ProtocolError::persistence_failed())
+        }
+
+        #[cfg(target_os = "linux")]
+        fn delete_thread(
+            &self,
+            thread_id: &str,
+            provenance: Provenance,
+        ) -> Result<(), ProtocolError> {
+            let mut journal = self
+                .journal
+                .lock()
+                .map_err(|_| ProtocolError::persistence_failed())?;
+            crate::journal::thread_mutation::append_thread_delete(
+                &mut journal,
+                Some("owner"),
+                thread_id,
+                "2026-01-01T00:00:01Z",
+                &provenance,
+            )
+            .map_err(|_| ProtocolError::persistence_failed())
         }
 
         #[cfg(target_os = "linux")]
@@ -1645,6 +1791,73 @@ mod tests {
             capability_versions: None,
             extra: BTreeMap::new(),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn attach_thread_mutations_replay_without_second_events() {
+        let (mut service, thread_id, _) = attach_service_with_thread();
+        let thread_id = Id::new(thread_id).unwrap();
+        let rename_key = Id::new("018f0000-0000-7000-8000-000000000030").unwrap();
+        let delete_key = Id::new("018f0000-0000-7000-8000-000000000031").unwrap();
+        let companion = CompanionProvenance {
+            profile: "default".into(),
+            companion_kind: "cli".into(),
+            companion_version: "1.2.3".into(),
+            peer_uid: 1000,
+            peer_pid: 42,
+        };
+
+        for request_id in [
+            "018f0000-0000-7000-8000-000000000032",
+            "018f0000-0000-7000-8000-000000000033",
+        ] {
+            service
+                .rename_thread(
+                    "workspace-a",
+                    &thread_id,
+                    "New title",
+                    &Id::new(request_id).unwrap(),
+                    &rename_key,
+                    companion.clone(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            service
+                .boundaries
+                .journal
+                .lock()
+                .unwrap()
+                .last_thread_seq(thread_id.as_str())
+                .unwrap(),
+            2
+        );
+
+        for request_id in [
+            "018f0000-0000-7000-8000-000000000034",
+            "018f0000-0000-7000-8000-000000000035",
+        ] {
+            service
+                .delete_thread(
+                    "workspace-a",
+                    &thread_id,
+                    &Id::new(request_id).unwrap(),
+                    &delete_key,
+                    companion.clone(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            service
+                .boundaries
+                .journal
+                .lock()
+                .unwrap()
+                .last_thread_seq(thread_id.as_str())
+                .unwrap(),
+            3
+        );
     }
 
     #[cfg(target_os = "linux")]
