@@ -91,10 +91,62 @@ fn verified_desktop_routes_to_approval_presenter_without_consuming_hello() {
 }
 
 #[test]
-fn handoff_probe_routes_to_companion() {
+fn verified_desktop_client_routes_to_desktop_client_without_consuming_hello() {
     let (expected, reader) = expected_and_reader();
     let (mut client, server) = UnixStream::pair().unwrap();
-    client.write_all(&hello("desktop-handoff-probe")).unwrap();
+    let frame = hello("desktop-client");
+    client.write_all(&frame).unwrap();
+    server
+        .set_read_timeout(Some(Duration::from_secs(17)))
+        .unwrap();
+
+    assert_eq!(
+        name_attach_connection_route(
+            &server,
+            credentials(),
+            &expected,
+            &reader,
+            Duration::from_secs(1),
+        ),
+        AttachConnectionRoute::DesktopClient
+    );
+    assert_eq!(
+        server.read_timeout().unwrap(),
+        Some(Duration::from_secs(17))
+    );
+    let mut received = vec![0_u8; frame.len()];
+    (&server).read_exact(&mut received).unwrap();
+    assert_eq!(received, frame);
+}
+
+#[test]
+fn handoff_probe_and_unknown_kind_route_to_companion() {
+    let (expected, reader) = expected_and_reader();
+    for kind in ["desktop-handoff-probe", "unknown"] {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&hello(kind)).unwrap();
+
+        assert_eq!(
+            name_attach_connection_route(
+                &server,
+                credentials(),
+                &expected,
+                &reader,
+                Duration::from_secs(1),
+            ),
+            AttachConnectionRoute::Companion
+        );
+    }
+}
+
+#[test]
+fn unverified_desktop_client_routes_to_companion() {
+    let (expected, _) = expected_and_reader();
+    let reader = FakeProcReader {
+        executable: Some(fs::canonicalize("/bin/sh").unwrap()),
+    };
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello("desktop-client")).unwrap();
 
     assert_eq!(
         name_attach_connection_route(

@@ -18,6 +18,7 @@ const ROUTE_PEEK_CAP: usize = 4 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttachConnectionRoute {
     ApprovalPresenter,
+    DesktopClient,
     Companion,
 }
 
@@ -48,13 +49,16 @@ pub fn name_attach_connection_route(
         return AttachConnectionRoute::Companion;
     };
 
-    let route = peek_hello(stream, deadline).map_or(AttachConnectionRoute::Companion, |hello| {
-        if hello.client.kind == "desktop" {
-            AttachConnectionRoute::ApprovalPresenter
-        } else {
-            AttachConnectionRoute::Companion
-        }
-    });
+    let route =
+        peek_hello(stream, deadline).map_or(AttachConnectionRoute::Companion, |hello| match hello
+            .client
+            .kind
+            .as_str()
+        {
+            "desktop" => AttachConnectionRoute::ApprovalPresenter,
+            "desktop-client" => AttachConnectionRoute::DesktopClient,
+            _ => AttachConnectionRoute::Companion,
+        });
     let _ = stream.set_read_timeout(previous_timeout);
     route
 }
