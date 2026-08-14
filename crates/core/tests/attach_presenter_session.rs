@@ -74,6 +74,51 @@ fn returns_each_presented_desktop_choice() {
 }
 
 #[test]
+fn denies_an_answer_with_a_different_request_id() {
+    let coordinator = ApprovalCoordinator::default();
+    let (runtime, mut desktop) = UnixStream::pair().unwrap();
+    let _session = serve_approval_presenter(
+        coordinator.clone(),
+        ApprovalPresenterConnection::new(runtime, "presenter-capability"),
+    )
+    .unwrap();
+    let server = thread::spawn(move || {
+        let mut request = read_request(&mut desktop);
+        request.request_id =
+            serde_json::from_value(json!("00000000-0000-0000-0000-000000000000")).unwrap();
+        answer(&mut desktop, &request, "approve");
+    });
+
+    assert!(!coordinator.request(
+        approval_request("mismatched-request-id"),
+        Duration::from_secs(1)
+    ));
+    server.join().unwrap();
+}
+
+#[test]
+fn denies_an_answer_with_a_different_challenge() {
+    let coordinator = ApprovalCoordinator::default();
+    let (runtime, mut desktop) = UnixStream::pair().unwrap();
+    let _session = serve_approval_presenter(
+        coordinator.clone(),
+        ApprovalPresenterConnection::new(runtime, "presenter-capability"),
+    )
+    .unwrap();
+    let server = thread::spawn(move || {
+        let mut request = read_request(&mut desktop);
+        request.body["challenge"] = json!("different-challenge");
+        answer(&mut desktop, &request, "approve");
+    });
+
+    assert!(!coordinator.request(
+        approval_request("mismatched-challenge"),
+        Duration::from_secs(1)
+    ));
+    server.join().unwrap();
+}
+
+#[test]
 fn rejects_a_second_session_and_allows_one_after_release() {
     let coordinator = ApprovalCoordinator::default();
     let (first, _first_peer) = UnixStream::pair().unwrap();
