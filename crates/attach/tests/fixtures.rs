@@ -7,6 +7,7 @@ use std::{
 use std::sync::{atomic::AtomicBool, Arc};
 
 use muniment_attach::fixtures::{export, open_generation, Mode, FIXTURE_DIRECTORY};
+use muniment_attach::{Hello, MigrationControlAuthorized};
 
 static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
@@ -48,6 +49,28 @@ fn export_is_deterministic_and_replaces_obsolete_files() {
     assert!(before.iter().all(|(_, bytes)| {
         bytes.ends_with(b"\n") && !bytes[..bytes.len() - 1].ends_with(b"\n")
     }));
+}
+
+#[test]
+fn export_includes_desktop_client_admission_fixtures() {
+    let root = TestDirectory::new();
+    export(&root.0, Mode::Write).unwrap();
+    let directory = fixture_dir(&root.0);
+
+    let hello: Hello = serde_json::from_slice(
+        &fs::read(directory.join("negotiation-hello-desktop-client.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(hello.client.kind, "desktop-client");
+    assert!(hello.authorized_client_credential.is_none());
+
+    let grant: MigrationControlAuthorized = serde_json::from_slice(
+        &fs::read(directory.join("authorization-desktop-client.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(!grant.profile_id.is_empty());
+    assert_eq!(grant.capability.len(), 64);
+    assert_eq!(grant.workspace_scopes.len(), 1);
 }
 
 #[test]

@@ -10,8 +10,9 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::{
-    Authorization, Client, ErrorEnvelope, Event, EventName, Failure, Hello, Id, Operation,
-    Protocol, ProtocolError, Request, Response, Success, VersionRange, Welcome,
+    Authorization, Client, ErrorEnvelope, Event, EventName, Failure, Hello, Id,
+    MigrationControlAuthorized, Operation, Protocol, ProtocolError, Request, Response, Success,
+    VersionRange, Welcome,
 };
 
 pub const FIXTURE_DIRECTORY: &str = "muniment.attach/1";
@@ -453,6 +454,21 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
     )?;
     insert(
         &mut fixtures,
+        "negotiation-hello-desktop-client.json",
+        &Hello {
+            protocol: Protocol,
+            client: Client {
+                kind: "desktop-client".into(),
+                version: "0.0.1".into(),
+            },
+            supported: VersionRange { min: 1, max: 1 },
+            client_nonce: "fixture-client-nonce".into(),
+            authorized_client_id: Id::new("018f0000-0000-7000-8000-000000000097").unwrap(),
+            authorized_client_credential: None,
+        },
+    )?;
+    insert(
+        &mut fixtures,
         "negotiation-welcome.json",
         &Welcome {
             selected: 1,
@@ -487,6 +503,22 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
                 .into_iter()
                 .collect(),
         ),
+    )?;
+    insert(
+        &mut fixtures,
+        "authorization-desktop-client.json",
+        &MigrationControlAuthorized {
+            profile_id: "profile-1".into(),
+            capability: "33".repeat(32),
+            expires_at: 60,
+            idle_timeout_seconds: 30,
+            workspace_scopes: [(
+                "/work/signed".into(),
+                BTreeSet::from(["threads:read".into()]),
+            )]
+            .into_iter()
+            .collect(),
+        },
     )?;
 
     let operations = [
@@ -922,7 +954,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            48,
+            50,
             "every canonical fixture must be inventoried"
         );
     }
