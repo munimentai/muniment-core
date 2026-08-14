@@ -4993,20 +4993,6 @@ fn unserved_operations_remain_unsupported_without_dispatch() {
             json!({"text": "private steer"}),
         ))
         .unwrap();
-    client
-        .write_all(&request_with_idempotency(
-            191,
-            Operation::ThreadRename,
-            json!({"thread_id": "thread-1", "title": "Renamed thread"}),
-        ))
-        .unwrap();
-    client
-        .write_all(&request_with_idempotency(
-            192,
-            Operation::ThreadDelete,
-            json!({"thread_id": "thread-1"}),
-        ))
-        .unwrap();
     client.shutdown(Shutdown::Write).unwrap();
     let mut approved = approval();
     approved.scopes.insert("run.write".into());
@@ -5021,7 +5007,7 @@ fn unserved_operations_remain_unsupported_without_dispatch() {
         ),
         Ok(())
     );
-    for id in [79, 80, 191, 192] {
+    for id in [79, 80] {
         let error: ErrorEnvelope = read_frame(&mut client);
         assert_eq!(
             error.request_id,
@@ -5030,6 +5016,46 @@ fn unserved_operations_remain_unsupported_without_dispatch() {
         assert_eq!(error.error.code(), ErrorCode::UnsupportedOperation);
     }
     assert!(service.calls.is_empty());
+}
+
+#[test]
+fn companion_refuses_desktop_only_thread_mutations() {
+    for (id, operation, body) in [
+        (
+            191,
+            Operation::ThreadRename,
+            json!({"thread_id":"0190a100-0000-7000-8000-000000000001","title":"Renamed thread"}),
+        ),
+        (
+            192,
+            Operation::ThreadDelete,
+            json!({"thread_id":"0190a100-0000-7000-8000-000000000001"}),
+        ),
+    ] {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&hello(1, 1)).unwrap();
+        client
+            .write_all(&request_with_idempotency(id, operation, body))
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut approved = approval();
+        approved.scopes.insert("run.write".into());
+        let mut service = StartService::default();
+
+        assert_eq!(
+            dispatch_session_with_approval(
+                &mut client,
+                server,
+                TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                approved,
+                &mut service,
+            ),
+            Err(AttachSessionError::Authorization)
+        );
+        let error: ErrorEnvelope = read_frame(&mut client);
+        assert_eq!(error.error.code(), ErrorCode::Unauthorized);
+        assert!(service.calls.is_empty());
+    }
 }
 
 #[test]

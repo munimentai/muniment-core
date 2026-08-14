@@ -13,6 +13,7 @@ use muniment_core::attach::{
     decode_frame, encode_frame, DesktopClientSession, Envelope, ErrorCode, EventName, Id,
     Operation, Protocol, ProtocolError, Request, WorkspaceOnboardRequest, WorkspaceOnboarded,
 };
+use muniment_core::journal::MAX_THREAD_TITLE_CHARS;
 use muniment_core::journal::{CommitSubscription, JournalCommitHint, RunEventProjection};
 
 struct TestService;
@@ -71,6 +72,157 @@ fn idempotent_request(id: &str, operation: Operation, body: serde_json::Value) -
     let mut request = request(id, operation, "admitted", body);
     request.idempotency_key = Some(Id::new("018f0000-0000-7000-8000-000000000299").unwrap());
     request
+}
+
+#[derive(Default)]
+struct ThreadMutationService {
+    renames: Vec<(String, Id, String, Id, Id, CompanionProvenance)>,
+    deletes: Vec<(String, Id, Id, Id, CompanionProvenance)>,
+}
+
+impl ThreadListService for ThreadMutationService {
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, ProtocolError> {
+        unreachable!()
+    }
+
+    fn rename_thread(
+        &mut self,
+        workspace: &str,
+        thread_id: &Id,
+        title: &str,
+        request_id: &Id,
+        idempotency_key: &Id,
+        provenance: CompanionProvenance,
+    ) -> Result<(), ProtocolError> {
+        self.renames.push((
+            workspace.into(),
+            thread_id.clone(),
+            title.into(),
+            request_id.clone(),
+            idempotency_key.clone(),
+            provenance,
+        ));
+        Ok(())
+    }
+
+    fn delete_thread(
+        &mut self,
+        workspace: &str,
+        thread_id: &Id,
+        request_id: &Id,
+        idempotency_key: &Id,
+        provenance: CompanionProvenance,
+    ) -> Result<(), ProtocolError> {
+        self.deletes.push((
+            workspace.into(),
+            thread_id.clone(),
+            request_id.clone(),
+            idempotency_key.clone(),
+            provenance,
+        ));
+        Ok(())
+    }
+}
+
+#[test]
+fn desktop_client_dispatches_thread_mutations() {
+    let thread_id = "0190a100-0000-7000-8000-000000000001";
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let session_thread = std::thread::spawn(move || {
+        let mut service = ThreadMutationService::default();
+        let result = serve_desktop_client_session(server, &session(), &mut service);
+        (result, service)
+    });
+
+    for request in [
+        idempotent_request(
+            "018f0000-0000-7000-8000-000000000230",
+            Operation::ThreadRename,
+            serde_json::json!({"thread_id":thread_id,"title":"Renamed thread"}),
+        ),
+        idempotent_request(
+            "018f0000-0000-7000-8000-000000000231",
+            Operation::ThreadDelete,
+            serde_json::json!({"thread_id":thread_id}),
+        ),
+    ] {
+        let Envelope::Response(response) = exchange(&mut client, request) else {
+            panic!("thread mutation did not return a response");
+        };
+        assert_eq!(response.body, serde_json::json!({}));
+    }
+
+    drop(client);
+    let (result, service) = session_thread.join().unwrap();
+    assert_eq!(result, Ok(()));
+    assert_eq!(service.renames.len(), 1);
+    assert_eq!(service.deletes.len(), 1);
+    assert_eq!(service.renames[0].0, "/work/signed");
+    assert_eq!(service.renames[0].1.as_str(), thread_id);
+    assert_eq!(service.renames[0].2, "Renamed thread");
+    assert_eq!(
+        service.renames[0].3.as_str(),
+        "018f0000-0000-7000-8000-000000000230"
+    );
+    assert_eq!(
+        service.renames[0].4.as_str(),
+        "018f0000-0000-7000-8000-000000000299"
+    );
+    assert_eq!(
+        service.deletes[0].2.as_str(),
+        "018f0000-0000-7000-8000-000000000231"
+    );
+    assert_eq!(
+        service.deletes[0].3.as_str(),
+        "018f0000-0000-7000-8000-000000000299"
+    );
+}
+
+#[test]
+fn desktop_thread_mutations_validate_idempotency_and_title() {
+    let thread_id = "0190a100-0000-7000-8000-000000000001";
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let session_thread = std::thread::spawn(move || {
+        let mut service = ThreadMutationService::default();
+        let result = serve_desktop_client_session(server, &session(), &mut service);
+        (result, service)
+    });
+
+    let Envelope::Error(error) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000232",
+            Operation::ThreadDelete,
+            "admitted",
+            serde_json::json!({"thread_id":thread_id}),
+        ),
+    ) else {
+        panic!("missing idempotency key did not return an error");
+    };
+    assert_eq!(error.error.code(), ErrorCode::IdempotencyKeyRequired);
+
+    let long_title = "x".repeat(MAX_THREAD_TITLE_CHARS + 1);
+    let Envelope::Error(error) = exchange(
+        &mut client,
+        idempotent_request(
+            "018f0000-0000-7000-8000-000000000233",
+            Operation::ThreadRename,
+            serde_json::json!({"thread_id":thread_id,"title":long_title}),
+        ),
+    ) else {
+        panic!("long title did not return an error");
+    };
+    assert_eq!(error.error.code(), ErrorCode::InvalidRequest);
+
+    drop(client);
+    let (result, service) = session_thread.join().unwrap();
+    assert_eq!(result, Ok(()));
+    assert!(service.renames.is_empty());
+    assert!(service.deletes.is_empty());
 }
 
 #[test]

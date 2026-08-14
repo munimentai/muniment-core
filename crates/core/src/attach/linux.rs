@@ -28,7 +28,9 @@ use super::{
     MAX_RUN_STREAM_WINDOW_TEXT_BYTES,
 };
 use crate::browser_control::LinuxProcReader;
-use crate::journal::{thread_summaries::ThreadSummaryListError, RunEventPageError, RunJournal};
+use crate::journal::{
+    thread_summaries::ThreadSummaryListError, RunEventPageError, RunJournal, MAX_THREAD_TITLE_CHARS,
+};
 
 const ATTACH_DIRECTORY: &[u8] = b"muniment\0";
 const ENDPOINT_NAME: &str = "attach-v1.sock";
@@ -913,6 +915,29 @@ pub trait ThreadListService {
         _idempotency_key: &super::Id,
         _provenance: CompanionProvenance,
     ) -> Result<ThreadCreateAccepted, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn rename_thread(
+        &mut self,
+        _workspace: &str,
+        _thread_id: &super::Id,
+        _title: &str,
+        _request_id: &super::Id,
+        _idempotency_key: &super::Id,
+        _provenance: CompanionProvenance,
+    ) -> Result<(), ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn delete_thread(
+        &mut self,
+        _workspace: &str,
+        _thread_id: &super::Id,
+        _request_id: &super::Id,
+        _idempotency_key: &super::Id,
+        _provenance: CompanionProvenance,
+    ) -> Result<(), ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
 
@@ -2147,6 +2172,18 @@ where
             );
             return Err(AttachSessionError::Authorization);
         }
+        if matches!(
+            request.operation,
+            Operation::ThreadRename | Operation::ThreadDelete
+        ) {
+            write_request_error(
+                stream,
+                Some(request.request_id),
+                ProtocolError::unauthorized(),
+                deadline,
+            );
+            return Err(AttachSessionError::Authorization);
+        }
         let required_scope = match request.operation {
             Operation::WorkspaceOnboard | Operation::HomeEnsure => None,
             Operation::ThreadList
@@ -2154,8 +2191,6 @@ where
             | Operation::RunStream
             | Operation::RunCursorAck => Some("thread.read"),
             Operation::ThreadCreate
-            | Operation::ThreadRename
-            | Operation::ThreadDelete
             | Operation::RunStart
             | Operation::RunCancel
             | Operation::PermissionAnswer => Some("run.write"),
@@ -2608,11 +2643,56 @@ fn dispatch_request<S: ThreadListService>(
             "thread_id": accepted.thread_id,
         })));
     }
-    if matches!(
-        request.operation,
-        Operation::ThreadRename | Operation::ThreadDelete
-    ) {
-        return Err(ProtocolError::unsupported_operation().into());
+    if request.operation == Operation::ThreadRename {
+        let idempotency_key = request
+            .idempotency_key
+            .as_ref()
+            .ok_or_else(ProtocolError::idempotency_key_required)?;
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            thread_id: String,
+            title: String,
+        }
+        let body: Body =
+            serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
+        let thread_id =
+            super::Id::new(body.thread_id).map_err(|_| ProtocolError::invalid_request())?;
+        if body.title.is_empty() || body.title.chars().count() > MAX_THREAD_TITLE_CHARS {
+            return Err(ProtocolError::invalid_request().into());
+        }
+        service.rename_thread(
+            workspace,
+            &thread_id,
+            &body.title,
+            &request.request_id,
+            idempotency_key,
+            provenance,
+        )?;
+        return Ok(response_only(serde_json::json!({})));
+    }
+    if request.operation == Operation::ThreadDelete {
+        let idempotency_key = request
+            .idempotency_key
+            .as_ref()
+            .ok_or_else(ProtocolError::idempotency_key_required)?;
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            thread_id: String,
+        }
+        let body: Body =
+            serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
+        let thread_id =
+            super::Id::new(body.thread_id).map_err(|_| ProtocolError::invalid_request())?;
+        service.delete_thread(
+            workspace,
+            &thread_id,
+            &request.request_id,
+            idempotency_key,
+            provenance,
+        )?;
+        return Ok(response_only(serde_json::json!({})));
     }
     if request.operation == Operation::RunCursorAck {
         #[derive(serde::Deserialize)]
