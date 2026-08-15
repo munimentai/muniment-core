@@ -6,12 +6,16 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use muniment_core::attach::linux::{
-    serve_desktop_client_session, CompanionProvenance, RunStartAccepted, RunStartRequest,
-    RunStreamPage, ThreadListPage, ThreadListRequest, ThreadListService,
+    serve_desktop_client_session, CompanionProvenance, EntitlementSnapshotResult, RunStartAccepted,
+    RunStartRequest, RunStreamPage, ThreadListPage, ThreadListRequest, ThreadListService,
 };
 use muniment_core::attach::{
     decode_frame, encode_frame, DesktopClientSession, Envelope, ErrorCode, EventName, Id,
     Operation, Protocol, ProtocolError, Request, WorkspaceOnboardRequest, WorkspaceOnboarded,
+};
+use muniment_core::auth::{
+    AuthStatus, EntitlementSnapshotView, NativeDeviceList, NativeEntitlementGroup,
+    NativeSessionRole,
 };
 use muniment_core::journal::MAX_THREAD_TITLE_CHARS;
 use muniment_core::journal::{CommitSubscription, JournalCommitHint, RunEventProjection};
@@ -72,6 +76,275 @@ fn idempotent_request(id: &str, operation: Operation, body: serde_json::Value) -
     let mut request = request(id, operation, "admitted", body);
     request.idempotency_key = Some(Id::new("018f0000-0000-7000-8000-000000000299").unwrap());
     request
+}
+
+#[derive(Default)]
+struct SessionService {
+    calls: Vec<Operation>,
+}
+
+impl ThreadListService for SessionService {
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, ProtocolError> {
+        unreachable!()
+    }
+
+    fn session_status(&mut self) -> Result<AuthStatus, ProtocolError> {
+        self.calls.push(Operation::SessionStatus);
+        Ok(auth_status())
+    }
+
+    fn entitlement_snapshot(&mut self) -> Result<EntitlementSnapshotResult, ProtocolError> {
+        self.calls.push(Operation::EntitlementSnapshot);
+        Ok(EntitlementSnapshotResult {
+            snapshot: EntitlementSnapshotView {
+                snapshot_version: 7,
+                org_id: uuid::Uuid::parse_str("20000000-0000-4000-8000-000000000002").unwrap(),
+                user_id: uuid::Uuid::parse_str("30000000-0000-4000-8000-000000000003").unwrap(),
+                role: NativeSessionRole::Owner,
+                user_display_name: Some("User".into()),
+                organization_display_name: Some("Muniment".into()),
+                groups: Vec::<NativeEntitlementGroup>::new(),
+            },
+            changed_snapshot_version: Some(7),
+        })
+    }
+
+    fn list_devices(&mut self) -> Result<NativeDeviceList, ProtocolError> {
+        self.calls.push(Operation::DeviceList);
+        Ok(serde_json::from_value(serde_json::json!({"devices": [{
+            "device_id": "10000000-0000-4000-8000-000000000001",
+            "client_id": "desktop-1",
+            "client_role": "desktop",
+            "platform": "desktop",
+            "created_at": "2026-01-01T00:00:00Z",
+            "revoked_at": null,
+            "last_active_at": "2026-01-02T00:00:00Z",
+            "current": true
+        }]}))
+        .unwrap())
+    }
+
+    fn sign_out(
+        &mut self,
+        _: &Id,
+        _: &Id,
+        _: CompanionProvenance,
+    ) -> Result<AuthStatus, ProtocolError> {
+        self.calls.push(Operation::SessionSignOut);
+        Ok(AuthStatus {
+            signed_in: false,
+            subject: None,
+            expires_at: None,
+        })
+    }
+}
+
+fn auth_status() -> AuthStatus {
+    AuthStatus {
+        signed_in: true,
+        subject: Some("user-1".into()),
+        expires_at: Some(1_800_000_000),
+    }
+}
+
+#[test]
+fn desktop_client_dispatches_session_operations() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let session_thread = std::thread::spawn(move || {
+        let mut service = SessionService::default();
+        let result = serve_desktop_client_session(server, &session(), &mut service);
+        (result, service)
+    });
+
+    let cases = [
+        (
+            request(
+                "018f0000-0000-7000-8000-000000000210",
+                Operation::SessionStatus,
+                "admitted",
+                serde_json::json!({}),
+            ),
+            serde_json::json!({"signed_in":true,"subject":"user-1","expires_at":1800000000_u64}),
+        ),
+        (
+            request(
+                "018f0000-0000-7000-8000-000000000211",
+                Operation::EntitlementSnapshot,
+                "admitted",
+                serde_json::json!({}),
+            ),
+            serde_json::json!({
+                "snapshot": {
+                    "snapshot_version": 7,
+                    "org_id": "20000000-0000-4000-8000-000000000002",
+                    "user_id": "30000000-0000-4000-8000-000000000003",
+                    "role": "owner",
+                    "user_display_name": "User",
+                    "organization_display_name": "Muniment",
+                    "groups": []
+                },
+                "changed_snapshot_version": 7
+            }),
+        ),
+        (
+            request(
+                "018f0000-0000-7000-8000-000000000212",
+                Operation::DeviceList,
+                "admitted",
+                serde_json::json!({}),
+            ),
+            serde_json::json!({"devices":[{
+                "device_id":"10000000-0000-4000-8000-000000000001",
+                "client_id":"desktop-1","client_role":"desktop","platform":"desktop",
+                "created_at":"2026-01-01T00:00:00Z","revoked_at":null,
+                "last_active_at":"2026-01-02T00:00:00Z","current":true
+            }]}),
+        ),
+        (
+            idempotent_request(
+                "018f0000-0000-7000-8000-000000000213",
+                Operation::SessionSignOut,
+                serde_json::json!({}),
+            ),
+            serde_json::json!({"status":{"signed_in":false,"subject":null,"expires_at":null}}),
+        ),
+    ];
+
+    for (request, expected) in cases {
+        let Envelope::Response(response) = exchange(&mut client, request) else {
+            panic!("session operation did not return a response");
+        };
+        assert_eq!(response.body, expected);
+    }
+
+    drop(client);
+    let (result, service) = session_thread.join().unwrap();
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        service.calls,
+        [
+            Operation::SessionStatus,
+            Operation::EntitlementSnapshot,
+            Operation::DeviceList,
+            Operation::SessionSignOut,
+        ]
+    );
+}
+
+#[test]
+fn desktop_session_operations_validate_empty_bodies_and_sign_out_idempotency() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let session_thread = std::thread::spawn(move || {
+        let mut service = SessionService::default();
+        let result = serve_desktop_client_session(server, &session(), &mut service);
+        (result, service)
+    });
+
+    for (id, operation) in [
+        (
+            "018f0000-0000-7000-8000-000000000214",
+            Operation::SessionStatus,
+        ),
+        (
+            "018f0000-0000-7000-8000-000000000215",
+            Operation::EntitlementSnapshot,
+        ),
+        (
+            "018f0000-0000-7000-8000-000000000216",
+            Operation::DeviceList,
+        ),
+    ] {
+        let Envelope::Error(error) = exchange(
+            &mut client,
+            request(
+                id,
+                operation,
+                "admitted",
+                serde_json::json!({"extra": true}),
+            ),
+        ) else {
+            panic!("nonempty body did not return an error");
+        };
+        assert_eq!(error.error.code(), ErrorCode::InvalidRequest);
+    }
+
+    let Envelope::Error(error) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000217",
+            Operation::SessionSignOut,
+            "admitted",
+            serde_json::json!({}),
+        ),
+    ) else {
+        panic!("missing idempotency key did not return an error");
+    };
+    assert_eq!(error.error.code(), ErrorCode::IdempotencyKeyRequired);
+
+    let Envelope::Error(error) = exchange(
+        &mut client,
+        idempotent_request(
+            "018f0000-0000-7000-8000-000000000219",
+            Operation::SessionSignOut,
+            serde_json::json!({"extra": true}),
+        ),
+    ) else {
+        panic!("nonempty sign-out body did not return an error");
+    };
+    assert_eq!(error.error.code(), ErrorCode::InvalidRequest);
+
+    drop(client);
+    let (result, service) = session_thread.join().unwrap();
+    assert_eq!(result, Ok(()));
+    assert!(service.calls.is_empty());
+}
+
+struct OversizedSessionService;
+
+impl ThreadListService for OversizedSessionService {
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, ProtocolError> {
+        unreachable!()
+    }
+
+    fn session_status(&mut self) -> Result<AuthStatus, ProtocolError> {
+        Ok(AuthStatus {
+            signed_in: true,
+            subject: Some("x".repeat(2 * 1024 * 1024)),
+            expires_at: None,
+        })
+    }
+}
+
+#[test]
+fn desktop_session_operation_rejects_an_oversized_response() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let session_thread = std::thread::spawn(move || {
+        serve_desktop_client_session(server, &session(), &mut OversizedSessionService)
+    });
+
+    let Envelope::Error(error) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000218",
+            Operation::SessionStatus,
+            "admitted",
+            serde_json::json!({}),
+        ),
+    ) else {
+        panic!("oversized response did not return an error");
+    };
+    assert_eq!(error.error.code(), ErrorCode::PersistenceFailed);
+
+    drop(client);
+    assert_eq!(session_thread.join().unwrap(), Ok(()));
 }
 
 #[derive(Default)]

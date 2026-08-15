@@ -5059,6 +5059,41 @@ fn companion_refuses_desktop_only_thread_mutations() {
 }
 
 #[test]
+fn companion_refuses_desktop_only_session_operations() {
+    for (id, operation) in [
+        (193, Operation::SessionStatus),
+        (194, Operation::EntitlementSnapshot),
+        (195, Operation::DeviceList),
+        (196, Operation::SessionSignOut),
+    ] {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&hello(1, 1)).unwrap();
+        let frame = if operation == Operation::SessionSignOut {
+            request_with_idempotency(id, operation, json!({}))
+        } else {
+            request(id, operation, json!({}))
+        };
+        client.write_all(&frame).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut service = StartService::default();
+
+        assert_eq!(
+            dispatch_session_with_approval(
+                &mut client,
+                server,
+                TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                approval(),
+                &mut service,
+            ),
+            Err(AttachSessionError::Authorization)
+        );
+        let error: ErrorEnvelope = read_frame(&mut client);
+        assert_eq!(error.error.code(), ErrorCode::Unauthorized);
+        assert!(service.calls.is_empty());
+    }
+}
+
+#[test]
 fn migration_control_uses_the_service_and_echoes_the_nonce() {
     let (mut client, server) = UnixStream::pair().unwrap();
     client.write_all(&hello(1, 1)).unwrap();

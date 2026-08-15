@@ -850,6 +850,12 @@ pub struct RunStreamPage {
     pub exhausted: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntitlementSnapshotResult {
+    pub snapshot: crate::auth::EntitlementSnapshotView,
+    pub changed_snapshot_version: Option<u64>,
+}
+
 /// Deterministic desktop service seam for authorized attach requests.
 pub trait ThreadListService {
     fn bind_authorized_client(&mut self, _client_identity: &str) {}
@@ -879,6 +885,27 @@ pub trait ThreadListService {
     }
 
     fn ensure_home(&mut self) -> Result<(), ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn session_status(&mut self) -> Result<crate::auth::AuthStatus, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn entitlement_snapshot(&mut self) -> Result<EntitlementSnapshotResult, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn list_devices(&mut self) -> Result<crate::auth::NativeDeviceList, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn sign_out(
+        &mut self,
+        _request_id: &super::Id,
+        _idempotency_key: &super::Id,
+        _provenance: CompanionProvenance,
+    ) -> Result<crate::auth::AuthStatus, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
 
@@ -2174,7 +2201,12 @@ where
         }
         if matches!(
             request.operation,
-            Operation::ThreadRename | Operation::ThreadDelete
+            Operation::ThreadRename
+                | Operation::ThreadDelete
+                | Operation::SessionStatus
+                | Operation::EntitlementSnapshot
+                | Operation::DeviceList
+                | Operation::SessionSignOut
         ) {
             write_request_error(
                 stream,
@@ -2542,6 +2574,17 @@ fn response_only(body: serde_json::Value) -> DispatchResult {
     }
 }
 
+fn bounded_response(body: serde_json::Value) -> Result<DispatchResult, DispatchFailure> {
+    if serde_json::to_vec(&body)
+        .map_err(|_| ProtocolError::persistence_failed())?
+        .len()
+        > MAX_RESPONSE_BODY_LENGTH
+    {
+        return Err(ProtocolError::persistence_failed().into());
+    }
+    Ok(response_only(body))
+}
+
 fn dispatch_request<S: ThreadListService>(
     request: Request,
     workspace: &str,
@@ -2550,6 +2593,44 @@ fn dispatch_request<S: ThreadListService>(
     subscriptions: &mut Vec<ActiveRunStream>,
 ) -> Result<DispatchResult, DispatchFailure> {
     request.validate_idempotency_key()?;
+    if matches!(
+        request.operation,
+        Operation::SessionStatus
+            | Operation::EntitlementSnapshot
+            | Operation::DeviceList
+            | Operation::SessionSignOut
+    ) {
+        if request.body != serde_json::json!({}) {
+            return Err(ProtocolError::invalid_request().into());
+        }
+        let body = match request.operation {
+            Operation::SessionStatus => serde_json::to_value(service.session_status()?),
+            Operation::EntitlementSnapshot => {
+                let result = service.entitlement_snapshot()?;
+                Ok(serde_json::json!({
+                    "snapshot": result.snapshot,
+                    "changed_snapshot_version": result.changed_snapshot_version,
+                }))
+            }
+            Operation::DeviceList => serde_json::to_value(service.list_devices()?),
+            Operation::SessionSignOut => {
+                let idempotency_key = request
+                    .idempotency_key
+                    .as_ref()
+                    .ok_or_else(ProtocolError::idempotency_key_required)?;
+                Ok(serde_json::json!({
+                    "status": service.sign_out(
+                        &request.request_id,
+                        idempotency_key,
+                        provenance,
+                    )?,
+                }))
+            }
+            _ => unreachable!(),
+        }
+        .map_err(|_| ProtocolError::persistence_failed())?;
+        return bounded_response(body);
+    }
     if request.operation == Operation::WorkspaceOnboard {
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
