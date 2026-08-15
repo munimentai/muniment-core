@@ -900,6 +900,20 @@ pub trait ThreadListService {
         Err(ProtocolError::unsupported_operation())
     }
 
+    fn list_companions(&mut self) -> Result<Vec<super::CompanionRecord>, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn revoke_companion(
+        &mut self,
+        _client_identity: &str,
+        _request_id: &super::Id,
+        _idempotency_key: &super::Id,
+        _provenance: CompanionProvenance,
+    ) -> Result<(), ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
     fn sign_out(
         &mut self,
         _request_id: &super::Id,
@@ -2207,6 +2221,8 @@ where
                 | Operation::EntitlementSnapshot
                 | Operation::DeviceList
                 | Operation::SessionSignOut
+                | Operation::CompanionList
+                | Operation::CompanionRevoke
         ) {
             write_request_error(
                 stream,
@@ -2599,6 +2615,7 @@ fn dispatch_request<S: ThreadListService>(
             | Operation::EntitlementSnapshot
             | Operation::DeviceList
             | Operation::SessionSignOut
+            | Operation::CompanionList
     ) {
         if request.body != serde_json::json!({}) {
             return Err(ProtocolError::invalid_request().into());
@@ -2613,6 +2630,17 @@ fn dispatch_request<S: ThreadListService>(
                 }))
             }
             Operation::DeviceList => serde_json::to_value(service.list_devices()?),
+            Operation::CompanionList => {
+                let companions = service.list_companions()?;
+                Ok(serde_json::json!({
+                    "companions": companions.into_iter().map(|companion| serde_json::json!({
+                        "identity": companion.identity,
+                        "claimed_kind": companion.claimed_kind,
+                        "claimed_version": companion.claimed_version,
+                        "approved_at": companion.approved_at,
+                    })).collect::<Vec<_>>(),
+                }))
+            }
             Operation::SessionSignOut => {
                 let idempotency_key = request
                     .idempotency_key
@@ -2630,6 +2658,29 @@ fn dispatch_request<S: ThreadListService>(
         }
         .map_err(|_| ProtocolError::persistence_failed())?;
         return bounded_response(body);
+    }
+    if request.operation == Operation::CompanionRevoke {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            client_identity: String,
+        }
+        let body: Body =
+            serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
+        if body.client_identity.is_empty() || body.client_identity.len() > MAX_TEXT_LENGTH {
+            return Err(ProtocolError::invalid_request().into());
+        }
+        let idempotency_key = request
+            .idempotency_key
+            .as_ref()
+            .ok_or_else(ProtocolError::idempotency_key_required)?;
+        service.revoke_companion(
+            &body.client_identity,
+            &request.request_id,
+            idempotency_key,
+            provenance,
+        )?;
+        return bounded_response(serde_json::json!({}));
     }
     if request.operation == Operation::WorkspaceOnboard {
         #[derive(serde::Deserialize)]

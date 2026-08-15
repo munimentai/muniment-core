@@ -10,8 +10,9 @@ use muniment_core::attach::linux::{
     RunStartRequest, RunStreamPage, ThreadListPage, ThreadListRequest, ThreadListService,
 };
 use muniment_core::attach::{
-    decode_frame, encode_frame, DesktopClientSession, Envelope, ErrorCode, EventName, Id,
-    Operation, Protocol, ProtocolError, Request, WorkspaceOnboardRequest, WorkspaceOnboarded,
+    decode_frame, encode_frame, CompanionRecord, DesktopClientSession, Envelope, ErrorCode,
+    EventName, Id, Operation, Protocol, ProtocolError, Request, WorkspaceOnboardRequest,
+    WorkspaceOnboarded,
 };
 use muniment_core::auth::{
     AuthStatus, EntitlementSnapshotView, NativeDeviceList, NativeEntitlementGroup,
@@ -340,6 +341,179 @@ fn desktop_session_operation_rejects_an_oversized_response() {
         ),
     ) else {
         panic!("oversized response did not return an error");
+    };
+    assert_eq!(error.error.code(), ErrorCode::PersistenceFailed);
+
+    drop(client);
+    assert_eq!(session_thread.join().unwrap(), Ok(()));
+}
+
+#[derive(Default)]
+struct CompanionService {
+    revoked: Vec<String>,
+}
+
+impl ThreadListService for CompanionService {
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, ProtocolError> {
+        unreachable!()
+    }
+
+    fn list_companions(&mut self) -> Result<Vec<CompanionRecord>, ProtocolError> {
+        Ok(vec![CompanionRecord {
+            identity: "companion-1".into(),
+            claimed_kind: "cli".into(),
+            claimed_version: "1.2.3".into(),
+            approved_at: Some("2026-08-14T12:00:00Z".into()),
+        }])
+    }
+
+    fn revoke_companion(
+        &mut self,
+        client_identity: &str,
+        _: &Id,
+        _: &Id,
+        _: CompanionProvenance,
+    ) -> Result<(), ProtocolError> {
+        self.revoked.push(client_identity.into());
+        Ok(())
+    }
+}
+
+#[test]
+fn desktop_client_dispatches_companion_operations() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let session_thread = std::thread::spawn(move || {
+        let mut service = CompanionService::default();
+        let result = serve_desktop_client_session(server, &session(), &mut service);
+        (result, service)
+    });
+
+    let Envelope::Response(response) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000220",
+            Operation::CompanionList,
+            "admitted",
+            serde_json::json!({}),
+        ),
+    ) else {
+        panic!("companion list did not return a response");
+    };
+    assert_eq!(
+        response.body,
+        serde_json::json!({"companions": [{
+            "identity": "companion-1",
+            "claimed_kind": "cli",
+            "claimed_version": "1.2.3",
+            "approved_at": "2026-08-14T12:00:00Z"
+        }]})
+    );
+
+    let Envelope::Response(response) = exchange(
+        &mut client,
+        idempotent_request(
+            "018f0000-0000-7000-8000-000000000221",
+            Operation::CompanionRevoke,
+            serde_json::json!({"client_identity": "companion-1"}),
+        ),
+    ) else {
+        panic!("companion revoke did not return a response");
+    };
+    assert_eq!(response.body, serde_json::json!({}));
+
+    drop(client);
+    let (result, service) = session_thread.join().unwrap();
+    assert_eq!(result, Ok(()));
+    assert_eq!(service.revoked, ["companion-1"]);
+}
+
+#[test]
+fn companion_operations_validate_requests() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let session_thread = std::thread::spawn(move || {
+        serve_desktop_client_session(server, &session(), &mut CompanionService::default())
+    });
+
+    for (request, expected) in [
+        (
+            request(
+                "018f0000-0000-7000-8000-000000000222",
+                Operation::CompanionList,
+                "admitted",
+                serde_json::json!({"extra": true}),
+            ),
+            ErrorCode::InvalidRequest,
+        ),
+        (
+            request(
+                "018f0000-0000-7000-8000-000000000223",
+                Operation::CompanionRevoke,
+                "admitted",
+                serde_json::json!({"client_identity": "companion-1"}),
+            ),
+            ErrorCode::IdempotencyKeyRequired,
+        ),
+        (
+            idempotent_request(
+                "018f0000-0000-7000-8000-000000000224",
+                Operation::CompanionRevoke,
+                serde_json::json!({"client_identity": ""}),
+            ),
+            ErrorCode::InvalidRequest,
+        ),
+    ] {
+        let Envelope::Error(error) = exchange(&mut client, request) else {
+            panic!("invalid companion request did not return an error");
+        };
+        assert_eq!(error.error.code(), expected);
+    }
+
+    drop(client);
+    assert_eq!(session_thread.join().unwrap(), Ok(()));
+}
+
+struct OversizedCompanionService;
+
+impl ThreadListService for OversizedCompanionService {
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, ProtocolError> {
+        unreachable!()
+    }
+
+    fn list_companions(&mut self) -> Result<Vec<CompanionRecord>, ProtocolError> {
+        Ok(vec![CompanionRecord {
+            identity: "x".repeat(2 * 1024 * 1024),
+            claimed_kind: "cli".into(),
+            claimed_version: "1.2.3".into(),
+            approved_at: None,
+        }])
+    }
+}
+
+#[test]
+fn companion_list_rejects_an_oversized_response() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let session_thread = std::thread::spawn(move || {
+        serve_desktop_client_session(server, &session(), &mut OversizedCompanionService)
+    });
+
+    let Envelope::Error(error) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000225",
+            Operation::CompanionList,
+            "admitted",
+            serde_json::json!({}),
+        ),
+    ) else {
+        panic!("oversized companion list did not return an error");
     };
     assert_eq!(error.error.code(), ErrorCode::PersistenceFailed);
 

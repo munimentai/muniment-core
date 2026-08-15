@@ -5060,18 +5060,27 @@ fn companion_refuses_desktop_only_thread_mutations() {
 
 #[test]
 fn companion_refuses_desktop_only_session_operations() {
-    for (id, operation) in [
-        (193, Operation::SessionStatus),
-        (194, Operation::EntitlementSnapshot),
-        (195, Operation::DeviceList),
-        (196, Operation::SessionSignOut),
+    for (id, operation, body) in [
+        (193, Operation::SessionStatus, json!({})),
+        (194, Operation::EntitlementSnapshot, json!({})),
+        (195, Operation::DeviceList, json!({})),
+        (196, Operation::SessionSignOut, json!({})),
+        (197, Operation::CompanionList, json!({})),
+        (
+            198,
+            Operation::CompanionRevoke,
+            json!({"client_identity": "companion-1"}),
+        ),
     ] {
         let (mut client, server) = UnixStream::pair().unwrap();
         client.write_all(&hello(1, 1)).unwrap();
-        let frame = if operation == Operation::SessionSignOut {
-            request_with_idempotency(id, operation, json!({}))
+        let frame = if matches!(
+            operation,
+            Operation::SessionSignOut | Operation::CompanionRevoke
+        ) {
+            request_with_idempotency(id, operation, body)
         } else {
-            request(id, operation, json!({}))
+            request(id, operation, body)
         };
         client.write_all(&frame).unwrap();
         client.shutdown(Shutdown::Write).unwrap();
