@@ -642,6 +642,14 @@ fn desktop_client_holder_is_unavailable_without_a_connection() {
         Err(ClientError::DesktopUnavailable)
     );
     assert_eq!(holder.sign_in(), Err(ClientError::DesktopUnavailable));
+    assert_eq!(
+        holder.thread_summaries(50, None),
+        Err(ClientError::DesktopUnavailable)
+    );
+    assert_eq!(
+        holder.thread_history("thread-1", 100, None),
+        Err(ClientError::DesktopUnavailable)
+    );
 }
 
 #[test]
@@ -854,6 +862,64 @@ fn desktop_second_tranche_methods_send_and_validate_requests() {
     client.sign_out().unwrap();
     client.list_companions().unwrap();
     client.revoke_companion("companion-1").unwrap();
+    worker.join().unwrap();
+}
+
+#[test]
+fn desktop_thread_read_methods_send_requests_and_return_bodies() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_desktop_client_handshake(&mut server);
+        for (operation, request_body, response_body) in [
+            (
+                "thread.summaries",
+                serde_json::json!({"limit": 50, "cursor": "thread-cursor-1"}),
+                serde_json::json!({"summaries": [], "next_cursor": null}),
+            ),
+            (
+                "thread.history",
+                serde_json::json!({
+                    "thread_id": "thread-1",
+                    "limit": 100,
+                    "cursor": "message-cursor-1"
+                }),
+                serde_json::json!({
+                    "thread_id": "thread-1",
+                    "entries": [],
+                    "next_cursor": null
+                }),
+            ),
+        ] {
+            let request = read_client_value(&mut server);
+            assert_eq!(request["operation"], operation);
+            assert_eq!(request["body"], request_body);
+            assert!(request.get("idempotency_key").is_none());
+            server
+                .write_all(
+                    &encode_frame(&Response {
+                        protocol: Protocol,
+                        request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+                        ok: Success,
+                        body: response_body,
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+    });
+    let mut client = handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap();
+    assert_eq!(
+        client
+            .thread_summaries(50, Some("thread-cursor-1"))
+            .unwrap(),
+        serde_json::json!({"summaries": [], "next_cursor": null})
+    );
+    assert_eq!(
+        client
+            .thread_history("thread-1", 100, Some("message-cursor-1"))
+            .unwrap(),
+        serde_json::json!({"thread_id": "thread-1", "entries": [], "next_cursor": null})
+    );
     worker.join().unwrap();
 }
 

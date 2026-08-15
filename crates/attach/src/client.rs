@@ -1463,6 +1463,23 @@ mod linux {
             self.with_client(DesktopClient::sign_in)
         }
 
+        pub fn thread_summaries(
+            &self,
+            limit: u8,
+            cursor: Option<&str>,
+        ) -> Result<Value, ClientError> {
+            self.with_client(|client| client.thread_summaries(limit, cursor))
+        }
+
+        pub fn thread_history(
+            &self,
+            thread_id: &str,
+            limit: u8,
+            cursor: Option<&str>,
+        ) -> Result<Value, ClientError> {
+            self.with_client(|client| client.thread_history(thread_id, limit, cursor))
+        }
+
         pub fn list_companions(&self) -> Result<Value, ClientError> {
             self.with_client(DesktopClient::list_companions)
         }
@@ -1856,6 +1873,29 @@ mod linux {
             Ok(body)
         }
 
+        pub fn thread_summaries(
+            &mut self,
+            limit: u8,
+            cursor: Option<&str>,
+        ) -> Result<Value, ClientError> {
+            let body = thread_read_body(limit, cursor)?;
+            Ok(self.request(Operation::ThreadSummaries, None, body)?.body)
+        }
+
+        pub fn thread_history(
+            &mut self,
+            thread_id: &str,
+            limit: u8,
+            cursor: Option<&str>,
+        ) -> Result<Value, ClientError> {
+            if thread_id.is_empty() || thread_id.len() > MAX_THREAD_ID_LENGTH {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            let mut body = thread_read_body(limit, cursor)?;
+            body["thread_id"] = Value::String(thread_id.into());
+            Ok(self.request(Operation::ThreadHistory, None, body)?.body)
+        }
+
         pub fn list_companions(&mut self) -> Result<Value, ClientError> {
             self.request_body(
                 Operation::CompanionList,
@@ -1899,6 +1939,20 @@ mod linux {
         pub fn into_stream(self) -> UnixStream {
             self.stream
         }
+    }
+
+    fn thread_read_body(limit: u8, cursor: Option<&str>) -> Result<Value, ClientError> {
+        if limit == 0
+            || limit > 100
+            || cursor.is_some_and(|cursor| cursor.is_empty() || cursor.len() > MAX_CURSOR_LENGTH)
+        {
+            return Err(ClientError::UnexpectedMessage);
+        }
+        let mut body = serde_json::json!({"limit": limit});
+        if let Some(cursor) = cursor {
+            body["cursor"] = Value::String(cursor.into());
+        }
+        Ok(body)
     }
 
     impl MigrationControlClient {
