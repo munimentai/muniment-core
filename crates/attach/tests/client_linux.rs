@@ -641,6 +641,7 @@ fn desktop_client_holder_is_unavailable_without_a_connection() {
         holder.delete_thread("thread-1"),
         Err(ClientError::DesktopUnavailable)
     );
+    assert_eq!(holder.sign_in(), Err(ClientError::DesktopUnavailable));
 }
 
 #[test]
@@ -794,6 +795,11 @@ fn desktop_second_tranche_methods_send_and_validate_requests() {
             ),
             ("device.list", serde_json::json!({"devices": []}), false),
             (
+                "session.sign_in",
+                serde_json::json!({"status": "signed_in"}),
+                true,
+            ),
+            (
                 "session.sign_out",
                 serde_json::json!({"status": "signed_out"}),
                 true,
@@ -841,6 +847,10 @@ fn desktop_second_tranche_methods_send_and_validate_requests() {
     client.session_status().unwrap();
     client.entitlement_snapshot().unwrap();
     client.list_devices().unwrap();
+    assert_eq!(
+        client.sign_in().unwrap(),
+        serde_json::json!({"status": "signed_in"})
+    );
     client.sign_out().unwrap();
     client.list_companions().unwrap();
     client.revoke_companion("companion-1").unwrap();
@@ -869,7 +879,7 @@ fn desktop_revoke_companion_rejects_invalid_identity_before_writing() {
 
 #[test]
 fn desktop_second_tranche_methods_reject_missing_answer_keys() {
-    for call in 0..6 {
+    for call in 0..7 {
         let (client, mut server) = UnixStream::pair().unwrap();
         let worker = thread::spawn(move || {
             complete_desktop_client_handshake(&mut server);
@@ -891,14 +901,58 @@ fn desktop_second_tranche_methods_reject_missing_answer_keys() {
             0 => client.session_status(),
             1 => client.entitlement_snapshot(),
             2 => client.list_devices(),
-            3 => client.sign_out(),
-            4 => client.list_companions(),
-            5 => client.revoke_companion("companion-1"),
+            3 => client.sign_in(),
+            4 => client.sign_out(),
+            5 => client.list_companions(),
+            6 => client.revoke_companion("companion-1"),
             _ => unreachable!(),
         };
         assert_eq!(result, Err(ClientError::UnexpectedMessage));
         worker.join().unwrap();
     }
+}
+
+#[test]
+fn desktop_sign_in_failure_disconnects_the_held_client() {
+    let path = socket_path();
+    let listener = UnixListener::bind(&path).unwrap();
+    let stop = DesktopClientStopHandle::new();
+    let observer_stop = stop.clone();
+    let holder = DesktopClientHolder::new();
+    let worker_holder = holder.clone();
+    let worker_stop = stop.clone();
+    let (observed_tx, observed) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        complete_desktop_client_handshake(&mut stream);
+        let request = read_client_value(&mut stream);
+        assert_eq!(request["operation"], "session.sign_in");
+    });
+    let path_for_worker = path.clone();
+    let worker = thread::spawn(move || {
+        serve_desktop_client_at(
+            &path_for_worker,
+            "0.0.1",
+            SHORT,
+            SHORT,
+            worker_stop,
+            worker_holder,
+            move |connected| {
+                observed_tx.send(connected).unwrap();
+                if !connected {
+                    observer_stop.stop();
+                }
+            },
+        );
+    });
+
+    assert_eq!(observed.recv_timeout(SHORT), Ok(true));
+    assert_eq!(holder.sign_in(), Err(ClientError::ConnectionClosed));
+    assert_eq!(observed.recv_timeout(SHORT), Ok(false));
+    worker.join().unwrap();
+    server.join().unwrap();
+    assert_eq!(holder.sign_in(), Err(ClientError::DesktopUnavailable));
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]

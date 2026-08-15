@@ -417,6 +417,7 @@ mod linux {
 
     const IO_TIMEOUT: Duration = Duration::from_secs(5);
     const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
+    const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
     const THREAD_LIST_LIMIT: u8 = 100;
     const THREAD_OPEN_LIMIT: u8 = 100;
     const MAX_THREAD_ID_LENGTH: usize = 36;
@@ -1458,6 +1459,10 @@ mod linux {
             self.with_client(DesktopClient::sign_out)
         }
 
+        pub fn sign_in(&self) -> Result<Value, ClientError> {
+            self.with_client(DesktopClient::sign_in)
+        }
+
         pub fn list_companions(&self) -> Result<Value, ClientError> {
             self.with_client(DesktopClient::list_companions)
         }
@@ -1737,6 +1742,16 @@ mod linux {
             idempotency_key: Option<Id>,
             body: Value,
         ) -> Result<Response, ClientError> {
+            self.request_before(operation, idempotency_key, body, deadline(self.io_timeout))
+        }
+
+        fn request_before(
+            &mut self,
+            operation: Operation,
+            idempotency_key: Option<Id>,
+            body: Value,
+            request_deadline: Instant,
+        ) -> Result<Response, ClientError> {
             let request_id = fresh_request_id()?;
             let request = Request {
                 protocol: Protocol,
@@ -1746,7 +1761,6 @@ mod linux {
                 idempotency_key,
                 body,
             };
-            let request_deadline = deadline(self.io_timeout);
             let bytes = encode_frame(&request).map_err(map_frame_error)?;
             write_all_before(&mut self.stream, &bytes, request_deadline)?;
             match serde_json::from_value(read_value(&mut self.stream, request_deadline)?)
@@ -1824,6 +1838,22 @@ mod linux {
                 serde_json::json!({}),
                 &["status"],
             )
+        }
+
+        pub fn sign_in(&mut self) -> Result<Value, ClientError> {
+            let body = self
+                .request_before(
+                    Operation::SessionSignIn,
+                    Some(fresh_request_id()?),
+                    serde_json::json!({}),
+                    deadline(SIGN_IN_TIMEOUT),
+                )?
+                .body;
+            let object = body.as_object().ok_or(ClientError::UnexpectedMessage)?;
+            if !object.contains_key("status") {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            Ok(body)
         }
 
         pub fn list_companions(&mut self) -> Result<Value, ClientError> {
