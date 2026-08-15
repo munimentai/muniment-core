@@ -262,6 +262,8 @@ pub enum Operation {
     DeviceList,
     #[serde(rename = "session.sign_out")]
     SessionSignOut,
+    #[serde(rename = "session.sign_in")]
+    SessionSignIn,
     #[serde(rename = "companion.list")]
     CompanionList,
     #[serde(rename = "companion.revoke")]
@@ -302,6 +304,7 @@ impl Operation {
                 | Self::ThreadRename
                 | Self::ThreadDelete
                 | Self::SessionSignOut
+                | Self::SessionSignIn
                 | Self::CompanionRevoke
                 | Self::RunStart
                 | Self::RunSteer
@@ -324,6 +327,7 @@ impl Operation {
             Self::EntitlementSnapshot => "entitlement.snapshot",
             Self::DeviceList => "device.list",
             Self::SessionSignOut => "session.sign_out",
+            Self::SessionSignIn => "session.sign_in",
             Self::CompanionList => "companion.list",
             Self::CompanionRevoke => "companion.revoke",
             Self::RunOpen => "run.open",

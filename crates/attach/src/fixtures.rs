@@ -546,6 +546,7 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         ("session-sign-out", Operation::SessionSignOut),
         ("companion-list", Operation::CompanionList),
         ("companion-revoke", Operation::CompanionRevoke),
+        ("session-sign-in", Operation::SessionSignIn),
     ];
     for (index, (name, operation)) in operations.into_iter().enumerate() {
         insert(
@@ -718,6 +719,7 @@ fn request_body(operation: Operation) -> serde_json::Value {
         | Operation::EntitlementSnapshot
         | Operation::DeviceList
         | Operation::SessionSignOut
+        | Operation::SessionSignIn
         | Operation::CompanionList => json!({}),
         Operation::CompanionRevoke => json!({"client_identity": "companion-1"}),
         Operation::RunOpen => json!({"run_id": "00000000000000000000000000000191"}),
@@ -919,6 +921,7 @@ mod tests {
             Operation::EntitlementSnapshot,
             Operation::DeviceList,
             Operation::SessionSignOut,
+            Operation::SessionSignIn,
             Operation::CompanionList,
             Operation::CompanionRevoke,
             Operation::RunOpen,
@@ -978,7 +981,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            58,
+            59,
             "every canonical fixture must be inventoried"
         );
     }
