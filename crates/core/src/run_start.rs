@@ -72,6 +72,16 @@ pub trait RunAttachBoundaries {
         Err(ProtocolError::unsupported_operation())
     }
     #[cfg(target_os = "linux")]
+    fn entitlement_snapshot(
+        &self,
+    ) -> Result<crate::attach::linux::EntitlementSnapshotResult, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(target_os = "linux")]
+    fn sign_out(&self, _provenance: Provenance) -> Result<crate::auth::AuthStatus, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(target_os = "linux")]
     fn list_devices(&self) -> Result<crate::auth::NativeDeviceList, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }

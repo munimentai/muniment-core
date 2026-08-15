@@ -38,7 +38,7 @@ impl fmt::Debug for TokenSet {
 
 /// What `auth_status` reports to the webview: signed-in state only, no
 /// token material.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct AuthStatus {
     pub signed_in: bool,
     pub subject: Option<String>,
