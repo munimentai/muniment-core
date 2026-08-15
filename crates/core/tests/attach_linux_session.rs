@@ -5064,10 +5064,11 @@ fn companion_refuses_desktop_only_session_operations() {
         (193, Operation::SessionStatus, json!({})),
         (194, Operation::EntitlementSnapshot, json!({})),
         (195, Operation::DeviceList, json!({})),
-        (196, Operation::SessionSignOut, json!({})),
-        (197, Operation::CompanionList, json!({})),
+        (196, Operation::SessionSignIn, json!({})),
+        (197, Operation::SessionSignOut, json!({})),
+        (198, Operation::CompanionList, json!({})),
         (
-            198,
+            199,
             Operation::CompanionRevoke,
             json!({"client_identity": "companion-1"}),
         ),
@@ -5076,7 +5077,7 @@ fn companion_refuses_desktop_only_session_operations() {
         client.write_all(&hello(1, 1)).unwrap();
         let frame = if matches!(
             operation,
-            Operation::SessionSignOut | Operation::CompanionRevoke
+            Operation::SessionSignIn | Operation::SessionSignOut | Operation::CompanionRevoke
         ) {
             request_with_idempotency(id, operation, body)
         } else {

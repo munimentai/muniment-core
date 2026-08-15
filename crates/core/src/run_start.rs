@@ -78,6 +78,10 @@ pub trait RunAttachBoundaries {
         Err(ProtocolError::unsupported_operation())
     }
     #[cfg(target_os = "linux")]
+    fn sign_in(&self, _provenance: Provenance) -> Result<crate::auth::AuthStatus, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(target_os = "linux")]
     fn sign_out(&self, _provenance: Provenance) -> Result<crate::auth::AuthStatus, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }

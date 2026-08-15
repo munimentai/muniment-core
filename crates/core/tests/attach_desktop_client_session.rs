@@ -142,6 +142,16 @@ impl ThreadListService for SessionService {
             expires_at: None,
         })
     }
+
+    fn sign_in(
+        &mut self,
+        _: &Id,
+        _: &Id,
+        _: CompanionProvenance,
+    ) -> Result<AuthStatus, ProtocolError> {
+        self.calls.push(Operation::SessionSignIn);
+        Ok(auth_status())
+    }
 }
 
 fn auth_status() -> AuthStatus {
@@ -208,6 +218,14 @@ fn desktop_client_dispatches_session_operations() {
         (
             idempotent_request(
                 "018f0000-0000-7000-8000-000000000213",
+                Operation::SessionSignIn,
+                serde_json::json!({}),
+            ),
+            serde_json::json!({"status":{"signed_in":true,"subject":"user-1","expires_at":1800000000_u64}}),
+        ),
+        (
+            idempotent_request(
+                "018f0000-0000-7000-8000-000000000214",
                 Operation::SessionSignOut,
                 serde_json::json!({}),
             ),
@@ -231,13 +249,14 @@ fn desktop_client_dispatches_session_operations() {
             Operation::SessionStatus,
             Operation::EntitlementSnapshot,
             Operation::DeviceList,
+            Operation::SessionSignIn,
             Operation::SessionSignOut,
         ]
     );
 }
 
 #[test]
-fn desktop_session_operations_validate_empty_bodies_and_sign_out_idempotency() {
+fn desktop_session_operations_validate_empty_bodies_and_idempotency() {
     let (mut client, server) = UnixStream::pair().unwrap();
     let session_thread = std::thread::spawn(move || {
         let mut service = SessionService::default();
@@ -273,30 +292,34 @@ fn desktop_session_operations_validate_empty_bodies_and_sign_out_idempotency() {
         assert_eq!(error.error.code(), ErrorCode::InvalidRequest);
     }
 
-    let Envelope::Error(error) = exchange(
-        &mut client,
-        request(
+    for (missing_key_id, nonempty_id, operation) in [
+        (
             "018f0000-0000-7000-8000-000000000217",
-            Operation::SessionSignOut,
-            "admitted",
-            serde_json::json!({}),
+            "018f0000-0000-7000-8000-000000000218",
+            Operation::SessionSignIn,
         ),
-    ) else {
-        panic!("missing idempotency key did not return an error");
-    };
-    assert_eq!(error.error.code(), ErrorCode::IdempotencyKeyRequired);
-
-    let Envelope::Error(error) = exchange(
-        &mut client,
-        idempotent_request(
+        (
             "018f0000-0000-7000-8000-000000000219",
+            "018f0000-0000-7000-8000-000000000220",
             Operation::SessionSignOut,
-            serde_json::json!({"extra": true}),
         ),
-    ) else {
-        panic!("nonempty sign-out body did not return an error");
-    };
-    assert_eq!(error.error.code(), ErrorCode::InvalidRequest);
+    ] {
+        let Envelope::Error(error) = exchange(
+            &mut client,
+            request(missing_key_id, operation, "admitted", serde_json::json!({})),
+        ) else {
+            panic!("missing idempotency key did not return an error");
+        };
+        assert_eq!(error.error.code(), ErrorCode::IdempotencyKeyRequired);
+
+        let Envelope::Error(error) = exchange(
+            &mut client,
+            idempotent_request(nonempty_id, operation, serde_json::json!({"extra": true})),
+        ) else {
+            panic!("nonempty body did not return an error");
+        };
+        assert_eq!(error.error.code(), ErrorCode::InvalidRequest);
+    }
 
     drop(client);
     let (result, service) = session_thread.join().unwrap();

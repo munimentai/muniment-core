@@ -104,6 +104,7 @@ fn export_includes_second_tranche_requests() {
             false,
         ),
         ("device.list", Operation::DeviceList, false),
+        ("session.sign_in", Operation::SessionSignIn, true),
         ("session.sign_out", Operation::SessionSignOut, true),
         ("session.sign_in", Operation::SessionSignIn, true),
         ("companion.list", Operation::CompanionList, false),

@@ -914,6 +914,15 @@ pub trait ThreadListService {
         Err(ProtocolError::unsupported_operation())
     }
 
+    fn sign_in(
+        &mut self,
+        _request_id: &super::Id,
+        _idempotency_key: &super::Id,
+        _provenance: CompanionProvenance,
+    ) -> Result<crate::auth::AuthStatus, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
     fn sign_out(
         &mut self,
         _request_id: &super::Id,
@@ -2218,6 +2227,7 @@ where
                 | Operation::SessionStatus
                 | Operation::EntitlementSnapshot
                 | Operation::DeviceList
+                | Operation::SessionSignIn
                 | Operation::SessionSignOut
                 | Operation::CompanionList
                 | Operation::CompanionRevoke
@@ -2612,6 +2622,7 @@ fn dispatch_request<S: ThreadListService>(
         Operation::SessionStatus
             | Operation::EntitlementSnapshot
             | Operation::DeviceList
+            | Operation::SessionSignIn
             | Operation::SessionSignOut
             | Operation::CompanionList
     ) {
@@ -2637,6 +2648,19 @@ fn dispatch_request<S: ThreadListService>(
                         "claimed_version": companion.claimed_version,
                         "approved_at": companion.approved_at,
                     })).collect::<Vec<_>>(),
+                }))
+            }
+            Operation::SessionSignIn => {
+                let idempotency_key = request
+                    .idempotency_key
+                    .as_ref()
+                    .ok_or_else(ProtocolError::idempotency_key_required)?;
+                Ok(serde_json::json!({
+                    "status": service.sign_in(
+                        &request.request_id,
+                        idempotency_key,
+                        provenance,
+                    )?,
                 }))
             }
             Operation::SessionSignOut => {
