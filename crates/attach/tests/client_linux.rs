@@ -777,6 +777,131 @@ fn desktop_thread_mutations_reject_invalid_answers_and_map_errors() {
 }
 
 #[test]
+fn desktop_second_tranche_methods_send_and_validate_requests() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_desktop_client_handshake(&mut server);
+        let calls = [
+            (
+                "session.status",
+                serde_json::json!({"signed_in": false, "subject": null, "expires_at": null}),
+                false,
+            ),
+            (
+                "entitlement.snapshot",
+                serde_json::json!({"snapshot": null, "changed_snapshot_version": null}),
+                false,
+            ),
+            ("device.list", serde_json::json!({"devices": []}), false),
+            (
+                "session.sign_out",
+                serde_json::json!({"status": "signed_out"}),
+                true,
+            ),
+            (
+                "companion.list",
+                serde_json::json!({"companions": []}),
+                false,
+            ),
+            ("companion.revoke", serde_json::json!({}), true),
+        ];
+        let mut keys = BTreeSet::new();
+        for (operation, body, mutating) in calls {
+            let request = read_client_value(&mut server);
+            assert_eq!(request["operation"], operation);
+            assert_eq!(
+                request["body"],
+                if operation == "companion.revoke" {
+                    serde_json::json!({"client_identity": "companion-1"})
+                } else {
+                    serde_json::json!({})
+                }
+            );
+            if mutating {
+                let key = request["idempotency_key"].as_str().unwrap();
+                assert_ne!(request["request_id"], key);
+                assert!(keys.insert(key.to_owned()));
+            } else {
+                assert!(request.get("idempotency_key").is_none());
+            }
+            server
+                .write_all(
+                    &encode_frame(&Response {
+                        protocol: Protocol,
+                        request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+                        ok: Success,
+                        body,
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+    });
+    let mut client = handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap();
+    client.session_status().unwrap();
+    client.entitlement_snapshot().unwrap();
+    client.list_devices().unwrap();
+    client.sign_out().unwrap();
+    client.list_companions().unwrap();
+    client.revoke_companion("companion-1").unwrap();
+    worker.join().unwrap();
+}
+
+#[test]
+fn desktop_revoke_companion_rejects_invalid_identity_before_writing() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_desktop_client_handshake(&mut server);
+        assert_eq!(server.read(&mut [0]).unwrap(), 0);
+    });
+    let mut client = handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap();
+    assert_eq!(
+        client.revoke_companion(""),
+        Err(ClientError::UnexpectedMessage)
+    );
+    assert_eq!(
+        client.revoke_companion(&"x".repeat(64 * 1024 + 1)),
+        Err(ClientError::UnexpectedMessage)
+    );
+    drop(client);
+    worker.join().unwrap();
+}
+
+#[test]
+fn desktop_second_tranche_methods_reject_missing_answer_keys() {
+    for call in 0..6 {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            complete_desktop_client_handshake(&mut server);
+            let request = read_client_value(&mut server);
+            server
+                .write_all(
+                    &encode_frame(&Response {
+                        protocol: Protocol,
+                        request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+                        ok: Success,
+                        body: serde_json::json!({"unexpected": true}),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        });
+        let mut client = handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap();
+        let result = match call {
+            0 => client.session_status(),
+            1 => client.entitlement_snapshot(),
+            2 => client.list_devices(),
+            3 => client.sign_out(),
+            4 => client.list_companions(),
+            5 => client.revoke_companion("companion-1"),
+            _ => unreachable!(),
+        };
+        assert_eq!(result, Err(ClientError::UnexpectedMessage));
+        worker.join().unwrap();
+    }
+}
+
+#[test]
 fn desktop_client_supervisor_publishes_reconnects_and_stops() {
     let path = socket_path();
     let listener = UnixListener::bind(&path).unwrap();

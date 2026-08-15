@@ -1441,6 +1441,44 @@ mod linux {
             }
             result
         }
+
+        pub fn session_status(&self) -> Result<Value, ClientError> {
+            self.with_client(DesktopClient::session_status)
+        }
+
+        pub fn entitlement_snapshot(&self) -> Result<Value, ClientError> {
+            self.with_client(DesktopClient::entitlement_snapshot)
+        }
+
+        pub fn list_devices(&self) -> Result<Value, ClientError> {
+            self.with_client(DesktopClient::list_devices)
+        }
+
+        pub fn sign_out(&self) -> Result<Value, ClientError> {
+            self.with_client(DesktopClient::sign_out)
+        }
+
+        pub fn list_companions(&self) -> Result<Value, ClientError> {
+            self.with_client(DesktopClient::list_companions)
+        }
+
+        pub fn revoke_companion(&self, client_identity: &str) -> Result<Value, ClientError> {
+            self.with_client(|client| client.revoke_companion(client_identity))
+        }
+
+        fn with_client<T>(
+            &self,
+            call: impl FnOnce(&mut DesktopClient) -> Result<T, ClientError>,
+        ) -> Result<T, ClientError> {
+            let (client, wake) = &*self.inner;
+            let mut client = client.lock().unwrap_or_else(|error| error.into_inner());
+            let result = call(client.as_mut().ok_or(ClientError::DesktopUnavailable)?);
+            if result.is_err() {
+                *client = None;
+                wake.notify_all();
+            }
+            result
+        }
     }
 
     #[derive(Clone, Debug, Default)]
@@ -1750,6 +1788,82 @@ mod linux {
                 return Err(ClientError::UnexpectedMessage);
             }
             Ok(())
+        }
+
+        pub fn session_status(&mut self) -> Result<Value, ClientError> {
+            self.request_body(
+                Operation::SessionStatus,
+                None,
+                serde_json::json!({}),
+                &["signed_in", "subject", "expires_at"],
+            )
+        }
+
+        pub fn entitlement_snapshot(&mut self) -> Result<Value, ClientError> {
+            self.request_body(
+                Operation::EntitlementSnapshot,
+                None,
+                serde_json::json!({}),
+                &["snapshot", "changed_snapshot_version"],
+            )
+        }
+
+        pub fn list_devices(&mut self) -> Result<Value, ClientError> {
+            self.request_body(
+                Operation::DeviceList,
+                None,
+                serde_json::json!({}),
+                &["devices"],
+            )
+        }
+
+        pub fn sign_out(&mut self) -> Result<Value, ClientError> {
+            self.request_body(
+                Operation::SessionSignOut,
+                Some(fresh_request_id()?),
+                serde_json::json!({}),
+                &["status"],
+            )
+        }
+
+        pub fn list_companions(&mut self) -> Result<Value, ClientError> {
+            self.request_body(
+                Operation::CompanionList,
+                None,
+                serde_json::json!({}),
+                &["companions"],
+            )
+        }
+
+        pub fn revoke_companion(&mut self, client_identity: &str) -> Result<Value, ClientError> {
+            if client_identity.is_empty() || client_identity.len() > MAX_TEXT_LENGTH {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            let body = self.request_body(
+                Operation::CompanionRevoke,
+                Some(fresh_request_id()?),
+                serde_json::json!({"client_identity": client_identity}),
+                &[],
+            )?;
+            if body != serde_json::json!({}) {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            Ok(body)
+        }
+
+        fn request_body(
+            &mut self,
+            operation: Operation,
+            idempotency_key: Option<Id>,
+            body: Value,
+            expected_keys: &[&str],
+        ) -> Result<Value, ClientError> {
+            let body = self.request(operation, idempotency_key, body)?.body;
+            let object = body.as_object().ok_or(ClientError::UnexpectedMessage)?;
+            if !expected_keys.iter().all(|key| object.contains_key(*key)) {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            Ok(body)
         }
 
         pub fn into_stream(self) -> UnixStream {
