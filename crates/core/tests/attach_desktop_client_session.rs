@@ -52,6 +52,305 @@ impl ThreadListService for TestService {
     }
 }
 
+#[derive(Default)]
+struct DesktopThreadReadService {
+    calls: Vec<(Operation, u8, Option<String>, Option<String>)>,
+}
+
+impl ThreadListService for DesktopThreadReadService {
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, ProtocolError> {
+        unreachable!()
+    }
+
+    fn thread_summaries(
+        &mut self,
+        request: ThreadListRequest,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        self.calls.push((
+            Operation::ThreadSummaries,
+            request.limit,
+            request.cursor,
+            None,
+        ));
+        Ok(serde_json::json!({
+            "summaries": [{
+                "thread_id": "thread-1",
+                "title": "Desktop title",
+                "updated_at": "2026-08-15T00:00:00Z"
+            }],
+            "next_cursor": "summary-next"
+        }))
+    }
+
+    fn thread_history(
+        &mut self,
+        request: muniment_core::attach::linux::ThreadOpenRequest,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        self.calls.push((
+            Operation::ThreadHistory,
+            request.limit,
+            request.cursor,
+            Some(request.thread_id),
+        ));
+        Ok(serde_json::json!({
+            "entries": [],
+            "nextCursor": "history-next"
+        }))
+    }
+}
+
+#[test]
+fn desktop_client_dispatches_thread_summaries_and_history() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let session_thread = std::thread::spawn(move || {
+        let mut service = DesktopThreadReadService::default();
+        let result = serve_desktop_client_session(server, &session(), &mut service);
+        (result, service)
+    });
+
+    let Envelope::Response(response) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000201",
+            Operation::ThreadSummaries,
+            "admitted",
+            serde_json::json!({"limit": 10, "cursor": "summary-cursor"}),
+        ),
+    ) else {
+        panic!("thread summaries did not return a response");
+    };
+    assert_eq!(
+        response.body,
+        serde_json::json!({
+            "summaries": [{
+                "thread_id": "thread-1",
+                "title": "Desktop title",
+                "updated_at": "2026-08-15T00:00:00Z"
+            }],
+            "next_cursor": "summary-next"
+        })
+    );
+
+    let Envelope::Response(response) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000202",
+            Operation::ThreadHistory,
+            "admitted",
+            serde_json::json!({
+                "thread_id": "thread-1",
+                "limit": 8,
+                "cursor": "history-cursor"
+            }),
+        ),
+    ) else {
+        panic!("thread history did not return a response");
+    };
+    assert_eq!(
+        response.body,
+        serde_json::json!({
+            "entries": [],
+            "nextCursor": "history-next"
+        })
+    );
+
+    drop(client);
+    let (result, service) = session_thread.join().unwrap();
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        service.calls,
+        [
+            (
+                Operation::ThreadSummaries,
+                10,
+                Some("summary-cursor".into()),
+                None,
+            ),
+            (
+                Operation::ThreadHistory,
+                8,
+                Some("history-cursor".into()),
+                Some("thread-1".into()),
+            ),
+        ]
+    );
+}
+
+#[derive(Default)]
+struct ShrinkingThreadReadService {
+    calls: Vec<(Operation, u8)>,
+}
+
+impl ThreadListService for ShrinkingThreadReadService {
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, ProtocolError> {
+        unreachable!()
+    }
+
+    fn thread_summaries(
+        &mut self,
+        request: ThreadListRequest,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        self.calls.push((Operation::ThreadSummaries, request.limit));
+        Ok(serde_json::json!({
+            "entries": if request.limit == 1 { "fits".into() } else { "x".repeat(2 * 1024 * 1024) }
+        }))
+    }
+
+    fn thread_history(
+        &mut self,
+        request: muniment_core::attach::linux::ThreadOpenRequest,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        self.calls.push((Operation::ThreadHistory, request.limit));
+        Ok(serde_json::json!({
+            "entries": if request.limit == 1 { "fits".into() } else { "x".repeat(2 * 1024 * 1024) }
+        }))
+    }
+}
+
+#[test]
+fn desktop_thread_reads_shrink_oversized_pages_to_one_entry() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let session_thread = std::thread::spawn(move || {
+        let mut service = ShrinkingThreadReadService::default();
+        let result = serve_desktop_client_session(server, &session(), &mut service);
+        (result, service)
+    });
+
+    for (id, operation, body) in [
+        (
+            "018f0000-0000-7000-8000-000000000203",
+            Operation::ThreadSummaries,
+            serde_json::json!({"limit": 5}),
+        ),
+        (
+            "018f0000-0000-7000-8000-000000000204",
+            Operation::ThreadHistory,
+            serde_json::json!({"thread_id": "thread-1", "limit": 4}),
+        ),
+    ] {
+        let Envelope::Response(response) =
+            exchange(&mut client, request(id, operation, "admitted", body))
+        else {
+            panic!("shrunk thread page did not return a response");
+        };
+        assert_eq!(response.body, serde_json::json!({"entries": "fits"}));
+    }
+
+    drop(client);
+    let (result, service) = session_thread.join().unwrap();
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        service.calls,
+        [
+            (Operation::ThreadSummaries, 5),
+            (Operation::ThreadSummaries, 2),
+            (Operation::ThreadSummaries, 1),
+            (Operation::ThreadHistory, 4),
+            (Operation::ThreadHistory, 2),
+            (Operation::ThreadHistory, 1),
+        ]
+    );
+}
+
+struct OversizedThreadReadService;
+
+impl ThreadListService for OversizedThreadReadService {
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, ProtocolError> {
+        unreachable!()
+    }
+
+    fn thread_summaries(
+        &mut self,
+        _: ThreadListRequest,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        Ok(serde_json::json!({"entries": "x".repeat(2 * 1024 * 1024)}))
+    }
+}
+
+#[test]
+fn desktop_thread_read_rejects_an_oversized_one_entry_page() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let session_thread = std::thread::spawn(move || {
+        serve_desktop_client_session(server, &session(), &mut OversizedThreadReadService)
+    });
+
+    let Envelope::Error(error) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000205",
+            Operation::ThreadSummaries,
+            "admitted",
+            serde_json::json!({"limit": 1}),
+        ),
+    ) else {
+        panic!("oversized one-entry page did not return an error");
+    };
+    assert_eq!(error.error.code(), ErrorCode::PersistenceFailed);
+
+    drop(client);
+    assert_eq!(session_thread.join().unwrap(), Ok(()));
+}
+
+#[test]
+fn desktop_thread_reads_reject_invalid_bodies_without_dispatch() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let session_thread = std::thread::spawn(move || {
+        let mut service = ShrinkingThreadReadService::default();
+        let result = serve_desktop_client_session(server, &session(), &mut service);
+        (result, service)
+    });
+    let oversized_thread_id = "x".repeat(1025);
+
+    for (index, (operation, body)) in [
+        (Operation::ThreadSummaries, serde_json::json!({"limit": 0})),
+        (
+            Operation::ThreadSummaries,
+            serde_json::json!({"limit": 101}),
+        ),
+        (
+            Operation::ThreadSummaries,
+            serde_json::json!({"limit": 1, "extra": true}),
+        ),
+        (
+            Operation::ThreadHistory,
+            serde_json::json!({"thread_id": oversized_thread_id, "limit": 1}),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let Envelope::Error(error) = exchange(
+            &mut client,
+            request(
+                &format!("018f0000-0000-7000-8000-{index:012}"),
+                operation,
+                "admitted",
+                body,
+            ),
+        ) else {
+            panic!("invalid thread request did not return an error");
+        };
+        assert_eq!(error.error.code(), ErrorCode::InvalidRequest);
+    }
+
+    drop(client);
+    let (result, service) = session_thread.join().unwrap();
+    assert_eq!(result, Ok(()));
+    assert!(service.calls.is_empty());
+}
+
 fn request(id: &str, operation: Operation, capability: &str, body: serde_json::Value) -> Request {
     Request {
         protocol: Protocol,

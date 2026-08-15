@@ -958,6 +958,20 @@ pub trait ThreadListService {
         Err(ProtocolError::unsupported_operation())
     }
 
+    fn thread_summaries(
+        &mut self,
+        _request: ThreadListRequest,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn thread_history(
+        &mut self,
+        _request: ThreadOpenRequest,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
     fn create_thread(
         &mut self,
         _workspace: &str,
@@ -2224,6 +2238,8 @@ where
             request.operation,
             Operation::ThreadRename
                 | Operation::ThreadDelete
+                | Operation::ThreadSummaries
+                | Operation::ThreadHistory
                 | Operation::SessionStatus
                 | Operation::EntitlementSnapshot
                 | Operation::DeviceList
@@ -3203,6 +3219,86 @@ fn dispatch_request<S: ThreadListService>(
             return Err(ProtocolError::persistence_failed().into());
         }
         return Ok(response_only(value));
+    }
+    if request.operation == Operation::ThreadSummaries {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            limit: u8,
+            #[serde(default)]
+            cursor: Option<String>,
+        }
+        let body: Body =
+            serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
+        if body.limit == 0
+            || body.limit > 100
+            || body
+                .cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.is_empty() || cursor.len() > MAX_CURSOR_LENGTH)
+        {
+            return Err(ProtocolError::invalid_request().into());
+        }
+        let mut limit = body.limit;
+        loop {
+            let value = service.thread_summaries(ThreadListRequest {
+                limit,
+                cursor: body.cursor.clone(),
+            })?;
+            if serde_json::to_vec(&value)
+                .map_err(|_| ProtocolError::persistence_failed())?
+                .len()
+                <= MAX_RESPONSE_BODY_LENGTH
+            {
+                return Ok(response_only(value));
+            }
+            if limit == 1 {
+                return Err(ProtocolError::persistence_failed().into());
+            }
+            limit /= 2;
+        }
+    }
+    if request.operation == Operation::ThreadHistory {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            thread_id: String,
+            limit: u8,
+            #[serde(default)]
+            cursor: Option<String>,
+        }
+        let body: Body =
+            serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
+        if body.thread_id.is_empty()
+            || body.thread_id.len() > MAX_THREAD_ID_LENGTH
+            || body.limit == 0
+            || body.limit > 100
+            || body
+                .cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.is_empty() || cursor.len() > MAX_CURSOR_LENGTH)
+        {
+            return Err(ProtocolError::invalid_request().into());
+        }
+        let mut limit = body.limit;
+        loop {
+            let value = service.thread_history(ThreadOpenRequest {
+                thread_id: body.thread_id.clone(),
+                limit,
+                cursor: body.cursor.clone(),
+            })?;
+            if serde_json::to_vec(&value)
+                .map_err(|_| ProtocolError::persistence_failed())?
+                .len()
+                <= MAX_RESPONSE_BODY_LENGTH
+            {
+                return Ok(response_only(value));
+            }
+            if limit == 1 {
+                return Err(ProtocolError::persistence_failed().into());
+            }
+            limit /= 2;
+        }
     }
     if request.operation != Operation::ThreadList {
         return Err(ProtocolError::unsupported_operation().into());

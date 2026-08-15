@@ -5072,6 +5072,12 @@ fn companion_refuses_desktop_only_session_operations() {
             Operation::CompanionRevoke,
             json!({"client_identity": "companion-1"}),
         ),
+        (200, Operation::ThreadSummaries, json!({"limit": 10})),
+        (
+            201,
+            Operation::ThreadHistory,
+            json!({"thread_id": "thread-1", "limit": 10}),
+        ),
     ] {
         let (mut client, server) = UnixStream::pair().unwrap();
         client.write_all(&hello(1, 1)).unwrap();
