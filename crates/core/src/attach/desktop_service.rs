@@ -149,6 +149,14 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
             .map_err(|_| ProtocolError::persistence_failed())
     }
 
+    fn session_status(&mut self) -> Result<crate::auth::AuthStatus, ProtocolError> {
+        self.boundaries.session_status()
+    }
+
+    fn list_devices(&mut self) -> Result<crate::auth::NativeDeviceList, ProtocolError> {
+        self.boundaries.list_devices()
+    }
+
     fn control_migration(
         &mut self,
         request: MigrationControlRequest,

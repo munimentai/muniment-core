@@ -68,6 +68,14 @@ pub struct RunStartLaunch {
 
 pub trait RunAttachBoundaries {
     #[cfg(target_os = "linux")]
+    fn session_status(&self) -> Result<crate::auth::AuthStatus, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(target_os = "linux")]
+    fn list_devices(&self) -> Result<crate::auth::NativeDeviceList, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(target_os = "linux")]
     fn list_threads(
         &self,
         workspace: &str,
