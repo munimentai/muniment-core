@@ -248,6 +248,10 @@ pub enum Operation {
     ThreadList,
     #[serde(rename = "thread.open")]
     ThreadOpen,
+    #[serde(rename = "thread.summaries")]
+    ThreadSummaries,
+    #[serde(rename = "thread.history")]
+    ThreadHistory,
     #[serde(rename = "thread.create")]
     ThreadCreate,
     #[serde(rename = "thread.rename")]
@@ -320,6 +324,8 @@ impl Operation {
             Self::HomeEnsure => "home.ensure",
             Self::ThreadList => "thread.list",
             Self::ThreadOpen => "thread.open",
+            Self::ThreadSummaries => "thread.summaries",
+            Self::ThreadHistory => "thread.history",
             Self::ThreadCreate => "thread.create",
             Self::ThreadRename => "thread.rename",
             Self::ThreadDelete => "thread.delete",

@@ -547,6 +547,8 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         ("companion-list", Operation::CompanionList),
         ("companion-revoke", Operation::CompanionRevoke),
         ("session-sign-in", Operation::SessionSignIn),
+        ("thread-summaries", Operation::ThreadSummaries),
+        ("thread-history", Operation::ThreadHistory),
     ];
     for (index, (name, operation)) in operations.into_iter().enumerate() {
         insert(
@@ -710,6 +712,10 @@ fn request_body(operation: Operation) -> serde_json::Value {
         Operation::HomeEnsure => json!({}),
         Operation::ThreadList => json!({"cursor": "thread-cursor-1", "limit": 50}),
         Operation::ThreadOpen => {
+            json!({"thread_id": "thread-1", "cursor": "message-cursor-1", "limit": 100})
+        }
+        Operation::ThreadSummaries => json!({"cursor": "thread-cursor-1", "limit": 50}),
+        Operation::ThreadHistory => {
             json!({"thread_id": "thread-1", "cursor": "message-cursor-1", "limit": 100})
         }
         Operation::ThreadCreate => json!({}),
@@ -914,6 +920,8 @@ mod tests {
         let operations = [
             Operation::ThreadList,
             Operation::ThreadOpen,
+            Operation::ThreadSummaries,
+            Operation::ThreadHistory,
             Operation::ThreadCreate,
             Operation::ThreadRename,
             Operation::ThreadDelete,
@@ -981,7 +989,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            59,
+            61,
             "every canonical fixture must be inventoried"
         );
     }

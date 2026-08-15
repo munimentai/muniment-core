@@ -144,6 +144,20 @@ fn canonical_thread_create_fixtures_match_client_contracts() {
 }
 
 #[test]
+fn canonical_thread_read_fixtures_decode_to_their_operations() {
+    for (name, operation) in [
+        ("request-thread-summaries.json", Operation::ThreadSummaries),
+        ("request-thread-history.json", Operation::ThreadHistory),
+    ] {
+        let envelope: Envelope = serde_json::from_value(canonical_fixture(name)).unwrap();
+        let Envelope::Request(request) = envelope else {
+            panic!("expected request fixture");
+        };
+        assert_eq!(request.operation, operation);
+    }
+}
+
+#[test]
 fn canonical_cursor_ack_and_permission_fixtures_match_client_contracts() {
     let request: Envelope =
         serde_json::from_value(canonical_fixture("request-run-cursor-ack.json")).unwrap();

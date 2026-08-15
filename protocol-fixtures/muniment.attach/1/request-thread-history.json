@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"0000000000000000000000000000007e","operation":"thread.history","capability":"fixture-capability","body":{"cursor":"message-cursor-1","limit":100,"thread_id":"thread-1"}}
