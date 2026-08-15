@@ -7,8 +7,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use muniment_attach::{
-    decode_frame, encode_frame, reconnect_welcome, ErrorEnvelope, Failure, FirstMessage,
-    MigrationControlAuthorized, NegotiationError, Protocol, ProtocolError, VersionRange,
+    decode_frame, encode_frame, reconnect_welcome, DesktopClientAuthorizedGrant, ErrorEnvelope,
+    Failure, FirstMessage, NegotiationError, Protocol, ProtocolError, VersionRange,
     MAX_FRAME_LENGTH,
 };
 
@@ -121,7 +121,7 @@ pub fn admit_desktop_client(
     let capability = hex(&capability_bytes);
     let mut workspace_scopes = BTreeMap::new();
     workspace_scopes.insert(approval.workspace.clone(), approval.scopes);
-    let grant = MigrationControlAuthorized {
+    let grant = DesktopClientAuthorizedGrant {
         profile_id: approval.profile.clone(),
         capability: capability.clone(),
         expires_at: approval.lifetime.min(MAX_CAPABILITY_LIFETIME).as_secs(),

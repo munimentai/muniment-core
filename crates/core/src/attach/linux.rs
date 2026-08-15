@@ -1861,12 +1861,10 @@ fn run_migration_control_session<S: ThreadListService>(
     let mut capability_bytes = [0u8; 32];
     fill_random(&mut capability_bytes).map_err(|_| AttachSessionError::Randomness)?;
     let capability = hex(&capability_bytes);
-    let authorized = muniment_attach::MigrationControlAuthorized {
-        profile_id: String::new(),
+    let authorized = muniment_attach::PeerAuthorizedGrant {
         capability: capability.clone(),
         expires_at: timeout.as_secs(),
         idle_timeout_seconds: timeout.as_secs(),
-        workspace_scopes: BTreeMap::new(),
     };
     write_before(
         stream,

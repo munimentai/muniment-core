@@ -3,7 +3,7 @@ use std::{
     fmt,
 };
 
-use serde::{de, Deserialize, Deserializer, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{ErrorAction, Id, Protocol, ProtocolError, VersionRange};
 
@@ -265,14 +265,99 @@ impl fmt::Debug for Authorized {
     }
 }
 
-/// A connection-bound migration control grant with no reconnect credential.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MigrationControlAuthorized {
+/// A connection-bound grant for an authorized local peer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerAuthorizedGrant {
+    pub capability: String,
+    pub expires_at: u64,
+    pub idle_timeout_seconds: u64,
+}
+
+impl Serialize for PeerAuthorizedGrant {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct PeerAuthorizedGrantFields<'a> {
+            profile_id: &'static str,
+            capability: &'a str,
+            expires_at: u64,
+            idle_timeout_seconds: u64,
+            workspace_scopes: BTreeMap<String, BTreeSet<String>>,
+        }
+
+        PeerAuthorizedGrantFields {
+            profile_id: "",
+            capability: &self.capability,
+            expires_at: self.expires_at,
+            idle_timeout_seconds: self.idle_timeout_seconds,
+            workspace_scopes: BTreeMap::new(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PeerAuthorizedGrant {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct PeerAuthorizedGrantFields {
+            profile_id: String,
+            capability: String,
+            expires_at: u64,
+            idle_timeout_seconds: u64,
+            workspace_scopes: BTreeMap<String, BTreeSet<String>>,
+        }
+
+        let fields = PeerAuthorizedGrantFields::deserialize(deserializer)?;
+        if !fields.profile_id.is_empty() || !fields.workspace_scopes.is_empty() {
+            return Err(de::Error::custom("peer grant contains workspace authority"));
+        }
+        Ok(Self {
+            capability: fields.capability,
+            expires_at: fields.expires_at,
+            idle_timeout_seconds: fields.idle_timeout_seconds,
+        })
+    }
+}
+
+/// A connection-bound grant for an admitted desktop client.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DesktopClientAuthorizedGrant {
     pub profile_id: String,
     pub capability: String,
     pub expires_at: u64,
     pub idle_timeout_seconds: u64,
     pub workspace_scopes: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl<'de> Deserialize<'de> for DesktopClientAuthorizedGrant {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct DesktopClientAuthorizedGrantFields {
+            profile_id: String,
+            capability: String,
+            expires_at: u64,
+            idle_timeout_seconds: u64,
+            workspace_scopes: BTreeMap<String, BTreeSet<String>>,
+        }
+
+        let fields = DesktopClientAuthorizedGrantFields::deserialize(deserializer)?;
+        if fields.profile_id.is_empty() {
+            return Err(de::Error::custom(
+                "desktop client grant has an empty profile",
+            ));
+        }
+        if fields.workspace_scopes.is_empty() {
+            return Err(de::Error::custom(
+                "desktop client grant has empty workspace scopes",
+            ));
+        }
+        Ok(Self {
+            profile_id: fields.profile_id,
+            capability: fields.capability,
+            expires_at: fields.expires_at,
+            idle_timeout_seconds: fields.idle_timeout_seconds,
+            workspace_scopes: fields.workspace_scopes,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

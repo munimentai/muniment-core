@@ -9,8 +9,8 @@ use std::time::Duration;
 use muniment_core::attach::linux::PeerCredentials;
 use muniment_core::attach::{
     admit_approval_presenter, decode_frame, encode_frame, ApprovalPresenterAdmissionError, Client,
-    ErrorCode, ErrorEnvelope, Hello, Id, MigrationControlAuthorized, Protocol, VersionRange,
-    Welcome, MAX_FRAME_LENGTH,
+    ErrorCode, ErrorEnvelope, Hello, Id, PeerAuthorizedGrant, Protocol, VersionRange, Welcome,
+    MAX_FRAME_LENGTH,
 };
 use muniment_core::browser_control::{LinuxProcReader, ProcReadError};
 
@@ -89,11 +89,9 @@ fn verified_peer_receives_welcome_and_credential_free_grant() {
     assert_eq!(welcome.desktop_version, "0.1.0");
     assert_hex(&welcome.server_nonce, 32);
     assert!(welcome.approval_challenge.is_empty());
-    let grant: MigrationControlAuthorized = read_frame(&mut client);
+    let grant: PeerAuthorizedGrant = read_frame(&mut client);
     assert_hex(&grant.capability, 64);
     assert_eq!(grant.capability, capability);
-    assert!(grant.profile_id.is_empty());
-    assert!(grant.workspace_scopes.is_empty());
     returned_stream.shutdown(std::net::Shutdown::Both).unwrap();
 }
 

@@ -10,9 +10,9 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::{
-    Authorization, Client, ErrorEnvelope, Event, EventName, Failure, Hello, Id,
-    MigrationControlAuthorized, Operation, Protocol, ProtocolError, Request, Response, Success,
-    VersionRange, Welcome,
+    Authorization, Client, DesktopClientAuthorizedGrant, ErrorEnvelope, Event, EventName, Failure,
+    Hello, Id, Operation, Protocol, ProtocolError, Request, Response, Success, VersionRange,
+    Welcome,
 };
 
 pub const FIXTURE_DIRECTORY: &str = "muniment.attach/1";
@@ -507,7 +507,7 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
     insert(
         &mut fixtures,
         "authorization-desktop-client.json",
-        &MigrationControlAuthorized {
+        &DesktopClientAuthorizedGrant {
             profile_id: "profile-1".into(),
             capability: "33".repeat(32),
             expires_at: 60,

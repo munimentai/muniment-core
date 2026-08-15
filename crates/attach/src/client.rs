@@ -368,10 +368,10 @@ mod linux {
         ThreadCreateAccepted, ThreadListPage, ThreadOpenPage,
     };
     use crate::{
-        decode_frame, encode_frame, Authorization, Authorized, Client, Envelope, ErrorCode,
-        ErrorEnvelope, EventName, FrameError, Hello, Id, MigrationControlAuthorized, Operation,
-        Protocol, Request, Response, VersionRange, Welcome, WorkspaceOnboarded, MAX_FRAME_LENGTH,
-        MAX_TEXT_LENGTH, PROTOCOL,
+        decode_frame, encode_frame, Authorization, Authorized, Client,
+        DesktopClientAuthorizedGrant, Envelope, ErrorCode, ErrorEnvelope, EventName, FrameError,
+        Hello, Id, Operation, PeerAuthorizedGrant, Protocol, Request, Response, VersionRange,
+        Welcome, WorkspaceOnboarded, MAX_FRAME_LENGTH, MAX_TEXT_LENGTH, PROTOCOL,
     };
     use serde::de::DeserializeOwned;
     use serde_json::Value;
@@ -2462,10 +2462,8 @@ mod linux {
         {
             return Err(ClientError::UnexpectedMessage);
         }
-        let authorized: MigrationControlAuthorized = parse_message(authorized_value)?;
-        if !authorized.profile_id.is_empty()
-            || !authorized.workspace_scopes.is_empty()
-            || !is_hex_secret(&authorized.capability, 64)
+        let authorized: PeerAuthorizedGrant = parse_message(authorized_value)?;
+        if !is_hex_secret(&authorized.capability, 64)
             || authorized.expires_at == 0
             || authorized.expires_at > 8 * 60 * 60
             || authorized.idle_timeout_seconds == 0
@@ -2523,9 +2521,8 @@ mod linux {
         {
             return Err(ClientError::UnexpectedMessage);
         }
-        let authorized: MigrationControlAuthorized = parse_message(authorized_value)?;
-        if authorized.profile_id.is_empty()
-            || authorized.workspace_scopes.len() != 1
+        let authorized: DesktopClientAuthorizedGrant = parse_message(authorized_value)?;
+        if authorized.workspace_scopes.len() != 1
             || !is_hex_secret(&authorized.capability, 64)
             || authorized.expires_at == 0
             || authorized.expires_at > 8 * 60 * 60
@@ -2586,10 +2583,8 @@ mod linux {
         {
             return Err(ClientError::UnexpectedMessage);
         }
-        let authorized: MigrationControlAuthorized = parse_message(authorized_value)?;
-        if !authorized.profile_id.is_empty()
-            || !authorized.workspace_scopes.is_empty()
-            || !is_hex_secret(&authorized.capability, 64)
+        let authorized: PeerAuthorizedGrant = parse_message(authorized_value)?;
+        if !is_hex_secret(&authorized.capability, 64)
             || authorized.expires_at == 0
             || authorized.expires_at > 8 * 60 * 60
             || authorized.idle_timeout_seconds == 0

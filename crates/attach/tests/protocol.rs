@@ -658,3 +658,50 @@ fn unknown_v1_events_are_representable_and_ignorable() {
     };
     assert_eq!(name.as_str(), "future.optional_event");
 }
+
+#[test]
+fn peer_grant_uses_empty_workspace_authority() {
+    let grant = PeerAuthorizedGrant {
+        capability: "capability".into(),
+        expires_at: 60,
+        idle_timeout_seconds: 30,
+    };
+    assert_eq!(
+        serde_json::to_string(&grant).unwrap(),
+        r#"{"profile_id":"","capability":"capability","expires_at":60,"idle_timeout_seconds":30,"workspace_scopes":{}}"#
+    );
+
+    let mut invalid = serde_json::to_value(grant).unwrap();
+    invalid["profile_id"] = json!("profile-1");
+    assert!(serde_json::from_value::<PeerAuthorizedGrant>(invalid).is_err());
+
+    let invalid = json!({
+        "profile_id": "",
+        "capability": "capability",
+        "expires_at": 60,
+        "idle_timeout_seconds": 30,
+        "workspace_scopes": {"/work/signed": ["threads:read"]}
+    });
+    assert!(serde_json::from_value::<PeerAuthorizedGrant>(invalid).is_err());
+}
+
+#[test]
+fn desktop_client_grant_requires_workspace_authority() {
+    let empty_profile = json!({
+        "profile_id": "",
+        "capability": "capability",
+        "expires_at": 60,
+        "idle_timeout_seconds": 30,
+        "workspace_scopes": {"/work/signed": ["threads:read"]}
+    });
+    assert!(serde_json::from_value::<DesktopClientAuthorizedGrant>(empty_profile).is_err());
+
+    let empty_scopes = json!({
+        "profile_id": "profile-1",
+        "capability": "capability",
+        "expires_at": 60,
+        "idle_timeout_seconds": 30,
+        "workspace_scopes": {}
+    });
+    assert!(serde_json::from_value::<DesktopClientAuthorizedGrant>(empty_scopes).is_err());
+}

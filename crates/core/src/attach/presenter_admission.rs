@@ -1,6 +1,5 @@
 //! Linux approval presenter admission.
 
-use std::collections::BTreeMap;
 use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -8,8 +7,7 @@ use std::time::{Duration, Instant};
 
 use muniment_attach::{
     decode_frame, encode_frame, reconnect_welcome, ErrorEnvelope, Failure, FirstMessage,
-    MigrationControlAuthorized, NegotiationError, Protocol, ProtocolError, VersionRange,
-    MAX_FRAME_LENGTH,
+    NegotiationError, PeerAuthorizedGrant, Protocol, ProtocolError, VersionRange, MAX_FRAME_LENGTH,
 };
 
 use super::deadline_io::{is_timeout, read_exact_before, write_all_before};
@@ -99,12 +97,10 @@ pub fn admit_approval_presenter(
     getrandom::fill(&mut capability_bytes)
         .map_err(|_| ApprovalPresenterAdmissionError::Randomness)?;
     let capability = hex(&capability_bytes);
-    let grant = MigrationControlAuthorized {
-        profile_id: String::new(),
+    let grant = PeerAuthorizedGrant {
         capability: capability.clone(),
         expires_at: timeout.as_secs(),
         idle_timeout_seconds: timeout.as_secs(),
-        workspace_scopes: BTreeMap::new(),
     };
     write_all_before(
         &mut stream,

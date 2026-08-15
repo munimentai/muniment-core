@@ -7,7 +7,7 @@ use std::{
 use std::sync::{atomic::AtomicBool, Arc};
 
 use muniment_attach::fixtures::{export, open_generation, Mode, FIXTURE_DIRECTORY};
-use muniment_attach::{Hello, MigrationControlAuthorized, Operation, Request};
+use muniment_attach::{DesktopClientAuthorizedGrant, Hello, Operation, Request};
 
 static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
@@ -64,7 +64,7 @@ fn export_includes_desktop_client_admission_fixtures() {
     assert_eq!(hello.client.kind, "desktop-client");
     assert!(hello.authorized_client_credential.is_none());
 
-    let grant: MigrationControlAuthorized = serde_json::from_slice(
+    let grant: DesktopClientAuthorizedGrant = serde_json::from_slice(
         &fs::read(directory.join("authorization-desktop-client.json")).unwrap(),
     )
     .unwrap();
