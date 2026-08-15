@@ -68,7 +68,8 @@ pub struct NativeEntitlementGroup {
 
 /// Safe webview projection. The signed envelope and native credentials have no
 /// fields in this type and therefore cannot be serialized through it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct EntitlementSnapshotView {
     pub snapshot_version: u64,
     pub org_id: Uuid,
