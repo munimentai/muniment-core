@@ -89,6 +89,42 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         self.boundaries.attach_approval()
     }
 
+    fn list_companions(&mut self) -> Result<Vec<super::CompanionRecord>, ProtocolError> {
+        self.boundaries.list_companions()
+    }
+
+    fn revoke_companion(
+        &mut self,
+        client_identity: &str,
+        request_id: &Id,
+        idempotency_key: &Id,
+        provenance: CompanionProvenance,
+    ) -> Result<(), ProtocolError> {
+        let canonical_input = json!({"client_identity": client_identity});
+        let ledger_request = AttachRequest {
+            protocol: Protocol,
+            request_id: request_id.clone(),
+            operation: Operation::CompanionRevoke,
+            capability: String::new(),
+            idempotency_key: Some(idempotency_key.clone()),
+            body: canonical_input.clone(),
+        };
+        self.idempotency.execute(
+            &provenance.profile,
+            &ledger_request,
+            &canonical_input,
+            || Ok(()),
+            || {
+                self.boundaries.revoke_companion(client_identity)?;
+                Ok(CommittedResult {
+                    body: json!({}),
+                    cursor: None,
+                })
+            },
+        )?;
+        Ok(())
+    }
+
     fn authorize_client(
         &mut self,
         client_identity: &str,

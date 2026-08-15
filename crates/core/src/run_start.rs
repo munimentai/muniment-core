@@ -76,6 +76,14 @@ pub trait RunAttachBoundaries {
         Err(ProtocolError::unsupported_operation())
     }
     #[cfg(target_os = "linux")]
+    fn list_companions(&self) -> Result<Vec<crate::attach::CompanionRecord>, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(target_os = "linux")]
+    fn revoke_companion(&self, _client_identity: &str) -> Result<(), ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(target_os = "linux")]
     fn list_threads(
         &self,
         workspace: &str,
