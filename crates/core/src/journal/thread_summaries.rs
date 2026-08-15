@@ -9,14 +9,16 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::fmt;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ThreadSummary {
     pub thread_id: String,
     pub title: String,
     pub updated_at: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ThreadSummaryPage {
     pub summaries: Vec<ThreadSummary>,
     pub next_cursor: Option<String>,

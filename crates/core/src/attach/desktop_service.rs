@@ -306,6 +306,23 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         self.boundaries.open_thread(workspace, request)
     }
 
+    fn thread_summaries(
+        &mut self,
+        request: ThreadListRequest,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        serde_json::to_value(self.boundaries.thread_summaries(request)?)
+            .map_err(|_| ProtocolError::persistence_failed())
+    }
+
+    #[cfg(feature = "keyring")]
+    fn thread_history(
+        &mut self,
+        request: ThreadOpenRequest,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        serde_json::to_value(self.boundaries.thread_history(request)?)
+            .map_err(|_| ProtocolError::persistence_failed())
+    }
+
     fn create_thread(
         &mut self,
         workspace: &str,

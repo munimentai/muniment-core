@@ -110,6 +110,20 @@ pub trait RunAttachBoundaries {
         request: ThreadOpenRequest,
     ) -> Result<ThreadOpenPage, ProtocolError>;
     #[cfg(target_os = "linux")]
+    fn thread_summaries(
+        &self,
+        _request: ThreadListRequest,
+    ) -> Result<crate::journal::thread_summaries::ThreadSummaryPage, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(all(target_os = "linux", feature = "keyring"))]
+    fn thread_history(
+        &self,
+        _request: ThreadOpenRequest,
+    ) -> Result<crate::thread_history::ChatThreadOpenPage, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(target_os = "linux")]
     fn create_thread(
         &self,
         _workspace: &str,
