@@ -278,6 +278,8 @@ pub enum Operation {
     RunStart,
     #[serde(rename = "run.stream")]
     RunStream,
+    #[serde(rename = "run.chat_events")]
+    RunChatEvents,
     #[serde(rename = "run.cursor_ack")]
     RunCursorAck,
     #[serde(rename = "run.steer")]
@@ -339,6 +341,7 @@ impl Operation {
             Self::RunOpen => "run.open",
             Self::RunStart => "run.start",
             Self::RunStream => "run.stream",
+            Self::RunChatEvents => "run.chat_events",
             Self::RunCursorAck => "run.cursor_ack",
             Self::RunSteer => "run.steer",
             Self::RunFollowUp => "run.follow_up",
@@ -357,6 +360,8 @@ impl Operation {
 pub enum EventName {
     #[serde(rename = "run.event")]
     RunEvent,
+    #[serde(rename = "chat.event")]
+    ChatEvent,
     #[serde(rename = "subscription.caught_up")]
     SubscriptionCaughtUp,
     #[serde(rename = "permission.pending")]

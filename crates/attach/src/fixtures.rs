@@ -549,6 +549,7 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         ("session-sign-in", Operation::SessionSignIn),
         ("thread-summaries", Operation::ThreadSummaries),
         ("thread-history", Operation::ThreadHistory),
+        ("run-chat-events", Operation::RunChatEvents),
     ];
     for (index, (name, operation)) in operations.into_iter().enumerate() {
         insert(
@@ -662,12 +663,13 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
             "unknown",
             serde_json::from_value(json!("future.optional")).map_err(io::Error::other)?,
         ),
+        ("chat-event", EventName::ChatEvent),
     ];
     for (index, (name, event)) in events.into_iter().enumerate() {
         let body = event_body(&event);
-        let artifact_event = matches!(
+        let event_without_run_cursor = matches!(
             event,
-            EventName::ArtifactChunk | EventName::ArtifactComplete
+            EventName::ArtifactChunk | EventName::ArtifactComplete | EventName::ChatEvent
         );
         insert(
             &mut fixtures,
@@ -676,8 +678,8 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
                 protocol: Protocol,
                 subscription_id: id(400)?,
                 event,
-                run_id: (!artifact_event).then(|| id(401)).transpose()?,
-                run_seq: (!artifact_event).then_some(index as u64 + 1),
+                run_id: (!event_without_run_cursor).then(|| id(401)).transpose()?,
+                run_seq: (!event_without_run_cursor).then_some(index as u64 + 1),
                 body,
             },
         )?;
@@ -735,6 +737,7 @@ fn request_body(operation: Operation) -> serde_json::Value {
         Operation::RunStream => {
             json!({"run_id": "00000000000000000000000000000191", "after_run_seq": 7})
         }
+        Operation::RunChatEvents => json!({}),
         Operation::RunCursorAck => {
             json!({"subscription_id": "00000000000000000000000000000190", "through_run_seq": 7})
         }
@@ -819,6 +822,15 @@ fn event_body(event: &EventName) -> serde_json::Value {
             "event_version": 1,
             "recorded_at": "2026-07-17T00:00:00Z",
             "payload": {"withheld": true}
+        }),
+        EventName::ChatEvent => json!({
+            "runId": "00000000000000000000000000000191",
+            "phase": "running",
+            "text": "Review the selected file.",
+            "toolActivity": [],
+            "attachments": [],
+            "recalls": [],
+            "appliedDiffs": []
         }),
         EventName::SubscriptionCaughtUp => json!({"through_run_seq": 7}),
         EventName::PermissionPending => {
@@ -935,6 +947,7 @@ mod tests {
             Operation::RunOpen,
             Operation::RunStart,
             Operation::RunStream,
+            Operation::RunChatEvents,
             Operation::RunCursorAck,
             Operation::RunSteer,
             Operation::RunFollowUp,
@@ -976,6 +989,7 @@ mod tests {
         for name in [
             "event-run-stream.json",
             "event-run-stream-tool-effect.json",
+            "event-chat-event.json",
             "event-subscription-caught-up.json",
             "event-permission-pending.json",
             "event-artifact-chunk.json",
@@ -989,7 +1003,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            61,
+            63,
             "every canonical fixture must be inventoried"
         );
     }

@@ -158,6 +158,47 @@ fn canonical_thread_read_fixtures_decode_to_their_operations() {
 }
 
 #[test]
+fn canonical_chat_event_fixtures_round_trip_byte_for_byte() {
+    let directory =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../protocol-fixtures/muniment.attach/1");
+
+    let request_bytes = fs::read(directory.join("request-run-chat-events.json")).unwrap();
+    let request: Request = serde_json::from_slice(&request_bytes).unwrap();
+    assert_eq!(request.operation, Operation::RunChatEvents);
+    assert_eq!(request.operation.as_str(), "run.chat_events");
+    assert!(!request.operation.requires_idempotency_key());
+    assert_eq!(request.body, json!({}));
+    let mut encoded_request = serde_json::to_vec(&request).unwrap();
+    encoded_request.push(b'\n');
+    assert_eq!(encoded_request, request_bytes);
+
+    let event_bytes = fs::read(directory.join("event-chat-event.json")).unwrap();
+    let event: Event = serde_json::from_slice(&event_bytes).unwrap();
+    assert_eq!(event.event, EventName::ChatEvent);
+    assert_eq!(
+        event.subscription_id.as_str(),
+        "00000000000000000000000000000190"
+    );
+    assert!(event.run_id.is_none());
+    assert!(event.run_seq.is_none());
+    assert_eq!(
+        event.body,
+        json!({
+            "runId": "00000000000000000000000000000191",
+            "phase": "running",
+            "text": "Review the selected file.",
+            "toolActivity": [],
+            "attachments": [],
+            "recalls": [],
+            "appliedDiffs": []
+        })
+    );
+    let mut encoded_event = serde_json::to_vec(&event).unwrap();
+    encoded_event.push(b'\n');
+    assert_eq!(encoded_event, event_bytes);
+}
+
+#[test]
 fn canonical_cursor_ack_and_permission_fixtures_match_client_contracts() {
     let request: Envelope =
         serde_json::from_value(canonical_fixture("request-run-cursor-ack.json")).unwrap();
