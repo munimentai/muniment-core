@@ -6,9 +6,10 @@ use super::linux::{
     CompanionProvenance, EntitlementSnapshotResult, MigrationControlRequest,
     PermissionAnswerAccepted, PermissionAnswerRequest, PermissionDecision, RunCancelAccepted,
     RunCancelRequest, RunMessageAccepted, RunMessageRequest, RunPermissionAnswerAccepted,
-    RunPermissionAnswerRequest, RunStartAccepted, RunStartRequest as AttachRunStartRequest,
-    RunStreamPage, ThreadCreateAccepted, ThreadListPage, ThreadListRequest, ThreadListService,
-    ThreadOpenPage, ThreadOpenRequest,
+    RunPermissionAnswerRequest, RunResumeAccepted, RunResumeRequest, RunStartAccepted,
+    RunStartRequest as AttachRunStartRequest, RunStreamPage, RunSubmitAccepted, RunSubmitRequest,
+    ThreadCreateAccepted, ThreadListPage, ThreadListRequest, ThreadListService, ThreadOpenPage,
+    ThreadOpenRequest,
 };
 use super::{
     bounded_claim, onboard_workspace_context,
@@ -735,6 +736,105 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
     }
 
+    fn submit_run(
+        &mut self,
+        workspace: &str,
+        request: RunSubmitRequest,
+        request_id: &Id,
+        idempotency_key: &Id,
+        companion: CompanionProvenance,
+    ) -> Result<RunSubmitAccepted, ProtocolError> {
+        let canonical_input = json!({
+            "workspace": workspace,
+            "text": &request.text,
+            "files": &request.files,
+            "thread_id": &request.thread_id,
+        });
+        let ledger_request = AttachRequest {
+            protocol: Protocol,
+            request_id: request_id.clone(),
+            operation: Operation::RunSubmit,
+            capability: String::new(),
+            idempotency_key: Some(idempotency_key.clone()),
+            body: canonical_input.clone(),
+        };
+        let outcome = self.idempotency.execute(
+            &companion.profile,
+            &ledger_request,
+            &canonical_input,
+            || Ok(()),
+            || {
+                let accepted = self
+                    .boundaries
+                    .submit_run(
+                        workspace,
+                        request.text,
+                        request
+                            .files
+                            .into_iter()
+                            .map(|path| crate::chat_view::SelectedFile {
+                                path: PathBuf::from(path),
+                            })
+                            .collect(),
+                        request.thread_id,
+                    )
+                    .map_err(|error| error.protocol_error())?;
+                Ok(CommittedResult {
+                    body: serde_json::to_value(accepted)
+                        .map_err(|_| ProtocolError::persistence_failed())?,
+                    cursor: None,
+                })
+            },
+        )?;
+        let committed = match outcome {
+            IdempotencyOutcome::Committed(result) | IdempotencyOutcome::Replayed(result) => result,
+        };
+        serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
+    }
+
+    fn resume_run(
+        &mut self,
+        workspace: &str,
+        request: RunResumeRequest,
+        request_id: &Id,
+        idempotency_key: &Id,
+        companion: CompanionProvenance,
+    ) -> Result<RunResumeAccepted, ProtocolError> {
+        let canonical_input = json!({
+            "workspace": workspace,
+            "run_id": &request.run_id,
+        });
+        let ledger_request = AttachRequest {
+            protocol: Protocol,
+            request_id: request_id.clone(),
+            operation: Operation::RunResume,
+            capability: String::new(),
+            idempotency_key: Some(idempotency_key.clone()),
+            body: canonical_input.clone(),
+        };
+        let outcome = self.idempotency.execute(
+            &companion.profile,
+            &ledger_request,
+            &canonical_input,
+            || Ok(()),
+            || {
+                let accepted = self
+                    .boundaries
+                    .resume_run(workspace, &request.run_id)
+                    .map_err(|error| error.protocol_error())?;
+                Ok(CommittedResult {
+                    body: serde_json::to_value(accepted)
+                        .map_err(|_| ProtocolError::persistence_failed())?,
+                    cursor: None,
+                })
+            },
+        )?;
+        let committed = match outcome {
+            IdempotencyOutcome::Committed(result) | IdempotencyOutcome::Replayed(result) => result,
+        };
+        serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
+    }
+
     fn steer_run(
         &mut self,
         workspace: &str,
@@ -1048,6 +1148,8 @@ mod tests {
         journaled_events: Mutex<BTreeMap<String, Vec<EventEnvelope>>>,
         clear_calls: AtomicUsize,
         cancel_calls: AtomicUsize,
+        submit_calls: AtomicUsize,
+        resume_calls: AtomicUsize,
         active_run: Mutex<Option<(String, String)>>,
         runtime_activity: RuntimeActivityRegistry,
         #[cfg(target_os = "linux")]
@@ -1088,6 +1190,8 @@ mod tests {
                 journaled_events: Mutex::new(BTreeMap::new()),
                 clear_calls: AtomicUsize::new(0),
                 cancel_calls: AtomicUsize::new(0),
+                submit_calls: AtomicUsize::new(0),
+                resume_calls: AtomicUsize::new(0),
                 active_run: Mutex::new(None),
                 runtime_activity: RuntimeActivityRegistry::new(),
                 #[cfg(target_os = "linux")]
@@ -1109,6 +1213,45 @@ mod tests {
     }
 
     impl RunAttachBoundaries for FakeRunStartBoundaries {
+        fn submit_run(
+            &self,
+            _workspace: &str,
+            _text: String,
+            files: Vec<SelectedFile>,
+            thread_id: Option<String>,
+        ) -> Result<crate::run_start::AttachPromptAccepted, RunStartError> {
+            self.submit_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::run_start::AttachPromptAccepted {
+                run_id: "0190a100-0000-7000-8000-000000000001".into(),
+                thread_id: thread_id
+                    .unwrap_or_else(|| "0190a100-0000-7000-8000-000000000002".into()),
+                attachments: files
+                    .into_iter()
+                    .map(|file| ChatAttachment {
+                        display_name: file.path.to_string_lossy().into_owned(),
+                        byte_length: 1,
+                        media_type: None,
+                    })
+                    .collect(),
+                committed_seq: 1,
+                accepted_at: "2026-08-16T00:00:00Z".into(),
+            })
+        }
+
+        fn resume_run(
+            &self,
+            _workspace: &str,
+            run_id: &str,
+        ) -> Result<crate::run_start::AttachResumeAccepted, RunStartError> {
+            self.resume_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::run_start::AttachResumeAccepted {
+                run_id: run_id.into(),
+                thread_id: "0190a100-0000-7000-8000-000000000002".into(),
+                committed_seq: 2,
+                accepted_at: "2026-08-16T00:00:00Z".into(),
+            })
+        }
+
         #[cfg(target_os = "linux")]
         fn queue_attach_message(
             &self,
@@ -1708,6 +1851,133 @@ mod tests {
         drop(journal);
         drop(service);
         std::fs::remove_file(database_path).unwrap();
+    }
+
+    fn test_companion_provenance() -> CompanionProvenance {
+        CompanionProvenance {
+            profile: "default".into(),
+            companion_kind: "desktop".into(),
+            companion_version: "1.0.0".into(),
+            peer_uid: 1000,
+            peer_pid: 42,
+        }
+    }
+
+    #[test]
+    fn attach_submit_replays_and_rejects_conflicting_input_without_second_boundary_call() {
+        let mut service = DesktopAttachService {
+            boundaries: FakeRunStartBoundaries::accepting(),
+            idempotency: IdempotencyStore::open(":memory:").unwrap(),
+            home: PathBuf::new(),
+            workspace_contexts: Arc::new(Mutex::new(WorkspaceContextMap::default())),
+            client_credentials: Arc::new(Mutex::new(HashMap::new())),
+            credential_path: None,
+            client_identity: Some("default".into()),
+        };
+        let request_id = Id::new("018f0000-0000-7000-8000-000000000001").unwrap();
+        let key = Id::new("018f0000-0000-7000-8000-000000000002").unwrap();
+        let request = RunSubmitRequest {
+            text: "hello".into(),
+            files: vec!["main.rs".into()],
+            thread_id: None,
+        };
+
+        let first = service
+            .submit_run(
+                "workspace-a",
+                request.clone(),
+                &request_id,
+                &key,
+                test_companion_provenance(),
+            )
+            .unwrap();
+        let replay = service
+            .submit_run(
+                "workspace-a",
+                request,
+                &request_id,
+                &key,
+                test_companion_provenance(),
+            )
+            .unwrap();
+        assert_eq!(replay.run_id, first.run_id);
+        assert_eq!(replay.thread_id, first.thread_id);
+        assert_eq!(replay.attachments, first.attachments);
+        assert_eq!(replay.committed_seq, first.committed_seq);
+        assert_eq!(replay.accepted_at, first.accepted_at);
+        assert_eq!(service.boundaries.submit_calls.load(Ordering::SeqCst), 1);
+
+        let conflict = service
+            .submit_run(
+                "workspace-a",
+                RunSubmitRequest {
+                    text: "changed".into(),
+                    files: vec!["main.rs".into()],
+                    thread_id: None,
+                },
+                &request_id,
+                &key,
+                test_companion_provenance(),
+            )
+            .unwrap_err();
+        assert_eq!(conflict.code(), ErrorCode::IdempotencyConflict);
+        assert_eq!(service.boundaries.submit_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn attach_resume_replays_and_rejects_conflicting_input_without_second_boundary_call() {
+        let mut service = DesktopAttachService {
+            boundaries: FakeRunStartBoundaries::accepting(),
+            idempotency: IdempotencyStore::open(":memory:").unwrap(),
+            home: PathBuf::new(),
+            workspace_contexts: Arc::new(Mutex::new(WorkspaceContextMap::default())),
+            client_credentials: Arc::new(Mutex::new(HashMap::new())),
+            credential_path: None,
+            client_identity: Some("default".into()),
+        };
+        let request_id = Id::new("018f0000-0000-7000-8000-000000000001").unwrap();
+        let key = Id::new("018f0000-0000-7000-8000-000000000002").unwrap();
+        let request = RunResumeRequest {
+            run_id: "0190a100-0000-7000-8000-000000000001".into(),
+        };
+
+        let first = service
+            .resume_run(
+                "workspace-a",
+                request.clone(),
+                &request_id,
+                &key,
+                test_companion_provenance(),
+            )
+            .unwrap();
+        let replay = service
+            .resume_run(
+                "workspace-a",
+                request,
+                &request_id,
+                &key,
+                test_companion_provenance(),
+            )
+            .unwrap();
+        assert_eq!(replay.run_id, first.run_id);
+        assert_eq!(replay.thread_id, first.thread_id);
+        assert_eq!(replay.committed_seq, first.committed_seq);
+        assert_eq!(replay.accepted_at, first.accepted_at);
+        assert_eq!(service.boundaries.resume_calls.load(Ordering::SeqCst), 1);
+
+        let conflict = service
+            .resume_run(
+                "workspace-a",
+                RunResumeRequest {
+                    run_id: "0190a100-0000-7000-8000-000000000099".into(),
+                },
+                &request_id,
+                &key,
+                test_companion_provenance(),
+            )
+            .unwrap_err();
+        assert_eq!(conflict.code(), ErrorCode::IdempotencyConflict);
+        assert_eq!(service.boundaries.resume_calls.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(target_os = "linux")]

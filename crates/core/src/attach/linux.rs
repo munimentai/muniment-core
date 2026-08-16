@@ -833,6 +833,35 @@ pub struct RunStartAccepted {
     pub accepted_at: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunSubmitRequest {
+    pub text: String,
+    pub files: Vec<String>,
+    pub thread_id: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct RunSubmitAccepted {
+    pub run_id: String,
+    pub thread_id: String,
+    pub attachments: Vec<crate::chat_view::ChatAttachment>,
+    pub committed_seq: u64,
+    pub accepted_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunResumeRequest {
+    pub run_id: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct RunResumeAccepted {
+    pub run_id: String,
+    pub thread_id: String,
+    pub committed_seq: u64,
+    pub accepted_at: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ThreadCreateAccepted {
@@ -1080,6 +1109,28 @@ pub trait ThreadListService {
         _idempotency_key: &super::Id,
         _provenance: CompanionProvenance,
     ) -> Result<RunStartAccepted, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn submit_run(
+        &mut self,
+        _workspace: &str,
+        _request: RunSubmitRequest,
+        _request_id: &super::Id,
+        _idempotency_key: &super::Id,
+        _provenance: CompanionProvenance,
+    ) -> Result<RunSubmitAccepted, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn resume_run(
+        &mut self,
+        _workspace: &str,
+        _request: RunResumeRequest,
+        _request_id: &super::Id,
+        _idempotency_key: &super::Id,
+        _provenance: CompanionProvenance,
+    ) -> Result<RunResumeAccepted, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
 
@@ -2372,6 +2423,8 @@ where
                 | Operation::CompanionList
                 | Operation::CompanionRevoke
                 | Operation::RunChatEvents
+                | Operation::RunSubmit
+                | Operation::RunResume
                 | Operation::RunSteer
                 | Operation::RunFollowUp
                 | Operation::RunPermissionAnswer
@@ -3161,6 +3214,114 @@ fn dispatch_request<S: ThreadListService>(
             provenance,
         )?;
         if super::Id::new(accepted.run_id.clone()).is_err()
+            || super::Id::new(accepted.thread_id.clone()).is_err()
+            || accepted.committed_seq == 0
+            || accepted.accepted_at.is_empty()
+            || accepted.accepted_at.len() > MAX_TEXT_LENGTH
+            || chrono::DateTime::parse_from_rfc3339(&accepted.accepted_at).is_err()
+        {
+            return Err(ProtocolError::persistence_failed().into());
+        }
+        return Ok(response_only(serde_json::json!({
+            "run_id": accepted.run_id,
+            "thread_id": accepted.thread_id,
+            "committed_seq": accepted.committed_seq,
+            "accepted_at": accepted.accepted_at,
+        })));
+    }
+    if request.operation == Operation::RunSubmit {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            text: String,
+            files: Vec<String>,
+            thread_id: Option<String>,
+        }
+        let body: Body =
+            serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
+        if body.text.trim().is_empty()
+            || body.text.len() > MAX_RUN_START_TEXT_LENGTH
+            || body
+                .files
+                .iter()
+                .any(|path| path.is_empty() || path.len() > MAX_TEXT_LENGTH)
+            || body
+                .thread_id
+                .as_ref()
+                .is_some_and(|value| super::Id::new(value.clone()).is_err())
+        {
+            return Err(ProtocolError::invalid_request().into());
+        }
+        let idempotency_key = request
+            .idempotency_key
+            .as_ref()
+            .ok_or_else(ProtocolError::idempotency_key_required)?;
+        let requested_thread_id = body.thread_id.clone();
+        let requested_attachment_count = body.files.len();
+        let accepted = service.submit_run(
+            workspace,
+            RunSubmitRequest {
+                text: body.text,
+                files: body.files,
+                thread_id: body.thread_id,
+            },
+            &request.request_id,
+            idempotency_key,
+            provenance,
+        )?;
+        if super::Id::new(accepted.run_id.clone()).is_err()
+            || super::Id::new(accepted.thread_id.clone()).is_err()
+            || requested_thread_id
+                .as_ref()
+                .is_some_and(|thread_id| thread_id != &accepted.thread_id)
+            || accepted.committed_seq == 0
+            || accepted.attachments.len() != requested_attachment_count
+            || accepted.attachments.iter().any(|attachment| {
+                attachment.display_name.trim().is_empty()
+                    || attachment.display_name.len() > MAX_TEXT_LENGTH
+                    || attachment.media_type.as_ref().is_some_and(|value| {
+                        value.trim().is_empty() || value.len() > MAX_TEXT_LENGTH
+                    })
+            })
+            || accepted.accepted_at.is_empty()
+            || accepted.accepted_at.len() > MAX_TEXT_LENGTH
+            || chrono::DateTime::parse_from_rfc3339(&accepted.accepted_at).is_err()
+        {
+            return Err(ProtocolError::persistence_failed().into());
+        }
+        return bounded_response(serde_json::json!({
+            "run_id": accepted.run_id,
+            "thread_id": accepted.thread_id,
+            "attachments": accepted.attachments,
+            "committed_seq": accepted.committed_seq,
+            "accepted_at": accepted.accepted_at,
+        }));
+    }
+    if request.operation == Operation::RunResume {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            run_id: String,
+        }
+        let body: Body =
+            serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
+        super::Id::new(body.run_id.clone()).map_err(|_| ProtocolError::invalid_request())?;
+        let idempotency_key = request
+            .idempotency_key
+            .as_ref()
+            .ok_or_else(ProtocolError::idempotency_key_required)?;
+        let requested_run_id = body.run_id.clone();
+        let accepted = service.resume_run(
+            workspace,
+            RunResumeRequest {
+                run_id: body.run_id,
+            },
+            &request.request_id,
+            idempotency_key,
+            provenance,
+        )?;
+        if accepted.run_id != requested_run_id
+            || super::Id::new(accepted.run_id.clone()).is_err()
             || super::Id::new(accepted.thread_id.clone()).is_err()
             || accepted.committed_seq == 0
             || accepted.accepted_at.is_empty()

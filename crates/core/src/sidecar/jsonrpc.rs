@@ -424,6 +424,10 @@ impl JsonRpcTransport {
             let Some(line) = line else {
                 continue;
             };
+            if deadline.saturating_duration_since(Instant::now()).is_zero() {
+                self.abandon(generation, id);
+                return Err(JsonRpcTransportError::Timeout);
+            }
             match decode_frame(&line)? {
                 JsonRpcFrame::Notification(notification) => on_notification(notification),
                 JsonRpcFrame::Success {

@@ -5013,6 +5013,16 @@ fn unserved_operations_remain_unsupported_without_dispatch() {
 fn companion_refuses_desktop_only_run_controls() {
     for (id, operation, body) in [
         (
+            201,
+            Operation::RunSubmit,
+            json!({"text":"submit","files":[],"thread_id":null}),
+        ),
+        (
+            202,
+            Operation::RunResume,
+            json!({"run_id":"0190a100-0000-7000-8000-000000000001"}),
+        ),
+        (
             203,
             Operation::RunSteer,
             json!({"run_id":"0190a100-0000-7000-8000-000000000001","text":"steer"}),

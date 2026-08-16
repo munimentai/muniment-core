@@ -54,6 +54,23 @@ pub struct RunStartRequest {
     pub thread_id: Option<String>,
 }
 
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct AttachPromptAccepted {
+    pub run_id: String,
+    pub thread_id: String,
+    pub attachments: Vec<crate::chat_view::ChatAttachment>,
+    pub committed_seq: u64,
+    pub accepted_at: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct AttachResumeAccepted {
+    pub run_id: String,
+    pub thread_id: String,
+    pub committed_seq: u64,
+    pub accepted_at: String,
+}
+
 pub struct RunStartLaunch {
     pub run_id: String,
     pub prompt: String,
@@ -67,6 +84,30 @@ pub struct RunStartLaunch {
 }
 
 pub trait RunAttachBoundaries {
+    #[cfg(target_os = "linux")]
+    fn submit_run(
+        &self,
+        _workspace: &str,
+        _text: String,
+        _files: Vec<SelectedFile>,
+        _thread_id: Option<String>,
+    ) -> Result<AttachPromptAccepted, RunStartError> {
+        Err(RunStartError::InvalidRequest(
+            "This prompt cannot be accepted.".into(),
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn resume_run(
+        &self,
+        _workspace: &str,
+        _run_id: &str,
+    ) -> Result<AttachResumeAccepted, RunStartError> {
+        Err(RunStartError::InvalidRequest(
+            "This reply cannot be resumed.".into(),
+        ))
+    }
+
     #[cfg(target_os = "linux")]
     fn queue_attach_message(
         &self,

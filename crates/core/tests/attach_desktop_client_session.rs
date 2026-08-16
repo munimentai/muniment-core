@@ -9,7 +9,8 @@ use std::time::Duration;
 use muniment_core::attach::linux::{
     serve_desktop_client_session, AttachSessionError, CompanionProvenance,
     EntitlementSnapshotResult, RunMessageAccepted, RunMessageRequest, RunPermissionAnswerAccepted,
-    RunPermissionAnswerRequest, RunStartAccepted, RunStartRequest, RunStreamPage, ThreadListPage,
+    RunPermissionAnswerRequest, RunResumeAccepted, RunResumeRequest, RunStartAccepted,
+    RunStartRequest, RunStreamPage, RunSubmitAccepted, RunSubmitRequest, ThreadListPage,
     ThreadListRequest, ThreadListService,
 };
 use muniment_core::attach::{
@@ -26,6 +27,31 @@ use muniment_core::journal::{CommitSubscription, JournalCommitHint, RunEventProj
 use muniment_core::run_events::ChatEvent;
 
 struct TestService;
+
+struct InvalidRunSubmitService {
+    accepted: Option<RunSubmitAccepted>,
+}
+
+impl ThreadListService for InvalidRunSubmitService {
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, ProtocolError> {
+        unreachable!()
+    }
+
+    fn submit_run(
+        &mut self,
+        _: &str,
+        _: RunSubmitRequest,
+        _: &Id,
+        _: &Id,
+        _: CompanionProvenance,
+    ) -> Result<RunSubmitAccepted, ProtocolError> {
+        Ok(self.accepted.take().unwrap())
+    }
+}
 
 #[derive(Default)]
 struct RunControlService {
@@ -52,6 +78,45 @@ impl ThreadListService for RunControlService {
         self.calls.push(Operation::RunSteer);
         Ok(RunMessageAccepted {
             run_id: request.run_id,
+            accepted_at: "2026-08-16T00:00:00Z".into(),
+        })
+    }
+
+    fn submit_run(
+        &mut self,
+        _: &str,
+        _: RunSubmitRequest,
+        _: &Id,
+        _: &Id,
+        _: CompanionProvenance,
+    ) -> Result<RunSubmitAccepted, ProtocolError> {
+        self.calls.push(Operation::RunSubmit);
+        Ok(RunSubmitAccepted {
+            run_id: "0190a100-0000-7000-8000-000000000001".into(),
+            thread_id: "0190a100-0000-7000-8000-000000000002".into(),
+            attachments: vec![muniment_core::chat_view::ChatAttachment {
+                display_name: "main.rs".into(),
+                byte_length: 128,
+                media_type: Some("text/rust".into()),
+            }],
+            committed_seq: 1,
+            accepted_at: "2026-08-16T00:00:00Z".into(),
+        })
+    }
+
+    fn resume_run(
+        &mut self,
+        _: &str,
+        request: RunResumeRequest,
+        _: &Id,
+        _: &Id,
+        _: CompanionProvenance,
+    ) -> Result<RunResumeAccepted, ProtocolError> {
+        self.calls.push(Operation::RunResume);
+        Ok(RunResumeAccepted {
+            run_id: request.run_id,
+            thread_id: "0190a100-0000-7000-8000-000000000002".into(),
+            committed_seq: 2,
             accepted_at: "2026-08-16T00:00:00Z".into(),
         })
     }
@@ -136,10 +201,137 @@ fn desktop_client_dispatches_each_run_control() {
 }
 
 #[test]
+fn desktop_client_dispatches_submit_and_resume() {
+    let run_id = "0190a100-0000-7000-8000-000000000001";
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let session_thread = std::thread::spawn(move || {
+        let mut service = RunControlService::default();
+        let result = serve_desktop_client_session(server, &session(), &mut service);
+        (result, service.calls)
+    });
+
+    let Envelope::Response(submit) = exchange(
+        &mut client,
+        idempotent_request(
+            "018f0000-0000-7000-8000-000000000211",
+            Operation::RunSubmit,
+            serde_json::json!({"text":"summarize","files":["/work/signed/main.rs"],"thread_id":null}),
+        ),
+    ) else {
+        panic!("run submit did not return an answer")
+    };
+    assert_eq!(submit.body["run_id"], run_id);
+    assert_eq!(
+        submit.body["thread_id"],
+        "0190a100-0000-7000-8000-000000000002"
+    );
+    assert_eq!(submit.body["attachments"][0]["displayName"], "main.rs");
+    assert_eq!(submit.body["committed_seq"], 1);
+    assert_eq!(submit.body["accepted_at"], "2026-08-16T00:00:00Z");
+
+    let Envelope::Response(resume) = exchange(
+        &mut client,
+        idempotent_request(
+            "018f0000-0000-7000-8000-000000000212",
+            Operation::RunResume,
+            serde_json::json!({"run_id":run_id}),
+        ),
+    ) else {
+        panic!("run resume did not return an answer")
+    };
+    assert_eq!(resume.body["run_id"], run_id);
+    assert_eq!(
+        resume.body["thread_id"],
+        "0190a100-0000-7000-8000-000000000002"
+    );
+    assert_eq!(resume.body["committed_seq"], 2);
+    assert_eq!(resume.body["accepted_at"], "2026-08-16T00:00:00Z");
+
+    drop(client);
+    let (result, calls) = session_thread.join().unwrap();
+    assert_eq!(result, Ok(()));
+    assert_eq!(calls, [Operation::RunSubmit, Operation::RunResume]);
+}
+
+#[test]
+fn desktop_run_submit_rejects_invalid_accepted_attachments() {
+    let cases = [
+        ("attachment count", vec![]),
+        (
+            "display name",
+            vec![muniment_core::chat_view::ChatAttachment {
+                display_name: " \t".into(),
+                byte_length: 128,
+                media_type: Some("text/rust".into()),
+            }],
+        ),
+        (
+            "media type",
+            vec![muniment_core::chat_view::ChatAttachment {
+                display_name: "main.rs".into(),
+                byte_length: 128,
+                media_type: Some(" \t".into()),
+            }],
+        ),
+    ];
+
+    for (name, attachments) in cases {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let session_thread = std::thread::spawn(move || {
+            let mut service = InvalidRunSubmitService {
+                accepted: Some(RunSubmitAccepted {
+                    run_id: "0190a100-0000-7000-8000-000000000001".into(),
+                    thread_id: "0190a100-0000-7000-8000-000000000002".into(),
+                    attachments,
+                    committed_seq: 1,
+                    accepted_at: "2026-08-16T00:00:00Z".into(),
+                }),
+            };
+            serve_desktop_client_session(server, &session(), &mut service)
+        });
+
+        let Envelope::Error(error) = exchange(
+            &mut client,
+            idempotent_request(
+                "018f0000-0000-7000-8000-000000000210",
+                Operation::RunSubmit,
+                serde_json::json!({"text":"hello","files":["main.rs"],"thread_id":null}),
+            ),
+        ) else {
+            panic!("invalid accepted {name} did not return an error")
+        };
+        assert_eq!(error.error.code(), ErrorCode::PersistenceFailed, "{name}");
+        drop(client);
+        assert_eq!(session_thread.join().unwrap(), Ok(()));
+    }
+}
+
+#[test]
 fn desktop_run_controls_reject_invalid_fields_without_dispatch() {
     let run_id = "0190a100-0000-7000-8000-000000000001";
     let oversized = "x".repeat(32 * 1024 + 1);
     let cases = vec![
+        (
+            Operation::RunSubmit,
+            serde_json::json!({"text":"","files":[],"thread_id":null}),
+        ),
+        (
+            Operation::RunSubmit,
+            serde_json::json!({"text":"hello","files":[""],"thread_id":null}),
+        ),
+        (
+            Operation::RunSubmit,
+            serde_json::json!({"text":"hello","files":[],"thread_id":"bad"}),
+        ),
+        (
+            Operation::RunSubmit,
+            serde_json::json!({"text":"hello","files":[],"thread_id":null,"extra":true}),
+        ),
+        (Operation::RunResume, serde_json::json!({"run_id":"bad"})),
+        (
+            Operation::RunResume,
+            serde_json::json!({"run_id":run_id,"extra":true}),
+        ),
         (
             Operation::RunSteer,
             serde_json::json!({"run_id":run_id,"text":""}),

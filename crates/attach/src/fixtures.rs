@@ -618,6 +618,21 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
     )?;
     insert(
         &mut fixtures,
+        "response-run-resume.json",
+        &Response {
+            protocol: Protocol,
+            request_id: id(129)?,
+            ok: Success,
+            body: json!({
+                "run_id": "00000000000000000000000000000191",
+                "thread_id": "00000000000000000000000000000192",
+                "committed_seq": 2,
+                "accepted_at": "2026-07-17T00:00:00Z"
+            }),
+        },
+    )?;
+    insert(
+        &mut fixtures,
         "response-run-cancel.json",
         &Response {
             protocol: Protocol,
@@ -1043,7 +1058,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            67,
+            68,
             "every canonical fixture must be inventoried"
         );
     }

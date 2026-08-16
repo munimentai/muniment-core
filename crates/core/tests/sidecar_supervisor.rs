@@ -543,7 +543,7 @@ fn spawn_with_json_rpc_probe(
     let probe_transport = Arc::clone(&transport);
     let supervisor = SidecarSupervisor::spawn(cfg, move |io| {
         let transport = probe_transport.get_or_init(|| Arc::new(JsonRpcTransport::new(io.clone())));
-        transport.health_probe("ping", Duration::from_millis(100))(io)
+        transport.health_probe("ping", Duration::from_secs(1))(io)
     })
     .unwrap();
     (supervisor, transport)
