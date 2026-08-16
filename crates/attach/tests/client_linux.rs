@@ -650,6 +650,103 @@ fn desktop_client_holder_is_unavailable_without_a_connection() {
         holder.thread_history("thread-1", 100, None),
         Err(ClientError::DesktopUnavailable)
     );
+    assert_eq!(
+        holder.run_submit("prompt", &[], None),
+        Err(ClientError::DesktopUnavailable)
+    );
+}
+
+#[test]
+fn desktop_run_submit_matches_the_fixture_and_validates_the_result() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_desktop_client_handshake(&mut server);
+        let mut keys = BTreeSet::new();
+        for thread_id in [None, Some("01900000-0000-7000-8000-000000000002")] {
+            let request = read_client_value(&mut server);
+            let request_id = request["request_id"].as_str().unwrap().to_owned();
+            let key = request["idempotency_key"].as_str().unwrap().to_owned();
+            assert_eq!(request["operation"], "run.submit");
+            assert_eq!(
+                request["body"],
+                serde_json::json!({
+                    "text": "Summarize the selected file.",
+                    "files": ["/work/repo/src/main.rs"],
+                    "thread_id": thread_id
+                })
+            );
+            assert_ne!(request_id, key);
+            assert!(keys.insert(key));
+            server
+                .write_all(
+                    &encode_frame(&Response {
+                        protocol: Protocol,
+                        request_id: Id::new(request_id).unwrap(),
+                        ok: Success,
+                        body: serde_json::json!({
+                            "run_id": "01900000-0000-7000-8000-000000000001",
+                            "thread_id": "01900000-0000-7000-8000-000000000002",
+                            "attachments": [{
+                                "displayName": "main.rs",
+                                "byteLength": 128,
+                                "mediaType": "text/rust"
+                            }],
+                            "committed_seq": 1,
+                            "accepted_at": "2026-07-17T00:00:00Z"
+                        }),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+    });
+    let files = ["/work/repo/src/main.rs".to_owned()];
+    let mut client = handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap();
+    let accepted = client
+        .run_submit("Summarize the selected file.", &files, None)
+        .unwrap();
+    assert_eq!(accepted.attachments[0].display_name, "main.rs");
+    client
+        .run_submit(
+            "Summarize the selected file.",
+            &files,
+            Some("01900000-0000-7000-8000-000000000002"),
+        )
+        .unwrap();
+    worker.join().unwrap();
+}
+
+#[test]
+fn desktop_run_submit_rejects_invalid_results() {
+    for body in [
+        serde_json::json!({"run_id":"bad","thread_id":"01900000-0000-7000-8000-000000000002","attachments":[],"committed_seq":1,"accepted_at":"2026-07-17T00:00:00Z"}),
+        serde_json::json!({"run_id":"01900000-0000-7000-8000-000000000001","thread_id":"01900000-0000-7000-8000-000000000003","attachments":[],"committed_seq":1,"accepted_at":"2026-07-17T00:00:00Z"}),
+        serde_json::json!({"run_id":"01900000-0000-7000-8000-000000000001","thread_id":"01900000-0000-7000-8000-000000000002","attachments":[],"committed_seq":0,"accepted_at":"2026-07-17T00:00:00Z"}),
+        serde_json::json!({"run_id":"01900000-0000-7000-8000-000000000001","thread_id":"01900000-0000-7000-8000-000000000002","attachments":[],"committed_seq":1,"accepted_at":"bad"}),
+    ] {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            complete_desktop_client_handshake(&mut server);
+            let request = read_client_value(&mut server);
+            server
+                .write_all(
+                    &encode_frame(&Response {
+                        protocol: Protocol,
+                        request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+                        ok: Success,
+                        body,
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        });
+        let mut client = handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap();
+        assert_eq!(
+            client.run_submit("prompt", &[], Some("01900000-0000-7000-8000-000000000002")),
+            Err(ClientError::UnexpectedMessage)
+        );
+        worker.join().unwrap();
+    }
 }
 
 #[test]

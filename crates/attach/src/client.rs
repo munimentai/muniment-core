@@ -122,6 +122,24 @@ pub struct RunStartAccepted {
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct RunSubmitAccepted {
+    pub run_id: String,
+    pub thread_id: String,
+    pub attachments: Vec<RunSubmitAttachment>,
+    pub committed_seq: u64,
+    pub accepted_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunSubmitAttachment {
+    pub display_name: String,
+    pub byte_length: u64,
+    pub media_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ThreadCreateAccepted {
     pub thread_id: String,
 }
@@ -367,7 +385,7 @@ mod linux {
         AuthorizationSummary, ClientError, MigrationControlFailure, MigrationControlOutcome,
         PendingPermission, PermissionAnswerAccepted, PermissionDecision, RedactedRunEvent,
         RunCancelAccepted, RunStartAccepted, RunStreamMessage, RunStreamSubscription,
-        ThreadCreateAccepted, ThreadListPage, ThreadOpenPage,
+        RunSubmitAccepted, ThreadCreateAccepted, ThreadListPage, ThreadOpenPage,
     };
     use crate::{
         decode_frame, encode_frame, Authorization, Authorized, Client,
@@ -1463,6 +1481,15 @@ mod linux {
             self.with_client(|client| client.revoke_companion(client_identity))
         }
 
+        pub fn run_submit(
+            &self,
+            text: &str,
+            files: &[String],
+            thread_id: Option<&str>,
+        ) -> Result<RunSubmitAccepted, ClientError> {
+            self.with_client(|client| client.run_submit(text, files, thread_id))
+        }
+
         fn with_client<T>(
             &self,
             call: impl FnOnce(&mut DesktopClient) -> Result<T, ClientError>,
@@ -1812,6 +1839,48 @@ mod linux {
                 return Err(ClientError::UnexpectedMessage);
             }
             Ok(())
+        }
+
+        pub fn run_submit(
+            &mut self,
+            text: &str,
+            files: &[String],
+            thread_id: Option<&str>,
+        ) -> Result<RunSubmitAccepted, ClientError> {
+            if text.trim().is_empty()
+                || text.len() > MAX_TEXT_LENGTH
+                || files
+                    .iter()
+                    .any(|file| file.trim().is_empty() || file.len() > MAX_TEXT_LENGTH)
+                || thread_id.is_some_and(|thread_id| thread_id.is_empty() || thread_id.len() > 36)
+            {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            let response = self.request(
+                Operation::RunSubmit,
+                Some(fresh_request_id()?),
+                serde_json::json!({"text": text, "files": files, "thread_id": thread_id}),
+            )?;
+            let accepted: RunSubmitAccepted = serde_json::from_value(response.body)
+                .map_err(|_| ClientError::UnexpectedMessage)?;
+            if Id::new(accepted.run_id.clone()).is_err()
+                || Id::new(accepted.thread_id.clone()).is_err()
+                || thread_id.is_some_and(|thread_id| accepted.thread_id != thread_id)
+                || accepted.committed_seq == 0
+                || accepted.accepted_at.len() > MAX_TEXT_LENGTH
+                || !is_rfc3339(&accepted.accepted_at)
+                || accepted.attachments.len() != files.len()
+                || accepted.attachments.iter().any(|attachment| {
+                    attachment.display_name.trim().is_empty()
+                        || attachment.display_name.len() > MAX_TEXT_LENGTH
+                        || attachment.media_type.as_ref().is_some_and(|media_type| {
+                            media_type.trim().is_empty() || media_type.len() > MAX_TEXT_LENGTH
+                        })
+                })
+            {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            Ok(accepted)
         }
 
         pub fn session_status(&mut self) -> Result<Value, ClientError> {
@@ -3051,6 +3120,42 @@ pub use linux::{
 #[cfg(not(target_os = "linux"))]
 #[derive(Debug)]
 pub struct AuthorizedClient;
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
+pub struct DesktopClient;
+
+#[cfg(not(target_os = "linux"))]
+impl DesktopClient {
+    pub fn run_submit(
+        &mut self,
+        _text: &str,
+        _files: &[String],
+        _thread_id: Option<&str>,
+    ) -> Result<RunSubmitAccepted, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Clone, Debug, Default)]
+pub struct DesktopClientHolder;
+
+#[cfg(not(target_os = "linux"))]
+impl DesktopClientHolder {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn run_submit(
+        &self,
+        _text: &str,
+        _files: &[String],
+        _thread_id: Option<&str>,
+    ) -> Result<RunSubmitAccepted, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+}
 
 #[cfg(not(target_os = "linux"))]
 impl AuthorizedClient {
