@@ -25,6 +25,11 @@ pub fn accepted_time_now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::AutoSi, true)
 }
 
+/// Returns a new time-ordered run identifier.
+pub fn new_run_id() -> String {
+    Uuid::now_v7().to_string()
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubmitResult {
@@ -340,7 +345,7 @@ pub fn prepare_desktop_run(
     }
 
     let tokens = boundaries.fresh_tokens()?;
-    let run_id = Uuid::now_v7().to_string();
+    let run_id = new_run_id();
     let grant =
         boundaries.configure_run(&run_id, &prompt, &tokens, request.workspace.as_deref())?;
     let cancelled = Arc::new(AtomicBool::new(false));

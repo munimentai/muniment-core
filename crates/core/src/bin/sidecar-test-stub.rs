@@ -155,6 +155,9 @@ fn pi_resume(args: Vec<String>) {
                 })
             ),
             "prompt" => {
+                if let Ok(delay) = std::env::var("PI_RESUME_STUB_PROMPT_DELAY_MS") {
+                    thread::sleep(Duration::from_millis(delay.parse().unwrap()));
+                }
                 if let Ok(path) = std::env::var("PI_RESUME_STUB_REQUESTS") {
                     let mut requests = fs::OpenOptions::new()
                         .create(true)
