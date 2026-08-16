@@ -5,10 +5,11 @@ use muniment_attach::{
     encode_frame, handshake_approval_presenter_stream, handshake_desktop_client_stream,
     handshake_migration_control_stream, handshake_stream, handshake_stream_with_credential,
     reconnect_welcome, serve_desktop_client_at, welcome, ApprovalDecision,
-    ApprovalPresenterServeOutcome, ClientError, DesktopClientHolder, DesktopClientStopHandle,
-    ErrorAction, ErrorEnvelope, Event, EventName, Failure, Id, MigrationControlFailure,
-    MigrationControlOutcome, Operation, PermissionDecision, PermissionKind, Protocol,
-    ProtocolError, Response, RunStreamMessage, Success, VersionRange, MAX_FRAME_LENGTH,
+    ApprovalPresenterServeOutcome, ChatPermissionAnswer, ClientError, DesktopClientHolder,
+    DesktopClientStopHandle, ErrorAction, ErrorEnvelope, Event, EventName, Failure, Id,
+    MigrationControlFailure, MigrationControlOutcome, Operation, PermissionDecision,
+    PermissionKind, Protocol, ProtocolError, Response, RunStreamMessage, Success, VersionRange,
+    MAX_FRAME_LENGTH,
 };
 use muniment_attach::{serve_approval_presenter_at, ApprovalPresenterStopHandle};
 use std::collections::{BTreeMap, BTreeSet};
@@ -3782,6 +3783,127 @@ fn permission_answer_rejects_hostile_receipts_and_maps_errors() {
         assert_eq!(
             client.answer_permission(run_id, "gate", PermissionDecision::Allow),
             Err(expected)
+        );
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn run_permission_answer_preserves_every_answer_and_uses_fresh_ids() {
+    let run_id = "01900000-0000-7000-8000-000000000001";
+    let answers = vec![
+        ChatPermissionAnswer::Select("choice-a".into()),
+        ChatPermissionAnswer::Confirm(true),
+        ChatPermissionAnswer::Input("input text".into()),
+        ChatPermissionAnswer::Editor("editor text\n".into()),
+        ChatPermissionAnswer::Cancelled,
+        ChatPermissionAnswer::CodeDiff {
+            gate_id: "code-gate".into(),
+            effect_id: "effect-1".into(),
+            code_diff_id: "diff-1".into(),
+            diff_sha256: "11".repeat(32),
+            write_plan_sha256: "22".repeat(32),
+        },
+    ];
+    let expected = answers.clone();
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_desktop_client_handshake(&mut server);
+        let mut request_ids = BTreeSet::new();
+        let mut idempotency_keys = BTreeSet::new();
+        for (index, answer) in expected.into_iter().enumerate() {
+            let request = read_client_value(&mut server);
+            assert_eq!(request["operation"], "run.permission_answer");
+            assert_eq!(request["body"]["run_id"], run_id);
+            assert_eq!(request["body"]["gate_id"], format!("gate-{index}"));
+            assert_eq!(
+                request["body"]["answer"],
+                serde_json::to_value(&answer).unwrap()
+            );
+            assert!(request_ids.insert(request["request_id"].as_str().unwrap().to_owned()));
+            assert!(
+                idempotency_keys.insert(request["idempotency_key"].as_str().unwrap().to_owned())
+            );
+            server
+                .write_all(
+                    &encode_frame(&Response {
+                        protocol: Protocol,
+                        request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+                        ok: Success,
+                        body: serde_json::json!({
+                            "run_id": run_id,
+                            "gate_id": format!("gate-{index}"),
+                            "answer": answer,
+                            "committed_seq": index + 1,
+                            "accepted_at": "2026-07-17T00:00:00Z"
+                        }),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+    });
+    let mut client = handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap();
+    for (index, answer) in answers.into_iter().enumerate() {
+        let accepted = client
+            .run_permission_answer(run_id, &format!("gate-{index}"), answer.clone())
+            .unwrap();
+        assert_eq!(accepted.answer, answer);
+    }
+    worker.join().unwrap();
+}
+
+#[test]
+fn run_permission_answer_rejects_invalid_input_and_receipts() {
+    let run_id = "01900000-0000-7000-8000-000000000001";
+    for (bad_run_id, bad_gate_id) in [("bad", "gate"), (run_id, " \n"), (run_id, &"x".repeat(257))]
+    {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            complete_desktop_client_handshake(&mut server);
+            assert_eq!(server.read(&mut [0]).unwrap(), 0);
+        });
+        let mut client = handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap();
+        assert_eq!(
+            client.run_permission_answer(
+                bad_run_id,
+                bad_gate_id,
+                ChatPermissionAnswer::Confirm(true)
+            ),
+            Err(ClientError::UnexpectedMessage)
+        );
+        drop(client);
+        worker.join().unwrap();
+    }
+
+    let hostile = [
+        serde_json::json!({"run_id":"bad","gate_id":"gate","answer":{"type":"confirm","value":true},"committed_seq":1,"accepted_at":"2026-07-17T00:00:00Z"}),
+        serde_json::json!({"run_id":run_id,"gate_id":"other","answer":{"type":"confirm","value":true},"committed_seq":1,"accepted_at":"2026-07-17T00:00:00Z"}),
+        serde_json::json!({"run_id":run_id,"gate_id":"gate","answer":{"type":"confirm","value":false},"committed_seq":1,"accepted_at":"2026-07-17T00:00:00Z"}),
+        serde_json::json!({"run_id":run_id,"gate_id":"gate","answer":{"type":"confirm","value":true},"committed_seq":0,"accepted_at":"2026-07-17T00:00:00Z"}),
+        serde_json::json!({"run_id":run_id,"gate_id":"gate","answer":{"type":"confirm","value":true},"committed_seq":1,"accepted_at":"bad"}),
+    ];
+    for body in hostile {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            complete_desktop_client_handshake(&mut server);
+            let request = read_client_value(&mut server);
+            server
+                .write_all(
+                    &encode_frame(&Response {
+                        protocol: Protocol,
+                        request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+                        ok: Success,
+                        body,
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        });
+        let mut client = handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap();
+        assert_eq!(
+            client.run_permission_answer(run_id, "gate", ChatPermissionAnswer::Confirm(true)),
+            Err(ClientError::UnexpectedMessage)
         );
         worker.join().unwrap();
     }

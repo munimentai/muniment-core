@@ -181,6 +181,38 @@ impl fmt::Debug for PermissionAnswerAccepted {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(
+    tag = "type",
+    content = "value",
+    rename_all = "camelCase",
+    deny_unknown_fields
+)]
+pub enum ChatPermissionAnswer {
+    Select(String),
+    Confirm(bool),
+    Input(String),
+    Editor(String),
+    Cancelled,
+    CodeDiff {
+        gate_id: String,
+        effect_id: String,
+        code_diff_id: String,
+        diff_sha256: String,
+        write_plan_sha256: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunPermissionAnswerAccepted {
+    pub run_id: String,
+    pub gate_id: String,
+    pub answer: ChatPermissionAnswer,
+    pub committed_seq: u64,
+    pub accepted_at: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunStreamWindow {
@@ -382,10 +414,11 @@ impl fmt::Debug for ThreadListPage {
 mod linux {
     use super::{
         ApprovalDecision, ApprovalPresentRequest, ApprovalPresenterServeOutcome,
-        AuthorizationSummary, ClientError, MigrationControlFailure, MigrationControlOutcome,
-        PendingPermission, PermissionAnswerAccepted, PermissionDecision, RedactedRunEvent,
-        RunCancelAccepted, RunStartAccepted, RunStreamMessage, RunStreamSubscription,
-        RunSubmitAccepted, ThreadCreateAccepted, ThreadListPage, ThreadOpenPage,
+        AuthorizationSummary, ChatPermissionAnswer, ClientError, MigrationControlFailure,
+        MigrationControlOutcome, PendingPermission, PermissionAnswerAccepted, PermissionDecision,
+        RedactedRunEvent, RunCancelAccepted, RunPermissionAnswerAccepted, RunStartAccepted,
+        RunStreamMessage, RunStreamSubscription, RunSubmitAccepted, ThreadCreateAccepted,
+        ThreadListPage, ThreadOpenPage,
     };
     use crate::{
         decode_frame, encode_frame, Authorization, Authorized, Client,
@@ -1490,6 +1523,15 @@ mod linux {
             self.with_client(|client| client.run_submit(text, files, thread_id))
         }
 
+        pub fn run_permission_answer(
+            &self,
+            run_id: &str,
+            gate_id: &str,
+            answer: ChatPermissionAnswer,
+        ) -> Result<RunPermissionAnswerAccepted, ClientError> {
+            self.with_client(|client| client.run_permission_answer(run_id, gate_id, answer))
+        }
+
         fn with_client<T>(
             &self,
             call: impl FnOnce(&mut DesktopClient) -> Result<T, ClientError>,
@@ -1877,6 +1919,40 @@ mod linux {
                             media_type.trim().is_empty() || media_type.len() > MAX_TEXT_LENGTH
                         })
                 })
+            {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            Ok(accepted)
+        }
+
+        pub fn run_permission_answer(
+            &mut self,
+            run_id: &str,
+            gate_id: &str,
+            answer: ChatPermissionAnswer,
+        ) -> Result<RunPermissionAnswerAccepted, ClientError> {
+            let run_id = Id::new(run_id.to_owned()).map_err(|_| ClientError::UnexpectedMessage)?;
+            if gate_id.trim().is_empty() || gate_id.len() > MAX_PERMISSION_GATE_ID_LENGTH {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            let response = self.request(
+                Operation::RunPermissionAnswer,
+                Some(fresh_request_id()?),
+                serde_json::json!({
+                    "run_id": run_id.as_str(),
+                    "gate_id": gate_id,
+                    "answer": &answer,
+                }),
+            )?;
+            let accepted: RunPermissionAnswerAccepted = serde_json::from_value(response.body)
+                .map_err(|_| ClientError::UnexpectedMessage)?;
+            if accepted.run_id != run_id.as_str()
+                || accepted.gate_id != gate_id
+                || accepted.answer != answer
+                || accepted.committed_seq == 0
+                || accepted.accepted_at.is_empty()
+                || accepted.accepted_at.len() > MAX_TEXT_LENGTH
+                || !is_rfc3339(&accepted.accepted_at)
             {
                 return Err(ClientError::UnexpectedMessage);
             }
@@ -3135,6 +3211,15 @@ impl DesktopClient {
     ) -> Result<RunSubmitAccepted, ClientError> {
         Err(ClientError::UnsupportedPlatform)
     }
+
+    pub fn run_permission_answer(
+        &mut self,
+        _run_id: &str,
+        _gate_id: &str,
+        _answer: ChatPermissionAnswer,
+    ) -> Result<RunPermissionAnswerAccepted, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -3153,6 +3238,15 @@ impl DesktopClientHolder {
         _files: &[String],
         _thread_id: Option<&str>,
     ) -> Result<RunSubmitAccepted, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+
+    pub fn run_permission_answer(
+        &self,
+        _run_id: &str,
+        _gate_id: &str,
+        _answer: ChatPermissionAnswer,
+    ) -> Result<RunPermissionAnswerAccepted, ClientError> {
         Err(ClientError::UnsupportedPlatform)
     }
 }
