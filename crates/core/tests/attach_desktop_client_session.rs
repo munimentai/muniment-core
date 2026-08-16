@@ -2,12 +2,14 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use muniment_core::attach::linux::{
-    serve_desktop_client_session, CompanionProvenance, EntitlementSnapshotResult, RunStartAccepted,
-    RunStartRequest, RunStreamPage, ThreadListPage, ThreadListRequest, ThreadListService,
+    serve_desktop_client_session, AttachSessionError, CompanionProvenance,
+    EntitlementSnapshotResult, RunStartAccepted, RunStartRequest, RunStreamPage, ThreadListPage,
+    ThreadListRequest, ThreadListService,
 };
 use muniment_core::attach::{
     decode_frame, encode_frame, CompanionRecord, DesktopClientSession, Envelope, ErrorCode,
@@ -20,6 +22,7 @@ use muniment_core::auth::{
 };
 use muniment_core::journal::MAX_THREAD_TITLE_CHARS;
 use muniment_core::journal::{CommitSubscription, JournalCommitHint, RunEventProjection};
+use muniment_core::run_events::ChatEvent;
 
 struct TestService;
 
@@ -349,6 +352,185 @@ fn desktop_thread_reads_reject_invalid_bodies_without_dispatch() {
     let (result, service) = session_thread.join().unwrap();
     assert_eq!(result, Ok(()));
     assert!(service.calls.is_empty());
+}
+
+struct ChatEventService {
+    receiver: Option<mpsc::Receiver<ChatEvent>>,
+}
+
+impl ThreadListService for ChatEventService {
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, ProtocolError> {
+        unreachable!()
+    }
+
+    fn subscribe_chat_events(&mut self) -> Result<mpsc::Receiver<ChatEvent>, ProtocolError> {
+        self.receiver
+            .take()
+            .ok_or_else(ProtocolError::invalid_request)
+    }
+}
+
+#[test]
+fn desktop_chat_subscription_delivers_events_and_owns_the_session() {
+    let (sender, receiver) = mpsc::channel();
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let session_thread = std::thread::spawn(move || {
+        serve_desktop_client_session(
+            server,
+            &session(),
+            &mut ChatEventService {
+                receiver: Some(receiver),
+            },
+        )
+    });
+
+    let Envelope::Response(response) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000210",
+            Operation::RunChatEvents,
+            "admitted",
+            serde_json::json!({}),
+        ),
+    ) else {
+        panic!("chat subscription did not return a response");
+    };
+    let subscription_id = response.body["subscription_id"].as_str().unwrap();
+
+    for (phase, text) in [("running", "first"), ("completed", "second")] {
+        sender
+            .send(ChatEvent {
+                run_id: "018f0000-0000-7000-8000-000000000211".into(),
+                phase: phase.into(),
+                text: text.into(),
+                receipt: None,
+                tool_activity: Vec::new(),
+                attachments: Vec::new(),
+                recalls: Vec::new(),
+                applied_diffs: Vec::new(),
+                pending_permission: None,
+            })
+            .unwrap();
+        let Envelope::Event(event) = read_envelope(&mut client) else {
+            panic!("chat event did not arrive");
+        };
+        assert_eq!(event.subscription_id.as_str(), subscription_id);
+        assert_eq!(event.event, EventName::ChatEvent);
+        assert_eq!(event.body["phase"], phase);
+        assert_eq!(event.body["text"], text);
+    }
+
+    for (id, operation, expected) in [
+        (
+            "018f0000-0000-7000-8000-000000000212",
+            Operation::RunChatEvents,
+            ErrorCode::InvalidRequest,
+        ),
+        (
+            "018f0000-0000-7000-8000-000000000213",
+            Operation::ThreadList,
+            ErrorCode::UnsupportedOperation,
+        ),
+    ] {
+        let Envelope::Error(error) = exchange(
+            &mut client,
+            request(id, operation, "admitted", serde_json::json!({})),
+        ) else {
+            panic!("request after the chat subscription did not return an error");
+        };
+        assert_eq!(error.error.code(), expected);
+    }
+
+    drop(sender);
+    assert_eq!(session_thread.join().unwrap(), Ok(()));
+}
+
+#[test]
+fn desktop_chat_subscription_stays_responsive_under_sustained_events() {
+    let (sender, receiver) = mpsc::channel();
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let session_thread = std::thread::spawn(move || {
+        serve_desktop_client_session(
+            server,
+            &session(),
+            &mut ChatEventService {
+                receiver: Some(receiver),
+            },
+        )
+    });
+
+    assert!(matches!(
+        exchange(
+            &mut client,
+            request(
+                "018f0000-0000-7000-8000-000000000215",
+                Operation::RunChatEvents,
+                "admitted",
+                serde_json::json!({}),
+            ),
+        ),
+        Envelope::Response(_)
+    ));
+    let producing = Arc::new(AtomicBool::new(true));
+    let producer_flag = Arc::clone(&producing);
+    let producer = std::thread::spawn(move || {
+        while producer_flag.load(Ordering::Relaxed) {
+            if sender
+                .send(ChatEvent {
+                    run_id: "018f0000-0000-7000-8000-000000000214".into(),
+                    phase: "running".into(),
+                    text: "event".into(),
+                    receipt: None,
+                    tool_activity: Vec::new(),
+                    attachments: Vec::new(),
+                    recalls: Vec::new(),
+                    applied_diffs: Vec::new(),
+                    pending_permission: None,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    assert!(matches!(read_envelope(&mut client), Envelope::Event(_)));
+
+    client
+        .write_all(
+            &encode_frame(&request(
+                "018f0000-0000-7000-8000-000000000216",
+                Operation::ThreadList,
+                "admitted",
+                serde_json::json!({}),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+    loop {
+        match read_envelope(&mut client) {
+            Envelope::Event(_) => {}
+            Envelope::Error(error) => {
+                assert_eq!(error.error.code(), ErrorCode::UnsupportedOperation);
+                break;
+            }
+            envelope => panic!("unexpected envelope: {envelope:?}"),
+        }
+    }
+
+    producing.store(false, Ordering::Relaxed);
+    producer.join().unwrap();
+    drop(client);
+    assert_eq!(
+        session_thread.join().unwrap(),
+        Err(AttachSessionError::Closed)
+    );
 }
 
 fn request(id: &str, operation: Operation, capability: &str, body: serde_json::Value) -> Request {

@@ -12,7 +12,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::TryRecvError;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1054,6 +1054,12 @@ pub trait ThreadListService {
     ) -> Result<Option<crate::journal::CommitSubscription>, ProtocolError> {
         Ok(None)
     }
+
+    fn subscribe_chat_events(
+        &mut self,
+    ) -> Result<Receiver<crate::run_events::ChatEvent>, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
 }
 
 impl<F> ThreadListService for F
@@ -1916,7 +1922,14 @@ fn run_migration_control_session<S: ThreadListService>(
             );
             continue;
         }
-        match dispatch_request(request, "", provenance.clone(), service, &mut Vec::new()) {
+        match dispatch_request(
+            request,
+            "",
+            provenance.clone(),
+            service,
+            &mut Vec::new(),
+            &mut None,
+        ) {
             Ok(dispatched) => {
                 let response = Response {
                     protocol: Protocol,
@@ -1953,6 +1966,7 @@ fn serve_desktop_client_requests<S: ThreadListService>(
     service: &mut S,
 ) -> Result<(), AttachSessionError> {
     let mut subscriptions = Vec::new();
+    let mut chat_subscription = None;
     loop {
         let live_events = match poll_run_streams(service, &mut subscriptions) {
             Ok(events) => events,
@@ -1964,6 +1978,16 @@ fn serve_desktop_client_requests<S: ThreadListService>(
         for event in live_events {
             let frame = encode_frame(&event).map_err(|_| AttachSessionError::MalformedFrame)?;
             write_before(stream, &frame, Instant::now() + HELLO_TIMEOUT)?;
+        }
+        if let Some(subscription) = chat_subscription.as_ref() {
+            let (events, closed) = drain_chat_events(subscription)?;
+            for event in events {
+                let frame = encode_frame(&event).map_err(|_| AttachSessionError::MalformedFrame)?;
+                write_before(stream, &frame, Instant::now() + HELLO_TIMEOUT)?;
+            }
+            if closed {
+                return Ok(());
+            }
         }
 
         match wait_until_readable(stream, Instant::now() + Duration::from_millis(50)) {
@@ -1999,6 +2023,7 @@ fn serve_desktop_client_requests<S: ThreadListService>(
             session.provenance.clone(),
             service,
             &mut subscriptions,
+            &mut chat_subscription,
         ) {
             Ok(dispatched) => {
                 let response = Response {
@@ -2247,6 +2272,7 @@ where
                 | Operation::SessionSignOut
                 | Operation::CompanionList
                 | Operation::CompanionRevoke
+                | Operation::RunChatEvents
         ) {
             write_request_error(
                 stream,
@@ -2293,6 +2319,7 @@ where
             session.provenance.clone(),
             service,
             &mut subscriptions,
+            &mut None,
         ) {
             Ok(dispatched) => {
                 let response = Response {
@@ -2394,6 +2421,7 @@ impl From<ProtocolError> for DispatchFailure {
 }
 
 const MAX_ACTIVE_RUN_STREAMS: usize = 64;
+const MAX_CHAT_EVENTS_PER_POLL: usize = 64;
 
 struct ActiveRunStream {
     cursor: RunStreamCursor,
@@ -2404,6 +2432,33 @@ struct ActiveRunStream {
     exhausted: bool,
     caught_up: bool,
     commit_hints: Option<crate::journal::CommitSubscription>,
+}
+
+struct ActiveChatSubscription {
+    subscription_id: super::Id,
+    receiver: Receiver<crate::run_events::ChatEvent>,
+}
+
+fn drain_chat_events(
+    subscription: &ActiveChatSubscription,
+) -> Result<(Vec<Event>, bool), AttachSessionError> {
+    let mut events = Vec::new();
+    for _ in 0..MAX_CHAT_EVENTS_PER_POLL {
+        match subscription.receiver.try_recv() {
+            Ok(event) => events.push(Event {
+                protocol: Protocol,
+                subscription_id: subscription.subscription_id.clone(),
+                event: EventName::ChatEvent,
+                run_id: None,
+                run_seq: None,
+                body: serde_json::to_value(event)
+                    .map_err(|_| AttachSessionError::MalformedFrame)?,
+            }),
+            Err(TryRecvError::Empty) => return Ok((events, false)),
+            Err(TryRecvError::Disconnected) => return Ok((events, true)),
+        }
+    }
+    Ok((events, false))
 }
 
 fn poll_run_streams<S: ThreadListService>(
@@ -2631,8 +2686,34 @@ fn dispatch_request<S: ThreadListService>(
     provenance: CompanionProvenance,
     service: &mut S,
     subscriptions: &mut Vec<ActiveRunStream>,
+    chat_subscription: &mut Option<ActiveChatSubscription>,
 ) -> Result<DispatchResult, DispatchFailure> {
+    if chat_subscription.is_some() {
+        return Err(if request.operation == Operation::RunChatEvents {
+            ProtocolError::invalid_request().into()
+        } else {
+            ProtocolError::unsupported_operation().into()
+        });
+    }
     request.validate_idempotency_key()?;
+    if request.operation == Operation::RunChatEvents {
+        if request.body != serde_json::json!({}) {
+            return Err(ProtocolError::invalid_request().into());
+        }
+        let receiver = service.subscribe_chat_events()?;
+        let mut subscription_random = [0u8; 16];
+        getrandom::fill(&mut subscription_random)
+            .map_err(|_| ProtocolError::persistence_failed())?;
+        let subscription_id = super::Id::new(hex(&subscription_random))
+            .map_err(|_| ProtocolError::persistence_failed())?;
+        *chat_subscription = Some(ActiveChatSubscription {
+            subscription_id: subscription_id.clone(),
+            receiver,
+        });
+        return Ok(response_only(serde_json::json!({
+            "subscription_id": subscription_id,
+        })));
+    }
     if matches!(
         request.operation,
         Operation::SessionStatus
