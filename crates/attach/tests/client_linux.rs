@@ -655,6 +655,14 @@ fn desktop_client_holder_is_unavailable_without_a_connection() {
         holder.run_submit("prompt", &[], None),
         Err(ClientError::DesktopUnavailable)
     );
+    assert_eq!(
+        holder.run_steer("01900000-0000-7000-8000-000000000001", "text"),
+        Err(ClientError::DesktopUnavailable)
+    );
+    assert_eq!(
+        holder.run_follow_up("01900000-0000-7000-8000-000000000001", "text"),
+        Err(ClientError::DesktopUnavailable)
+    );
 }
 
 #[test]
@@ -748,6 +756,107 @@ fn desktop_run_submit_rejects_invalid_results() {
         );
         worker.join().unwrap();
     }
+}
+
+#[test]
+fn desktop_run_messages_match_the_fixtures_and_use_fresh_keys() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_desktop_client_handshake(&mut server);
+        let mut keys = BTreeSet::new();
+        for (operation, text) in [
+            ("run.steer", "Focus on error handling."),
+            ("run.follow_up", "Now suggest tests."),
+        ] {
+            let request = read_client_value(&mut server);
+            assert_eq!(request["operation"], operation);
+            assert_eq!(
+                request["body"],
+                serde_json::json!({
+                    "run_id": "01900000-0000-7000-8000-000000000001",
+                    "text": text,
+                })
+            );
+            let request_id = request["request_id"].as_str().unwrap();
+            let key = request["idempotency_key"].as_str().unwrap();
+            assert_ne!(request_id, key);
+            assert!(keys.insert(key.to_owned()));
+            server
+                .write_all(
+                    &encode_frame(&Response {
+                        protocol: Protocol,
+                        request_id: Id::new(request_id).unwrap(),
+                        ok: Success,
+                        body: serde_json::json!({
+                            "run_id": "01900000-0000-7000-8000-000000000001",
+                            "accepted_at": "2026-07-17T00:00:00Z",
+                        }),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+    });
+    let mut client = handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap();
+    client
+        .run_steer(
+            "01900000-0000-7000-8000-000000000001",
+            "Focus on error handling.",
+        )
+        .unwrap();
+    client
+        .run_follow_up("01900000-0000-7000-8000-000000000001", "Now suggest tests.")
+        .unwrap();
+    worker.join().unwrap();
+}
+
+#[test]
+fn desktop_run_messages_reject_invalid_input_and_receipts() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_desktop_client_handshake(&mut server);
+        for body in [
+            serde_json::json!({"run_id":"01900000-0000-7000-8000-000000000002","accepted_at":"2026-07-17T00:00:00Z"}),
+            serde_json::json!({"run_id":"01900000-0000-7000-8000-000000000001","accepted_at":"bad"}),
+            serde_json::json!({"run_id":"01900000-0000-7000-8000-000000000001","accepted_at":"2026-07-17T00:00:00Z","extra":true}),
+        ] {
+            let request = read_client_value(&mut server);
+            server
+                .write_all(
+                    &encode_frame(&Response {
+                        protocol: Protocol,
+                        request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+                        ok: Success,
+                        body,
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+    });
+    let run_id = "01900000-0000-7000-8000-000000000001";
+    let mut client = handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap();
+    assert_eq!(
+        client.run_steer("bad", "text"),
+        Err(ClientError::UnexpectedMessage)
+    );
+    assert_eq!(
+        client.run_steer(run_id, "   "),
+        Err(ClientError::UnexpectedMessage)
+    );
+    assert_eq!(
+        client.run_follow_up(run_id, &"x".repeat(32 * 1024 + 1)),
+        Err(ClientError::UnexpectedMessage)
+    );
+    for call in 0..3 {
+        let result = if call == 1 {
+            client.run_follow_up(run_id, "text")
+        } else {
+            client.run_steer(run_id, "text")
+        };
+        assert_eq!(result, Err(ClientError::UnexpectedMessage));
+    }
+    worker.join().unwrap();
 }
 
 #[test]

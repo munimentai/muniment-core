@@ -151,6 +151,13 @@ pub struct RunCancelAccepted {
     pub accepted_at: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunMessageAccepted {
+    pub run_id: String,
+    pub accepted_at: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionDecision {
@@ -416,9 +423,9 @@ mod linux {
         ApprovalDecision, ApprovalPresentRequest, ApprovalPresenterServeOutcome,
         AuthorizationSummary, ChatPermissionAnswer, ClientError, MigrationControlFailure,
         MigrationControlOutcome, PendingPermission, PermissionAnswerAccepted, PermissionDecision,
-        RedactedRunEvent, RunCancelAccepted, RunPermissionAnswerAccepted, RunStartAccepted,
-        RunStreamMessage, RunStreamSubscription, RunSubmitAccepted, ThreadCreateAccepted,
-        ThreadListPage, ThreadOpenPage,
+        RedactedRunEvent, RunCancelAccepted, RunMessageAccepted, RunPermissionAnswerAccepted,
+        RunStartAccepted, RunStreamMessage, RunStreamSubscription, RunSubmitAccepted,
+        ThreadCreateAccepted, ThreadListPage, ThreadOpenPage,
     };
     use crate::{
         decode_frame, encode_frame, Authorization, Authorized, Client,
@@ -477,6 +484,7 @@ mod linux {
     const MAX_THREAD_ID_LENGTH: usize = 36;
     const MAX_CURSOR_LENGTH: usize = 1024;
     const MAX_RUN_START_TEXT_LENGTH: usize = 32 * 1024;
+    const MAX_RUN_MESSAGE_TEXT_LENGTH: usize = 32 * 1024;
     const MAX_RUN_START_CONTEXT_LENGTH: usize = 64 * 1024;
     const MAX_PERMISSION_GATE_ID_LENGTH: usize = 256;
     const MAX_PERMISSION_TITLE_LENGTH: usize = 1_024;
@@ -1532,6 +1540,22 @@ mod linux {
             self.with_client(|client| client.run_permission_answer(run_id, gate_id, answer))
         }
 
+        pub fn run_steer(
+            &self,
+            run_id: &str,
+            text: &str,
+        ) -> Result<RunMessageAccepted, ClientError> {
+            self.with_client(|client| client.run_steer(run_id, text))
+        }
+
+        pub fn run_follow_up(
+            &self,
+            run_id: &str,
+            text: &str,
+        ) -> Result<RunMessageAccepted, ClientError> {
+            self.with_client(|client| client.run_follow_up(run_id, text))
+        }
+
         fn with_client<T>(
             &self,
             call: impl FnOnce(&mut DesktopClient) -> Result<T, ClientError>,
@@ -1950,6 +1974,49 @@ mod linux {
                 || accepted.gate_id != gate_id
                 || accepted.answer != answer
                 || accepted.committed_seq == 0
+                || accepted.accepted_at.is_empty()
+                || accepted.accepted_at.len() > MAX_TEXT_LENGTH
+                || !is_rfc3339(&accepted.accepted_at)
+            {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            Ok(accepted)
+        }
+
+        pub fn run_steer(
+            &mut self,
+            run_id: &str,
+            text: &str,
+        ) -> Result<RunMessageAccepted, ClientError> {
+            self.run_message(Operation::RunSteer, run_id, text)
+        }
+
+        pub fn run_follow_up(
+            &mut self,
+            run_id: &str,
+            text: &str,
+        ) -> Result<RunMessageAccepted, ClientError> {
+            self.run_message(Operation::RunFollowUp, run_id, text)
+        }
+
+        fn run_message(
+            &mut self,
+            operation: Operation,
+            run_id: &str,
+            text: &str,
+        ) -> Result<RunMessageAccepted, ClientError> {
+            let run_id = Id::new(run_id.to_owned()).map_err(|_| ClientError::UnexpectedMessage)?;
+            if text.trim().is_empty() || text.len() > MAX_RUN_MESSAGE_TEXT_LENGTH {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            let response = self.request(
+                operation,
+                Some(fresh_request_id()?),
+                serde_json::json!({"run_id": run_id.as_str(), "text": text}),
+            )?;
+            let accepted: RunMessageAccepted = serde_json::from_value(response.body)
+                .map_err(|_| ClientError::UnexpectedMessage)?;
+            if accepted.run_id != run_id.as_str()
                 || accepted.accepted_at.is_empty()
                 || accepted.accepted_at.len() > MAX_TEXT_LENGTH
                 || !is_rfc3339(&accepted.accepted_at)
@@ -3220,6 +3287,22 @@ impl DesktopClient {
     ) -> Result<RunPermissionAnswerAccepted, ClientError> {
         Err(ClientError::UnsupportedPlatform)
     }
+
+    pub fn run_steer(
+        &mut self,
+        _run_id: &str,
+        _text: &str,
+    ) -> Result<RunMessageAccepted, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+
+    pub fn run_follow_up(
+        &mut self,
+        _run_id: &str,
+        _text: &str,
+    ) -> Result<RunMessageAccepted, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -3247,6 +3330,18 @@ impl DesktopClientHolder {
         _gate_id: &str,
         _answer: ChatPermissionAnswer,
     ) -> Result<RunPermissionAnswerAccepted, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+
+    pub fn run_steer(&self, _run_id: &str, _text: &str) -> Result<RunMessageAccepted, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+
+    pub fn run_follow_up(
+        &self,
+        _run_id: &str,
+        _text: &str,
+    ) -> Result<RunMessageAccepted, ClientError> {
         Err(ClientError::UnsupportedPlatform)
     }
 }
