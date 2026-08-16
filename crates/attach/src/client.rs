@@ -2378,7 +2378,7 @@ mod linux {
         interruptible_connect_with_state(endpoint, &stop.inner)
     }
 
-    fn interruptible_connect_with_state<S>(
+    pub fn interruptible_connect_with_state<S>(
         endpoint: &Path,
         stop: &Arc<(Mutex<S>, Condvar)>,
     ) -> Option<UnixStream>
@@ -2465,7 +2465,7 @@ mod linux {
         Some(stream)
     }
 
-    trait InterruptibleConnectState {
+    pub trait InterruptibleConnectState {
         fn stopped(&self) -> bool;
         fn set_stream(&mut self, stream: Option<UnixStream>);
     }
@@ -3006,9 +3006,10 @@ pub use linux::{
     connect_approval_presenter, connect_approval_presenter_at, connect_desktop_client,
     connect_desktop_client_at, handshake_approval_presenter_stream,
     handshake_desktop_client_stream, handshake_migration_control_stream, handshake_stream,
-    handshake_stream_with_credential, serve_approval_presenter_at, serve_desktop_client_at,
-    ApprovalPresenterClient, ApprovalPresenterStopHandle, AuthorizedClient, DesktopClient,
-    DesktopClientHolder, DesktopClientStopHandle, MigrationControlClient,
+    handshake_stream_with_credential, interruptible_connect_with_state,
+    serve_approval_presenter_at, serve_desktop_client_at, ApprovalPresenterClient,
+    ApprovalPresenterStopHandle, AuthorizedClient, DesktopClient, DesktopClientHolder,
+    DesktopClientStopHandle, InterruptibleConnectState, MigrationControlClient,
 };
 
 #[cfg(not(target_os = "linux"))]
