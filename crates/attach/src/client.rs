@@ -11,6 +11,7 @@ pub enum ClientError {
     RuntimeDirectoryMissing,
     RuntimeDirectoryRelative,
     DesktopUnavailable,
+    DesktopBusy,
     Timeout,
     ConnectionClosed,
     MalformedFrame,
@@ -32,6 +33,7 @@ impl fmt::Display for ClientError {
             Self::RuntimeDirectoryMissing => "XDG_RUNTIME_DIR is not set",
             Self::RuntimeDirectoryRelative => "XDG_RUNTIME_DIR must be an absolute path",
             Self::DesktopUnavailable => "the Muniment desktop attach service is unavailable",
+            Self::DesktopBusy => "the Muniment desktop attach service is busy",
             Self::Timeout => "the desktop did not complete pairing in time",
             Self::ConnectionClosed => "the desktop closed the pairing connection",
             Self::MalformedFrame => "the desktop sent a malformed attach message",
@@ -383,7 +385,7 @@ mod linux {
     use std::os::unix::io::{AsRawFd, FromRawFd};
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Condvar, Mutex};
+    use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[repr(C)]
@@ -418,6 +420,7 @@ mod linux {
     const IO_TIMEOUT: Duration = Duration::from_secs(5);
     const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
     const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
+    const DESKTOP_CLIENT_LOCK_TIMEOUT: Duration = Duration::from_millis(100);
     const THREAD_LIST_LIMIT: u8 = 100;
     const THREAD_OPEN_LIMIT: u8 = 100;
     const MAX_THREAD_ID_LENGTH: usize = 36;
@@ -1404,45 +1407,15 @@ mod linux {
             idempotency_key: Option<Id>,
             body: Value,
         ) -> Result<Response, ClientError> {
-            let (client, wake) = &*self.inner;
-            let mut client = client.lock().unwrap_or_else(|error| error.into_inner());
-            let result = client
-                .as_mut()
-                .ok_or(ClientError::DesktopUnavailable)?
-                .request(operation, idempotency_key, body);
-            if result.is_err() {
-                *client = None;
-                wake.notify_all();
-            }
-            result
+            self.with_client(|client| client.request(operation, idempotency_key, body))
         }
 
         pub fn rename_thread(&self, thread_id: &str, title: &str) -> Result<(), ClientError> {
-            let (client, wake) = &*self.inner;
-            let mut client = client.lock().unwrap_or_else(|error| error.into_inner());
-            let result = client
-                .as_mut()
-                .ok_or(ClientError::DesktopUnavailable)?
-                .rename_thread(thread_id, title);
-            if result.is_err() {
-                *client = None;
-                wake.notify_all();
-            }
-            result
+            self.with_client(|client| client.rename_thread(thread_id, title))
         }
 
         pub fn delete_thread(&self, thread_id: &str) -> Result<(), ClientError> {
-            let (client, wake) = &*self.inner;
-            let mut client = client.lock().unwrap_or_else(|error| error.into_inner());
-            let result = client
-                .as_mut()
-                .ok_or(ClientError::DesktopUnavailable)?
-                .delete_thread(thread_id);
-            if result.is_err() {
-                *client = None;
-                wake.notify_all();
-            }
-            result
+            self.with_client(|client| client.delete_thread(thread_id))
         }
 
         pub fn session_status(&self) -> Result<Value, ClientError> {
@@ -1495,13 +1468,31 @@ mod linux {
             call: impl FnOnce(&mut DesktopClient) -> Result<T, ClientError>,
         ) -> Result<T, ClientError> {
             let (client, wake) = &*self.inner;
-            let mut client = client.lock().unwrap_or_else(|error| error.into_inner());
+            let mut client = Self::lock_client(client)?;
             let result = call(client.as_mut().ok_or(ClientError::DesktopUnavailable)?);
             if result.is_err() {
                 *client = None;
                 wake.notify_all();
             }
             result
+        }
+
+        fn lock_client(
+            client: &Mutex<Option<DesktopClient>>,
+        ) -> Result<MutexGuard<'_, Option<DesktopClient>>, ClientError> {
+            let deadline = Instant::now() + DESKTOP_CLIENT_LOCK_TIMEOUT;
+            loop {
+                match client.try_lock() {
+                    Ok(client) => return Ok(client),
+                    Err(TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+                    Err(TryLockError::WouldBlock) if Instant::now() >= deadline => {
+                        return Err(ClientError::DesktopBusy);
+                    }
+                    Err(TryLockError::WouldBlock) => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
         }
     }
 
@@ -2997,6 +2988,51 @@ mod linux {
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::BrokenPipe => ClientError::ConnectionClosed,
             _ => ClientError::DesktopUnavailable,
+        }
+    }
+
+    #[cfg(test)]
+    mod holder_tests {
+        use super::*;
+        use std::sync::Barrier;
+
+        #[test]
+        fn slow_call_makes_second_caller_busy_without_clearing_client() {
+            let holder = DesktopClientHolder::new();
+            let (stream, _peer) = UnixStream::pair().unwrap();
+            let desktop_client = DesktopClient {
+                stream,
+                profile_id: "profile".to_string(),
+                workspace_scopes: BTreeMap::new(),
+                capability: "capability".to_string(),
+                summary: AuthorizationSummary {
+                    expires_in_seconds: 60,
+                    idle_timeout_seconds: 60,
+                },
+                authorized_at: Instant::now(),
+                chat_subscription_id: None,
+                io_timeout: IO_TIMEOUT,
+            };
+            let (client, _) = &*holder.inner;
+            *client.lock().unwrap() = Some(desktop_client);
+
+            let entered = Arc::new(Barrier::new(2));
+            let slow_holder = holder.clone();
+            let slow_entered = entered.clone();
+            let slow_call = std::thread::spawn(move || {
+                slow_holder.with_client(|_| {
+                    slow_entered.wait();
+                    std::thread::sleep(DESKTOP_CLIENT_LOCK_TIMEOUT * 3);
+                    Ok(())
+                })
+            });
+            entered.wait();
+
+            let started = Instant::now();
+            assert_eq!(holder.session_status(), Err(ClientError::DesktopBusy));
+            assert!(started.elapsed() < DESKTOP_CLIENT_LOCK_TIMEOUT * 2);
+            assert_eq!(slow_call.join().unwrap(), Ok(()));
+            assert!(client.lock().unwrap().is_some());
         }
     }
 }

@@ -229,6 +229,7 @@ pub enum ErrorCode {
     IdempotencyKeyForbidden,
     IdempotencyConflict,
     PersistenceFailed,
+    DesktopBusy,
     InvalidCursor,
     InvalidArtifactCursor,
     InvalidRequest,
@@ -461,6 +462,8 @@ pub enum ErrorMessage {
     IdempotencyConflict,
     #[serde(rename = "The request could not be committed.")]
     PersistenceFailed,
+    #[serde(rename = "The desktop is busy with another request.")]
+    DesktopBusy,
     #[serde(rename = "The stream cursor is invalid.")]
     InvalidCursor,
     #[serde(rename = "The artifact transfer cursor is invalid.")]
@@ -530,6 +533,12 @@ impl ProtocolError {
             ErrorCode::PersistenceFailed,
             ErrorMessage::PersistenceFailed,
         );
+        error.retryable = true;
+        error
+    }
+
+    pub fn desktop_busy() -> Self {
+        let mut error = Self::simple(ErrorCode::DesktopBusy, ErrorMessage::DesktopBusy);
         error.retryable = true;
         error
     }
@@ -625,6 +634,7 @@ impl<'de> Deserialize<'de> for ProtocolError {
             (ErrorCode::IdempotencyKeyForbidden, None, None) => Self::idempotency_key_forbidden(),
             (ErrorCode::IdempotencyConflict, None, None) => Self::idempotency_conflict(),
             (ErrorCode::PersistenceFailed, None, None) => Self::persistence_failed(),
+            (ErrorCode::DesktopBusy, None, None) => Self::desktop_busy(),
             (ErrorCode::InvalidCursor, None, None) => Self::invalid_cursor(),
             (ErrorCode::InvalidArtifactCursor, None, None) => Self::invalid_artifact_cursor(),
             (ErrorCode::InvalidRequest, None, None) => Self::invalid_request(),

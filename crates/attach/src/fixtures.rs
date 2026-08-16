@@ -799,6 +799,7 @@ fn error_fixture(code: crate::ErrorCode) -> (&'static str, ProtocolError) {
             ProtocolError::idempotency_conflict(),
         ),
         PersistenceFailed => ("persistence-failed", ProtocolError::persistence_failed()),
+        DesktopBusy => ("desktop-busy", ProtocolError::desktop_busy()),
         InvalidCursor => ("invalid-cursor", ProtocolError::invalid_cursor()),
         InvalidArtifactCursor => (
             "invalid-artifact-cursor",
