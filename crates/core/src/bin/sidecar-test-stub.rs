@@ -182,7 +182,7 @@ fn pi_resume(args: Vec<String>) {
                     serde_json::json!({"type":"response", "command":"prompt", "success":true, "id":request["id"]})
                 );
                 if std::env::var_os("PI_RESUME_STUB_STEER_CAPTURE").is_some() {
-                    // Keep the run active until the test sends a steer command.
+                    // Keep the run active until the test sends a queued message.
                 } else if std::env::var_os("PI_RESUME_STUB_PERMISSION_CAPTURE").is_some() {
                     println!(
                         "{}",
@@ -208,19 +208,29 @@ fn pi_resume(args: Vec<String>) {
                     println!("{}", serde_json::json!({"type":"agent_end"}));
                 }
             }
-            "steer" => {
+            command @ ("steer" | "follow_up") => {
                 if let Ok(path) = std::env::var("PI_RESUME_STUB_STEER_CAPTURE") {
                     fs::write(path, request.to_string()).unwrap();
                 }
                 println!(
                     "{}",
-                    serde_json::json!({"type":"response", "command":"steer", "success":true, "id":request["id"]})
+                    serde_json::json!({"type":"response", "command":command, "success":true, "id":request["id"]})
                 );
                 println!(
                     "{}",
-                    serde_json::json!({"type":"message_update", "assistantMessageEvent":{"type":"text_delta", "delta":" steered"}})
+                    serde_json::json!({"type":"message_update", "assistantMessageEvent":{"type":"text_delta", "delta":format!(" {command}")}})
                 );
-                println!("{}", serde_json::json!({"type":"agent_end"}));
+                if std::env::var_os("PI_RESUME_STUB_PERMISSION_CAPTURE").is_some() {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "type":"extension_ui_request", "id":"permission-1", "method":"confirm",
+                            "title":"Allow this action?", "message":"The test stub needs permission."
+                        })
+                    );
+                } else {
+                    println!("{}", serde_json::json!({"type":"agent_end"}));
+                }
             }
             "extension_ui_response" => {
                 if let Ok(path) = std::env::var("PI_RESUME_STUB_PERMISSION_CAPTURE") {
