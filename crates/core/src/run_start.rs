@@ -161,6 +161,12 @@ pub trait RunAttachBoundaries {
         run_id: &str,
     ) -> Result<crate::journal::CommitSubscription, ProtocolError>;
     #[cfg(target_os = "linux")]
+    fn subscribe_chat_events(
+        &self,
+    ) -> Result<std::sync::mpsc::Receiver<crate::run_events::ChatEvent>, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(target_os = "linux")]
     fn queue_attach_permission_answer(
         &self,
         workspace: &str,

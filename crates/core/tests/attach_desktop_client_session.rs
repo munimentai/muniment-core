@@ -524,13 +524,11 @@ fn desktop_chat_subscription_stays_responsive_under_sustained_events() {
         }
     }
 
+    drop(client);
+    let session_result = session_thread.join().unwrap();
     producing.store(false, Ordering::Relaxed);
     producer.join().unwrap();
-    drop(client);
-    assert_eq!(
-        session_thread.join().unwrap(),
-        Err(AttachSessionError::Closed)
-    );
+    assert_eq!(session_result, Err(AttachSessionError::Closed));
 }
 
 fn request(id: &str, operation: Operation, capability: &str, body: serde_json::Value) -> Request {

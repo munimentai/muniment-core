@@ -740,6 +740,12 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
     ) -> Result<Option<crate::journal::CommitSubscription>, ProtocolError> {
         self.boundaries.subscribe_run_commits(run_id).map(Some)
     }
+
+    fn subscribe_chat_events(
+        &mut self,
+    ) -> Result<std::sync::mpsc::Receiver<crate::run_events::ChatEvent>, ProtocolError> {
+        self.boundaries.subscribe_chat_events()
+    }
 }
 
 fn attach_provenance(
