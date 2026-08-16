@@ -12,7 +12,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::TryRecvError;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1207,7 +1207,7 @@ pub trait ThreadListService {
 
     fn subscribe_chat_events(
         &mut self,
-    ) -> Result<Receiver<crate::run_events::ChatEvent>, ProtocolError> {
+    ) -> Result<crate::run_events::ChatEventSubscription, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
 }
@@ -2591,7 +2591,7 @@ struct ActiveRunStream {
 
 struct ActiveChatSubscription {
     subscription_id: super::Id,
-    receiver: Receiver<crate::run_events::ChatEvent>,
+    receiver: crate::run_events::ChatEventSubscription,
 }
 
 fn drain_chat_events(

@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::mpsc::{Receiver, RecvError, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
@@ -32,6 +34,49 @@ pub struct ChatEvent {
     pub applied_diffs: Vec<ChatAppliedDiff>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_permission: Option<ChatPendingPermission>,
+}
+
+/// A chat-event receiver that unregisters itself when dropped.
+pub struct ChatEventSubscription {
+    receiver: Receiver<ChatEvent>,
+    on_drop: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl ChatEventSubscription {
+    pub fn new(receiver: Receiver<ChatEvent>, on_drop: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            receiver,
+            on_drop: Some(Box::new(on_drop)),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn detached(receiver: Receiver<ChatEvent>) -> Self {
+        Self {
+            receiver,
+            on_drop: None,
+        }
+    }
+
+    pub fn recv(&self) -> Result<ChatEvent, RecvError> {
+        self.receiver.recv()
+    }
+
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<ChatEvent, RecvTimeoutError> {
+        self.receiver.recv_timeout(timeout)
+    }
+
+    pub fn try_recv(&self) -> Result<ChatEvent, TryRecvError> {
+        self.receiver.try_recv()
+    }
+}
+
+impl Drop for ChatEventSubscription {
+    fn drop(&mut self) {
+        if let Some(on_drop) = self.on_drop.take() {
+            on_drop();
+        }
+    }
 }
 
 pub struct ChatStorage {

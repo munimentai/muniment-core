@@ -1030,7 +1030,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
 
     fn subscribe_chat_events(
         &mut self,
-    ) -> Result<std::sync::mpsc::Receiver<crate::run_events::ChatEvent>, ProtocolError> {
+    ) -> Result<crate::run_events::ChatEventSubscription, ProtocolError> {
         self.boundaries.subscribe_chat_events()
     }
 }

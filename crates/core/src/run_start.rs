@@ -221,7 +221,7 @@ pub trait RunAttachBoundaries {
     #[cfg(target_os = "linux")]
     fn subscribe_chat_events(
         &self,
-    ) -> Result<std::sync::mpsc::Receiver<crate::run_events::ChatEvent>, ProtocolError> {
+    ) -> Result<crate::run_events::ChatEventSubscription, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
     #[cfg(target_os = "linux")]

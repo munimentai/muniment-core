@@ -745,9 +745,12 @@ impl ThreadListService for ChatEventService {
         unreachable!()
     }
 
-    fn subscribe_chat_events(&mut self) -> Result<mpsc::Receiver<ChatEvent>, ProtocolError> {
+    fn subscribe_chat_events(
+        &mut self,
+    ) -> Result<muniment_core::run_events::ChatEventSubscription, ProtocolError> {
         self.receiver
             .take()
+            .map(muniment_core::run_events::ChatEventSubscription::detached)
             .ok_or_else(ProtocolError::invalid_request)
     }
 }
