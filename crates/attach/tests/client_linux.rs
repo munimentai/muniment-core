@@ -924,6 +924,121 @@ fn desktop_thread_read_methods_send_requests_and_return_bodies() {
 }
 
 #[test]
+fn desktop_chat_subscription_reads_events_and_refuses_other_frames() {
+    for refusal in [None, Some("subscription"), Some("event")] {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            complete_desktop_client_handshake(&mut server);
+            let request = read_client_value(&mut server);
+            assert_eq!(request["operation"], "run.chat_events");
+            assert_eq!(request["body"], serde_json::json!({}));
+            assert!(request.get("idempotency_key").is_none());
+            server
+                .write_all(
+                    &encode_frame(&Response {
+                        protocol: Protocol,
+                        request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+                        ok: Success,
+                        body: serde_json::json!({
+                            "subscription_id": "00000000000000000000000000000190"
+                        }),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            let subscription_id = if refusal == Some("subscription") {
+                "00000000000000000000000000000191"
+            } else {
+                "00000000000000000000000000000190"
+            };
+            let event = if refusal == Some("event") {
+                EventName::ArtifactComplete
+            } else {
+                EventName::ChatEvent
+            };
+            server
+                .write_all(
+                    &encode_frame(&Event {
+                        protocol: Protocol,
+                        subscription_id: Id::new(subscription_id).unwrap(),
+                        event,
+                        run_id: None,
+                        run_seq: None,
+                        body: serde_json::json!({"phase": "running"}),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        });
+        let mut client = handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap();
+        assert_eq!(
+            client.subscribe_chat_events().unwrap(),
+            "00000000000000000000000000000190"
+        );
+        let result = client.read_chat_event();
+        if refusal.is_some() {
+            assert_eq!(result, Err(ClientError::UnexpectedMessage));
+        } else {
+            assert_eq!(result.unwrap(), serde_json::json!({"phase": "running"}));
+        }
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn desktop_chat_subscription_maps_revocation_and_disconnect() {
+    for revoked in [true, false] {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            complete_desktop_client_handshake(&mut server);
+            let request = read_client_value(&mut server);
+            server
+                .write_all(
+                    &encode_frame(&Response {
+                        protocol: Protocol,
+                        request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+                        ok: Success,
+                        body: serde_json::json!({
+                            "subscription_id": "00000000000000000000000000000190"
+                        }),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            if revoked {
+                server
+                    .write_all(
+                        &encode_frame(&Event {
+                            protocol: Protocol,
+                            subscription_id: Id::new("00000000000000000000000000000190").unwrap(),
+                            event: EventName::CapabilityRevoked,
+                            run_id: None,
+                            run_seq: None,
+                            body: serde_json::json!({
+                                "capability": "33".repeat(32),
+                                "reason": "signed out"
+                            }),
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
+        });
+        let mut client = handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap();
+        client.subscribe_chat_events().unwrap();
+        assert_eq!(
+            client.read_chat_event(),
+            Err(if revoked {
+                ClientError::CapabilityRevoked
+            } else {
+                ClientError::DesktopUnavailable
+            })
+        );
+        worker.join().unwrap();
+    }
+}
+
+#[test]
 fn desktop_revoke_companion_rejects_invalid_identity_before_writing() {
     let (client, mut server) = UnixStream::pair().unwrap();
     let worker = thread::spawn(move || {

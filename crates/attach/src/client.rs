@@ -1383,6 +1383,8 @@ mod linux {
         workspace_scopes: BTreeMap<String, BTreeSet<String>>,
         capability: String,
         summary: AuthorizationSummary,
+        authorized_at: Instant,
+        chat_subscription_id: Option<Id>,
         io_timeout: Duration,
     }
 
@@ -1894,6 +1896,70 @@ mod linux {
             let mut body = thread_read_body(limit, cursor)?;
             body["thread_id"] = Value::String(thread_id.into());
             Ok(self.request(Operation::ThreadHistory, None, body)?.body)
+        }
+
+        pub fn subscribe_chat_events(&mut self) -> Result<String, ClientError> {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Subscription {
+                subscription_id: String,
+            }
+
+            let response = self.request(Operation::RunChatEvents, None, serde_json::json!({}))?;
+            let subscription: Subscription = serde_json::from_value(response.body)
+                .map_err(|_| ClientError::UnexpectedMessage)?;
+            let subscription_id = Id::new(subscription.subscription_id)
+                .map_err(|_| ClientError::UnexpectedMessage)?;
+            let result = subscription_id.as_str().to_owned();
+            self.chat_subscription_id = Some(subscription_id);
+            Ok(result)
+        }
+
+        pub fn read_chat_event(&mut self) -> Result<Value, ClientError> {
+            let subscription_id = self
+                .chat_subscription_id
+                .as_ref()
+                .ok_or(ClientError::UnexpectedMessage)?;
+            let authorization_remaining = Duration::from_secs(self.summary.expires_in_seconds)
+                .saturating_sub(self.authorized_at.elapsed());
+            let wait =
+                authorization_remaining.min(Duration::from_secs(self.summary.idle_timeout_seconds));
+            if wait.is_zero() {
+                return Err(ClientError::AuthorizationExpired);
+            }
+            let value = read_value(&mut self.stream, deadline(wait)).map_err(|error| {
+                if error == ClientError::ConnectionClosed {
+                    ClientError::DesktopUnavailable
+                } else {
+                    error
+                }
+            })?;
+            if value
+                .get("protocol")
+                .and_then(Value::as_str)
+                .is_some_and(|protocol| protocol != PROTOCOL)
+            {
+                return Err(ClientError::ProtocolIncompatible);
+            }
+            let event =
+                match serde_json::from_value(value).map_err(|_| ClientError::UnexpectedMessage)? {
+                    Envelope::Event(event) => event,
+                    Envelope::Error(error) => return Err(map_protocol_error(error.error.code())),
+                    _ => return Err(ClientError::UnexpectedMessage),
+                };
+            if event.event == EventName::CapabilityRevoked {
+                AuthorizedClient::validate_capability_revocation(&event)?
+                    .ok_or(ClientError::UnexpectedMessage)?;
+                return Err(ClientError::CapabilityRevoked);
+            }
+            if &event.subscription_id != subscription_id
+                || event.event != EventName::ChatEvent
+                || event.run_id.is_some()
+                || event.run_seq.is_some()
+            {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            Ok(event.body)
         }
 
         pub fn list_companions(&mut self) -> Result<Value, ClientError> {
@@ -2624,6 +2690,8 @@ mod linux {
                 expires_in_seconds: authorized.expires_at,
                 idle_timeout_seconds: authorized.idle_timeout_seconds,
             },
+            authorized_at: Instant::now(),
+            chat_subscription_id: None,
             io_timeout,
         })
     }
