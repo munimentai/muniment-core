@@ -68,6 +68,18 @@ pub struct RunStartLaunch {
 
 pub trait RunAttachBoundaries {
     #[cfg(target_os = "linux")]
+    fn queue_attach_message(
+        &self,
+        _workspace: &str,
+        _run_id: &str,
+        _delivery: crate::active_run::ChatDelivery,
+        _message: &str,
+    ) -> Result<(), RunStartError> {
+        Err(RunStartError::InvalidRequest(
+            "That reply is no longer active.".into(),
+        ))
+    }
+    #[cfg(target_os = "linux")]
     fn session_status(&self) -> Result<crate::auth::AuthStatus, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }

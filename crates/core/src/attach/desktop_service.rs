@@ -5,9 +5,10 @@
 use super::linux::{
     CompanionProvenance, EntitlementSnapshotResult, MigrationControlRequest,
     PermissionAnswerAccepted, PermissionAnswerRequest, PermissionDecision, RunCancelAccepted,
-    RunCancelRequest, RunStartAccepted, RunStartRequest as AttachRunStartRequest, RunStreamPage,
-    ThreadCreateAccepted, ThreadListPage, ThreadListRequest, ThreadListService, ThreadOpenPage,
-    ThreadOpenRequest,
+    RunCancelRequest, RunMessageAccepted, RunMessageRequest, RunPermissionAnswerAccepted,
+    RunPermissionAnswerRequest, RunStartAccepted, RunStartRequest as AttachRunStartRequest,
+    RunStreamPage, ThreadCreateAccepted, ThreadListPage, ThreadListRequest, ThreadListService,
+    ThreadOpenPage, ThreadOpenRequest,
 };
 use super::{
     bounded_claim, onboard_workspace_context,
@@ -15,6 +16,7 @@ use super::{
     CommittedResult, Id, IdempotencyOutcome, IdempotencyStore, Operation, Protocol, ProtocolError,
     Request as AttachRequest, WorkspaceContextMap, WorkspaceOnboardRequest, WorkspaceOnboarded,
 };
+use crate::active_run::ChatDelivery;
 use crate::journal::Provenance;
 use crate::permission_gate::ChatPermissionAnswer;
 use crate::run_start::{
@@ -75,6 +77,58 @@ pub struct DesktopAttachService<B, I = IdempotencyStore> {
     pub client_credentials: Arc<Mutex<HashMap<String, ClientCredential>>>,
     pub credential_path: Option<PathBuf>,
     pub client_identity: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn queue_run_message<B: RunAttachBoundaries, I: RunStartIdempotency>(
+    boundaries: &B,
+    idempotency: &mut I,
+    operation: Operation,
+    delivery: ChatDelivery,
+    workspace: &str,
+    request: RunMessageRequest,
+    request_id: &Id,
+    idempotency_key: &Id,
+    companion: CompanionProvenance,
+) -> Result<RunMessageAccepted, ProtocolError> {
+    let canonical_input = json!({
+        "workspace": workspace,
+        "run_id": &request.run_id,
+        "text": &request.text,
+    });
+    let ledger_request = AttachRequest {
+        protocol: Protocol,
+        request_id: request_id.clone(),
+        operation,
+        capability: String::new(),
+        idempotency_key: Some(idempotency_key.clone()),
+        body: canonical_input.clone(),
+    };
+    let outcome = idempotency.execute(
+        &companion.profile,
+        &ledger_request,
+        &canonical_input,
+        || Ok(()),
+        || {
+            boundaries
+                .queue_attach_message(workspace, &request.run_id, delivery, &request.text)
+                .map_err(|error| error.protocol_error())?;
+            Ok(CommittedResult {
+                body: json!({
+                    "run_id": request.run_id,
+                    "accepted_at": chrono::Utc::now().to_rfc3339_opts(
+                        chrono::SecondsFormat::AutoSi,
+                        true,
+                    ),
+                }),
+                cursor: None,
+            })
+        },
+    )?;
+    let committed = match outcome {
+        IdempotencyOutcome::Committed(result) | IdempotencyOutcome::Replayed(result) => result,
+    };
+    serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
 }
 
 #[cfg(target_os = "linux")]
@@ -681,6 +735,139 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
     }
 
+    fn steer_run(
+        &mut self,
+        workspace: &str,
+        request: RunMessageRequest,
+        request_id: &Id,
+        idempotency_key: &Id,
+        companion: CompanionProvenance,
+    ) -> Result<RunMessageAccepted, ProtocolError> {
+        queue_run_message(
+            &self.boundaries,
+            &mut self.idempotency,
+            Operation::RunSteer,
+            ChatDelivery::Steer,
+            workspace,
+            request,
+            request_id,
+            idempotency_key,
+            companion,
+        )
+    }
+
+    fn follow_up_run(
+        &mut self,
+        workspace: &str,
+        request: RunMessageRequest,
+        request_id: &Id,
+        idempotency_key: &Id,
+        companion: CompanionProvenance,
+    ) -> Result<RunMessageAccepted, ProtocolError> {
+        queue_run_message(
+            &self.boundaries,
+            &mut self.idempotency,
+            Operation::RunFollowUp,
+            ChatDelivery::FollowUp,
+            workspace,
+            request,
+            request_id,
+            idempotency_key,
+            companion,
+        )
+    }
+
+    fn answer_run_permission(
+        &mut self,
+        workspace: &str,
+        request: RunPermissionAnswerRequest,
+        request_id: &Id,
+        idempotency_key: &Id,
+        companion: CompanionProvenance,
+    ) -> Result<RunPermissionAnswerAccepted, ProtocolError> {
+        let canonical_input = json!({
+            "workspace": workspace,
+            "run_id": &request.run_id,
+            "gate_id": &request.gate_id,
+            "answer": &request.answer,
+        });
+        let ledger_request = AttachRequest {
+            protocol: Protocol,
+            request_id: request_id.clone(),
+            operation: Operation::RunPermissionAnswer,
+            capability: String::new(),
+            idempotency_key: Some(idempotency_key.clone()),
+            body: canonical_input.clone(),
+        };
+        let outcome = self.idempotency.execute(
+            &companion.profile,
+            &ledger_request,
+            &canonical_input,
+            || Ok(()),
+            || {
+                let commits = self.boundaries.subscribe_run_commits(&request.run_id)?;
+                if commits.committed_high_water == 0 {
+                    return Err(ProtocolError::invalid_request());
+                }
+                let resolved = self
+                    .boundaries
+                    .queue_attach_permission_answer(
+                        workspace,
+                        &request.run_id,
+                        &request.gate_id,
+                        request.answer.clone(),
+                    )
+                    .map_err(|error| error.protocol_error())?;
+                let deadline = std::time::Instant::now() + PERMISSION_COMMIT_TIMEOUT;
+                let remaining = deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .ok_or_else(ProtocolError::persistence_failed)?;
+                let expected_seq = resolved
+                    .recv_timeout(remaining)
+                    .map_err(|_| ProtocolError::persistence_failed())?
+                    .ok_or_else(ProtocolError::invalid_request)?;
+                let committed_seq = loop {
+                    let remaining = deadline
+                        .checked_duration_since(std::time::Instant::now())
+                        .ok_or_else(ProtocolError::persistence_failed)?;
+                    let hint = commits
+                        .recv_timeout(remaining)
+                        .map_err(|_| ProtocolError::persistence_failed())?;
+                    if hint.run_id != request.run_id || hint.run_seq != expected_seq {
+                        continue;
+                    }
+                    let page = self.boundaries.stream_run(
+                        workspace,
+                        &request.run_id,
+                        hint.run_seq.saturating_sub(1),
+                    )?;
+                    if page.events.first().is_some_and(|event| {
+                        event.run_seq == hint.run_seq && event.event_type == "permission.resolved"
+                    }) {
+                        break hint.run_seq;
+                    }
+                };
+                Ok(CommittedResult {
+                    body: json!({
+                        "run_id": request.run_id,
+                        "gate_id": request.gate_id,
+                        "answer": request.answer,
+                        "committed_seq": committed_seq,
+                        "accepted_at": chrono::Utc::now().to_rfc3339_opts(
+                            chrono::SecondsFormat::AutoSi,
+                            true,
+                        ),
+                    }),
+                    cursor: None,
+                })
+            },
+        )?;
+        let committed = match outcome {
+            IdempotencyOutcome::Committed(result) | IdempotencyOutcome::Replayed(result) => result,
+        };
+        serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
+    }
+
     fn cancel_run(
         &mut self,
         workspace: &str,
@@ -864,6 +1051,8 @@ mod tests {
         active_run: Mutex<Option<(String, String)>>,
         runtime_activity: RuntimeActivityRegistry,
         #[cfg(target_os = "linux")]
+        queued_messages: Mutex<Vec<(ChatDelivery, String)>>,
+        #[cfg(target_os = "linux")]
         queued_permission_answers: Mutex<Vec<(String, ChatPermissionAnswer)>>,
         #[cfg(target_os = "linux")]
         permission_auto_commit: bool,
@@ -902,6 +1091,8 @@ mod tests {
                 active_run: Mutex::new(None),
                 runtime_activity: RuntimeActivityRegistry::new(),
                 #[cfg(target_os = "linux")]
+                queued_messages: Mutex::new(Vec::new()),
+                #[cfg(target_os = "linux")]
                 queued_permission_answers: Mutex::new(Vec::new()),
                 #[cfg(target_os = "linux")]
                 permission_auto_commit: true,
@@ -918,6 +1109,32 @@ mod tests {
     }
 
     impl RunAttachBoundaries for FakeRunStartBoundaries {
+        #[cfg(target_os = "linux")]
+        fn queue_attach_message(
+            &self,
+            workspace: &str,
+            run_id: &str,
+            delivery: ChatDelivery,
+            message: &str,
+        ) -> Result<(), RunStartError> {
+            if !self
+                .active_run
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|active| active.0 == run_id && active.1 == workspace)
+            {
+                return Err(RunStartError::InvalidRequest(
+                    "That reply is no longer active.".into(),
+                ));
+            }
+            self.queued_messages
+                .lock()
+                .unwrap()
+                .push((delivery, message.to_owned()));
+            Ok(())
+        }
+
         #[cfg(target_os = "linux")]
         fn list_threads(
             &self,
@@ -1584,6 +1801,168 @@ mod tests {
                 peer_pid: 42,
             },
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_permission_request(
+        service: &mut DesktopAttachService<FakeRunStartBoundaries>,
+        answer: ChatPermissionAnswer,
+        request_id: &str,
+        key: &str,
+    ) -> Result<RunPermissionAnswerAccepted, ProtocolError> {
+        service.answer_run_permission(
+            "workspace-a",
+            RunPermissionAnswerRequest {
+                run_id: "0190a100-0000-7000-8000-000000000001".into(),
+                gate_id: "gate-1".into(),
+                answer,
+            },
+            &Id::new(request_id).unwrap(),
+            &Id::new(key).unwrap(),
+            CompanionProvenance {
+                profile: "default".into(),
+                companion_kind: "desktop-client".into(),
+                companion_version: "1.2.3".into(),
+                peer_uid: 1000,
+                peer_pid: 42,
+            },
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn message_request(
+        service: &mut DesktopAttachService<FakeRunStartBoundaries>,
+        operation: Operation,
+        text: &str,
+        request_id: &str,
+        key: &str,
+    ) -> Result<RunMessageAccepted, ProtocolError> {
+        let request = RunMessageRequest {
+            run_id: "0190a100-0000-7000-8000-000000000001".into(),
+            text: text.into(),
+        };
+        let request_id = Id::new(request_id).unwrap();
+        let key = Id::new(key).unwrap();
+        let provenance = CompanionProvenance {
+            profile: "default".into(),
+            companion_kind: "desktop-client".into(),
+            companion_version: "1.2.3".into(),
+            peer_uid: 1000,
+            peer_pid: 42,
+        };
+        if operation == Operation::RunSteer {
+            service.steer_run("workspace-a", request, &request_id, &key, provenance)
+        } else {
+            service.follow_up_run("workspace-a", request, &request_id, &key, provenance)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn attach_run_messages_replay_exact_retries_and_reject_conflicts_without_queueing() {
+        for (index, operation) in [Operation::RunSteer, Operation::RunFollowUp]
+            .into_iter()
+            .enumerate()
+        {
+            let run_id = "0190a100-0000-7000-8000-000000000001";
+            let mut service = permission_service(
+                FakeRunStartBoundaries::accepting(),
+                Some((run_id, "workspace-a")),
+            );
+            let key = format!("018f0000-0000-7000-8000-{:012x}", 50 + index);
+            let first = message_request(
+                &mut service,
+                operation,
+                "hello",
+                "018f0000-0000-7000-8000-000000000060",
+                &key,
+            )
+            .unwrap();
+            let replay = message_request(
+                &mut service,
+                operation,
+                "hello",
+                "018f0000-0000-7000-8000-000000000061",
+                &key,
+            )
+            .unwrap();
+            assert_eq!(replay, first);
+            assert_eq!(service.boundaries.queued_messages.lock().unwrap().len(), 1);
+
+            let conflict = message_request(
+                &mut service,
+                operation,
+                "changed",
+                "018f0000-0000-7000-8000-000000000062",
+                &key,
+            )
+            .unwrap_err();
+            assert_eq!(
+                serde_json::to_value(conflict).unwrap()["code"],
+                "idempotency_conflict"
+            );
+            assert_eq!(service.boundaries.queued_messages.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn attach_run_permission_replays_exact_retry_and_rejects_conflict_without_queueing() {
+        let run_id = "0190a100-0000-7000-8000-000000000001";
+        let mut service = permission_service(
+            FakeRunStartBoundaries::accepting(),
+            Some((run_id, "workspace-a")),
+        );
+        let key = "018f0000-0000-7000-8000-000000000070";
+        let first = run_permission_request(
+            &mut service,
+            ChatPermissionAnswer::Confirm(true),
+            "018f0000-0000-7000-8000-000000000071",
+            key,
+        )
+        .unwrap();
+        let replay = run_permission_request(
+            &mut service,
+            ChatPermissionAnswer::Confirm(true),
+            "018f0000-0000-7000-8000-000000000072",
+            key,
+        )
+        .unwrap();
+        assert_eq!(replay.run_id, first.run_id);
+        assert_eq!(replay.gate_id, first.gate_id);
+        assert_eq!(replay.committed_seq, first.committed_seq);
+        assert_eq!(replay.accepted_at, first.accepted_at);
+        assert!(matches!(replay.answer, ChatPermissionAnswer::Confirm(true)));
+        assert_eq!(
+            service
+                .boundaries
+                .queued_permission_answers
+                .lock()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let conflict = run_permission_request(
+            &mut service,
+            ChatPermissionAnswer::Confirm(false),
+            "018f0000-0000-7000-8000-000000000073",
+            key,
+        )
+        .unwrap_err();
+        assert_eq!(
+            serde_json::to_value(conflict).unwrap()["code"],
+            "idempotency_conflict"
+        );
+        assert_eq!(
+            service
+                .boundaries
+                .queued_permission_answers
+                .lock()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[cfg(target_os = "linux")]

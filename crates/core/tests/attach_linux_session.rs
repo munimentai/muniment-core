@@ -4986,13 +4986,6 @@ fn unserved_operations_remain_unsupported_without_dispatch() {
     client
         .write_all(&request(79, Operation::RunOpen, json!({})))
         .unwrap();
-    client
-        .write_all(&request_with_idempotency(
-            80,
-            Operation::RunSteer,
-            json!({"text": "private steer"}),
-        ))
-        .unwrap();
     client.shutdown(Shutdown::Write).unwrap();
     let mut approved = approval();
     approved.scopes.insert("run.write".into());
@@ -5007,15 +5000,56 @@ fn unserved_operations_remain_unsupported_without_dispatch() {
         ),
         Ok(())
     );
-    for id in [79, 80] {
-        let error: ErrorEnvelope = read_frame(&mut client);
-        assert_eq!(
-            error.request_id,
-            Some(Id::new(format!("{id:032x}")).unwrap())
-        );
-        assert_eq!(error.error.code(), ErrorCode::UnsupportedOperation);
-    }
+    let error: ErrorEnvelope = read_frame(&mut client);
+    assert_eq!(
+        error.request_id,
+        Some(Id::new(format!("{:032x}", 79)).unwrap())
+    );
+    assert_eq!(error.error.code(), ErrorCode::UnsupportedOperation);
     assert!(service.calls.is_empty());
+}
+
+#[test]
+fn companion_refuses_desktop_only_run_controls() {
+    for (id, operation, body) in [
+        (
+            203,
+            Operation::RunSteer,
+            json!({"run_id":"0190a100-0000-7000-8000-000000000001","text":"steer"}),
+        ),
+        (
+            204,
+            Operation::RunFollowUp,
+            json!({"run_id":"0190a100-0000-7000-8000-000000000001","text":"follow up"}),
+        ),
+        (
+            205,
+            Operation::RunPermissionAnswer,
+            json!({"run_id":"0190a100-0000-7000-8000-000000000001","gate_id":"gate-1","answer":{"type":"confirm","value":true}}),
+        ),
+    ] {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&hello(1, 1)).unwrap();
+        client
+            .write_all(&request_with_idempotency(id, operation, body))
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut service = StartService::default();
+
+        assert_eq!(
+            dispatch_session_with_approval(
+                &mut client,
+                server,
+                TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                approval(),
+                &mut service,
+            ),
+            Err(AttachSessionError::Authorization)
+        );
+        let error: ErrorEnvelope = read_frame(&mut client);
+        assert_eq!(error.error.code(), ErrorCode::Unauthorized);
+        assert!(service.calls.is_empty());
+    }
 }
 
 #[test]

@@ -22,6 +22,8 @@ pub enum ChatDelivery {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ChatQueueRequest {
     pub run_id: String,
+    #[serde(default)]
+    pub workspace: Option<String>,
     pub delivery: ChatDelivery,
     pub message: String,
 }
@@ -35,7 +37,13 @@ pub fn queue_message(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let run = active
         .as_ref()
-        .filter(|run| run.id == request.run_id)
+        .filter(|run| {
+            run.id == request.run_id
+                && request
+                    .workspace
+                    .as_deref()
+                    .is_none_or(|workspace| workspace == run.workspace)
+        })
         .ok_or_else(|| "That reply is no longer active.".to_string())?;
     let transport = run
         .transport
@@ -192,6 +200,7 @@ mod tests {
         )));
         let request = |run_id: &str| ChatQueueRequest {
             run_id: run_id.into(),
+            workspace: None,
             delivery: ChatDelivery::Steer,
             message: "hello".into(),
         };
@@ -202,6 +211,27 @@ mod tests {
         assert_eq!(
             queue_message(&active, request("run-1")).unwrap_err(),
             "The reply is not ready for messages yet."
+        );
+    }
+
+    #[test]
+    fn queue_rejects_a_run_in_another_workspace() {
+        let runtime_activity = RuntimeActivityRegistry::new();
+        let active = Mutex::new(Some(inactive_transport_run(
+            "run-1",
+            "workspace-a",
+            &runtime_activity,
+        )));
+        let request = ChatQueueRequest {
+            run_id: "run-1".into(),
+            workspace: Some("workspace-b".into()),
+            delivery: ChatDelivery::Steer,
+            message: "hello".into(),
+        };
+
+        assert_eq!(
+            queue_message(&active, request).unwrap_err(),
+            "That reply is no longer active."
         );
     }
 

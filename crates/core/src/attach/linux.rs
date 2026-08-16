@@ -32,6 +32,43 @@ use crate::journal::{
     thread_summaries::ThreadSummaryListError, RunEventPageError, RunJournal, MAX_THREAD_TITLE_CHARS,
 };
 
+fn invalid_permission_answer(answer: &crate::permission_gate::ChatPermissionAnswer) -> bool {
+    use crate::permission_gate::ChatPermissionAnswer;
+    match answer {
+        ChatPermissionAnswer::Select(value)
+        | ChatPermissionAnswer::Input(value)
+        | ChatPermissionAnswer::Editor(value) => value.trim().is_empty(),
+        ChatPermissionAnswer::CodeDiff {
+            gate_id,
+            effect_id,
+            code_diff_id,
+            diff_sha256,
+            write_plan_sha256,
+        } => {
+            [gate_id, effect_id, code_diff_id]
+                .into_iter()
+                .any(|value| value.trim().is_empty() || value.len() > MAX_PERMISSION_GATE_ID_LENGTH)
+                || [diff_sha256, write_plan_sha256].into_iter().any(|value| {
+                    value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        }
+        ChatPermissionAnswer::Confirm(_) | ChatPermissionAnswer::Cancelled => false,
+    }
+}
+
+fn permission_answer_gate_mismatch(
+    gate_id: &str,
+    answer: &crate::permission_gate::ChatPermissionAnswer,
+) -> bool {
+    matches!(
+        answer,
+        crate::permission_gate::ChatPermissionAnswer::CodeDiff {
+            gate_id: answer_gate_id,
+            ..
+        } if answer_gate_id != gate_id
+    )
+}
+
 const ATTACH_DIRECTORY: &[u8] = b"muniment\0";
 const ENDPOINT_NAME: &str = "attach-v1.sock";
 const INSTANCE_LOCK_NAME: &[u8] = b"instance.lock\0";
@@ -46,6 +83,7 @@ const MAX_RESPONSE_BODY_LENGTH: usize = MAX_FRAME_LENGTH - 4096;
 const MAX_HANDOFF_NONCE_BYTES: usize = 128;
 const MAX_HANDOFF_DEADLINE_MS: u64 = 60_000;
 pub const MAX_RUN_START_TEXT_LENGTH: usize = 32 * 1024;
+pub const MAX_RUN_MESSAGE_TEXT_LENGTH: usize = 32 * 1024;
 pub const MAX_RUN_START_CONTEXT_LENGTH: usize = 64 * 1024;
 pub const MAX_PERMISSION_GATE_ID_LENGTH: usize = 256;
 
@@ -841,6 +879,34 @@ pub struct PermissionAnswerAccepted {
     pub accepted_at: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunMessageRequest {
+    pub run_id: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct RunMessageAccepted {
+    pub run_id: String,
+    pub accepted_at: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct RunPermissionAnswerRequest {
+    pub run_id: String,
+    pub gate_id: String,
+    pub answer: crate::permission_gate::ChatPermissionAnswer,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct RunPermissionAnswerAccepted {
+    pub run_id: String,
+    pub gate_id: String,
+    pub answer: crate::permission_gate::ChatPermissionAnswer,
+    pub committed_seq: u64,
+    pub accepted_at: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunStreamPage {
     pub run_id: String,
@@ -1025,6 +1091,39 @@ pub trait ThreadListService {
         _idempotency_key: &super::Id,
         _provenance: CompanionProvenance,
     ) -> Result<PermissionAnswerAccepted, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn steer_run(
+        &mut self,
+        _workspace: &str,
+        _request: RunMessageRequest,
+        _request_id: &super::Id,
+        _idempotency_key: &super::Id,
+        _provenance: CompanionProvenance,
+    ) -> Result<RunMessageAccepted, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn follow_up_run(
+        &mut self,
+        _workspace: &str,
+        _request: RunMessageRequest,
+        _request_id: &super::Id,
+        _idempotency_key: &super::Id,
+        _provenance: CompanionProvenance,
+    ) -> Result<RunMessageAccepted, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn answer_run_permission(
+        &mut self,
+        _workspace: &str,
+        _request: RunPermissionAnswerRequest,
+        _request_id: &super::Id,
+        _idempotency_key: &super::Id,
+        _provenance: CompanionProvenance,
+    ) -> Result<RunPermissionAnswerAccepted, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
 
@@ -2273,6 +2372,9 @@ where
                 | Operation::CompanionList
                 | Operation::CompanionRevoke
                 | Operation::RunChatEvents
+                | Operation::RunSteer
+                | Operation::RunFollowUp
+                | Operation::RunPermissionAnswer
         ) {
             write_request_error(
                 stream,
@@ -3107,6 +3209,125 @@ fn dispatch_request<S: ThreadListService>(
         }
         return Ok(response_only(serde_json::json!({
             "run_id": accepted.run_id,
+            "accepted_at": accepted.accepted_at,
+        })));
+    }
+    if matches!(
+        request.operation,
+        Operation::RunSteer | Operation::RunFollowUp
+    ) {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            run_id: String,
+            text: String,
+        }
+        let body: Body =
+            serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
+        super::Id::new(body.run_id.clone()).map_err(|_| ProtocolError::invalid_request())?;
+        if body.text.trim().is_empty() || body.text.len() > MAX_RUN_MESSAGE_TEXT_LENGTH {
+            return Err(ProtocolError::invalid_request().into());
+        }
+        let idempotency_key = request
+            .idempotency_key
+            .as_ref()
+            .ok_or_else(ProtocolError::idempotency_key_required)?;
+        let requested_run_id = body.run_id.clone();
+        let operation = request.operation;
+        let mutation = RunMessageRequest {
+            run_id: body.run_id,
+            text: body.text,
+        };
+        let accepted = if operation == Operation::RunSteer {
+            service.steer_run(
+                workspace,
+                mutation,
+                &request.request_id,
+                idempotency_key,
+                provenance,
+            )?
+        } else {
+            service.follow_up_run(
+                workspace,
+                mutation,
+                &request.request_id,
+                idempotency_key,
+                provenance,
+            )?
+        };
+        if accepted.run_id != requested_run_id
+            || super::Id::new(accepted.run_id.clone()).is_err()
+            || accepted.accepted_at.is_empty()
+            || accepted.accepted_at.len() > MAX_TEXT_LENGTH
+            || chrono::DateTime::parse_from_rfc3339(&accepted.accepted_at).is_err()
+        {
+            return Err(ProtocolError::persistence_failed().into());
+        }
+        return Ok(response_only(serde_json::json!({
+            "run_id": accepted.run_id,
+            "accepted_at": accepted.accepted_at,
+        })));
+    }
+    if request.operation == Operation::RunPermissionAnswer {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            run_id: String,
+            gate_id: String,
+            answer: crate::permission_gate::ChatPermissionAnswer,
+        }
+        let body: Body =
+            serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
+        super::Id::new(body.run_id.clone()).map_err(|_| ProtocolError::invalid_request())?;
+        let answer_length = serde_json::to_vec(&body.answer)
+            .map_err(|_| ProtocolError::invalid_request())?
+            .len();
+        if body.gate_id.trim().is_empty()
+            || body.gate_id.len() > MAX_PERMISSION_GATE_ID_LENGTH
+            || answer_length > MAX_RUN_MESSAGE_TEXT_LENGTH
+            || invalid_permission_answer(&body.answer)
+            || permission_answer_gate_mismatch(&body.gate_id, &body.answer)
+        {
+            return Err(ProtocolError::invalid_request().into());
+        }
+        let idempotency_key = request
+            .idempotency_key
+            .as_ref()
+            .ok_or_else(ProtocolError::idempotency_key_required)?;
+        let requested_run_id = body.run_id.clone();
+        let requested_gate_id = body.gate_id.clone();
+        let requested_answer =
+            serde_json::to_value(&body.answer).map_err(|_| ProtocolError::invalid_request())?;
+        let accepted = service.answer_run_permission(
+            workspace,
+            RunPermissionAnswerRequest {
+                run_id: body.run_id,
+                gate_id: body.gate_id,
+                answer: body.answer,
+            },
+            &request.request_id,
+            idempotency_key,
+            provenance,
+        )?;
+        if accepted.run_id != requested_run_id
+            || accepted.gate_id != requested_gate_id
+            || super::Id::new(accepted.run_id.clone()).is_err()
+            || accepted.committed_seq == 0
+            || serde_json::to_value(&accepted.answer)
+                .map_or(true, |answer| answer != requested_answer)
+            || invalid_permission_answer(&accepted.answer)
+            || permission_answer_gate_mismatch(&accepted.gate_id, &accepted.answer)
+            || accepted.accepted_at.is_empty()
+            || accepted.accepted_at.len() > MAX_TEXT_LENGTH
+            || chrono::DateTime::parse_from_rfc3339(&accepted.accepted_at).is_err()
+        {
+            return Err(ProtocolError::persistence_failed().into());
+        }
+        return Ok(response_only(serde_json::json!({
+            "run_id": accepted.run_id,
+            "gate_id": accepted.gate_id,
+            "answer": accepted.answer,
+            "committed_seq": accepted.committed_seq,
             "accepted_at": accepted.accepted_at,
         })));
     }
