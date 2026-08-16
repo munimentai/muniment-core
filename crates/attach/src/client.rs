@@ -131,6 +131,15 @@ pub struct RunSubmitAccepted {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunResumeAccepted {
+    pub run_id: String,
+    pub thread_id: String,
+    pub committed_seq: u64,
+    pub accepted_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RunSubmitAttachment {
     pub display_name: String,
@@ -424,8 +433,8 @@ mod linux {
         AuthorizationSummary, ChatPermissionAnswer, ClientError, MigrationControlFailure,
         MigrationControlOutcome, PendingPermission, PermissionAnswerAccepted, PermissionDecision,
         RedactedRunEvent, RunCancelAccepted, RunMessageAccepted, RunPermissionAnswerAccepted,
-        RunStartAccepted, RunStreamMessage, RunStreamSubscription, RunSubmitAccepted,
-        ThreadCreateAccepted, ThreadListPage, ThreadOpenPage,
+        RunResumeAccepted, RunStartAccepted, RunStreamMessage, RunStreamSubscription,
+        RunSubmitAccepted, ThreadCreateAccepted, ThreadListPage, ThreadOpenPage,
     };
     use crate::{
         decode_frame, encode_frame, Authorization, Authorized, Client,
@@ -1535,6 +1544,10 @@ mod linux {
             self.with_client(|client| client.run_cancel(run_id))
         }
 
+        pub fn run_resume(&self, run_id: &str) -> Result<RunResumeAccepted, ClientError> {
+            self.with_client(|client| client.run_resume(run_id))
+        }
+
         pub fn run_permission_answer(
             &self,
             run_id: &str,
@@ -1963,6 +1976,27 @@ mod linux {
             let accepted: RunCancelAccepted = serde_json::from_value(response.body)
                 .map_err(|_| ClientError::UnexpectedMessage)?;
             if accepted.run_id != run_id.as_str()
+                || accepted.accepted_at.is_empty()
+                || accepted.accepted_at.len() > MAX_TEXT_LENGTH
+                || !is_rfc3339(&accepted.accepted_at)
+            {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            Ok(accepted)
+        }
+
+        pub fn run_resume(&mut self, run_id: &str) -> Result<RunResumeAccepted, ClientError> {
+            let run_id = Id::new(run_id.to_owned()).map_err(|_| ClientError::UnexpectedMessage)?;
+            let response = self.request(
+                Operation::RunResume,
+                Some(fresh_request_id()?),
+                serde_json::json!({"run_id": run_id.as_str()}),
+            )?;
+            let accepted: RunResumeAccepted = serde_json::from_value(response.body)
+                .map_err(|_| ClientError::UnexpectedMessage)?;
+            if accepted.run_id != run_id.as_str()
+                || Id::new(accepted.thread_id.clone()).is_err()
+                || accepted.committed_seq == 0
                 || accepted.accepted_at.is_empty()
                 || accepted.accepted_at.len() > MAX_TEXT_LENGTH
                 || !is_rfc3339(&accepted.accepted_at)
@@ -3302,6 +3336,10 @@ impl DesktopClient {
         Err(ClientError::UnsupportedPlatform)
     }
 
+    pub fn run_resume(&mut self, _run_id: &str) -> Result<RunResumeAccepted, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+
     pub fn run_permission_answer(
         &mut self,
         _run_id: &str,
@@ -3348,6 +3386,10 @@ impl DesktopClientHolder {
     }
 
     pub fn run_cancel(&self, _run_id: &str) -> Result<RunCancelAccepted, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+
+    pub fn run_resume(&self, _run_id: &str) -> Result<RunResumeAccepted, ClientError> {
         Err(ClientError::UnsupportedPlatform)
     }
 

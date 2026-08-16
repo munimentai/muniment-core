@@ -660,6 +660,10 @@ fn desktop_client_holder_is_unavailable_without_a_connection() {
         Err(ClientError::DesktopUnavailable)
     );
     assert_eq!(
+        holder.run_resume("01900000-0000-7000-8000-000000000001"),
+        Err(ClientError::DesktopUnavailable)
+    );
+    assert_eq!(
         holder.run_steer("01900000-0000-7000-8000-000000000001", "text"),
         Err(ClientError::DesktopUnavailable)
     );
@@ -667,6 +671,59 @@ fn desktop_client_holder_is_unavailable_without_a_connection() {
         holder.run_follow_up("01900000-0000-7000-8000-000000000001", "text"),
         Err(ClientError::DesktopUnavailable)
     );
+}
+
+#[test]
+fn desktop_run_resume_matches_the_fixture_and_maps_a_protocol_error() {
+    let response_fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../protocol-fixtures/muniment.attach/1/response-run-resume.json"
+    ))
+    .unwrap();
+    let expected_body = response_fixture["body"].clone();
+    let run_id = expected_body["run_id"].as_str().unwrap().to_owned();
+    let server_run_id = run_id.clone();
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_desktop_client_handshake(&mut server);
+        for error in [false, true] {
+            let request = read_client_value(&mut server);
+            let request_id = request["request_id"].as_str().unwrap().to_owned();
+            assert_eq!(request["operation"], "run.resume");
+            assert_eq!(
+                request["body"],
+                serde_json::json!({"run_id": server_run_id})
+            );
+            let idempotency_key = request["idempotency_key"].as_str().unwrap();
+            assert_ne!(idempotency_key, request_id);
+            let frame = if error {
+                encode_frame(&ErrorEnvelope {
+                    protocol: Protocol,
+                    request_id: Some(Id::new(request_id).unwrap()),
+                    ok: Failure,
+                    error: ProtocolError::unauthorized(),
+                })
+            } else {
+                encode_frame(&Response {
+                    protocol: Protocol,
+                    request_id: Id::new(request_id).unwrap(),
+                    ok: Success,
+                    body: expected_body.clone(),
+                })
+            };
+            server.write_all(&frame.unwrap()).unwrap();
+        }
+    });
+    let mut client = handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap();
+    let accepted = client.run_resume(&run_id).unwrap();
+    assert_eq!(accepted.run_id, run_id);
+    assert_eq!(accepted.thread_id, "00000000000000000000000000000192");
+    assert_eq!(accepted.committed_seq, 2);
+    assert_eq!(accepted.accepted_at, "2026-07-17T00:00:00Z");
+    assert_eq!(
+        client.run_resume(&run_id),
+        Err(ClientError::AuthorizationExpired)
+    );
+    worker.join().unwrap();
 }
 
 #[test]
