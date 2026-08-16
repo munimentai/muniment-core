@@ -277,6 +277,12 @@ pub enum Operation {
     RunOpen,
     #[serde(rename = "run.start")]
     RunStart,
+    #[serde(rename = "run.submit")]
+    RunSubmit,
+    #[serde(rename = "run.resume")]
+    RunResume,
+    #[serde(rename = "run.permission_answer")]
+    RunPermissionAnswer,
     #[serde(rename = "run.stream")]
     RunStream,
     #[serde(rename = "run.chat_events")]
@@ -314,6 +320,9 @@ impl Operation {
                 | Self::SessionSignIn
                 | Self::CompanionRevoke
                 | Self::RunStart
+                | Self::RunSubmit
+                | Self::RunResume
+                | Self::RunPermissionAnswer
                 | Self::RunSteer
                 | Self::RunFollowUp
                 | Self::RunCancel
@@ -341,6 +350,9 @@ impl Operation {
             Self::CompanionRevoke => "companion.revoke",
             Self::RunOpen => "run.open",
             Self::RunStart => "run.start",
+            Self::RunSubmit => "run.submit",
+            Self::RunResume => "run.resume",
+            Self::RunPermissionAnswer => "run.permission_answer",
             Self::RunStream => "run.stream",
             Self::RunChatEvents => "run.chat_events",
             Self::RunCursorAck => "run.cursor_ack",

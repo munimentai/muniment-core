@@ -550,6 +550,9 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         ("thread-summaries", Operation::ThreadSummaries),
         ("thread-history", Operation::ThreadHistory),
         ("run-chat-events", Operation::RunChatEvents),
+        ("run-submit", Operation::RunSubmit),
+        ("run-resume", Operation::RunResume),
+        ("run-permission-answer", Operation::RunPermissionAnswer),
     ];
     for (index, (name, operation)) in operations.into_iter().enumerate() {
         insert(
@@ -588,6 +591,26 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
             body: json!({
                 "run_id": "00000000000000000000000000000191",
                 "thread_id": "00000000000000000000000000000192",
+                "committed_seq": 1,
+                "accepted_at": "2026-07-17T00:00:00Z"
+            }),
+        },
+    )?;
+    insert(
+        &mut fixtures,
+        "response-run-submit.json",
+        &Response {
+            protocol: Protocol,
+            request_id: id(128)?,
+            ok: Success,
+            body: json!({
+                "run_id": "00000000000000000000000000000191",
+                "thread_id": "00000000000000000000000000000192",
+                "attachments": [{
+                    "displayName": "main.rs",
+                    "byteLength": 128,
+                    "mediaType": "text/rust"
+                }],
                 "committed_seq": 1,
                 "accepted_at": "2026-07-17T00:00:00Z"
             }),
@@ -734,6 +757,19 @@ fn request_body(operation: Operation) -> serde_json::Value {
         Operation::RunStart => {
             json!({"text": "Summarize the selected file.", "context": {"selected_file": "src/main.rs"}})
         }
+        Operation::RunSubmit => json!({
+            "text": "Summarize the selected file.",
+            "files": ["/work/repo/src/main.rs"],
+            "thread_id": null
+        }),
+        Operation::RunResume => {
+            json!({"run_id": "00000000000000000000000000000191"})
+        }
+        Operation::RunPermissionAnswer => json!({
+            "run_id": "00000000000000000000000000000191",
+            "gate_id": "permission-1",
+            "answer": {"type": "confirm", "value": true}
+        }),
         Operation::RunStream => {
             json!({"run_id": "00000000000000000000000000000191", "after_run_seq": 7})
         }
@@ -947,6 +983,9 @@ mod tests {
             Operation::CompanionRevoke,
             Operation::RunOpen,
             Operation::RunStart,
+            Operation::RunSubmit,
+            Operation::RunResume,
+            Operation::RunPermissionAnswer,
             Operation::RunStream,
             Operation::RunChatEvents,
             Operation::RunCursorAck,
@@ -1004,7 +1043,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            63,
+            67,
             "every canonical fixture must be inventoried"
         );
     }

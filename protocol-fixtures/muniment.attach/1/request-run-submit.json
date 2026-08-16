@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"00000000000000000000000000000080","operation":"run.submit","capability":"fixture-capability","idempotency_key":"000000000000000000000000000000e4","body":{"files":["/work/repo/src/main.rs"],"text":"Summarize the selected file.","thread_id":null}}

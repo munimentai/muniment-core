@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"00000000000000000000000000000080","ok":true,"body":{"accepted_at":"2026-07-17T00:00:00Z","attachments":[{"byteLength":128,"displayName":"main.rs","mediaType":"text/rust"}],"committed_seq":1,"run_id":"00000000000000000000000000000191","thread_id":"00000000000000000000000000000192"}}

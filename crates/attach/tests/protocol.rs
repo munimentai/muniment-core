@@ -123,6 +123,79 @@ fn canonical_run_start_fixtures_match_client_contracts() {
 }
 
 #[test]
+fn canonical_desktop_run_fixtures_round_trip_byte_for_byte() {
+    let directory =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../protocol-fixtures/muniment.attach/1");
+    let requests = [
+        (
+            "request-run-submit.json",
+            Operation::RunSubmit,
+            json!({
+                "text": "Summarize the selected file.",
+                "files": ["/work/repo/src/main.rs"],
+                "thread_id": null
+            }),
+        ),
+        (
+            "request-run-resume.json",
+            Operation::RunResume,
+            json!({"run_id": "00000000000000000000000000000191"}),
+        ),
+        (
+            "request-run-permission-answer.json",
+            Operation::RunPermissionAnswer,
+            json!({
+                "run_id": "00000000000000000000000000000191",
+                "gate_id": "permission-1",
+                "answer": {"type": "confirm", "value": true}
+            }),
+        ),
+    ];
+
+    for (name, operation, body) in requests {
+        let bytes = fs::read(directory.join(name)).unwrap();
+        let request: Request = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(request.operation, operation);
+        let wire_name = serde_json::to_value(operation).unwrap();
+        assert_eq!(wire_name, json!(operation.as_str()));
+        assert_eq!(
+            serde_json::from_value::<Operation>(wire_name).unwrap(),
+            operation
+        );
+        assert!(request.operation.requires_idempotency_key());
+        assert!(request.idempotency_key.is_some());
+        assert_eq!(request.body, body);
+        let mut encoded = serde_json::to_vec(&request).unwrap();
+        encoded.push(b'\n');
+        assert_eq!(encoded, bytes);
+    }
+
+    let bytes = fs::read(directory.join("response-run-submit.json")).unwrap();
+    let response: Response = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        response.request_id,
+        Id::new("00000000000000000000000000000080").unwrap()
+    );
+    assert_eq!(
+        response.body,
+        json!({
+            "run_id": "00000000000000000000000000000191",
+            "thread_id": "00000000000000000000000000000192",
+            "attachments": [{
+                "displayName": "main.rs",
+                "byteLength": 128,
+                "mediaType": "text/rust"
+            }],
+            "committed_seq": 1,
+            "accepted_at": "2026-07-17T00:00:00Z"
+        })
+    );
+    let mut encoded = serde_json::to_vec(&response).unwrap();
+    encoded.push(b'\n');
+    assert_eq!(encoded, bytes);
+}
+
+#[test]
 fn canonical_thread_create_fixtures_match_client_contracts() {
     let request: Envelope =
         serde_json::from_value(canonical_fixture("request-thread-create.json")).unwrap();

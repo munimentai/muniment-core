@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"00000000000000000000000000000082","operation":"run.permission_answer","capability":"fixture-capability","idempotency_key":"000000000000000000000000000000e6","body":{"answer":{"type":"confirm","value":true},"gate_id":"permission-1","run_id":"00000000000000000000000000000191"}}
