@@ -656,6 +656,10 @@ fn desktop_client_holder_is_unavailable_without_a_connection() {
         Err(ClientError::DesktopUnavailable)
     );
     assert_eq!(
+        holder.run_cancel("01900000-0000-7000-8000-000000000001"),
+        Err(ClientError::DesktopUnavailable)
+    );
+    assert_eq!(
         holder.run_steer("01900000-0000-7000-8000-000000000001", "text"),
         Err(ClientError::DesktopUnavailable)
     );
@@ -663,6 +667,81 @@ fn desktop_client_holder_is_unavailable_without_a_connection() {
         holder.run_follow_up("01900000-0000-7000-8000-000000000001", "text"),
         Err(ClientError::DesktopUnavailable)
     );
+}
+
+#[test]
+fn desktop_run_cancel_holder_returns_success_and_disconnects_on_client_error() {
+    let path = socket_path();
+    let listener = UnixListener::bind(&path).unwrap();
+    let stop = DesktopClientStopHandle::new();
+    let observer_stop = stop.clone();
+    let holder = DesktopClientHolder::new();
+    let worker_holder = holder.clone();
+    let worker_stop = stop.clone();
+    let (observed_tx, observed) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        complete_desktop_client_handshake(&mut stream);
+        for accepted_at in ["2026-07-17T00:00:00Z", "bad"] {
+            let request = read_client_value(&mut stream);
+            assert_eq!(request["operation"], "run.cancel");
+            assert_eq!(
+                request["body"],
+                serde_json::json!({
+                    "run_id": "01900000-0000-7000-8000-000000000001",
+                })
+            );
+            stream
+                .write_all(
+                    &encode_frame(&Response {
+                        protocol: Protocol,
+                        request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+                        ok: Success,
+                        body: serde_json::json!({
+                            "run_id": "01900000-0000-7000-8000-000000000001",
+                            "accepted_at": accepted_at,
+                        }),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+    });
+    let path_for_worker = path.clone();
+    let worker = thread::spawn(move || {
+        serve_desktop_client_at(
+            &path_for_worker,
+            "0.0.1",
+            SHORT,
+            SHORT,
+            worker_stop,
+            worker_holder,
+            move |connected| {
+                observed_tx.send(connected).unwrap();
+                if !connected {
+                    observer_stop.stop();
+                }
+            },
+        );
+    });
+
+    let run_id = "01900000-0000-7000-8000-000000000001";
+    assert_eq!(observed.recv_timeout(SHORT), Ok(true));
+    let accepted = holder.run_cancel(run_id).unwrap();
+    assert_eq!(accepted.run_id, run_id);
+    assert_eq!(accepted.accepted_at, "2026-07-17T00:00:00Z");
+    assert_eq!(
+        holder.run_cancel(run_id),
+        Err(ClientError::UnexpectedMessage)
+    );
+    assert_eq!(observed.recv_timeout(SHORT), Ok(false));
+    worker.join().unwrap();
+    server.join().unwrap();
+    assert_eq!(
+        holder.run_cancel(run_id),
+        Err(ClientError::DesktopUnavailable)
+    );
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]

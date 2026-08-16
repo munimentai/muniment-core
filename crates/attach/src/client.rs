@@ -1531,6 +1531,10 @@ mod linux {
             self.with_client(|client| client.run_submit(text, files, thread_id))
         }
 
+        pub fn run_cancel(&self, run_id: &str) -> Result<RunCancelAccepted, ClientError> {
+            self.with_client(|client| client.run_cancel(run_id))
+        }
+
         pub fn run_permission_answer(
             &self,
             run_id: &str,
@@ -1943,6 +1947,25 @@ mod linux {
                             media_type.trim().is_empty() || media_type.len() > MAX_TEXT_LENGTH
                         })
                 })
+            {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            Ok(accepted)
+        }
+
+        pub fn run_cancel(&mut self, run_id: &str) -> Result<RunCancelAccepted, ClientError> {
+            let run_id = Id::new(run_id.to_owned()).map_err(|_| ClientError::UnexpectedMessage)?;
+            let response = self.request(
+                Operation::RunCancel,
+                Some(fresh_request_id()?),
+                serde_json::json!({"run_id": run_id.as_str()}),
+            )?;
+            let accepted: RunCancelAccepted = serde_json::from_value(response.body)
+                .map_err(|_| ClientError::UnexpectedMessage)?;
+            if accepted.run_id != run_id.as_str()
+                || accepted.accepted_at.is_empty()
+                || accepted.accepted_at.len() > MAX_TEXT_LENGTH
+                || !is_rfc3339(&accepted.accepted_at)
             {
                 return Err(ClientError::UnexpectedMessage);
             }
@@ -3321,6 +3344,10 @@ impl DesktopClientHolder {
         _files: &[String],
         _thread_id: Option<&str>,
     ) -> Result<RunSubmitAccepted, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+
+    pub fn run_cancel(&self, _run_id: &str) -> Result<RunCancelAccepted, ClientError> {
         Err(ClientError::UnsupportedPlatform)
     }
 
