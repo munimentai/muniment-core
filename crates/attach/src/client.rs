@@ -1486,6 +1486,10 @@ mod linux {
             self.with_client(|client| client.delete_thread(thread_id))
         }
 
+        pub fn thread_select(&self, thread_id: &str) -> Result<(), ClientError> {
+            self.with_client(|client| client.thread_select(thread_id))
+        }
+
         pub fn session_status(&self) -> Result<Value, ClientError> {
             self.with_client(DesktopClient::session_status)
         }
@@ -1916,6 +1920,21 @@ mod linux {
             let response = self.request(
                 Operation::ThreadDelete,
                 Some(fresh_request_id()?),
+                serde_json::json!({"thread_id": thread_id}),
+            )?;
+            if response.body != serde_json::json!({}) {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            Ok(())
+        }
+
+        pub fn thread_select(&mut self, thread_id: &str) -> Result<(), ClientError> {
+            if thread_id.is_empty() || thread_id.len() > MAX_THREAD_ID_LENGTH {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            let response = self.request(
+                Operation::ThreadSelect,
+                None,
                 serde_json::json!({"thread_id": thread_id}),
             )?;
             if response.body != serde_json::json!({}) {

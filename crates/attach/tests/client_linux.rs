@@ -642,6 +642,10 @@ fn desktop_client_holder_is_unavailable_without_a_connection() {
         holder.delete_thread("thread-1"),
         Err(ClientError::DesktopUnavailable)
     );
+    assert_eq!(
+        holder.thread_select("thread-1"),
+        Err(ClientError::DesktopUnavailable)
+    );
     assert_eq!(holder.sign_in(), Err(ClientError::DesktopUnavailable));
     assert_eq!(
         holder.thread_summaries(50, None),
@@ -671,6 +675,65 @@ fn desktop_client_holder_is_unavailable_without_a_connection() {
         holder.run_follow_up("01900000-0000-7000-8000-000000000001", "text"),
         Err(ClientError::DesktopUnavailable)
     );
+}
+
+#[test]
+fn desktop_thread_select_matches_the_fixtures_and_maps_a_protocol_error() {
+    let request_fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../protocol-fixtures/muniment.attach/1/request-thread-select.json"
+    ))
+    .unwrap();
+    let response_fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../protocol-fixtures/muniment.attach/1/response-thread-select.json"
+    ))
+    .unwrap();
+    let thread_id = request_fixture["body"]["thread_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let server_thread_id = thread_id.clone();
+    let expected_body = response_fixture["body"].clone();
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_desktop_client_handshake(&mut server);
+        for error in [false, true] {
+            let request = read_client_value(&mut server);
+            let request_id = request["request_id"].as_str().unwrap().to_owned();
+            assert_eq!(request["operation"], request_fixture["operation"]);
+            assert_eq!(
+                request["body"],
+                serde_json::json!({"thread_id": server_thread_id})
+            );
+            assert!(request.get("idempotency_key").is_none());
+            let frame = if error {
+                encode_frame(&ErrorEnvelope {
+                    protocol: Protocol,
+                    request_id: Some(Id::new(request_id).unwrap()),
+                    ok: Failure,
+                    error: ProtocolError::unauthorized(),
+                })
+            } else {
+                encode_frame(&Response {
+                    protocol: Protocol,
+                    request_id: Id::new(request_id).unwrap(),
+                    ok: Success,
+                    body: expected_body.clone(),
+                })
+            };
+            server.write_all(&frame.unwrap()).unwrap();
+        }
+    });
+    let mut client = handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap();
+    assert_eq!(
+        client.thread_select(""),
+        Err(ClientError::UnexpectedMessage)
+    );
+    client.thread_select(&thread_id).unwrap();
+    assert_eq!(
+        client.thread_select(&thread_id),
+        Err(ClientError::AuthorizationExpired)
+    );
+    worker.join().unwrap();
 }
 
 #[test]
