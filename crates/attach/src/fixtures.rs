@@ -553,6 +553,7 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         ("run-submit", Operation::RunSubmit),
         ("run-resume", Operation::RunResume),
         ("run-permission-answer", Operation::RunPermissionAnswer),
+        ("thread-select", Operation::ThreadSelect),
     ];
     for (index, (name, operation)) in operations.into_iter().enumerate() {
         insert(
@@ -594,6 +595,16 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
                 "committed_seq": 1,
                 "accepted_at": "2026-07-17T00:00:00Z"
             }),
+        },
+    )?;
+    insert(
+        &mut fixtures,
+        "response-thread-select.json",
+        &Response {
+            protocol: Protocol,
+            request_id: id(131)?,
+            ok: Success,
+            body: json!({}),
         },
     )?;
     insert(
@@ -760,6 +771,7 @@ fn request_body(operation: Operation) -> serde_json::Value {
         }
         Operation::ThreadCreate => json!({}),
         Operation::ThreadRename => json!({"thread_id": "thread-1", "title": "Renamed thread"}),
+        Operation::ThreadSelect => json!({"thread_id": "thread-1"}),
         Operation::ThreadDelete => json!({"thread_id": "thread-1"}),
         Operation::SessionStatus
         | Operation::EntitlementSnapshot
@@ -988,6 +1000,7 @@ mod tests {
             Operation::ThreadHistory,
             Operation::ThreadCreate,
             Operation::ThreadRename,
+            Operation::ThreadSelect,
             Operation::ThreadDelete,
             Operation::SessionStatus,
             Operation::EntitlementSnapshot,
@@ -1058,7 +1071,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            68,
+            70,
             "every canonical fixture must be inventoried"
         );
     }

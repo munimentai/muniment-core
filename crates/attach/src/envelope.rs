@@ -257,6 +257,8 @@ pub enum Operation {
     ThreadCreate,
     #[serde(rename = "thread.rename")]
     ThreadRename,
+    #[serde(rename = "thread.select")]
+    ThreadSelect,
     #[serde(rename = "thread.delete")]
     ThreadDelete,
     #[serde(rename = "session.status")]
@@ -340,6 +342,7 @@ impl Operation {
             Self::ThreadHistory => "thread.history",
             Self::ThreadCreate => "thread.create",
             Self::ThreadRename => "thread.rename",
+            Self::ThreadSelect => "thread.select",
             Self::ThreadDelete => "thread.delete",
             Self::SessionStatus => "session.status",
             Self::EntitlementSnapshot => "entitlement.snapshot",

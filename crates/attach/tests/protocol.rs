@@ -231,6 +231,26 @@ fn canonical_thread_read_fixtures_decode_to_their_operations() {
 }
 
 #[test]
+fn canonical_thread_select_fixtures_match_the_wire_contract() {
+    let request: Request =
+        serde_json::from_value(canonical_fixture("request-thread-select.json")).unwrap();
+    assert_eq!(request.operation, Operation::ThreadSelect);
+    assert_eq!(request.operation.as_str(), "thread.select");
+    assert_eq!(
+        serde_json::to_value(request.operation).unwrap(),
+        json!("thread.select")
+    );
+    assert!(!request.operation.requires_idempotency_key());
+    assert!(request.idempotency_key.is_none());
+    assert_eq!(request.body, json!({"thread_id": "thread-1"}));
+
+    let response: Response =
+        serde_json::from_value(canonical_fixture("response-thread-select.json")).unwrap();
+    assert_eq!(response.request_id, request.request_id);
+    assert_eq!(response.body, json!({}));
+}
+
+#[test]
 fn canonical_chat_event_fixtures_round_trip_byte_for_byte() {
     let directory =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../protocol-fixtures/muniment.attach/1");
