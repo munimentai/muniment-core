@@ -369,6 +369,14 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
             .map_err(|_| ProtocolError::persistence_failed())
     }
 
+    fn select_thread(&mut self, thread_id: &Id) -> Result<(), ProtocolError> {
+        if self.boundaries.select_thread(thread_id.as_str())? {
+            Ok(())
+        } else {
+            Err(ProtocolError::thread_not_found())
+        }
+    }
+
     #[cfg(feature = "keyring")]
     fn thread_history(
         &mut self,
@@ -1213,6 +1221,16 @@ mod tests {
     }
 
     impl RunAttachBoundaries for FakeRunStartBoundaries {
+        #[cfg(target_os = "linux")]
+        fn select_thread(&self, thread_id: &str) -> Result<bool, ProtocolError> {
+            crate::thread_ownership::subject_owns_first_run(
+                &mut self.journal.lock().unwrap(),
+                thread_id,
+                Some("owner"),
+            )
+            .map_err(|_| ProtocolError::thread_not_found())
+        }
+
         fn submit_run(
             &self,
             _workspace: &str,

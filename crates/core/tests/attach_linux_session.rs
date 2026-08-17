@@ -5118,6 +5118,11 @@ fn companion_refuses_desktop_only_session_operations() {
         ),
         (200, Operation::ThreadSummaries, json!({"limit": 10})),
         (
+            203,
+            Operation::ThreadSelect,
+            json!({"thread_id": "thread-1"}),
+        ),
+        (
             201,
             Operation::ThreadHistory,
             json!({"thread_id": "thread-1", "limit": 10}),

@@ -561,6 +561,109 @@ fn desktop_client_dispatches_thread_summaries_and_history() {
     );
 }
 
+struct ThreadSelectService;
+
+impl ThreadListService for ThreadSelectService {
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, ProtocolError> {
+        unreachable!()
+    }
+
+    fn select_thread(&mut self, thread_id: &Id) -> Result<(), ProtocolError> {
+        if thread_id.as_str() == "0190a100-0000-7000-8000-000000000001" {
+            Ok(())
+        } else {
+            Err(ProtocolError::thread_not_found())
+        }
+    }
+}
+
+#[test]
+fn desktop_client_selects_only_an_owned_live_thread() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let session_thread = std::thread::spawn(move || {
+        serve_desktop_client_session(server, &session(), &mut ThreadSelectService)
+    });
+
+    let Envelope::Response(response) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000203",
+            Operation::ThreadSelect,
+            "admitted",
+            serde_json::json!({"thread_id":"0190a100-0000-7000-8000-000000000001"}),
+        ),
+    ) else {
+        panic!("owned thread selection did not return a response");
+    };
+    assert_eq!(response.body, serde_json::json!({}));
+
+    for (request_id, thread_id) in [
+        (
+            "018f0000-0000-7000-8000-000000000204",
+            "0190a100-0000-7000-8000-000000000002",
+        ),
+        (
+            "018f0000-0000-7000-8000-000000000205",
+            "0190a100-0000-7000-8000-000000000003",
+        ),
+    ] {
+        let Envelope::Error(error) = exchange(
+            &mut client,
+            request(
+                request_id,
+                Operation::ThreadSelect,
+                "admitted",
+                serde_json::json!({"thread_id":thread_id}),
+            ),
+        ) else {
+            panic!("unavailable thread selection did not return an error");
+        };
+        assert_eq!(error.error.code(), ErrorCode::ThreadNotFound);
+    }
+
+    drop(client);
+    assert_eq!(session_thread.join().unwrap(), Ok(()));
+}
+
+#[test]
+fn thread_select_validates_the_thread_id_and_idempotency_key() {
+    for (mut invalid, expected) in [
+        (
+            request(
+                "018f0000-0000-7000-8000-000000000206",
+                Operation::ThreadSelect,
+                "admitted",
+                serde_json::json!({"thread_id":"not-an-id"}),
+            ),
+            ErrorCode::InvalidRequest,
+        ),
+        (
+            idempotent_request(
+                "018f0000-0000-7000-8000-000000000207",
+                Operation::ThreadSelect,
+                serde_json::json!({"thread_id":"0190a100-0000-7000-8000-000000000001"}),
+            ),
+            ErrorCode::IdempotencyKeyForbidden,
+        ),
+    ] {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let session_thread = std::thread::spawn(move || {
+            serve_desktop_client_session(server, &session(), &mut ThreadSelectService)
+        });
+        invalid.capability = "admitted".into();
+        let Envelope::Error(error) = exchange(&mut client, invalid) else {
+            panic!("invalid thread selection did not return an error");
+        };
+        assert_eq!(error.error.code(), expected);
+        drop(client);
+        assert_eq!(session_thread.join().unwrap(), Ok(()));
+    }
+}
+
 #[derive(Default)]
 struct ShrinkingThreadReadService {
     calls: Vec<(Operation, u8)>,

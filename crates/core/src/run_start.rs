@@ -174,6 +174,10 @@ pub trait RunAttachBoundaries {
     ) -> Result<crate::journal::thread_summaries::ThreadSummaryPage, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
+    #[cfg(target_os = "linux")]
+    fn select_thread(&self, _thread_id: &str) -> Result<bool, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
     #[cfg(all(target_os = "linux", feature = "keyring"))]
     fn thread_history(
         &self,
@@ -514,6 +518,11 @@ mod tests {
             _workspace: &str,
             _request: ThreadOpenRequest,
         ) -> Result<ThreadOpenPage, ProtocolError> {
+            unreachable!()
+        }
+
+        #[cfg(target_os = "linux")]
+        fn select_thread(&self, _thread_id: &str) -> Result<bool, ProtocolError> {
             unreachable!()
         }
 

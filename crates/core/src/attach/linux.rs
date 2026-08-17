@@ -1060,6 +1060,10 @@ pub trait ThreadListService {
         Err(ProtocolError::unsupported_operation())
     }
 
+    fn select_thread(&mut self, _thread_id: &super::Id) -> Result<(), ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
     fn thread_history(
         &mut self,
         _request: ThreadOpenRequest,
@@ -2413,6 +2417,7 @@ where
             request.operation,
             Operation::ThreadRename
                 | Operation::ThreadDelete
+                | Operation::ThreadSelect
                 | Operation::ThreadSummaries
                 | Operation::ThreadHistory
                 | Operation::SessionStatus
@@ -3762,6 +3767,17 @@ fn dispatch_request<S: ThreadListService>(
             }
             limit /= 2;
         }
+    }
+    if request.operation == Operation::ThreadSelect {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            thread_id: super::Id,
+        }
+        let body: Body =
+            serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
+        service.select_thread(&body.thread_id)?;
+        return Ok(response_only(serde_json::json!({})));
     }
     if request.operation != Operation::ThreadList {
         return Err(ProtocolError::unsupported_operation().into());
