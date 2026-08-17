@@ -953,6 +953,10 @@ pub struct EntitlementSnapshotResult {
 
 /// Deterministic desktop service seam for authorized attach requests.
 pub trait ThreadListService {
+    fn drain_state(&self) -> Option<&super::DrainState> {
+        None
+    }
+
     fn bind_authorized_client(&mut self, _client_identity: &str) {}
 
     fn reconnect_approval(&self) -> Option<Approval> {
@@ -2413,6 +2417,18 @@ where
             );
             return Err(AttachSessionError::Authorization);
         }
+        if service
+            .drain_state()
+            .is_some_and(|drain| drain.admit(request.operation).is_err())
+        {
+            write_request_error(
+                stream,
+                Some(request.request_id),
+                ProtocolError::runtime_draining(),
+                deadline,
+            );
+            continue;
+        }
         if matches!(
             request.operation,
             Operation::ThreadRename
@@ -2848,6 +2864,12 @@ fn dispatch_request<S: ThreadListService>(
     subscriptions: &mut Vec<ActiveRunStream>,
     chat_subscription: &mut Option<ActiveChatSubscription>,
 ) -> Result<DispatchResult, DispatchFailure> {
+    if service
+        .drain_state()
+        .is_some_and(|drain| drain.admit(request.operation).is_err())
+    {
+        return Err(ProtocolError::runtime_draining().into());
+    }
     if chat_subscription.is_some() {
         return Err(if request.operation == Operation::RunChatEvents {
             ProtocolError::invalid_request().into()

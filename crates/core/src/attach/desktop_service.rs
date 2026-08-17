@@ -121,6 +121,7 @@ pub struct DesktopAttachService<B, I = IdempotencyStore> {
     pub client_credentials: Arc<Mutex<HashMap<String, ClientCredential>>>,
     pub credential_path: Option<PathBuf>,
     pub client_identity: Option<String>,
+    pub drain_state: crate::attach::DrainState,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -179,6 +180,10 @@ fn queue_run_message<B: RunAttachBoundaries, I: RunStartIdempotency>(
 impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> ThreadListService
     for DesktopAttachService<B, I>
 {
+    fn drain_state(&self) -> Option<&crate::attach::DrainState> {
+        Some(&self.drain_state)
+    }
+
     fn bind_authorized_client(&mut self, client_identity: &str) {
         self.client_identity = Some(client_identity.to_owned());
     }
@@ -1803,6 +1808,7 @@ mod tests {
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
             client_identity: Some("default".into()),
+            drain_state: crate::attach::DrainState::new(),
         };
         let result = service.start_run(
             "workspace-a",
@@ -1842,6 +1848,7 @@ mod tests {
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
             client_identity: Some("default".into()),
+            drain_state: crate::attach::DrainState::new(),
         };
         let key = Id::new("018f0000-0000-7000-8000-000000000002").unwrap();
         let companion = CompanionProvenance {
@@ -1934,6 +1941,7 @@ mod tests {
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
             client_identity: Some("default".into()),
+            drain_state: crate::attach::DrainState::new(),
         };
         let request_id = Id::new("018f0000-0000-7000-8000-000000000001").unwrap();
         let key = Id::new("018f0000-0000-7000-8000-000000000002").unwrap();
@@ -1995,6 +2003,7 @@ mod tests {
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
             client_identity: Some("default".into()),
+            drain_state: crate::attach::DrainState::new(),
         };
         let request_id = Id::new("018f0000-0000-7000-8000-000000000001").unwrap();
         let key = Id::new("018f0000-0000-7000-8000-000000000002").unwrap();
@@ -2102,6 +2111,7 @@ mod tests {
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
             client_identity: Some("default".into()),
+            drain_state: crate::attach::DrainState::new(),
         }
     }
 
@@ -2508,6 +2518,7 @@ mod tests {
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
             client_identity: Some("default".into()),
+            drain_state: crate::attach::DrainState::new(),
         };
         let run_id = "0190a100-0000-7000-8000-000000000001";
         let key = "018f0000-0000-7000-8000-000000000002";
@@ -2555,6 +2566,7 @@ mod tests {
                 client_credentials: Arc::new(Mutex::new(HashMap::new())),
                 credential_path: None,
                 client_identity: Some("default".into()),
+                drain_state: crate::attach::DrainState::new(),
             };
             assert!(cancel_request(
                 &mut service,
@@ -2627,6 +2639,7 @@ mod tests {
                 client_credentials: Arc::new(Mutex::new(HashMap::new())),
                 credential_path: None,
                 client_identity: Some("default".into()),
+                drain_state: crate::attach::DrainState::new(),
             },
             thread_id,
             first_run_id,
@@ -2813,6 +2826,7 @@ mod tests {
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
             client_identity: Some("default".into()),
+            drain_state: crate::attach::DrainState::new(),
         };
 
         let first = service
@@ -2944,6 +2958,7 @@ mod tests {
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
             client_identity: Some("default".into()),
+            drain_state: crate::attach::DrainState::new(),
         };
         first_connection
             .onboard_workspace(
@@ -2968,6 +2983,7 @@ mod tests {
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
             client_identity: Some("default".into()),
+            drain_state: crate::attach::DrainState::new(),
         };
         second_connection
             .onboard_workspace(
@@ -3009,6 +3025,7 @@ mod tests {
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
             client_identity: Some("client-b".into()),
+            drain_state: crate::attach::DrainState::new(),
         };
         // Grants are bound to the authorizing client: a second identity cannot
         // borrow another client's onboarded workspaces. `authorized_workspace`
@@ -3092,6 +3109,7 @@ mod tests {
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
             client_identity: Some("default".into()),
+            drain_state: crate::attach::DrainState::new(),
         };
         let second_memory_authorized = third_connection
             .authorized_workspace("workspace-b", &second_memory.to_string_lossy())
@@ -3450,6 +3468,7 @@ mod tests {
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
             client_identity: Some("default".into()),
+            drain_state: crate::attach::DrainState::new(),
         };
         let result = service.start_run(
             "workspace-b",
@@ -3521,6 +3540,7 @@ mod tests {
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
             client_identity: Some("default".into()),
+            drain_state: crate::attach::DrainState::new(),
         };
         let result = service.start_run(
             "workspace-a",
@@ -3628,6 +3648,7 @@ mod tests {
             client_credentials: credentials.clone(),
             credential_path: None,
             client_identity: None,
+            drain_state: crate::attach::DrainState::new(),
         };
 
         let mut client = make_service();
@@ -3722,6 +3743,7 @@ mod tests {
             client_credentials: Arc::new(Mutex::new(credentials)),
             credential_path: Some(path.clone()),
             client_identity: None,
+            drain_state: crate::attach::DrainState::new(),
         };
 
         let mut initial = make_service(HashMap::new());
@@ -3849,6 +3871,7 @@ mod tests {
             client_credentials: Arc::new(Mutex::new(credentials)),
             credential_path: Some(path.clone()),
             client_identity: None,
+            drain_state: crate::attach::DrainState::new(),
         };
         assert_eq!(
             service
@@ -3875,6 +3898,7 @@ mod tests {
             client_credentials: Arc::new(Mutex::new(loaded)),
             credential_path: Some(path.clone()),
             client_identity: None,
+            drain_state: crate::attach::DrainState::new(),
         };
         assert!(restarted
             .authorize_client(identity, Some(&credential), "", "changed", "9.9.9")

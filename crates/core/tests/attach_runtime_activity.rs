@@ -1,4 +1,6 @@
-use muniment_core::attach::{evaluate_quiesce, QuiesceError, RuntimeActivityRegistry};
+use muniment_core::attach::{
+    evaluate_quiesce, DrainRefusal, DrainState, Operation, QuiesceError, RuntimeActivityRegistry,
+};
 
 #[test]
 fn an_unmarked_registry_has_an_idle_snapshot() {
@@ -78,4 +80,47 @@ fn snapshot_feeds_the_existing_quiesce_rule() {
         evaluate_quiesce(registry.snapshot()),
         Err(QuiesceError::PendingPermissionGate)
     );
+}
+
+#[test]
+fn drain_state_is_shared_and_one_way() {
+    let drain = DrainState::new();
+    let clone = drain.clone();
+    assert!(!drain.is_set());
+
+    clone.set();
+    drain.set();
+
+    assert!(drain.is_set());
+    assert!(clone.is_set());
+}
+
+#[test]
+fn drain_refuses_new_blocking_work() {
+    let drain = DrainState::new();
+    drain.set();
+
+    for operation in [
+        Operation::RunStart,
+        Operation::RunSubmit,
+        Operation::RunResume,
+        Operation::SessionSignIn,
+    ] {
+        assert_eq!(drain.admit(operation), Err(DrainRefusal));
+    }
+}
+
+#[test]
+fn drain_allows_work_that_finishes_or_observes_a_run() {
+    let drain = DrainState::new();
+    drain.set();
+
+    for operation in [
+        Operation::RunPermissionAnswer,
+        Operation::RunCancel,
+        Operation::ThreadOpen,
+        Operation::RunStream,
+    ] {
+        assert_eq!(drain.admit(operation), Ok(()));
+    }
 }

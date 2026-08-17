@@ -58,7 +58,7 @@ fn rejects_each_blocker() {
 }
 
 #[test]
-fn reports_the_first_blocker_in_declared_field_order() {
+fn reports_every_blocker_in_declared_field_order() {
     let blockers = [
         RuntimeActivity {
             active_run: true,
@@ -82,10 +82,10 @@ fn reports_the_first_blocker_in_declared_field_order() {
         },
     ];
     let expected = [
-        QuiesceError::ActiveRun,
-        QuiesceError::PendingPermissionGate,
-        QuiesceError::AuthenticationOperation,
-        QuiesceError::SessionRefresh,
+        "active run, pending permission gate",
+        "pending permission gate, authentication operation",
+        "authentication operation, session refresh",
+        "session refresh, in-flight external effect",
     ];
 
     for (index, expected) in expected.into_iter().enumerate() {
@@ -97,8 +97,28 @@ fn reports_the_first_blocker_in_declared_field_order() {
         activity.session_refresh |= next.session_refresh;
         activity.in_flight_external_effect |= next.in_flight_external_effect;
 
-        assert_eq!(evaluate_quiesce(activity), Err(expected));
+        assert_eq!(
+            evaluate_quiesce(activity).unwrap_err().to_string(),
+            expected
+        );
     }
+}
+
+#[test]
+fn reports_all_blockers_together() {
+    let error = evaluate_quiesce(RuntimeActivity {
+        active_run: true,
+        pending_permission_gate: true,
+        authentication_operation: true,
+        session_refresh: true,
+        in_flight_external_effect: true,
+    })
+    .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "active run, pending permission gate, authentication operation, session refresh, in-flight external effect"
+    );
 }
 
 #[test]

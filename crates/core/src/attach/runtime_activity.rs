@@ -1,7 +1,46 @@
 //! Shared runtime activity tracking for migration handoff.
 
-use super::RuntimeActivity;
+use super::{Operation, RuntimeActivity};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+
+/// A shared, one-way runtime drain state.
+#[derive(Clone, Default)]
+pub struct DrainState(Arc<AtomicBool>);
+
+/// A request tried to add runtime activity after draining started.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DrainRefusal;
+
+impl DrainState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_set(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    pub fn admit(&self, operation: Operation) -> Result<(), DrainRefusal> {
+        if self.is_set()
+            && matches!(
+                operation,
+                Operation::RunStart
+                    | Operation::RunSubmit
+                    | Operation::RunResume
+                    | Operation::SessionSignIn
+            )
+        {
+            Err(DrainRefusal)
+        } else {
+            Ok(())
+        }
+    }
+}
 
 #[derive(Default)]
 struct ActivityCounts {

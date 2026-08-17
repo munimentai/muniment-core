@@ -15,10 +15,11 @@ use muniment_core::attach::linux::{
 };
 use muniment_core::attach::{
     decode_frame, encode_frame, Approval, AuthorizationClock, AuthorizationTokenGenerator,
-    Authorized, Envelope, ErrorAction, ErrorCode, ErrorEnvelope, Event, EventName, Hello, Id,
-    Operation, Protocol, Request, Response, VersionRange, Welcome, WorkspaceOnboardRequest,
-    WorkspaceOnboarded, CHALLENGE_LIFETIME, MAX_FRAME_LENGTH, MAX_JSON_DEPTH,
-    MAX_RUN_STREAM_WINDOW_BYTES, MAX_RUN_STREAM_WINDOW_EVENTS, MAX_RUN_STREAM_WINDOW_TEXT_BYTES,
+    Authorized, DrainState, Envelope, ErrorAction, ErrorCode, ErrorEnvelope, Event, EventName,
+    Hello, Id, Operation, Protocol, Request, Response, VersionRange, Welcome,
+    WorkspaceOnboardRequest, WorkspaceOnboarded, CHALLENGE_LIFETIME, MAX_FRAME_LENGTH,
+    MAX_JSON_DEPTH, MAX_RUN_STREAM_WINDOW_BYTES, MAX_RUN_STREAM_WINDOW_EVENTS,
+    MAX_RUN_STREAM_WINDOW_TEXT_BYTES,
 };
 use muniment_core::browser_control::{LinuxProcReader, ProcReadError};
 use muniment_core::journal::{
@@ -45,6 +46,101 @@ fn credentials() -> PeerCredentials {
         uid: unsafe { libc::geteuid() },
         gid: unsafe { libc::getegid() },
     }
+}
+
+struct DrainingService {
+    drain: DrainState,
+}
+
+impl ThreadListService for DrainingService {
+    fn drain_state(&self) -> Option<&DrainState> {
+        Some(&self.drain)
+    }
+
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, muniment_core::attach::ProtocolError> {
+        unreachable!()
+    }
+}
+
+#[test]
+fn companion_drain_gate_refuses_new_activity_and_serves_completion_operations() {
+    let (mut client, server_thread) = draining_companion_session();
+
+    for (index, operation) in [
+        Operation::RunStart,
+        Operation::RunSubmit,
+        Operation::RunResume,
+        Operation::SessionSignIn,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        client
+            .write_all(&request_with_idempotency(
+                10 + index as u128,
+                operation,
+                json!({}),
+            ))
+            .unwrap();
+        let error: ErrorEnvelope = read_frame(&mut client);
+        assert_eq!(error.error.code(), ErrorCode::RuntimeDraining);
+    }
+    client.shutdown(Shutdown::Both).unwrap();
+    assert_eq!(server_thread.join().unwrap(), Ok(()));
+
+    for operation in [
+        Operation::RunPermissionAnswer,
+        Operation::RunCancel,
+        Operation::ThreadOpen,
+        Operation::RunStream,
+    ] {
+        let (mut client, server_thread) = draining_companion_session();
+        client
+            .write_all(&request_with_idempotency(20, operation, json!({})))
+            .unwrap();
+        let error: ErrorEnvelope = read_frame(&mut client);
+        assert_ne!(error.error.code(), ErrorCode::RuntimeDraining);
+        drop(client);
+        let _ = server_thread.join().unwrap();
+    }
+}
+
+fn draining_companion_session() -> (
+    UnixStream,
+    thread::JoinHandle<Result<(), AttachSessionError>>,
+) {
+    let drain = DrainState::new();
+    drain.set();
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let server_thread = thread::spawn(move || {
+        run_authenticated_session_with_authorization(
+            server,
+            credentials(),
+            "0.1.0",
+            Duration::from_secs(1),
+            AuthorizationSessionDependencies {
+                fill_random: |bytes: &mut [u8]| {
+                    bytes.fill(9);
+                    Ok(())
+                },
+                clock: SessionTestClock(Instant::now()),
+                tokens: TestTokens(1),
+                approvals: |_: &muniment_core::attach::PairingChallenge, _: Duration| {
+                    Some(ApprovalDecision::Approve(approval()))
+                },
+            },
+            &mut DrainingService { drain },
+        )
+    });
+
+    client.write_all(&hello(1, 1)).unwrap();
+    let _: Welcome = read_frame(&mut client);
+    let _: Authorized = read_frame(&mut client);
+    (client, server_thread)
 }
 
 fn sole_thread_id(journal: &mut RunJournal, workspace: &str) -> String {

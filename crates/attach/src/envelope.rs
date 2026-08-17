@@ -237,6 +237,7 @@ pub enum ErrorCode {
     Unauthorized,
     UnsupportedOperation,
     MigrationNotReady,
+    RuntimeDraining,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -493,6 +494,8 @@ pub enum ErrorMessage {
     UnsupportedOperation,
     #[serde(rename = "The desktop cannot hand off ownership yet.")]
     MigrationNotReady,
+    #[serde(rename = "The runtime is draining and cannot accept new work.")]
+    RuntimeDraining,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -597,6 +600,12 @@ impl ProtocolError {
         error
     }
 
+    pub fn runtime_draining() -> Self {
+        let mut error = Self::simple(ErrorCode::RuntimeDraining, ErrorMessage::RuntimeDraining);
+        error.retryable = true;
+        error
+    }
+
     fn simple(code: ErrorCode, message: ErrorMessage) -> Self {
         Self {
             code,
@@ -657,9 +666,13 @@ impl<'de> Deserialize<'de> for ProtocolError {
             (ErrorCode::Unauthorized, None, None) => Self::unauthorized(),
             (ErrorCode::UnsupportedOperation, None, None) => Self::unsupported_operation(),
             (ErrorCode::MigrationNotReady, None, None) => Self::migration_not_ready(),
+            (ErrorCode::RuntimeDraining, None, None) => Self::runtime_draining(),
             _ => return Err(de::Error::custom("invalid error schema")),
         };
-        if wire.code == ErrorCode::MigrationNotReady {
+        if matches!(
+            wire.code,
+            ErrorCode::MigrationNotReady | ErrorCode::RuntimeDraining
+        ) {
             expected.retryable = wire.retryable;
         }
         if wire.message != expected.message || wire.retryable != expected.retryable {

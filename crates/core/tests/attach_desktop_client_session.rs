@@ -14,8 +14,8 @@ use muniment_core::attach::linux::{
     ThreadListRequest, ThreadListService,
 };
 use muniment_core::attach::{
-    decode_frame, encode_frame, CompanionRecord, DesktopClientSession, Envelope, ErrorCode,
-    EventName, Id, Operation, Protocol, ProtocolError, Request, WorkspaceOnboardRequest,
+    decode_frame, encode_frame, CompanionRecord, DesktopClientSession, DrainState, Envelope,
+    ErrorCode, EventName, Id, Operation, Protocol, ProtocolError, Request, WorkspaceOnboardRequest,
     WorkspaceOnboarded,
 };
 use muniment_core::auth::{
@@ -27,6 +27,81 @@ use muniment_core::journal::{CommitSubscription, JournalCommitHint, RunEventProj
 use muniment_core::run_events::ChatEvent;
 
 struct TestService;
+
+struct DrainingService {
+    drain: DrainState,
+}
+
+impl ThreadListService for DrainingService {
+    fn drain_state(&self) -> Option<&DrainState> {
+        Some(&self.drain)
+    }
+
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, ProtocolError> {
+        unreachable!()
+    }
+}
+
+#[test]
+fn desktop_drain_gate_refuses_new_activity_and_serves_completion_operations() {
+    let drain = DrainState::new();
+    drain.set();
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let session_thread = std::thread::spawn(move || {
+        serve_desktop_client_session(server, &session(), &mut DrainingService { drain })
+    });
+
+    for (index, operation) in [
+        Operation::RunStart,
+        Operation::RunSubmit,
+        Operation::RunResume,
+        Operation::SessionSignIn,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let Envelope::Error(error) = exchange(
+            &mut client,
+            idempotent_request(
+                &format!("018f0000-0000-7000-8000-{index:012x}"),
+                operation,
+                serde_json::json!({}),
+            ),
+        ) else {
+            panic!("draining operation did not return an error");
+        };
+        assert_eq!(error.error.code(), ErrorCode::RuntimeDraining);
+    }
+
+    for (index, operation) in [
+        Operation::RunPermissionAnswer,
+        Operation::RunCancel,
+        Operation::ThreadOpen,
+        Operation::RunStream,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let Envelope::Error(error) = exchange(
+            &mut client,
+            idempotent_request(
+                &format!("018f0000-0000-7000-8001-{index:012x}"),
+                operation,
+                serde_json::json!({}),
+            ),
+        ) else {
+            panic!("completion operation did not reach dispatch");
+        };
+        assert_ne!(error.error.code(), ErrorCode::RuntimeDraining);
+    }
+
+    drop(client);
+    assert_eq!(session_thread.join().unwrap(), Ok(()));
+}
 
 struct InvalidRunSubmitService {
     accepted: Option<RunSubmitAccepted>,
