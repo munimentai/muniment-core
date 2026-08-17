@@ -2951,7 +2951,7 @@ mod linux {
             return Err(ClientError::UnexpectedMessage);
         }
         let authorized: DesktopClientAuthorizedGrant = parse_message(authorized_value)?;
-        if authorized.workspace_scopes.len() != 1
+        if authorized.workspace_scopes.len() > 1
             || !is_hex_secret(&authorized.capability, 64)
             || authorized.expires_at == 0
             || authorized.expires_at > 8 * 60 * 60

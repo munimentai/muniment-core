@@ -1872,7 +1872,6 @@ fn desktop_client_handshake_rejects_invalid_welcome_and_grant_fields() {
         (2, "authorized", "profile-1", 1, 64, false),
         (1, "pairing_required", "profile-1", 1, 64, false),
         (1, "authorized", "", 1, 64, false),
-        (1, "authorized", "profile-1", 0, 64, false),
         (1, "authorized", "profile-1", 2, 64, false),
         (1, "authorized", "profile-1", 1, 63, false),
         (1, "authorized", "profile-1", 1, 65, false),
@@ -1912,6 +1911,34 @@ fn desktop_client_handshake_rejects_invalid_welcome_and_grant_fields() {
         );
         worker.join().unwrap();
     }
+}
+
+#[test]
+fn desktop_client_handshake_accepts_empty_workspace_authority() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        read_client_frame(&mut server);
+        server
+            .write_all(&encode_frame(&reconnect_welcome(1, "0.0.1", "11".repeat(16), "")).unwrap())
+            .unwrap();
+        server
+            .write_all(
+                &encode_frame(&serde_json::json!({
+                    "profile_id": "desktop-owner",
+                    "capability": "33".repeat(32),
+                    "expires_at": 60,
+                    "idle_timeout_seconds": 30,
+                    "workspace_scopes": {},
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+    });
+
+    let client = handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap();
+    assert_eq!(client.profile_id(), "desktop-owner");
+    assert!(client.workspace_scopes().is_empty());
+    worker.join().unwrap();
 }
 
 #[test]

@@ -345,11 +345,6 @@ impl<'de> Deserialize<'de> for DesktopClientAuthorizedGrant {
                 "desktop client grant has an empty profile",
             ));
         }
-        if fields.workspace_scopes.is_empty() {
-            return Err(de::Error::custom(
-                "desktop client grant has empty workspace scopes",
-            ));
-        }
         Ok(Self {
             profile_id: fields.profile_id,
             capability: fields.capability,

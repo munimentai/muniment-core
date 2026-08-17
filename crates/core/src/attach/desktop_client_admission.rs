@@ -50,7 +50,7 @@ pub fn admit_desktop_client(
     expected_desktop_executable: &Path,
     process_reader: &dyn LinuxProcReader,
     runtime_version: &str,
-    approval: Approval,
+    approval: Option<Approval>,
     timeout: Duration,
 ) -> Result<(UnixStream, DesktopClientSession), DesktopClientAdmissionError> {
     let deadline = Instant::now()
@@ -120,11 +120,20 @@ pub fn admit_desktop_client(
     getrandom::fill(&mut capability_bytes).map_err(|_| DesktopClientAdmissionError::Randomness)?;
     let capability = hex(&capability_bytes);
     let mut workspace_scopes = BTreeMap::new();
-    workspace_scopes.insert(approval.workspace.clone(), approval.scopes);
+    if let Some(approval) = approval.as_ref() {
+        workspace_scopes.insert(approval.workspace.clone(), approval.scopes.clone());
+    }
     let grant = DesktopClientAuthorizedGrant {
-        profile_id: approval.profile.clone(),
+        profile_id: approval.as_ref().map_or_else(
+            || "desktop-owner".into(),
+            |approval| approval.profile.clone(),
+        ),
         capability: capability.clone(),
-        expires_at: approval.lifetime.min(MAX_CAPABILITY_LIFETIME).as_secs(),
+        expires_at: approval
+            .as_ref()
+            .map_or(MAX_CAPABILITY_LIFETIME, |approval| approval.lifetime)
+            .min(MAX_CAPABILITY_LIFETIME)
+            .as_secs(),
         idle_timeout_seconds: CAPABILITY_IDLE_LIFETIME.as_secs(),
         workspace_scopes,
     };
@@ -139,10 +148,13 @@ pub fn admit_desktop_client(
         stream,
         DesktopClientSession {
             capability,
-            workspace: approval.workspace,
+            workspace: approval
+                .as_ref()
+                .map_or_else(String::new, |approval| approval.workspace.clone()),
             client_identity,
             provenance: CompanionProvenance {
-                profile: approval.profile,
+                profile: approval
+                    .map_or_else(|| "desktop-owner".into(), |approval| approval.profile),
                 companion_kind,
                 companion_version,
                 peer_uid: peer_credentials.uid,

@@ -834,7 +834,7 @@ fn peer_grant_uses_empty_workspace_authority() {
 }
 
 #[test]
-fn desktop_client_grant_requires_workspace_authority() {
+fn desktop_client_grant_allows_empty_workspace_authority() {
     let empty_profile = json!({
         "profile_id": "",
         "capability": "capability",
@@ -851,5 +851,6 @@ fn desktop_client_grant_requires_workspace_authority() {
         "idle_timeout_seconds": 30,
         "workspace_scopes": {}
     });
-    assert!(serde_json::from_value::<DesktopClientAuthorizedGrant>(empty_scopes).is_err());
+    let grant = serde_json::from_value::<DesktopClientAuthorizedGrant>(empty_scopes).unwrap();
+    assert!(grant.workspace_scopes.is_empty());
 }

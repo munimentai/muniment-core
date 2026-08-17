@@ -103,7 +103,7 @@ fn verified_peer_receives_workspace_grant_without_client_credential() {
         &executable,
         &reader,
         "0.1.0",
-        approval(),
+        Some(approval()),
         Duration::from_secs(30),
     )
     .unwrap();
@@ -138,6 +138,40 @@ fn verified_peer_receives_workspace_grant_without_client_credential() {
 }
 
 #[test]
+fn verified_peer_receives_a_bounded_grant_without_workspace_authority() {
+    let executable = fs::canonicalize("/proc/self/exe").unwrap();
+    let reader = FakeProcReader {
+        executable: executable.clone(),
+    };
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello(1, 1)).unwrap();
+
+    let (returned_stream, session) = admit_desktop_client(
+        server,
+        credentials(),
+        &executable,
+        &reader,
+        "0.1.0",
+        None,
+        Duration::from_secs(30),
+    )
+    .unwrap();
+
+    let _: Welcome = read_frame(&mut client);
+    let grant: DesktopClientAuthorizedGrant = read_frame(&mut client);
+    assert_eq!(grant.profile_id, "desktop-owner");
+    assert_eq!(grant.expires_at, MAX_CAPABILITY_LIFETIME.as_secs());
+    assert_eq!(
+        grant.idle_timeout_seconds,
+        CAPABILITY_IDLE_LIFETIME.as_secs()
+    );
+    assert!(grant.workspace_scopes.is_empty());
+    assert!(session.workspace.is_empty());
+    assert_eq!(session.provenance.profile, "desktop-owner");
+    returned_stream.shutdown(std::net::Shutdown::Both).unwrap();
+}
+
+#[test]
 fn rejected_peer_receives_only_unauthorized() {
     let expected = fs::canonicalize("/proc/self/exe").unwrap();
     let reader = FakeProcReader {
@@ -152,7 +186,7 @@ fn rejected_peer_receives_only_unauthorized() {
             &expected,
             &reader,
             "0.1.0",
-            approval(),
+            Some(approval()),
             Duration::from_secs(1),
         )
         .unwrap_err(),
@@ -175,7 +209,7 @@ fn unresolved_peer_receives_only_unauthorized() {
             &expected,
             &UnavailableProcReader,
             "0.1.0",
-            approval(),
+            Some(approval()),
             Duration::from_secs(1),
         )
         .unwrap_err(),
@@ -202,7 +236,7 @@ fn incompatible_version_receives_protocol_incompatible() {
             &executable,
             &reader,
             "0.1.0",
-            approval(),
+            Some(approval()),
             Duration::from_secs(1),
         )
         .unwrap_err(),
@@ -230,7 +264,7 @@ fn oversized_first_frame_receives_payload_too_large() {
             &executable,
             &reader,
             "0.1.0",
-            approval(),
+            Some(approval()),
             Duration::from_secs(1),
         )
         .unwrap_err(),
@@ -255,7 +289,7 @@ fn silent_client_reaches_the_deadline_without_a_response() {
             &executable,
             &reader,
             "0.1.0",
-            approval(),
+            Some(approval()),
             Duration::from_millis(20),
         )
         .unwrap_err(),
