@@ -37,6 +37,20 @@ pub fn read_retention_choice(config_dir: &Path) -> Option<RetentionChoice> {
         .map(|record| record.choice)
 }
 
+/// Reads the current choice and applies its age limit when one is recorded.
+pub fn apply_recorded_retention<T, E>(
+    config_dir: &Path,
+    apply: impl FnOnce(i64) -> Result<T, E>,
+) -> Result<Option<T>, E> {
+    let Some(max_age_seconds) = read_retention_choice(config_dir)
+        .and_then(RetentionChoice::max_age_seconds)
+        .and_then(|seconds| i64::try_from(seconds).ok())
+    else {
+        return Ok(None);
+    };
+    apply(max_age_seconds).map(Some)
+}
+
 pub fn write_retention_choice(config_dir: &Path, choice: RetentionChoice) -> io::Result<()> {
     fs::create_dir_all(config_dir)?;
     let contents =
@@ -187,6 +201,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_retention_choice(&directory), None);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recorded_retention_applies_only_age_limits() {
+        let directory = test_directory("apply");
+        let mut applied = Vec::new();
+        assert_eq!(
+            apply_recorded_retention(&directory, |age| {
+                applied.push(age);
+                Ok::<_, ()>(())
+            }),
+            Ok(None)
+        );
+        write_retention_choice(&directory, RetentionChoice::KeepEveryThread).unwrap();
+        assert_eq!(
+            apply_recorded_retention(&directory, |age| {
+                applied.push(age);
+                Ok::<_, ()>(())
+            }),
+            Ok(None)
+        );
+        write_retention_choice(&directory, RetentionChoice::DeleteAfter30Days).unwrap();
+        assert_eq!(
+            apply_recorded_retention(&directory, |age| {
+                applied.push(age);
+                Ok::<_, ()>(())
+            }),
+            Ok(Some(()))
+        );
+        assert_eq!(applied, vec![30 * SECONDS_PER_DAY as i64]);
         fs::remove_dir_all(directory).unwrap();
     }
 }

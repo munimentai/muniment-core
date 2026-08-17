@@ -1770,6 +1770,7 @@ fn desktop_client_supervisor_keeps_one_connection_until_failure() {
     let retry_interval = Duration::from_millis(60);
     let (healthy_tx, healthy) = mpsc::channel();
     let (fail_tx, fail) = mpsc::channel();
+    let (reconnected_tx, reconnected) = mpsc::channel();
     let server = thread::spawn(move || {
         let (mut first, _) = listener.accept().unwrap();
         complete_desktop_client_handshake(&mut first);
@@ -1788,6 +1789,7 @@ fn desktop_client_supervisor_keeps_one_connection_until_failure() {
         let (mut second, _) = listener.accept().unwrap();
         assert!(failed_at.elapsed() >= retry_interval);
         complete_desktop_client_handshake(&mut second);
+        reconnected_tx.send(()).unwrap();
         let mut byte = [0];
         assert_eq!(second.read(&mut byte).unwrap(), 0);
     });
@@ -1810,7 +1812,7 @@ fn desktop_client_supervisor_keeps_one_connection_until_failure() {
         holder.request(Operation::ThreadList, None, serde_json::json!({})),
         Err(ClientError::ConnectionClosed)
     );
-    thread::sleep(retry_interval + SHORT);
+    reconnected.recv_timeout(SHORT + SHORT).unwrap();
     stop.stop();
     worker.join().unwrap();
     server.join().unwrap();
