@@ -9,6 +9,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -160,9 +161,11 @@ fn times_out_when_a_listener_stays_silent() {
 fn confirms_after_the_listener_binds() {
     let socket = TestSocket::new();
     thread::scope(|scope| {
-        let server = scope.spawn(|| {
-            thread::sleep(Duration::from_millis(30));
-            let listener = UnixListener::bind(&socket.0).unwrap();
+        let (server_started_tx, server_started_rx) = mpsc::sync_channel(0);
+        let socket_path = socket.0.clone();
+        let server = scope.spawn(move || {
+            let listener = UnixListener::bind(socket_path).unwrap();
+            server_started_tx.send(()).unwrap();
             let (mut stream, _) = listener.accept().unwrap();
             read_hello(&mut stream);
             stream
@@ -170,6 +173,7 @@ fn confirms_after_the_listener_binds() {
                 .unwrap();
         });
 
+        server_started_rx.recv().unwrap();
         assert!(probe_handoff(
             &socket.0,
             "handoff-nonce",
