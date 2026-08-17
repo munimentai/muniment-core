@@ -36,6 +36,49 @@ const PERMISSION_COMMIT_TIMEOUT: Duration = Duration::from_millis(50);
 
 pub type WorkspaceContexts = Arc<Mutex<WorkspaceContextMap>>;
 
+pub struct AttachHome {
+    config_directory: Option<PathBuf>,
+    documents: Option<PathBuf>,
+    home: Option<PathBuf>,
+}
+
+impl AttachHome {
+    pub fn configured(
+        config_directory: PathBuf,
+        documents: Option<PathBuf>,
+        home: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            config_directory: Some(config_directory),
+            documents,
+            home,
+        }
+    }
+
+    pub fn resolve(&self) -> Result<PathBuf, ProtocolError> {
+        let Some(config_directory) = &self.config_directory else {
+            return Ok(self.home.clone().unwrap_or_default());
+        };
+        match crate::home::configured_home(config_directory)
+            .map_err(|_| ProtocolError::persistence_failed())?
+        {
+            Some(home) => Ok(home),
+            None => crate::home::choose_default_home(self.documents.clone(), self.home.clone())
+                .map_err(|_| ProtocolError::persistence_failed()),
+        }
+    }
+}
+
+impl From<PathBuf> for AttachHome {
+    fn from(home: PathBuf) -> Self {
+        Self {
+            config_directory: None,
+            documents: None,
+            home: Some(home),
+        }
+    }
+}
+
 /// Production adapter from the authorized Linux attach seam into the desktop coordinator.
 pub trait RunStartIdempotency {
     fn execute<A, W>(
@@ -73,7 +116,7 @@ impl RunStartIdempotency for IdempotencyStore {
 pub struct DesktopAttachService<B, I = IdempotencyStore> {
     pub boundaries: B,
     pub idempotency: I,
-    pub home: PathBuf,
+    pub home: AttachHome,
     pub workspace_contexts: WorkspaceContexts,
     pub client_credentials: Arc<Mutex<HashMap<String, ClientCredential>>>,
     pub credential_path: Option<PathBuf>,
@@ -236,8 +279,8 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
     }
 
     fn ensure_home(&mut self) -> Result<(), ProtocolError> {
-        crate::ensure_cross_project_home(&self.home)
-            .map_err(|_| ProtocolError::persistence_failed())
+        let home = self.home.resolve()?;
+        crate::ensure_cross_project_home(&home).map_err(|_| ProtocolError::persistence_failed())
     }
 
     fn session_status(&mut self) -> Result<crate::auth::AuthStatus, ProtocolError> {
@@ -1755,7 +1798,7 @@ mod tests {
         let mut service = DesktopAttachService {
             boundaries,
             idempotency: IdempotencyStore::open(":memory:").unwrap(),
-            home: PathBuf::new(),
+            home: PathBuf::new().into(),
             workspace_contexts: Arc::new(Mutex::new(WorkspaceContextMap::default())),
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
@@ -1794,7 +1837,7 @@ mod tests {
         let mut service = DesktopAttachService {
             boundaries,
             idempotency: IdempotencyStore::open(":memory:").unwrap(),
-            home: PathBuf::new(),
+            home: PathBuf::new().into(),
             workspace_contexts: Arc::new(Mutex::new(WorkspaceContextMap::default())),
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
@@ -1886,7 +1929,7 @@ mod tests {
         let mut service = DesktopAttachService {
             boundaries: FakeRunStartBoundaries::accepting(),
             idempotency: IdempotencyStore::open(":memory:").unwrap(),
-            home: PathBuf::new(),
+            home: PathBuf::new().into(),
             workspace_contexts: Arc::new(Mutex::new(WorkspaceContextMap::default())),
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
@@ -1947,7 +1990,7 @@ mod tests {
         let mut service = DesktopAttachService {
             boundaries: FakeRunStartBoundaries::accepting(),
             idempotency: IdempotencyStore::open(":memory:").unwrap(),
-            home: PathBuf::new(),
+            home: PathBuf::new().into(),
             workspace_contexts: Arc::new(Mutex::new(WorkspaceContextMap::default())),
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
@@ -2054,7 +2097,7 @@ mod tests {
         DesktopAttachService {
             boundaries,
             idempotency: IdempotencyStore::open(":memory:").unwrap(),
-            home: PathBuf::new(),
+            home: PathBuf::new().into(),
             workspace_contexts: Arc::new(Mutex::new(WorkspaceContextMap::default())),
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
@@ -2460,7 +2503,7 @@ mod tests {
         let mut service = DesktopAttachService {
             boundaries,
             idempotency: IdempotencyStore::open(":memory:").unwrap(),
-            home: PathBuf::new(),
+            home: PathBuf::new().into(),
             workspace_contexts: Arc::new(Mutex::new(WorkspaceContextMap::default())),
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
@@ -2507,7 +2550,7 @@ mod tests {
             let mut service = DesktopAttachService {
                 boundaries,
                 idempotency: IdempotencyStore::open(":memory:").unwrap(),
-                home: PathBuf::new(),
+                home: PathBuf::new().into(),
                 workspace_contexts: Arc::new(Mutex::new(WorkspaceContextMap::default())),
                 client_credentials: Arc::new(Mutex::new(HashMap::new())),
                 credential_path: None,
@@ -2579,7 +2622,7 @@ mod tests {
             DesktopAttachService {
                 boundaries,
                 idempotency: IdempotencyStore::open(":memory:").unwrap(),
-                home: PathBuf::new(),
+                home: PathBuf::new().into(),
                 workspace_contexts: Arc::new(Mutex::new(WorkspaceContextMap::default())),
                 client_credentials: Arc::new(Mutex::new(HashMap::new())),
                 credential_path: None,
@@ -2765,7 +2808,7 @@ mod tests {
         let mut service = DesktopAttachService {
             boundaries,
             idempotency: IdempotencyStore::open(":memory:").unwrap(),
-            home: PathBuf::new(),
+            home: PathBuf::new().into(),
             workspace_contexts: Arc::new(Mutex::new(WorkspaceContextMap::default())),
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
@@ -2896,7 +2939,7 @@ mod tests {
         let mut first_connection = DesktopAttachService {
             boundaries: FakeRunStartBoundaries::accepting(),
             idempotency: IdempotencyStore::open(":memory:").unwrap(),
-            home: root.join("home"),
+            home: root.join("home").into(),
             workspace_contexts: contexts.clone(),
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
@@ -2920,7 +2963,7 @@ mod tests {
                 ..FakeRunStartBoundaries::accepting()
             },
             idempotency: IdempotencyStore::open(":memory:").unwrap(),
-            home: root.join("home"),
+            home: root.join("home").into(),
             workspace_contexts: contexts.clone(),
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
@@ -2961,7 +3004,7 @@ mod tests {
         let client_b = DesktopAttachService {
             boundaries: FakeRunStartBoundaries::accepting(),
             idempotency: IdempotencyStore::open(":memory:").unwrap(),
-            home: root.join("home"),
+            home: root.join("home").into(),
             workspace_contexts: contexts.clone(),
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
@@ -3044,7 +3087,7 @@ mod tests {
                 ..FakeRunStartBoundaries::accepting()
             },
             idempotency: IdempotencyStore::open(":memory:").unwrap(),
-            home: root.join("home"),
+            home: root.join("home").into(),
             workspace_contexts: contexts.clone(),
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
@@ -3402,7 +3445,7 @@ mod tests {
         let mut service = DesktopAttachService {
             boundaries: FakeRunStartBoundaries::accepting(),
             idempotency: IdempotencyStore::open(":memory:").unwrap(),
-            home: PathBuf::new(),
+            home: PathBuf::new().into(),
             workspace_contexts: Arc::new(Mutex::new(WorkspaceContextMap::default())),
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
@@ -3473,7 +3516,7 @@ mod tests {
         let mut service = DesktopAttachService {
             boundaries: FakeRunStartBoundaries::accepting(),
             idempotency: FailingFinalization,
-            home: PathBuf::new(),
+            home: PathBuf::new().into(),
             workspace_contexts: Arc::new(Mutex::new(WorkspaceContextMap::default())),
             client_credentials: Arc::new(Mutex::new(HashMap::new())),
             credential_path: None,
@@ -3580,7 +3623,7 @@ mod tests {
         let make_service = || DesktopAttachService {
             boundaries: FakeRunStartBoundaries::accepting(),
             idempotency: IdempotencyStore::open(":memory:").unwrap(),
-            home: root.join("home"),
+            home: root.join("home").into(),
             workspace_contexts: contexts.clone(),
             client_credentials: credentials.clone(),
             credential_path: None,
@@ -3674,7 +3717,7 @@ mod tests {
         let make_service = |credentials| DesktopAttachService {
             boundaries: FakeRunStartBoundaries::accepting(),
             idempotency: IdempotencyStore::open(":memory:").unwrap(),
-            home: root.join("home"),
+            home: root.join("home").into(),
             workspace_contexts: Arc::new(Mutex::new(WorkspaceContextMap::default())),
             client_credentials: Arc::new(Mutex::new(credentials)),
             credential_path: Some(path.clone()),
@@ -3801,7 +3844,7 @@ mod tests {
         let mut service = DesktopAttachService {
             boundaries: FakeRunStartBoundaries::accepting(),
             idempotency: IdempotencyStore::open(":memory:").unwrap(),
-            home: root.join("home"),
+            home: root.join("home").into(),
             workspace_contexts: Arc::new(Mutex::new(WorkspaceContextMap::default())),
             client_credentials: Arc::new(Mutex::new(credentials)),
             credential_path: Some(path.clone()),
@@ -3827,7 +3870,7 @@ mod tests {
         let mut restarted = DesktopAttachService {
             boundaries: FakeRunStartBoundaries::accepting(),
             idempotency: IdempotencyStore::open(":memory:").unwrap(),
-            home: root.join("home"),
+            home: root.join("home").into(),
             workspace_contexts: Arc::new(Mutex::new(WorkspaceContextMap::default())),
             client_credentials: Arc::new(Mutex::new(loaded)),
             credential_path: Some(path.clone()),
