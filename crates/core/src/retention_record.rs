@@ -1,9 +1,10 @@
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use std::{fs, io, path::Path};
+use std::{fs, io, path::Path, time::Duration};
 
 const RECORD_FILE: &str = "thread-retention.json";
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+pub const RETENTION_CHECK_INTERVAL: Duration = Duration::from_secs(SECONDS_PER_DAY);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -49,6 +50,20 @@ pub fn apply_recorded_retention<T, E>(
         return Ok(None);
     };
     apply(max_age_seconds).map(Some)
+}
+
+/// Checks recorded retention at startup and after each requested wait.
+pub fn run_recorded_retention_checks<E>(
+    config_dir: &Path,
+    mut wait_for_next: impl FnMut(Duration) -> bool,
+    mut apply: impl FnMut(i64) -> Result<(), E>,
+) {
+    loop {
+        let _ = apply_recorded_retention(config_dir, &mut apply);
+        if !wait_for_next(RETENTION_CHECK_INTERVAL) {
+            break;
+        }
+    }
 }
 
 pub fn write_retention_choice(config_dir: &Path, choice: RetentionChoice) -> io::Result<()> {
@@ -232,6 +247,61 @@ mod tests {
             Ok(Some(()))
         );
         assert_eq!(applied, vec![30 * SECONDS_PER_DAY as i64]);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recorded_retention_checks_at_startup_and_after_each_wait() {
+        let directory = test_directory("schedule");
+        write_retention_choice(&directory, RetentionChoice::DeleteAfter30Days).unwrap();
+        let mut waits = Vec::new();
+        let mut applied = Vec::new();
+
+        run_recorded_retention_checks(
+            &directory,
+            |interval| {
+                waits.push(interval);
+                waits.len() < 3
+            },
+            |age| {
+                applied.push(age);
+                Ok::<_, ()>(())
+            },
+        );
+
+        assert_eq!(waits, vec![RETENTION_CHECK_INTERVAL; 3]);
+        assert_eq!(applied, vec![30 * SECONDS_PER_DAY as i64; 3]);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recorded_retention_checks_read_the_record_again_after_waiting() {
+        let directory = test_directory("schedule-record-change");
+        write_retention_choice(&directory, RetentionChoice::DeleteAfter30Days).unwrap();
+        let mut wait_count = 0;
+        let mut applied = Vec::new();
+
+        run_recorded_retention_checks(
+            &directory,
+            |_| {
+                wait_count += 1;
+                if wait_count == 1 {
+                    write_retention_choice(&directory, RetentionChoice::DeleteAfter90Days).unwrap();
+                    true
+                } else {
+                    false
+                }
+            },
+            |age| {
+                applied.push(age);
+                Ok::<_, ()>(())
+            },
+        );
+
+        assert_eq!(
+            applied,
+            vec![30 * SECONDS_PER_DAY as i64, 90 * SECONDS_PER_DAY as i64]
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 }
