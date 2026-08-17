@@ -106,7 +106,7 @@ fn drain_refuses_new_blocking_work() {
         Operation::RunResume,
         Operation::SessionSignIn,
     ] {
-        assert_eq!(drain.admit(operation), Err(DrainRefusal));
+        assert!(matches!(drain.admit(operation), Err(DrainRefusal)));
     }
 }
 
@@ -121,6 +121,45 @@ fn drain_allows_work_that_finishes_or_observes_a_run() {
         Operation::ThreadOpen,
         Operation::RunStream,
     ] {
-        assert_eq!(drain.admit(operation), Ok(()));
+        assert!(drain.admit(operation).is_ok());
     }
+}
+
+#[test]
+fn admitted_request_blocks_quiesce_before_activity_registration() {
+    let drain = DrainState::new();
+    let registry = RuntimeActivityRegistry::with_drain_state(&drain);
+    let request_drain = drain.clone();
+    let request_registry = registry.clone();
+    let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+    let (register_tx, register_rx) = std::sync::mpsc::channel();
+    let (registered_tx, registered_rx) = std::sync::mpsc::channel();
+    let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+
+    let request = std::thread::spawn(move || {
+        let admission = request_drain.admit(Operation::RunStart).unwrap();
+        admitted_tx.send(()).unwrap();
+        register_rx.recv().unwrap();
+        let activity = request_registry.mark_active_run();
+        drop(admission);
+        registered_tx.send(()).unwrap();
+        finish_rx.recv().unwrap();
+        drop(activity);
+    });
+
+    admitted_rx.recv().unwrap();
+    drain.set();
+    assert_eq!(
+        evaluate_quiesce(registry.snapshot()),
+        Err(QuiesceError::ActiveRun)
+    );
+    register_tx.send(()).unwrap();
+    registered_rx.recv().unwrap();
+    assert_eq!(
+        evaluate_quiesce(registry.snapshot()),
+        Err(QuiesceError::ActiveRun)
+    );
+    finish_tx.send(()).unwrap();
+    request.join().unwrap();
+    assert!(evaluate_quiesce(registry.snapshot()).is_ok());
 }

@@ -2864,12 +2864,11 @@ fn dispatch_request<S: ThreadListService>(
     subscriptions: &mut Vec<ActiveRunStream>,
     chat_subscription: &mut Option<ActiveChatSubscription>,
 ) -> Result<DispatchResult, DispatchFailure> {
-    if service
+    let _drain_admission = service
         .drain_state()
-        .is_some_and(|drain| drain.admit(request.operation).is_err())
-    {
-        return Err(ProtocolError::runtime_draining().into());
-    }
+        .map(|drain| drain.admit(request.operation))
+        .transpose()
+        .map_err(|_| ProtocolError::runtime_draining())?;
     if chat_subscription.is_some() {
         return Err(if request.operation == Operation::RunChatEvents {
             ProtocolError::invalid_request().into()
