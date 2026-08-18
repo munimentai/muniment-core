@@ -335,6 +335,24 @@ fn supervise(
         let mut ready = false;
         let mut next_probe = Instant::now();
         let cause = loop {
+            // Probe before the wait. A generation whose startup timeout is shorter
+            // than one poll tick would otherwise time out without a single probe.
+            if probe_in_flight_generation != Some(child_generation) && Instant::now() >= next_probe
+            {
+                next_probe = Instant::now() + config.health_interval;
+                probe_in_flight_generation = Some(child_generation);
+                let probe = Arc::clone(&probe);
+                let probe_io = io.clone();
+                let results = probe_results_tx.clone();
+                thread::spawn(move || {
+                    let outcome = probe(&probe_io);
+                    let _ = results.send(ProbeResult {
+                        generation: child_generation,
+                        completed_at: Instant::now(),
+                        outcome,
+                    });
+                });
+            }
             let wait = if ready {
                 config.poll_interval
             } else {
@@ -471,22 +489,6 @@ fn supervise(
                     timeout: config.startup_timeout,
                     stderr_tail: stderr_tail(&stderr),
                 };
-            }
-            if probe_in_flight_generation != Some(child_generation) && Instant::now() >= next_probe
-            {
-                next_probe = Instant::now() + config.health_interval;
-                probe_in_flight_generation = Some(child_generation);
-                let probe = Arc::clone(&probe);
-                let probe_io = io.clone();
-                let results = probe_results_tx.clone();
-                thread::spawn(move || {
-                    let outcome = probe(&probe_io);
-                    let _ = results.send(ProbeResult {
-                        generation: child_generation,
-                        completed_at: Instant::now(),
-                        outcome,
-                    });
-                });
             }
         };
         io.stdin.0.lock().unwrap().writer = None;

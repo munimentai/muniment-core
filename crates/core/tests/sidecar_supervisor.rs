@@ -355,6 +355,31 @@ fn blocked_probe_cannot_delay_startup_timeout_or_become_healthy() {
 }
 
 #[test]
+fn generation_probes_even_when_startup_timeout_is_under_one_poll_tick() {
+    let mut cfg = config(&["echo"]);
+    cfg.startup_timeout = Duration::from_millis(1);
+    cfg.poll_interval = Duration::from_millis(50);
+    cfg.restart.max_restarts = 0;
+    let probe_started = Arc::new(AtomicUsize::new(0));
+    let started = Arc::clone(&probe_started);
+    let supervisor = SidecarSupervisor::spawn(cfg, move |_| {
+        started.fetch_add(1, Ordering::SeqCst);
+        Ok(ProbeOutcome::Ready)
+    })
+    .unwrap();
+    let events = supervisor.subscribe();
+    assert_eq!(next_event(&events).status, SidecarStatus::Starting);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while probe_started.load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the generation ran without a single probe"
+        );
+        thread::yield_now();
+    }
+}
+
+#[test]
 fn restarted_generation_probes_independently_of_stale_blocked_probe() {
     let mut cfg = config(&["echo"]);
     cfg.startup_timeout = Duration::from_millis(500);
