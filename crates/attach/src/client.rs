@@ -1504,6 +1504,10 @@ mod linux {
             self.with_client(|client| client.thread_select(thread_id))
         }
 
+        pub fn recheck_retention(&self) -> Result<(), ClientError> {
+            self.with_client(DesktopClient::recheck_retention)
+        }
+
         pub fn session_status(&self) -> Result<Value, ClientError> {
             self.with_client(DesktopClient::session_status)
         }
@@ -2006,6 +2010,15 @@ mod linux {
                 None,
                 serde_json::json!({"thread_id": thread_id}),
             )?;
+            if response.body != serde_json::json!({}) {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            Ok(())
+        }
+
+        pub fn recheck_retention(&mut self) -> Result<(), ClientError> {
+            let response =
+                self.request(Operation::RetentionRecheck, None, serde_json::json!({}))?;
             if response.body != serde_json::json!({}) {
                 return Err(ClientError::UnexpectedMessage);
             }
