@@ -251,6 +251,26 @@ fn canonical_thread_select_fixtures_match_the_wire_contract() {
 }
 
 #[test]
+fn canonical_retention_recheck_fixtures_match_the_wire_contract() {
+    let request: Request =
+        serde_json::from_value(canonical_fixture("request-retention-recheck.json")).unwrap();
+    assert_eq!(request.operation, Operation::RetentionRecheck);
+    assert_eq!(request.operation.as_str(), "retention.recheck");
+    assert_eq!(
+        serde_json::to_value(request.operation).unwrap(),
+        json!("retention.recheck")
+    );
+    assert!(!request.operation.requires_idempotency_key());
+    assert!(request.idempotency_key.is_none());
+    assert_eq!(request.body, json!({}));
+
+    let response: Response =
+        serde_json::from_value(canonical_fixture("response-retention-recheck.json")).unwrap();
+    assert_eq!(response.request_id, request.request_id);
+    assert_eq!(response.body, json!({}));
+}
+
+#[test]
 fn canonical_chat_event_fixtures_round_trip_byte_for_byte() {
     let directory =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../protocol-fixtures/muniment.attach/1");

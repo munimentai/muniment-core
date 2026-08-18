@@ -1068,6 +1068,10 @@ pub trait ThreadListService {
         Err(ProtocolError::unsupported_operation())
     }
 
+    fn recheck_retention(&mut self) -> Result<(), ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
     fn thread_history(
         &mut self,
         _request: ThreadOpenRequest,
@@ -2455,6 +2459,7 @@ where
                 | Operation::RunSteer
                 | Operation::RunFollowUp
                 | Operation::RunPermissionAnswer
+                | Operation::RetentionRecheck
         ) {
             write_request_error(
                 stream,
@@ -3804,6 +3809,13 @@ fn dispatch_request<S: ThreadListService>(
         let body: Body =
             serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
         service.select_thread(&body.thread_id)?;
+        return Ok(response_only(serde_json::json!({})));
+    }
+    if request.operation == Operation::RetentionRecheck {
+        if request.body != serde_json::json!({}) {
+            return Err(ProtocolError::invalid_request().into());
+        }
+        service.recheck_retention()?;
         return Ok(response_only(serde_json::json!({})));
     }
     if request.operation != Operation::ThreadList {

@@ -44,6 +44,10 @@ impl ThreadListService for DrainingService {
     ) -> Result<ThreadListPage, ProtocolError> {
         unreachable!()
     }
+
+    fn recheck_retention(&mut self) -> Result<(), ProtocolError> {
+        Ok(())
+    }
 }
 
 #[test]
@@ -98,6 +102,19 @@ fn desktop_drain_gate_refuses_new_activity_and_serves_completion_operations() {
         };
         assert_ne!(error.error.code(), ErrorCode::RuntimeDraining);
     }
+
+    let Envelope::Response(response) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8002-000000000000",
+            Operation::RetentionRecheck,
+            "admitted",
+            serde_json::json!({}),
+        ),
+    ) else {
+        panic!("the draining runtime did not answer the retention recheck");
+    };
+    assert_eq!(response.body, serde_json::json!({}));
 
     drop(client);
     assert_eq!(session_thread.join().unwrap(), Ok(()));
@@ -737,6 +754,128 @@ fn thread_select_validates_the_thread_id_and_idempotency_key() {
         drop(client);
         assert_eq!(session_thread.join().unwrap(), Ok(()));
     }
+}
+
+#[derive(Default)]
+struct RetentionRecheckService {
+    checks: usize,
+    failing: bool,
+}
+
+impl ThreadListService for RetentionRecheckService {
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, ProtocolError> {
+        unreachable!()
+    }
+
+    fn recheck_retention(&mut self) -> Result<(), ProtocolError> {
+        self.checks += 1;
+        if self.failing {
+            Err(ProtocolError::persistence_failed())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn desktop_client_rechecks_the_recorded_retention() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let session_thread = std::thread::spawn(move || {
+        let mut service = RetentionRecheckService::default();
+        let result = serve_desktop_client_session(server, &session(), &mut service);
+        (result, service)
+    });
+
+    let Envelope::Response(response) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000240",
+            Operation::RetentionRecheck,
+            "admitted",
+            serde_json::json!({}),
+        ),
+    ) else {
+        panic!("the retention recheck did not return a response");
+    };
+    assert_eq!(response.body, serde_json::json!({}));
+
+    let Envelope::Error(error) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000241",
+            Operation::RetentionRecheck,
+            "other",
+            serde_json::json!({}),
+        ),
+    ) else {
+        panic!("the unauthorized retention recheck did not return an error");
+    };
+    assert_eq!(error.error.code(), ErrorCode::Unauthorized);
+
+    let Envelope::Error(error) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000242",
+            Operation::RetentionRecheck,
+            "admitted",
+            serde_json::json!({"max_age_seconds": 60}),
+        ),
+    ) else {
+        panic!("the retention recheck body was not validated");
+    };
+    assert_eq!(error.error.code(), ErrorCode::InvalidRequest);
+
+    let Envelope::Error(error) = exchange(
+        &mut client,
+        idempotent_request(
+            "018f0000-0000-7000-8000-000000000243",
+            Operation::RetentionRecheck,
+            serde_json::json!({}),
+        ),
+    ) else {
+        panic!("the retention recheck idempotency key was not refused");
+    };
+    assert_eq!(error.error.code(), ErrorCode::IdempotencyKeyForbidden);
+
+    drop(client);
+    let (result, service) = session_thread.join().unwrap();
+    assert_eq!(result, Ok(()));
+    assert_eq!(service.checks, 1);
+}
+
+#[test]
+fn a_failed_retention_recheck_keeps_the_session_open() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let session_thread = std::thread::spawn(move || {
+        let mut service = RetentionRecheckService {
+            checks: 0,
+            failing: true,
+        };
+        let result = serve_desktop_client_session(server, &session(), &mut service);
+        (result, service)
+    });
+
+    let Envelope::Error(error) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000244",
+            Operation::RetentionRecheck,
+            "admitted",
+            serde_json::json!({}),
+        ),
+    ) else {
+        panic!("the failed retention recheck did not return an error");
+    };
+    assert_eq!(error.error.code(), ErrorCode::PersistenceFailed);
+
+    drop(client);
+    let (result, service) = session_thread.join().unwrap();
+    assert_eq!(result, Ok(()));
+    assert_eq!(service.checks, 1);
 }
 
 #[derive(Default)]

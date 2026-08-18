@@ -5224,6 +5224,7 @@ fn companion_refuses_desktop_only_session_operations() {
             json!({"thread_id": "thread-1", "limit": 10}),
         ),
         (202, Operation::RunChatEvents, json!({})),
+        (204, Operation::RetentionRecheck, json!({})),
     ] {
         let (mut client, server) = UnixStream::pair().unwrap();
         client.write_all(&hello(1, 1)).unwrap();

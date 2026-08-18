@@ -554,6 +554,7 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         ("run-resume", Operation::RunResume),
         ("run-permission-answer", Operation::RunPermissionAnswer),
         ("thread-select", Operation::ThreadSelect),
+        ("retention-recheck", Operation::RetentionRecheck),
     ];
     for (index, (name, operation)) in operations.into_iter().enumerate() {
         insert(
@@ -603,6 +604,16 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         &Response {
             protocol: Protocol,
             request_id: id(131)?,
+            ok: Success,
+            body: json!({}),
+        },
+    )?;
+    insert(
+        &mut fixtures,
+        "response-retention-recheck.json",
+        &Response {
+            protocol: Protocol,
+            request_id: id(132)?,
             ok: Success,
             body: json!({}),
         },
@@ -835,6 +846,7 @@ fn request_body(operation: Operation) -> serde_json::Value {
             "scopes": ["thread.read"],
             "deadline_ms": 120_000
         }),
+        Operation::RetentionRecheck => json!({}),
     }
 }
 
@@ -1028,6 +1040,7 @@ mod tests {
             Operation::RequestCancel,
             Operation::MigrationControl,
             Operation::ApprovalPresent,
+            Operation::RetentionRecheck,
         ];
         for operation in operations {
             let name = operation.as_str().replace(['.', '_'], "-");
@@ -1074,7 +1087,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            71,
+            73,
             "every canonical fixture must be inventoried"
         );
     }

@@ -425,6 +425,10 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         }
     }
 
+    fn recheck_retention(&mut self) -> Result<(), ProtocolError> {
+        self.boundaries.recheck_retention()
+    }
+
     #[cfg(feature = "keyring")]
     fn thread_history(
         &mut self,

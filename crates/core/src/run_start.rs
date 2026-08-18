@@ -178,6 +178,10 @@ pub trait RunAttachBoundaries {
     fn select_thread(&self, _thread_id: &str) -> Result<bool, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
+    #[cfg(target_os = "linux")]
+    fn recheck_retention(&self) -> Result<(), ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
     #[cfg(all(target_os = "linux", feature = "keyring"))]
     fn thread_history(
         &self,

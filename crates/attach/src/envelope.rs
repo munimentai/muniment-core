@@ -310,6 +310,8 @@ pub enum Operation {
     MigrationControl,
     #[serde(rename = "approval.present")]
     ApprovalPresent,
+    #[serde(rename = "retention.recheck")]
+    RetentionRecheck,
 }
 
 impl Operation {
@@ -369,6 +371,7 @@ impl Operation {
             Self::RequestCancel => "request.cancel",
             Self::MigrationControl => "migration.control",
             Self::ApprovalPresent => "approval.present",
+            Self::RetentionRecheck => "retention.recheck",
         }
     }
 }
