@@ -2150,6 +2150,9 @@ fn serve_desktop_client_requests<S: ThreadListService>(
 
         match wait_until_readable(stream, Instant::now() + Duration::from_millis(50)) {
             Ok(()) => {}
+            Err(AttachSessionError::Closed) if chat_subscription.is_some() => {
+                return Err(AttachSessionError::Closed);
+            }
             Err(AttachSessionError::Closed) => return Ok(()),
             Err(AttachSessionError::Timeout) => continue,
             Err(error) => return Err(error),
@@ -2157,6 +2160,9 @@ fn serve_desktop_client_requests<S: ThreadListService>(
         let deadline = Instant::now() + HELLO_TIMEOUT;
         let request = match read_request_before(stream, deadline) {
             Ok(request) => request,
+            Err(AttachSessionError::Closed) if chat_subscription.is_some() => {
+                return Err(AttachSessionError::Closed);
+            }
             Err(AttachSessionError::Closed) => return Ok(()),
             Err(error) => return Err(error),
         };

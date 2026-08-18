@@ -607,11 +607,15 @@ fn complete_migration_handshake(server: &mut UnixStream) {
 }
 
 fn complete_desktop_client_handshake(server: &mut UnixStream) {
+    complete_desktop_client_handshake_with_version(server, "0.0.1");
+}
+
+fn complete_desktop_client_handshake_with_version(server: &mut UnixStream, version: &str) {
     let hello = read_client_value(server);
     assert_eq!(hello["client"]["kind"], "desktop-client");
     assert!(hello.get("authorized_client_credential").is_none());
     server
-        .write_all(&encode_frame(&reconnect_welcome(1, "0.0.1", "11".repeat(16), "")).unwrap())
+        .write_all(&encode_frame(&reconnect_welcome(1, version, "11".repeat(16), "")).unwrap())
         .unwrap();
     server
         .write_all(
@@ -630,6 +634,7 @@ fn complete_desktop_client_handshake(server: &mut UnixStream) {
 #[test]
 fn desktop_client_holder_is_unavailable_without_a_connection() {
     let holder = DesktopClientHolder::new();
+    assert_eq!(holder.runtime_version(), None);
     assert_eq!(
         holder.request(Operation::ThreadList, None, serde_json::json!({})),
         Err(ClientError::DesktopUnavailable)
@@ -1553,13 +1558,13 @@ fn desktop_client_supervisor_publishes_reconnects_and_stops() {
     let (observed_tx, observed) = mpsc::channel();
     let server = thread::spawn(move || {
         let (mut first, _) = listener.accept().unwrap();
-        complete_desktop_client_handshake(&mut first);
+        complete_desktop_client_handshake_with_version(&mut first, "1.2.3");
         let request = read_client_value(&mut first);
         assert_eq!(request["operation"], "thread.list");
         drop(first);
 
         let (mut second, _) = listener.accept().unwrap();
-        complete_desktop_client_handshake(&mut second);
+        complete_desktop_client_handshake_with_version(&mut second, "1.3.0");
         let request = read_client_value(&mut second);
         let request_id = request["request_id"].as_str().unwrap();
         second
@@ -1590,18 +1595,22 @@ fn desktop_client_supervisor_publishes_reconnects_and_stops() {
     });
 
     observed.recv_timeout(SHORT).unwrap();
+    assert_eq!(holder.runtime_version().as_deref(), Some("1.2.3"));
     assert_eq!(
         holder.request(Operation::ThreadList, None, serde_json::json!({})),
         Err(ClientError::ConnectionClosed)
     );
     assert_eq!(observed.recv_timeout(SHORT), Ok(false));
+    assert_eq!(holder.runtime_version(), None);
     assert_eq!(observed.recv_timeout(SHORT), Ok(true));
+    assert_eq!(holder.runtime_version().as_deref(), Some("1.3.0"));
     assert!(holder
         .request(Operation::ThreadList, None, serde_json::json!({}))
         .is_ok());
     stop.stop();
     worker.join().unwrap();
     assert_eq!(observed.recv_timeout(SHORT), Ok(false));
+    assert_eq!(holder.runtime_version(), None);
     server.join().unwrap();
     std::fs::remove_file(path).unwrap();
 }

@@ -1450,6 +1450,7 @@ mod linux {
     /// A connection-bound client for the peer-authorized desktop session.
     pub struct DesktopClient {
         stream: UnixStream,
+        runtime_version: String,
         profile_id: String,
         workspace_scopes: BTreeMap<String, BTreeSet<String>>,
         capability: String,
@@ -1467,6 +1468,15 @@ mod linux {
     impl DesktopClientHolder {
         pub fn new() -> Self {
             Self::default()
+        }
+
+        pub fn runtime_version(&self) -> Option<String> {
+            let (client, _) = &*self.inner;
+            client
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                .map(|client| client.runtime_version.clone())
         }
 
         pub fn request(
@@ -2962,6 +2972,7 @@ mod linux {
         }
         Ok(DesktopClient {
             stream,
+            runtime_version: welcome.desktop_version,
             profile_id: authorized.profile_id,
             workspace_scopes: authorized.workspace_scopes,
             capability: authorized.capability,
@@ -3290,6 +3301,7 @@ mod linux {
             let (stream, _peer) = UnixStream::pair().unwrap();
             let desktop_client = DesktopClient {
                 stream,
+                runtime_version: "0.0.1".to_string(),
                 profile_id: "profile".to_string(),
                 workspace_scopes: BTreeMap::new(),
                 capability: "capability".to_string(),
@@ -3393,6 +3405,10 @@ pub struct DesktopClientHolder;
 impl DesktopClientHolder {
     pub fn new() -> Self {
         Self
+    }
+
+    pub fn runtime_version(&self) -> Option<String> {
+        None
     }
 
     pub fn run_submit(

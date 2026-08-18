@@ -585,6 +585,19 @@ fn hello_welcome_and_version_overlap() {
 }
 
 #[test]
+fn runtime_version_compatibility_compares_numeric_segments() {
+    assert!(runtime_version_meets_minimum("1.2.3", "1.2.3"));
+    assert!(runtime_version_meets_minimum("1.10.0", "1.2.9"));
+    assert!(!runtime_version_meets_minimum("1.2.2", "1.2.3"));
+    assert!(!runtime_version_meets_minimum("1.2", "1.2.1"));
+    assert!(runtime_version_meets_minimum("1.2.0", "1.2"));
+
+    for malformed in ["", "1..2", "1.2-beta", " 1.2", "1.2."] {
+        assert!(!runtime_version_meets_minimum(malformed, "1.0.0"));
+    }
+}
+
+#[test]
 fn authorized_round_trips_and_ignores_future_optional_fields() {
     let message = authorized(
         "profile-id",
