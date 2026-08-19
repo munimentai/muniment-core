@@ -21,6 +21,18 @@ fn transfer(total: u64, chunk_bytes: u64, chunk_count: u64) -> ArtifactTransfer 
     .unwrap()
 }
 
+fn empty_transfer(transfer_id: Id) -> ArtifactTransfer {
+    ArtifactTransfer::new(ArtifactMetadata {
+        transfer_id,
+        artifact_id: id(2),
+        total_bytes: 0,
+        sha256: hash(&[]),
+        chunk_bytes: 4,
+        chunk_count: 0,
+    })
+    .unwrap()
+}
+
 #[test]
 fn empty_and_single_chunk_complete_only_after_final_ack() {
     assert!(transfer(0, 4, 0).completion().is_some());
@@ -118,4 +130,66 @@ fn invalid_metadata_windows_and_chunks_return_transfer_local_close() {
             .is_err());
         assert_eq!(state.highest_emitted(), -1);
     }
+}
+
+#[test]
+fn registry_inserts_looks_up_and_removes_by_transfer_id() {
+    let mut registry = ArtifactTransferRegistry::new();
+    let transfer_id = id(1);
+    let unknown = id(2);
+    let missing = registry.get(&unknown).unwrap_err();
+    assert_eq!(missing, ArtifactTransferRegistryError::NotFound);
+    assert_eq!(registry.get_mut(&unknown).unwrap_err(), missing);
+    assert_eq!(registry.remove(&unknown).unwrap_err(), missing);
+
+    registry
+        .insert(empty_transfer(transfer_id.clone()))
+        .unwrap();
+    assert_eq!(
+        registry.get(&transfer_id).unwrap().metadata().transfer_id,
+        transfer_id
+    );
+    assert_eq!(
+        registry
+            .get_mut(&transfer_id)
+            .unwrap()
+            .metadata()
+            .transfer_id,
+        transfer_id
+    );
+    let removed = registry.remove(&transfer_id).unwrap();
+    assert_eq!(removed.metadata().transfer_id, transfer_id);
+    assert_eq!(registry.get(&transfer_id).unwrap_err(), missing);
+    assert_eq!(registry.remove(&transfer_id).unwrap_err(), missing);
+}
+
+#[test]
+fn registry_rejects_a_sixty_fifth_insert() {
+    assert_eq!(MAX_ACTIVE_ARTIFACT_TRANSFERS, 64);
+    let mut registry = ArtifactTransferRegistry::new();
+    for n in 1..=MAX_ACTIVE_ARTIFACT_TRANSFERS {
+        registry.insert(empty_transfer(id(n as u128))).unwrap();
+    }
+    let overflow = id((MAX_ACTIVE_ARTIFACT_TRANSFERS as u128) + 1);
+    assert_eq!(
+        registry
+            .insert(empty_transfer(overflow.clone()))
+            .unwrap_err(),
+        ArtifactTransferRegistryError::BoundReached
+    );
+    assert!(registry.get(&id(1)).is_ok());
+    assert!(registry.get(&id(64)).is_ok());
+    assert_eq!(
+        registry.get(&overflow).unwrap_err(),
+        ArtifactTransferRegistryError::NotFound
+    );
+
+    registry.insert(empty_transfer(id(1))).unwrap();
+    registry.remove(&id(1)).unwrap();
+    registry.insert(empty_transfer(overflow.clone())).unwrap();
+    assert!(registry.get(&overflow).is_ok());
+    assert_eq!(
+        registry.get(&id(1)).unwrap_err(),
+        ArtifactTransferRegistryError::NotFound
+    );
 }

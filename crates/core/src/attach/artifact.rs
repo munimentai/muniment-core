@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use sha2::{Digest, Sha256};
 
 use super::{Id, ProtocolError, StreamClose, StreamCloseCode};
@@ -6,6 +8,8 @@ use super::{Id, ProtocolError, StreamClose, StreamCloseCode};
 pub const MAX_ARTIFACT_CHUNK_BYTES: u64 = 256 * 1024;
 /// A single `artifact.window` may grant at most this many chunks.
 pub const MAX_ARTIFACT_WINDOW_CHUNKS: u32 = 1_024;
+/// One attach session may hold this many concurrent artifact transfers.
+pub const MAX_ACTIVE_ARTIFACT_TRANSFERS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactMetadata {
@@ -31,8 +35,7 @@ pub struct ArtifactCompletion {
     pub sha256: String,
 }
 
-/// Closed failure for one transfer. Registry lookup and `transfer_not_found`
-/// belong to the future session/transfer registry, outside this pinned state.
+/// Closed failure for one pinned transfer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArtifactTransferError {
     error: ProtocolError,
@@ -190,6 +193,66 @@ impl ArtifactTransfer {
                 sha256: self.metadata.sha256.clone(),
             }
         })
+    }
+}
+
+/// Local registry failure. This is not a wire `ErrorCode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactTransferRegistryError {
+    NotFound,
+    BoundReached,
+}
+
+/// Bounded map of live artifact transfers for one attach session.
+#[derive(Debug, Default)]
+pub struct ArtifactTransferRegistry {
+    transfers: HashMap<Id, ArtifactTransfer>,
+}
+
+impl ArtifactTransferRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(
+        &mut self,
+        transfer: ArtifactTransfer,
+    ) -> Result<(), ArtifactTransferRegistryError> {
+        let transfer_id = transfer.metadata().transfer_id.clone();
+        if !self.transfers.contains_key(&transfer_id)
+            && self.transfers.len() >= MAX_ACTIVE_ARTIFACT_TRANSFERS
+        {
+            return Err(ArtifactTransferRegistryError::BoundReached);
+        }
+        self.transfers.insert(transfer_id, transfer);
+        Ok(())
+    }
+
+    pub fn get(
+        &self,
+        transfer_id: &Id,
+    ) -> Result<&ArtifactTransfer, ArtifactTransferRegistryError> {
+        self.transfers
+            .get(transfer_id)
+            .ok_or(ArtifactTransferRegistryError::NotFound)
+    }
+
+    pub fn get_mut(
+        &mut self,
+        transfer_id: &Id,
+    ) -> Result<&mut ArtifactTransfer, ArtifactTransferRegistryError> {
+        self.transfers
+            .get_mut(transfer_id)
+            .ok_or(ArtifactTransferRegistryError::NotFound)
+    }
+
+    pub fn remove(
+        &mut self,
+        transfer_id: &Id,
+    ) -> Result<ArtifactTransfer, ArtifactTransferRegistryError> {
+        self.transfers
+            .remove(transfer_id)
+            .ok_or(ArtifactTransferRegistryError::NotFound)
     }
 }
 
