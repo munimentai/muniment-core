@@ -428,6 +428,31 @@ fn canonical_command_and_artifact_fixtures_match_the_pinned_contract() {
     assert_eq!(closed.body, json!({"code": "cancelled", "resumable": true}));
 }
 
+#[test]
+fn subscription_cancel_error_fixtures_match_helpers() {
+    for (name, expected) in [
+        (
+            "error-subscription-not-found.json",
+            ProtocolError::subscription_not_found(),
+        ),
+        (
+            "error-already-completed.json",
+            ProtocolError::already_completed(),
+        ),
+    ] {
+        let Envelope::Error(error) = serde_json::from_value(canonical_fixture(name)).unwrap()
+        else {
+            panic!("expected error fixture");
+        };
+        assert_eq!(error.error, expected);
+        assert!(!error.error.retryable());
+        let encoded = serde_json::to_string(&error.error).unwrap();
+        assert!(!encoded.contains("details"));
+        let round_trip: ProtocolError = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(round_trip, expected);
+    }
+}
+
 fn id(n: u128) -> Id {
     Id::new(format!("{n:032x}")).unwrap()
 }

@@ -1,6 +1,6 @@
 //! Linux filesystem boundary for the companion attach endpoint.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::ffi::{CString, OsStr};
 use std::fmt;
@@ -2069,6 +2069,7 @@ fn run_migration_control_session<S: ThreadListService>(
         peer_uid: credentials.uid,
         peer_pid: credentials.pid as u32,
     };
+    let mut cancelled_subscriptions = HashSet::new();
     loop {
         let deadline = Instant::now()
             .checked_add(timeout)
@@ -2090,6 +2091,7 @@ fn run_migration_control_session<S: ThreadListService>(
             provenance.clone(),
             service,
             &mut Vec::new(),
+            &mut cancelled_subscriptions,
             &mut None,
         ) {
             Ok(dispatched) => {
@@ -2128,6 +2130,7 @@ fn serve_desktop_client_requests<S: ThreadListService>(
     service: &mut S,
 ) -> Result<(), AttachSessionError> {
     let mut subscriptions = Vec::new();
+    let mut cancelled_subscriptions = HashSet::new();
     let mut chat_subscription = None;
     loop {
         let live_events = match poll_run_streams(service, &mut subscriptions) {
@@ -2191,6 +2194,7 @@ fn serve_desktop_client_requests<S: ThreadListService>(
             session.provenance.clone(),
             service,
             &mut subscriptions,
+            &mut cancelled_subscriptions,
             &mut chat_subscription,
         ) {
             Ok(dispatched) => {
@@ -2293,6 +2297,7 @@ where
     S: ThreadListService,
 {
     let mut subscriptions = Vec::new();
+    let mut cancelled_subscriptions = HashSet::new();
     loop {
         let gate = session
             .connection
@@ -2474,7 +2479,8 @@ where
             Operation::ThreadList
             | Operation::ThreadOpen
             | Operation::RunStream
-            | Operation::RunCursorAck => Some("thread.read"),
+            | Operation::RunCursorAck
+            | Operation::RequestCancel => Some("thread.read"),
             Operation::ThreadCreate
             | Operation::RunStart
             | Operation::RunCancel
@@ -2506,6 +2512,7 @@ where
             session.provenance.clone(),
             service,
             &mut subscriptions,
+            &mut cancelled_subscriptions,
             &mut None,
         ) {
             Ok(dispatched) => {
@@ -2873,6 +2880,7 @@ fn dispatch_request<S: ThreadListService>(
     provenance: CompanionProvenance,
     service: &mut S,
     subscriptions: &mut Vec<ActiveRunStream>,
+    cancelled_subscriptions: &mut HashSet<super::Id>,
     chat_subscription: &mut Option<ActiveChatSubscription>,
 ) -> Result<DispatchResult, DispatchFailure> {
     let _drain_admission = service
@@ -3192,6 +3200,67 @@ fn dispatch_request<S: ThreadListService>(
             }),
             events,
         });
+    }
+    if request.operation == Operation::RequestCancel {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            kind: String,
+            #[serde(default)]
+            subscription_id: Option<String>,
+            #[serde(default)]
+            request_id: Option<String>,
+        }
+        let body: Body =
+            serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
+        match (body.kind.as_str(), body.subscription_id, body.request_id) {
+            ("request", None, Some(_)) => {
+                return Err(ProtocolError::unsupported_operation().into());
+            }
+            ("subscription", Some(subscription_id), None) => {
+                let subscription_id = super::Id::new(subscription_id)
+                    .map_err(|_| ProtocolError::invalid_request())?;
+                let Some(index) = subscriptions
+                    .iter()
+                    .position(|stream| stream.cursor.subscription_id() == &subscription_id)
+                else {
+                    return Err(if cancelled_subscriptions.contains(&subscription_id) {
+                        ProtocolError::already_completed()
+                    } else {
+                        ProtocolError::subscription_not_found()
+                    }
+                    .into());
+                };
+                let stream = subscriptions.remove(index);
+                cancelled_subscriptions.insert(subscription_id.clone());
+                let run_id = stream.cursor.run_id().clone();
+                let run_seq = stream.cursor.highest_sent_run_seq();
+                return Ok(DispatchResult {
+                    body: serde_json::json!({
+                        "subscription_id": subscription_id,
+                    }),
+                    events: vec![
+                        Event {
+                            protocol: Protocol,
+                            subscription_id: subscription_id.clone(),
+                            event: EventName::RequestCancelled,
+                            run_id: Some(run_id.clone()),
+                            run_seq: Some(run_seq),
+                            body: serde_json::json!({}),
+                        },
+                        Event {
+                            protocol: Protocol,
+                            subscription_id,
+                            event: EventName::StreamClosed,
+                            run_id: Some(run_id),
+                            run_seq: Some(run_seq),
+                            body: serde_json::json!({"code": "cancelled", "resumable": true}),
+                        },
+                    ],
+                });
+            }
+            _ => return Err(ProtocolError::invalid_request().into()),
+        }
     }
     if request.operation == Operation::RunStart {
         #[derive(serde::Deserialize)]

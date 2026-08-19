@@ -2586,6 +2586,300 @@ fn run_cursor_ack_subscription_ids_are_isolated_between_connections() {
     }
 }
 
+fn request_cancel_stream_session(
+    run: &str,
+) -> (
+    UnixStream,
+    thread::JoinHandle<Result<(), AttachSessionError>>,
+) {
+    let mut service = StreamService {
+        page: RunStreamPage {
+            run_id: run.into(),
+            first_available_run_seq: 1,
+            current_run_seq: 1,
+            events: vec![stream_projection(run, 1, "safe.event".into())],
+            exhausted: true,
+        },
+    };
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let server_thread = thread::spawn(move || {
+        run_authenticated_session_with_authorization(
+            server,
+            credentials(),
+            "0.1.0",
+            Duration::from_secs(30),
+            AuthorizationSessionDependencies {
+                fill_random: |bytes: &mut [u8]| {
+                    bytes.fill(9);
+                    Ok(())
+                },
+                clock: TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                tokens: TestTokens(1),
+                approvals: |_: &muniment_core::attach::PairingChallenge, _: Duration| {
+                    Some(ApprovalDecision::Approve(approval()))
+                },
+            },
+            &mut service,
+        )
+    });
+    client.write_all(&hello(1, 1)).unwrap();
+    let _: Welcome = read_frame(&mut client);
+    let _: Authorized = read_frame(&mut client);
+    (client, server_thread)
+}
+
+#[test]
+fn request_cancel_unknown_subscription_returns_subscription_not_found() {
+    let (mut client, server_thread) =
+        request_cancel_stream_session("0190a100-0000-7000-8000-000000000030");
+    client
+        .write_all(&request(
+            80,
+            Operation::RequestCancel,
+            json!({"kind": "subscription", "subscription_id": "0".repeat(32)}),
+        ))
+        .unwrap();
+    assert_redacted_request_error(
+        &read_frame(&mut client),
+        80,
+        ErrorCode::SubscriptionNotFound,
+    );
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(server_thread.join().unwrap(), Ok(()));
+}
+
+#[test]
+fn request_cancel_closes_this_connection_run_stream_then_rejects_a_second_cancel() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000031";
+    let (mut client, server_thread) = request_cancel_stream_session(RUN);
+    client
+        .write_all(&request(
+            81,
+            Operation::RunStream,
+            json!({"run_id": RUN, "after_run_seq": 0}),
+        ))
+        .unwrap();
+    let response: Response = read_frame(&mut client);
+    let subscription = response.body["subscription_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let Envelope::Event(event) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected run event")
+    };
+    assert_eq!(event.event, EventName::RunEvent);
+    let Envelope::Event(caught_up) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected caught-up event")
+    };
+    assert_eq!(caught_up.event, EventName::SubscriptionCaughtUp);
+
+    client
+        .write_all(&request(
+            82,
+            Operation::RequestCancel,
+            json!({"kind": "subscription", "subscription_id": subscription}),
+        ))
+        .unwrap();
+    let cancelled: Response = read_frame(&mut client);
+    assert_eq!(cancelled.request_id.as_str(), format!("{:032x}", 82));
+    assert_eq!(cancelled.body["subscription_id"], subscription);
+    let Envelope::Event(request_cancelled) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected request.cancelled")
+    };
+    assert_eq!(request_cancelled.event, EventName::RequestCancelled);
+    assert_eq!(request_cancelled.subscription_id.as_str(), subscription);
+    assert_eq!(request_cancelled.run_id.as_ref().unwrap().as_str(), RUN);
+    let Envelope::Event(closed) = read_frame::<Envelope>(&mut client) else {
+        panic!("expected stream.closed")
+    };
+    assert_eq!(closed.event, EventName::StreamClosed);
+    assert_eq!(closed.subscription_id.as_str(), subscription);
+    assert_eq!(closed.run_id.as_ref().unwrap().as_str(), RUN);
+    assert_eq!(closed.body, json!({"code": "cancelled", "resumable": true}));
+
+    client
+        .write_all(&request(
+            83,
+            Operation::RequestCancel,
+            json!({"kind": "subscription", "subscription_id": subscription}),
+        ))
+        .unwrap();
+    assert_redacted_request_error(&read_frame(&mut client), 83, ErrorCode::AlreadyCompleted);
+
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(server_thread.join().unwrap(), Ok(()));
+}
+
+#[test]
+fn request_cancel_request_kind_stays_unsupported() {
+    let (mut client, server_thread) =
+        request_cancel_stream_session("0190a100-0000-7000-8000-000000000032");
+    client
+        .write_all(&request(
+            84,
+            Operation::RequestCancel,
+            json!({"kind": "request", "request_id": "0".repeat(32)}),
+        ))
+        .unwrap();
+    assert_redacted_request_error(
+        &read_frame(&mut client),
+        84,
+        ErrorCode::UnsupportedOperation,
+    );
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(server_thread.join().unwrap(), Ok(()));
+}
+
+#[test]
+fn request_cancel_malformed_targets_are_invalid_request() {
+    let (mut client, server_thread) =
+        request_cancel_stream_session("0190a100-0000-7000-8000-000000000033");
+    for (request_id, body) in [
+        (85, json!({})),
+        (86, json!({"kind": "subscription"})),
+        (87, json!({"kind": "subscription", "subscription_id": ""})),
+        (
+            88,
+            json!({"kind": "subscription", "subscription_id": "not-an-id"}),
+        ),
+        (
+            89,
+            json!({
+                "kind": "subscription",
+                "subscription_id": "0".repeat(32),
+                "extra": true
+            }),
+        ),
+        (
+            90,
+            json!({
+                "kind": "subscription",
+                "subscription_id": "0".repeat(32),
+                "request_id": "0".repeat(32)
+            }),
+        ),
+        (
+            91,
+            json!({"kind": "transfer", "subscription_id": "0".repeat(32)}),
+        ),
+    ] {
+        client
+            .write_all(&request(request_id, Operation::RequestCancel, body))
+            .unwrap();
+        assert_redacted_request_error(
+            &read_frame(&mut client),
+            request_id,
+            ErrorCode::InvalidRequest,
+        );
+    }
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(server_thread.join().unwrap(), Ok(()));
+}
+
+#[test]
+fn request_cancel_without_read_scope_fails_closed() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello(1, 1)).unwrap();
+    client
+        .write_all(&request(
+            95,
+            Operation::RequestCancel,
+            json!({"kind": "subscription", "subscription_id": "0".repeat(32)}),
+        ))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut approved = approval();
+    approved.scopes.clear();
+    assert_eq!(
+        dispatch_session_with_approval(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            approved,
+            &mut unavailable_service,
+        ),
+        Err(AttachSessionError::Authorization)
+    );
+    assert_redacted_request_error(&read_frame(&mut client), 95, ErrorCode::Unauthorized);
+}
+
+#[test]
+fn request_cancel_subscription_ids_are_isolated_between_connections() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000034";
+    let mut clients = Vec::new();
+    let mut threads = Vec::new();
+    for _ in 0..2 {
+        let (client, server_thread) = request_cancel_stream_session(RUN);
+        clients.push(client);
+        threads.push(server_thread);
+    }
+
+    clients[0]
+        .write_all(&request(
+            92,
+            Operation::RunStream,
+            json!({"run_id": RUN, "after_run_seq": 0}),
+        ))
+        .unwrap();
+    let response: Response = read_frame(&mut clients[0]);
+    let foreign_subscription = response.body["subscription_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let _: Envelope = read_frame(&mut clients[0]);
+    let _: Envelope = read_frame(&mut clients[0]);
+
+    clients[1]
+        .write_all(&request(
+            93,
+            Operation::RequestCancel,
+            json!({
+                "kind": "subscription",
+                "subscription_id": foreign_subscription
+            }),
+        ))
+        .unwrap();
+    assert_redacted_request_error(
+        &read_frame(&mut clients[1]),
+        93,
+        ErrorCode::SubscriptionNotFound,
+    );
+
+    clients[0]
+        .write_all(&request(
+            94,
+            Operation::RequestCancel,
+            json!({
+                "kind": "subscription",
+                "subscription_id": foreign_subscription
+            }),
+        ))
+        .unwrap();
+    let cancelled: Response = read_frame(&mut clients[0]);
+    assert_eq!(cancelled.body["subscription_id"], foreign_subscription);
+    let Envelope::Event(request_cancelled) = read_frame::<Envelope>(&mut clients[0]) else {
+        panic!("expected owner connection request.cancelled")
+    };
+    assert_eq!(request_cancelled.event, EventName::RequestCancelled);
+    assert_eq!(
+        request_cancelled.subscription_id.as_str(),
+        foreign_subscription
+    );
+    let Envelope::Event(closed) = read_frame::<Envelope>(&mut clients[0]) else {
+        panic!("expected owner connection stream.closed")
+    };
+    assert_eq!(closed.event, EventName::StreamClosed);
+    assert_eq!(closed.body["code"], "cancelled");
+    assert_eq!(closed.body["resumable"], true);
+
+    for client in &mut clients {
+        client.shutdown(Shutdown::Write).unwrap();
+    }
+    for server_thread in threads {
+        assert_eq!(server_thread.join().unwrap(), Ok(()));
+    }
+}
+
 #[test]
 fn real_journal_run_stream_fetches_next_page_after_window_ack() {
     const RUN: &str = "0190a100-0000-7000-8000-000000000018";

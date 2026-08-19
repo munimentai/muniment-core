@@ -238,6 +238,8 @@ pub enum ErrorCode {
     UnsupportedOperation,
     MigrationNotReady,
     RuntimeDraining,
+    SubscriptionNotFound,
+    AlreadyCompleted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -499,6 +501,10 @@ pub enum ErrorMessage {
     MigrationNotReady,
     #[serde(rename = "The runtime is draining and cannot accept new work.")]
     RuntimeDraining,
+    #[serde(rename = "The subscription was not found.")]
+    SubscriptionNotFound,
+    #[serde(rename = "The target has already completed.")]
+    AlreadyCompleted,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -609,6 +615,17 @@ impl ProtocolError {
         error
     }
 
+    pub fn subscription_not_found() -> Self {
+        Self::simple(
+            ErrorCode::SubscriptionNotFound,
+            ErrorMessage::SubscriptionNotFound,
+        )
+    }
+
+    pub fn already_completed() -> Self {
+        Self::simple(ErrorCode::AlreadyCompleted, ErrorMessage::AlreadyCompleted)
+    }
+
     fn simple(code: ErrorCode, message: ErrorMessage) -> Self {
         Self {
             code,
@@ -670,6 +687,8 @@ impl<'de> Deserialize<'de> for ProtocolError {
             (ErrorCode::UnsupportedOperation, None, None) => Self::unsupported_operation(),
             (ErrorCode::MigrationNotReady, None, None) => Self::migration_not_ready(),
             (ErrorCode::RuntimeDraining, None, None) => Self::runtime_draining(),
+            (ErrorCode::SubscriptionNotFound, None, None) => Self::subscription_not_found(),
+            (ErrorCode::AlreadyCompleted, None, None) => Self::already_completed(),
             _ => return Err(de::Error::custom("invalid error schema")),
         };
         if matches!(
