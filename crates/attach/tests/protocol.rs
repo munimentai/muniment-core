@@ -298,6 +298,7 @@ fn canonical_chat_event_fixtures_round_trip_byte_for_byte() {
         event.body,
         json!({
             "runId": "00000000000000000000000000000191",
+            "threadId": "00000000000000000000000000000192",
             "phase": "running",
             "text": "Review the selected file.",
             "toolActivity": [],

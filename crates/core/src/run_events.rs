@@ -24,6 +24,8 @@ use muniment_code_diff::CodeDiff;
 #[serde(rename_all = "camelCase")]
 pub struct ChatEvent {
     pub run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
     pub phase: String,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -101,6 +103,7 @@ pub fn chat_event(
 ) -> ChatEvent {
     ChatEvent {
         run_id: run_id.into(),
+        thread_id: None,
         phase: projection_phase(&projection.status).into(),
         text: projection.text,
         receipt: projection.receipt,
@@ -263,6 +266,8 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    use crate::journal::reducer::ChatProjection;
+
     #[derive(Default)]
     struct RecordingSink {
         events: Mutex<Vec<ChatEvent>>,
@@ -312,6 +317,7 @@ mod tests {
         let events = sink.events.lock().unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].run_id, run_id);
+        assert!(events[0].thread_id.is_none());
         assert_eq!(events[0].phase, "thinking");
         let stored = storage.lock().unwrap().journal.events(&run_id).unwrap();
         assert_eq!(stored[0].provenance.actor_id.as_deref(), Some("actor-1"));
@@ -545,5 +551,22 @@ mod tests {
             .events(&run_id)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn chat_event_leaves_thread_id_absent() {
+        let event = chat_event("run-1", ChatProjection::default(), None, Vec::new());
+        assert!(event.thread_id.is_none());
+        let value = serde_json::to_value(&event).unwrap();
+        assert!(value.get("threadId").is_none());
+        assert_eq!(value["runId"], "run-1");
+    }
+
+    #[test]
+    fn chat_event_serializes_present_thread_id() {
+        let mut event = chat_event("run-1", ChatProjection::default(), None, Vec::new());
+        event.thread_id = Some("thread-1".into());
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["threadId"], "thread-1");
     }
 }

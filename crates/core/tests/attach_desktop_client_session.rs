@@ -1103,6 +1103,7 @@ fn desktop_chat_subscription_delivers_events_and_owns_the_session() {
         sender
             .send(ChatEvent {
                 run_id: "018f0000-0000-7000-8000-000000000211".into(),
+                thread_id: None,
                 phase: phase.into(),
                 text: text.into(),
                 receipt: None,
@@ -1183,6 +1184,7 @@ fn desktop_chat_subscription_stays_responsive_under_sustained_events() {
             if sender
                 .send(ChatEvent {
                     run_id: "018f0000-0000-7000-8000-000000000214".into(),
+                    thread_id: None,
                     phase: "running".into(),
                     text: "event".into(),
                     receipt: None,

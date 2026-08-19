@@ -903,6 +903,7 @@ fn event_body(event: &EventName) -> serde_json::Value {
         }),
         EventName::ChatEvent => json!({
             "runId": "00000000000000000000000000000191",
+            "threadId": "00000000000000000000000000000192",
             "phase": "running",
             "text": "Review the selected file.",
             "toolActivity": [],
