@@ -16,6 +16,9 @@ use std::sync::mpsc::TryRecvError;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use sha2::{Digest, Sha256};
+
 use super::{
     encode_frame, welcome, Approval, ArtifactMetadata, ArtifactTransfer, ArtifactTransferRegistry,
     ArtifactTransferRegistryError, AuthorizationClock, AuthorizationError, AuthorizationState,
@@ -1222,6 +1225,16 @@ pub trait ThreadListService {
         _workspace: &str,
         _artifact_id: &super::Id,
     ) -> Result<ArtifactFetchResult, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn read_artifact_range(
+        &mut self,
+        _workspace: &str,
+        _artifact_id: &super::Id,
+        _offset: u64,
+        _length: u64,
+    ) -> Result<Vec<u8>, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
 
@@ -3012,10 +3025,101 @@ fn dispatch_request<S: ThreadListService>(
                     });
                 }
             };
-        return Ok(response_only(serde_json::json!({
-            "ack_through_chunk": body.ack_through_chunk,
-            "granted_chunks": granted_chunks,
-        })));
+        let metadata = transfer.metadata().clone();
+        let first_chunk = u64::try_from(transfer.highest_emitted() + 1)
+            .map_err(|_| ProtocolError::persistence_failed())?;
+        let end_chunk = first_chunk
+            .checked_add(u64::from(granted_chunks))
+            .map(|end| end.min(metadata.chunk_count))
+            .ok_or_else(ProtocolError::persistence_failed)?;
+        let mut events = Vec::new();
+        for chunk_index in first_chunk..end_chunk {
+            let offset = chunk_index
+                .checked_mul(metadata.chunk_bytes)
+                .ok_or_else(ProtocolError::persistence_failed)?;
+            let byte_length = metadata
+                .total_bytes
+                .checked_sub(offset)
+                .map(|remaining| remaining.min(metadata.chunk_bytes))
+                .ok_or_else(ProtocolError::persistence_failed)?;
+            let data = match service.read_artifact_range(
+                workspace,
+                &metadata.artifact_id,
+                offset,
+                byte_length,
+            ) {
+                Ok(data) => data,
+                Err(error) => {
+                    registries.artifact_transfers.remove(&transfer_id).ok();
+                    let code = serde_json::to_value(error.code())
+                        .unwrap_or_else(|_| serde_json::json!("persistence_failed"));
+                    return Err(DispatchFailure {
+                        error,
+                        events: vec![Event {
+                            protocol: Protocol,
+                            subscription_id: transfer_id,
+                            event: EventName::StreamClosed,
+                            run_id: None,
+                            run_seq: None,
+                            body: serde_json::json!({"code": code, "resumable": true}),
+                        }],
+                    });
+                }
+            };
+            let chunk_sha256 = format!("{:x}", Sha256::digest(&data));
+            let admission = registries
+                .artifact_transfers
+                .get_mut(&transfer_id)
+                .map_err(|_| ProtocolError::transfer_not_found())?
+                .admit_chunk(
+                    &metadata.artifact_id,
+                    chunk_index,
+                    offset,
+                    byte_length,
+                    &chunk_sha256,
+                    &data,
+                );
+            if let Err(error) = admission {
+                let close = error.close();
+                registries.artifact_transfers.remove(&transfer_id).ok();
+                return Err(DispatchFailure {
+                    error: error.error().clone(),
+                    events: vec![Event {
+                        protocol: Protocol,
+                        subscription_id: transfer_id,
+                        event: EventName::StreamClosed,
+                        run_id: None,
+                        run_seq: None,
+                        body: serde_json::json!({
+                            "code": "invalid_artifact_cursor",
+                            "resumable": close.resumable,
+                        }),
+                    }],
+                });
+            }
+            events.push(Event {
+                protocol: Protocol,
+                subscription_id: transfer_id.clone(),
+                event: EventName::ArtifactChunk,
+                run_id: None,
+                run_seq: None,
+                body: serde_json::json!({
+                    "artifact_id": metadata.artifact_id,
+                    "chunk_index": chunk_index,
+                    "offset": offset,
+                    "byte_length": byte_length,
+                    "chunk_sha256": chunk_sha256,
+                    "data": STANDARD.encode(data),
+                }),
+            });
+        }
+        return Ok(DispatchResult {
+            body: serde_json::json!({
+                "ack_through_chunk": body.ack_through_chunk,
+                "granted_chunks": granted_chunks,
+            }),
+            events,
+        });
     }
     if request.operation == Operation::ArtifactFetch {
         #[derive(serde::Deserialize)]

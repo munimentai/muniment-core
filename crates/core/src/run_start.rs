@@ -230,6 +230,16 @@ pub trait RunAttachBoundaries {
         Err(ProtocolError::unsupported_operation())
     }
     #[cfg(target_os = "linux")]
+    fn read_artifact_range(
+        &self,
+        _workspace: &str,
+        _artifact_id: &crate::attach::Id,
+        _offset: u64,
+        _length: u64,
+    ) -> Result<Vec<u8>, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(target_os = "linux")]
     fn subscribe_run_commits(
         &self,
         run_id: &str,

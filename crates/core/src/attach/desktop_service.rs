@@ -1089,6 +1089,17 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         self.boundaries.fetch_artifact(workspace, artifact_id)
     }
 
+    fn read_artifact_range(
+        &mut self,
+        workspace: &str,
+        artifact_id: &Id,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, ProtocolError> {
+        self.boundaries
+            .read_artifact_range(workspace, artifact_id, offset, length)
+    }
+
     fn subscribe_run_commits(
         &mut self,
         run_id: &str,

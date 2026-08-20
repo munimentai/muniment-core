@@ -68,6 +68,14 @@ fn validate_payload(payload: &[u8]) -> Result<(), FrameError> {
     }
     std::str::from_utf8(payload).map_err(|_| FrameError::InvalidUtf8)?;
     let value: Value = serde_json::from_slice(payload).map_err(|_| FrameError::InvalidJson)?;
+    let artifact_data = value
+        .as_object()
+        .filter(|object| object.get("event").and_then(Value::as_str) == Some("artifact.chunk"))
+        .and_then(|object| object.get("body"))
+        .and_then(Value::as_object)
+        .and_then(|body| body.get("data"))
+        .and_then(Value::as_str);
+    const MAX_ARTIFACT_BASE64_LENGTH: usize = (256_usize * 1024).div_ceil(3) * 4;
     let mut stack = vec![(&value, 1usize)];
     let (mut strings, mut entries) = (0usize, 0usize);
     while let Some((value, depth)) = stack.pop() {
@@ -77,7 +85,10 @@ fn validate_payload(payload: &[u8]) -> Result<(), FrameError> {
         match value {
             Value::String(s) => {
                 strings += 1;
-                if s.len() > crate::MAX_TEXT_LENGTH {
+                let artifact_data_in_range = artifact_data
+                    .is_some_and(|data| std::ptr::eq(data, s.as_str()))
+                    && s.len() <= MAX_ARTIFACT_BASE64_LENGTH;
+                if s.len() > crate::MAX_TEXT_LENGTH && !artifact_data_in_range {
                     return Err(FrameError::StructureLimit);
                 }
             }

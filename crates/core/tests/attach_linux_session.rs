@@ -296,6 +296,7 @@ struct StartService {
     calls: Vec<(String, String, RunStartRequest, Id, Id, CompanionProvenance)>,
     output: Option<RunStartAccepted>,
     artifact_ids: Vec<(String, Id)>,
+    artifact_read_failures: usize,
 }
 
 #[derive(Default)]
@@ -744,6 +745,103 @@ impl ThreadListService for StartService {
             sha256: "0".repeat(64),
         })
     }
+
+    fn read_artifact_range(
+        &mut self,
+        workspace: &str,
+        artifact_id: &Id,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, muniment_core::attach::ProtocolError> {
+        if self.artifact_read_failures > 0 {
+            self.artifact_read_failures -= 1;
+            return Err(muniment_core::attach::ProtocolError::persistence_failed());
+        }
+        assert_eq!(workspace, "workspace-1");
+        assert_eq!(artifact_id.as_str(), "0190a100-0000-7000-8000-000000000079");
+        Ok((offset..offset + length)
+            .map(|position| position as u8)
+            .collect())
+    }
+}
+
+#[test]
+fn artifact_read_failure_closes_only_the_failed_transfer() {
+    let artifact_id = "0190a100-0000-7000-8000-000000000079";
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        let mut service = StartService {
+            artifact_read_failures: 1,
+            ..StartService::default()
+        };
+        run_authenticated_session_with_authorization(
+            server,
+            credentials(),
+            "0.1.0",
+            Duration::from_secs(1),
+            AuthorizationSessionDependencies {
+                fill_random: |bytes: &mut [u8]| {
+                    bytes.fill(9);
+                    Ok(())
+                },
+                clock: TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                tokens: TestTokens(1),
+                approvals: |_: &muniment_core::attach::PairingChallenge, _: Duration| {
+                    Some(ApprovalDecision::Approve(approval()))
+                },
+            },
+            &mut service,
+        )
+    });
+    client.write_all(&hello(1, 1)).unwrap();
+    let _: Welcome = read_frame(&mut client);
+    let _: Authorized = read_frame(&mut client);
+    for request_id in [920, 921] {
+        client
+            .write_all(&request(
+                request_id,
+                Operation::ArtifactFetch,
+                json!({"artifact_id": artifact_id}),
+            ))
+            .unwrap();
+    }
+    let failed_transfer: Response = read_frame(&mut client);
+    let live_transfer: Response = read_frame(&mut client);
+    client
+        .write_all(&request(
+            922,
+            Operation::ArtifactWindow,
+            json!({
+                "transfer_id": failed_transfer.body["transfer_id"],
+                "ack_through_chunk": -1,
+                "max_chunks": 1
+            }),
+        ))
+        .unwrap();
+    let error: ErrorEnvelope = read_frame(&mut client);
+    assert_eq!(error.error.code(), ErrorCode::PersistenceFailed);
+    let closed: Event = read_frame(&mut client);
+    assert_eq!(closed.event, EventName::StreamClosed);
+    assert_eq!(
+        closed.body,
+        json!({"code": "persistence_failed", "resumable": true})
+    );
+    client
+        .write_all(&request(
+            923,
+            Operation::ArtifactWindow,
+            json!({
+                "transfer_id": live_transfer.body["transfer_id"],
+                "ack_through_chunk": -1,
+                "max_chunks": 1
+            }),
+        ))
+        .unwrap();
+    let _: Response = read_frame(&mut client);
+    let chunk: Event = read_frame(&mut client);
+    assert_eq!(chunk.event, EventName::ArtifactChunk);
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(worker.join().unwrap(), Ok(()));
 }
 
 #[test]
@@ -6212,6 +6310,14 @@ fn artifact_window_grants_chunks_on_the_named_session_transfer() {
         granted.body,
         json!({"ack_through_chunk": -1, "granted_chunks": 2})
     );
+    for expected_index in 0..2 {
+        let chunk: Event = read_frame(&mut client);
+        assert_eq!(chunk.event, EventName::ArtifactChunk);
+        assert_eq!(chunk.subscription_id.as_str(), transfer_id);
+        assert_eq!(chunk.body["artifact_id"], json!(artifact_id));
+        assert_eq!(chunk.body["chunk_index"], json!(expected_index));
+        assert_eq!(chunk.body["offset"], json!(expected_index * 256 * 1024));
+    }
     client.shutdown(Shutdown::Write).unwrap();
     let (result, service) = worker.join().unwrap();
     assert_eq!(result, Ok(()));
@@ -6281,6 +6387,21 @@ fn artifact_window_reports_a_missing_transfer_without_changing_a_live_transfer()
         .unwrap();
     let granted: Response = read_frame(&mut client);
     assert_eq!(granted.body["granted_chunks"], json!(1));
+    let chunk: Event = read_frame(&mut client);
+    assert_eq!(chunk.event, EventName::ArtifactChunk);
+    assert_eq!(
+        chunk.subscription_id.as_str(),
+        fetched.body["transfer_id"].as_str().unwrap()
+    );
+    assert_eq!(chunk.body["chunk_index"], json!(0));
+    client
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let mut ungranted = [0_u8; 1];
+    assert!(matches!(
+        client.read(&mut ungranted).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
     client.shutdown(Shutdown::Write).unwrap();
     assert_eq!(worker.join().unwrap(), Ok(()));
 }
