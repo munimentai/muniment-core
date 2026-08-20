@@ -432,6 +432,13 @@ pub struct RunOpenPage {
     pub exhausted: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactWindowGrant {
+    pub ack_through_chunk: i64,
+    pub granted_chunks: u32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactTransferMetadata {
@@ -457,8 +464,8 @@ impl fmt::Debug for ThreadListPage {
 mod linux {
     use super::{
         ApprovalDecision, ApprovalPresentRequest, ApprovalPresenterServeOutcome,
-        ArtifactTransferMetadata, AuthorizationSummary, ChatPermissionAnswer, ClientError,
-        MigrationControlFailure, MigrationControlOutcome, PendingPermission,
+        ArtifactTransferMetadata, ArtifactWindowGrant, AuthorizationSummary, ChatPermissionAnswer,
+        ClientError, MigrationControlFailure, MigrationControlOutcome, PendingPermission,
         PermissionAnswerAccepted, PermissionDecision, RedactedRunEvent, RunCancelAccepted,
         RunMessageAccepted, RunOpenPage, RunPermissionAnswerAccepted, RunResumeAccepted,
         RunStartAccepted, RunStreamMessage, RunStreamSubscription, RunSubmitAccepted,
@@ -843,6 +850,34 @@ mod linux {
                 return Err(ClientError::UnexpectedMessage);
             }
             Ok(page)
+        }
+
+        pub fn grant_artifact_window(
+            &mut self,
+            transfer_id: &str,
+            ack_through_chunk: i64,
+            max_chunks: u32,
+        ) -> Result<ArtifactWindowGrant, ClientError> {
+            let transfer_id =
+                Id::new(transfer_id.to_owned()).map_err(|_| ClientError::UnexpectedMessage)?;
+            if max_chunks == 0 || max_chunks > 1_024 {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            let request_id = fresh_request_id()?;
+            let request = Request {
+                protocol: Protocol,
+                request_id: request_id.clone(),
+                operation: Operation::ArtifactWindow,
+                capability: self.capability.clone(),
+                idempotency_key: None,
+                body: serde_json::json!({
+                    "transfer_id": transfer_id.as_str(),
+                    "ack_through_chunk": ack_through_chunk,
+                    "max_chunks": max_chunks,
+                }),
+            };
+            let response = self.send_request(request, &request_id)?;
+            serde_json::from_value(response.body).map_err(|_| ClientError::UnexpectedMessage)
         }
 
         pub fn fetch_artifact(
@@ -3708,6 +3743,15 @@ impl AuthorizedClient {
     }
 
     pub fn open_run(&mut self, _run_id: &str) -> Result<RunOpenPage, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+
+    pub fn grant_artifact_window(
+        &mut self,
+        _transfer_id: &str,
+        _ack_through_chunk: i64,
+        _max_chunks: u32,
+    ) -> Result<ArtifactWindowGrant, ClientError> {
         Err(ClientError::UnsupportedPlatform)
     }
 

@@ -5,9 +5,9 @@ use muniment_attach::{
     encode_frame, handshake_approval_presenter_stream, handshake_desktop_client_stream,
     handshake_migration_control_stream, handshake_stream, handshake_stream_with_credential,
     reconnect_welcome, serve_desktop_client_at, welcome, ApprovalDecision,
-    ApprovalPresenterServeOutcome, ChatPermissionAnswer, ClientError, DesktopClientHolder,
-    DesktopClientStopHandle, ErrorAction, ErrorEnvelope, Event, EventName, Failure, Id,
-    MigrationControlFailure, MigrationControlOutcome, Operation, PermissionDecision,
+    ApprovalPresenterServeOutcome, ArtifactWindowGrant, ChatPermissionAnswer, ClientError,
+    DesktopClientHolder, DesktopClientStopHandle, ErrorAction, ErrorEnvelope, Event, EventName,
+    Failure, Id, MigrationControlFailure, MigrationControlOutcome, Operation, PermissionDecision,
     PermissionKind, Protocol, ProtocolError, RedactedRunEvent, Response, RunOpenPage,
     RunStreamMessage, Success, VersionRange, MAX_FRAME_LENGTH,
 };
@@ -4563,6 +4563,46 @@ fn run_open_rejects_invalid_input_before_writing() {
 }
 
 #[test]
+fn artifact_window_uses_exact_envelope_and_returns_the_grant() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let transfer_id = "01900000-0000-7000-8000-000000000002";
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        let request = read_client_value(&mut server);
+        assert_eq!(request["protocol"], "muniment.attach/1");
+        assert_eq!(request["operation"], "artifact.window");
+        assert_eq!(request["capability"], "33".repeat(32));
+        assert_eq!(
+            request["body"],
+            serde_json::json!({
+                "transfer_id": transfer_id,
+                "ack_through_chunk": -1,
+                "max_chunks": 1024
+            })
+        );
+        assert!(request.get("idempotency_key").is_none());
+        let response = Response {
+            protocol: Protocol,
+            request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+            ok: Success,
+            body: serde_json::json!({"ack_through_chunk": -1, "granted_chunks": 512}),
+        };
+        server.write_all(&encode_frame(&response).unwrap()).unwrap();
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    assert_eq!(
+        client
+            .grant_artifact_window(transfer_id, -1, 1_024)
+            .unwrap(),
+        ArtifactWindowGrant {
+            ack_through_chunk: -1,
+            granted_chunks: 512
+        }
+    );
+    worker.join().unwrap();
+}
+
+#[test]
 fn artifact_fetch_uses_exact_envelope_and_returns_transfer_metadata() {
     let (client, mut server) = UnixStream::pair().unwrap();
     let artifact_id = "01900000-0000-7000-8000-000000000001";
@@ -4621,6 +4661,28 @@ fn artifact_fetch_rejects_invalid_input_before_writing() {
 }
 
 #[test]
+fn artifact_window_rejects_invalid_input_before_writing() {
+    for (transfer_id, max_chunks) in [
+        ("not-a-transfer-id", 1),
+        ("01900000-0000-7000-8000-000000000002", 0),
+        ("01900000-0000-7000-8000-000000000002", 1_025),
+    ] {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            complete_pairing(&mut server);
+            server.set_read_timeout(Some(SHORT)).unwrap();
+            assert!(server.read(&mut [0]).is_err());
+        });
+        let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+        assert_eq!(
+            client.grant_artifact_window(transfer_id, -1, max_chunks),
+            Err(ClientError::UnexpectedMessage)
+        );
+        worker.join().unwrap();
+    }
+}
+
+#[test]
 fn artifact_fetch_rejects_invalid_ids_and_unknown_fields() {
     let artifact_id = "01900000-0000-7000-8000-000000000001";
     for body in [
@@ -4658,6 +4720,33 @@ fn artifact_fetch_rejects_invalid_ids_and_unknown_fields() {
         );
         worker.join().unwrap();
     }
+}
+
+#[test]
+fn artifact_window_rejects_unknown_response_fields() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let transfer_id = "01900000-0000-7000-8000-000000000002";
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        let request = read_client_value(&mut server);
+        let response = Response {
+            protocol: Protocol,
+            request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+            ok: Success,
+            body: serde_json::json!({
+                "ack_through_chunk": 4,
+                "granted_chunks": 1,
+                "extra": true
+            }),
+        };
+        server.write_all(&encode_frame(&response).unwrap()).unwrap();
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    assert_eq!(
+        client.grant_artifact_window(transfer_id, 4, 1),
+        Err(ClientError::UnexpectedMessage)
+    );
+    worker.join().unwrap();
 }
 
 #[test]
