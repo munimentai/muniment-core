@@ -3113,6 +3113,30 @@ fn dispatch_request<S: ThreadListService>(
                 }),
             });
         }
+        if let Some(completion) = registries
+            .artifact_transfers
+            .get(&transfer_id)
+            .map_err(|_| ProtocolError::transfer_not_found())?
+            .completion()
+        {
+            registries
+                .artifact_transfers
+                .remove(&transfer_id)
+                .map_err(|_| ProtocolError::transfer_not_found())?;
+            events.push(Event {
+                protocol: Protocol,
+                subscription_id: transfer_id,
+                event: EventName::ArtifactComplete,
+                run_id: None,
+                run_seq: None,
+                body: serde_json::json!({
+                    "transfer_id": completion.transfer_id,
+                    "artifact_id": completion.artifact_id,
+                    "total_bytes": completion.total_bytes,
+                    "sha256": completion.sha256,
+                }),
+            });
+        }
         return Ok(DispatchResult {
             body: serde_json::json!({
                 "ack_through_chunk": body.ack_through_chunk,
