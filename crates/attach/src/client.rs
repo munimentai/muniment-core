@@ -1190,6 +1190,28 @@ mod linux {
             Ok(summary)
         }
 
+        pub fn cancel_subscription(&mut self, subscription_id: &str) -> Result<(), ClientError> {
+            let subscription_id =
+                Id::new(subscription_id.to_owned()).map_err(|_| ClientError::UnexpectedMessage)?;
+            let request_id = fresh_request_id()?;
+            let request = Request {
+                protocol: Protocol,
+                request_id: request_id.clone(),
+                operation: Operation::RequestCancel,
+                capability: self.capability.clone(),
+                idempotency_key: None,
+                body: serde_json::json!({
+                    "kind": "subscription",
+                    "subscription_id": subscription_id.as_str(),
+                }),
+            };
+            let response = self.send_request(request, &request_id)?;
+            if response.body != serde_json::json!({"subscription_id": subscription_id.as_str()}) {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            Ok(())
+        }
+
         pub fn acknowledge_run_cursor(&mut self, through_run_seq: u64) -> Result<(), ClientError> {
             let active = self
                 .active_run_stream
@@ -3805,6 +3827,10 @@ impl AuthorizedClient {
         _run_id: &str,
         _after_run_seq: u64,
     ) -> Result<RunStreamSubscription, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+
+    pub fn cancel_subscription(&mut self, _subscription_id: &str) -> Result<(), ClientError> {
         Err(ClientError::UnsupportedPlatform)
     }
 

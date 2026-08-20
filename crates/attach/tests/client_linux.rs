@@ -4661,6 +4661,81 @@ fn artifact_fetch_rejects_invalid_input_before_writing() {
 }
 
 #[test]
+fn subscription_cancel_uses_exact_envelope() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let subscription_id = "01900000-0000-7000-8000-000000000002";
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        let request = read_client_value(&mut server);
+        assert_eq!(request["protocol"], "muniment.attach/1");
+        assert_eq!(request["operation"], "request.cancel");
+        assert_eq!(request["capability"], "33".repeat(32));
+        assert_eq!(
+            request["body"],
+            serde_json::json!({
+                "kind": "subscription",
+                "subscription_id": subscription_id
+            })
+        );
+        assert!(request.get("idempotency_key").is_none());
+        let response = Response {
+            protocol: Protocol,
+            request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+            ok: Success,
+            body: serde_json::json!({"subscription_id": subscription_id}),
+        };
+        server.write_all(&encode_frame(&response).unwrap()).unwrap();
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    client.cancel_subscription(subscription_id).unwrap();
+    worker.join().unwrap();
+}
+
+#[test]
+fn subscription_cancel_rejects_invalid_input_before_writing() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        server.set_read_timeout(Some(SHORT)).unwrap();
+        assert!(server.read(&mut [0]).is_err());
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    assert_eq!(
+        client.cancel_subscription("not-a-subscription-id"),
+        Err(ClientError::UnexpectedMessage)
+    );
+    worker.join().unwrap();
+}
+
+#[test]
+fn subscription_cancel_maps_protocol_errors() {
+    let subscription_id = "01900000-0000-7000-8000-000000000002";
+    for error in [
+        ProtocolError::subscription_not_found(),
+        ProtocolError::already_completed(),
+    ] {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            complete_pairing(&mut server);
+            let request = read_client_value(&mut server);
+            let response = ErrorEnvelope {
+                protocol: Protocol,
+                request_id: Some(Id::new(request["request_id"].as_str().unwrap()).unwrap()),
+                ok: Failure,
+                error,
+            };
+            server.write_all(&encode_frame(&response).unwrap()).unwrap();
+        });
+        let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+        assert_eq!(
+            client.cancel_subscription(subscription_id),
+            Err(ClientError::RequestRejected)
+        );
+        worker.join().unwrap();
+    }
+}
+
+#[test]
 fn artifact_window_rejects_invalid_input_before_writing() {
     for (transfer_id, max_chunks) in [
         ("not-a-transfer-id", 1),
