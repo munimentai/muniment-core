@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -190,6 +190,36 @@ impl LocalCas {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Reads one bounded byte range without loading the complete object.
+    pub fn read_range(
+        &self,
+        hash: &ContentHash,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, CasError> {
+        let mut file = self
+            .open_object(hash)?
+            .ok_or_else(|| CasError::NotFound(hash.clone()))?;
+        let object_length = file.metadata()?.len();
+        if offset > object_length || length > object_length - offset {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "object range exceeds object length",
+            )
+            .into());
+        }
+        let buffer_length = usize::try_from(length).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "object range length exceeds memory limits",
+            )
+        })?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = vec![0; buffer_length];
+        file.read_exact(&mut bytes)?;
+        Ok(bytes)
     }
 
     pub fn has(&self, hash: &ContentHash) -> Result<bool, CasError> {

@@ -123,6 +123,35 @@ fn streaming_put_and_open_round_trip_a_large_object() {
 }
 
 #[test]
+fn reads_a_bounded_range_from_a_large_object() {
+    let root = TestDirectory::new();
+    let store = LocalCas::open(root.as_ref()).unwrap();
+    let mut bytes = vec![0x37; 3 * 1024 * 1024];
+    bytes[1_000_000..1_000_004].copy_from_slice(b"test");
+    let hash = store.put(&bytes).unwrap();
+
+    assert_eq!(store.read_range(&hash, 1_000_000, 4).unwrap(), b"test");
+}
+
+#[test]
+fn range_reads_reject_missing_objects_and_out_of_bounds_ranges() {
+    let root = TestDirectory::new();
+    let store = LocalCas::open(root.as_ref()).unwrap();
+    let hash = store.put(b"object").unwrap();
+    let missing =
+        ContentHash::from_str("0000000000000000000000000000000000000000000000000000000000000000")
+            .unwrap();
+
+    assert!(matches!(
+        store.read_range(&missing, 0, 0),
+        Err(CasError::NotFound(found)) if found == missing
+    ));
+    assert!(store.read_range(&hash, 7, 0).is_err());
+    assert!(store.read_range(&hash, 5, 2).is_err());
+    assert_eq!(store.read_range(&hash, 6, 0).unwrap(), b"");
+}
+
+#[test]
 fn streaming_put_of_existing_content_does_not_replace_it() {
     let root = TestDirectory::new();
     let store = LocalCas::open(root.as_ref()).unwrap();
