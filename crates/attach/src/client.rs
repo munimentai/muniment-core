@@ -450,6 +450,19 @@ pub struct ArtifactTransferMetadata {
     pub chunk_count: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactChunk {
+    pub chunk_index: u64,
+    pub offset: u64,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ArtifactTransferEvent {
+    Chunk(ArtifactChunk),
+    Complete,
+}
+
 impl fmt::Debug for ThreadListPage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -463,13 +476,13 @@ impl fmt::Debug for ThreadListPage {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::{
-        ApprovalDecision, ApprovalPresentRequest, ApprovalPresenterServeOutcome,
-        ArtifactTransferMetadata, ArtifactWindowGrant, AuthorizationSummary, ChatPermissionAnswer,
-        ClientError, MigrationControlFailure, MigrationControlOutcome, PendingPermission,
-        PermissionAnswerAccepted, PermissionDecision, RedactedRunEvent, RunCancelAccepted,
-        RunMessageAccepted, RunOpenPage, RunPermissionAnswerAccepted, RunResumeAccepted,
-        RunStartAccepted, RunStreamMessage, RunStreamSubscription, RunSubmitAccepted,
-        ThreadCreateAccepted, ThreadListPage, ThreadOpenPage,
+        ApprovalDecision, ApprovalPresentRequest, ApprovalPresenterServeOutcome, ArtifactChunk,
+        ArtifactTransferEvent, ArtifactTransferMetadata, ArtifactWindowGrant, AuthorizationSummary,
+        ChatPermissionAnswer, ClientError, MigrationControlFailure, MigrationControlOutcome,
+        PendingPermission, PermissionAnswerAccepted, PermissionDecision, RedactedRunEvent,
+        RunCancelAccepted, RunMessageAccepted, RunOpenPage, RunPermissionAnswerAccepted,
+        RunResumeAccepted, RunStartAccepted, RunStreamMessage, RunStreamSubscription,
+        RunSubmitAccepted, ThreadCreateAccepted, ThreadListPage, ThreadOpenPage,
     };
     use crate::{
         decode_frame, encode_frame, Authorization, Authorized, Client,
@@ -898,10 +911,115 @@ mod linux {
             let response = self.send_request(request, &request_id)?;
             let metadata: ArtifactTransferMetadata = serde_json::from_value(response.body)
                 .map_err(|_| ClientError::UnexpectedMessage)?;
-            if Id::new(&metadata.transfer_id).is_err() || Id::new(&metadata.artifact_id).is_err() {
+            if metadata.chunk_bytes == 0 {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            let expected_chunks = metadata.total_bytes.div_ceil(metadata.chunk_bytes);
+            if Id::new(&metadata.transfer_id).is_err()
+                || metadata.artifact_id != artifact_id.as_str()
+                || !valid_sha256(&metadata.sha256)
+                || metadata.chunk_bytes > 256 * 1024
+                || metadata.chunk_count != expected_chunks
+            {
                 return Err(ClientError::UnexpectedMessage);
             }
             Ok(metadata)
+        }
+
+        pub fn read_artifact_event(
+            &mut self,
+            metadata: &ArtifactTransferMetadata,
+        ) -> Result<ArtifactTransferEvent, ClientError> {
+            if Id::new(&metadata.transfer_id).is_err()
+                || Id::new(&metadata.artifact_id).is_err()
+                || !valid_sha256(&metadata.sha256)
+                || metadata.chunk_bytes == 0
+                || metadata.chunk_bytes > 256 * 1024
+                || metadata.chunk_count != metadata.total_bytes.div_ceil(metadata.chunk_bytes)
+            {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            let value = read_value(&mut self.stream, deadline(self.io_timeout))?;
+            if value
+                .get("protocol")
+                .and_then(Value::as_str)
+                .is_some_and(|protocol| protocol != PROTOCOL)
+            {
+                return Err(ClientError::ProtocolIncompatible);
+            }
+            let event =
+                match serde_json::from_value(value).map_err(|_| ClientError::UnexpectedMessage)? {
+                    Envelope::Event(event) => event,
+                    _ => return Err(ClientError::UnexpectedMessage),
+                };
+            if event.subscription_id.as_str() != metadata.transfer_id
+                || event.run_id.is_some()
+                || event.run_seq.is_some()
+            {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            match event.event {
+                EventName::ArtifactChunk => {
+                    #[derive(serde::Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct Body {
+                        artifact_id: String,
+                        byte_length: u64,
+                        chunk_index: u64,
+                        chunk_sha256: String,
+                        data: String,
+                        offset: u64,
+                    }
+                    let body: Body = serde_json::from_value(event.body)
+                        .map_err(|_| ClientError::UnexpectedMessage)?;
+                    let expected_offset = body
+                        .chunk_index
+                        .checked_mul(metadata.chunk_bytes)
+                        .ok_or(ClientError::UnexpectedMessage)?;
+                    let remaining = metadata
+                        .total_bytes
+                        .checked_sub(expected_offset)
+                        .ok_or(ClientError::UnexpectedMessage)?;
+                    let expected_length = remaining.min(metadata.chunk_bytes);
+                    let bytes = decode_base64(&body.data).ok_or(ClientError::UnexpectedMessage)?;
+                    if body.artifact_id != metadata.artifact_id
+                        || body.chunk_index >= metadata.chunk_count
+                        || body.offset != expected_offset
+                        || body.byte_length != expected_length
+                        || usize::try_from(body.byte_length).ok() != Some(bytes.len())
+                        || !valid_sha256(&body.chunk_sha256)
+                        || sha256_hex(&bytes) != body.chunk_sha256
+                    {
+                        return Err(ClientError::UnexpectedMessage);
+                    }
+                    Ok(ArtifactTransferEvent::Chunk(ArtifactChunk {
+                        chunk_index: body.chunk_index,
+                        offset: body.offset,
+                        bytes,
+                    }))
+                }
+                EventName::ArtifactComplete => {
+                    #[derive(serde::Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct Body {
+                        artifact_id: String,
+                        sha256: String,
+                        total_bytes: u64,
+                        transfer_id: String,
+                    }
+                    let body: Body = serde_json::from_value(event.body)
+                        .map_err(|_| ClientError::UnexpectedMessage)?;
+                    if body.artifact_id != metadata.artifact_id
+                        || body.transfer_id != metadata.transfer_id
+                        || body.total_bytes != metadata.total_bytes
+                        || body.sha256 != metadata.sha256
+                    {
+                        return Err(ClientError::UnexpectedMessage);
+                    }
+                    Ok(ArtifactTransferEvent::Complete)
+                }
+                _ => Err(ClientError::UnexpectedMessage),
+            }
         }
 
         pub fn start_run(
@@ -3506,6 +3624,134 @@ mod linux {
         }
     }
 
+    fn valid_sha256(value: &str) -> bool {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    fn decode_base64(value: &str) -> Option<Vec<u8>> {
+        if !value.len().is_multiple_of(4) {
+            return None;
+        }
+        let mut output = Vec::with_capacity(value.len() / 4 * 3);
+        for (group_index, group) in value.as_bytes().chunks_exact(4).enumerate() {
+            let last = group_index + 1 == value.len() / 4;
+            let padding = usize::from(group[3] == b'=') + usize::from(group[2] == b'=');
+            if padding > 2 || (!last && padding != 0) || (group[2] == b'=' && group[3] != b'=') {
+                return None;
+            }
+            let a = base64_value(group[0])?;
+            let b = base64_value(group[1])?;
+            let c = if group[2] == b'=' {
+                0
+            } else {
+                base64_value(group[2])?
+            };
+            let d = if group[3] == b'=' {
+                0
+            } else {
+                base64_value(group[3])?
+            };
+            if (padding == 1 && d != 0) || (padding == 2 && (c != 0 || b & 0x0f != 0)) {
+                return None;
+            }
+            if padding == 1 && c & 0x03 != 0 {
+                return None;
+            }
+            output.push((a << 2) | (b >> 4));
+            if padding < 2 {
+                output.push((b << 4) | (c >> 2));
+            }
+            if padding == 0 {
+                output.push((c << 6) | d);
+            }
+        }
+        Some(output)
+    }
+
+    fn base64_value(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        const INITIAL: [u32; 8] = [
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+            0x5be0cd19,
+        ];
+        const ROUND: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2,
+        ];
+        let bit_length = (bytes.len() as u64).wrapping_mul(8);
+        let mut padded = bytes.to_vec();
+        padded.push(0x80);
+        while padded.len() % 64 != 56 {
+            padded.push(0);
+        }
+        padded.extend_from_slice(&bit_length.to_be_bytes());
+        let mut hash = INITIAL;
+        for chunk in padded.chunks_exact(64) {
+            let mut words = [0_u32; 64];
+            for (word, bytes) in words.iter_mut().zip(chunk.chunks_exact(4)) {
+                *word = u32::from_be_bytes(bytes.try_into().expect("four-byte word"));
+            }
+            for index in 16..64 {
+                let s0 = words[index - 15].rotate_right(7)
+                    ^ words[index - 15].rotate_right(18)
+                    ^ (words[index - 15] >> 3);
+                let s1 = words[index - 2].rotate_right(17)
+                    ^ words[index - 2].rotate_right(19)
+                    ^ (words[index - 2] >> 10);
+                words[index] = words[index - 16]
+                    .wrapping_add(s0)
+                    .wrapping_add(words[index - 7])
+                    .wrapping_add(s1);
+            }
+            let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = hash;
+            for index in 0..64 {
+                let sum1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+                let choice = (e & f) ^ (!e & g);
+                let first = h
+                    .wrapping_add(sum1)
+                    .wrapping_add(choice)
+                    .wrapping_add(ROUND[index])
+                    .wrapping_add(words[index]);
+                let sum0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+                let majority = (a & b) ^ (a & c) ^ (b & c);
+                let second = sum0.wrapping_add(majority);
+                h = g;
+                g = f;
+                f = e;
+                e = d.wrapping_add(first);
+                d = c;
+                c = b;
+                b = a;
+                a = first.wrapping_add(second);
+            }
+            for (state, value) in hash.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+                *state = state.wrapping_add(value);
+            }
+        }
+        hash.iter().map(|word| format!("{word:08x}")).collect()
+    }
+
     fn map_io_error(error: io::Error) -> ClientError {
         match error.kind() {
             io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => ClientError::Timeout,
@@ -3781,6 +4027,13 @@ impl AuthorizedClient {
         &mut self,
         _artifact_id: &str,
     ) -> Result<ArtifactTransferMetadata, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+
+    pub fn read_artifact_event(
+        &mut self,
+        _metadata: &ArtifactTransferMetadata,
+    ) -> Result<ArtifactTransferEvent, ClientError> {
         Err(ClientError::UnsupportedPlatform)
     }
 

@@ -5,9 +5,10 @@ use muniment_attach::{
     encode_frame, handshake_approval_presenter_stream, handshake_desktop_client_stream,
     handshake_migration_control_stream, handshake_stream, handshake_stream_with_credential,
     reconnect_welcome, serve_desktop_client_at, welcome, ApprovalDecision,
-    ApprovalPresenterServeOutcome, ArtifactWindowGrant, ChatPermissionAnswer, ClientError,
-    DesktopClientHolder, DesktopClientStopHandle, ErrorAction, ErrorEnvelope, Event, EventName,
-    Failure, Id, MigrationControlFailure, MigrationControlOutcome, Operation, PermissionDecision,
+    ApprovalPresenterServeOutcome, ArtifactTransferEvent, ArtifactTransferMetadata,
+    ArtifactWindowGrant, ChatPermissionAnswer, ClientError, DesktopClientHolder,
+    DesktopClientStopHandle, ErrorAction, ErrorEnvelope, Event, EventName, Failure, Id,
+    MigrationControlFailure, MigrationControlOutcome, Operation, PermissionDecision,
     PermissionKind, Protocol, ProtocolError, RedactedRunEvent, Response, RunOpenPage,
     RunStreamMessage, Success, VersionRange, MAX_FRAME_LENGTH,
 };
@@ -4642,6 +4643,114 @@ fn artifact_fetch_uses_exact_envelope_and_returns_transfer_metadata() {
     assert_eq!(metadata.chunk_count, 2);
     assert_eq!(metadata.sha256.len(), 64);
     worker.join().unwrap();
+}
+
+#[test]
+fn artifact_reader_returns_validated_chunk_and_completion_events() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let metadata = ArtifactTransferMetadata {
+        transfer_id: "01900000-0000-7000-8000-000000000002".into(),
+        artifact_id: "01900000-0000-7000-8000-000000000001".into(),
+        total_bytes: 7,
+        sha256: "f16d05ec6b29248d2c61adb1e9263f78e4f7bace1b955014a2d17872cfe4064d".into(),
+        chunk_bytes: 7,
+        chunk_count: 1,
+    };
+    let expected = metadata.clone();
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        for event in [
+            serde_json::json!({
+                "protocol": "muniment.attach/1",
+                "subscription_id": expected.transfer_id,
+                "event": "artifact.chunk",
+                "body": {
+                    "artifact_id": expected.artifact_id,
+                    "byte_length": 7,
+                    "chunk_index": 0,
+                    "chunk_sha256": expected.sha256,
+                    "data": "Zml4dHVyZQ==",
+                    "offset": 0
+                }
+            }),
+            serde_json::json!({
+                "protocol": "muniment.attach/1",
+                "subscription_id": expected.transfer_id,
+                "event": "artifact.complete",
+                "body": {
+                    "artifact_id": expected.artifact_id,
+                    "sha256": expected.sha256,
+                    "total_bytes": 7,
+                    "transfer_id": expected.transfer_id
+                }
+            }),
+        ] {
+            server.write_all(&encode_frame(&event).unwrap()).unwrap();
+        }
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    let ArtifactTransferEvent::Chunk(chunk) = client.read_artifact_event(&metadata).unwrap() else {
+        panic!("expected an artifact chunk");
+    };
+    assert_eq!(chunk.chunk_index, 0);
+    assert_eq!(chunk.offset, 0);
+    assert_eq!(chunk.bytes, b"fixture");
+    assert_eq!(
+        client.read_artifact_event(&metadata),
+        Ok(ArtifactTransferEvent::Complete)
+    );
+    worker.join().unwrap();
+}
+
+#[test]
+fn artifact_reader_rejects_contradictory_chunk_fields_without_returning_bytes() {
+    let valid_body = serde_json::json!({
+        "artifact_id": "01900000-0000-7000-8000-000000000001",
+        "byte_length": 7,
+        "chunk_index": 0,
+        "chunk_sha256": "f16d05ec6b29248d2c61adb1e9263f78e4f7bace1b955014a2d17872cfe4064d",
+        "data": "Zml4dHVyZQ==",
+        "offset": 0
+    });
+    for (field, value) in [
+        (
+            "artifact_id",
+            serde_json::json!("01900000-0000-7000-8000-000000000003"),
+        ),
+        ("byte_length", serde_json::json!(6)),
+        ("chunk_index", serde_json::json!(1)),
+        ("chunk_sha256", serde_json::json!("0".repeat(64))),
+        ("data", serde_json::json!("%%%")),
+        ("offset", serde_json::json!(1)),
+    ] {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let mut body = valid_body.clone();
+        body[field] = value;
+        let worker = thread::spawn(move || {
+            complete_pairing(&mut server);
+            let event = serde_json::json!({
+                "protocol": "muniment.attach/1",
+                "subscription_id": "01900000-0000-7000-8000-000000000002",
+                "event": "artifact.chunk",
+                "body": body
+            });
+            server.write_all(&encode_frame(&event).unwrap()).unwrap();
+        });
+        let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+        let metadata = ArtifactTransferMetadata {
+            transfer_id: "01900000-0000-7000-8000-000000000002".into(),
+            artifact_id: "01900000-0000-7000-8000-000000000001".into(),
+            total_bytes: 7,
+            sha256: "f16d05ec6b29248d2c61adb1e9263f78e4f7bace1b955014a2d17872cfe4064d".into(),
+            chunk_bytes: 7,
+            chunk_count: 1,
+        };
+        assert_eq!(
+            client.read_artifact_event(&metadata),
+            Err(ClientError::UnexpectedMessage)
+        );
+        worker.join().unwrap();
+    }
 }
 
 #[test]
