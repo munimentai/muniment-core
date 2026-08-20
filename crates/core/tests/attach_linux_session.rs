@@ -627,6 +627,29 @@ impl ThreadListService for StreamService {
         assert_eq!(run_id, self.page.run_id);
         Ok(self.page.clone())
     }
+
+    fn fetch_artifact(
+        &mut self,
+        workspace: &str,
+        _: &Id,
+    ) -> Result<ArtifactFetchResult, muniment_core::attach::ProtocolError> {
+        assert_eq!(workspace, "workspace-1");
+        Ok(ArtifactFetchResult {
+            total_bytes: 1,
+            sha256: "0".repeat(64),
+        })
+    }
+
+    fn read_artifact_range(
+        &mut self,
+        workspace: &str,
+        _: &Id,
+        _: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, muniment_core::attach::ProtocolError> {
+        assert_eq!(workspace, "workspace-1");
+        Ok(vec![0; length as usize])
+    }
 }
 
 struct OpenService {
@@ -2859,6 +2882,111 @@ fn request_cancel_closes_this_connection_run_stream_then_rejects_a_second_cancel
         ))
         .unwrap();
     assert_redacted_request_error(&read_frame(&mut client), 83, ErrorCode::AlreadyCompleted);
+
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(server_thread.join().unwrap(), Ok(()));
+}
+
+#[test]
+fn request_cancel_retires_only_the_named_artifact_transfer() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000035";
+    const ARTIFACT: &str = "0190a100-0000-7000-8000-000000000079";
+    let (mut client, server_thread) = request_cancel_stream_session(RUN);
+    client
+        .write_all(&request(
+            85,
+            Operation::RunStream,
+            json!({"run_id": RUN, "after_run_seq": 0}),
+        ))
+        .unwrap();
+    let run_response: Response = read_frame(&mut client);
+    let run_subscription = run_response.body["subscription_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let _: Event = read_frame(&mut client);
+    let _: Event = read_frame(&mut client);
+
+    for request_id in [86, 87] {
+        client
+            .write_all(&request(
+                request_id,
+                Operation::ArtifactFetch,
+                json!({"artifact_id": ARTIFACT}),
+            ))
+            .unwrap();
+    }
+    let cancelled_transfer: Response = read_frame(&mut client);
+    let live_transfer: Response = read_frame(&mut client);
+    let cancelled_transfer_id = cancelled_transfer.body["transfer_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let live_transfer_id = live_transfer.body["transfer_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    client
+        .write_all(&request(
+            88,
+            Operation::RequestCancel,
+            json!({"kind": "subscription", "subscription_id": cancelled_transfer_id}),
+        ))
+        .unwrap();
+    let response: Response = read_frame(&mut client);
+    assert_eq!(response.body["subscription_id"], cancelled_transfer_id);
+    let cancelled: Event = read_frame(&mut client);
+    assert_eq!(cancelled.event, EventName::RequestCancelled);
+    assert_eq!(cancelled.subscription_id.as_str(), cancelled_transfer_id);
+    assert_eq!(cancelled.run_id, None);
+    assert_eq!(cancelled.run_seq, None);
+    let closed: Event = read_frame(&mut client);
+    assert_eq!(closed.event, EventName::StreamClosed);
+    assert_eq!(closed.subscription_id.as_str(), cancelled_transfer_id);
+    assert_eq!(closed.run_id, None);
+    assert_eq!(closed.run_seq, None);
+    assert_eq!(closed.body, json!({"code": "cancelled", "resumable": true}));
+
+    client
+        .write_all(&request(
+            89,
+            Operation::RequestCancel,
+            json!({"kind": "subscription", "subscription_id": cancelled_transfer_id}),
+        ))
+        .unwrap();
+    assert_redacted_request_error(&read_frame(&mut client), 89, ErrorCode::AlreadyCompleted);
+    client
+        .write_all(&request(
+            90,
+            Operation::ArtifactWindow,
+            json!({
+                "transfer_id": live_transfer_id,
+                "ack_through_chunk": -1,
+                "max_chunks": 1
+            }),
+        ))
+        .unwrap();
+    let _: Response = read_frame(&mut client);
+    let chunk: Event = read_frame(&mut client);
+    assert_eq!(chunk.event, EventName::ArtifactChunk);
+    assert_eq!(chunk.subscription_id.as_str(), live_transfer_id);
+
+    client
+        .write_all(&request(
+            91,
+            Operation::RequestCancel,
+            json!({"kind": "subscription", "subscription_id": run_subscription}),
+        ))
+        .unwrap();
+    let _: Response = read_frame(&mut client);
+    let run_cancelled: Event = read_frame(&mut client);
+    assert_eq!(run_cancelled.event, EventName::RequestCancelled);
+    assert_eq!(run_cancelled.subscription_id.as_str(), run_subscription);
+    assert_eq!(run_cancelled.run_id.as_ref().unwrap().as_str(), RUN);
+    let run_closed: Event = read_frame(&mut client);
+    assert_eq!(run_closed.event, EventName::StreamClosed);
+    assert_eq!(run_closed.subscription_id.as_str(), run_subscription);
 
     client.shutdown(Shutdown::Write).unwrap();
     assert_eq!(server_thread.join().unwrap(), Ok(()));

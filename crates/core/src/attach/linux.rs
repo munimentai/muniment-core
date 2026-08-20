@@ -3512,6 +3512,38 @@ fn dispatch_request<S: ThreadListService>(
             ("subscription", Some(subscription_id), None) => {
                 let subscription_id = super::Id::new(subscription_id)
                     .map_err(|_| ProtocolError::invalid_request())?;
+                if registries
+                    .artifact_transfers
+                    .remove(&subscription_id)
+                    .is_ok()
+                {
+                    registries
+                        .cancelled_subscriptions
+                        .insert(subscription_id.clone());
+                    return Ok(DispatchResult {
+                        body: serde_json::json!({
+                            "subscription_id": subscription_id,
+                        }),
+                        events: vec![
+                            Event {
+                                protocol: Protocol,
+                                subscription_id: subscription_id.clone(),
+                                event: EventName::RequestCancelled,
+                                run_id: None,
+                                run_seq: None,
+                                body: serde_json::json!({}),
+                            },
+                            Event {
+                                protocol: Protocol,
+                                subscription_id,
+                                event: EventName::StreamClosed,
+                                run_id: None,
+                                run_seq: None,
+                                body: serde_json::json!({"code": "cancelled", "resumable": true}),
+                            },
+                        ],
+                    });
+                }
                 let Some(index) = subscriptions
                     .iter()
                     .position(|stream| stream.cursor.subscription_id() == &subscription_id)
