@@ -5,13 +5,13 @@ use muniment_core::attach::linux::{
     run_authenticated_session_with_authorization,
     run_authenticated_session_with_authorization_and_registry,
     run_authenticated_session_with_authorization_registry_and_migration,
-    run_authenticated_session_with_service_and_approvals, ApprovalDecision, AttachSessionError,
-    AuthorizationSessionDependencies, CompanionProvenance, LiveConnectionRegistry,
-    MigrationControlRequest, MigrationControlSessionDependencies, PeerCredentials,
-    PermissionAnswerAccepted, PermissionAnswerRequest, RedactedThreadSummary, RunCancelAccepted,
-    RunCancelRequest, RunStartAccepted, RunStartRequest, RunStreamPage, ThreadListPage,
-    ThreadListRequest, ThreadListService, ThreadOpenRequest, MAX_PERMISSION_GATE_ID_LENGTH,
-    MAX_RUN_START_CONTEXT_LENGTH, MAX_RUN_START_TEXT_LENGTH,
+    run_authenticated_session_with_service_and_approvals, ApprovalDecision, ArtifactFetchResult,
+    AttachSessionError, AuthorizationSessionDependencies, CompanionProvenance,
+    LiveConnectionRegistry, MigrationControlRequest, MigrationControlSessionDependencies,
+    PeerCredentials, PermissionAnswerAccepted, PermissionAnswerRequest, RedactedThreadSummary,
+    RunCancelAccepted, RunCancelRequest, RunStartAccepted, RunStartRequest, RunStreamPage,
+    ThreadListPage, ThreadListRequest, ThreadListService, ThreadOpenRequest,
+    MAX_PERMISSION_GATE_ID_LENGTH, MAX_RUN_START_CONTEXT_LENGTH, MAX_RUN_START_TEXT_LENGTH,
 };
 use muniment_core::attach::{
     decode_frame, encode_frame, Approval, AuthorizationClock, AuthorizationTokenGenerator,
@@ -28,7 +28,7 @@ use muniment_core::journal::{
 };
 use serde_json::json;
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
@@ -295,6 +295,7 @@ fn unavailable_service(
 struct StartService {
     calls: Vec<(String, String, RunStartRequest, Id, Id, CompanionProvenance)>,
     output: Option<RunStartAccepted>,
+    artifact_ids: Vec<(String, Id)>,
 }
 
 #[derive(Default)]
@@ -729,6 +730,19 @@ impl ThreadListService for StartService {
             committed_seq: 2,
             accepted_at: "2026-07-17T00:00:00Z".into(),
         }))
+    }
+
+    fn fetch_artifact(
+        &mut self,
+        workspace: &str,
+        artifact_id: &Id,
+    ) -> Result<ArtifactFetchResult, muniment_core::attach::ProtocolError> {
+        self.artifact_ids
+            .push((workspace.to_owned(), artifact_id.clone()));
+        Ok(ArtifactFetchResult {
+            total_bytes: 300_000,
+            sha256: "0".repeat(64),
+        })
     }
 }
 
@@ -6019,14 +6033,61 @@ fn run_open_rejects_missing_scope_malformed_bodies_and_inaccessible_runs() {
 }
 
 #[test]
-fn unserved_operations_remain_unsupported_without_dispatch() {
+fn artifact_fetch_rejects_a_malformed_body() {
+    for (request_id, body) in [
+        (79, json!({})),
+        (80, json!({"artifact_id": "not-an-id"})),
+        (
+            81,
+            json!({
+                "artifact_id": "0190a100-0000-7000-8000-000000000079",
+                "unknown": true
+            }),
+        ),
+    ] {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&hello(1, 1)).unwrap();
+        client
+            .write_all(&request(request_id, Operation::ArtifactFetch, body))
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut service = StartService::default();
+        assert_eq!(
+            dispatch_session(
+                &mut client,
+                server,
+                TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                &mut service,
+            ),
+            Ok(())
+        );
+        let error: ErrorEnvelope = read_frame(&mut client);
+        assert_eq!(
+            error.request_id,
+            Some(Id::new(format!("{request_id:032x}")).unwrap())
+        );
+        assert_eq!(error.error.code(), ErrorCode::InvalidRequest);
+        assert!(!error.error.retryable());
+        assert!(service.calls.is_empty());
+        assert!(service.artifact_ids.is_empty());
+    }
+}
+
+#[test]
+fn artifact_fetch_requires_thread_read() {
+    let artifact_id = "0190a100-0000-7000-8000-000000000079";
     let (mut client, server) = UnixStream::pair().unwrap();
     client.write_all(&hello(1, 1)).unwrap();
     client
-        .write_all(&request(79, Operation::ArtifactFetch, json!({})))
+        .write_all(&request(
+            82,
+            Operation::ArtifactFetch,
+            json!({"artifact_id": artifact_id}),
+        ))
         .unwrap();
     client.shutdown(Shutdown::Write).unwrap();
     let mut approved = approval();
+    approved.scopes.clear();
     approved.scopes.insert("run.write".into());
     let mut service = StartService::default();
     assert_eq!(
@@ -6037,15 +6098,50 @@ fn unserved_operations_remain_unsupported_without_dispatch() {
             approved,
             &mut service,
         ),
-        Ok(())
+        Err(AttachSessionError::Authorization)
     );
     let error: ErrorEnvelope = read_frame(&mut client);
-    assert_eq!(
-        error.request_id,
-        Some(Id::new(format!("{:032x}", 79)).unwrap())
-    );
-    assert_eq!(error.error.code(), ErrorCode::UnsupportedOperation);
-    assert!(service.calls.is_empty());
+    assert_eq!(error.error.code(), ErrorCode::Unauthorized);
+    assert!(!error.error.retryable());
+    assert!(service.artifact_ids.is_empty());
+}
+
+#[test]
+fn artifact_fetch_returns_metadata_and_rejects_the_sixty_fifth_live_transfer() {
+    let artifact_id = Id::new("0190a100-0000-7000-8000-000000000079").unwrap();
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello(1, 1)).unwrap();
+    for request_id in 1..=65 {
+        client
+            .write_all(&request(
+                900 + request_id,
+                Operation::ArtifactFetch,
+                json!({"artifact_id": artifact_id}),
+            ))
+            .unwrap();
+    }
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut service = StartService::default();
+    dispatch_session(
+        &mut client,
+        server,
+        TestClock(Rc::new(Cell::new(Duration::ZERO))),
+        &mut service,
+    )
+    .unwrap();
+    let mut transfer_ids = HashSet::new();
+    for _ in 0..64 {
+        let response: Response = read_frame(&mut client);
+        assert_eq!(response.body["artifact_id"], json!(artifact_id));
+        assert_eq!(response.body["total_bytes"], json!(300_000));
+        assert_eq!(response.body["sha256"], json!("0".repeat(64)));
+        assert_eq!(response.body["chunk_bytes"], json!(256 * 1024));
+        assert_eq!(response.body["chunk_count"], json!(2));
+        assert!(transfer_ids.insert(response.body["transfer_id"].clone()));
+    }
+    let error: ErrorEnvelope = read_frame(&mut client);
+    assert_eq!(error.error.code(), ErrorCode::InvalidRequest);
+    assert_eq!(service.artifact_ids.len(), 65);
 }
 
 #[test]

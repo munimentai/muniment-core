@@ -1081,6 +1081,14 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         self.boundaries.stream_run(workspace, run_id, after_run_seq)
     }
 
+    fn fetch_artifact(
+        &mut self,
+        workspace: &str,
+        artifact_id: &Id,
+    ) -> Result<super::linux::ArtifactFetchResult, ProtocolError> {
+        self.boundaries.fetch_artifact(workspace, artifact_id)
+    }
+
     fn subscribe_run_commits(
         &mut self,
         run_id: &str,

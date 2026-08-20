@@ -1532,6 +1532,41 @@ impl RunJournal {
             .map_err(Into::into)
     }
 
+    /// Resolves a CAS-backed event by its durable ID inside one workspace.
+    pub fn workspace_artifact(
+        &mut self,
+        workspace: &str,
+        event_id: &str,
+    ) -> Result<Option<CasReference>, JournalError> {
+        let coordination = self.coordination.clone();
+        let _operation = coordination
+            .as_ref()
+            .map(|state| state.operation.lock().unwrap());
+        self.refresh_after_compaction()?;
+        let raw = self
+            .connection
+            .as_ref()
+            .expect("journal connection is always present outside compaction")
+            .query_row(
+                "SELECT e.envelope_json FROM events e \
+                 JOIN run_workspaces w ON w.run_id=e.run_id \
+                 WHERE e.event_id=?1 AND w.workspace=?2",
+                params![event_id, workspace],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        let envelope: EventEnvelope = serde_json::from_str(&raw).map_err(|error| {
+            JournalError::Corrupt(format!("invalid stored envelope JSON: {error}"))
+        })?;
+        Ok(match envelope.payload {
+            EventPayload::Cas { payload_cas } => Some(payload_cas),
+            EventPayload::Inline { .. } | EventPayload::Attachment { .. } => None,
+        })
+    }
+
     pub fn events(&mut self, run_id: &str) -> Result<Vec<EventEnvelope>, JournalError> {
         let coordination = self.coordination.clone();
         let _operation = coordination

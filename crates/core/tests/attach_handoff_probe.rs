@@ -144,15 +144,16 @@ fn times_out_when_a_listener_stays_silent() {
     let socket = TestSocket::new();
     let listener = UnixListener::bind(&socket.0).unwrap();
     thread::scope(|scope| {
-        let server = scope.spawn(|| {
+        let (probe_finished_tx, probe_finished_rx) = mpsc::sync_channel(0);
+        let server = scope.spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             read_hello(&mut stream);
-            thread::sleep(Duration::from_millis(100));
+            probe_finished_rx.recv().unwrap();
         });
-        assert_eq!(
-            read_handoff_probe_welcome(&socket.0, Instant::now() + Duration::from_millis(25)),
-            Err(HandoffProbeError::ReadinessDeadlineReached)
-        );
+        let result =
+            read_handoff_probe_welcome(&socket.0, Instant::now() + Duration::from_millis(25));
+        probe_finished_tx.send(()).unwrap();
+        assert_eq!(result, Err(HandoffProbeError::ReadinessDeadlineReached));
         server.join().unwrap();
     });
 }

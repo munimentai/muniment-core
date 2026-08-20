@@ -17,11 +17,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::{
-    encode_frame, welcome, Approval, AuthorizationClock, AuthorizationError, AuthorizationState,
+    encode_frame, welcome, Approval, ArtifactMetadata, ArtifactTransfer, ArtifactTransferRegistry,
+    ArtifactTransferRegistryError, AuthorizationClock, AuthorizationError, AuthorizationState,
     AuthorizationTokenGenerator, ConnectionBinding, Envelope, ErrorEnvelope, Event, EventName,
     Failure, FirstMessage, NegotiationError, Operation, Protocol, ProtocolError, Request, Response,
     Success, VersionRange, WorkspaceOnboardRequest, WorkspaceOnboarded, CHALLENGE_LIFETIME,
-    MAX_FRAME_LENGTH, MAX_TEXT_LENGTH,
+    MAX_ARTIFACT_CHUNK_BYTES, MAX_FRAME_LENGTH, MAX_TEXT_LENGTH,
 };
 use super::{
     RunEventAdmission, RunStreamCursor, MAX_RUN_STREAM_WINDOW_BYTES, MAX_RUN_STREAM_WINDOW_EVENTS,
@@ -951,6 +952,12 @@ pub struct EntitlementSnapshotResult {
     pub changed_snapshot_version: Option<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactFetchResult {
+    pub total_bytes: u64,
+    pub sha256: String,
+}
+
 /// Deterministic desktop service seam for authorized attach requests.
 pub trait ThreadListService {
     fn drain_state(&self) -> Option<&super::DrainState> {
@@ -1207,6 +1214,14 @@ pub trait ThreadListService {
         _run_id: &str,
         _after_run_seq: u64,
     ) -> Result<RunStreamPage, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn fetch_artifact(
+        &mut self,
+        _workspace: &str,
+        _artifact_id: &super::Id,
+    ) -> Result<ArtifactFetchResult, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
 
@@ -2069,7 +2084,7 @@ fn run_migration_control_session<S: ThreadListService>(
         peer_uid: credentials.uid,
         peer_pid: credentials.pid as u32,
     };
-    let mut cancelled_subscriptions = HashSet::new();
+    let mut registries = SessionRegistries::default();
     loop {
         let deadline = Instant::now()
             .checked_add(timeout)
@@ -2091,8 +2106,8 @@ fn run_migration_control_session<S: ThreadListService>(
             provenance.clone(),
             service,
             &mut Vec::new(),
-            &mut cancelled_subscriptions,
             &mut None,
+            &mut registries,
         ) {
             Ok(dispatched) => {
                 let response = Response {
@@ -2130,8 +2145,8 @@ fn serve_desktop_client_requests<S: ThreadListService>(
     service: &mut S,
 ) -> Result<(), AttachSessionError> {
     let mut subscriptions = Vec::new();
-    let mut cancelled_subscriptions = HashSet::new();
     let mut chat_subscription = None;
+    let mut registries = SessionRegistries::default();
     loop {
         let live_events = match poll_run_streams(service, &mut subscriptions) {
             Ok(events) => events,
@@ -2194,8 +2209,8 @@ fn serve_desktop_client_requests<S: ThreadListService>(
             session.provenance.clone(),
             service,
             &mut subscriptions,
-            &mut cancelled_subscriptions,
             &mut chat_subscription,
+            &mut registries,
         ) {
             Ok(dispatched) => {
                 let response = Response {
@@ -2297,7 +2312,7 @@ where
     S: ThreadListService,
 {
     let mut subscriptions = Vec::new();
-    let mut cancelled_subscriptions = HashSet::new();
+    let mut registries = SessionRegistries::default();
     loop {
         let gate = session
             .connection
@@ -2481,6 +2496,7 @@ where
             | Operation::RunOpen
             | Operation::RunStream
             | Operation::RunCursorAck
+            | Operation::ArtifactFetch
             | Operation::RequestCancel => Some("thread.read"),
             Operation::ThreadCreate
             | Operation::RunStart
@@ -2513,8 +2529,8 @@ where
             session.provenance.clone(),
             service,
             &mut subscriptions,
-            &mut cancelled_subscriptions,
             &mut None,
+            &mut registries,
         ) {
             Ok(dispatched) => {
                 let response = Response {
@@ -2599,6 +2615,12 @@ fn wait_until_readable(stream: &UnixStream, deadline: Instant) -> Result<(), Att
 struct DispatchResult {
     body: serde_json::Value,
     events: Vec<Event>,
+}
+
+#[derive(Debug, Default)]
+struct SessionRegistries {
+    cancelled_subscriptions: HashSet<super::Id>,
+    artifact_transfers: ArtifactTransferRegistry,
 }
 
 struct DispatchFailure {
@@ -2932,8 +2954,8 @@ fn dispatch_request<S: ThreadListService>(
     provenance: CompanionProvenance,
     service: &mut S,
     subscriptions: &mut Vec<ActiveRunStream>,
-    cancelled_subscriptions: &mut HashSet<super::Id>,
     chat_subscription: &mut Option<ActiveChatSubscription>,
+    registries: &mut SessionRegistries,
 ) -> Result<DispatchResult, DispatchFailure> {
     let _drain_admission = service
         .drain_state()
@@ -2948,6 +2970,49 @@ fn dispatch_request<S: ThreadListService>(
         });
     }
     request.validate_idempotency_key()?;
+    if request.operation == Operation::ArtifactFetch {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            artifact_id: String,
+        }
+        let body: Body =
+            serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
+        let artifact_id =
+            super::Id::new(body.artifact_id).map_err(|_| ProtocolError::invalid_request())?;
+        let artifact = service.fetch_artifact(workspace, &artifact_id)?;
+        let chunk_bytes = MAX_ARTIFACT_CHUNK_BYTES;
+        let chunk_count = artifact.total_bytes.div_ceil(chunk_bytes);
+        let mut transfer_random = [0u8; 16];
+        getrandom::fill(&mut transfer_random).map_err(|_| ProtocolError::persistence_failed())?;
+        let transfer_id = super::Id::new(hex(&transfer_random))
+            .map_err(|_| ProtocolError::persistence_failed())?;
+        let metadata = ArtifactMetadata {
+            transfer_id: transfer_id.clone(),
+            artifact_id: artifact_id.clone(),
+            total_bytes: artifact.total_bytes,
+            sha256: artifact.sha256,
+            chunk_bytes,
+            chunk_count,
+        };
+        let transfer = ArtifactTransfer::new(metadata.clone())
+            .map_err(|_| ProtocolError::persistence_failed())?;
+        registries
+            .artifact_transfers
+            .insert(transfer)
+            .map_err(|error| match error {
+                ArtifactTransferRegistryError::BoundReached => ProtocolError::invalid_request(),
+                ArtifactTransferRegistryError::NotFound => ProtocolError::persistence_failed(),
+            })?;
+        return Ok(response_only(serde_json::json!({
+            "transfer_id": transfer_id,
+            "artifact_id": artifact_id,
+            "total_bytes": metadata.total_bytes,
+            "sha256": metadata.sha256,
+            "chunk_bytes": metadata.chunk_bytes,
+            "chunk_count": metadata.chunk_count,
+        })));
+    }
     if request.operation == Operation::RunChatEvents {
         if request.body != serde_json::json!({}) {
             return Err(ProtocolError::invalid_request().into());
@@ -3276,7 +3341,10 @@ fn dispatch_request<S: ThreadListService>(
                     .iter()
                     .position(|stream| stream.cursor.subscription_id() == &subscription_id)
                 else {
-                    return Err(if cancelled_subscriptions.contains(&subscription_id) {
+                    return Err(if registries
+                        .cancelled_subscriptions
+                        .contains(&subscription_id)
+                    {
                         ProtocolError::already_completed()
                     } else {
                         ProtocolError::subscription_not_found()
@@ -3284,7 +3352,9 @@ fn dispatch_request<S: ThreadListService>(
                     .into());
                 };
                 let stream = subscriptions.remove(index);
-                cancelled_subscriptions.insert(subscription_id.clone());
+                registries
+                    .cancelled_subscriptions
+                    .insert(subscription_id.clone());
                 let run_id = stream.cursor.run_id().clone();
                 let run_seq = stream.cursor.highest_sent_run_seq();
                 return Ok(DispatchResult {

@@ -222,6 +222,14 @@ pub trait RunAttachBoundaries {
         after_run_seq: u64,
     ) -> Result<crate::attach::linux::RunStreamPage, ProtocolError>;
     #[cfg(target_os = "linux")]
+    fn fetch_artifact(
+        &self,
+        _workspace: &str,
+        _artifact_id: &crate::attach::Id,
+    ) -> Result<crate::attach::linux::ArtifactFetchResult, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(target_os = "linux")]
     fn subscribe_run_commits(
         &self,
         run_id: &str,
