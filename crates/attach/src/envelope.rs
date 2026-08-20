@@ -234,6 +234,7 @@ pub enum ErrorCode {
     InvalidArtifactCursor,
     InvalidRequest,
     ThreadNotFound,
+    TransferNotFound,
     Unauthorized,
     UnsupportedOperation,
     MigrationNotReady,
@@ -493,6 +494,8 @@ pub enum ErrorMessage {
     InvalidRequest,
     #[serde(rename = "The thread was not found.")]
     ThreadNotFound,
+    #[serde(rename = "The artifact transfer was not found.")]
+    TransferNotFound,
     #[serde(rename = "The capability is not authorized.")]
     Unauthorized,
     #[serde(rename = "The operation is not supported.")]
@@ -589,6 +592,10 @@ impl ProtocolError {
         Self::simple(ErrorCode::ThreadNotFound, ErrorMessage::ThreadNotFound)
     }
 
+    pub fn transfer_not_found() -> Self {
+        Self::simple(ErrorCode::TransferNotFound, ErrorMessage::TransferNotFound)
+    }
+
     pub fn unauthorized() -> Self {
         Self::simple(ErrorCode::Unauthorized, ErrorMessage::Unauthorized)
     }
@@ -683,6 +690,7 @@ impl<'de> Deserialize<'de> for ProtocolError {
             (ErrorCode::InvalidArtifactCursor, None, None) => Self::invalid_artifact_cursor(),
             (ErrorCode::InvalidRequest, None, None) => Self::invalid_request(),
             (ErrorCode::ThreadNotFound, None, None) => Self::thread_not_found(),
+            (ErrorCode::TransferNotFound, None, None) => Self::transfer_not_found(),
             (ErrorCode::Unauthorized, None, None) => Self::unauthorized(),
             (ErrorCode::UnsupportedOperation, None, None) => Self::unsupported_operation(),
             (ErrorCode::MigrationNotReady, None, None) => Self::migration_not_ready(),

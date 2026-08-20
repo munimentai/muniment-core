@@ -698,6 +698,7 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         crate::ErrorCode::RuntimeDraining,
         crate::ErrorCode::SubscriptionNotFound,
         crate::ErrorCode::AlreadyCompleted,
+        crate::ErrorCode::TransferNotFound,
     ];
     for (index, code) in errors.into_iter().enumerate() {
         let (name, error) = error_fixture(code);
@@ -885,6 +886,7 @@ fn error_fixture(code: crate::ErrorCode) -> (&'static str, ProtocolError) {
         ),
         InvalidRequest => ("invalid-request", ProtocolError::invalid_request()),
         ThreadNotFound => ("thread-not-found", ProtocolError::thread_not_found()),
+        TransferNotFound => ("transfer-not-found", ProtocolError::transfer_not_found()),
         Unauthorized => ("unauthorized", ProtocolError::unauthorized()),
         UnsupportedOperation => (
             "unsupported-operation",
@@ -1068,6 +1070,7 @@ mod tests {
             crate::ErrorCode::InvalidArtifactCursor,
             crate::ErrorCode::InvalidRequest,
             crate::ErrorCode::ThreadNotFound,
+            crate::ErrorCode::TransferNotFound,
             crate::ErrorCode::Unauthorized,
             crate::ErrorCode::UnsupportedOperation,
             crate::ErrorCode::MigrationNotReady,
@@ -1097,7 +1100,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            75,
+            76,
             "every canonical fixture must be inventoried"
         );
     }

@@ -429,6 +429,41 @@ fn canonical_command_and_artifact_fixtures_match_the_pinned_contract() {
 }
 
 #[test]
+fn transfer_not_found_error_fixture_matches_the_closed_schema() {
+    let expected = ProtocolError::transfer_not_found();
+    assert_eq!(expected.code(), ErrorCode::TransferNotFound);
+    assert_eq!(expected.message(), ErrorMessage::TransferNotFound);
+    assert!(!expected.retryable());
+    assert!(expected.action().is_none());
+    assert!(expected.details().is_none());
+
+    let Envelope::Error(error) =
+        serde_json::from_value(canonical_fixture("error-transfer-not-found.json")).unwrap()
+    else {
+        panic!("expected error fixture");
+    };
+    assert_eq!(error.error, expected);
+    let encoded = serde_json::to_string(&error.error).unwrap();
+    assert!(!encoded.contains("details"));
+    let round_trip: ProtocolError = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(round_trip, expected);
+
+    let mismatched = json!({
+        "code": "transfer_not_found",
+        "message": "The thread was not found.",
+        "retryable": false
+    });
+    assert!(serde_json::from_value::<ProtocolError>(mismatched).is_err());
+
+    let retryable = json!({
+        "code": "transfer_not_found",
+        "message": "The artifact transfer was not found.",
+        "retryable": true
+    });
+    assert!(serde_json::from_value::<ProtocolError>(retryable).is_err());
+}
+
+#[test]
 fn subscription_cancel_error_fixtures_match_helpers() {
     for (name, expected) in [
         (
