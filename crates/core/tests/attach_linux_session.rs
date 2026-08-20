@@ -6710,6 +6710,79 @@ fn artifact_window_rejects_invalid_cursor_inputs_with_a_resumable_closure() {
 }
 
 #[test]
+fn artifact_window_expires_a_transfer_that_exceeds_the_retained_byte_budget() {
+    let artifact_id = "0190a100-0000-7000-8000-000000000079";
+    let request_id = 919;
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        let mut service = StartService {
+            artifact_fetch_result: Some(ArtifactFetchResult {
+                total_bytes: 9 * 1024 * 1024,
+                sha256: "0".repeat(64),
+            }),
+            ..StartService::default()
+        };
+        run_authenticated_session_with_authorization(
+            server,
+            credentials(),
+            "0.1.0",
+            Duration::from_secs(1),
+            AuthorizationSessionDependencies {
+                fill_random: |bytes: &mut [u8]| {
+                    bytes.fill(9);
+                    Ok(())
+                },
+                clock: TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                tokens: TestTokens(1),
+                approvals: |_: &muniment_core::attach::PairingChallenge, _: Duration| {
+                    Some(ApprovalDecision::Approve(approval()))
+                },
+            },
+            &mut service,
+        )
+    });
+    client.write_all(&hello(1, 1)).unwrap();
+    let _: Welcome = read_frame(&mut client);
+    let _: Authorized = read_frame(&mut client);
+    client
+        .write_all(&request(
+            918,
+            Operation::ArtifactFetch,
+            json!({"artifact_id": artifact_id}),
+        ))
+        .unwrap();
+    let fetched: Response = read_frame(&mut client);
+    let transfer_id = fetched.body["transfer_id"].as_str().unwrap();
+    client
+        .write_all(&request(
+            request_id,
+            Operation::ArtifactWindow,
+            json!({
+                "transfer_id": transfer_id,
+                "ack_through_chunk": -1,
+                "max_chunks": 33
+            }),
+        ))
+        .unwrap();
+    let error: ErrorEnvelope = read_frame(&mut client);
+    assert_eq!(
+        error.request_id.unwrap().as_str(),
+        format!("{request_id:032x}")
+    );
+    assert_eq!(error.error.code(), ErrorCode::SlowConsumer);
+    assert!(error.error.retryable());
+    let closed: Event = read_frame(&mut client);
+    assert_eq!(closed.event, EventName::StreamClosed);
+    assert_eq!(closed.subscription_id.as_str(), transfer_id);
+    assert_eq!(
+        closed.body,
+        json!({"code": "slow_consumer", "resumable": true})
+    );
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(worker.join().unwrap(), Ok(()));
+}
+
+#[test]
 fn companion_refuses_desktop_only_run_controls() {
     for (id, operation, body) in [
         (

@@ -170,6 +170,15 @@ fn exact_byte_limit_is_valid_and_one_byte_overflow_is_rejected() {
         )
         .unwrap_err();
     assert!(error.is_slow_consumer());
+    assert_eq!(error.error().code(), ErrorCode::SlowConsumer);
+    assert!(error.error().retryable());
+    assert_eq!(
+        error.close(),
+        StreamClose {
+            code: StreamCloseCode::SlowConsumer,
+            resumable: true
+        }
+    );
     assert_eq!(state.retained_bytes(), MAX_UNACKNOWLEDGED_ARTIFACT_BYTES);
 }
 

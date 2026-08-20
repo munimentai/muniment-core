@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","subscription_id":"00000000000000000000000000000190","event":"stream.closed","body":{"code":"slow_consumer","resumable":true}}

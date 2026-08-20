@@ -18,6 +18,17 @@ pub struct RunStreamWindow {
 pub enum StreamCloseCode {
     InvalidCursor,
     InvalidArtifactCursor,
+    SlowConsumer,
+}
+
+impl StreamCloseCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidCursor => "invalid_cursor",
+            Self::InvalidArtifactCursor => "invalid_artifact_cursor",
+            Self::SlowConsumer => "slow_consumer",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

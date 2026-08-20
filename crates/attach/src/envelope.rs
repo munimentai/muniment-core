@@ -232,6 +232,7 @@ pub enum ErrorCode {
     DesktopBusy,
     InvalidCursor,
     InvalidArtifactCursor,
+    SlowConsumer,
     InvalidRequest,
     ThreadNotFound,
     TransferNotFound,
@@ -490,6 +491,8 @@ pub enum ErrorMessage {
     InvalidCursor,
     #[serde(rename = "The artifact transfer cursor is invalid.")]
     InvalidArtifactCursor,
+    #[serde(rename = "Artifact consumer is too slow.")]
+    SlowConsumer,
     #[serde(rename = "The request is invalid.")]
     InvalidRequest,
     #[serde(rename = "The thread was not found.")]
@@ -582,6 +585,12 @@ impl ProtocolError {
             ErrorCode::InvalidArtifactCursor,
             ErrorMessage::InvalidArtifactCursor,
         )
+    }
+
+    pub fn slow_consumer() -> Self {
+        let mut error = Self::simple(ErrorCode::SlowConsumer, ErrorMessage::SlowConsumer);
+        error.retryable = true;
+        error
     }
 
     pub fn invalid_request() -> Self {
@@ -688,6 +697,7 @@ impl<'de> Deserialize<'de> for ProtocolError {
             (ErrorCode::DesktopBusy, None, None) => Self::desktop_busy(),
             (ErrorCode::InvalidCursor, None, None) => Self::invalid_cursor(),
             (ErrorCode::InvalidArtifactCursor, None, None) => Self::invalid_artifact_cursor(),
+            (ErrorCode::SlowConsumer, None, None) => Self::slow_consumer(),
             (ErrorCode::InvalidRequest, None, None) => Self::invalid_request(),
             (ErrorCode::ThreadNotFound, None, None) => Self::thread_not_found(),
             (ErrorCode::TransferNotFound, None, None) => Self::transfer_not_found(),

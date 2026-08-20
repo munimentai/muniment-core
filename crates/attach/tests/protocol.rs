@@ -464,6 +464,47 @@ fn transfer_not_found_error_fixture_matches_the_closed_schema() {
 }
 
 #[test]
+fn slow_consumer_fixtures_match_the_artifact_transfer_contract() {
+    let expected = ProtocolError::slow_consumer();
+    assert_eq!(expected.code(), ErrorCode::SlowConsumer);
+    assert_eq!(expected.message(), ErrorMessage::SlowConsumer);
+    assert!(expected.retryable());
+    assert!(expected.action().is_none());
+    assert!(expected.details().is_none());
+
+    let Envelope::Error(error) =
+        serde_json::from_value(canonical_fixture("error-slow-consumer.json")).unwrap()
+    else {
+        panic!("expected error fixture");
+    };
+    assert_eq!(
+        error.request_id.unwrap().as_str(),
+        "0000000000000000000000000000013e"
+    );
+    assert_eq!(error.error, expected);
+    assert_eq!(
+        serde_json::to_value(&error.error).unwrap(),
+        json!({
+            "code": "slow_consumer",
+            "message": "Artifact consumer is too slow.",
+            "retryable": true
+        })
+    );
+
+    let Envelope::Event(closed) =
+        serde_json::from_value(canonical_fixture("event-stream-closed-slow-consumer.json"))
+            .unwrap()
+    else {
+        panic!("expected stream close fixture");
+    };
+    assert_eq!(closed.event, EventName::StreamClosed);
+    assert_eq!(
+        closed.body,
+        json!({"code": "slow_consumer", "resumable": true})
+    );
+}
+
+#[test]
 fn subscription_cancel_error_fixtures_match_helpers() {
     for (name, expected) in [
         (

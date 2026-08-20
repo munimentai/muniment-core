@@ -61,9 +61,14 @@ impl ArtifactTransferError {
     }
 
     fn slow_consumer() -> Self {
-        let mut error = Self::invalid_cursor();
-        error.slow_consumer = true;
-        error
+        Self {
+            error: ProtocolError::slow_consumer(),
+            close: StreamClose {
+                code: StreamCloseCode::SlowConsumer,
+                resumable: true,
+            },
+            slow_consumer: true,
+        }
     }
 
     pub fn error(&self) -> &ProtocolError {

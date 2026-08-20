@@ -3005,6 +3005,7 @@ fn dispatch_request<S: ThreadListService>(
                 Ok(granted_chunks) => granted_chunks,
                 Err(error) => {
                     let close = error.close();
+                    let code = close.code.as_str();
                     registries
                         .artifact_transfers
                         .remove(&transfer_id)
@@ -3018,7 +3019,7 @@ fn dispatch_request<S: ThreadListService>(
                             run_id: None,
                             run_seq: None,
                             body: serde_json::json!({
-                                "code": "invalid_artifact_cursor",
+                                "code": code,
                                 "resumable": close.resumable,
                             }),
                         }],
@@ -3081,6 +3082,7 @@ fn dispatch_request<S: ThreadListService>(
                 );
             if let Err(error) = admission {
                 let close = error.close();
+                let code = close.code.as_str();
                 registries.artifact_transfers.remove(&transfer_id).ok();
                 return Err(DispatchFailure {
                     error: error.error().clone(),
@@ -3091,7 +3093,7 @@ fn dispatch_request<S: ThreadListService>(
                         run_id: None,
                         run_seq: None,
                         body: serde_json::json!({
-                            "code": "invalid_artifact_cursor",
+                            "code": code,
                             "resumable": close.resumable,
                         }),
                     }],
