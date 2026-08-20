@@ -6145,6 +6145,215 @@ fn artifact_fetch_returns_metadata_and_rejects_the_sixty_fifth_live_transfer() {
 }
 
 #[test]
+fn artifact_window_grants_chunks_on_the_named_session_transfer() {
+    let artifact_id = "0190a100-0000-7000-8000-000000000079";
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        let mut service = StartService::default();
+        let result = run_authenticated_session_with_authorization(
+            server,
+            credentials(),
+            "0.1.0",
+            Duration::from_secs(1),
+            AuthorizationSessionDependencies {
+                fill_random: |bytes: &mut [u8]| {
+                    bytes.fill(9);
+                    Ok(())
+                },
+                clock: TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                tokens: TestTokens(1),
+                approvals: |_: &muniment_core::attach::PairingChallenge, _: Duration| {
+                    Some(ApprovalDecision::Approve(approval()))
+                },
+            },
+            &mut service,
+        );
+        (result, service)
+    });
+    client.write_all(&hello(1, 1)).unwrap();
+    let _: Welcome = read_frame(&mut client);
+    let _: Authorized = read_frame(&mut client);
+    client
+        .write_all(&request(
+            910,
+            Operation::ArtifactFetch,
+            json!({"artifact_id": artifact_id}),
+        ))
+        .unwrap();
+    let fetched: Response = read_frame(&mut client);
+    let transfer_id = fetched.body["transfer_id"].as_str().unwrap();
+    client
+        .write_all(&request(
+            911,
+            Operation::ArtifactWindow,
+            json!({
+                "transfer_id": transfer_id,
+                "ack_through_chunk": -1,
+                "max_chunks": 1,
+                "unknown": true
+            }),
+        ))
+        .unwrap();
+    let malformed: ErrorEnvelope = read_frame(&mut client);
+    assert_eq!(malformed.error.code(), ErrorCode::InvalidRequest);
+    client
+        .write_all(&request(
+            919,
+            Operation::ArtifactWindow,
+            json!({
+                "transfer_id": transfer_id,
+                "ack_through_chunk": -1,
+                "max_chunks": 2
+            }),
+        ))
+        .unwrap();
+    let granted: Response = read_frame(&mut client);
+    assert_eq!(
+        granted.body,
+        json!({"ack_through_chunk": -1, "granted_chunks": 2})
+    );
+    client.shutdown(Shutdown::Write).unwrap();
+    let (result, service) = worker.join().unwrap();
+    assert_eq!(result, Ok(()));
+    assert_eq!(service.artifact_ids.len(), 1);
+}
+
+#[test]
+fn artifact_window_reports_a_missing_transfer_without_changing_a_live_transfer() {
+    let artifact_id = "0190a100-0000-7000-8000-000000000079";
+    let missing_id = "0190a100-0000-7000-8000-000000000080";
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        let mut service = StartService::default();
+        run_authenticated_session_with_authorization(
+            server,
+            credentials(),
+            "0.1.0",
+            Duration::from_secs(1),
+            AuthorizationSessionDependencies {
+                fill_random: |bytes: &mut [u8]| {
+                    bytes.fill(9);
+                    Ok(())
+                },
+                clock: TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                tokens: TestTokens(1),
+                approvals: |_: &muniment_core::attach::PairingChallenge, _: Duration| {
+                    Some(ApprovalDecision::Approve(approval()))
+                },
+            },
+            &mut service,
+        )
+    });
+    client.write_all(&hello(1, 1)).unwrap();
+    let _: Welcome = read_frame(&mut client);
+    let _: Authorized = read_frame(&mut client);
+    client
+        .write_all(&request(
+            912,
+            Operation::ArtifactFetch,
+            json!({"artifact_id": artifact_id}),
+        ))
+        .unwrap();
+    let fetched: Response = read_frame(&mut client);
+    client
+        .write_all(&request(
+            913,
+            Operation::ArtifactWindow,
+            json!({
+                "transfer_id": missing_id,
+                "ack_through_chunk": -1,
+                "max_chunks": 1
+            }),
+        ))
+        .unwrap();
+    let missing: ErrorEnvelope = read_frame(&mut client);
+    assert_eq!(missing.error.code(), ErrorCode::TransferNotFound);
+    client
+        .write_all(&request(
+            914,
+            Operation::ArtifactWindow,
+            json!({
+                "transfer_id": fetched.body["transfer_id"],
+                "ack_through_chunk": -1,
+                "max_chunks": 1
+            }),
+        ))
+        .unwrap();
+    let granted: Response = read_frame(&mut client);
+    assert_eq!(granted.body["granted_chunks"], json!(1));
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(worker.join().unwrap(), Ok(()));
+}
+
+#[test]
+fn artifact_window_rejects_invalid_cursor_inputs_with_a_resumable_closure() {
+    let artifact_id = "0190a100-0000-7000-8000-000000000079";
+    for (request_id, ack_through_chunk, max_chunks) in
+        [(915, -2, 1), (916, -1, 0), (917, -1, 1_025)]
+    {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&hello(1, 1)).unwrap();
+        client
+            .write_all(&request(
+                918,
+                Operation::ArtifactFetch,
+                json!({"artifact_id": artifact_id}),
+            ))
+            .unwrap();
+        let mut service = StartService::default();
+        let worker = thread::spawn(move || {
+            run_authenticated_session_with_authorization(
+                server,
+                credentials(),
+                "0.1.0",
+                Duration::from_secs(1),
+                AuthorizationSessionDependencies {
+                    fill_random: |bytes: &mut [u8]| {
+                        bytes.fill(9);
+                        Ok(())
+                    },
+                    clock: TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                    tokens: TestTokens(1),
+                    approvals: |_: &muniment_core::attach::PairingChallenge, _: Duration| {
+                        Some(ApprovalDecision::Approve(approval()))
+                    },
+                },
+                &mut service,
+            )
+        });
+        let _: Welcome = read_frame(&mut client);
+        let _: Authorized = read_frame(&mut client);
+        let fetched: Response = read_frame(&mut client);
+        let transfer_id = fetched.body["transfer_id"].clone();
+        client
+            .write_all(&request(
+                request_id,
+                Operation::ArtifactWindow,
+                json!({
+                    "transfer_id": transfer_id,
+                    "ack_through_chunk": ack_through_chunk,
+                    "max_chunks": max_chunks
+                }),
+            ))
+            .unwrap();
+        let error: ErrorEnvelope = read_frame(&mut client);
+        assert_eq!(error.error.code(), ErrorCode::InvalidArtifactCursor);
+        let closed: Event = read_frame(&mut client);
+        assert_eq!(closed.event, EventName::StreamClosed);
+        assert_eq!(
+            closed.subscription_id,
+            Id::new(transfer_id.as_str().unwrap().to_owned()).unwrap()
+        );
+        assert_eq!(
+            closed.body,
+            json!({"code": "invalid_artifact_cursor", "resumable": true})
+        );
+        client.shutdown(Shutdown::Write).unwrap();
+        assert_eq!(worker.join().unwrap(), Ok(()));
+    }
+}
+
+#[test]
 fn companion_refuses_desktop_only_run_controls() {
     for (id, operation, body) in [
         (

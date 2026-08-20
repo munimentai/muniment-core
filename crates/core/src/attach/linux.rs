@@ -2497,6 +2497,7 @@ where
             | Operation::RunStream
             | Operation::RunCursorAck
             | Operation::ArtifactFetch
+            | Operation::ArtifactWindow
             | Operation::RequestCancel => Some("thread.read"),
             Operation::ThreadCreate
             | Operation::RunStart
@@ -2970,6 +2971,52 @@ fn dispatch_request<S: ThreadListService>(
         });
     }
     request.validate_idempotency_key()?;
+    if request.operation == Operation::ArtifactWindow {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            transfer_id: String,
+            ack_through_chunk: i64,
+            max_chunks: u32,
+        }
+        let body: Body =
+            serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
+        let transfer_id =
+            super::Id::new(body.transfer_id).map_err(|_| ProtocolError::invalid_request())?;
+        let transfer = registries
+            .artifact_transfers
+            .get_mut(&transfer_id)
+            .map_err(|_| ProtocolError::transfer_not_found())?;
+        let granted_chunks =
+            match transfer.accept_window(&transfer_id, body.ack_through_chunk, body.max_chunks) {
+                Ok(granted_chunks) => granted_chunks,
+                Err(error) => {
+                    let close = error.close();
+                    registries
+                        .artifact_transfers
+                        .remove(&transfer_id)
+                        .map_err(|_| ProtocolError::transfer_not_found())?;
+                    return Err(DispatchFailure {
+                        error: error.error().clone(),
+                        events: vec![Event {
+                            protocol: Protocol,
+                            subscription_id: transfer_id,
+                            event: EventName::StreamClosed,
+                            run_id: None,
+                            run_seq: None,
+                            body: serde_json::json!({
+                                "code": "invalid_artifact_cursor",
+                                "resumable": close.resumable,
+                            }),
+                        }],
+                    });
+                }
+            };
+        return Ok(response_only(serde_json::json!({
+            "ack_through_chunk": body.ack_through_chunk,
+            "granted_chunks": granted_chunks,
+        })));
+    }
     if request.operation == Operation::ArtifactFetch {
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
