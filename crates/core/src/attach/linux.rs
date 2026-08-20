@@ -2478,6 +2478,7 @@ where
             Operation::WorkspaceOnboard | Operation::HomeEnsure => None,
             Operation::ThreadList
             | Operation::ThreadOpen
+            | Operation::RunOpen
             | Operation::RunStream
             | Operation::RunCursorAck
             | Operation::RequestCancel => Some("thread.read"),
@@ -2872,6 +2873,57 @@ fn bounded_response(body: serde_json::Value) -> Result<DispatchResult, DispatchF
         return Err(ProtocolError::persistence_failed().into());
     }
     Ok(response_only(body))
+}
+
+fn redacted_run_open_event(
+    event: &crate::journal::RunEventProjection,
+) -> Result<serde_json::Value, ProtocolError> {
+    if event.event_type.is_empty()
+        || event.event_type.len() > MAX_TEXT_LENGTH
+        || event.event_version == 0
+        || event.recorded_at.is_empty()
+        || event.recorded_at.len() > MAX_TEXT_LENGTH
+        || chrono::DateTime::parse_from_rfc3339(&event.recorded_at).is_err()
+        || event
+            .text
+            .as_ref()
+            .is_some_and(|text| text.is_empty() || text.len() > 65_536)
+        || event
+            .effect_id
+            .as_ref()
+            .is_some_and(|effect_id| effect_id.is_empty() || effect_id.len() > 65_536)
+        || event
+            .display_name
+            .as_ref()
+            .is_some_and(|display_name| display_name.is_empty() || display_name.len() > 65_536)
+    {
+        return Err(ProtocolError::persistence_failed());
+    }
+    let mut body = serde_json::json!({
+        "run_seq": event.run_seq,
+        "event_type": event.event_type,
+        "event_version": event.event_version,
+        "recorded_at": event.recorded_at,
+    });
+    if let Some(text) = &event.text {
+        body["text"] = serde_json::json!(text);
+    }
+    if let Some(effect_id) = &event.effect_id {
+        body["effect_id"] = serde_json::json!(effect_id);
+    }
+    if let Some(display_name) = &event.display_name {
+        body["display_name"] = serde_json::json!(display_name);
+    }
+    if let Some(receipt) = &event.receipt {
+        body["receipt"] = serde_json::json!({
+            "route": receipt.route,
+            "model": receipt.model,
+            "cost": receipt.cost,
+            "time": receipt.time,
+            "capabilities": receipt.capabilities,
+        });
+    }
+    Ok(body)
 }
 
 fn dispatch_request<S: ThreadListService>(
@@ -3644,6 +3696,58 @@ fn dispatch_request<S: ThreadListService>(
             "committed_seq": accepted.committed_seq,
             "accepted_at": accepted.accepted_at,
         })));
+    }
+    if request.operation == Operation::RunOpen {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            run_id: String,
+        }
+        let body: Body =
+            serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
+        let run_id = super::Id::new(body.run_id).map_err(|_| ProtocolError::invalid_request())?;
+        let page = service.stream_run(workspace, run_id.as_str(), 0)?;
+        if page.run_id != run_id.as_str()
+            || page.first_available_run_seq == 0
+            || (page.first_available_run_seq > page.current_run_seq
+                && page.first_available_run_seq != page.current_run_seq.saturating_add(1))
+            || (page.exhausted && page.events.len() as u64 != page.current_run_seq)
+            || page.events.len() > MAX_RUN_STREAM_WINDOW_EVENTS
+            || page.events.iter().enumerate().any(|(index, event)| {
+                event.run_id != page.run_id
+                    || event.run_seq != index as u64 + 1
+                    || event.run_seq > page.current_run_seq
+            })
+        {
+            return Err(ProtocolError::persistence_failed().into());
+        }
+        let mut events = page
+            .events
+            .iter()
+            .map(redacted_run_open_event)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut exhausted = page.exhausted;
+        loop {
+            let body = serde_json::json!({
+                "run_id": page.run_id,
+                "first_available_run_seq": page.first_available_run_seq,
+                "current_run_seq": page.current_run_seq,
+                "events": &events,
+                "exhausted": exhausted,
+            });
+            if serde_json::to_vec(&body)
+                .map_err(|_| ProtocolError::persistence_failed())?
+                .len()
+                <= MAX_RESPONSE_BODY_LENGTH
+            {
+                return Ok(response_only(body));
+            }
+            if events.len() <= 1 {
+                return Err(ProtocolError::persistence_failed().into());
+            }
+            events.pop();
+            exhausted = false;
+        }
     }
     if request.operation == Operation::RunStream {
         if subscriptions.len() >= MAX_ACTIVE_RUN_STREAMS {

@@ -23,7 +23,8 @@ use muniment_core::attach::{
 };
 use muniment_core::browser_control::{LinuxProcReader, ProcReadError};
 use muniment_core::journal::{
-    EventEnvelope, EventPayload, Provenance, RunEventProjection, RunJournal,
+    EventEnvelope, EventPayload, Provenance, ReceiptCapabilityProjection, ReceiptProjection,
+    RunEventProjection, RunJournal,
 };
 use serde_json::json;
 use std::cell::Cell;
@@ -621,6 +622,43 @@ impl ThreadListService for StreamService {
     ) -> Result<RunStreamPage, muniment_core::attach::ProtocolError> {
         assert_eq!(workspace, "workspace-1");
         assert_eq!(run_id, self.page.run_id);
+        Ok(self.page.clone())
+    }
+}
+
+struct OpenService {
+    page: RunStreamPage,
+    after_run_seqs: Vec<u64>,
+}
+
+impl ThreadListService for OpenService {
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, muniment_core::attach::ProtocolError> {
+        panic!("thread reads must not dispatch")
+    }
+
+    fn subscribe_run_commits(
+        &mut self,
+        _: &str,
+    ) -> Result<
+        Option<muniment_core::journal::CommitSubscription>,
+        muniment_core::attach::ProtocolError,
+    > {
+        panic!("run.open must not subscribe")
+    }
+
+    fn stream_run(
+        &mut self,
+        workspace: &str,
+        run_id: &str,
+        after_run_seq: u64,
+    ) -> Result<RunStreamPage, muniment_core::attach::ProtocolError> {
+        assert_eq!(workspace, "workspace-1");
+        assert_eq!(run_id, self.page.run_id);
+        self.after_run_seqs.push(after_run_seq);
         Ok(self.page.clone())
     }
 }
@@ -5370,11 +5408,622 @@ fn permission_answer_service_failure_is_redacted() {
 }
 
 #[test]
+fn authorized_run_open_returns_stream_run_page_without_subscription() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000071";
+    let started = stream_projection(RUN, 1, "user.prompt.submitted".into());
+    let mut delta = stream_projection(RUN, 2, "model.stream.delta".into());
+    delta.text = Some("released reply".into());
+    let mut tool = stream_projection(RUN, 3, "tool.effect.started".into());
+    tool.effect_id = Some("tool-1".into());
+    tool.display_name = Some("Search".into());
+    let mut completed = stream_projection(RUN, 4, "run.completed".into());
+    completed.receipt = Some(ReceiptProjection {
+        route: Some("cloud".into()),
+        model: None,
+        cost: None,
+        time: None,
+        capabilities: vec![ReceiptCapabilityProjection {
+            name: "search".into(),
+            version: "1".into(),
+        }],
+    });
+    let mut service = OpenService {
+        page: RunStreamPage {
+            run_id: RUN.into(),
+            first_available_run_seq: 1,
+            current_run_seq: 4,
+            events: vec![started, delta, tool, completed],
+            exhausted: true,
+        },
+        after_run_seqs: Vec::new(),
+    };
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello(1, 1)).unwrap();
+    client
+        .write_all(&request(80, Operation::RunOpen, json!({"run_id": RUN})))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(
+        dispatch_session(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            &mut service,
+        ),
+        Ok(())
+    );
+    let response: Response = read_frame(&mut client);
+    assert_eq!(
+        response.request_id,
+        Id::new(format!("{:032x}", 80)).unwrap()
+    );
+    assert_eq!(service.after_run_seqs, vec![0]);
+    assert!(response.body.get("subscription_id").is_none());
+    assert_eq!(
+        response.body,
+        json!({
+            "run_id": RUN,
+            "first_available_run_seq": 1,
+            "current_run_seq": 4,
+            "events": [
+                {
+                    "run_seq": 1,
+                    "event_type": "user.prompt.submitted",
+                    "event_version": 1,
+                    "recorded_at": "2026-07-16T03:00:00Z"
+                },
+                {
+                    "run_seq": 2,
+                    "event_type": "model.stream.delta",
+                    "event_version": 1,
+                    "recorded_at": "2026-07-16T03:00:00Z",
+                    "text": "released reply"
+                },
+                {
+                    "run_seq": 3,
+                    "event_type": "tool.effect.started",
+                    "event_version": 1,
+                    "recorded_at": "2026-07-16T03:00:00Z",
+                    "effect_id": "tool-1",
+                    "display_name": "Search"
+                },
+                {
+                    "run_seq": 4,
+                    "event_type": "run.completed",
+                    "event_version": 1,
+                    "recorded_at": "2026-07-16T03:00:00Z",
+                    "receipt": {
+                        "route": "cloud",
+                        "model": null,
+                        "cost": null,
+                        "time": null,
+                        "capabilities": [{"name": "search", "version": "1"}]
+                    }
+                }
+            ],
+            "exhausted": true
+        })
+    );
+    let mut remaining = Vec::new();
+    client.read_to_end(&mut remaining).unwrap();
+    assert!(remaining.is_empty());
+}
+
+#[test]
+fn authorized_run_open_matches_journal_stream_run_from_zero() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000072";
+    let mut journal = RunJournal::open(":memory:").unwrap();
+    journal
+        .append(0, &prompt(RUN, "private prompt", "2026-07-16T03:00:00Z"))
+        .unwrap();
+    let mut delta = prompt(RUN, "unused", "2026-07-16T03:00:01Z");
+    delta.event_id = "0190a200-0000-7000-8000-000000000073".into();
+    delta.run_seq = 2;
+    delta.event_type = "model.stream.delta".into();
+    delta.payload = EventPayload::Inline {
+        payload_json: json!({"text":"released reply", "content_disclosure":"released"}),
+    };
+    journal.append(1, &delta).unwrap();
+    let mut tool = prompt(RUN, "unused", "2026-07-16T03:00:01Z");
+    tool.event_id = "0190a200-0000-7000-8000-000000000074".into();
+    tool.run_seq = 3;
+    tool.event_type = "tool.effect.started".into();
+    tool.payload = EventPayload::Inline {
+        payload_json: json!({"effect_id":"tool-1","display_name":"Search"}),
+    };
+    journal.append(2, &tool).unwrap();
+    let mut completed = prompt(RUN, "unused", "2026-07-16T03:00:01Z");
+    completed.event_id = "0190a200-0000-7000-8000-000000000075".into();
+    completed.run_seq = 4;
+    completed.event_type = "run.completed".into();
+    completed.payload = EventPayload::Inline {
+        payload_json: json!({
+            "receipt": {"route": "cloud", "capabilities": [{"name": "search", "version": "1"}]},
+            "private": "must remain withheld"
+        }),
+    };
+    journal.append(3, &completed).unwrap();
+    journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+    let expected = journal.stream_run("workspace-1", RUN, 0).unwrap();
+
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello(1, 1)).unwrap();
+    client
+        .write_all(&request(81, Operation::RunOpen, json!({"run_id": RUN})))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(
+        dispatch_session(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            &mut journal,
+        ),
+        Ok(())
+    );
+    let response: Response = read_frame(&mut client);
+    assert_eq!(response.body["run_id"], expected.run_id);
+    assert_eq!(
+        response.body["first_available_run_seq"],
+        expected.first_available_run_seq
+    );
+    assert_eq!(response.body["current_run_seq"], expected.current_run_seq);
+    assert_eq!(response.body["exhausted"], expected.exhausted);
+    assert!(response.body.get("subscription_id").is_none());
+    let events = response.body["events"].as_array().unwrap();
+    assert_eq!(events.len(), expected.events.len());
+    for (actual, event) in events.iter().zip(&expected.events) {
+        assert_eq!(actual["run_seq"], event.run_seq);
+        assert_eq!(actual["event_type"], event.event_type);
+        assert_eq!(actual["event_version"], event.event_version);
+        assert_eq!(actual["recorded_at"], event.recorded_at);
+        match &event.text {
+            Some(text) => assert_eq!(actual["text"], *text),
+            None => assert!(actual.get("text").is_none()),
+        }
+        match &event.effect_id {
+            Some(effect_id) => assert_eq!(actual["effect_id"], *effect_id),
+            None => assert!(actual.get("effect_id").is_none()),
+        }
+        match &event.display_name {
+            Some(display_name) => assert_eq!(actual["display_name"], *display_name),
+            None => assert!(actual.get("display_name").is_none()),
+        }
+        match &event.receipt {
+            Some(receipt) => {
+                assert_eq!(actual["receipt"]["route"], json!(receipt.route));
+                assert_eq!(actual["receipt"]["model"], json!(receipt.model));
+                assert_eq!(actual["receipt"]["cost"], json!(receipt.cost));
+                assert_eq!(actual["receipt"]["time"], json!(receipt.time));
+                assert_eq!(
+                    actual["receipt"]["capabilities"],
+                    json!(receipt.capabilities)
+                );
+            }
+            None => assert!(actual.get("receipt").is_none()),
+        }
+        assert!(actual.get("run_id").is_none());
+        assert!(actual.get("pending_permission").is_none());
+        assert!(actual.get("tool_effect_valid").is_none());
+    }
+    let encoded = serde_json::to_string(&response.body).unwrap();
+    assert!(!encoded.contains("private prompt"));
+    assert!(!encoded.contains("must remain withheld"));
+    let mut remaining = Vec::new();
+    client.read_to_end(&mut remaining).unwrap();
+    assert!(remaining.is_empty());
+}
+
+#[test]
+fn authorized_run_open_returns_a_prefix_when_the_stream_run_page_exceeds_the_response_bound() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000078";
+    const MAX_RESPONSE_BODY_LENGTH: usize = MAX_FRAME_LENGTH - 4096;
+    let text = "x".repeat(60_000);
+    let events = (1..=18)
+        .map(|seq| {
+            let mut event = stream_projection(RUN, seq, "model.stream.delta".into());
+            event.text = Some(text.clone());
+            event
+        })
+        .collect::<Vec<_>>();
+    let redacted = events
+        .iter()
+        .map(|event| {
+            json!({
+                "run_seq": event.run_seq,
+                "event_type": event.event_type,
+                "event_version": event.event_version,
+                "recorded_at": event.recorded_at,
+                "text": event.text,
+            })
+        })
+        .collect::<Vec<_>>();
+    let untrimmed = json!({
+        "run_id": RUN,
+        "first_available_run_seq": 1,
+        "current_run_seq": 18,
+        "events": &redacted,
+        "exhausted": true
+    });
+    assert!(serde_json::to_vec(&untrimmed).unwrap().len() > MAX_RESPONSE_BODY_LENGTH);
+    let mut prefix_len = 0;
+    for len in 1..redacted.len() {
+        let candidate = json!({
+            "run_id": RUN,
+            "first_available_run_seq": 1,
+            "current_run_seq": 18,
+            "events": &redacted[..len],
+            "exhausted": false
+        });
+        if serde_json::to_vec(&candidate).unwrap().len() <= MAX_RESPONSE_BODY_LENGTH {
+            prefix_len = len;
+        } else {
+            break;
+        }
+    }
+    assert!(prefix_len > 0);
+    assert!(prefix_len < redacted.len());
+    let mut service = OpenService {
+        page: RunStreamPage {
+            run_id: RUN.into(),
+            first_available_run_seq: 1,
+            current_run_seq: 18,
+            events,
+            exhausted: true,
+        },
+        after_run_seqs: Vec::new(),
+    };
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let server_thread = thread::spawn(move || {
+        let result = run_authenticated_session_with_authorization(
+            server,
+            credentials(),
+            "0.1.0",
+            Duration::from_secs(30),
+            AuthorizationSessionDependencies {
+                fill_random: |bytes: &mut [u8]| {
+                    bytes.fill(9);
+                    Ok(())
+                },
+                clock: TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                tokens: TestTokens(1),
+                approvals: |_: &muniment_core::attach::PairingChallenge, _: Duration| {
+                    Some(ApprovalDecision::Approve(approval()))
+                },
+            },
+            &mut service,
+        );
+        (result, service)
+    });
+    client.write_all(&hello(1, 1)).unwrap();
+    let _: Welcome = read_frame(&mut client);
+    let _: Authorized = read_frame(&mut client);
+    client
+        .write_all(&request(86, Operation::RunOpen, json!({"run_id": RUN})))
+        .unwrap();
+    let response: Response = read_frame(&mut client);
+    client.shutdown(Shutdown::Write).unwrap();
+    let (result, service) = server_thread.join().unwrap();
+    assert_eq!(result, Ok(()));
+    assert_eq!(service.after_run_seqs, vec![0]);
+    assert!(response.body.get("subscription_id").is_none());
+    assert_eq!(response.body["run_id"], RUN);
+    assert_eq!(response.body["first_available_run_seq"], 1);
+    assert_eq!(response.body["current_run_seq"], 18);
+    assert_eq!(response.body["exhausted"], false);
+    assert_eq!(response.body["events"], json!(&redacted[..prefix_len]));
+    assert!(serde_json::to_vec(&response.body).unwrap().len() <= MAX_RESPONSE_BODY_LENGTH);
+    let mut remaining = Vec::new();
+    client.read_to_end(&mut remaining).unwrap();
+    assert!(remaining.is_empty());
+}
+
+#[test]
+fn authorized_run_open_keeps_a_fitting_non_exhausted_stream_run_page() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000079";
+    const MAX_RESPONSE_BODY_LENGTH: usize = MAX_FRAME_LENGTH - 4096;
+    let started = stream_projection(RUN, 1, "user.prompt.submitted".into());
+    let mut delta = stream_projection(RUN, 2, "model.stream.delta".into());
+    delta.text = Some("released reply".into());
+    let mut later = stream_projection(RUN, 3, "model.stream.delta".into());
+    later.text = Some("still streaming".into());
+    let mut service = OpenService {
+        page: RunStreamPage {
+            run_id: RUN.into(),
+            first_available_run_seq: 1,
+            current_run_seq: 6,
+            events: vec![started, delta, later],
+            exhausted: false,
+        },
+        after_run_seqs: Vec::new(),
+    };
+    let expected = json!({
+        "run_id": RUN,
+        "first_available_run_seq": 1,
+        "current_run_seq": 6,
+        "events": [
+            {
+                "run_seq": 1,
+                "event_type": "user.prompt.submitted",
+                "event_version": 1,
+                "recorded_at": "2026-07-16T03:00:00Z"
+            },
+            {
+                "run_seq": 2,
+                "event_type": "model.stream.delta",
+                "event_version": 1,
+                "recorded_at": "2026-07-16T03:00:00Z",
+                "text": "released reply"
+            },
+            {
+                "run_seq": 3,
+                "event_type": "model.stream.delta",
+                "event_version": 1,
+                "recorded_at": "2026-07-16T03:00:00Z",
+                "text": "still streaming"
+            }
+        ],
+        "exhausted": false
+    });
+    assert!(serde_json::to_vec(&expected).unwrap().len() <= MAX_RESPONSE_BODY_LENGTH);
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello(1, 1)).unwrap();
+    client
+        .write_all(&request(87, Operation::RunOpen, json!({"run_id": RUN})))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(
+        dispatch_session(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            &mut service,
+        ),
+        Ok(())
+    );
+    let response: Response = read_frame(&mut client);
+    assert_eq!(service.after_run_seqs, vec![0]);
+    assert!(response.body.get("subscription_id").is_none());
+    assert_eq!(response.body, expected);
+    assert_eq!(response.body["exhausted"], false);
+    let mut remaining = Vec::new();
+    client.read_to_end(&mut remaining).unwrap();
+    assert!(remaining.is_empty());
+}
+
+#[test]
+fn run_open_without_read_scope_fails_closed_without_dispatch() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000077";
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello(1, 1)).unwrap();
+    client
+        .write_all(&request(85, Operation::RunOpen, json!({"run_id": RUN})))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut service = OpenService {
+        page: RunStreamPage {
+            run_id: RUN.into(),
+            first_available_run_seq: 1,
+            current_run_seq: 1,
+            events: vec![stream_projection(RUN, 1, "safe.event".into())],
+            exhausted: true,
+        },
+        after_run_seqs: Vec::new(),
+    };
+    let mut approved = approval();
+    approved.scopes.clear();
+    assert_eq!(
+        dispatch_session_with_approval(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            approved,
+            &mut service,
+        ),
+        Err(AttachSessionError::Authorization)
+    );
+    let error: ErrorEnvelope = read_frame(&mut client);
+    assert_eq!(
+        error.request_id,
+        Some(Id::new(format!("{:032x}", 85)).unwrap())
+    );
+    assert_eq!(error.error.code(), ErrorCode::Unauthorized);
+    assert_eq!(
+        serde_json::to_value(&error.error).unwrap().get("details"),
+        None
+    );
+    assert!(service.after_run_seqs.is_empty());
+}
+
+#[test]
+fn run_open_rejects_missing_scope_malformed_bodies_and_inaccessible_runs() {
+    const RUN: &str = "0190a100-0000-7000-8000-000000000076";
+    let cases = [
+        (false, None, json!({"run_id": RUN}), ErrorCode::Unauthorized),
+        (
+            true,
+            Some("run.write"),
+            json!({"run_id": RUN}),
+            ErrorCode::Unauthorized,
+        ),
+        (
+            true,
+            None,
+            json!({"run_id": RUN}),
+            ErrorCode::InvalidRequest,
+        ),
+        (true, None, json!({}), ErrorCode::InvalidRequest),
+        (true, None, json!({"run_id": ""}), ErrorCode::InvalidRequest),
+        (
+            true,
+            None,
+            json!({"run_id": "not-a-run-id"}),
+            ErrorCode::InvalidRequest,
+        ),
+        (true, None, json!({"run_id": 1}), ErrorCode::InvalidRequest),
+    ];
+    for (has_read, extra_scope, body, expected) in cases {
+        let mut journal = RunJournal::open(":memory:").unwrap();
+        let mut permission = prompt(RUN, "unused", "2026-07-16T03:00:00Z");
+        permission.event_type = "permission.requested".into();
+        permission.payload = EventPayload::Inline {
+            payload_json: json!({
+                "gate_id": "other-workspace-private-gate", "kind": "confirm",
+                "title": "Other workspace private title",
+                "message": "other-workspace-private-context"
+            }),
+        };
+        journal.append(0, &permission).unwrap();
+        journal.bind_run_workspace(RUN, "workspace-2").unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&hello(1, 1)).unwrap();
+        client
+            .write_all(&request(82, Operation::RunOpen, body))
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut approved = approval();
+        if !has_read {
+            approved.scopes.clear();
+        }
+        if let Some(scope) = extra_scope {
+            approved.scopes.clear();
+            approved.scopes.insert(scope.into());
+        }
+        let _ = dispatch_session_with_approval(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            approved,
+            &mut journal,
+        );
+        let error: ErrorEnvelope = read_frame(&mut client);
+        assert_eq!(error.error.code(), expected);
+        assert_eq!(
+            serde_json::to_value(&error.error).unwrap().get("details"),
+            None
+        );
+        let encoded = serde_json::to_string(&error).unwrap();
+        assert!(!encoded.contains("other-workspace-private-gate"));
+        assert!(!encoded.contains("Other workspace private title"));
+        assert!(!encoded.contains("other-workspace-private-context"));
+        let mut remaining = Vec::new();
+        client.read_to_end(&mut remaining).unwrap();
+        assert!(remaining.is_empty());
+    }
+
+    for (id, body) in [
+        (86, json!({"run_id": RUN, "after_run_seq": 0})),
+        (87, json!({"run_id": RUN, "extra": true})),
+        (88, json!({"run_id": RUN, "workspace": "other"})),
+    ] {
+        let mut service = OpenService {
+            page: RunStreamPage {
+                run_id: RUN.into(),
+                first_available_run_seq: 1,
+                current_run_seq: 1,
+                events: vec![stream_projection(RUN, 1, "safe.event".into())],
+                exhausted: true,
+            },
+            after_run_seqs: Vec::new(),
+        };
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&hello(1, 1)).unwrap();
+        client
+            .write_all(&request(id, Operation::RunOpen, body))
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        assert_eq!(
+            dispatch_session(
+                &mut client,
+                server,
+                TestClock(Rc::new(Cell::new(Duration::ZERO))),
+                &mut service,
+            ),
+            Ok(())
+        );
+        let error: ErrorEnvelope = read_frame(&mut client);
+        assert_eq!(error.error.code(), ErrorCode::InvalidRequest);
+        assert_eq!(
+            serde_json::to_value(&error.error).unwrap().get("details"),
+            None
+        );
+        assert!(service.after_run_seqs.is_empty());
+        let mut remaining = Vec::new();
+        client.read_to_end(&mut remaining).unwrap();
+        assert!(remaining.is_empty());
+    }
+
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.write_all(&hello(1, 1)).unwrap();
+    client
+        .write_all(&request_with_idempotency(
+            84,
+            Operation::RunOpen,
+            json!({"run_id": RUN}),
+        ))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut service = OpenService {
+        page: RunStreamPage {
+            run_id: RUN.into(),
+            first_available_run_seq: 1,
+            current_run_seq: 1,
+            events: vec![stream_projection(RUN, 1, "safe.event".into())],
+            exhausted: true,
+        },
+        after_run_seqs: Vec::new(),
+    };
+    assert_eq!(
+        dispatch_session(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            &mut service,
+        ),
+        Ok(())
+    );
+    let idempotent: ErrorEnvelope = read_frame(&mut client);
+    assert_eq!(idempotent.error.code(), ErrorCode::IdempotencyKeyForbidden);
+    assert!(service.after_run_seqs.is_empty());
+
+    for present in [false, true] {
+        let mut journal = RunJournal::open(":memory:").unwrap();
+        if present {
+            journal
+                .append(0, &prompt(RUN, "private", "2026-07-16T03:00:00Z"))
+                .unwrap();
+            journal.bind_run_workspace(RUN, "workspace-1").unwrap();
+            journal.delete_run(RUN).unwrap();
+        }
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&hello(1, 1)).unwrap();
+        client
+            .write_all(&request(83, Operation::RunOpen, json!({"run_id": RUN})))
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        dispatch_session(
+            &mut client,
+            server,
+            TestClock(Rc::new(Cell::new(Duration::ZERO))),
+            &mut journal,
+        )
+        .unwrap();
+        let error: ErrorEnvelope = read_frame(&mut client);
+        assert_eq!(error.error.code(), ErrorCode::InvalidRequest);
+        assert_eq!(
+            serde_json::to_value(&error.error).unwrap().get("details"),
+            None
+        );
+        assert!(!serde_json::to_string(&error).unwrap().contains("private"));
+    }
+}
+
+#[test]
 fn unserved_operations_remain_unsupported_without_dispatch() {
     let (mut client, server) = UnixStream::pair().unwrap();
     client.write_all(&hello(1, 1)).unwrap();
     client
-        .write_all(&request(79, Operation::RunOpen, json!({})))
+        .write_all(&request(79, Operation::ArtifactFetch, json!({})))
         .unwrap();
     client.shutdown(Shutdown::Write).unwrap();
     let mut approved = approval();
