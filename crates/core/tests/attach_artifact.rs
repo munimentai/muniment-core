@@ -1,5 +1,6 @@
 use muniment_core::attach::*;
 use sha2::{Digest, Sha256};
+use std::time::{Duration, Instant};
 
 fn id(n: u128) -> Id {
     Id::new(format!("{n:032x}")).unwrap()
@@ -81,6 +82,133 @@ fn partial_windows_pause_and_acknowledgements_are_bounded() {
     assert!(state.completion().is_none());
     state.accept_window(&id(1), 2, 1).unwrap();
     assert!(state.completion().is_some());
+}
+
+#[test]
+fn acknowledgements_release_bytes_and_control_deadlines_across_windows() {
+    let started = Instant::now();
+    let mut state = transfer(5, 2, 3);
+    assert_eq!(state.retained_bytes(), 0);
+    assert_eq!(state.acknowledgement_deadline(), None);
+
+    state.accept_window_at(&id(1), -1, 2, started).unwrap();
+    for (index, bytes) in [(0, &b"ab"[..]), (1, &b"cd"[..])] {
+        state
+            .admit_chunk_at(&id(2), index, index * 2, 2, &hash(bytes), bytes, started)
+            .unwrap();
+    }
+    let first_deadline = started + ARTIFACT_ACKNOWLEDGEMENT_TIMEOUT;
+    assert_eq!(state.retained_bytes(), 4);
+    assert_eq!(state.acknowledgement_deadline(), Some(first_deadline));
+
+    let partial_ack = started + Duration::from_secs(10);
+    state.accept_window_at(&id(1), 0, 1, partial_ack).unwrap();
+    assert_eq!(state.retained_bytes(), 2);
+    assert_eq!(
+        state.acknowledgement_deadline(),
+        Some(partial_ack + ARTIFACT_ACKNOWLEDGEMENT_TIMEOUT)
+    );
+
+    let repeated_ack = started + Duration::from_secs(20);
+    state.accept_window_at(&id(1), 0, 1, repeated_ack).unwrap();
+    assert_eq!(state.retained_bytes(), 2);
+    assert_eq!(
+        state.acknowledgement_deadline(),
+        Some(partial_ack + ARTIFACT_ACKNOWLEDGEMENT_TIMEOUT)
+    );
+    state.accept_window_at(&id(1), 1, 1, repeated_ack).unwrap();
+    assert_eq!(state.retained_bytes(), 0);
+    assert_eq!(state.acknowledgement_deadline(), None);
+
+    state
+        .admit_chunk_at(&id(2), 2, 4, 1, &hash(b"e"), b"e", repeated_ack)
+        .unwrap();
+    assert_eq!(state.retained_bytes(), 1);
+    assert_eq!(
+        state.acknowledgement_deadline(),
+        Some(repeated_ack + ARTIFACT_ACKNOWLEDGEMENT_TIMEOUT)
+    );
+
+    state.accept_window_at(&id(1), 2, 1, repeated_ack).unwrap();
+    assert_eq!(state.retained_bytes(), 0);
+    assert_eq!(state.acknowledgement_deadline(), None);
+}
+
+#[test]
+fn exact_byte_limit_is_valid_and_one_byte_overflow_is_rejected() {
+    let started = Instant::now();
+    let total = MAX_UNACKNOWLEDGED_ARTIFACT_BYTES + 1;
+    let chunk_count = total.div_ceil(MAX_ARTIFACT_CHUNK_BYTES);
+    let mut state = transfer(total, MAX_ARTIFACT_CHUNK_BYTES, chunk_count);
+    state
+        .accept_window_at(&id(1), -1, chunk_count as u32, started)
+        .unwrap();
+    let bytes = vec![0; MAX_ARTIFACT_CHUNK_BYTES as usize];
+    for index in 0..chunk_count - 1 {
+        state
+            .admit_chunk_at(
+                &id(2),
+                index,
+                index * MAX_ARTIFACT_CHUNK_BYTES,
+                MAX_ARTIFACT_CHUNK_BYTES,
+                &hash(&bytes),
+                &bytes,
+                started,
+            )
+            .unwrap();
+    }
+    assert_eq!(state.retained_bytes(), MAX_UNACKNOWLEDGED_ARTIFACT_BYTES);
+    let error = state
+        .admit_chunk_at(
+            &id(2),
+            chunk_count - 1,
+            MAX_UNACKNOWLEDGED_ARTIFACT_BYTES,
+            1,
+            &hash(b"x"),
+            b"x",
+            started,
+        )
+        .unwrap_err();
+    assert!(error.is_slow_consumer());
+    assert_eq!(state.retained_bytes(), MAX_UNACKNOWLEDGED_ARTIFACT_BYTES);
+}
+
+#[test]
+fn exact_deadline_rejects_emission_and_acknowledgement() {
+    let started = Instant::now();
+    let deadline = started + ARTIFACT_ACKNOWLEDGEMENT_TIMEOUT;
+    let mut emission = transfer(2, 1, 2);
+    emission.accept_window_at(&id(1), -1, 2, started).unwrap();
+    emission
+        .admit_chunk_at(&id(2), 0, 0, 1, &hash(b"a"), b"a", started)
+        .unwrap();
+    assert!(emission
+        .admit_chunk_at(&id(2), 1, 1, 1, &hash(b"b"), b"b", deadline)
+        .unwrap_err()
+        .is_slow_consumer());
+
+    let mut acknowledgement = transfer(1, 1, 1);
+    acknowledgement
+        .accept_window_at(&id(1), -1, 1, started)
+        .unwrap();
+    acknowledgement
+        .admit_chunk_at(&id(2), 0, 0, 1, &hash(b"a"), b"a", started)
+        .unwrap();
+    assert!(acknowledgement
+        .accept_window_at(&id(1), 0, 1, deadline)
+        .unwrap_err()
+        .is_slow_consumer());
+    assert_eq!(acknowledgement.retained_bytes(), 1);
+}
+
+#[test]
+fn zero_byte_transfer_never_starts_a_deadline() {
+    let mut state = transfer(0, 4, 0);
+    state
+        .accept_window_at(&id(1), -1, 1, Instant::now())
+        .unwrap();
+    assert_eq!(state.retained_bytes(), 0);
+    assert_eq!(state.acknowledgement_deadline(), None);
 }
 
 #[test]

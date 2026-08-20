@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use sha2::{Digest, Sha256};
 
@@ -10,6 +13,8 @@ pub const MAX_ARTIFACT_CHUNK_BYTES: u64 = 256 * 1024;
 pub const MAX_ARTIFACT_WINDOW_CHUNKS: u32 = 1_024;
 /// One attach session may hold this many concurrent artifact transfers.
 pub const MAX_ACTIVE_ARTIFACT_TRANSFERS: usize = 64;
+pub const MAX_UNACKNOWLEDGED_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
+pub const ARTIFACT_ACKNOWLEDGEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactMetadata {
@@ -40,6 +45,7 @@ pub struct ArtifactCompletion {
 pub struct ArtifactTransferError {
     error: ProtocolError,
     close: StreamClose,
+    slow_consumer: bool,
 }
 
 impl ArtifactTransferError {
@@ -50,7 +56,14 @@ impl ArtifactTransferError {
                 code: StreamCloseCode::InvalidArtifactCursor,
                 resumable: true,
             },
+            slow_consumer: false,
         }
+    }
+
+    fn slow_consumer() -> Self {
+        let mut error = Self::invalid_cursor();
+        error.slow_consumer = true;
+        error
     }
 
     pub fn error(&self) -> &ProtocolError {
@@ -58,6 +71,9 @@ impl ArtifactTransferError {
     }
     pub fn close(&self) -> StreamClose {
         self.close
+    }
+    pub fn is_slow_consumer(&self) -> bool {
+        self.slow_consumer
     }
 }
 
@@ -68,6 +84,8 @@ pub struct ArtifactTransfer {
     acknowledged_through: i64,
     highest_emitted: i64,
     outstanding_grant: u64,
+    retained_bytes: u64,
+    acknowledgement_deadline: Option<Instant>,
 }
 
 impl ArtifactTransfer {
@@ -100,6 +118,8 @@ impl ArtifactTransfer {
             acknowledged_through: -1,
             highest_emitted: -1,
             outstanding_grant: 0,
+            retained_bytes: 0,
+            acknowledgement_deadline: None,
         })
     }
 
@@ -115,6 +135,12 @@ impl ArtifactTransfer {
     pub fn outstanding_grant(&self) -> u64 {
         self.outstanding_grant
     }
+    pub fn retained_bytes(&self) -> u64 {
+        self.retained_bytes
+    }
+    pub fn acknowledgement_deadline(&self) -> Option<Instant> {
+        self.acknowledgement_deadline
+    }
 
     pub fn accept_window(
         &mut self,
@@ -122,6 +148,17 @@ impl ArtifactTransfer {
         ack_through_chunk: i64,
         max_chunks: u32,
     ) -> Result<u32, ArtifactTransferError> {
+        self.accept_window_at(transfer_id, ack_through_chunk, max_chunks, Instant::now())
+    }
+
+    pub fn accept_window_at(
+        &mut self,
+        transfer_id: &Id,
+        ack_through_chunk: i64,
+        max_chunks: u32,
+        now: Instant,
+    ) -> Result<u32, ArtifactTransferError> {
+        self.reject_expired(now)?;
         if transfer_id != &self.metadata.transfer_id
             || max_chunks == 0
             || max_chunks > MAX_ARTIFACT_WINDOW_CHUNKS
@@ -135,6 +172,20 @@ impl ArtifactTransfer {
             .checked_add(u64::from(max_chunks))
             .filter(|grant| *grant <= u64::from(MAX_ARTIFACT_WINDOW_CHUNKS))
             .ok_or_else(ArtifactTransferError::invalid_cursor)?;
+        if ack_through_chunk > self.acknowledged_through {
+            let released_through = ((ack_through_chunk as u64 + 1)
+                .saturating_mul(self.metadata.chunk_bytes))
+            .min(self.metadata.total_bytes);
+            let released_after = if self.acknowledged_through < 0 {
+                0
+            } else {
+                ((self.acknowledged_through as u64 + 1).saturating_mul(self.metadata.chunk_bytes))
+                    .min(self.metadata.total_bytes)
+            };
+            self.retained_bytes -= released_through - released_after;
+            self.acknowledgement_deadline =
+                (self.retained_bytes > 0).then(|| now + ARTIFACT_ACKNOWLEDGEMENT_TIMEOUT);
+        }
         // Since emission itself is contiguous, every in-range prefix ack is contiguous.
         self.acknowledged_through = ack_through_chunk;
         self.outstanding_grant = new_grant;
@@ -151,6 +202,29 @@ impl ArtifactTransfer {
         chunk_sha256: &str,
         data: &[u8],
     ) -> Result<ArtifactChunkAdmission, ArtifactTransferError> {
+        self.admit_chunk_at(
+            artifact_id,
+            chunk_index,
+            offset,
+            byte_length,
+            chunk_sha256,
+            data,
+            Instant::now(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_chunk_at(
+        &mut self,
+        artifact_id: &Id,
+        chunk_index: u64,
+        offset: u64,
+        byte_length: u64,
+        chunk_sha256: &str,
+        data: &[u8],
+        now: Instant,
+    ) -> Result<ArtifactChunkAdmission, ArtifactTransferError> {
+        self.reject_expired(now)?;
         if self.outstanding_grant == 0 {
             return Ok(ArtifactChunkAdmission::Paused);
         }
@@ -178,9 +252,28 @@ impl ArtifactTransfer {
         {
             return Err(ArtifactTransferError::invalid_cursor());
         }
+        let retained_bytes = self
+            .retained_bytes
+            .checked_add(byte_length)
+            .filter(|bytes| *bytes <= MAX_UNACKNOWLEDGED_ARTIFACT_BYTES)
+            .ok_or_else(ArtifactTransferError::slow_consumer)?;
         self.highest_emitted = chunk_index as i64;
         self.outstanding_grant -= 1;
+        if self.retained_bytes == 0 {
+            self.acknowledgement_deadline = Some(now + ARTIFACT_ACKNOWLEDGEMENT_TIMEOUT);
+        }
+        self.retained_bytes = retained_bytes;
         Ok(ArtifactChunkAdmission::Emitted)
+    }
+
+    fn reject_expired(&self, now: Instant) -> Result<(), ArtifactTransferError> {
+        if self
+            .acknowledgement_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            return Err(ArtifactTransferError::slow_consumer());
+        }
+        Ok(())
     }
 
     pub fn completion(&self) -> Option<ArtifactCompletion> {
