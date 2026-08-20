@@ -4563,6 +4563,104 @@ fn run_open_rejects_invalid_input_before_writing() {
 }
 
 #[test]
+fn artifact_fetch_uses_exact_envelope_and_returns_transfer_metadata() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let artifact_id = "01900000-0000-7000-8000-000000000001";
+    let transfer_id = "01900000-0000-7000-8000-000000000002";
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        let request = read_client_value(&mut server);
+        assert_eq!(request["protocol"], "muniment.attach/1");
+        assert_eq!(request["operation"], "artifact.fetch");
+        assert_eq!(request["capability"], "33".repeat(32));
+        assert_eq!(
+            request["body"],
+            serde_json::json!({"artifact_id": artifact_id})
+        );
+        assert!(request.get("idempotency_key").is_none());
+        let response = Response {
+            protocol: Protocol,
+            request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+            ok: Success,
+            body: serde_json::json!({
+                "transfer_id": transfer_id,
+                "artifact_id": artifact_id,
+                "total_bytes": 7,
+                "sha256": "f16d05ec6b29248d2c61adb1e9263f78e4f7bace1b955014a2d17872cfe4064d",
+                "chunk_bytes": 4,
+                "chunk_count": 2
+            }),
+        };
+        server.write_all(&encode_frame(&response).unwrap()).unwrap();
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    let metadata = client.fetch_artifact(artifact_id).unwrap();
+    assert_eq!(metadata.transfer_id, transfer_id);
+    assert_eq!(metadata.artifact_id, artifact_id);
+    assert_eq!(metadata.total_bytes, 7);
+    assert_eq!(metadata.chunk_bytes, 4);
+    assert_eq!(metadata.chunk_count, 2);
+    assert_eq!(metadata.sha256.len(), 64);
+    worker.join().unwrap();
+}
+
+#[test]
+fn artifact_fetch_rejects_invalid_input_before_writing() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        server.set_read_timeout(Some(SHORT)).unwrap();
+        assert!(server.read(&mut [0]).is_err());
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    assert_eq!(
+        client.fetch_artifact("not-an-artifact-id"),
+        Err(ClientError::UnexpectedMessage)
+    );
+    worker.join().unwrap();
+}
+
+#[test]
+fn artifact_fetch_rejects_invalid_ids_and_unknown_fields() {
+    let artifact_id = "01900000-0000-7000-8000-000000000001";
+    for body in [
+        serde_json::json!({
+            "transfer_id": "not-a-transfer-id", "artifact_id": artifact_id,
+            "total_bytes": 7, "sha256": "hash", "chunk_bytes": 4, "chunk_count": 2
+        }),
+        serde_json::json!({
+            "transfer_id": "01900000-0000-7000-8000-000000000002",
+            "artifact_id": "not-an-artifact-id", "total_bytes": 7, "sha256": "hash",
+            "chunk_bytes": 4, "chunk_count": 2
+        }),
+        serde_json::json!({
+            "transfer_id": "01900000-0000-7000-8000-000000000002",
+            "artifact_id": artifact_id, "total_bytes": 7, "sha256": "hash",
+            "chunk_bytes": 4, "chunk_count": 2, "extra": true
+        }),
+    ] {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            complete_pairing(&mut server);
+            let request = read_client_value(&mut server);
+            let response = Response {
+                protocol: Protocol,
+                request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+                ok: Success,
+                body,
+            };
+            server.write_all(&encode_frame(&response).unwrap()).unwrap();
+        });
+        let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+        assert_eq!(
+            client.fetch_artifact(artifact_id),
+            Err(ClientError::UnexpectedMessage)
+        );
+        worker.join().unwrap();
+    }
+}
+
+#[test]
 fn run_open_rejects_invalid_response_fields_and_maps_protocol_errors() {
     let run_id = "01900000-0000-7000-8000-000000000001";
     let valid = serde_json::json!({
