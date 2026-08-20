@@ -35,7 +35,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc,
 };
 use std::thread;
@@ -245,6 +245,14 @@ struct TestClock(Rc<Cell<Duration>>);
 impl AuthorizationClock for TestClock {
     fn now(&self) -> Duration {
         self.0.get()
+    }
+}
+
+#[derive(Clone)]
+struct SharedTestClock(Arc<AtomicU64>);
+impl AuthorizationClock for SharedTestClock {
+    fn now(&self) -> Duration {
+        Duration::from_secs(self.0.load(Ordering::SeqCst))
     }
 }
 struct TestTokens(u8);
@@ -6786,6 +6794,105 @@ fn artifact_window_expires_a_transfer_that_exceeds_the_retained_byte_budget() {
         closed.body,
         json!({"code": "slow_consumer", "resumable": true})
     );
+    client.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(worker.join().unwrap(), Ok(()));
+}
+
+#[test]
+fn stalled_artifact_expires_without_another_client_frame() {
+    let artifact_id = "0190a100-0000-7000-8000-000000000079";
+    let clock_value = Arc::new(AtomicU64::new(0));
+    let worker_clock = SharedTestClock(Arc::clone(&clock_value));
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        let mut service = StartService::default();
+        run_authenticated_session_with_authorization(
+            server,
+            credentials(),
+            "0.1.0",
+            Duration::from_secs(1),
+            AuthorizationSessionDependencies {
+                fill_random: |bytes: &mut [u8]| {
+                    bytes.fill(9);
+                    Ok(())
+                },
+                clock: worker_clock,
+                tokens: TestTokens(1),
+                approvals: |_: &muniment_core::attach::PairingChallenge, _: Duration| {
+                    Some(ApprovalDecision::Approve(approval()))
+                },
+            },
+            &mut service,
+        )
+    });
+    client.write_all(&hello(1, 1)).unwrap();
+    let _: Welcome = read_frame(&mut client);
+    let _: Authorized = read_frame(&mut client);
+
+    for request_id in [920, 921] {
+        client
+            .write_all(&request(
+                request_id,
+                Operation::ArtifactFetch,
+                json!({"artifact_id": artifact_id}),
+            ))
+            .unwrap();
+    }
+    let stalled: Response = read_frame(&mut client);
+    let unrelated: Response = read_frame(&mut client);
+    client
+        .write_all(&request(
+            922,
+            Operation::ArtifactWindow,
+            json!({
+                "transfer_id": stalled.body["transfer_id"],
+                "ack_through_chunk": -1,
+                "max_chunks": 1
+            }),
+        ))
+        .unwrap();
+    let _: Response = read_frame(&mut client);
+    let _: Event = read_frame(&mut client);
+
+    clock_value.store(30, Ordering::SeqCst);
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let error: ErrorEnvelope = read_frame(&mut client);
+    assert_eq!(error.request_id, None);
+    assert_eq!(error.error.code(), ErrorCode::SlowConsumer);
+    assert!(error.error.retryable());
+    let closed: Event = read_frame(&mut client);
+    assert_eq!(closed.event, EventName::StreamClosed);
+    assert_eq!(
+        closed.subscription_id,
+        Id::new(stalled.body["transfer_id"].as_str().unwrap().to_owned()).unwrap()
+    );
+    assert_eq!(
+        closed.body,
+        json!({"code": "slow_consumer", "resumable": true})
+    );
+
+    client
+        .write_all(&request(
+            923,
+            Operation::ArtifactWindow,
+            json!({
+                "transfer_id": unrelated.body["transfer_id"],
+                "ack_through_chunk": -1,
+                "max_chunks": 1
+            }),
+        ))
+        .unwrap();
+    let response: Response = read_frame(&mut client);
+    assert_eq!(response.body["granted_chunks"], 1);
+    let chunk: Event = read_frame(&mut client);
+    assert_eq!(chunk.event, EventName::ArtifactChunk);
+    assert_eq!(
+        chunk.subscription_id.as_str(),
+        unrelated.body["transfer_id"]
+    );
+
     client.shutdown(Shutdown::Write).unwrap();
     assert_eq!(worker.join().unwrap(), Ok(()));
 }

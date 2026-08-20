@@ -167,6 +167,10 @@ impl<C: AuthorizationClock, G: AuthorizationTokenGenerator> AuthorizationState<C
         }
     }
 
+    pub(crate) fn now(&self) -> Duration {
+        self.clock.now()
+    }
+
     pub fn issue_challenge(&mut self) -> Result<PairingChallenge, AuthorizationError> {
         if !matches!(self.state, State::PairingRequired) {
             return Err(if matches!(self.state, State::Revoked) {

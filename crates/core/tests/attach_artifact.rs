@@ -301,6 +301,27 @@ fn registry_inserts_looks_up_and_removes_by_transfer_id() {
 }
 
 #[test]
+fn registry_removes_only_transfers_at_the_deadline() {
+    let started = Instant::now();
+    let mut expired = transfer(1, 1, 1);
+    expired.accept_window_at(&id(1), -1, 1, started).unwrap();
+    expired
+        .admit_chunk_at(&id(2), 0, 0, 1, &hash(b"a"), b"a", started)
+        .unwrap();
+    let live = empty_transfer(id(3));
+
+    let mut registry = ArtifactTransferRegistry::new();
+    registry.insert(expired).unwrap();
+    registry.insert(live).unwrap();
+    let deadline = started + ARTIFACT_ACKNOWLEDGEMENT_TIMEOUT;
+    assert_eq!(registry.nearest_acknowledgement_deadline(), Some(deadline));
+    assert_eq!(registry.remove_expired(deadline), vec![id(1)]);
+    assert!(registry.get(&id(1)).is_err());
+    assert!(registry.get(&id(3)).is_ok());
+    assert_eq!(registry.nearest_acknowledgement_deadline(), None);
+}
+
+#[test]
 fn registry_rejects_a_sixty_fifth_insert() {
     assert_eq!(MAX_ACTIVE_ARTIFACT_TRANSFERS, 64);
     let mut registry = ArtifactTransferRegistry::new();

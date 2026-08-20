@@ -352,6 +352,30 @@ impl ArtifactTransferRegistry {
             .remove(transfer_id)
             .ok_or(ArtifactTransferRegistryError::NotFound)
     }
+
+    pub fn nearest_acknowledgement_deadline(&self) -> Option<Instant> {
+        self.transfers
+            .values()
+            .filter_map(ArtifactTransfer::acknowledgement_deadline)
+            .min()
+    }
+
+    pub fn remove_expired(&mut self, now: Instant) -> Vec<Id> {
+        let expired = self
+            .transfers
+            .iter()
+            .filter(|(_, transfer)| {
+                transfer
+                    .acknowledgement_deadline()
+                    .is_some_and(|deadline| now >= deadline)
+            })
+            .map(|(transfer_id, _)| transfer_id.clone())
+            .collect::<Vec<_>>();
+        for transfer_id in &expired {
+            self.transfers.remove(transfer_id);
+        }
+        expired
+    }
 }
 
 fn valid_sha256(value: &str) -> bool {

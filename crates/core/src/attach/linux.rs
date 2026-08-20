@@ -2327,6 +2327,7 @@ where
 {
     let mut subscriptions = Vec::new();
     let mut registries = SessionRegistries::default();
+    let artifact_clock_origin = (authorization.now(), Instant::now());
     loop {
         let gate = session
             .connection
@@ -2360,6 +2361,25 @@ where
         let idle_deadline = Instant::now()
             .checked_add(idle_remaining)
             .ok_or(AttachSessionError::Timeout)?;
+        let artifact_now =
+            artifact_clock_origin.1 + authorization.now().saturating_sub(artifact_clock_origin.0);
+        for transfer_id in registries.artifact_transfers.remove_expired(artifact_now) {
+            let deadline = (Instant::now() + timeout).min(idle_deadline);
+            write_request_error(stream, None, ProtocolError::slow_consumer(), deadline);
+            let closed = Event {
+                protocol: Protocol,
+                subscription_id: transfer_id,
+                event: EventName::StreamClosed,
+                run_id: None,
+                run_seq: None,
+                body: serde_json::json!({"code": "slow_consumer", "resumable": true}),
+            };
+            write_before(
+                stream,
+                &encode_frame(&closed).map_err(|_| AttachSessionError::MalformedFrame)?,
+                deadline,
+            )?;
+        }
         let live_events = if authorization_expired {
             Vec::new()
         } else {
@@ -2381,7 +2401,14 @@ where
         }
         drop(state);
         drop(gate);
-        let poll_deadline = (Instant::now() + Duration::from_millis(50)).min(idle_deadline);
+        let artifact_wait_deadline = registries
+            .artifact_transfers
+            .nearest_acknowledgement_deadline()
+            .map(|deadline| Instant::now() + deadline.saturating_duration_since(artifact_now));
+        let poll_deadline = artifact_wait_deadline
+            .unwrap_or(idle_deadline)
+            .min(Instant::now() + Duration::from_millis(50))
+            .min(idle_deadline);
         let mut prefix = [0; 4];
         match wait_until_readable(stream, poll_deadline) {
             Ok(()) => {}
@@ -2538,6 +2565,9 @@ where
             return Err(AttachSessionError::Authorization);
         }
         let request_id = request.request_id.clone();
+        let artifact_now =
+            artifact_clock_origin.1 + authorization.now().saturating_sub(artifact_clock_origin.0);
+        registries.artifact_now = Some(artifact_now);
         match dispatch_request(
             request,
             session.workspace,
@@ -2636,6 +2666,7 @@ struct DispatchResult {
 struct SessionRegistries {
     cancelled_subscriptions: HashSet<super::Id>,
     artifact_transfers: ArtifactTransferRegistry,
+    artifact_now: Option<Instant>,
 }
 
 struct DispatchFailure {
@@ -2972,6 +3003,7 @@ fn dispatch_request<S: ThreadListService>(
     chat_subscription: &mut Option<ActiveChatSubscription>,
     registries: &mut SessionRegistries,
 ) -> Result<DispatchResult, DispatchFailure> {
+    let now = registries.artifact_now.unwrap_or_else(Instant::now);
     let _drain_admission = service
         .drain_state()
         .map(|drain| drain.admit(request.operation))
@@ -3001,32 +3033,36 @@ fn dispatch_request<S: ThreadListService>(
             .artifact_transfers
             .get_mut(&transfer_id)
             .map_err(|_| ProtocolError::transfer_not_found())?;
-        let granted_chunks =
-            match transfer.accept_window(&transfer_id, body.ack_through_chunk, body.max_chunks) {
-                Ok(granted_chunks) => granted_chunks,
-                Err(error) => {
-                    let close = error.close();
-                    let code = close.code.as_str();
-                    registries
-                        .artifact_transfers
-                        .remove(&transfer_id)
-                        .map_err(|_| ProtocolError::transfer_not_found())?;
-                    return Err(DispatchFailure {
-                        error: error.error().clone(),
-                        events: vec![Event {
-                            protocol: Protocol,
-                            subscription_id: transfer_id,
-                            event: EventName::StreamClosed,
-                            run_id: None,
-                            run_seq: None,
-                            body: serde_json::json!({
-                                "code": code,
-                                "resumable": close.resumable,
-                            }),
-                        }],
-                    });
-                }
-            };
+        let granted_chunks = match transfer.accept_window_at(
+            &transfer_id,
+            body.ack_through_chunk,
+            body.max_chunks,
+            now,
+        ) {
+            Ok(granted_chunks) => granted_chunks,
+            Err(error) => {
+                let close = error.close();
+                let code = close.code.as_str();
+                registries
+                    .artifact_transfers
+                    .remove(&transfer_id)
+                    .map_err(|_| ProtocolError::transfer_not_found())?;
+                return Err(DispatchFailure {
+                    error: error.error().clone(),
+                    events: vec![Event {
+                        protocol: Protocol,
+                        subscription_id: transfer_id,
+                        event: EventName::StreamClosed,
+                        run_id: None,
+                        run_seq: None,
+                        body: serde_json::json!({
+                            "code": code,
+                            "resumable": close.resumable,
+                        }),
+                    }],
+                });
+            }
+        };
         let metadata = transfer.metadata().clone();
         let first_chunk = u64::try_from(transfer.highest_emitted() + 1)
             .map_err(|_| ProtocolError::persistence_failed())?;
@@ -3073,13 +3109,14 @@ fn dispatch_request<S: ThreadListService>(
                 .artifact_transfers
                 .get_mut(&transfer_id)
                 .map_err(|_| ProtocolError::transfer_not_found())?
-                .admit_chunk(
+                .admit_chunk_at(
                     &metadata.artifact_id,
                     chunk_index,
                     offset,
                     byte_length,
                     &chunk_sha256,
                     &data,
+                    now,
                 );
             if let Err(error) = admission {
                 let close = error.close();
