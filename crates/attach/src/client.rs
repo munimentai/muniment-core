@@ -448,6 +448,8 @@ pub struct ArtifactTransferMetadata {
     pub sha256: String,
     pub chunk_bytes: u64,
     pub chunk_count: u64,
+    pub max_unacknowledged_bytes: u64,
+    pub acknowledgement_timeout_ms: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -920,6 +922,8 @@ mod linux {
                 || !valid_sha256(&metadata.sha256)
                 || metadata.chunk_bytes > 256 * 1024
                 || metadata.chunk_count != expected_chunks
+                || metadata.max_unacknowledged_bytes != 8 * 1024 * 1024
+                || metadata.acknowledgement_timeout_ms != 30_000
             {
                 return Err(ClientError::UnexpectedMessage);
             }

@@ -4629,7 +4629,9 @@ fn artifact_fetch_uses_exact_envelope_and_returns_transfer_metadata() {
                 "total_bytes": 7,
                 "sha256": "f16d05ec6b29248d2c61adb1e9263f78e4f7bace1b955014a2d17872cfe4064d",
                 "chunk_bytes": 4,
-                "chunk_count": 2
+                "chunk_count": 2,
+                "max_unacknowledged_bytes": 8_388_608,
+                "acknowledgement_timeout_ms": 30_000
             }),
         };
         server.write_all(&encode_frame(&response).unwrap()).unwrap();
@@ -4641,6 +4643,8 @@ fn artifact_fetch_uses_exact_envelope_and_returns_transfer_metadata() {
     assert_eq!(metadata.total_bytes, 7);
     assert_eq!(metadata.chunk_bytes, 4);
     assert_eq!(metadata.chunk_count, 2);
+    assert_eq!(metadata.max_unacknowledged_bytes, 8_388_608);
+    assert_eq!(metadata.acknowledgement_timeout_ms, 30_000);
     assert_eq!(metadata.sha256.len(), 64);
     worker.join().unwrap();
 }
@@ -4655,6 +4659,8 @@ fn artifact_reader_returns_validated_chunk_and_completion_events() {
         sha256: "f16d05ec6b29248d2c61adb1e9263f78e4f7bace1b955014a2d17872cfe4064d".into(),
         chunk_bytes: 7,
         chunk_count: 1,
+        max_unacknowledged_bytes: 8_388_608,
+        acknowledgement_timeout_ms: 30_000,
     };
     let expected = metadata.clone();
     let worker = thread::spawn(move || {
@@ -4744,6 +4750,8 @@ fn artifact_reader_rejects_contradictory_chunk_fields_without_returning_bytes() 
             sha256: "f16d05ec6b29248d2c61adb1e9263f78e4f7bace1b955014a2d17872cfe4064d".into(),
             chunk_bytes: 7,
             chunk_count: 1,
+            max_unacknowledged_bytes: 8_388_608,
+            acknowledgement_timeout_ms: 30_000,
         };
         assert_eq!(
             client.read_artifact_event(&metadata),
@@ -4872,19 +4880,87 @@ fn artifact_fetch_rejects_invalid_ids_and_unknown_fields() {
     for body in [
         serde_json::json!({
             "transfer_id": "not-a-transfer-id", "artifact_id": artifact_id,
-            "total_bytes": 7, "sha256": "hash", "chunk_bytes": 4, "chunk_count": 2
+            "total_bytes": 7, "sha256": "hash", "chunk_bytes": 4, "chunk_count": 2,
+            "max_unacknowledged_bytes": 8_388_608, "acknowledgement_timeout_ms": 30_000
         }),
         serde_json::json!({
             "transfer_id": "01900000-0000-7000-8000-000000000002",
             "artifact_id": "not-an-artifact-id", "total_bytes": 7, "sha256": "hash",
-            "chunk_bytes": 4, "chunk_count": 2
+            "chunk_bytes": 4, "chunk_count": 2,
+            "max_unacknowledged_bytes": 8_388_608, "acknowledgement_timeout_ms": 30_000
         }),
         serde_json::json!({
             "transfer_id": "01900000-0000-7000-8000-000000000002",
             "artifact_id": artifact_id, "total_bytes": 7, "sha256": "hash",
-            "chunk_bytes": 4, "chunk_count": 2, "extra": true
+            "chunk_bytes": 4, "chunk_count": 2, "max_unacknowledged_bytes": 8_388_608,
+            "acknowledgement_timeout_ms": 30_000, "extra": true
         }),
     ] {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            complete_pairing(&mut server);
+            let request = read_client_value(&mut server);
+            let response = Response {
+                protocol: Protocol,
+                request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+                ok: Success,
+                body,
+            };
+            server.write_all(&encode_frame(&response).unwrap()).unwrap();
+        });
+        let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+        assert_eq!(
+            client.fetch_artifact(artifact_id),
+            Err(ClientError::UnexpectedMessage)
+        );
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn artifact_fetch_rejects_missing_renamed_or_changed_fixed_limits() {
+    let artifact_id = "01900000-0000-7000-8000-000000000001";
+    let valid = serde_json::json!({
+        "transfer_id": "01900000-0000-7000-8000-000000000002",
+        "artifact_id": artifact_id,
+        "total_bytes": 7,
+        "sha256": "f16d05ec6b29248d2c61adb1e9263f78e4f7bace1b955014a2d17872cfe4064d",
+        "chunk_bytes": 4,
+        "chunk_count": 2,
+        "max_unacknowledged_bytes": 8_388_608,
+        "acknowledgement_timeout_ms": 30_000
+    });
+    let mut invalid_bodies = Vec::new();
+    for (field, renamed, changed) in [
+        (
+            "max_unacknowledged_bytes",
+            "maximum_unacknowledged_bytes",
+            serde_json::json!(8_388_607),
+        ),
+        (
+            "acknowledgement_timeout_ms",
+            "acknowledgment_timeout_ms",
+            serde_json::json!(29_999),
+        ),
+    ] {
+        let mut missing = valid.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        invalid_bodies.push(missing);
+
+        let mut renamed_body = valid.clone();
+        let value = renamed_body.as_object_mut().unwrap().remove(field).unwrap();
+        renamed_body
+            .as_object_mut()
+            .unwrap()
+            .insert(renamed.into(), value);
+        invalid_bodies.push(renamed_body);
+
+        let mut changed_body = valid.clone();
+        changed_body[field] = changed;
+        invalid_bodies.push(changed_body);
+    }
+
+    for body in invalid_bodies {
         let (client, mut server) = UnixStream::pair().unwrap();
         let worker = thread::spawn(move || {
             complete_pairing(&mut server);

@@ -6362,11 +6362,19 @@ fn artifact_fetch_returns_metadata_and_rejects_the_sixty_fifth_live_transfer() {
     let mut transfer_ids = HashSet::new();
     for _ in 0..64 {
         let response: Response = read_frame(&mut client);
-        assert_eq!(response.body["artifact_id"], json!(artifact_id));
-        assert_eq!(response.body["total_bytes"], json!(300_000));
-        assert_eq!(response.body["sha256"], json!("0".repeat(64)));
-        assert_eq!(response.body["chunk_bytes"], json!(256 * 1024));
-        assert_eq!(response.body["chunk_count"], json!(2));
+        assert_eq!(
+            response.body,
+            json!({
+                "transfer_id": response.body["transfer_id"],
+                "artifact_id": artifact_id,
+                "total_bytes": 300_000,
+                "sha256": "0".repeat(64),
+                "chunk_bytes": 256 * 1024,
+                "chunk_count": 2,
+                "max_unacknowledged_bytes": 8_388_608,
+                "acknowledgement_timeout_ms": 30_000,
+            })
+        );
         assert!(transfer_ids.insert(response.body["transfer_id"].clone()));
     }
     let error: ErrorEnvelope = read_frame(&mut client);

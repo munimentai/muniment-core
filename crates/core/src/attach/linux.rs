@@ -24,8 +24,9 @@ use super::{
     ArtifactTransferRegistryError, AuthorizationClock, AuthorizationError, AuthorizationState,
     AuthorizationTokenGenerator, ConnectionBinding, Envelope, ErrorEnvelope, Event, EventName,
     Failure, FirstMessage, NegotiationError, Operation, Protocol, ProtocolError, Request, Response,
-    Success, VersionRange, WorkspaceOnboardRequest, WorkspaceOnboarded, CHALLENGE_LIFETIME,
-    MAX_ARTIFACT_CHUNK_BYTES, MAX_FRAME_LENGTH, MAX_TEXT_LENGTH,
+    Success, VersionRange, WorkspaceOnboardRequest, WorkspaceOnboarded,
+    ARTIFACT_ACKNOWLEDGEMENT_TIMEOUT, CHALLENGE_LIFETIME, MAX_ARTIFACT_CHUNK_BYTES,
+    MAX_FRAME_LENGTH, MAX_TEXT_LENGTH, MAX_UNACKNOWLEDGED_ARTIFACT_BYTES,
 };
 use super::{
     RunEventAdmission, RunStreamCursor, MAX_RUN_STREAM_WINDOW_BYTES, MAX_RUN_STREAM_WINDOW_EVENTS,
@@ -3188,6 +3189,8 @@ fn dispatch_request<S: ThreadListService>(
             "sha256": metadata.sha256,
             "chunk_bytes": metadata.chunk_bytes,
             "chunk_count": metadata.chunk_count,
+            "max_unacknowledged_bytes": MAX_UNACKNOWLEDGED_ARTIFACT_BYTES,
+            "acknowledgement_timeout_ms": ARTIFACT_ACKNOWLEDGEMENT_TIMEOUT.as_millis(),
         })));
     }
     if request.operation == Operation::RunChatEvents {
