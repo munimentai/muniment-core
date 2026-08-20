@@ -256,9 +256,13 @@ pub struct RedactedRunEvent {
     pub event_type: String,
     pub event_version: u32,
     pub recorded_at: String,
+    #[serde(default)]
     pub text: Option<String>,
+    #[serde(default)]
     pub effect_id: Option<String>,
+    #[serde(default)]
     pub display_name: Option<String>,
+    #[serde(default)]
     pub receipt: Option<RunReceipt>,
 }
 
@@ -418,6 +422,16 @@ impl fmt::Debug for ThreadOpenPage {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunOpenPage {
+    pub run_id: String,
+    pub first_available_run_seq: u64,
+    pub current_run_seq: u64,
+    pub events: Vec<RedactedRunEvent>,
+    pub exhausted: bool,
+}
+
 impl fmt::Debug for ThreadListPage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -434,9 +448,10 @@ mod linux {
         ApprovalDecision, ApprovalPresentRequest, ApprovalPresenterServeOutcome,
         AuthorizationSummary, ChatPermissionAnswer, ClientError, MigrationControlFailure,
         MigrationControlOutcome, PendingPermission, PermissionAnswerAccepted, PermissionDecision,
-        RedactedRunEvent, RunCancelAccepted, RunMessageAccepted, RunPermissionAnswerAccepted,
-        RunResumeAccepted, RunStartAccepted, RunStreamMessage, RunStreamSubscription,
-        RunSubmitAccepted, ThreadCreateAccepted, ThreadListPage, ThreadOpenPage,
+        RedactedRunEvent, RunCancelAccepted, RunMessageAccepted, RunOpenPage,
+        RunPermissionAnswerAccepted, RunResumeAccepted, RunStartAccepted, RunStreamMessage,
+        RunStreamSubscription, RunSubmitAccepted, ThreadCreateAccepted, ThreadListPage,
+        ThreadOpenPage,
     };
     use crate::{
         decode_frame, encode_frame, Authorization, Authorized, Client,
@@ -775,6 +790,44 @@ mod linux {
                     .next_cursor
                     .as_ref()
                     .is_some_and(|cursor| cursor.is_empty() || cursor.len() > MAX_CURSOR_LENGTH)
+            {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            Ok(page)
+        }
+
+        pub fn open_run(&mut self, run_id: &str) -> Result<RunOpenPage, ClientError> {
+            let run_id = Id::new(run_id.to_owned()).map_err(|_| ClientError::UnexpectedMessage)?;
+            let request_id = fresh_request_id()?;
+            let request = Request {
+                protocol: Protocol,
+                request_id: request_id.clone(),
+                operation: Operation::RunOpen,
+                capability: self.capability.clone(),
+                idempotency_key: None,
+                body: serde_json::json!({"run_id": run_id.as_str()}),
+            };
+            let response = self.send_request(request, &request_id)?;
+            let page: RunOpenPage = serde_json::from_value(response.body)
+                .map_err(|_| ClientError::UnexpectedMessage)?;
+            if page.run_id != run_id.as_str()
+                || page.first_available_run_seq == 0
+                || page.first_available_run_seq > page.current_run_seq
+                || page.events.len() > MAX_RUN_STREAM_WINDOW_EVENTS
+                || page.events.iter().enumerate().any(|(index, event)| {
+                    event.run_seq != page.first_available_run_seq.saturating_add(index as u64)
+                        || event.run_seq > page.current_run_seq
+                        || event.event_type.is_empty()
+                        || event.event_type.len() > MAX_TEXT_LENGTH
+                        || event.event_version == 0
+                        || event.recorded_at.is_empty()
+                        || event.recorded_at.len() > MAX_TEXT_LENGTH
+                        || !is_rfc3339(&event.recorded_at)
+                        || event
+                            .text
+                            .as_ref()
+                            .is_some_and(|text| text.is_empty() || text.len() > 65_536)
+                })
             {
                 return Err(ClientError::UnexpectedMessage);
             }
@@ -3616,6 +3669,10 @@ impl AuthorizedClient {
         _thread_id: &str,
         _cursor: Option<&str>,
     ) -> Result<ThreadOpenPage, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+
+    pub fn open_run(&mut self, _run_id: &str) -> Result<RunOpenPage, ClientError> {
         Err(ClientError::UnsupportedPlatform)
     }
 
