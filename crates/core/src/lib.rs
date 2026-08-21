@@ -50,6 +50,8 @@ pub mod sidecar;
 #[cfg(feature = "keyring")]
 pub mod thread_history;
 pub mod thread_ownership;
+#[cfg(unix)]
+pub mod user_diagnostics;
 pub mod write_plan;
 
 pub use muniment_attach::{
