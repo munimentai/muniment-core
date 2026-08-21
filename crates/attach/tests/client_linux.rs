@@ -4928,6 +4928,262 @@ fn artifact_metadata() -> ArtifactTransferMetadata {
     }
 }
 
+fn answer_artifact_fetch(
+    server: &mut UnixStream,
+    total_bytes: u64,
+    sha256: &str,
+    chunk_bytes: u64,
+) {
+    let request = read_client_value(server);
+    assert_eq!(request["operation"], "artifact.fetch");
+    let response = Response {
+        protocol: Protocol,
+        request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+        ok: Success,
+        body: serde_json::json!({
+            "transfer_id": "01900000-0000-7000-8000-000000000002",
+            "artifact_id": "01900000-0000-7000-8000-000000000001",
+            "total_bytes": total_bytes,
+            "sha256": sha256,
+            "chunk_bytes": chunk_bytes,
+            "chunk_count": total_bytes.div_ceil(chunk_bytes),
+            "max_unacknowledged_bytes": 8_388_608,
+            "acknowledgement_timeout_ms": 30_000
+        }),
+    };
+    server.write_all(&encode_frame(&response).unwrap()).unwrap();
+}
+
+fn answer_artifact_window(server: &mut UnixStream, acknowledged: i64, granted: u32) {
+    let request = read_client_value(server);
+    assert_eq!(request["operation"], "artifact.window");
+    assert_eq!(request["body"]["ack_through_chunk"], acknowledged);
+    let response = Response {
+        protocol: Protocol,
+        request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
+        ok: Success,
+        body: serde_json::json!({
+            "ack_through_chunk": acknowledged,
+            "granted_chunks": granted
+        }),
+    };
+    server.write_all(&encode_frame(&response).unwrap()).unwrap();
+}
+
+fn send_artifact_chunk(server: &mut UnixStream, index: u64, data: &str, sha256: &str) {
+    let event = serde_json::json!({
+        "protocol": "muniment.attach/1",
+        "subscription_id": "01900000-0000-7000-8000-000000000002",
+        "event": "artifact.chunk",
+        "body": {
+            "artifact_id": "01900000-0000-7000-8000-000000000001",
+            "byte_length": 3,
+            "chunk_index": index,
+            "chunk_sha256": sha256,
+            "data": data,
+            "offset": index * 3
+        }
+    });
+    server.write_all(&encode_frame(&event).unwrap()).unwrap();
+}
+
+fn send_artifact_complete(server: &mut UnixStream, total_bytes: u64, sha256: &str) {
+    let event = serde_json::json!({
+        "protocol": "muniment.attach/1",
+        "subscription_id": "01900000-0000-7000-8000-000000000002",
+        "event": "artifact.complete",
+        "body": {
+            "artifact_id": "01900000-0000-7000-8000-000000000001",
+            "sha256": sha256,
+            "total_bytes": total_bytes,
+            "transfer_id": "01900000-0000-7000-8000-000000000002"
+        }
+    });
+    server.write_all(&encode_frame(&event).unwrap()).unwrap();
+}
+
+#[test]
+fn artifact_download_writes_and_verifies_one_artifact() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        let hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        answer_artifact_fetch(&mut server, 3, hash, 3);
+        answer_artifact_window(&mut server, -1, 1);
+        send_artifact_chunk(&mut server, 0, "YWJj", hash);
+        answer_artifact_window(&mut server, 0, 1);
+        send_artifact_complete(&mut server, 3, hash);
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    let mut output = Vec::new();
+    let metadata = client
+        .download_artifact("01900000-0000-7000-8000-000000000001", &mut output)
+        .unwrap();
+    assert_eq!(metadata.total_bytes, 3);
+    assert_eq!(output, b"abc");
+    worker.join().unwrap();
+}
+
+#[test]
+fn artifact_download_verifies_an_empty_artifact() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        let hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        answer_artifact_fetch(&mut server, 0, hash, 3);
+        answer_artifact_window(&mut server, -1, 1);
+        send_artifact_complete(&mut server, 0, hash);
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    let mut output = Vec::new();
+    client
+        .download_artifact("01900000-0000-7000-8000-000000000001", &mut output)
+        .unwrap();
+    assert!(output.is_empty());
+    worker.join().unwrap();
+}
+
+#[test]
+fn artifact_download_returns_a_writer_failure() {
+    struct FailedWriter;
+
+    impl Write for FailedWriter {
+        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("fixture failure"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        let hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        answer_artifact_fetch(&mut server, 3, hash, 3);
+        answer_artifact_window(&mut server, -1, 1);
+        send_artifact_chunk(&mut server, 0, "YWJj", hash);
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    assert_eq!(
+        client.download_artifact("01900000-0000-7000-8000-000000000001", &mut FailedWriter),
+        Err(ClientError::WriterFailed)
+    );
+    worker.join().unwrap();
+}
+
+#[test]
+fn artifact_download_acknowledges_each_multi_window_prefix() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        let whole = "19cc02f26df43cc571bc9ed7b0c4d29224a3ec229529221725ef76d021c8326f";
+        answer_artifact_fetch(&mut server, 9, whole, 3);
+        for (index, data, hash) in [
+            (
+                0,
+                "YWJj",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+            (
+                1,
+                "ZGVm",
+                "cb8379ac2098aa165029e3938a51da0bcecfc008fd6795f401178647f96c5b34",
+            ),
+            (
+                2,
+                "Z2hp",
+                "50ae61e841fac4e8f9e40baf2ad36ec868922ea48368c18f9535e47db56dd7fb",
+            ),
+        ] {
+            answer_artifact_window(&mut server, index - 1, 1);
+            send_artifact_chunk(&mut server, index as u64, data, hash);
+        }
+        answer_artifact_window(&mut server, 2, 1);
+        send_artifact_complete(&mut server, 9, whole);
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    let mut output = Vec::new();
+    client
+        .download_artifact("01900000-0000-7000-8000-000000000001", &mut output)
+        .unwrap();
+    assert_eq!(output, b"abcdefghi");
+    worker.join().unwrap();
+}
+
+#[test]
+fn artifact_download_rejects_malformed_order() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        let whole = "19cc02f26df43cc571bc9ed7b0c4d29224a3ec229529221725ef76d021c8326f";
+        answer_artifact_fetch(&mut server, 9, whole, 3);
+        answer_artifact_window(&mut server, -1, 1);
+        send_artifact_chunk(
+            &mut server,
+            1,
+            "ZGVm",
+            "cb8379ac2098aa165029e3938a51da0bcecfc008fd6795f401178647f96c5b34",
+        );
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    assert_eq!(
+        client.download_artifact("01900000-0000-7000-8000-000000000001", &mut Vec::new()),
+        Err(ClientError::UnexpectedMessage)
+    );
+    worker.join().unwrap();
+}
+
+#[test]
+fn artifact_download_rejects_the_whole_artifact_digest_mismatch() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        let declared = "0000000000000000000000000000000000000000000000000000000000000000";
+        answer_artifact_fetch(&mut server, 3, declared, 3);
+        answer_artifact_window(&mut server, -1, 1);
+        send_artifact_chunk(
+            &mut server,
+            0,
+            "YWJj",
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        );
+        answer_artifact_window(&mut server, 0, 1);
+        send_artifact_complete(&mut server, 3, declared);
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    assert_eq!(
+        client.download_artifact("01900000-0000-7000-8000-000000000001", &mut Vec::new()),
+        Err(ClientError::UnexpectedMessage)
+    );
+    worker.join().unwrap();
+}
+
+#[test]
+fn artifact_download_returns_an_error_for_a_resumable_closure() {
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        let hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        answer_artifact_fetch(&mut server, 3, hash, 3);
+        answer_artifact_window(&mut server, -1, 1);
+        let closure = serde_json::json!({
+            "protocol": "muniment.attach/1",
+            "subscription_id": "01900000-0000-7000-8000-000000000002",
+            "event": "stream.closed",
+            "body": {"code": "invalid_artifact_cursor", "resumable": true}
+        });
+        server.write_all(&encode_frame(&closure).unwrap()).unwrap();
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    assert_eq!(
+        client.download_artifact("01900000-0000-7000-8000-000000000001", &mut Vec::new()),
+        Err(ClientError::UnexpectedMessage)
+    );
+    worker.join().unwrap();
+}
+
 #[test]
 fn artifact_reader_rejects_contradictory_chunk_fields_without_returning_bytes() {
     let valid_body = serde_json::json!({
