@@ -494,7 +494,7 @@ impl fmt::Debug for ThreadListPage {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod linux {
     use super::{
         ApprovalDecision, ApprovalPresentRequest, ApprovalPresenterServeOutcome, ArtifactChunk,
@@ -532,27 +532,54 @@ mod linux {
         revents: i16,
     }
 
+    #[cfg(target_os = "linux")]
+    #[repr(C)]
+    struct UnixSocketAddress {
+        family: u16,
+        path: [i8; 108],
+    }
+
+    #[cfg(target_os = "macos")]
+    #[repr(C)]
+    struct UnixSocketAddress {
+        length: u8,
+        family: u8,
+        path: [i8; 104],
+    }
+
     unsafe extern "C" {
         fn poll(descriptors: *mut PollFd, count: usize, timeout: i32) -> i32;
-        fn socket(domain: i32, socket_type: i32, protocol: i32) -> i32;
-        fn connect(socket: i32, address: *const UnixSocketAddress, length: u32) -> i32;
+        fn socket(domain: i32, kind: i32, protocol: i32) -> i32;
+        fn connect(descriptor: i32, address: *const UnixSocketAddress, length: u32) -> i32;
+        fn fcntl(descriptor: i32, command: i32, argument: i32) -> i32;
         fn getsockopt(
-            socket: i32,
+            descriptor: i32,
             level: i32,
             option: i32,
-            value: *mut i32,
+            value: *mut std::ffi::c_void,
             length: *mut u32,
         ) -> i32;
     }
 
     const POLLIN: i16 = 0x001;
     const POLLOUT: i16 = 0x004;
-
-    #[repr(C)]
-    struct UnixSocketAddress {
-        family: u16,
-        path: [u8; 108],
-    }
+    const AF_UNIX: i32 = 1;
+    const SOCK_STREAM: i32 = 1;
+    const F_GETFD: i32 = 1;
+    const F_SETFD: i32 = 2;
+    const FD_CLOEXEC: i32 = 1;
+    #[cfg(target_os = "linux")]
+    const EINPROGRESS: i32 = 115;
+    #[cfg(target_os = "macos")]
+    const EINPROGRESS: i32 = 36;
+    #[cfg(target_os = "linux")]
+    const SOL_SOCKET: i32 = 1;
+    #[cfg(target_os = "macos")]
+    const SOL_SOCKET: i32 = 0xffff;
+    #[cfg(target_os = "linux")]
+    const SO_ERROR: i32 = 4;
+    #[cfg(target_os = "macos")]
+    const SO_ERROR: i32 = 0x1007;
 
     const IO_TIMEOUT: Duration = Duration::from_secs(5);
     const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1948,8 +1975,8 @@ mod linux {
                 0xc67178f2,
             ];
             let mut words = [0_u32; 64];
-            for (word, bytes) in words.iter_mut().zip(self.block.chunks_exact(4)) {
-                *word = u32::from_be_bytes(bytes.try_into().expect("four-byte SHA-256 word"));
+            for (word, bytes) in words.iter_mut().zip(self.block.as_chunks::<4>().0) {
+                *word = u32::from_be_bytes(*bytes);
             }
             for index in 16..64 {
                 let s0 = words[index - 15].rotate_right(7)
@@ -3365,22 +3392,41 @@ mod linux {
         S: InterruptibleConnectState,
     {
         let path = endpoint.as_os_str().as_bytes();
-        if path.is_empty() || path.len() >= 108 || path.contains(&0) {
+        let path_capacity =
+            std::mem::size_of_val(&unsafe { std::mem::zeroed::<UnixSocketAddress>() }.path);
+        if path.is_empty() || path.len() >= path_capacity || path.contains(&0) {
             return None;
         }
-        // SAFETY: The constants and arguments match Linux's socket(2) interface.
-        let descriptor = unsafe { socket(1, 1 | 0x800 | 0x80000, 0) };
+        // SAFETY: The constants and arguments match the platform socket(2) interface.
+        let descriptor = unsafe { socket(AF_UNIX, SOCK_STREAM, 0) };
         if descriptor < 0 {
             return None;
         }
         // SAFETY: `descriptor` is a new owned descriptor from socket(2).
         let stream = unsafe { UnixStream::from_raw_fd(descriptor) };
+        // SAFETY: `descriptor` remains open and F_SETFD accepts the returned flags.
+        let descriptor_flags = unsafe { fcntl(descriptor, F_GETFD, 0) };
+        if descriptor_flags < 0
+            || unsafe { fcntl(descriptor, F_SETFD, descriptor_flags | FD_CLOEXEC) } < 0
+        {
+            return None;
+        }
         let interrupt = stream.try_clone().ok()?;
-        let mut address = UnixSocketAddress {
-            family: 1,
-            path: [0; 108],
-        };
-        address.path[..path.len()].copy_from_slice(path);
+        if stream.set_nonblocking(true).is_err() {
+            return None;
+        }
+        // SAFETY: A zeroed sockaddr_un is valid after its family and path are set.
+        let mut address = unsafe { std::mem::zeroed::<UnixSocketAddress>() };
+        address.family = AF_UNIX as _;
+        for (target, source) in address.path.iter_mut().zip(path) {
+            *target = *source as i8;
+        }
+        let address_length =
+            (std::mem::offset_of!(UnixSocketAddress, path) + path.len() + 1) as u32;
+        #[cfg(target_os = "macos")]
+        {
+            address.length = address_length as u8;
+        }
 
         let connect_result = {
             let (state, _) = &**stop;
@@ -3390,15 +3436,9 @@ mod linux {
             }
             state.set_stream(Some(interrupt));
             // SAFETY: `address` has a valid AF_UNIX family and a terminated pathname.
-            unsafe {
-                connect(
-                    descriptor,
-                    &address,
-                    (std::mem::size_of::<u16>() + path.len() + 1) as u32,
-                )
-            }
+            unsafe { connect(descriptor, std::ptr::from_ref(&address), address_length) }
         };
-        if connect_result < 0 && io::Error::last_os_error().raw_os_error() != Some(115) {
+        if connect_result < 0 && io::Error::last_os_error().raw_os_error() != Some(EINPROGRESS) {
             clear_interruptible_stream(stop);
             return None;
         }
@@ -3432,7 +3472,17 @@ mod linux {
             let mut error = 0;
             let mut length = std::mem::size_of::<i32>() as u32;
             // SAFETY: `error` and `length` are valid output pointers for SO_ERROR.
-            if unsafe { getsockopt(descriptor, 1, 4, &mut error, &mut length) } < 0 || error != 0 {
+            if unsafe {
+                getsockopt(
+                    descriptor,
+                    SOL_SOCKET,
+                    SO_ERROR,
+                    std::ptr::from_mut(&mut error).cast(),
+                    &mut length,
+                )
+            } < 0
+                || error != 0
+            {
                 clear_interruptible_stream(stop);
                 return None;
             }
@@ -3983,7 +4033,7 @@ mod linux {
             return None;
         }
         let mut output = Vec::with_capacity(value.len() / 4 * 3);
-        for (group_index, group) in value.as_bytes().chunks_exact(4).enumerate() {
+        for (group_index, group) in value.as_bytes().as_chunks::<4>().0.iter().enumerate() {
             let last = group_index + 1 == value.len() / 4;
             let padding = usize::from(group[3] == b'=') + usize::from(group[2] == b'=');
             if padding > 2 || (!last && padding != 0) || (group[2] == b'=' && group[3] != b'=') {
@@ -4054,10 +4104,10 @@ mod linux {
         }
         padded.extend_from_slice(&bit_length.to_be_bytes());
         let mut hash = INITIAL;
-        for chunk in padded.chunks_exact(64) {
+        for chunk in padded.as_chunks::<64>().0 {
             let mut words = [0_u32; 64];
-            for (word, bytes) in words.iter_mut().zip(chunk.chunks_exact(4)) {
-                *word = u32::from_be_bytes(bytes.try_into().expect("four-byte word"));
+            for (word, bytes) in words.iter_mut().zip(chunk.as_chunks::<4>().0) {
+                *word = u32::from_be_bytes(*bytes);
             }
             for index in 16..64 {
                 let s0 = words[index - 15].rotate_right(7)
@@ -4216,7 +4266,7 @@ mod linux {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub use linux::{
     connect_approval_presenter, connect_approval_presenter_at, connect_desktop_client,
     connect_desktop_client_at, handshake_approval_presenter_stream,
@@ -4227,15 +4277,15 @@ pub use linux::{
     DesktopClientStopHandle, InterruptibleConnectState, MigrationControlClient,
 };
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 #[derive(Debug)]
 pub struct AuthorizedClient;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 #[derive(Debug)]
 pub struct DesktopClient;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 impl DesktopClient {
     pub fn run_submit(
         &mut self,
@@ -4276,11 +4326,11 @@ impl DesktopClient {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 #[derive(Clone, Debug, Default)]
 pub struct DesktopClientHolder;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 impl DesktopClientHolder {
     pub fn new() -> Self {
         Self
@@ -4329,7 +4379,7 @@ impl DesktopClientHolder {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 impl AuthorizedClient {
     pub fn onboard_workspace(
         &mut self,
@@ -4455,7 +4505,7 @@ impl AuthorizedClient {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub fn handshake(
     client_version: &str,
     client_kind: &str,
@@ -4464,7 +4514,7 @@ pub fn handshake(
     linux::handshake(client_version, client_kind, pairing_pending)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub fn handshake_as(
     client_version: &str,
     client_kind: &str,
@@ -4479,7 +4529,7 @@ pub fn handshake_as(
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub fn handshake_as_with_credential(
     client_version: &str,
     client_kind: &str,
@@ -4516,9 +4566,43 @@ mod tests {
         }))
         .is_err());
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn interruptible_connect_uses_the_macos_unix_socket_abi() {
+        use super::{interruptible_connect_with_state, InterruptibleConnectState};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::sync::{Arc, Condvar, Mutex};
+
+        struct StopState {
+            stream: Option<UnixStream>,
+        }
+
+        impl InterruptibleConnectState for StopState {
+            fn stopped(&self) -> bool {
+                false
+            }
+
+            fn set_stream(&mut self, stream: Option<UnixStream>) {
+                self.stream = stream;
+            }
+        }
+
+        let endpoint = std::env::temp_dir().join(format!("mt-connect-{}.sock", std::process::id()));
+        let listener = UnixListener::bind(&endpoint).unwrap();
+        let stop = Arc::new((Mutex::new(StopState { stream: None }), Condvar::new()));
+
+        let connected = interruptible_connect_with_state(&endpoint, &stop).unwrap();
+        let accepted = listener.accept().unwrap().0;
+
+        drop(connected);
+        drop(accepted);
+        drop(listener);
+        std::fs::remove_file(endpoint).unwrap();
+    }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 pub fn handshake_as(
     _client_version: &str,
     _client_kind: &str,
@@ -4528,7 +4612,7 @@ pub fn handshake_as(
     Err(ClientError::UnsupportedPlatform)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 pub fn handshake(
     _client_version: &str,
     _client_kind: &str,
@@ -4537,7 +4621,7 @@ pub fn handshake(
     Err(ClientError::UnsupportedPlatform)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 pub fn handshake_as_with_credential(
     _client_version: &str,
     _client_kind: &str,
