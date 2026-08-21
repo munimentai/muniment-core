@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use sha2::{Digest, Sha256};
 
+pub use super::EntitlementSnapshotResult;
 use super::{
     encode_frame, welcome, Approval, ArtifactMetadata, ArtifactTransfer, ArtifactTransferRegistry,
     ArtifactTransferRegistryError, AuthorizationClock, AuthorizationError, AuthorizationState,
@@ -948,12 +949,6 @@ pub struct RunStreamPage {
     pub current_run_seq: u64,
     pub events: Vec<crate::journal::RunEventProjection>,
     pub exhausted: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EntitlementSnapshotResult {
-    pub snapshot: crate::auth::EntitlementSnapshotView,
-    pub changed_snapshot_version: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
