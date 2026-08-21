@@ -4709,6 +4709,226 @@ fn artifact_reader_returns_validated_chunk_and_completion_events() {
 }
 
 #[test]
+fn artifact_reader_returns_typed_cancellation_error_and_closure_events() {
+    let frames = [
+        serde_json::json!({
+            "protocol": "muniment.attach/1",
+            "subscription_id": "01900000-0000-7000-8000-000000000002",
+            "event": "request.cancelled",
+            "body": {}
+        }),
+        serde_json::json!({
+            "protocol": "muniment.attach/1",
+            "ok": false,
+            "error": {
+                "code": "slow_consumer",
+                "message": "Artifact consumer is too slow.",
+                "retryable": true
+            }
+        }),
+        serde_json::json!({
+            "protocol": "muniment.attach/1",
+            "subscription_id": "01900000-0000-7000-8000-000000000002",
+            "event": "stream.closed",
+            "body": {"code": "slow_consumer", "resumable": true}
+        }),
+        serde_json::json!({
+            "protocol": "muniment.attach/1",
+            "subscription_id": "01900000-0000-7000-8000-000000000002",
+            "event": "stream.closed",
+            "body": {"code": "invalid_artifact_cursor", "resumable": true}
+        }),
+    ];
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        for frame in frames {
+            server.write_all(&encode_frame(&frame).unwrap()).unwrap();
+        }
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    let metadata = artifact_metadata();
+    assert_eq!(
+        client.read_artifact_event(&metadata),
+        Ok(ArtifactTransferEvent::Cancelled)
+    );
+    assert_eq!(
+        client.read_artifact_event(&metadata),
+        Ok(ArtifactTransferEvent::Error {
+            code: muniment_attach::ArtifactTransferTerminalCode::SlowConsumer,
+            retryable: true
+        })
+    );
+    assert_eq!(
+        client.read_artifact_event(&metadata),
+        Ok(ArtifactTransferEvent::Closed {
+            code: muniment_attach::ArtifactTransferTerminalCode::SlowConsumer,
+            resumable: true
+        })
+    );
+    assert_eq!(
+        client.read_artifact_event(&metadata),
+        Ok(ArtifactTransferEvent::Closed {
+            code: muniment_attach::ArtifactTransferTerminalCode::InvalidArtifactCursor,
+            resumable: true
+        })
+    );
+    worker.join().unwrap();
+}
+
+#[test]
+fn artifact_reader_rejects_malformed_or_mismatched_terminals() {
+    let terminals = [
+        serde_json::json!({
+            "protocol": "muniment.attach/1",
+            "subscription_id": "01900000-0000-7000-8000-000000000003",
+            "event": "request.cancelled",
+            "body": {}
+        }),
+        serde_json::json!({
+            "protocol": "muniment.attach/1",
+            "subscription_id": "01900000-0000-7000-8000-000000000002",
+            "event": "request.cancelled",
+            "body": {"request_id": "00000000000000000000000000000064"}
+        }),
+        serde_json::json!({
+            "protocol": "muniment.attach/1",
+            "subscription_id": "01900000-0000-7000-8000-000000000002",
+            "event": "stream.closed",
+            "body": {"code": "slow_consumer", "resumable": false}
+        }),
+        serde_json::json!({
+            "protocol": "muniment.attach/1",
+            "subscription_id": "01900000-0000-7000-8000-000000000002",
+            "event": "stream.closed",
+            "body": {"code": "slow_consumer", "resumable": true, "extra": true}
+        }),
+        serde_json::json!({
+            "protocol": "muniment.attach/1",
+            "request_id": null,
+            "ok": false,
+            "error": {
+                "code": "slow_consumer",
+                "message": "Artifact consumer is too slow.",
+                "retryable": true
+            }
+        }),
+        serde_json::json!({
+            "protocol": "muniment.attach/1",
+            "request_id": "00000000000000000000000000000064",
+            "ok": false,
+            "error": {
+                "code": "slow_consumer",
+                "message": "Artifact consumer is too slow.",
+                "retryable": true,
+                "details": {}
+            }
+        }),
+        serde_json::json!({
+            "protocol": "muniment.attach/1",
+            "request_id": "00000000000000000000000000000064",
+            "ok": false,
+            "error": {
+                "code": "slow_consumer",
+                "message": "Artifact consumer is too slow.",
+                "retryable": true
+            },
+            "extra": true
+        }),
+        serde_json::json!({
+            "protocol": "muniment.attach/1",
+            "subscription_id": "01900000-0000-7000-8000-000000000002",
+            "event": "stream.closed",
+            "body": {"code": "transfer_not_found", "resumable": false}
+        }),
+        serde_json::json!({
+            "protocol": "muniment.attach/1",
+            "subscription_id": "01900000-0000-7000-8000-000000000002",
+            "event": "stream.closed",
+            "body": {"code": "invalid_artifact_cursor", "resumable": false}
+        }),
+    ];
+    for terminal in terminals {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            complete_pairing(&mut server);
+            server.write_all(&encode_frame(&terminal).unwrap()).unwrap();
+        });
+        let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+        assert_eq!(
+            client.read_artifact_event(&artifact_metadata()),
+            Err(ClientError::UnexpectedMessage)
+        );
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn artifact_reader_pairs_an_unbound_slow_consumer_error_with_its_transfer() {
+    let other_transfer = "01900000-0000-7000-8000-000000000003";
+    let frames = [
+        serde_json::json!({
+            "protocol": "muniment.attach/1",
+            "request_id": "00000000000000000000000000000064",
+            "ok": false,
+            "error": {
+                "code": "slow_consumer",
+                "message": "Artifact consumer is too slow.",
+                "retryable": true
+            }
+        }),
+        serde_json::json!({
+            "protocol": "muniment.attach/1",
+            "subscription_id": other_transfer,
+            "event": "stream.closed",
+            "body": {"code": "slow_consumer", "resumable": true}
+        }),
+    ];
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_pairing(&mut server);
+        for frame in frames {
+            server.write_all(&encode_frame(&frame).unwrap()).unwrap();
+        }
+    });
+    let mut client = handshake_stream(client, "0.0.1", SHORT, SHORT, || {}).unwrap();
+    assert_eq!(
+        client.read_artifact_event(&artifact_metadata()),
+        Err(ClientError::UnexpectedMessage)
+    );
+    let mut other_metadata = artifact_metadata();
+    other_metadata.transfer_id = other_transfer.into();
+    assert_eq!(
+        client.read_artifact_event(&other_metadata),
+        Ok(ArtifactTransferEvent::Error {
+            code: muniment_attach::ArtifactTransferTerminalCode::SlowConsumer,
+            retryable: true,
+        })
+    );
+    assert_eq!(
+        client.read_artifact_event(&other_metadata),
+        Ok(ArtifactTransferEvent::Closed {
+            code: muniment_attach::ArtifactTransferTerminalCode::SlowConsumer,
+            resumable: true,
+        })
+    );
+    worker.join().unwrap();
+}
+
+fn artifact_metadata() -> ArtifactTransferMetadata {
+    ArtifactTransferMetadata {
+        transfer_id: "01900000-0000-7000-8000-000000000002".into(),
+        artifact_id: "01900000-0000-7000-8000-000000000001".into(),
+        total_bytes: 7,
+        sha256: "f16d05ec6b29248d2c61adb1e9263f78e4f7bace1b955014a2d17872cfe4064d".into(),
+        chunk_bytes: 7,
+        chunk_count: 1,
+        max_unacknowledged_bytes: 8_388_608,
+        acknowledgement_timeout_ms: 30_000,
+    }
+}
+
+#[test]
 fn artifact_reader_rejects_contradictory_chunk_fields_without_returning_bytes() {
     let valid_body = serde_json::json!({
         "artifact_id": "01900000-0000-7000-8000-000000000001",
