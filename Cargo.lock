@@ -2853,6 +2853,7 @@ dependencies = [
  "libc",
  "muniment-attach",
  "muniment-core",
+ "muniment-runtime",
  "objc2",
  "objc2-foundation",
  "objc2-service-management",
