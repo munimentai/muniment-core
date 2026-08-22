@@ -8,6 +8,18 @@ pub const CHALLENGE_LIFETIME: Duration = Duration::from_secs(2 * 60);
 pub const MAX_CAPABILITY_LIFETIME: Duration = Duration::from_secs(8 * 60 * 60);
 pub const CAPABILITY_IDLE_LIFETIME: Duration = Duration::from_secs(15 * 60);
 
+pub fn bounded_claim(claim: &str) -> String {
+    const MAX_CLAIM_LENGTH: usize = 80;
+    if claim.chars().any(char::is_control)
+        || claim.trim().is_empty()
+        || claim.chars().take(MAX_CLAIM_LENGTH + 1).count() > MAX_CLAIM_LENGTH
+    {
+        "unknown".into()
+    } else {
+        claim.into()
+    }
+}
+
 /// A monotonic clock. Values have no wire meaning and need only be comparable.
 pub trait AuthorizationClock {
     fn now(&self) -> Duration;

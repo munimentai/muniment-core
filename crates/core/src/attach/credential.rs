@@ -1,4 +1,4 @@
-use super::{Id, ProtocolError};
+use super::{bounded_claim, Id, ProtocolError};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -30,18 +30,6 @@ where
 struct ClientCredentialStore {
     version: u32,
     companions: HashMap<String, ClientCredential>,
-}
-
-pub fn bounded_claim(claim: &str) -> String {
-    const MAX_CLAIM_LENGTH: usize = 80;
-    if claim.chars().any(char::is_control)
-        || claim.trim().is_empty()
-        || claim.chars().take(MAX_CLAIM_LENGTH + 1).count() > MAX_CLAIM_LENGTH
-    {
-        "unknown".into()
-    } else {
-        claim.into()
-    }
 }
 
 pub fn load_client_credentials(
