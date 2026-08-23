@@ -6729,6 +6729,8 @@ fn artifact_window_rejects_invalid_cursor_inputs_with_a_resumable_closure() {
 fn artifact_window_expires_a_transfer_that_exceeds_the_retained_byte_budget() {
     let artifact_id = "0190a100-0000-7000-8000-000000000079";
     let request_id = 919;
+    // This test hashes the full retained-byte limit, so allow for parallel test load.
+    let io_timeout = Duration::from_secs(10);
     let (mut client, server) = UnixStream::pair().unwrap();
     let worker = thread::spawn(move || {
         let mut service = StartService {
@@ -6742,7 +6744,7 @@ fn artifact_window_expires_a_transfer_that_exceeds_the_retained_byte_budget() {
             server,
             credentials(),
             "0.1.0",
-            Duration::from_secs(1),
+            io_timeout,
             AuthorizationSessionDependencies {
                 fill_random: |bytes: &mut [u8]| {
                     bytes.fill(9);
