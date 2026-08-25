@@ -25,6 +25,10 @@ mod idempotency;
 pub mod linux;
 #[cfg(target_os = "linux")]
 mod listener_lifecycle;
+#[cfg(target_os = "macos")]
+mod macos_listener;
+#[cfg(target_os = "macos")]
+mod macos_peer;
 #[cfg(target_os = "linux")]
 mod peer_authority;
 #[cfg(unix)]
@@ -62,6 +66,10 @@ pub use handoff_probe::*;
 pub use idempotency::*;
 #[cfg(target_os = "linux")]
 pub use listener_lifecycle::*;
+#[cfg(target_os = "macos")]
+pub use macos_listener::*;
+#[cfg(target_os = "macos")]
+pub use macos_peer::*;
 pub use muniment_attach::*;
 #[cfg(target_os = "linux")]
 pub use peer_authority::*;

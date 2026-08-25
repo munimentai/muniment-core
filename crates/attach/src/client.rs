@@ -525,6 +525,68 @@ mod linux {
     use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    #[cfg(target_os = "macos")]
+    pub trait MacosPeerReader {
+        fn peer_effective_uid(&self, socket: i32) -> Result<u32, ()>;
+        fn local_effective_uid(&self) -> u32;
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe extern "C" {
+        fn getpeereid(socket: i32, effective_uid: *mut u32, effective_gid: *mut u32) -> i32;
+        fn geteuid() -> u32;
+    }
+
+    #[cfg(target_os = "macos")]
+    struct NativeMacosPeerReader;
+
+    #[cfg(target_os = "macos")]
+    impl MacosPeerReader for NativeMacosPeerReader {
+        fn peer_effective_uid(&self, socket: i32) -> Result<u32, ()> {
+            let mut uid = 0;
+            let mut gid = 0;
+            if unsafe { getpeereid(socket, &mut uid, &mut gid) } == 0 {
+                Ok(uid)
+            } else {
+                Err(())
+            }
+        }
+
+        fn local_effective_uid(&self) -> u32 {
+            unsafe { geteuid() }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn verify_macos_peer(stream: &UnixStream) -> Result<(), ClientError> {
+        verify_macos_peer_with_reader(stream, &NativeMacosPeerReader)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[doc(hidden)]
+    pub fn verify_macos_peer_with_reader(
+        stream: &UnixStream,
+        reader: &impl MacosPeerReader,
+    ) -> Result<(), ClientError> {
+        let peer_uid = reader
+            .peer_effective_uid(stream.as_raw_fd())
+            .map_err(|_| ClientError::ConnectionClosed)?;
+        if peer_uid != reader.local_effective_uid() {
+            return Err(ClientError::ConnectionClosed);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn verify_connected_peer(stream: &UnixStream) -> Result<(), ClientError> {
+        verify_macos_peer(stream)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn verify_connected_peer(_stream: &UnixStream) -> Result<(), ClientError> {
+        Ok(())
+    }
+
     #[repr(C)]
     struct PollFd {
         fd: i32,
@@ -3558,6 +3620,26 @@ mod linux {
         )
     }
 
+    #[cfg(target_os = "macos")]
+    #[doc(hidden)]
+    pub fn handshake_stream_with_peer_reader(
+        stream: UnixStream,
+        reader: &impl MacosPeerReader,
+        client_version: &str,
+        io_timeout: Duration,
+        approval_timeout: Duration,
+        pairing_pending: impl FnOnce(),
+    ) -> Result<AuthorizedClient, ClientError> {
+        verify_macos_peer_with_reader(&stream, reader)?;
+        handshake_stream(
+            stream,
+            client_version,
+            io_timeout,
+            approval_timeout,
+            pairing_pending,
+        )
+    }
+
     #[doc(hidden)]
     pub fn handshake_stream_as(
         stream: UnixStream,
@@ -3608,6 +3690,7 @@ mod linux {
         client_version: &str,
         io_timeout: Duration,
     ) -> Result<MigrationControlClient, ClientError> {
+        verify_connected_peer(&stream)?;
         let hello = Hello {
             protocol: Protocol,
             client: Client {
@@ -3667,6 +3750,7 @@ mod linux {
         client_version: &str,
         io_timeout: Duration,
     ) -> Result<DesktopClient, ClientError> {
+        verify_connected_peer(&stream)?;
         let hello = Hello {
             protocol: Protocol,
             client: Client {
@@ -3732,6 +3816,7 @@ mod linux {
         client_version: &str,
         io_timeout: Duration,
     ) -> Result<ApprovalPresenterClient, ClientError> {
+        verify_connected_peer(&stream)?;
         let hello = Hello {
             protocol: Protocol,
             client: Client {
@@ -3793,6 +3878,7 @@ mod linux {
         approval_timeout: Duration,
         pairing_pending: impl FnOnce(),
     ) -> Result<AuthorizedClient, ClientError> {
+        verify_connected_peer(&stream)?;
         let authorized_client_id =
             Id::new(identity.id).map_err(|_| ClientError::UnexpectedMessage)?;
         let hello = Hello {
@@ -4275,6 +4361,12 @@ pub use linux::{
     serve_approval_presenter_at, serve_desktop_client_at, ApprovalPresenterClient,
     ApprovalPresenterStopHandle, AuthorizedClient, DesktopClient, DesktopClientHolder,
     DesktopClientStopHandle, InterruptibleConnectState, MigrationControlClient,
+};
+
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub use linux::{
+    handshake_stream_with_peer_reader, verify_macos_peer_with_reader, MacosPeerReader,
 };
 
 #[cfg(not(unix))]
