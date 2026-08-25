@@ -4,7 +4,7 @@
 mod linux_identity;
 #[cfg(target_os = "linux")]
 mod linux_transport;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 mod macos_identity;
 #[cfg(target_os = "macos")]
 mod macos_transport;
