@@ -2563,7 +2563,7 @@ where
         let artifact_now =
             artifact_clock_origin.1 + authorization.now().saturating_sub(artifact_clock_origin.0);
         registries.artifact_now = Some(artifact_now);
-        match dispatch_request(
+        let dispatched = dispatch_request(
             request,
             session.workspace,
             session.provenance.clone(),
@@ -2571,7 +2571,13 @@ where
             &mut subscriptions,
             &mut None,
             &mut registries,
-        ) {
+        );
+        let deadline = post_dispatch_deadline(
+            Instant::now(),
+            timeout,
+            authorization.remaining_lifetime().unwrap_or_default(),
+        )?;
+        match dispatched {
             Ok(dispatched) => {
                 let response = Response {
                     protocol: Protocol,
@@ -2600,6 +2606,15 @@ where
         drop(admission);
         drop(admission_gate);
     }
+}
+
+fn post_dispatch_deadline(
+    now: Instant,
+    timeout: Duration,
+    authorization_remaining: Duration,
+) -> Result<Instant, AttachSessionError> {
+    now.checked_add(timeout.min(authorization_remaining))
+        .ok_or(AttachSessionError::Timeout)
 }
 
 fn send_revocation(
@@ -4418,6 +4433,26 @@ fn write_protocol_error(stream: &mut UnixStream, error: ProtocolError, deadline:
     };
     if let Ok(frame) = encode_frame(&envelope) {
         let _ = write_before(stream, &frame, deadline);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::post_dispatch_deadline;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn post_dispatch_deadline_uses_each_configured_limit() {
+        let now = Instant::now();
+
+        assert_eq!(
+            post_dispatch_deadline(now, Duration::from_secs(2), Duration::from_secs(9)),
+            Ok(now + Duration::from_secs(2))
+        );
+        assert_eq!(
+            post_dispatch_deadline(now, Duration::from_secs(9), Duration::from_secs(7)),
+            Ok(now + Duration::from_secs(7))
+        );
     }
 }
 

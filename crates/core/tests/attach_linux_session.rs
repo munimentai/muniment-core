@@ -5158,30 +5158,50 @@ fn malformed_post_authorization_request_is_redacted_and_terminal() {
 #[test]
 fn authorization_is_rechecked_before_every_dispatch() {
     let (mut client, server) = UnixStream::pair().unwrap();
+    let now = Arc::new(AtomicU64::new(0));
+    let worker_now = Arc::clone(&now);
+    let worker = thread::spawn(move || {
+        let mut service = |_: &str, _: ThreadListRequest| {
+            Ok(ThreadListPage {
+                threads: vec![],
+                next_cursor: None,
+            })
+        };
+        run_authenticated_session_with_authorization(
+            server,
+            credentials(),
+            "0.1.0",
+            Duration::from_secs(1),
+            AuthorizationSessionDependencies {
+                fill_random: |bytes: &mut [u8]| {
+                    bytes.fill(9);
+                    Ok(())
+                },
+                clock: SharedTestClock(worker_now),
+                tokens: TestTokens(1),
+                approvals: |_: &muniment_core::attach::PairingChallenge, _: Duration| {
+                    Some(ApprovalDecision::Approve(approval()))
+                },
+            },
+            &mut service,
+        )
+    });
     client.write_all(&hello(1, 1)).unwrap();
+    let _: Welcome = read_frame(&mut client);
+    let _: Authorized = read_frame(&mut client);
     client
         .write_all(&request(20, Operation::ThreadList, json!({"limit": 1})))
         .unwrap();
+    let _: Response = read_frame(&mut client);
+    now.store(3_601, Ordering::SeqCst);
     client
         .write_all(&request(21, Operation::ThreadList, json!({"limit": 1})))
         .unwrap();
-    client.shutdown(Shutdown::Write).unwrap();
-    let now = Rc::new(Cell::new(Duration::ZERO));
-    let advance = now.clone();
-    let calls = Cell::new(0);
-    let mut service = move |_: &str, _: ThreadListRequest| {
-        calls.set(calls.get() + 1);
-        advance.set(Duration::from_secs(3601));
-        Ok(ThreadListPage {
-            threads: vec![],
-            next_cursor: None,
-        })
-    };
+
     assert_eq!(
-        dispatch_session(&mut client, server, TestClock(now), &mut service),
+        worker.join().unwrap(),
         Err(AttachSessionError::Authorization)
     );
-    let _: Response = read_frame(&mut client);
     let error: ErrorEnvelope = read_frame(&mut client);
     assert_eq!(
         error.request_id,
