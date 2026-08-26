@@ -2,7 +2,7 @@ use std::ffi::{c_void, OsStr};
 use std::io;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::ptr::null_mut;
 use std::slice;
 use windows_sys::Win32::Foundation::{LocalFree, HANDLE, INVALID_HANDLE_VALUE};
@@ -33,7 +33,7 @@ const PIPE_ACCESS_MASK: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
 /// A bound Windows attach pipe that has not accepted a connection.
 pub struct WindowsAttachListener {
     path: String,
-    _handle: OwnedHandle,
+    handle: OwnedHandle,
 }
 
 impl WindowsAttachListener {
@@ -65,15 +65,17 @@ impl WindowsAttachListener {
             .map_err(|_| io::Error::other("could not read the Windows attach pipe security"))?;
         verify_windows_pipe_security_with_reader(&reader).map_err(io::Error::other)?;
 
-        Ok(Self {
-            path,
-            _handle: handle,
-        })
+        Ok(Self { path, handle })
     }
 
     /// Returns the bound pipe path.
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    /// Returns the bound server pipe handle.
+    pub fn handle(&self) -> BorrowedHandle<'_> {
+        self.handle.as_handle()
     }
 }
 

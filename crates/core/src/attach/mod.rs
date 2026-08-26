@@ -41,6 +41,8 @@ mod runtime_activity;
 #[cfg(target_os = "windows")]
 mod windows_listener;
 mod windows_peer;
+#[cfg(target_os = "windows")]
+mod windows_peer_native;
 mod windows_pipe;
 mod windows_pipe_security;
 mod workspace_context;
@@ -88,6 +90,8 @@ pub use runtime_activity::*;
 #[cfg(target_os = "windows")]
 pub use windows_listener::*;
 pub use windows_peer::*;
+#[cfg(target_os = "windows")]
+pub use windows_peer_native::*;
 pub use windows_pipe::*;
 pub use windows_pipe_security::*;
 pub use workspace_context::*;
