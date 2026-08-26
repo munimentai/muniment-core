@@ -1,8 +1,8 @@
 use muniment_core::windows_task::{
-    build_task_definition, plan_task_registration, registration_verdict,
-    render_task_definition_xml, task_uri, LogonType, MultipleInstancesPolicy, ObservedRegistration,
-    RegistrationVerdict, RenderTaskDefinitionError, RunLevel, SidError, TaskDefinitionError,
-    TaskRegistrationPlan, Trigger,
+    build_task_definition, plan_task_registration, plan_task_removal, registration_verdict,
+    render_task_definition_xml, sid_from_task_uri, task_uri, LogonType, MultipleInstancesPolicy,
+    ObservedRegistration, RegistrationVerdict, RemovalScope, RenderTaskDefinitionError, RunLevel,
+    SidError, TaskDefinitionError, TaskRegistrationPlan, TaskRemovalPlan, Trigger,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -49,6 +49,27 @@ fn builds_the_stable_uri_only_for_canonical_sids() {
         "S-1-5-1-2-3-4-5-6-7-8-9-10-11-12-13-14-15-16",
     ] {
         assert_eq!(task_uri(sid), Err(SidError::NotCanonical), "{sid}");
+    }
+}
+
+#[test]
+fn reads_canonical_sids_only_from_stable_task_uris() {
+    assert_eq!(
+        sid_from_task_uri(r"\Muniment\Runtime-S-1-5-21-111-222-333-1001"),
+        Some(SID)
+    );
+
+    for uri in [
+        "",
+        SID,
+        r"Muniment\Runtime-S-1-5-21-111-222-333-1001",
+        r"\muniment\Runtime-S-1-5-21-111-222-333-1001",
+        r"\Muniment\Other-S-1-5-21-111-222-333-1001",
+        r"\Muniment\Runtime-s-1-5-21-111-222-333-1001",
+        r"\Muniment\Runtime-S-1-05-21-111-222-333-1001",
+        r"\Muniment\Runtime-S-1-5-21-111-222-333-1001\extra",
+    ] {
+        assert_eq!(sid_from_task_uri(uri), None, "{uri}");
     }
 }
 
@@ -347,6 +368,110 @@ fn refuses_tasks_that_are_not_safe_to_update() {
     assert_eq!(
         plan_task_registration(&definition, Some(&observed), "relative", USER_ROOT),
         TaskRegistrationPlan::Refuse
+    );
+}
+
+#[test]
+fn plans_per_user_task_removal() {
+    let mut observed = observed_registration(&task_uri(SID).unwrap());
+    observed.action_path = PathBuf::from(USER_PAYLOAD);
+    let scope = RemovalScope::PerUser {
+        user_sid: SID.to_owned(),
+        payload_path: PathBuf::from(USER_PAYLOAD),
+        machine_payload_path: Some(PathBuf::from(PAYLOAD)),
+    };
+    assert_eq!(
+        plan_task_removal(&scope, &observed),
+        TaskRemovalPlan::RepointTo(PathBuf::from(PAYLOAD))
+    );
+
+    let scope = RemovalScope::PerUser {
+        user_sid: SID.to_owned(),
+        payload_path: PathBuf::from(USER_PAYLOAD),
+        machine_payload_path: None,
+    };
+    assert_eq!(
+        plan_task_removal(&scope, &observed),
+        TaskRemovalPlan::StopAndDelete
+    );
+}
+
+#[test]
+fn leaves_another_users_task_unchanged_during_per_user_removal() {
+    const OTHER_SID: &str = "S-1-5-21-111-222-333-1002";
+
+    let mut observed = observed_registration(&task_uri(OTHER_SID).unwrap());
+    observed.principal_sid = OTHER_SID.to_owned();
+    observed.action_path = PathBuf::from(USER_PAYLOAD);
+
+    for machine_payload_path in [Some(PathBuf::from(PAYLOAD)), None] {
+        let scope = RemovalScope::PerUser {
+            user_sid: SID.to_owned(),
+            payload_path: PathBuf::from(USER_PAYLOAD),
+            machine_payload_path,
+        };
+        assert_eq!(
+            plan_task_removal(&scope, &observed),
+            TaskRemovalPlan::LeaveUnchanged
+        );
+    }
+}
+
+#[test]
+fn plans_machine_task_removal() {
+    let observed = observed_registration(&task_uri(SID).unwrap());
+    let scope = RemovalScope::Machine {
+        payload_path: PathBuf::from(PAYLOAD),
+        per_user_payload_path: Some(PathBuf::from(USER_PAYLOAD)),
+    };
+    assert_eq!(
+        plan_task_removal(&scope, &observed),
+        TaskRemovalPlan::RepointTo(PathBuf::from(USER_PAYLOAD))
+    );
+
+    let scope = RemovalScope::Machine {
+        payload_path: PathBuf::from(PAYLOAD),
+        per_user_payload_path: None,
+    };
+    assert_eq!(
+        plan_task_removal(&scope, &observed),
+        TaskRemovalPlan::StopAndDelete
+    );
+}
+
+#[test]
+fn leaves_tasks_unchanged_when_removal_ownership_does_not_match() {
+    let scope = RemovalScope::Machine {
+        payload_path: PathBuf::from(PAYLOAD),
+        per_user_payload_path: Some(PathBuf::from(USER_PAYLOAD)),
+    };
+    let uri = task_uri(SID).unwrap();
+    let mut observed = observed_registration(&uri);
+
+    observed.uri = r"\Muniment\Runtime-S-1-5-21-111-222-333-1002".to_owned();
+    assert_eq!(
+        plan_task_removal(&scope, &observed),
+        TaskRemovalPlan::LeaveUnchanged
+    );
+
+    observed = observed_registration(r"\Muniment\Runtime-S-1-5-21-foreign");
+    assert_eq!(
+        plan_task_removal(&scope, &observed),
+        TaskRemovalPlan::LeaveUnchanged
+    );
+
+    observed = observed_registration(&uri);
+    observed.action_arguments = Some(String::new());
+    assert_eq!(
+        plan_task_removal(&scope, &observed),
+        TaskRemovalPlan::LeaveUnchanged
+    );
+
+    observed = observed_registration(&uri);
+    observed.action_path = PathBuf::from(USER_PAYLOAD);
+    assert_eq!(
+        plan_task_removal(&scope, &observed),
+        TaskRemovalPlan::LeaveUnchanged
     );
 }
 
