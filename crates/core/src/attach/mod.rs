@@ -12,7 +12,6 @@ mod connection_route;
 #[cfg(target_os = "linux")]
 mod credential;
 mod cursor;
-#[cfg(unix)]
 mod deadline_io;
 #[cfg(target_os = "linux")]
 mod desktop_client_admission;

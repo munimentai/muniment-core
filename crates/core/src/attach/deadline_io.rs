@@ -1,9 +1,26 @@
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-pub(super) fn read_exact_before(
-    stream: &mut UnixStream,
+pub(super) trait DeadlineStream: Read + Write {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+}
+
+#[cfg(unix)]
+impl DeadlineStream for UnixStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        UnixStream::set_read_timeout(self, timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        UnixStream::set_write_timeout(self, timeout)
+    }
+}
+
+pub(super) fn read_exact_before<S: DeadlineStream + ?Sized>(
+    stream: &mut S,
     mut bytes: &mut [u8],
     deadline: Instant,
 ) -> io::Result<()> {
@@ -18,8 +35,8 @@ pub(super) fn read_exact_before(
     Ok(())
 }
 
-pub(super) fn write_all_before(
-    stream: &mut UnixStream,
+pub(super) fn write_all_before<S: DeadlineStream + ?Sized>(
+    stream: &mut S,
     mut bytes: &[u8],
     deadline: Instant,
 ) -> io::Result<()> {
