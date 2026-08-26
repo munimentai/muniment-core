@@ -1,5 +1,6 @@
 //! Resolves the installed Windows runtime payload without reading known folders.
 
+use crate::windows_task::{is_canonical_sid, RemovalScope, SidError};
 use std::path::{Path, PathBuf};
 
 const PAYLOAD_DIRECTORY: &str = "muniment";
@@ -23,6 +24,62 @@ pub trait WindowsPayloadProbe {
 pub enum PayloadRootError {
     RelativeRoot,
     ParentPathSegment,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowsPayloadScopes {
+    pub machine_payload_path: Option<PathBuf>,
+    pub per_user_payload_path: Option<PathBuf>,
+}
+
+impl WindowsPayloadScopes {
+    /// Builds the removal scope for an installed per-user payload.
+    pub fn per_user_removal_scope(&self, user_sid: &str) -> Result<Option<RemovalScope>, SidError> {
+        if !is_canonical_sid(user_sid) {
+            return Err(SidError::NotCanonical);
+        }
+        Ok(self
+            .per_user_payload_path
+            .as_ref()
+            .map(|payload_path| RemovalScope::PerUser {
+                user_sid: user_sid.to_owned(),
+                payload_path: payload_path.clone(),
+                machine_payload_path: self.machine_payload_path.clone(),
+            }))
+    }
+
+    /// Builds the removal scope for an installed machine payload.
+    pub fn machine_removal_scope(&self) -> Option<RemovalScope> {
+        self.machine_payload_path
+            .as_ref()
+            .map(|payload_path| RemovalScope::Machine {
+                payload_path: payload_path.clone(),
+                per_user_payload_path: self.per_user_payload_path.clone(),
+            })
+    }
+}
+
+/// Resolves the machine and per-user payloads independently.
+pub fn resolve_windows_payload_scopes(
+    program_files_root: impl AsRef<Path>,
+    local_app_data_root: impl AsRef<Path>,
+    probe: &impl WindowsPayloadProbe,
+) -> Result<WindowsPayloadScopes, PayloadRootError> {
+    let program_files_root = program_files_root.as_ref();
+    let local_app_data_root = local_app_data_root.as_ref();
+    validate_root(program_files_root)?;
+    validate_root(local_app_data_root)?;
+
+    let machine_payload_path = payload_path(program_files_root);
+    let per_user_payload_path = payload_path(local_app_data_root);
+    Ok(WindowsPayloadScopes {
+        machine_payload_path: (probe.file_kind(&machine_payload_path)
+            == PayloadFileKind::RegularFile)
+            .then_some(machine_payload_path),
+        per_user_payload_path: (probe.file_kind(&per_user_payload_path)
+            == PayloadFileKind::RegularFile)
+            .then_some(per_user_payload_path),
+    })
 }
 
 /// Resolves the machine payload first, then the per-user payload.

@@ -1,6 +1,8 @@
 use muniment_core::windows_payload::{
-    resolve_windows_payload, PayloadFileKind, PayloadRootError, WindowsPayloadProbe,
+    resolve_windows_payload, resolve_windows_payload_scopes, PayloadFileKind, PayloadRootError,
+    WindowsPayloadProbe, WindowsPayloadScopes,
 };
+use muniment_core::windows_task::{RemovalScope, SidError};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -30,6 +32,106 @@ impl WindowsPayloadProbe for FakeProbe {
 
 fn payload(root: &Path) -> PathBuf {
     root.join("muniment").join("muniment-runtime.exe")
+}
+
+const SID: &str = "S-1-5-21-111-222-333-1001";
+
+#[test]
+fn resolves_both_payload_scopes_independently() {
+    let program_files = Path::new(r"C:\Program Files");
+    let local_app_data = Path::new(r"C:\Users\Ada\AppData\Local");
+    let machine_payload = payload(program_files);
+    let user_payload = payload(local_app_data);
+
+    for (machine_kind, user_kind, expected_machine, expected_user) in [
+        (
+            PayloadFileKind::RegularFile,
+            PayloadFileKind::RegularFile,
+            Some(machine_payload.clone()),
+            Some(user_payload.clone()),
+        ),
+        (
+            PayloadFileKind::RegularFile,
+            PayloadFileKind::Missing,
+            Some(machine_payload.clone()),
+            None,
+        ),
+        (
+            PayloadFileKind::Missing,
+            PayloadFileKind::RegularFile,
+            None,
+            Some(user_payload.clone()),
+        ),
+        (
+            PayloadFileKind::Missing,
+            PayloadFileKind::Missing,
+            None,
+            None,
+        ),
+        (
+            PayloadFileKind::SymbolicLink,
+            PayloadFileKind::SymbolicLink,
+            None,
+            None,
+        ),
+    ] {
+        let probe = FakeProbe::default()
+            .with_kind(machine_payload.clone(), machine_kind)
+            .with_kind(user_payload.clone(), user_kind);
+        assert_eq!(
+            resolve_windows_payload_scopes(program_files, local_app_data, &probe),
+            Ok(WindowsPayloadScopes {
+                machine_payload_path: expected_machine,
+                per_user_payload_path: expected_user,
+            }),
+            "machine: {machine_kind:?}, user: {user_kind:?}"
+        );
+        assert_eq!(
+            *probe.probed.borrow(),
+            [machine_payload.clone(), user_payload.clone()]
+        );
+    }
+}
+
+#[test]
+fn builds_removal_scopes_from_resolved_payloads() {
+    let machine_payload = PathBuf::from(r"C:\Program Files\muniment\muniment-runtime.exe");
+    let user_payload = PathBuf::from(r"C:\Users\Ada\AppData\Local\muniment\muniment-runtime.exe");
+    let scopes = WindowsPayloadScopes {
+        machine_payload_path: Some(machine_payload.clone()),
+        per_user_payload_path: Some(user_payload.clone()),
+    };
+
+    assert_eq!(
+        scopes.per_user_removal_scope(SID),
+        Ok(Some(RemovalScope::PerUser {
+            user_sid: SID.to_owned(),
+            payload_path: user_payload.clone(),
+            machine_payload_path: Some(machine_payload.clone()),
+        }))
+    );
+    assert_eq!(
+        scopes.machine_removal_scope(),
+        Some(RemovalScope::Machine {
+            payload_path: machine_payload,
+            per_user_payload_path: Some(user_payload),
+        })
+    );
+    assert_eq!(
+        scopes.per_user_removal_scope("s-1-5-21-111-222-333-1001"),
+        Err(SidError::NotCanonical)
+    );
+}
+
+#[test]
+fn removal_scope_is_absent_when_its_payload_is_absent() {
+    let scopes = WindowsPayloadScopes {
+        machine_payload_path: None,
+        per_user_payload_path: None,
+    };
+
+    assert_eq!(scopes.per_user_removal_scope(SID), Ok(None));
+    assert_eq!(scopes.machine_removal_scope(), None);
 }
 
 #[test]
@@ -138,6 +240,10 @@ fn invalid_roots_are_rejected_before_any_probe() {
         );
         assert_eq!(
             resolve_windows_payload(program_files, local_app_data, &probe),
+            Err(error)
+        );
+        assert_eq!(
+            resolve_windows_payload_scopes(program_files, local_app_data, &probe),
             Err(error)
         );
         assert!(probe.probed.borrow().is_empty());
