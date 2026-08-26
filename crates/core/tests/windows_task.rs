@@ -1,6 +1,7 @@
 use muniment_core::windows_task::{
-    build_task_definition, registration_verdict, task_uri, LogonType, MultipleInstancesPolicy,
-    ObservedRegistration, RegistrationVerdict, RunLevel, SidError, TaskDefinitionError, Trigger,
+    build_task_definition, registration_verdict, render_task_definition_xml, task_uri, LogonType,
+    MultipleInstancesPolicy, ObservedRegistration, RegistrationVerdict, RenderTaskDefinitionError,
+    RunLevel, SidError, TaskDefinitionError, Trigger,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -93,6 +94,90 @@ fn builds_the_required_principal_action_trigger_and_settings() {
     assert!(!definition.settings.run_only_if_network_available);
     assert!(!definition.settings.disallow_start_if_on_batteries);
     assert!(!definition.settings.stop_if_going_on_batteries);
+}
+
+#[test]
+fn renders_the_machine_payload_task_document() {
+    let definition = build_task_definition(SID, PAYLOAD).unwrap();
+
+    assert_eq!(
+        render_task_definition_xml(&definition),
+        Ok(format!(
+            r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <URI>\Muniment\Runtime-{SID}</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <UserId>{SID}</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{SID}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <RestartOnFailure>
+      <Count>4</Count>
+      <Interval>PT1M</Interval>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{PAYLOAD}</Command>
+    </Exec>
+  </Actions>
+</Task>
+"#
+        ))
+    );
+}
+
+#[test]
+fn escapes_action_values_and_writes_optional_arguments() {
+    let mut definition = build_task_definition(SID, PAYLOAD).unwrap();
+    definition.action.path = PathBuf::from(r#"C:\A&B<"folder">\muniment-runtime.exe"#);
+    definition.action.arguments = Some(r#"--value=&<">"#.to_owned());
+
+    let machine_xml =
+        render_task_definition_xml(&build_task_definition(SID, PAYLOAD).unwrap()).unwrap();
+    let expected = machine_xml.replace(
+        &format!("      <Command>{PAYLOAD}</Command>"),
+        concat!(
+            "      <Command>C:\\A&amp;B&lt;&quot;folder&quot;&gt;\\muniment-runtime.exe</Command>\n",
+            "      <Arguments>--value=&amp;&lt;&quot;&gt;</Arguments>"
+        ),
+    );
+
+    assert_eq!(render_task_definition_xml(&definition), Ok(expected));
+}
+
+#[test]
+fn rejects_unsupported_principal_variants() {
+    let mut definition = build_task_definition(SID, PAYLOAD).unwrap();
+    definition.logon_type = LogonType::Other(99);
+    assert_eq!(
+        render_task_definition_xml(&definition),
+        Err(RenderTaskDefinitionError::UnsupportedLogonType)
+    );
+
+    definition.logon_type = LogonType::InteractiveToken;
+    definition.run_level = RunLevel::Other(99);
+    assert_eq!(
+        render_task_definition_xml(&definition),
+        Err(RenderTaskDefinitionError::UnsupportedRunLevel)
+    );
 }
 
 #[test]

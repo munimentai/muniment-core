@@ -1,5 +1,6 @@
 //! Platform-independent values for the Windows runtime Scheduled Task.
 
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -73,6 +74,13 @@ pub enum TaskDefinitionError {
     WrongPayloadFileName,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderTaskDefinitionError {
+    UnsupportedLogonType,
+    UnsupportedRunLevel,
+    NonUnicodeActionPath,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObservedRegistration {
     pub uri: String,
@@ -134,6 +142,166 @@ pub fn build_task_definition(
     payload_path: impl AsRef<Path>,
 ) -> Result<TaskDefinition, TaskDefinitionError> {
     TaskDefinition::new(sid, payload_path)
+}
+
+/// Renders a Task Scheduler XML document from a platform-independent definition.
+pub fn render_task_definition_xml(
+    definition: &TaskDefinition,
+) -> Result<String, RenderTaskDefinitionError> {
+    let logon_type = match definition.logon_type {
+        LogonType::InteractiveToken => "InteractiveToken",
+        LogonType::Other(_) => return Err(RenderTaskDefinitionError::UnsupportedLogonType),
+    };
+    let run_level = match definition.run_level {
+        RunLevel::LeastPrivilege => "LeastPrivilege",
+        RunLevel::HighestPrivilege => "HighestAvailable",
+        RunLevel::Other(_) => return Err(RenderTaskDefinitionError::UnsupportedRunLevel),
+    };
+    let action_path = definition
+        .action
+        .path
+        .to_str()
+        .ok_or(RenderTaskDefinitionError::NonUnicodeActionPath)?;
+
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
+<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n",
+    );
+    xml.push_str("  <RegistrationInfo>\n");
+    write_element(&mut xml, 4, "URI", &definition.uri);
+    xml.push_str("  </RegistrationInfo>\n  <Triggers>\n");
+    for trigger in &definition.triggers {
+        match trigger {
+            Trigger::Logon => {
+                xml.push_str("    <LogonTrigger>\n");
+                write_element(&mut xml, 6, "UserId", &definition.principal_sid);
+                xml.push_str("    </LogonTrigger>\n");
+            }
+        }
+    }
+    xml.push_str("  </Triggers>\n  <Principals>\n    <Principal id=\"Author\">\n");
+    write_element(&mut xml, 6, "UserId", &definition.principal_sid);
+    write_element(&mut xml, 6, "LogonType", logon_type);
+    write_element(&mut xml, 6, "RunLevel", run_level);
+    xml.push_str("    </Principal>\n  </Principals>\n  <Settings>\n");
+    write_bool_element(
+        &mut xml,
+        "AllowStartOnDemand",
+        definition.settings.allow_start_on_demand,
+    );
+    write_element(
+        &mut xml,
+        4,
+        "MultipleInstancesPolicy",
+        match definition.settings.multiple_instances {
+            MultipleInstancesPolicy::IgnoreNew => "IgnoreNew",
+        },
+    );
+    write_bool_element(
+        &mut xml,
+        "StartWhenAvailable",
+        definition.settings.start_when_available,
+    );
+    write_bool_element(
+        &mut xml,
+        "DisallowStartIfOnBatteries",
+        definition.settings.disallow_start_if_on_batteries,
+    );
+    write_bool_element(
+        &mut xml,
+        "StopIfGoingOnBatteries",
+        definition.settings.stop_if_going_on_batteries,
+    );
+    write_bool_element(
+        &mut xml,
+        "RunOnlyIfNetworkAvailable",
+        definition.settings.run_only_if_network_available,
+    );
+    let execution_time_limit = definition
+        .settings
+        .execution_time_limit
+        .map(format_duration)
+        .unwrap_or_else(|| "PT0S".to_owned());
+    write_element(&mut xml, 4, "ExecutionTimeLimit", &execution_time_limit);
+    xml.push_str("    <RestartOnFailure>\n");
+    write_element(
+        &mut xml,
+        6,
+        "Count",
+        &definition.settings.restart_count.to_string(),
+    );
+    write_element(
+        &mut xml,
+        6,
+        "Interval",
+        &format_duration(definition.settings.restart_interval),
+    );
+    xml.push_str(
+        "    </RestartOnFailure>\n  </Settings>\n  <Actions Context=\"Author\">\n    <Exec>\n",
+    );
+    write_element(&mut xml, 6, "Command", action_path);
+    if let Some(arguments) = &definition.action.arguments {
+        write_element(&mut xml, 6, "Arguments", arguments);
+    }
+    xml.push_str("    </Exec>\n  </Actions>\n</Task>\n");
+    Ok(xml)
+}
+
+fn write_bool_element(xml: &mut String, name: &str, value: bool) {
+    write_element(xml, 4, name, if value { "true" } else { "false" });
+}
+
+fn write_element(xml: &mut String, indent: usize, name: &str, value: &str) {
+    let escaped = escape_xml(value);
+    writeln!(xml, "{space:indent$}<{name}>{escaped}</{name}>", space = "")
+        .expect("writing to a String cannot fail");
+}
+
+fn escape_xml(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let days = total_seconds / 86_400;
+    let hours = total_seconds % 86_400 / 3_600;
+    let minutes = total_seconds % 3_600 / 60;
+    let seconds = total_seconds % 60;
+    let nanos = duration.subsec_nanos();
+
+    let mut value = String::from("P");
+    if days > 0 {
+        write!(value, "{days}D").expect("writing to a String cannot fail");
+    }
+    if hours > 0 || minutes > 0 || seconds > 0 || nanos > 0 || days == 0 {
+        value.push('T');
+        if hours > 0 {
+            write!(value, "{hours}H").expect("writing to a String cannot fail");
+        }
+        if minutes > 0 {
+            write!(value, "{minutes}M").expect("writing to a String cannot fail");
+        }
+        if seconds > 0 || nanos > 0 || (hours == 0 && minutes == 0) {
+            write!(value, "{seconds}").expect("writing to a String cannot fail");
+            if nanos > 0 {
+                let fraction = format!("{nanos:09}");
+                value.push('.');
+                value.push_str(fraction.trim_end_matches('0'));
+            }
+            value.push('S');
+        }
+    }
+    value
 }
 
 /// Classifies only the registration values that establish ownership and compatibility.
