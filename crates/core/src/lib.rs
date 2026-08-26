@@ -52,6 +52,7 @@ pub mod thread_history;
 pub mod thread_ownership;
 #[cfg(unix)]
 pub mod user_diagnostics;
+pub mod windows_task;
 #[cfg(target_os = "windows")]
 pub mod windows_user_diagnostics;
 pub mod write_plan;
