@@ -7,6 +7,7 @@
 pub mod active_run;
 pub mod asr;
 pub mod assistant_text;
+pub mod atomic_file;
 pub mod attach;
 pub mod attachment;
 pub mod auth;
