@@ -1,8 +1,9 @@
 use muniment_core::windows_task::{
-    build_task_definition, plan_task_registration, plan_task_removal, registration_verdict,
-    render_task_definition_xml, sid_from_task_uri, task_uri, LogonType, MultipleInstancesPolicy,
-    ObservedRegistration, RegistrationVerdict, RemovalScope, RenderTaskDefinitionError, RunLevel,
-    SidError, TaskDefinitionError, TaskRegistrationPlan, TaskRemovalPlan, Trigger,
+    build_task_definition, parse_observed_registration, plan_task_registration, plan_task_removal,
+    registration_verdict, render_task_definition_xml, sid_from_task_uri, task_uri, LogonType,
+    MultipleInstancesPolicy, ObservedRegistration, ParseObservedRegistrationError,
+    RegistrationVerdict, RemovalScope, RenderTaskDefinitionError, RunLevel, SidError,
+    TaskDefinitionError, TaskRegistrationPlan, TaskRemovalPlan, Trigger,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -186,6 +187,119 @@ fn escapes_action_values_and_writes_optional_arguments() {
     );
 
     assert_eq!(render_task_definition_xml(&definition), Ok(expected));
+}
+
+#[test]
+fn parses_a_rendered_definition_as_an_equal_registration() {
+    let definition = build_task_definition(SID, PAYLOAD).unwrap();
+    let xml = render_task_definition_xml(&definition).unwrap();
+    let observed = parse_observed_registration(&definition.uri, &xml).unwrap();
+
+    assert_eq!(
+        registration_verdict(&definition, &observed),
+        RegistrationVerdict::Equal
+    );
+}
+
+#[test]
+fn parses_live_task_extras_entities_and_optional_arguments() {
+    let uri = task_uri(SID).unwrap();
+    let xml = format!(
+        r#"<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Author>A &amp; B</Author><URI>{uri}</URI><Date>2025-01-01</Date></RegistrationInfo>
+  <Principals><Principal id="Author"><UserId>{SID}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings><IdleSettings><StopOnIdleEnd>true</StopOnIdleEnd></IdleSettings></Settings>
+  <Actions Context="Author"><Exec><Command>C:\A&amp;B&lt;C&gt;&quot;D&quot;&apos;E\muniment-runtime.exe</Command><Arguments>--name=&quot;A&amp;B&apos;s&quot;</Arguments></Exec></Actions>
+</Task>"#
+    );
+
+    let observed = parse_observed_registration(&uri, &xml).unwrap();
+    assert_eq!(observed.uri, uri);
+    assert_eq!(observed.principal_sid, SID);
+    assert_eq!(observed.logon_type, LogonType::InteractiveToken);
+    assert_eq!(observed.run_level, RunLevel::HighestPrivilege);
+    assert_eq!(
+        observed.action_path,
+        PathBuf::from("C:\\A&B<C>\"D\"'E\\muniment-runtime.exe")
+    );
+    assert_eq!(
+        observed.action_arguments.as_deref(),
+        Some("--name=\"A&B's\"")
+    );
+}
+
+#[test]
+fn maps_all_documented_principal_names() {
+    let uri = task_uri(SID).unwrap();
+    for (name, expected) in [
+        ("None", LogonType::Other(0)),
+        ("Password", LogonType::Other(1)),
+        ("S4U", LogonType::Other(2)),
+        ("InteractiveToken", LogonType::InteractiveToken),
+        ("Group", LogonType::Other(4)),
+        ("ServiceAccount", LogonType::Other(5)),
+        ("InteractiveTokenOrPassword", LogonType::Other(6)),
+    ] {
+        let xml = observed_xml(&uri, name, "LeastPrivilege", false);
+        assert_eq!(
+            parse_observed_registration(&uri, &xml).unwrap().logon_type,
+            expected,
+            "{name}"
+        );
+    }
+
+    let xml = observed_xml(&uri, "InteractiveToken", "HighestAvailable", false);
+    assert_eq!(
+        parse_observed_registration(&uri, &xml).unwrap().run_level,
+        RunLevel::HighestPrivilege
+    );
+}
+
+#[test]
+fn rejects_invalid_or_incomplete_task_documents() {
+    use ParseObservedRegistrationError as Error;
+
+    let uri = task_uri(SID).unwrap();
+    let valid = observed_xml(&uri, "InteractiveToken", "LeastPrivilege", false);
+    assert_eq!(
+        parse_observed_registration(&uri, "<NotTask />"),
+        Err(Error::MissingTaskRoot)
+    );
+    assert_eq!(
+        parse_observed_registration(&uri, "not xml"),
+        Err(Error::MissingTaskRoot)
+    );
+    assert_eq!(
+        parse_observed_registration("different", &valid),
+        Err(Error::UriMismatch)
+    );
+
+    let without_user = valid.replace(&format!("<UserId>{SID}</UserId>"), "");
+    assert_eq!(
+        parse_observed_registration(&uri, &without_user),
+        Err(Error::MissingElement("Principals/Principal/UserId"))
+    );
+    let without_command = valid.replace(&format!("<Command>{PAYLOAD}</Command>"), "");
+    assert_eq!(
+        parse_observed_registration(&uri, &without_command),
+        Err(Error::MissingElement("Actions/Exec/Command"))
+    );
+
+    let two_exec_actions = observed_xml(&uri, "InteractiveToken", "LeastPrivilege", true);
+    assert_eq!(
+        parse_observed_registration(&uri, &two_exec_actions),
+        Err(Error::MultipleExecActions)
+    );
+    let unknown_logon = observed_xml(&uri, "FutureLogon", "LeastPrivilege", false);
+    assert_eq!(
+        parse_observed_registration(&uri, &unknown_logon),
+        Err(Error::UnrecognizedLogonType)
+    );
+    let unknown_level = observed_xml(&uri, "InteractiveToken", "FutureLevel", false);
+    assert_eq!(
+        parse_observed_registration(&uri, &unknown_level),
+        Err(Error::UnrecognizedRunLevel)
+    );
 }
 
 #[test]
@@ -473,6 +587,20 @@ fn leaves_tasks_unchanged_when_removal_ownership_does_not_match() {
         plan_task_removal(&scope, &observed),
         TaskRemovalPlan::LeaveUnchanged
     );
+}
+
+fn observed_xml(uri: &str, logon_type: &str, run_level: &str, second_exec: bool) -> String {
+    let second_exec = if second_exec {
+        format!("<Exec><Command>{PAYLOAD}</Command></Exec>")
+    } else {
+        String::new()
+    };
+    format!(
+        "<Task><RegistrationInfo><URI>{uri}</URI></RegistrationInfo>\
+         <Principals><Principal><UserId>{SID}</UserId><LogonType>{logon_type}</LogonType>\
+         <RunLevel>{run_level}</RunLevel></Principal></Principals>\
+         <Actions><Exec><Command>{PAYLOAD}</Command></Exec>{second_exec}</Actions></Task>"
+    )
 }
 
 fn observed_registration(uri: &str) -> ObservedRegistration {

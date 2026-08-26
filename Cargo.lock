@@ -2825,6 +2825,7 @@ dependencies = [
  "libc",
  "muniment-attach",
  "muniment-code-diff",
+ "quick-xml",
  "rusqlite",
  "same-file",
  "serde",

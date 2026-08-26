@@ -1,5 +1,7 @@
 //! Platform-independent values for the Windows runtime Scheduled Task.
 
+use quick_xml::events::Event;
+use quick_xml::Reader;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -89,6 +91,18 @@ pub struct ObservedRegistration {
     pub run_level: RunLevel,
     pub action_path: PathBuf,
     pub action_arguments: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParseObservedRegistrationError {
+    MalformedXml,
+    MissingTaskRoot,
+    MissingElement(&'static str),
+    DuplicateElement(&'static str),
+    MultipleExecActions,
+    UriMismatch,
+    UnrecognizedLogonType,
+    UnrecognizedRunLevel,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -303,6 +317,256 @@ fn escape_xml(value: &str) -> String {
         }
     }
     escaped
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObservedField {
+    Uri,
+    UserId,
+    LogonType,
+    RunLevel,
+    Command,
+    Arguments,
+}
+
+impl ObservedField {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Uri => "RegistrationInfo/URI",
+            Self::UserId => "Principals/Principal/UserId",
+            Self::LogonType => "Principals/Principal/LogonType",
+            Self::RunLevel => "Principals/Principal/RunLevel",
+            Self::Command => "Actions/Exec/Command",
+            Self::Arguments => "Actions/Exec/Arguments",
+        }
+    }
+}
+
+/// Parses the registration values from a Task Scheduler XML document.
+pub fn parse_observed_registration(
+    uri: &str,
+    xml: &str,
+) -> Result<ObservedRegistration, ParseObservedRegistrationError> {
+    use ParseObservedRegistrationError as Error;
+
+    let mut reader = Reader::from_str(xml);
+    let mut path = Vec::<Vec<u8>>::new();
+    let mut saw_root = false;
+    let mut root_closed = false;
+    let mut exec_count = 0;
+    let mut active_field: Option<(ObservedField, String)> = None;
+    let mut values: Vec<(ObservedField, String)> = Vec::new();
+
+    loop {
+        match reader.read_event().map_err(|_| Error::MalformedXml)? {
+            Event::Start(element) => {
+                if path.is_empty() {
+                    if saw_root || element.local_name().as_ref() != b"Task" {
+                        return Err(Error::MissingTaskRoot);
+                    }
+                    saw_root = true;
+                } else if root_closed {
+                    return Err(Error::MalformedXml);
+                }
+                path.push(element.local_name().as_ref().to_vec());
+                start_observed_element(&path, &mut exec_count, &mut active_field, &values)?;
+            }
+            Event::Empty(element) => {
+                if path.is_empty() {
+                    if saw_root || element.local_name().as_ref() != b"Task" {
+                        return Err(Error::MissingTaskRoot);
+                    }
+                    saw_root = true;
+                } else if root_closed {
+                    return Err(Error::MalformedXml);
+                }
+                path.push(element.local_name().as_ref().to_vec());
+                start_observed_element(&path, &mut exec_count, &mut active_field, &values)?;
+                finish_observed_element(&path, &mut active_field, &mut values);
+                path.pop();
+                if path.is_empty() {
+                    root_closed = true;
+                }
+            }
+            Event::Text(text) => {
+                if let Some((_, value)) = &mut active_field {
+                    value.push_str(&text.decode().map_err(|_| Error::MalformedXml)?);
+                }
+            }
+            Event::GeneralRef(reference) => {
+                if let Some((_, value)) = &mut active_field {
+                    let reference = reference.decode().map_err(|_| Error::MalformedXml)?;
+                    let escaped = format!("&{reference};");
+                    value.push_str(
+                        &quick_xml::escape::unescape(&escaped).map_err(|_| Error::MalformedXml)?,
+                    );
+                }
+            }
+            Event::CData(text) => {
+                if let Some((_, value)) = &mut active_field {
+                    value.push_str(&text.decode().map_err(|_| Error::MalformedXml)?);
+                }
+            }
+            Event::End(_) => {
+                finish_observed_element(&path, &mut active_field, &mut values);
+                path.pop().ok_or(Error::MalformedXml)?;
+                if path.is_empty() {
+                    root_closed = true;
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    if !saw_root {
+        return Err(Error::MissingTaskRoot);
+    }
+    if !root_closed {
+        return Err(Error::MalformedXml);
+    }
+    if exec_count == 0 {
+        return Err(Error::MissingElement("Actions/Exec"));
+    }
+
+    let document_uri = take_observed_value(&mut values, ObservedField::Uri)?;
+    if document_uri != uri {
+        return Err(Error::UriMismatch);
+    }
+    let principal_sid = take_observed_value(&mut values, ObservedField::UserId)?;
+    let logon_type = match take_observed_value(&mut values, ObservedField::LogonType)?.as_str() {
+        "InteractiveToken" => LogonType::InteractiveToken,
+        "None" => LogonType::Other(0),
+        "Password" => LogonType::Other(1),
+        "S4U" => LogonType::Other(2),
+        "Group" => LogonType::Other(4),
+        "ServiceAccount" => LogonType::Other(5),
+        "InteractiveTokenOrPassword" => LogonType::Other(6),
+        _ => return Err(Error::UnrecognizedLogonType),
+    };
+    let run_level = match take_observed_value(&mut values, ObservedField::RunLevel)?.as_str() {
+        "LeastPrivilege" => RunLevel::LeastPrivilege,
+        "HighestAvailable" => RunLevel::HighestPrivilege,
+        _ => return Err(Error::UnrecognizedRunLevel),
+    };
+    let action_path = PathBuf::from(take_observed_value(&mut values, ObservedField::Command)?);
+    let action_arguments = values
+        .iter()
+        .position(|(field, _)| *field == ObservedField::Arguments)
+        .map(|index| values.swap_remove(index).1);
+
+    Ok(ObservedRegistration {
+        uri: uri.to_owned(),
+        principal_sid,
+        logon_type,
+        run_level,
+        action_path,
+        action_arguments,
+    })
+}
+
+fn start_observed_element(
+    path: &[Vec<u8>],
+    exec_count: &mut usize,
+    active_field: &mut Option<(ObservedField, String)>,
+    values: &[(ObservedField, String)],
+) -> Result<(), ParseObservedRegistrationError> {
+    if path_matches(path, &["Task", "Actions", "Exec"]) {
+        *exec_count += 1;
+        if *exec_count > 1 {
+            return Err(ParseObservedRegistrationError::MultipleExecActions);
+        }
+    }
+
+    let field = if path_matches(path, &["Task", "RegistrationInfo", "URI"]) {
+        Some(ObservedField::Uri)
+    } else if path_matches(path, &["Task", "Principals", "Principal", "UserId"]) {
+        Some(ObservedField::UserId)
+    } else if path_matches(path, &["Task", "Principals", "Principal", "LogonType"]) {
+        Some(ObservedField::LogonType)
+    } else if path_matches(path, &["Task", "Principals", "Principal", "RunLevel"]) {
+        Some(ObservedField::RunLevel)
+    } else if path_matches(path, &["Task", "Actions", "Exec", "Command"]) {
+        Some(ObservedField::Command)
+    } else if path_matches(path, &["Task", "Actions", "Exec", "Arguments"]) {
+        Some(ObservedField::Arguments)
+    } else {
+        None
+    };
+
+    if let Some(field) = field {
+        if values.iter().any(|(existing, _)| *existing == field)
+            || active_field
+                .as_ref()
+                .is_some_and(|(existing, _)| *existing == field)
+        {
+            return Err(ParseObservedRegistrationError::DuplicateElement(
+                field.name(),
+            ));
+        }
+        *active_field = Some((field, String::new()));
+    }
+    Ok(())
+}
+
+fn finish_observed_element(
+    path: &[Vec<u8>],
+    active_field: &mut Option<(ObservedField, String)>,
+    values: &mut Vec<(ObservedField, String)>,
+) {
+    let should_finish = active_field
+        .as_ref()
+        .is_some_and(|(field, _)| observed_field_for_path(path) == Some(*field));
+    if should_finish {
+        values.push(active_field.take().expect("the field exists"));
+    }
+}
+
+fn observed_field_for_path(path: &[Vec<u8>]) -> Option<ObservedField> {
+    [
+        (ObservedField::Uri, &["Task", "RegistrationInfo", "URI"][..]),
+        (
+            ObservedField::UserId,
+            &["Task", "Principals", "Principal", "UserId"][..],
+        ),
+        (
+            ObservedField::LogonType,
+            &["Task", "Principals", "Principal", "LogonType"][..],
+        ),
+        (
+            ObservedField::RunLevel,
+            &["Task", "Principals", "Principal", "RunLevel"][..],
+        ),
+        (
+            ObservedField::Command,
+            &["Task", "Actions", "Exec", "Command"][..],
+        ),
+        (
+            ObservedField::Arguments,
+            &["Task", "Actions", "Exec", "Arguments"][..],
+        ),
+    ]
+    .into_iter()
+    .find_map(|(field, expected)| path_matches(path, expected).then_some(field))
+}
+
+fn path_matches(path: &[Vec<u8>], expected: &[&str]) -> bool {
+    path.len() == expected.len()
+        && path
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual == expected.as_bytes())
+}
+
+fn take_observed_value(
+    values: &mut Vec<(ObservedField, String)>,
+    field: ObservedField,
+) -> Result<String, ParseObservedRegistrationError> {
+    let index = values
+        .iter()
+        .position(|(existing, _)| *existing == field)
+        .ok_or(ParseObservedRegistrationError::MissingElement(field.name()))?;
+    Ok(values.swap_remove(index).1)
 }
 
 fn format_duration(duration: Duration) -> String {
