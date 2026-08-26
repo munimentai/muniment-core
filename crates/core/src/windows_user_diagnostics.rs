@@ -8,17 +8,16 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{
-    GetLastError, LocalFree, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_INSUFFICIENT_BUFFER,
-    GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    LocalFree, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
 use windows_sys::Win32::Security::{
     AclSizeInformation, AddAccessAllowedAce, EqualSid, GetAce, GetAclInformation,
-    GetSecurityDescriptorControl, GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor,
-    SetSecurityDescriptorControl, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner, TokenUser,
+    GetSecurityDescriptorControl, InitializeAcl, InitializeSecurityDescriptor,
+    SetSecurityDescriptorControl, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner,
     ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION,
     OWNER_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
-    TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, GetFileInformationByHandle, LockFileEx,
@@ -29,50 +28,30 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::SystemServices::{
     ACCESS_ALLOWED_ACE_TYPE, SECURITY_DESCRIPTOR_REVISION,
 };
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
+use crate::windows_sid::{current_process_user_sid, WindowsSid};
+
 struct OwnerSecurity {
-    _token: OwnedHandle,
-    token_user: Vec<usize>,
+    sid: WindowsSid,
     acl: Vec<usize>,
     descriptor: SECURITY_DESCRIPTOR,
 }
 
 impl OwnerSecurity {
     fn new() -> io::Result<Self> {
-        let mut token = null_mut();
-        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let token = unsafe { OwnedHandle::from_raw_handle(token) };
-        let mut length = 0;
-        unsafe {
-            GetTokenInformation(token.as_raw_handle(), TokenUser, null_mut(), 0, &mut length)
-        };
-        if unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
-            return Err(io::Error::last_os_error());
-        }
-        let mut token_user = vec![0usize; (length as usize).div_ceil(size_of::<usize>())];
-        if unsafe {
-            GetTokenInformation(
-                token.as_raw_handle(),
-                TokenUser,
-                token_user.as_mut_ptr().cast(),
-                length,
-                &mut length,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let sid = unsafe { (*(token_user.as_ptr().cast::<TOKEN_USER>())).User.Sid };
-        let acl_length = size_of::<ACL>() + size_of::<ACCESS_ALLOWED_ACE>() + sid_length(sid)?
+        let sid = current_process_user_sid().map_err(io::Error::other)?;
+        let acl_length = size_of::<ACL>() + size_of::<ACCESS_ALLOWED_ACE>() + sid.as_bytes().len()
             - size_of::<u32>();
         let mut acl = vec![0usize; acl_length.div_ceil(size_of::<usize>())];
         if unsafe { InitializeAcl(acl.as_mut_ptr().cast(), acl_length as u32, ACL_REVISION) } == 0
             || unsafe {
-                AddAccessAllowedAce(acl.as_mut_ptr().cast(), ACL_REVISION, FILE_ALL_ACCESS, sid)
+                AddAccessAllowedAce(
+                    acl.as_mut_ptr().cast(),
+                    ACL_REVISION,
+                    FILE_ALL_ACCESS,
+                    sid.as_psid(),
+                )
             } == 0
         {
             return Err(io::Error::last_os_error());
@@ -87,7 +66,7 @@ impl OwnerSecurity {
             || unsafe {
                 SetSecurityDescriptorOwner(
                     (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
-                    sid,
+                    sid.as_psid(),
                     0,
                 )
             } == 0
@@ -110,15 +89,14 @@ impl OwnerSecurity {
             return Err(io::Error::last_os_error());
         }
         Ok(Self {
-            _token: token,
-            token_user,
+            sid,
             acl,
             descriptor,
         })
     }
 
     fn sid(&self) -> PSID {
-        unsafe { (*(self.token_user.as_ptr().cast::<TOKEN_USER>())).User.Sid }
+        self.sid.as_psid()
     }
 
     fn attributes(&mut self) -> SECURITY_ATTRIBUTES {
@@ -387,15 +365,6 @@ fn unsafe_access() -> io::Result<()> {
         io::ErrorKind::PermissionDenied,
         "diagnostic path owner or access is unsafe",
     ))
-}
-
-fn sid_length(sid: PSID) -> io::Result<usize> {
-    let length = unsafe { windows_sys::Win32::Security::GetLengthSid(sid) };
-    if length == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(length as usize)
-    }
 }
 
 fn wide(path: &Path) -> Vec<u16> {

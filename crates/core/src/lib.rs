@@ -54,6 +54,8 @@ pub mod thread_ownership;
 #[cfg(unix)]
 pub mod user_diagnostics;
 pub mod windows_payload;
+#[cfg(target_os = "windows")]
+pub mod windows_sid;
 pub mod windows_task;
 #[cfg(target_os = "windows")]
 pub mod windows_user_diagnostics;
