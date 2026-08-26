@@ -39,6 +39,7 @@ mod presenter_admission;
 mod presenter_session;
 mod quiesce;
 mod runtime_activity;
+mod windows_pipe;
 mod workspace_context;
 
 pub use approval::*;
@@ -81,6 +82,7 @@ pub use presenter_admission::*;
 pub use presenter_session::*;
 pub use quiesce::*;
 pub use runtime_activity::*;
+pub use windows_pipe::*;
 pub use workspace_context::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -189,7 +189,8 @@ fn is_absolute_windows_path(path: &str, segments: &[&str]) -> bool {
     drive_absolute || unc_absolute
 }
 
-fn is_canonical_sid(sid: &str) -> bool {
+/// Returns whether a string uses the canonical SID syntax.
+pub fn is_canonical_sid(sid: &str) -> bool {
     let mut parts = sid.split('-');
     if parts.next() != Some("S") || parts.next() != Some("1") {
         return false;
