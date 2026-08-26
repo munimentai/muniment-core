@@ -11,6 +11,11 @@ use muniment_core::sidecar::{
 };
 use serde_json::{json, Value};
 
+// A shared runner can starve the spawned stub child before it writes a response.
+const STUB_RESPONSE_DEADLINE: Duration = Duration::from_secs(10);
+// A shared runner can starve the spawned stub child while shutdown reaps it.
+const SHUTDOWN_COMPLETION_DEADLINE: Duration = Duration::from_secs(5);
+
 fn config(args: &[&str]) -> SidecarConfig {
     let mut cfg = SidecarConfig::new(env!("CARGO_BIN_EXE_sidecar-test-stub"));
     cfg.args = args.iter().map(|s| s.to_string()).collect();
@@ -721,7 +726,7 @@ fn failed_json_rpc_probe_restarts_child_and_recovers() {
     for _ in 0..3 {
         assert_eq!(
             stderr
-                .read_line_timeout(Duration::from_secs(2))
+                .read_line_timeout(STUB_RESPONSE_DEADLINE)
                 .unwrap()
                 .as_deref(),
             Some("ping")
@@ -867,9 +872,9 @@ fn shutdown_is_not_stalled_by_in_flight_json_rpc_call() {
     let call = thread::spawn(move || {
         transport.call_with_notifications::<_, String, _>(
             "delayed",
-            Some(json!({"delay_ms": 500})),
+            Some(json!({"delay_ms": 10_000})),
             JsonRpcId::String("application".into()),
-            Duration::from_secs(1),
+            STUB_RESPONSE_DEADLINE,
             |_| {
                 started_tx.send(()).unwrap();
             },
@@ -879,7 +884,7 @@ fn shutdown_is_not_stalled_by_in_flight_json_rpc_call() {
     let started = Instant::now();
     supervisor.shutdown().unwrap();
     assert!(
-        started.elapsed() < Duration::from_millis(250),
+        started.elapsed() < SHUTDOWN_COMPLETION_DEADLINE,
         "shutdown waited for the application call"
     );
     assert!(call.join().unwrap().is_err());
