@@ -41,6 +41,7 @@ mod quiesce;
 mod runtime_activity;
 mod windows_peer;
 mod windows_pipe;
+mod windows_pipe_security;
 mod workspace_context;
 
 pub use approval::*;
@@ -85,6 +86,7 @@ pub use quiesce::*;
 pub use runtime_activity::*;
 pub use windows_peer::*;
 pub use windows_pipe::*;
+pub use windows_pipe_security::*;
 pub use workspace_context::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
