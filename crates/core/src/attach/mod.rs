@@ -38,6 +38,8 @@ mod presenter_admission;
 mod presenter_session;
 mod quiesce;
 mod runtime_activity;
+#[cfg(target_os = "windows")]
+mod windows_listener;
 mod windows_peer;
 mod windows_pipe;
 mod windows_pipe_security;
@@ -83,6 +85,8 @@ pub use presenter_admission::*;
 pub use presenter_session::*;
 pub use quiesce::*;
 pub use runtime_activity::*;
+#[cfg(target_os = "windows")]
+pub use windows_listener::*;
 pub use windows_peer::*;
 pub use windows_pipe::*;
 pub use windows_pipe_security::*;

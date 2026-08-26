@@ -13,11 +13,9 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
 use windows_sys::Win32::Security::{
-    AclSizeInformation, AddAccessAllowedAce, EqualSid, GetAce, GetAclInformation,
-    GetSecurityDescriptorControl, InitializeAcl, InitializeSecurityDescriptor,
-    SetSecurityDescriptorControl, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner,
-    ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION,
-    OWNER_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+    AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorControl,
+    ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION,
+    OWNER_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES, SE_DACL_PROTECTED,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, GetFileInformationByHandle, LockFileEx,
@@ -25,89 +23,10 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, OPEN_EXISTING, READ_CONTROL,
 };
-use windows_sys::Win32::System::SystemServices::{
-    ACCESS_ALLOWED_ACE_TYPE, SECURITY_DESCRIPTOR_REVISION,
-};
+use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
-use crate::windows_sid::{current_process_user_sid, WindowsSid};
-
-struct OwnerSecurity {
-    sid: WindowsSid,
-    acl: Vec<usize>,
-    descriptor: SECURITY_DESCRIPTOR,
-}
-
-impl OwnerSecurity {
-    fn new() -> io::Result<Self> {
-        let sid = current_process_user_sid().map_err(io::Error::other)?;
-        let acl_length = size_of::<ACL>() + size_of::<ACCESS_ALLOWED_ACE>() + sid.as_bytes().len()
-            - size_of::<u32>();
-        let mut acl = vec![0usize; acl_length.div_ceil(size_of::<usize>())];
-        if unsafe { InitializeAcl(acl.as_mut_ptr().cast(), acl_length as u32, ACL_REVISION) } == 0
-            || unsafe {
-                AddAccessAllowedAce(
-                    acl.as_mut_ptr().cast(),
-                    ACL_REVISION,
-                    FILE_ALL_ACCESS,
-                    sid.as_psid(),
-                )
-            } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let mut descriptor = unsafe { zeroed::<SECURITY_DESCRIPTOR>() };
-        if unsafe {
-            InitializeSecurityDescriptor(
-                (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
-                SECURITY_DESCRIPTOR_REVISION,
-            )
-        } == 0
-            || unsafe {
-                SetSecurityDescriptorOwner(
-                    (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
-                    sid.as_psid(),
-                    0,
-                )
-            } == 0
-            || unsafe {
-                SetSecurityDescriptorDacl(
-                    (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
-                    1,
-                    acl.as_ptr().cast(),
-                    0,
-                )
-            } == 0
-            || unsafe {
-                SetSecurityDescriptorControl(
-                    (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast(),
-                    SE_DACL_PROTECTED,
-                    SE_DACL_PROTECTED,
-                )
-            } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Self {
-            sid,
-            acl,
-            descriptor,
-        })
-    }
-
-    fn sid(&self) -> PSID {
-        self.sid.as_psid()
-    }
-
-    fn attributes(&mut self) -> SECURITY_ATTRIBUTES {
-        let _ = &self.acl;
-        SECURITY_ATTRIBUTES {
-            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: (&mut self.descriptor as *mut SECURITY_DESCRIPTOR).cast(),
-            bInheritHandle: 0,
-        }
-    }
-}
+use crate::windows_security::OwnerSecurity;
 
 pub fn append_owner_only_record(
     root: &Path,
@@ -117,7 +36,7 @@ pub fn append_owner_only_record(
 ) -> io::Result<()> {
     reject_parent_segments(root)?;
     reject_reparse_points(root)?;
-    let mut security = OwnerSecurity::new()?;
+    let mut security = OwnerSecurity::new(FILE_ALL_ACCESS)?;
     let root_handle = open_directory(root)?;
     validate_kind(root, &root_handle, true)?;
 
@@ -378,7 +297,7 @@ mod tests {
 
     #[test]
     fn rejects_a_foreign_owner_sid() {
-        let mut security = OwnerSecurity::new().unwrap();
+        let mut security = OwnerSecurity::new(FILE_ALL_ACCESS).unwrap();
         let mut world = vec![0usize; 68usize.div_ceil(size_of::<usize>())];
         let mut world_length = 68;
         assert_ne!(
@@ -394,7 +313,7 @@ mod tests {
         );
         let descriptor = security.attributes().lpSecurityDescriptor;
         let expected_owner = security.sid();
-        let acl = security.acl.as_mut_ptr().cast();
+        let acl = security.acl_mut_ptr();
         assert!(validate_acl(descriptor, world.as_mut_ptr().cast(), acl, expected_owner,).is_err());
     }
 }
