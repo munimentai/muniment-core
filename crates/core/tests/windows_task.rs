@@ -1,13 +1,17 @@
 use muniment_core::windows_task::{
-    build_task_definition, registration_verdict, render_task_definition_xml, task_uri, LogonType,
-    MultipleInstancesPolicy, ObservedRegistration, RegistrationVerdict, RenderTaskDefinitionError,
-    RunLevel, SidError, TaskDefinitionError, Trigger,
+    build_task_definition, plan_task_registration, registration_verdict,
+    render_task_definition_xml, task_uri, LogonType, MultipleInstancesPolicy, ObservedRegistration,
+    RegistrationVerdict, RenderTaskDefinitionError, RunLevel, SidError, TaskDefinitionError,
+    TaskRegistrationPlan, Trigger,
 };
 use std::path::PathBuf;
 use std::time::Duration;
 
 const SID: &str = "S-1-5-21-111-222-333-1001";
+const MACHINE_ROOT: &str = r"C:\Program Files";
+const USER_ROOT: &str = r"C:\Users\Alice\AppData\Local";
 const PAYLOAD: &str = r"C:\Program Files\muniment\muniment-runtime.exe";
+const USER_PAYLOAD: &str = r"C:\Users\Alice\AppData\Local\muniment\muniment-runtime.exe";
 
 #[test]
 fn builds_the_stable_uri_only_for_canonical_sids() {
@@ -238,6 +242,111 @@ fn verdict_ignores_settings_outside_the_registration_identity() {
     assert_eq!(
         registration_verdict(&definition, &observed),
         RegistrationVerdict::Equal
+    );
+}
+
+#[test]
+fn plans_registration_for_absent_and_equal_tasks() {
+    let definition = build_task_definition(SID, PAYLOAD).unwrap();
+    assert_eq!(
+        plan_task_registration(&definition, None, MACHINE_ROOT, USER_ROOT),
+        TaskRegistrationPlan::Register
+    );
+
+    let observed = observed_registration(&definition.uri);
+    assert_eq!(
+        plan_task_registration(&definition, Some(&observed), MACHINE_ROOT, USER_ROOT),
+        TaskRegistrationPlan::LeaveUnchanged
+    );
+}
+
+#[test]
+fn keeps_the_machine_payload_when_the_expected_payload_is_per_user() {
+    let definition = build_task_definition(SID, USER_PAYLOAD).unwrap();
+    let mut observed = observed_registration(&definition.uri);
+    observed.logon_type = LogonType::Other(1);
+    observed.run_level = RunLevel::HighestPrivilege;
+
+    assert_eq!(
+        plan_task_registration(&definition, Some(&observed), MACHINE_ROOT, USER_ROOT),
+        TaskRegistrationPlan::LeaveUnchanged
+    );
+}
+
+#[test]
+fn plans_updates_for_compatible_task_differences() {
+    let definition = build_task_definition(SID, USER_PAYLOAD).unwrap();
+    let mut observed = ObservedRegistration {
+        uri: definition.uri.clone(),
+        principal_sid: SID.to_owned(),
+        logon_type: LogonType::Other(1),
+        run_level: RunLevel::LeastPrivilege,
+        action_path: PathBuf::from(USER_PAYLOAD),
+        action_arguments: None,
+    };
+    assert_eq!(
+        plan_task_registration(&definition, Some(&observed), MACHINE_ROOT, USER_ROOT),
+        TaskRegistrationPlan::Update
+    );
+
+    observed.logon_type = LogonType::InteractiveToken;
+    observed.run_level = RunLevel::HighestPrivilege;
+    assert_eq!(
+        plan_task_registration(&definition, Some(&observed), MACHINE_ROOT, USER_ROOT),
+        TaskRegistrationPlan::Update
+    );
+
+    observed.run_level = RunLevel::LeastPrivilege;
+    observed.action_path = PathBuf::from(r"C:\Users\Alice\AppData\Local\old\muniment-runtime.exe");
+    assert_eq!(
+        plan_task_registration(&definition, Some(&observed), MACHINE_ROOT, USER_ROOT),
+        TaskRegistrationPlan::Update
+    );
+}
+
+#[test]
+fn refuses_tasks_that_are_not_safe_to_update() {
+    let definition = build_task_definition(SID, PAYLOAD).unwrap();
+    let mut observed = observed_registration(&definition.uri);
+
+    observed.principal_sid = "S-1-5-21-111-222-333-1002".to_owned();
+    assert_eq!(
+        plan_task_registration(&definition, Some(&observed), MACHINE_ROOT, USER_ROOT),
+        TaskRegistrationPlan::Refuse
+    );
+
+    observed = observed_registration(&definition.uri);
+    observed.action_arguments = Some(String::new());
+    assert_eq!(
+        plan_task_registration(&definition, Some(&observed), MACHINE_ROOT, USER_ROOT),
+        TaskRegistrationPlan::Refuse
+    );
+
+    for path in [
+        r"C:\other\muniment-runtime.exe",
+        r"C:\Program Files-old\muniment-runtime.exe",
+        r"C:\Program Files\..\other\muniment-runtime.exe",
+    ] {
+        observed = observed_registration(&definition.uri);
+        observed.action_path = PathBuf::from(path);
+        assert_eq!(
+            plan_task_registration(&definition, Some(&observed), MACHINE_ROOT, USER_ROOT),
+            TaskRegistrationPlan::Refuse,
+            "{path}"
+        );
+    }
+
+    observed = observed_registration(r"\Muniment\Runtime-S-1-5-21-foreign");
+    assert_eq!(
+        plan_task_registration(&definition, Some(&observed), MACHINE_ROOT, USER_ROOT),
+        TaskRegistrationPlan::Refuse
+    );
+
+    observed = observed_registration(&definition.uri);
+    observed.action_path = PathBuf::from(r"relative\muniment-runtime.exe");
+    assert_eq!(
+        plan_task_registration(&definition, Some(&observed), "relative", USER_ROOT),
+        TaskRegistrationPlan::Refuse
     );
 }
 
