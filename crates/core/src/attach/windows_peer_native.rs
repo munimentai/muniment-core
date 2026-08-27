@@ -1,11 +1,10 @@
 use std::mem::size_of;
 use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::ptr::null_mut;
-use std::slice;
 
 use windows_sys::Win32::Foundation::{GetLastError, ERROR_INSUFFICIENT_BUFFER};
 use windows_sys::Win32::Security::{
-    GetLengthSid, GetTokenInformation, IsValidSid, RevertToSelf, TokenUser, TOKEN_QUERY, TOKEN_USER,
+    GetTokenInformation, RevertToSelf, TokenUser, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::System::Pipes::ImpersonateNamedPipeClient;
 use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
@@ -14,7 +13,7 @@ use super::{
     verify_windows_attach_peer_with_reader, WindowsAttachPeerReader, WindowsPeerError,
     WindowsPeerReadError,
 };
-use crate::windows_sid::current_process_user_sid;
+use crate::windows_sid::{copy_sid_bytes, current_process_user_sid};
 
 /// Reads Windows attach peer identity from a connected named pipe.
 pub struct NativeWindowsAttachPeerReader<'pipe> {
@@ -89,12 +88,5 @@ fn read_thread_token_user_sid() -> Result<Vec<u8>, WindowsPeerReadError> {
     }
 
     let sid = unsafe { (*(token_user.as_ptr().cast::<TOKEN_USER>())).User.Sid };
-    if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
-        return Err(WindowsPeerReadError);
-    }
-    let sid_length = unsafe { GetLengthSid(sid) } as usize;
-    if sid_length == 0 {
-        return Err(WindowsPeerReadError);
-    }
-    Ok(unsafe { slice::from_raw_parts(sid.cast(), sid_length) }.to_vec())
+    copy_sid_bytes(sid).ok_or(WindowsPeerReadError)
 }

@@ -3,7 +3,6 @@ use std::fmt;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr::null_mut;
-use std::slice;
 use std::time::Instant;
 
 use windows_sys::Win32::Foundation::{
@@ -11,7 +10,7 @@ use windows_sys::Win32::Foundation::{
     ERROR_SEM_TIMEOUT, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
-use windows_sys::Win32::Security::{GetLengthSid, IsValidSid, OWNER_SECURITY_INFORMATION, PSID};
+use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, SECURITY_IDENTIFICATION,
     SECURITY_SQOS_PRESENT,
@@ -23,7 +22,7 @@ use super::{
     WindowsPipeAccessControlEntry, WindowsPipeSecurityError, WindowsPipeSecurityReadError,
     WindowsPipeSecurityReader,
 };
-use crate::windows_sid::current_process_user_sid;
+use crate::windows_sid::{copy_sid_bytes, current_process_user_sid};
 
 /// A failure while connecting to the current user's Windows attach endpoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -184,10 +183,10 @@ impl NativeWindowsEndpointOwnerReader {
             return Err(WindowsPipeSecurityReadError);
         }
 
-        let owner_sid = copy_sid(owner);
+        let owner_sid = copy_sid_bytes(owner);
         unsafe { LocalFree(descriptor) };
         Ok(Self {
-            owner_sid: owner_sid?,
+            owner_sid: owner_sid.ok_or(WindowsPipeSecurityReadError)?,
             local_sid: local_sid.to_vec(),
         })
     }
@@ -211,15 +210,4 @@ impl WindowsPipeSecurityReader for NativeWindowsEndpointOwnerReader {
     fn local_process_user_sid(&self) -> Result<Vec<u8>, WindowsPipeSecurityReadError> {
         Ok(self.local_sid.clone())
     }
-}
-
-fn copy_sid(sid: PSID) -> Result<Vec<u8>, WindowsPipeSecurityReadError> {
-    if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
-        return Err(WindowsPipeSecurityReadError);
-    }
-    let length = unsafe { GetLengthSid(sid) } as usize;
-    if length == 0 {
-        return Err(WindowsPipeSecurityReadError);
-    }
-    Ok(unsafe { slice::from_raw_parts(sid.cast::<u8>(), length) }.to_vec())
 }

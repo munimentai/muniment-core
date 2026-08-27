@@ -61,6 +61,19 @@ impl fmt::Display for WindowsSidError {
 
 impl std::error::Error for WindowsSidError {}
 
+pub(crate) fn sid_byte_len(sid: PSID) -> Option<usize> {
+    if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
+        return None;
+    }
+    let length = unsafe { GetLengthSid(sid) } as usize;
+    (length != 0).then_some(length)
+}
+
+pub(crate) fn copy_sid_bytes(sid: PSID) -> Option<Vec<u8>> {
+    let length = sid_byte_len(sid)?;
+    Some(unsafe { slice::from_raw_parts(sid.cast(), length) }.to_vec())
+}
+
 /// Reads the current process token user SID as owned bytes and a canonical string.
 pub fn current_process_user_sid() -> Result<WindowsSid, WindowsSidError> {
     let mut token = null_mut();
@@ -90,13 +103,7 @@ pub fn current_process_user_sid() -> Result<WindowsSid, WindowsSidError> {
     }
 
     let sid = unsafe { (*(token_user.as_ptr().cast::<TOKEN_USER>())).User.Sid };
-    if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
-        return Err(WindowsSidError::InvalidSid);
-    }
-    let sid_length = unsafe { GetLengthSid(sid) } as usize;
-    if sid_length == 0 {
-        return Err(WindowsSidError::InvalidSid);
-    }
+    let sid_length = sid_byte_len(sid).ok_or(WindowsSidError::InvalidSid)?;
     let mut storage = vec![0usize; sid_length.div_ceil(size_of::<usize>())];
     unsafe {
         std::ptr::copy_nonoverlapping(sid.cast::<u8>(), storage.as_mut_ptr().cast(), sid_length)

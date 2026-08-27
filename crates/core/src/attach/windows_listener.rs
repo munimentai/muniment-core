@@ -4,12 +4,11 @@ use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::ptr::null_mut;
-use std::slice;
 use windows_sys::Win32::Foundation::{LocalFree, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
 use windows_sys::Win32::Security::{
-    AclSizeInformation, GetAce, GetAclInformation, GetLengthSid, GetSecurityDescriptorControl,
-    IsValidSid, ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
+    AclSizeInformation, GetAce, GetAclInformation, GetSecurityDescriptorControl,
+    ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
     DACL_SECURITY_INFORMATION, INHERITED_ACE, OWNER_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED,
 };
 use windows_sys::Win32::Storage::FileSystem::{
@@ -27,7 +26,7 @@ use super::{
 };
 use crate::attach::windows_attach_pipe_path;
 use crate::windows_security::OwnerSecurity;
-use crate::windows_sid::current_process_user_sid;
+use crate::windows_sid::{copy_sid_bytes, current_process_user_sid};
 
 const PIPE_ACCESS_MASK: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
 
@@ -155,7 +154,7 @@ fn read_security_snapshot(
     dacl: *mut ACL,
     descriptor: *mut c_void,
 ) -> Result<(Vec<u8>, bool, Vec<WindowsPipeAccessControlEntry>), WindowsPipeSecurityReadError> {
-    let owner_sid = copy_sid(owner)?;
+    let owner_sid = copy_sid_bytes(owner).ok_or(WindowsPipeSecurityReadError)?;
     if dacl.is_null() {
         return Err(WindowsPipeSecurityReadError);
     }
@@ -205,7 +204,7 @@ fn read_security_snapshot(
             _ => return Err(WindowsPipeSecurityReadError),
         };
         entries.push(WindowsPipeAccessControlEntry {
-            sid: copy_sid(sid)?,
+            sid: copy_sid_bytes(sid).ok_or(WindowsPipeSecurityReadError)?,
             access_mask,
             allows,
             inherited: u32::from(header.AceFlags) & INHERITED_ACE != 0,
@@ -213,15 +212,4 @@ fn read_security_snapshot(
     }
 
     Ok((owner_sid, control & SE_DACL_PROTECTED != 0, entries))
-}
-
-fn copy_sid(sid: PSID) -> Result<Vec<u8>, WindowsPipeSecurityReadError> {
-    if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
-        return Err(WindowsPipeSecurityReadError);
-    }
-    let length = unsafe { GetLengthSid(sid) } as usize;
-    if length == 0 {
-        return Err(WindowsPipeSecurityReadError);
-    }
-    Ok(unsafe { slice::from_raw_parts(sid.cast(), length) }.to_vec())
 }
