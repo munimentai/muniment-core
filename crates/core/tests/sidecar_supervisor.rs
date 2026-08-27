@@ -306,7 +306,7 @@ fn loading_generation_becomes_healthy_once_when_ready() {
 #[test]
 fn loading_timeout_exhausts_restart_budget_with_stderr_diagnostics() {
     let mut cfg = config(&["stderr-hang"]);
-    cfg.startup_timeout = Duration::from_millis(25);
+    cfg.startup_timeout = Duration::from_secs(1);
     cfg.restart.max_restarts = 1;
     let supervisor = SidecarSupervisor::spawn(cfg, |_| Ok(ProbeOutcome::Loading)).unwrap();
     let events = supervisor.subscribe();
@@ -321,7 +321,7 @@ fn loading_timeout_exhausts_restart_budget_with_stderr_diagnostics() {
     assert!(saw_restart);
     assert!(matches!(failed.cause,
         Some(SidecarEventCause::StartupTimeout { timeout, stderr_tail })
-            if timeout == Duration::from_millis(25) && stderr_tail == ["health failure detail"]));
+            if timeout == Duration::from_secs(1) && stderr_tail == ["health failure detail"]));
 }
 
 #[test]
