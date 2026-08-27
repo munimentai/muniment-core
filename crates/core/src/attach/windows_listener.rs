@@ -1,10 +1,15 @@
 use std::ffi::{c_void, OsStr};
+use std::fmt;
 use std::io;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
-use std::ptr::null_mut;
-use windows_sys::Win32::Foundation::{LocalFree, HANDLE, INVALID_HANDLE_VALUE};
+use std::ptr::{null, null_mut};
+use std::time::Instant;
+use windows_sys::Win32::Foundation::{
+    GetLastError, LocalFree, ERROR_IO_PENDING, ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED,
+    ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
 use windows_sys::Win32::Security::{
     AclSizeInformation, GetAce, GetAclInformation, GetSecurityDescriptorControl,
@@ -16,9 +21,12 @@ use windows_sys::Win32::Storage::FileSystem::{
     PIPE_ACCESS_DUPLEX,
 };
 use windows_sys::Win32::System::Pipes::{
-    CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+    PIPE_TYPE_BYTE,
 };
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
+use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 use super::{
     verify_windows_pipe_security_with_reader, WindowsAttachStream, WindowsPipeAccessControlEntry,
@@ -30,10 +38,45 @@ use crate::windows_sid::{copy_sid_bytes, current_process_user_sid};
 
 const PIPE_ACCESS_MASK: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
 
+/// A failure while accepting a Windows attach connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowsAttachAcceptError {
+    DeadlineExpired,
+    CreateEvent(u32),
+    Connect(u32),
+    Wait(u32),
+    Cancel(u32),
+}
+
+impl fmt::Display for WindowsAttachAcceptError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeadlineExpired => formatter.write_str("the attach accept deadline expired"),
+            Self::CreateEvent(code) => {
+                write!(formatter, "could not create an accept event ({code})")
+            }
+            Self::Connect(code) => write!(
+                formatter,
+                "could not accept the Windows attach pipe ({code})"
+            ),
+            Self::Wait(code) => write!(
+                formatter,
+                "could not wait for a Windows attach client ({code})"
+            ),
+            Self::Cancel(code) => write!(
+                formatter,
+                "could not cancel the Windows attach wait ({code})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WindowsAttachAcceptError {}
+
 /// A bound Windows attach pipe that has not accepted a connection.
 pub struct WindowsAttachListener {
     path: String,
-    handle: OwnedHandle,
+    handle: Option<OwnedHandle>,
 }
 
 impl WindowsAttachListener {
@@ -65,7 +108,10 @@ impl WindowsAttachListener {
             .map_err(|_| io::Error::other("could not read the Windows attach pipe security"))?;
         verify_windows_pipe_security_with_reader(&reader).map_err(io::Error::other)?;
 
-        Ok(Self { path, handle })
+        Ok(Self {
+            path,
+            handle: Some(handle),
+        })
     }
 
     /// Returns the bound pipe path.
@@ -75,12 +121,125 @@ impl WindowsAttachListener {
 
     /// Returns the bound server pipe handle.
     pub fn handle(&self) -> BorrowedHandle<'_> {
-        self.handle.as_handle()
+        self.handle
+            .as_ref()
+            .expect("an accepted listener has no server pipe handle")
+            .as_handle()
+    }
+
+    /// Waits until one client connects or the deadline expires.
+    pub fn accept(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<WindowsAttachStream, WindowsAttachAcceptError> {
+        if Instant::now() >= deadline {
+            return Err(WindowsAttachAcceptError::DeadlineExpired);
+        }
+
+        let event = unsafe { CreateEventW(null(), 1, 0, null()) };
+        if event.is_null() {
+            return Err(WindowsAttachAcceptError::CreateEvent(unsafe {
+                GetLastError()
+            }));
+        }
+        let event = unsafe { OwnedHandle::from_raw_handle(event) };
+        let mut overlapped = OVERLAPPED {
+            hEvent: event.as_raw_handle(),
+            ..OVERLAPPED::default()
+        };
+        let handle = self.handle().as_raw_handle();
+
+        if unsafe { ConnectNamedPipe(handle, &mut overlapped) } == 0 {
+            match unsafe { GetLastError() } {
+                ERROR_PIPE_CONNECTED => return Ok(self.take_stream()),
+                ERROR_IO_PENDING => self.wait_for_connection(deadline, &overlapped)?,
+                error => return Err(WindowsAttachAcceptError::Connect(error)),
+            }
+        }
+
+        Ok(self.take_stream())
+    }
+
+    fn wait_for_connection(
+        &self,
+        deadline: Instant,
+        overlapped: &OVERLAPPED,
+    ) -> Result<(), WindowsAttachAcceptError> {
+        let handle = self.handle().as_raw_handle();
+        let wait = unsafe {
+            WaitForSingleObject(
+                overlapped.hEvent,
+                deadline_millis(deadline.saturating_duration_since(Instant::now())),
+            )
+        };
+        if wait == WAIT_TIMEOUT {
+            let cancelled = unsafe { CancelIoEx(handle, overlapped) } != 0;
+            let cancel_error = if cancelled {
+                None
+            } else {
+                Some(unsafe { GetLastError() })
+            };
+            let mut transferred = 0;
+            if unsafe { GetOverlappedResult(handle, overlapped, &mut transferred, 1) } != 0 {
+                return Ok(());
+            }
+            let completion_error = unsafe { GetLastError() };
+            if cancelled && completion_error == ERROR_OPERATION_ABORTED {
+                return Err(WindowsAttachAcceptError::DeadlineExpired);
+            }
+            if cancel_error == Some(ERROR_NOT_FOUND) {
+                return Err(WindowsAttachAcceptError::Connect(completion_error));
+            }
+            return Err(WindowsAttachAcceptError::Cancel(
+                cancel_error.unwrap_or(completion_error),
+            ));
+        }
+        if wait == WAIT_FAILED {
+            let error = unsafe { GetLastError() };
+            cancel_connect_and_wait(handle, overlapped);
+            return Err(WindowsAttachAcceptError::Wait(error));
+        }
+        if wait != WAIT_OBJECT_0 {
+            cancel_connect_and_wait(handle, overlapped);
+            return Err(WindowsAttachAcceptError::Wait(wait));
+        }
+
+        let mut transferred = 0;
+        if unsafe { GetOverlappedResult(handle, overlapped, &mut transferred, 0) } == 0 {
+            return Err(WindowsAttachAcceptError::Connect(unsafe { GetLastError() }));
+        }
+        Ok(())
+    }
+
+    fn take_stream(&mut self) -> WindowsAttachStream {
+        WindowsAttachStream::new(
+            self.handle
+                .take()
+                .expect("an accepted listener has no server pipe handle"),
+        )
     }
 
     /// Converts a connected listener into an attach stream.
-    pub fn into_stream(self) -> WindowsAttachStream {
-        WindowsAttachStream::new(self.handle)
+    pub fn into_stream(mut self) -> WindowsAttachStream {
+        self.take_stream()
+    }
+}
+
+fn deadline_millis(remaining: std::time::Duration) -> u32 {
+    if remaining.is_zero() {
+        return 0;
+    }
+    remaining
+        .as_nanos()
+        .div_ceil(1_000_000)
+        .min(u128::from(u32::MAX - 1)) as u32
+}
+
+fn cancel_connect_and_wait(handle: HANDLE, overlapped: &OVERLAPPED) {
+    unsafe {
+        CancelIoEx(handle, overlapped);
+        let mut transferred = 0;
+        GetOverlappedResult(handle, overlapped, &mut transferred, 1);
     }
 }
 
