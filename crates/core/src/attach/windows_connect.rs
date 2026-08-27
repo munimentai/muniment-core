@@ -3,7 +3,8 @@ use std::fmt;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr::null_mut;
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
     GetLastError, LocalFree, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_PIPE_BUSY,
@@ -23,6 +24,8 @@ use super::{
     WindowsPipeSecurityReader,
 };
 use crate::windows_sid::{copy_sid_bytes, current_process_user_sid};
+
+const ATTACH_ENDPOINT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 /// A failure while connecting to the current user's Windows attach endpoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,6 +61,51 @@ impl fmt::Display for WindowsAttachConnectError {
 }
 
 impl std::error::Error for WindowsAttachConnectError {}
+
+/// Waits for and connects to the current user's Windows attach endpoint.
+pub fn wait_for_windows_attach_endpoint(
+    deadline: Instant,
+) -> Result<WindowsAttachStream, WindowsAttachConnectError> {
+    wait_for_windows_attach_endpoint_with(
+        deadline,
+        ATTACH_ENDPOINT_RETRY_INTERVAL,
+        Instant::now,
+        thread::sleep,
+        connect_windows_attach_endpoint,
+    )
+}
+
+#[doc(hidden)]
+pub fn wait_for_windows_attach_endpoint_with<T, N, S, C>(
+    deadline: Instant,
+    retry_interval: Duration,
+    mut now: N,
+    mut sleep: S,
+    mut connect: C,
+) -> Result<T, WindowsAttachConnectError>
+where
+    N: FnMut() -> Instant,
+    S: FnMut(Duration),
+    C: FnMut(Instant) -> Result<T, WindowsAttachConnectError>,
+{
+    loop {
+        if now() >= deadline {
+            return Err(WindowsAttachConnectError::DeadlineExpired);
+        }
+
+        match connect(deadline) {
+            Ok(stream) => return Ok(stream),
+            Err(WindowsAttachConnectError::EndpointAbsent) => {
+                let remaining = deadline.saturating_duration_since(now());
+                if remaining.is_zero() {
+                    return Err(WindowsAttachConnectError::DeadlineExpired);
+                }
+                sleep(retry_interval.min(remaining));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 /// Opens and verifies the current user's Windows attach endpoint before protocol I/O.
 pub fn connect_windows_attach_endpoint(
