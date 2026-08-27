@@ -3,7 +3,8 @@ use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-pub(super) trait DeadlineStream: Read + Write {
+#[doc(hidden)]
+pub trait DeadlineStream: Read + Write {
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
     fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
 }
@@ -19,7 +20,8 @@ impl DeadlineStream for UnixStream {
     }
 }
 
-pub(super) fn read_exact_before<S: DeadlineStream + ?Sized>(
+#[doc(hidden)]
+pub fn read_exact_before<S: DeadlineStream + ?Sized>(
     stream: &mut S,
     mut bytes: &mut [u8],
     deadline: Instant,
@@ -35,7 +37,8 @@ pub(super) fn read_exact_before<S: DeadlineStream + ?Sized>(
     Ok(())
 }
 
-pub(super) fn write_all_before<S: DeadlineStream + ?Sized>(
+#[doc(hidden)]
+pub fn write_all_before<S: DeadlineStream + ?Sized>(
     stream: &mut S,
     mut bytes: &[u8],
     deadline: Instant,

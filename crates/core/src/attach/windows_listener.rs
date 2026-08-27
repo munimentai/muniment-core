@@ -13,7 +13,8 @@ use windows_sys::Win32::Security::{
     DACL_SECURITY_INFORMATION, INHERITED_ACE, OWNER_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, PIPE_ACCESS_DUPLEX,
+    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    PIPE_ACCESS_DUPLEX,
 };
 use windows_sys::Win32::System::Pipes::{
     CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
@@ -21,7 +22,7 @@ use windows_sys::Win32::System::Pipes::{
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
 
 use super::{
-    verify_windows_pipe_security_with_reader, WindowsPipeAccessControlEntry,
+    verify_windows_pipe_security_with_reader, WindowsAttachStream, WindowsPipeAccessControlEntry,
     WindowsPipeSecurityReadError, WindowsPipeSecurityReader,
 };
 use crate::attach::windows_attach_pipe_path;
@@ -48,7 +49,7 @@ impl WindowsAttachListener {
         let handle = unsafe {
             CreateNamedPipeW(
                 wide.as_ptr(),
-                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_REJECT_REMOTE_CLIENTS,
                 1,
                 0,
@@ -76,6 +77,11 @@ impl WindowsAttachListener {
     /// Returns the bound server pipe handle.
     pub fn handle(&self) -> BorrowedHandle<'_> {
         self.handle.as_handle()
+    }
+
+    /// Converts a connected listener into an attach stream.
+    pub fn into_stream(self) -> WindowsAttachStream {
+        WindowsAttachStream::new(self.handle)
     }
 }
 

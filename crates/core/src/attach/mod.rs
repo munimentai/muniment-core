@@ -45,6 +45,8 @@ mod windows_peer;
 mod windows_peer_native;
 mod windows_pipe;
 mod windows_pipe_security;
+#[cfg(target_os = "windows")]
+mod windows_stream;
 mod workspace_context;
 
 pub use approval::*;
@@ -63,6 +65,8 @@ pub use cursor::{
     StreamCloseCode, MAX_RUN_STREAM_WINDOW_BYTES, MAX_RUN_STREAM_WINDOW_EVENTS,
     MAX_RUN_STREAM_WINDOW_TEXT_BYTES,
 };
+#[doc(hidden)]
+pub use deadline_io::{read_exact_before, write_all_before, DeadlineStream};
 #[cfg(target_os = "linux")]
 pub use desktop_client_admission::*;
 #[cfg(target_os = "linux")]
@@ -94,6 +98,8 @@ pub use windows_peer::*;
 pub use windows_peer_native::*;
 pub use windows_pipe::*;
 pub use windows_pipe_security::*;
+#[cfg(target_os = "windows")]
+pub use windows_stream::*;
 pub use workspace_context::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
