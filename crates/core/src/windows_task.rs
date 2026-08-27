@@ -444,10 +444,15 @@ pub fn parse_observed_registration(
         "InteractiveTokenOrPassword" => LogonType::Other(6),
         _ => return Err(Error::UnrecognizedLogonType),
     };
-    let run_level = match take_observed_value(&mut values, ObservedField::RunLevel)?.as_str() {
-        "LeastPrivilege" => RunLevel::LeastPrivilege,
-        "HighestAvailable" => RunLevel::HighestPrivilege,
-        _ => return Err(Error::UnrecognizedRunLevel),
+    let run_level = match values
+        .iter()
+        .position(|(field, _)| *field == ObservedField::RunLevel)
+        .map(|index| values.swap_remove(index).1)
+        .as_deref()
+    {
+        None | Some("LeastPrivilege") => RunLevel::LeastPrivilege,
+        Some("HighestAvailable") => RunLevel::HighestPrivilege,
+        Some(_) => return Err(Error::UnrecognizedRunLevel),
     };
     let action_path = PathBuf::from(take_observed_value(&mut values, ObservedField::Command)?);
     let action_arguments = values

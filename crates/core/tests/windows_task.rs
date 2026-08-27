@@ -202,6 +202,22 @@ fn parses_a_rendered_definition_as_an_equal_registration() {
 }
 
 #[test]
+fn defaults_an_omitted_run_level_to_least_privilege() {
+    let definition = build_task_definition(SID, PAYLOAD).unwrap();
+    let xml = render_task_definition_xml(&definition)
+        .unwrap()
+        .replace("      <RunLevel>LeastPrivilege</RunLevel>\n", "");
+    assert!(!xml.contains("RunLevel"));
+
+    let observed = parse_observed_registration(&definition.uri, &xml).unwrap();
+    assert_eq!(observed.run_level, RunLevel::LeastPrivilege);
+    assert_eq!(
+        registration_verdict(&definition, &observed),
+        RegistrationVerdict::Equal
+    );
+}
+
+#[test]
 fn parses_live_task_extras_entities_and_optional_arguments() {
     let uri = task_uri(SID).unwrap();
     let xml = format!(
