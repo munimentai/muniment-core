@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::io::{self, Read, Write};
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::ptr::{null, null_mut};
 use std::time::Duration;
 
@@ -94,6 +94,12 @@ impl WindowsAttachStream {
             return operation_error(unsafe { GetLastError() });
         }
         Ok(transferred as usize)
+    }
+}
+
+impl AsRawHandle for WindowsAttachStream {
+    fn as_raw_handle(&self) -> RawHandle {
+        self.handle.as_raw_handle()
     }
 }
 
