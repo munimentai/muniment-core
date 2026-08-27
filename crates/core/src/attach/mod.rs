@@ -40,6 +40,7 @@ mod quiesce;
 mod runtime_activity;
 #[cfg(target_os = "windows")]
 mod windows_connect;
+mod windows_instance_lock;
 #[cfg(target_os = "windows")]
 mod windows_listener;
 mod windows_peer;
@@ -95,6 +96,7 @@ pub use quiesce::*;
 pub use runtime_activity::*;
 #[cfg(target_os = "windows")]
 pub use windows_connect::*;
+pub use windows_instance_lock::*;
 #[cfg(target_os = "windows")]
 pub use windows_listener::*;
 pub use windows_peer::*;
