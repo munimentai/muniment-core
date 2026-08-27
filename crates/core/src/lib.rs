@@ -60,6 +60,8 @@ pub(crate) mod windows_security;
 pub mod windows_sid;
 pub mod windows_task;
 #[cfg(target_os = "windows")]
+pub mod windows_task_service;
+#[cfg(target_os = "windows")]
 pub mod windows_user_diagnostics;
 pub mod write_plan;
 
