@@ -1,19 +1,21 @@
 //! Live registration access through the Windows Task Scheduler.
 
 use crate::windows_task::{
-    parse_observed_registration, plan_task_registration, render_task_definition_xml, task_uri,
-    ObservedRegistration, ParseObservedRegistrationError, RenderTaskDefinitionError, SidError,
-    TaskDefinition, TaskDefinitionError, TaskRegistrationPlan,
+    parse_observed_registration, plan_task_registration, registration_verdict,
+    render_task_definition_xml, task_uri, ObservedRegistration, ParseObservedRegistrationError,
+    RegistrationVerdict, RenderTaskDefinitionError, SidError, TaskDefinition, TaskDefinitionError,
+    TaskRegistrationPlan,
 };
 use std::fmt;
 use std::path::Path;
 use windows::core::{BSTR, HRESULT};
-use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, SCHED_E_ALREADY_RUNNING};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
 use windows::Win32::System::TaskScheduler::{
     ITaskFolder, ITaskService, TaskScheduler, TASK_CREATE_OR_UPDATE, TASK_LOGON_INTERACTIVE_TOKEN,
+    TASK_STATE_RUNNING,
 };
 use windows::Win32::System::Variant::VARIANT;
 
@@ -104,6 +106,131 @@ impl fmt::Display for EnsureTaskRegistrationError {
 }
 
 impl std::error::Error for EnsureTaskRegistrationError {}
+
+/// The result of a request to start the registered runtime task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartRegisteredTaskResult {
+    Started,
+    AlreadyRunning,
+}
+
+/// A failure while starting the registered runtime task.
+#[derive(Debug, Eq, PartialEq)]
+pub enum StartRegisteredTaskError<E> {
+    ReadRegistration(ReadObservedRegistrationError),
+    Missing,
+    CurrentExecutable,
+    InvalidTaskDefinition(TaskDefinitionError),
+    Refused,
+    InitializeCom(HRESULT),
+    CreateTaskService(HRESULT),
+    ConnectTaskService(HRESULT),
+    OpenTaskFolder(HRESULT),
+    OpenTask(HRESULT),
+    ReadTaskXml(HRESULT),
+    InvalidTaskXmlText,
+    ParseTaskXml(ParseObservedRegistrationError),
+    ReadTaskState(HRESULT),
+    ClearCrashWindow(E),
+    RunTask(HRESULT),
+}
+
+impl<E> fmt::Display for StartRegisteredTaskError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::ReadRegistration(_) => "could not read the runtime task registration",
+            Self::Missing => "the runtime task is not registered",
+            Self::CurrentExecutable => "could not locate the current executable",
+            Self::InvalidTaskDefinition(_) => "the runtime task definition is invalid",
+            Self::Refused => "refused to start a foreign runtime task",
+            Self::InitializeCom(_) => "could not initialize COM",
+            Self::CreateTaskService(_) => "could not create the Task Scheduler service",
+            Self::ConnectTaskService(_) => "could not connect to the local Task Scheduler",
+            Self::OpenTaskFolder(_) => "could not open the Muniment task folder",
+            Self::OpenTask(_) => "could not open the runtime task",
+            Self::ReadTaskXml(_) => "could not read the runtime task XML",
+            Self::InvalidTaskXmlText => "the runtime task XML contains invalid text",
+            Self::ParseTaskXml(_) => "could not parse the runtime task XML",
+            Self::ReadTaskState(_) => "could not read the runtime task state",
+            Self::ClearCrashWindow(_) => "could not clear the runtime crash window",
+            Self::RunTask(_) => "could not start the runtime task",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl<E> std::error::Error for StartRegisteredTaskError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ReadRegistration(error) => Some(error),
+            Self::ClearCrashWindow(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// Reads, validates, and starts the registered runtime task.
+pub fn start_registered_task<F, E>(
+    sid: &str,
+    clear_crash_window: F,
+) -> Result<StartRegisteredTaskResult, StartRegisteredTaskError<E>>
+where
+    F: FnOnce() -> Result<(), E>,
+{
+    let observed = read_observed_registration(sid)
+        .map_err(StartRegisteredTaskError::ReadRegistration)?
+        .ok_or(StartRegisteredTaskError::Missing)?;
+    let mut payload_path =
+        std::env::current_exe().map_err(|_| StartRegisteredTaskError::CurrentExecutable)?;
+    payload_path.set_file_name("muniment-runtime.exe");
+    let expected = TaskDefinition::new(sid, payload_path)
+        .map_err(StartRegisteredTaskError::InvalidTaskDefinition)?;
+    if registration_verdict(&expected, &observed) == RegistrationVerdict::Foreign {
+        return Err(StartRegisteredTaskError::Refused);
+    }
+
+    let task_name = expected
+        .uri
+        .strip_prefix(r"\Muniment\")
+        .expect("TaskDefinition::new always returns a task in the Muniment folder");
+    let _apartment = ComApartment::initialize_for_start()?;
+    let service: ITaskService = unsafe {
+        CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER)
+            .map_err(|error| StartRegisteredTaskError::CreateTaskService(error.code()))?
+    };
+    let empty = VARIANT::default();
+    unsafe { service.Connect(&empty, &empty, &empty, &empty) }
+        .map_err(|error| StartRegisteredTaskError::ConnectTaskService(error.code()))?;
+    let folder = unsafe { service.GetFolder(&BSTR::from(TASK_FOLDER)) }
+        .map_err(|error| StartRegisteredTaskError::OpenTaskFolder(error.code()))?;
+    let task = unsafe { folder.GetTask(&BSTR::from(task_name)) }
+        .map_err(|error| StartRegisteredTaskError::OpenTask(error.code()))?;
+    let xml = unsafe { task.Xml() }
+        .map_err(|error| StartRegisteredTaskError::ReadTaskXml(error.code()))?;
+    let xml = String::try_from(&xml).map_err(|_| StartRegisteredTaskError::InvalidTaskXmlText)?;
+    let current = parse_observed_registration(&expected.uri, &xml)
+        .map_err(StartRegisteredTaskError::ParseTaskXml)?;
+    if registration_verdict(&expected, &current) == RegistrationVerdict::Foreign {
+        return Err(StartRegisteredTaskError::Refused);
+    }
+    let state = unsafe { task.State() }
+        .map_err(|error| StartRegisteredTaskError::ReadTaskState(error.code()))?;
+    if state == TASK_STATE_RUNNING {
+        return Ok(StartRegisteredTaskResult::AlreadyRunning);
+    }
+
+    clear_crash_window().map_err(StartRegisteredTaskError::ClearCrashWindow)?;
+    match unsafe { task.Run(&empty) } {
+        Ok(_) => Ok(StartRegisteredTaskResult::Started),
+        Err(error) if error.code() == SCHED_E_ALREADY_RUNNING => {
+            Ok(StartRegisteredTaskResult::AlreadyRunning)
+        }
+        Err(error) => Err(StartRegisteredTaskError::RunTask(error.code())),
+    }
+}
 
 /// Reads the runtime task registration for a canonical user SID.
 pub fn read_observed_registration(
@@ -278,6 +405,10 @@ impl ComApartment {
 
     fn initialize_for_write() -> Result<Self, EnsureTaskRegistrationError> {
         Self::initialize_inner().map_err(EnsureTaskRegistrationError::InitializeCom)
+    }
+
+    fn initialize_for_start<E>() -> Result<Self, StartRegisteredTaskError<E>> {
+        Self::initialize_inner().map_err(StartRegisteredTaskError::InitializeCom)
     }
 
     fn initialize_inner() -> Result<Self, HRESULT> {
