@@ -1,6 +1,7 @@
 use muniment_core::attach::{
-    verify_windows_pipe_security_with_reader, WindowsPipeAccessControlEntry,
-    WindowsPipeSecurityError, WindowsPipeSecurityReadError, WindowsPipeSecurityReader,
+    verify_windows_endpoint_owner_with_reader, verify_windows_pipe_security_with_reader,
+    WindowsPipeAccessControlEntry, WindowsPipeSecurityError, WindowsPipeSecurityReadError,
+    WindowsPipeSecurityReader,
 };
 
 struct FakeSecurityReader {
@@ -46,6 +47,37 @@ fn reader(entries: Vec<WindowsPipeAccessControlEntry>) -> FakeSecurityReader {
         entries: Ok(entries),
         local_sid: Ok(vec![1, 2, 3, 4]),
     }
+}
+
+#[test]
+fn endpoint_owner_accepts_the_local_owner_without_reading_the_dacl() {
+    let mut reader = reader(Vec::new());
+    reader.protected = Err(WindowsPipeSecurityReadError);
+    reader.entries = Err(WindowsPipeSecurityReadError);
+
+    assert_eq!(verify_windows_endpoint_owner_with_reader(&reader), Ok(()));
+}
+
+#[test]
+fn endpoint_owner_rejects_a_foreign_owner() {
+    let mut reader = reader(Vec::new());
+    reader.owner_sid = Ok(vec![4, 3, 2, 1]);
+
+    assert_eq!(
+        verify_windows_endpoint_owner_with_reader(&reader),
+        Err(WindowsPipeSecurityError::ForeignOwner)
+    );
+}
+
+#[test]
+fn endpoint_owner_rejects_an_unavailable_identity() {
+    let mut reader = reader(Vec::new());
+    reader.local_sid = Err(WindowsPipeSecurityReadError);
+
+    assert_eq!(
+        verify_windows_endpoint_owner_with_reader(&reader),
+        Err(WindowsPipeSecurityError::IdentityUnavailable)
+    );
 }
 
 #[test]

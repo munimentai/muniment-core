@@ -39,6 +39,8 @@ mod presenter_session;
 mod quiesce;
 mod runtime_activity;
 #[cfg(target_os = "windows")]
+mod windows_connect;
+#[cfg(target_os = "windows")]
 mod windows_listener;
 mod windows_peer;
 #[cfg(target_os = "windows")]
@@ -91,6 +93,8 @@ pub use presenter_admission::*;
 pub use presenter_session::*;
 pub use quiesce::*;
 pub use runtime_activity::*;
+#[cfg(target_os = "windows")]
+pub use windows_connect::*;
 #[cfg(target_os = "windows")]
 pub use windows_listener::*;
 pub use windows_peer::*;

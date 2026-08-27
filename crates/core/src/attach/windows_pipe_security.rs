@@ -47,21 +47,18 @@ impl fmt::Display for WindowsPipeSecurityError {
 
 impl std::error::Error for WindowsPipeSecurityError {}
 
+/// Verifies a Windows attach endpoint owner through an injected security boundary.
+pub fn verify_windows_endpoint_owner_with_reader(
+    reader: &impl WindowsPipeSecurityReader,
+) -> Result<(), WindowsPipeSecurityError> {
+    verified_endpoint_owner(reader).map(|_| ())
+}
+
 /// Verifies a Windows attach pipe through an injected security boundary.
 pub fn verify_windows_pipe_security_with_reader(
     reader: &impl WindowsPipeSecurityReader,
 ) -> Result<(), WindowsPipeSecurityError> {
-    let owner_sid = reader
-        .endpoint_owner_sid()
-        .map_err(|_| WindowsPipeSecurityError::IdentityUnavailable)?;
-    let local_sid = reader
-        .local_process_user_sid()
-        .map_err(|_| WindowsPipeSecurityError::IdentityUnavailable)?;
-
-    if owner_sid != local_sid {
-        return Err(WindowsPipeSecurityError::ForeignOwner);
-    }
-
+    let local_sid = verified_endpoint_owner(reader)?;
     let protected = reader
         .dacl_is_protected()
         .map_err(|_| WindowsPipeSecurityError::IdentityUnavailable)?;
@@ -81,4 +78,21 @@ pub fn verify_windows_pipe_security_with_reader(
     }
 
     Ok(())
+}
+
+fn verified_endpoint_owner(
+    reader: &impl WindowsPipeSecurityReader,
+) -> Result<Vec<u8>, WindowsPipeSecurityError> {
+    let owner_sid = reader
+        .endpoint_owner_sid()
+        .map_err(|_| WindowsPipeSecurityError::IdentityUnavailable)?;
+    let local_sid = reader
+        .local_process_user_sid()
+        .map_err(|_| WindowsPipeSecurityError::IdentityUnavailable)?;
+
+    if owner_sid != local_sid {
+        return Err(WindowsPipeSecurityError::ForeignOwner);
+    }
+
+    Ok(local_sid)
 }
