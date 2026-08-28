@@ -53,6 +53,8 @@ pub mod thread_history;
 pub mod thread_ownership;
 #[cfg(unix)]
 pub mod user_diagnostics;
+#[cfg(target_os = "windows")]
+pub mod windows_known_folders;
 pub mod windows_payload;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows_security;

@@ -1,7 +1,10 @@
-//! Resolves the installed Windows runtime payload without reading known folders.
+//! Resolves the installed Windows runtime payload from validated roots.
 
 use crate::windows_task::{is_canonical_sid, RemovalScope, SidError};
 use std::path::{Path, PathBuf};
+
+#[cfg(target_os = "windows")]
+use crate::windows_known_folders::{windows_payload_roots, WindowsKnownFolderError};
 
 const PAYLOAD_DIRECTORY: &str = "muniment";
 const PAYLOAD_FILE_NAME: &str = "muniment-runtime.exe";
@@ -32,6 +35,13 @@ pub struct WindowsPayloadScopes {
     pub per_user_payload_path: Option<PathBuf>,
 }
 
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiveWindowsPayloadScopesError {
+    KnownFolder(WindowsKnownFolderError),
+    PayloadRoot(PayloadRootError),
+}
+
 impl WindowsPayloadScopes {
     /// Builds the removal scope for an installed per-user payload.
     pub fn per_user_removal_scope(&self, user_sid: &str) -> Result<Option<RemovalScope>, SidError> {
@@ -57,6 +67,19 @@ impl WindowsPayloadScopes {
                 per_user_payload_path: self.per_user_payload_path.clone(),
             })
     }
+}
+
+/// Resolves the installed machine and per-user payloads from Shell known folders.
+#[cfg(target_os = "windows")]
+pub fn resolve_live_windows_payload_scopes(
+) -> Result<WindowsPayloadScopes, LiveWindowsPayloadScopesError> {
+    let roots = windows_payload_roots().map_err(LiveWindowsPayloadScopesError::KnownFolder)?;
+    resolve_windows_payload_scopes(
+        roots.program_files,
+        roots.local_app_data,
+        &WindowsNativePayloadProbe,
+    )
+    .map_err(LiveWindowsPayloadScopesError::PayloadRoot)
 }
 
 /// Resolves the machine and per-user payloads independently.
