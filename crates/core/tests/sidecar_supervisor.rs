@@ -106,6 +106,22 @@ fn wait_for(supervisor: &SidecarSupervisor, wanted: SidecarStatus) {
     );
 }
 
+fn wait_for_stub_pid(path: &PathBuf) -> u32 {
+    let until = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Ok(pid) = std::fs::read_to_string(path)
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .parse::<u32>()
+        {
+            return pid;
+        }
+        assert!(Instant::now() < until, "stub did not write its pid");
+        thread::yield_now();
+    }
+}
+
 fn next_event(events: &std::sync::mpsc::Receiver<SidecarEvent>) -> SidecarEvent {
     events.recv_timeout(Duration::from_secs(5)).unwrap()
 }
@@ -463,19 +479,8 @@ fn shutdown_during_loading_is_prompt_and_reaps_child() {
     .unwrap();
     let events = supervisor.subscribe();
     assert_eq!(next_event(&events).status, SidecarStatus::Starting);
+    let pid = wait_for_stub_pid(&pid_file.0);
     let until = Instant::now() + Duration::from_secs(2);
-    let pid = loop {
-        if let Ok(pid) = std::fs::read_to_string(&pid_file.0)
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or_default()
-            .parse::<u32>()
-        {
-            break pid;
-        }
-        assert!(Instant::now() < until, "stub did not write its pid");
-        thread::yield_now();
-    };
     while probe_started.load(Ordering::SeqCst) == 0 {
         assert!(Instant::now() < until, "probe did not start");
         thread::yield_now();
@@ -739,48 +744,40 @@ fn failed_json_rpc_probe_restarts_child_and_recovers() {
 
 #[test]
 fn graceful_shutdown_leaves_no_child() {
-    let pid_file = temp_marker("pid");
-    let _ = std::fs::remove_file(&pid_file);
-    let pid_arg = pid_file.to_string_lossy().into_owned();
+    let pid_file = FileMarker::new("pid");
+    let pid_arg = pid_file.0.to_string_lossy().into_owned();
     let mut supervisor =
         SidecarSupervisor::spawn(config(&["pid", &pid_arg]), |_| Ok(ProbeOutcome::Ready)).unwrap();
     wait_for(&supervisor, SidecarStatus::Healthy);
-    let until = Instant::now() + Duration::from_secs(2);
-    while !pid_file.exists() && Instant::now() < until {
-        thread::sleep(Duration::from_millis(5));
-    }
-    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    let pid = wait_for_stub_pid(&pid_file.0);
+    #[cfg(target_os = "linux")]
+    let child_identity = ProcessIdentity::read(pid).unwrap();
     supervisor.shutdown().unwrap();
     assert_eq!(supervisor.status(), SidecarStatus::Stopped);
     #[cfg(target_os = "linux")]
     assert!(
-        !PathBuf::from(format!("/proc/{pid}")).exists(),
-        "child {pid} was orphaned"
+        !child_identity.still_exists(),
+        "exact child {child_identity:?} still exists after shutdown returned"
     );
-    let _ = std::fs::remove_file(pid_file);
 }
 
 #[test]
 fn shutdown_forces_and_reaps_an_uncooperative_child() {
-    let pid_file = temp_marker("hung-pid");
-    let _ = std::fs::remove_file(&pid_file);
-    let pid_arg = pid_file.to_string_lossy().into_owned();
+    let pid_file = FileMarker::new("hung-pid");
+    let pid_arg = pid_file.0.to_string_lossy().into_owned();
     let mut cfg = config(&["hang", &pid_arg]);
     cfg.shutdown_timeout = Duration::from_millis(30);
     let mut supervisor = SidecarSupervisor::spawn(cfg, |_| Ok(ProbeOutcome::Ready)).unwrap();
     wait_for(&supervisor, SidecarStatus::Healthy);
-    let until = Instant::now() + Duration::from_secs(2);
-    while !pid_file.exists() && Instant::now() < until {
-        thread::sleep(Duration::from_millis(5));
-    }
-    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    let pid = wait_for_stub_pid(&pid_file.0);
+    #[cfg(target_os = "linux")]
+    let child_identity = ProcessIdentity::read(pid).unwrap();
     supervisor.shutdown().unwrap();
     #[cfg(target_os = "linux")]
     assert!(
-        !PathBuf::from(format!("/proc/{pid}")).exists(),
-        "uncooperative child {pid} was orphaned"
+        !child_identity.still_exists(),
+        "exact uncooperative child {child_identity:?} still exists after shutdown returned"
     );
-    let _ = std::fs::remove_file(pid_file);
 }
 
 fn rpc_supervisor() -> SidecarSupervisor {
