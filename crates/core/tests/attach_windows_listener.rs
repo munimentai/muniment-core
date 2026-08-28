@@ -24,24 +24,40 @@ fn binds_the_current_user_pipe_and_rejects_a_second_listener() {
 }
 
 #[test]
-fn accepts_one_connected_client() {
+fn accepts_two_clients_while_both_connections_stay_open() {
     let _guard = LISTENER_TEST_LOCK.lock().unwrap();
     let mut listener = WindowsAttachListener::bind().unwrap();
     let path = listener.path().to_owned();
-    let client = thread::spawn(move || {
+    let first_client = thread::spawn({
+        let path = path.clone();
+        move || {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap()
+        }
+    });
+    let first_stream = listener
+        .accept(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    let first_client = first_client.join().unwrap();
+
+    assert_eq!(listener.path(), path);
+    let _unconnected_handle = listener.handle();
+    let second_client = thread::spawn(move || {
         OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
             .unwrap()
     });
-
-    let stream = listener
+    let second_stream = listener
         .accept(Instant::now() + Duration::from_secs(1))
         .unwrap();
+    let second_client = second_client.join().unwrap();
 
-    drop(stream);
-    drop(client.join().unwrap());
+    drop((first_stream, first_client, second_stream, second_client));
 }
 
 #[test]

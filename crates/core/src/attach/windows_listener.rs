@@ -22,7 +22,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-    PIPE_TYPE_BYTE,
+    PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
 };
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
 use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
@@ -43,6 +43,8 @@ const PIPE_ACCESS_MASK: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
 pub enum WindowsAttachAcceptError {
     DeadlineExpired,
     CreateEvent(u32),
+    CreateInstance(u32),
+    VerifyInstanceSecurity,
     Connect(u32),
     Wait(u32),
     Cancel(u32),
@@ -54,6 +56,15 @@ impl fmt::Display for WindowsAttachAcceptError {
             Self::DeadlineExpired => formatter.write_str("the attach accept deadline expired"),
             Self::CreateEvent(code) => {
                 write!(formatter, "could not create an accept event ({code})")
+            }
+            Self::CreateInstance(code) => {
+                write!(
+                    formatter,
+                    "could not create the next attach pipe instance ({code})"
+                )
+            }
+            Self::VerifyInstanceSecurity => {
+                formatter.write_str("could not verify the next attach pipe instance security")
             }
             Self::Connect(code) => write!(
                 formatter,
@@ -73,7 +84,7 @@ impl fmt::Display for WindowsAttachAcceptError {
 
 impl std::error::Error for WindowsAttachAcceptError {}
 
-/// A bound Windows attach pipe that has not accepted a connection.
+/// A bound Windows attach pipe listener.
 pub struct WindowsAttachListener {
     path: String,
     handle: Option<OwnedHandle>,
@@ -85,28 +96,7 @@ impl WindowsAttachListener {
         let sid = current_process_user_sid().map_err(io::Error::other)?;
         let path = windows_attach_pipe_path(sid.as_str())
             .map_err(|_| io::Error::other("could not derive the Windows attach pipe path"))?;
-        let wide: Vec<u16> = OsStr::new(&path).encode_wide().chain(Some(0)).collect();
-        let mut security = OwnerSecurity::new(PIPE_ACCESS_MASK)?;
-        let attributes = security.attributes();
-        let handle = unsafe {
-            CreateNamedPipeW(
-                wide.as_ptr(),
-                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_REJECT_REMOTE_CLIENTS,
-                1,
-                0,
-                0,
-                0,
-                &attributes,
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
-        }
-        let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
-        let reader = NativeWindowsPipeSecurityReader::read(handle.as_raw_handle())
-            .map_err(|_| io::Error::other("could not read the Windows attach pipe security"))?;
-        verify_windows_pipe_security_with_reader(&reader).map_err(io::Error::other)?;
+        let handle = create_pipe_instance(&path, true)?;
 
         Ok(Self {
             path,
@@ -123,7 +113,7 @@ impl WindowsAttachListener {
     pub fn handle(&self) -> BorrowedHandle<'_> {
         self.handle
             .as_ref()
-            .expect("an accepted listener has no server pipe handle")
+            .expect("the listener has no server pipe handle")
             .as_handle()
     }
 
@@ -151,13 +141,13 @@ impl WindowsAttachListener {
 
         if unsafe { ConnectNamedPipe(handle, &mut overlapped) } == 0 {
             match unsafe { GetLastError() } {
-                ERROR_PIPE_CONNECTED => return Ok(self.take_stream()),
+                ERROR_PIPE_CONNECTED => {}
                 ERROR_IO_PENDING => self.wait_for_connection(deadline, &overlapped)?,
                 error => return Err(WindowsAttachAcceptError::Connect(error)),
             }
         }
 
-        Ok(self.take_stream())
+        self.take_stream_and_replace()
     }
 
     fn wait_for_connection(
@@ -211,11 +201,25 @@ impl WindowsAttachListener {
         Ok(())
     }
 
+    fn take_stream_and_replace(&mut self) -> Result<WindowsAttachStream, WindowsAttachAcceptError> {
+        let next = create_pipe_instance(&self.path, false).map_err(|error| {
+            error
+                .raw_os_error()
+                .map(|code| WindowsAttachAcceptError::CreateInstance(code as u32))
+                .unwrap_or(WindowsAttachAcceptError::VerifyInstanceSecurity)
+        })?;
+        let connected = self
+            .handle
+            .replace(next)
+            .expect("the listener has no server pipe handle");
+        Ok(WindowsAttachStream::new(connected))
+    }
+
     fn take_stream(&mut self) -> WindowsAttachStream {
         WindowsAttachStream::new(
             self.handle
                 .take()
-                .expect("an accepted listener has no server pipe handle"),
+                .expect("the listener has no server pipe handle"),
         )
     }
 
@@ -223,6 +227,37 @@ impl WindowsAttachListener {
     pub fn into_stream(mut self) -> WindowsAttachStream {
         self.take_stream()
     }
+}
+
+fn create_pipe_instance(path: &str, first: bool) -> io::Result<OwnedHandle> {
+    let wide: Vec<u16> = OsStr::new(path).encode_wide().chain(Some(0)).collect();
+    let mut security = OwnerSecurity::new(PIPE_ACCESS_MASK)?;
+    let attributes = security.attributes();
+    let first_instance = if first {
+        FILE_FLAG_FIRST_PIPE_INSTANCE
+    } else {
+        0
+    };
+    let handle = unsafe {
+        CreateNamedPipeW(
+            wide.as_ptr(),
+            PIPE_ACCESS_DUPLEX | first_instance | FILE_FLAG_OVERLAPPED,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_REJECT_REMOTE_CLIENTS,
+            PIPE_UNLIMITED_INSTANCES,
+            0,
+            0,
+            0,
+            &attributes,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    let reader = NativeWindowsPipeSecurityReader::read(handle.as_raw_handle())
+        .map_err(|_| io::Error::other("could not read the Windows attach pipe security"))?;
+    verify_windows_pipe_security_with_reader(&reader).map_err(io::Error::other)?;
+    Ok(handle)
 }
 
 fn deadline_millis(remaining: std::time::Duration) -> u32 {
