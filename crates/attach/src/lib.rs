@@ -30,6 +30,8 @@ pub fn runtime_version_meets_minimum(version: &str, minimum: &str) -> bool {
 
 #[cfg(feature = "client")]
 mod client;
+#[cfg(feature = "client")]
+mod client_stream;
 mod envelope;
 pub mod fixtures;
 mod framing;
