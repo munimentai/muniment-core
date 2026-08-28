@@ -163,7 +163,7 @@ fn lists_a_registered_runtime_task_until_it_is_removed() {
 #[test]
 fn starting_an_absent_task_does_not_clear_the_crash_window() {
     let mut cleared = false;
-    let result = start_registered_task("S-1-5-999999999", || {
+    let result = start_registered_task("S-1-5-999999999", runtime_payload_path(), || {
         cleared = true;
         Ok::<(), ()>(())
     });
@@ -173,7 +173,7 @@ fn starting_an_absent_task_does_not_clear_the_crash_window() {
 }
 
 #[test]
-fn starting_a_foreign_task_is_refused_without_clearing_the_crash_window() {
+fn starting_with_a_non_matching_expected_payload_is_refused_without_clearing_the_crash_window() {
     let _guard = SCHEDULER_TEST_LOCK.lock().unwrap();
     let sid = current_process_user_sid().unwrap();
     let mut fixture = SchedulerFixture::new(sid.as_str());
@@ -181,7 +181,7 @@ fn starting_a_foreign_task_is_refused_without_clearing_the_crash_window() {
     fixture.register_task(sid.as_str(), Path::new(FOREIGN_PAYLOAD));
     let mut cleared = false;
 
-    let result = start_registered_task(sid.as_str(), || {
+    let result = start_registered_task(sid.as_str(), runtime_payload_path(), || {
         cleared = true;
         Ok::<(), ()>(())
     });
@@ -191,11 +191,16 @@ fn starting_a_foreign_task_is_refused_without_clearing_the_crash_window() {
 }
 
 #[test]
-fn starts_a_registered_task_that_exits_at_once() {
+fn starts_a_registered_task_with_a_matching_expected_payload_outside_the_test_directory() {
     let _guard = SCHEDULER_TEST_LOCK.lock().unwrap();
     let sid = current_process_user_sid().unwrap();
     let mut fixture = SchedulerFixture::new(sid.as_str());
     let payload = runtime_payload_path();
+    let test_executable = std::env::current_exe().unwrap();
+    assert_ne!(payload.parent(), test_executable.parent());
+    let payload_directory = payload.parent().unwrap();
+    std::fs::create_dir_all(payload_directory).unwrap();
+    fixture.payload_directory = Some(payload_directory.to_owned());
     let system_root = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
     std::fs::copy(system_root.join("System32").join("where.exe"), &payload).unwrap();
     fixture.payload = Some(payload.clone());
@@ -203,7 +208,7 @@ fn starts_a_registered_task_that_exits_at_once() {
     fixture.register_task(sid.as_str(), &payload);
     let mut clear_count = 0;
 
-    let result = start_registered_task(sid.as_str(), || {
+    let result = start_registered_task(sid.as_str(), &payload, || {
         clear_count += 1;
         Ok::<(), ()>(())
     });
@@ -214,9 +219,9 @@ fn starts_a_registered_task_that_exits_at_once() {
 }
 
 fn runtime_payload_path() -> PathBuf {
-    let mut path = std::env::current_exe().unwrap();
-    path.set_file_name("muniment-runtime.exe");
-    path
+    std::env::temp_dir()
+        .join(format!("muniment-task-service-{}", std::process::id()))
+        .join("muniment-runtime.exe")
 }
 
 struct SchedulerFixture {

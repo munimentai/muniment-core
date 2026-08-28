@@ -202,7 +202,6 @@ pub enum StartRegisteredTaskResult {
 pub enum StartRegisteredTaskError<E> {
     ReadRegistration(ReadObservedRegistrationError),
     Missing,
-    CurrentExecutable,
     InvalidTaskDefinition(TaskDefinitionError),
     Refused,
     InitializeCom(HRESULT),
@@ -223,7 +222,6 @@ impl<E> fmt::Display for StartRegisteredTaskError<E> {
         let message = match self {
             Self::ReadRegistration(_) => "could not read the runtime task registration",
             Self::Missing => "the runtime task is not registered",
-            Self::CurrentExecutable => "could not locate the current executable",
             Self::InvalidTaskDefinition(_) => "the runtime task definition is invalid",
             Self::Refused => "refused to start a foreign runtime task",
             Self::InitializeCom(_) => "could not initialize COM",
@@ -258,6 +256,7 @@ where
 /// Reads, validates, and starts the registered runtime task.
 pub fn start_registered_task<F, E>(
     sid: &str,
+    expected_payload_path: impl AsRef<Path>,
     clear_crash_window: F,
 ) -> Result<StartRegisteredTaskResult, StartRegisteredTaskError<E>>
 where
@@ -266,10 +265,7 @@ where
     let observed = read_observed_registration(sid)
         .map_err(StartRegisteredTaskError::ReadRegistration)?
         .ok_or(StartRegisteredTaskError::Missing)?;
-    let mut payload_path =
-        std::env::current_exe().map_err(|_| StartRegisteredTaskError::CurrentExecutable)?;
-    payload_path.set_file_name("muniment-runtime.exe");
-    let expected = TaskDefinition::new(sid, payload_path)
+    let expected = TaskDefinition::new(sid, expected_payload_path)
         .map_err(StartRegisteredTaskError::InvalidTaskDefinition)?;
     if registration_verdict(&expected, &observed) == RegistrationVerdict::Foreign {
         return Err(StartRegisteredTaskError::Refused);
