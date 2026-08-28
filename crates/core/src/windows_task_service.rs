@@ -1,5 +1,7 @@
 //! Live registration access through the Windows Task Scheduler.
 
+use crate::windows_payload::{resolve_live_windows_payload, LiveWindowsPayloadScopesError};
+use crate::windows_sid::{current_process_user_sid, WindowsSidError};
 use crate::windows_task::{
     parse_observed_registration, plan_task_registration, registration_verdict,
     render_task_definition_xml, sid_from_task_uri, task_uri, ObservedRegistration,
@@ -164,6 +166,29 @@ impl fmt::Display for EnsureTaskRegistrationError {
 }
 
 impl std::error::Error for EnsureTaskRegistrationError {}
+
+/// A failure while writing a live runtime task registration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnsureLiveTaskRegistrationError {
+    ReadProcessUserSid(WindowsSidError),
+    ResolvePayload(LiveWindowsPayloadScopesError),
+    NoInstalledPayload,
+    EnsureRegistration(EnsureTaskRegistrationError),
+}
+
+impl fmt::Display for EnsureLiveTaskRegistrationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::ReadProcessUserSid(_) => "could not read the process user SID",
+            Self::ResolvePayload(_) => "could not resolve the installed runtime payload",
+            Self::NoInstalledPayload => "no installed runtime payload exists",
+            Self::EnsureRegistration(_) => "could not write the runtime task registration",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for EnsureLiveTaskRegistrationError {}
 
 /// The result of a request to start the registered runtime task.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -378,6 +403,26 @@ pub fn list_observed_registrations(
     }
 
     Ok(registrations)
+}
+
+/// Registers the runtime task from the live payload and known-folder roots.
+///
+/// The caller must hold the per-user install lock.
+pub fn ensure_live_task_registration(
+) -> Result<TaskRegistrationPlan, EnsureLiveTaskRegistrationError> {
+    let sid =
+        current_process_user_sid().map_err(EnsureLiveTaskRegistrationError::ReadProcessUserSid)?;
+    let payload = resolve_live_windows_payload()
+        .map_err(EnsureLiveTaskRegistrationError::ResolvePayload)?
+        .ok_or(EnsureLiveTaskRegistrationError::NoInstalledPayload)?;
+
+    ensure_task_registration(
+        sid.as_str(),
+        payload.payload_path,
+        payload.machine_payload_root,
+        payload.user_payload_root,
+    )
+    .map_err(EnsureLiveTaskRegistrationError::EnsureRegistration)
 }
 
 /// Makes the planned runtime task registration change and returns its plan.

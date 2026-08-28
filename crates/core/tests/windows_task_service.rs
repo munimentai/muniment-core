@@ -1,13 +1,16 @@
 #![cfg(target_os = "windows")]
 
+use muniment_core::windows_known_folders::windows_payload_roots;
+use muniment_core::windows_payload::resolve_live_windows_payload;
 use muniment_core::windows_sid::current_process_user_sid;
 use muniment_core::windows_task::{
     render_task_definition_xml, SidError, TaskDefinition, TaskRegistrationPlan,
 };
 use muniment_core::windows_task_service::{
-    ensure_task_registration, list_observed_registrations, read_observed_registration,
-    start_registered_task, EnsureTaskRegistrationError, ReadObservedRegistrationError,
-    StartRegisteredTaskError, StartRegisteredTaskResult,
+    ensure_live_task_registration, ensure_task_registration, list_observed_registrations,
+    read_observed_registration, start_registered_task, EnsureLiveTaskRegistrationError,
+    EnsureTaskRegistrationError, ReadObservedRegistrationError, StartRegisteredTaskError,
+    StartRegisteredTaskResult,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -42,6 +45,64 @@ fn non_canonical_sid_is_rejected_before_scheduler_access() {
     assert_eq!(
         error,
         ReadObservedRegistrationError::InvalidSid(SidError::NotCanonical)
+    );
+}
+
+#[test]
+fn live_registration_rejects_an_absent_payload_without_writing_a_task() {
+    let _guard = SCHEDULER_TEST_LOCK.lock().unwrap();
+    let sid = current_process_user_sid().unwrap();
+    let mut fixture = SchedulerFixture::new(sid.as_str());
+    fixture.owns_task = true;
+    assert_eq!(read_observed_registration(sid.as_str()).unwrap(), None);
+
+    let result = ensure_live_task_registration();
+
+    assert_eq!(
+        result,
+        Err(EnsureLiveTaskRegistrationError::NoInstalledPayload)
+    );
+    assert_eq!(read_observed_registration(sid.as_str()).unwrap(), None);
+}
+
+#[test]
+fn live_registration_uses_the_resolved_payload() {
+    let _guard = SCHEDULER_TEST_LOCK.lock().unwrap();
+    let sid = current_process_user_sid().unwrap();
+    let mut fixture = SchedulerFixture::new(sid.as_str());
+    fixture.owns_task = true;
+    assert_eq!(read_observed_registration(sid.as_str()).unwrap(), None);
+
+    let roots = windows_payload_roots().unwrap();
+    let payload = roots
+        .local_app_data
+        .join("muniment")
+        .join("muniment-runtime.exe");
+    let payload_directory = payload.parent().unwrap();
+    if !payload_directory.exists() {
+        std::fs::create_dir_all(payload_directory).unwrap();
+        fixture.payload_directory = Some(payload_directory.to_owned());
+    }
+    if std::fs::symlink_metadata(&payload)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&payload)
+            .unwrap();
+        fixture.payload = Some(payload);
+    }
+    let resolved = resolve_live_windows_payload().unwrap().unwrap();
+
+    ensure_live_task_registration().unwrap();
+
+    assert_eq!(
+        read_observed_registration(sid.as_str())
+            .unwrap()
+            .unwrap()
+            .action_path,
+        resolved.payload_path
     );
 }
 
@@ -164,6 +225,7 @@ struct SchedulerFixture {
     owns_task: bool,
     remove_folder: bool,
     payload: Option<PathBuf>,
+    payload_directory: Option<PathBuf>,
     _apartment: TestComApartment,
 }
 
@@ -182,6 +244,7 @@ impl SchedulerFixture {
             owns_task: false,
             remove_folder,
             payload: None,
+            payload_directory: None,
             _apartment: apartment,
         }
     }
@@ -247,6 +310,9 @@ impl Drop for SchedulerFixture {
         }
         if let Some(payload) = &self.payload {
             let _ = std::fs::remove_file(payload);
+        }
+        if let Some(payload_directory) = &self.payload_directory {
+            let _ = std::fs::remove_dir(payload_directory);
         }
     }
 }

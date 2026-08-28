@@ -42,6 +42,14 @@ pub enum LiveWindowsPayloadScopesError {
     PayloadRoot(PayloadRootError),
 }
 
+#[cfg(target_os = "windows")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveWindowsPayload {
+    pub payload_path: PathBuf,
+    pub machine_payload_root: PathBuf,
+    pub user_payload_root: PathBuf,
+}
+
 impl WindowsPayloadScopes {
     /// Builds the removal scope for an installed per-user payload.
     pub fn per_user_removal_scope(&self, user_sid: &str) -> Result<Option<RemovalScope>, SidError> {
@@ -67,6 +75,27 @@ impl WindowsPayloadScopes {
                 per_user_payload_path: self.per_user_payload_path.clone(),
             })
     }
+}
+
+/// Resolves the installed payload and its roots from Shell known folders.
+///
+/// The machine payload takes precedence while it exists.
+#[cfg(target_os = "windows")]
+pub fn resolve_live_windows_payload(
+) -> Result<Option<LiveWindowsPayload>, LiveWindowsPayloadScopesError> {
+    let roots = windows_payload_roots().map_err(LiveWindowsPayloadScopesError::KnownFolder)?;
+    let payload_path = resolve_windows_payload(
+        &roots.program_files,
+        &roots.local_app_data,
+        &WindowsNativePayloadProbe,
+    )
+    .map_err(LiveWindowsPayloadScopesError::PayloadRoot)?;
+
+    Ok(payload_path.map(|payload_path| LiveWindowsPayload {
+        payload_path,
+        machine_payload_root: roots.program_files,
+        user_payload_root: roots.local_app_data,
+    }))
 }
 
 /// Resolves the installed machine and per-user payloads from Shell known folders.
