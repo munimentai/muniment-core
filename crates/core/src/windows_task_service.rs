@@ -2,9 +2,9 @@
 
 use crate::windows_task::{
     parse_observed_registration, plan_task_registration, registration_verdict,
-    render_task_definition_xml, task_uri, ObservedRegistration, ParseObservedRegistrationError,
-    RegistrationVerdict, RenderTaskDefinitionError, SidError, TaskDefinition, TaskDefinitionError,
-    TaskRegistrationPlan,
+    render_task_definition_xml, sid_from_task_uri, task_uri, ObservedRegistration,
+    ParseObservedRegistrationError, RegistrationVerdict, RenderTaskDefinitionError, SidError,
+    TaskDefinition, TaskDefinitionError, TaskRegistrationPlan,
 };
 use std::fmt;
 use std::path::Path;
@@ -14,8 +14,8 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
 use windows::Win32::System::TaskScheduler::{
-    ITaskFolder, ITaskService, TaskScheduler, TASK_CREATE_OR_UPDATE, TASK_LOGON_INTERACTIVE_TOKEN,
-    TASK_STATE_RUNNING,
+    ITaskFolder, ITaskService, TaskScheduler, TASK_CREATE_OR_UPDATE, TASK_ENUM_HIDDEN,
+    TASK_LOGON_INTERACTIVE_TOKEN, TASK_STATE_RUNNING,
 };
 use windows::Win32::System::Variant::VARIANT;
 
@@ -57,6 +57,64 @@ impl fmt::Display for ReadObservedRegistrationError {
 }
 
 impl std::error::Error for ReadObservedRegistrationError {}
+
+/// A failure while listing runtime task registrations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ListObservedRegistrationsError {
+    InitializeCom(HRESULT),
+    CreateTaskService(HRESULT),
+    ConnectTaskService(HRESULT),
+    OpenTaskFolder(HRESULT),
+    ListTasks(HRESULT),
+    CountTasks(HRESULT),
+    ReadTask(HRESULT),
+    ReadTaskName(HRESULT),
+    InvalidTaskNameText,
+    ReadTaskXml {
+        uri: String,
+        code: HRESULT,
+    },
+    InvalidTaskXmlText {
+        uri: String,
+    },
+    ParseTaskXml {
+        uri: String,
+        source: ParseObservedRegistrationError,
+    },
+}
+
+impl fmt::Display for ListObservedRegistrationsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InitializeCom(_) => formatter.write_str("could not initialize COM"),
+            Self::CreateTaskService(_) => {
+                formatter.write_str("could not create the Task Scheduler service")
+            }
+            Self::ConnectTaskService(_) => {
+                formatter.write_str("could not connect to the local Task Scheduler")
+            }
+            Self::OpenTaskFolder(_) => {
+                formatter.write_str("could not open the Muniment task folder")
+            }
+            Self::ListTasks(_) => formatter.write_str("could not list the Muniment tasks"),
+            Self::CountTasks(_) => formatter.write_str("could not count the Muniment tasks"),
+            Self::ReadTask(_) => formatter.write_str("could not read a Muniment task"),
+            Self::ReadTaskName(_) => formatter.write_str("could not read a Muniment task name"),
+            Self::InvalidTaskNameText => {
+                formatter.write_str("a Muniment task name contains invalid text")
+            }
+            Self::ReadTaskXml { uri, .. } => write!(formatter, "could not read task XML for {uri}"),
+            Self::InvalidTaskXmlText { uri } => {
+                write!(formatter, "task XML for {uri} contains invalid text")
+            }
+            Self::ParseTaskXml { uri, .. } => {
+                write!(formatter, "could not parse task XML for {uri}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ListObservedRegistrationsError {}
 
 /// A failure while writing a runtime task registration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -270,6 +328,58 @@ pub fn read_observed_registration(
     Ok(Some(observed))
 }
 
+/// Lists the runtime task registrations in the Muniment task folder.
+pub fn list_observed_registrations(
+) -> Result<Vec<ObservedRegistration>, ListObservedRegistrationsError> {
+    let _apartment = ComApartment::initialize_for_list()?;
+    let service: ITaskService = unsafe {
+        CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER)
+            .map_err(|error| ListObservedRegistrationsError::CreateTaskService(error.code()))?
+    };
+    let empty = VARIANT::default();
+    unsafe { service.Connect(&empty, &empty, &empty, &empty) }
+        .map_err(|error| ListObservedRegistrationsError::ConnectTaskService(error.code()))?;
+    let folder = match unsafe { service.GetFolder(&BSTR::from(TASK_FOLDER)) } {
+        Ok(folder) => folder,
+        Err(error) if is_absent(error.code()) => return Ok(Vec::new()),
+        Err(error) => return Err(ListObservedRegistrationsError::OpenTaskFolder(error.code())),
+    };
+    let tasks = unsafe { folder.GetTasks(TASK_ENUM_HIDDEN.0) }
+        .map_err(|error| ListObservedRegistrationsError::ListTasks(error.code()))?;
+    let count = unsafe { tasks.Count() }
+        .map_err(|error| ListObservedRegistrationsError::CountTasks(error.code()))?;
+    let mut registrations = Vec::new();
+
+    for index in 1..=count {
+        let task = unsafe { tasks.get_Item(&VARIANT::from(index)) }
+            .map_err(|error| ListObservedRegistrationsError::ReadTask(error.code()))?;
+        let name = unsafe { task.Name() }
+            .map_err(|error| ListObservedRegistrationsError::ReadTaskName(error.code()))?;
+        let name = String::try_from(&name)
+            .map_err(|_| ListObservedRegistrationsError::InvalidTaskNameText)?;
+        let uri = format!(r"{TASK_FOLDER}\{name}");
+        if sid_from_task_uri(&uri).is_none() {
+            continue;
+        }
+        let xml =
+            unsafe { task.Xml() }.map_err(|error| ListObservedRegistrationsError::ReadTaskXml {
+                uri: uri.clone(),
+                code: error.code(),
+            })?;
+        let xml = String::try_from(&xml)
+            .map_err(|_| ListObservedRegistrationsError::InvalidTaskXmlText { uri: uri.clone() })?;
+        let observed = parse_observed_registration(&uri, &xml).map_err(|source| {
+            ListObservedRegistrationsError::ParseTaskXml {
+                uri: uri.clone(),
+                source,
+            }
+        })?;
+        registrations.push(observed);
+    }
+
+    Ok(registrations)
+}
+
 /// Makes the planned runtime task registration change and returns its plan.
 pub fn ensure_task_registration(
     sid: &str,
@@ -401,6 +511,10 @@ struct ComApartment {
 impl ComApartment {
     fn initialize() -> Result<Self, ReadObservedRegistrationError> {
         Self::initialize_inner().map_err(ReadObservedRegistrationError::InitializeCom)
+    }
+
+    fn initialize_for_list() -> Result<Self, ListObservedRegistrationsError> {
+        Self::initialize_inner().map_err(ListObservedRegistrationsError::InitializeCom)
     }
 
     fn initialize_for_write() -> Result<Self, EnsureTaskRegistrationError> {

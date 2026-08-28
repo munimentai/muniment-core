@@ -5,9 +5,9 @@ use muniment_core::windows_task::{
     render_task_definition_xml, SidError, TaskDefinition, TaskRegistrationPlan,
 };
 use muniment_core::windows_task_service::{
-    ensure_task_registration, read_observed_registration, start_registered_task,
-    EnsureTaskRegistrationError, ReadObservedRegistrationError, StartRegisteredTaskError,
-    StartRegisteredTaskResult,
+    ensure_task_registration, list_observed_registrations, read_observed_registration,
+    start_registered_task, EnsureTaskRegistrationError, ReadObservedRegistrationError,
+    StartRegisteredTaskError, StartRegisteredTaskResult,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -74,6 +74,29 @@ fn registers_leaves_unchanged_and_refuses_a_foreign_task() {
             .action_path,
         PathBuf::from(FOREIGN_PAYLOAD)
     );
+}
+
+#[test]
+fn lists_a_registered_runtime_task_until_it_is_removed() {
+    let _guard = SCHEDULER_TEST_LOCK.lock().unwrap();
+    let sid = current_process_user_sid().unwrap();
+    let uri = format!(r"\Muniment\Runtime-{}", sid.as_str());
+
+    {
+        let mut fixture = SchedulerFixture::new(sid.as_str());
+        fixture.owns_task = true;
+        fixture.register_task(sid.as_str(), Path::new(PAYLOAD));
+        let registrations = list_observed_registrations().unwrap();
+
+        assert!(registrations
+            .iter()
+            .any(|registration| registration.uri == uri));
+    }
+
+    let registrations = list_observed_registrations().unwrap();
+    assert!(registrations
+        .iter()
+        .all(|registration| registration.uri != uri));
 }
 
 #[test]
