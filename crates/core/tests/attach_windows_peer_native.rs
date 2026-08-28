@@ -6,6 +6,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr::{null, null_mut};
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 use muniment_core::attach::{verify_windows_attach_peer, WindowsAttachListener};
 use windows_sys::Win32::Foundation::{
@@ -18,7 +19,9 @@ use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 
 #[test]
 fn admits_a_connected_peer_from_the_same_user() {
-    let listener = WindowsAttachListener::bind().unwrap();
+    let state_directory =
+        std::env::temp_dir().join(format!("muniment-windows-peer-test-{}", std::process::id()));
+    let listener = WindowsAttachListener::bind(state_directory, Duration::ZERO).unwrap();
     let path = listener.path().to_owned();
     let (release_sender, release_receiver) = mpsc::channel();
     let client = thread::spawn(move || {

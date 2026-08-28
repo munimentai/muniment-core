@@ -10,7 +10,11 @@ use windows_sys::Win32::Foundation::ERROR_SEM_TIMEOUT;
 
 #[test]
 fn connects_to_a_live_current_user_endpoint_and_bounds_a_busy_wait() {
-    let listener = WindowsAttachListener::bind().unwrap();
+    let state_directory = std::env::temp_dir().join(format!(
+        "muniment-windows-connect-test-{}",
+        std::process::id()
+    ));
+    let listener = WindowsAttachListener::bind(state_directory, Duration::ZERO).unwrap();
     let stream = connect_windows_attach_endpoint(Instant::now() + Duration::from_secs(1)).unwrap();
 
     let busy = connect_windows_attach_endpoint(Instant::now() + Duration::from_millis(20));

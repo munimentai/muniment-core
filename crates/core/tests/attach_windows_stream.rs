@@ -17,7 +17,11 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 
 #[test]
 fn moves_frames_times_out_cleanly_and_reports_peer_close() {
-    let listener = WindowsAttachListener::bind().unwrap();
+    let state_directory = std::env::temp_dir().join(format!(
+        "muniment-windows-stream-test-{}",
+        std::process::id()
+    ));
+    let listener = WindowsAttachListener::bind(state_directory, Duration::ZERO).unwrap();
     let request = encode_frame(&json!({ "message": "hello" })).unwrap();
     let response = encode_frame(&json!({ "message": "welcome" })).unwrap();
     let expected_request = request.clone();

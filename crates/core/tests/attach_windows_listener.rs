@@ -2,17 +2,30 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use muniment_core::attach::{
     decode_frame, serve_next_windows_attach, windows_attach_pipe_path, Welcome,
-    WindowsAttachAcceptError, WindowsAttachListener,
+    WindowsAttachAcceptError, WindowsAttachBindError, WindowsAttachInstanceLockError,
+    WindowsAttachListener,
 };
 use muniment_core::windows_sid::current_process_user_sid;
 
 static LISTENER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn state_directory() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "muniment-windows-listener-test-{}",
+        std::process::id()
+    ))
+}
+
+fn bind_listener() -> WindowsAttachListener {
+    WindowsAttachListener::bind(state_directory(), Duration::ZERO).unwrap()
+}
 
 fn hello_frame() -> Vec<u8> {
     let body = br#"{"protocol":"muniment.attach/1","client":{"kind":"editor-extension","version":"0.0.1"},"supported":{"min":1,"max":1},"client_nonce":"nonce","authorized_client_id":"018f0000-0000-7000-8000-000000000099"}"#;
@@ -50,18 +63,33 @@ fn exchange_hello(client: &mut File) -> Welcome {
 #[test]
 fn binds_the_current_user_pipe_and_rejects_a_second_listener() {
     let _guard = LISTENER_TEST_LOCK.lock().unwrap();
-    let listener = WindowsAttachListener::bind().unwrap();
+    let listener = bind_listener();
     let expected_path =
         windows_attach_pipe_path(current_process_user_sid().unwrap().as_str()).unwrap();
 
     assert_eq!(listener.path(), expected_path);
-    assert!(WindowsAttachListener::bind().is_err());
+    assert!(matches!(
+        WindowsAttachListener::bind(state_directory(), Duration::ZERO),
+        Err(WindowsAttachBindError::InstanceLock(
+            WindowsAttachInstanceLockError::Contended
+        ))
+    ));
+    assert!(matches!(
+        WindowsAttachListener::bind(
+            state_directory().with_extension("other-profile"),
+            Duration::ZERO
+        ),
+        Err(WindowsAttachBindError::Pipe(_))
+    ));
+
+    drop(listener);
+    assert!(WindowsAttachListener::bind(state_directory(), Duration::ZERO).is_ok());
 }
 
 #[test]
 fn accepts_two_clients_while_both_connections_stay_open() {
     let _guard = LISTENER_TEST_LOCK.lock().unwrap();
-    let mut listener = WindowsAttachListener::bind().unwrap();
+    let mut listener = bind_listener();
     let path = listener.path().to_owned();
     let first_client = thread::spawn({
         let path = path.clone();
@@ -98,7 +126,7 @@ fn accepts_two_clients_while_both_connections_stay_open() {
 #[test]
 fn serves_two_sequential_clients_on_independent_threads() {
     let _guard = LISTENER_TEST_LOCK.lock().unwrap();
-    let mut listener = WindowsAttachListener::bind().unwrap();
+    let mut listener = bind_listener();
     let path = listener.path().to_owned();
 
     let mut first_client = connect_and_serve(&mut listener, path.clone());
@@ -113,7 +141,7 @@ fn serves_two_sequential_clients_on_independent_threads() {
 #[test]
 fn serve_next_returns_the_accept_error() {
     let _guard = LISTENER_TEST_LOCK.lock().unwrap();
-    let mut listener = WindowsAttachListener::bind().unwrap();
+    let mut listener = bind_listener();
 
     assert_eq!(
         serve_next_windows_attach(&mut listener, "1.2.3", Instant::now()),
@@ -124,7 +152,7 @@ fn serve_next_returns_the_accept_error() {
 #[test]
 fn expires_the_deadline_and_keeps_the_listener_bound() {
     let _guard = LISTENER_TEST_LOCK.lock().unwrap();
-    let mut listener = WindowsAttachListener::bind().unwrap();
+    let mut listener = bind_listener();
 
     let error = match listener.accept(Instant::now() + Duration::from_millis(20)) {
         Ok(_) => panic!("the accept deadline did not expire"),

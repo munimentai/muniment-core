@@ -4,6 +4,7 @@ use std::io;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
+use std::path::Path;
 use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
@@ -32,7 +33,10 @@ use super::{
     verify_windows_pipe_security_with_reader, WindowsAttachStream, WindowsPipeAccessControlEntry,
     WindowsPipeSecurityReadError, WindowsPipeSecurityReader,
 };
-use crate::attach::{serve_windows_attach_session, windows_attach_pipe_path};
+use crate::attach::{
+    acquire_windows_attach_instance_lock, serve_windows_attach_session, windows_attach_pipe_path,
+    WindowsAttachInstanceLock, WindowsAttachInstanceLockError,
+};
 use crate::windows_security::OwnerSecurity;
 use crate::windows_sid::{copy_sid_bytes, current_process_user_sid};
 
@@ -85,10 +89,42 @@ impl fmt::Display for WindowsAttachAcceptError {
 
 impl std::error::Error for WindowsAttachAcceptError {}
 
+/// A failure while binding the Windows attach listener.
+#[derive(Debug)]
+pub enum WindowsAttachBindError {
+    InstanceLock(WindowsAttachInstanceLockError),
+    Pipe(io::Error),
+}
+
+impl fmt::Display for WindowsAttachBindError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InstanceLock(error) => write!(
+                formatter,
+                "could not acquire the attach instance lock: {error}"
+            ),
+            Self::Pipe(error) => write!(
+                formatter,
+                "could not create or verify the attach pipe: {error}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WindowsAttachBindError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InstanceLock(error) => Some(error),
+            Self::Pipe(error) => Some(error),
+        }
+    }
+}
+
 /// A bound Windows attach pipe listener.
 pub struct WindowsAttachListener {
     path: String,
     handle: Option<OwnedHandle>,
+    _instance_lock: WindowsAttachInstanceLock,
 }
 
 /// Accepts and serves one Windows attach stream on a worker thread.
@@ -108,15 +144,24 @@ pub fn serve_next_windows_attach(
 
 impl WindowsAttachListener {
     /// Creates and verifies the current user's Windows attach pipe.
-    pub fn bind() -> io::Result<Self> {
-        let sid = current_process_user_sid().map_err(io::Error::other)?;
+    pub fn bind(
+        state_directory: impl AsRef<Path>,
+        bounded_wait: Duration,
+    ) -> Result<Self, WindowsAttachBindError> {
+        let instance_lock = acquire_windows_attach_instance_lock(state_directory, bounded_wait)
+            .map_err(WindowsAttachBindError::InstanceLock)?;
+        let sid = current_process_user_sid()
+            .map_err(io::Error::other)
+            .map_err(WindowsAttachBindError::Pipe)?;
         let path = windows_attach_pipe_path(sid.as_str())
-            .map_err(|_| io::Error::other("could not derive the Windows attach pipe path"))?;
-        let handle = create_pipe_instance(&path, true)?;
+            .map_err(|_| io::Error::other("could not derive the Windows attach pipe path"))
+            .map_err(WindowsAttachBindError::Pipe)?;
+        let handle = create_pipe_instance(&path, true).map_err(WindowsAttachBindError::Pipe)?;
 
         Ok(Self {
             path,
             handle: Some(handle),
+            _instance_lock: instance_lock,
         })
     }
 
