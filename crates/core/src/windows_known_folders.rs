@@ -1,4 +1,4 @@
-//! Resolves Windows payload roots through the Shell known-folder API.
+//! Resolves Windows paths through the Shell known-folder API.
 
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
@@ -6,13 +6,14 @@ use std::path::PathBuf;
 use windows_sys::core::{GUID, PWSTR};
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::UI::Shell::{
-    FOLDERID_LocalAppData, FOLDERID_ProgramFiles, SHGetKnownFolderPath,
+    FOLDERID_LocalAppData, FOLDERID_ProgramFiles, FOLDERID_RoamingAppData, SHGetKnownFolderPath,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowsKnownFolder {
     ProgramFiles,
     LocalAppData,
+    RoamingAppData,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,11 +35,18 @@ pub struct WindowsPayloadRoots {
 pub fn windows_payload_roots() -> Result<WindowsPayloadRoots, WindowsKnownFolderError> {
     Ok(WindowsPayloadRoots {
         program_files: known_folder_path(WindowsKnownFolder::ProgramFiles, &FOLDERID_ProgramFiles)?,
-        local_app_data: known_folder_path(
-            WindowsKnownFolder::LocalAppData,
-            &FOLDERID_LocalAppData,
-        )?,
+        local_app_data: windows_local_app_data()?,
     })
+}
+
+/// Resolves the local application data root without reading the environment.
+pub fn windows_local_app_data() -> Result<PathBuf, WindowsKnownFolderError> {
+    known_folder_path(WindowsKnownFolder::LocalAppData, &FOLDERID_LocalAppData)
+}
+
+/// Resolves the roaming application data root without reading the environment.
+pub fn windows_roaming_app_data() -> Result<PathBuf, WindowsKnownFolderError> {
+    known_folder_path(WindowsKnownFolder::RoamingAppData, &FOLDERID_RoamingAppData)
 }
 
 fn known_folder_path(

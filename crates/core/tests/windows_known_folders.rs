@@ -1,6 +1,6 @@
 #![cfg(target_os = "windows")]
 
-use muniment_core::windows_known_folders::windows_payload_roots;
+use muniment_core::windows_known_folders::{windows_payload_roots, windows_roaming_app_data};
 use muniment_core::windows_payload::{
     resolve_live_windows_payload_scopes, resolve_windows_payload_scopes, WindowsNativePayloadProbe,
 };
@@ -12,6 +12,14 @@ fn resolves_payload_roots_from_shell_known_folders() {
     assert!(roots.program_files.is_absolute());
     assert!(roots.local_app_data.is_absolute());
     assert_ne!(roots.program_files, roots.local_app_data);
+}
+
+#[test]
+fn resolves_roaming_app_data_from_shell_known_folder() {
+    let roaming_app_data =
+        windows_roaming_app_data().expect("roaming application data should resolve");
+
+    assert!(roaming_app_data.is_absolute());
 }
 
 #[test]
