@@ -5,7 +5,7 @@ use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::ptr::{null, null_mut};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
     GetLastError, LocalFree, ERROR_IO_PENDING, ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED,
     ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
@@ -32,11 +32,12 @@ use super::{
     verify_windows_pipe_security_with_reader, WindowsAttachStream, WindowsPipeAccessControlEntry,
     WindowsPipeSecurityReadError, WindowsPipeSecurityReader,
 };
-use crate::attach::windows_attach_pipe_path;
+use crate::attach::{serve_windows_attach_session, windows_attach_pipe_path};
 use crate::windows_security::OwnerSecurity;
 use crate::windows_sid::{copy_sid_bytes, current_process_user_sid};
 
 const PIPE_ACCESS_MASK: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+const WINDOWS_ATTACH_SESSION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A failure while accepting a Windows attach connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,6 +89,21 @@ impl std::error::Error for WindowsAttachAcceptError {}
 pub struct WindowsAttachListener {
     path: String,
     handle: Option<OwnedHandle>,
+}
+
+/// Accepts and serves one Windows attach stream on a worker thread.
+pub fn serve_next_windows_attach(
+    listener: &mut WindowsAttachListener,
+    desktop_version: &str,
+    accept_deadline: Instant,
+) -> Result<(), WindowsAttachAcceptError> {
+    let stream = listener.accept(accept_deadline)?;
+    let desktop_version = desktop_version.to_owned();
+    let session_deadline = Instant::now() + WINDOWS_ATTACH_SESSION_TIMEOUT;
+    std::thread::spawn(move || {
+        let _ = serve_windows_attach_session(stream, &desktop_version, session_deadline);
+    });
+    Ok(())
 }
 
 impl WindowsAttachListener {
