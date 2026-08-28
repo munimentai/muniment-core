@@ -1,6 +1,9 @@
 //! Live registration access through the Windows Task Scheduler.
 
-use crate::windows_payload::{resolve_live_windows_payload, LiveWindowsPayloadScopesError};
+use crate::windows_payload::{
+    plan_windows_payload_removals, resolve_live_windows_payload,
+    resolve_live_windows_payload_scopes, LiveWindowsPayloadScopesError, UninstallerRemovalPlan,
+};
 use crate::windows_sid::{current_process_user_sid, WindowsSidError};
 use crate::windows_task::{
     parse_observed_registration, plan_task_registration, registration_verdict,
@@ -117,6 +120,29 @@ impl fmt::Display for ListObservedRegistrationsError {
 }
 
 impl std::error::Error for ListObservedRegistrationsError {}
+
+/// A failure while planning live runtime task removal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlanLiveTaskRemovalsError {
+    ResolvePayloads(LiveWindowsPayloadScopesError),
+    ReadProcessUserSid(WindowsSidError),
+    ListRegistrations(ListObservedRegistrationsError),
+    InvalidProcessUserSid(SidError),
+}
+
+impl fmt::Display for PlanLiveTaskRemovalsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::ResolvePayloads(_) => "could not resolve the installed runtime payloads",
+            Self::ReadProcessUserSid(_) => "could not read the process user SID",
+            Self::ListRegistrations(_) => "could not list the runtime task registrations",
+            Self::InvalidProcessUserSid(_) => "the process user SID is not canonical",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for PlanLiveTaskRemovalsError {}
 
 /// A failure while writing a runtime task registration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -399,6 +425,18 @@ pub fn list_observed_registrations(
     }
 
     Ok(registrations)
+}
+
+/// Plans every live uninstaller scope against every runtime task registration.
+pub fn plan_live_task_removals() -> Result<Vec<UninstallerRemovalPlan>, PlanLiveTaskRemovalsError> {
+    let payload_scopes = resolve_live_windows_payload_scopes()
+        .map_err(PlanLiveTaskRemovalsError::ResolvePayloads)?;
+    let user_sid =
+        current_process_user_sid().map_err(PlanLiveTaskRemovalsError::ReadProcessUserSid)?;
+    let registrations =
+        list_observed_registrations().map_err(PlanLiveTaskRemovalsError::ListRegistrations)?;
+    plan_windows_payload_removals(&payload_scopes, user_sid.as_str(), &registrations)
+        .map_err(PlanLiveTaskRemovalsError::InvalidProcessUserSid)
 }
 
 /// Registers the runtime task from the live payload and known-folder roots.

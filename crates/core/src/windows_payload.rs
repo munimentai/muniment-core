@@ -1,6 +1,9 @@
 //! Resolves the installed Windows runtime payload from validated roots.
 
-use crate::windows_task::{is_canonical_sid, RemovalScope, SidError};
+use crate::windows_task::{
+    is_canonical_sid, plan_task_removal, ObservedRegistration, RemovalScope, SidError,
+    TaskRemovalPlan,
+};
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "windows")]
@@ -35,6 +38,18 @@ pub struct WindowsPayloadScopes {
     pub per_user_payload_path: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedTaskRemoval {
+    pub registration: ObservedRegistration,
+    pub plan: TaskRemovalPlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UninstallerRemovalPlan {
+    pub scope: RemovalScope,
+    pub tasks: Vec<PlannedTaskRemoval>,
+}
+
 #[cfg(target_os = "windows")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LiveWindowsPayloadScopesError {
@@ -48,6 +63,35 @@ pub struct LiveWindowsPayload {
     pub payload_path: PathBuf,
     pub machine_payload_root: PathBuf,
     pub user_payload_root: PathBuf,
+}
+
+/// Pairs every observed registration with its removal plan for one scope.
+pub fn plan_scope_task_removals(
+    scope: RemovalScope,
+    registrations: &[ObservedRegistration],
+) -> UninstallerRemovalPlan {
+    let tasks = registrations
+        .iter()
+        .map(|registration| PlannedTaskRemoval {
+            registration: registration.clone(),
+            plan: plan_task_removal(&scope, registration),
+        })
+        .collect();
+    UninstallerRemovalPlan { scope, tasks }
+}
+
+/// Plans every installed uninstaller scope against all observed registrations.
+pub fn plan_windows_payload_removals(
+    payload_scopes: &WindowsPayloadScopes,
+    user_sid: &str,
+    registrations: &[ObservedRegistration],
+) -> Result<Vec<UninstallerRemovalPlan>, SidError> {
+    let per_user_scope = payload_scopes.per_user_removal_scope(user_sid)?;
+    Ok(per_user_scope
+        .into_iter()
+        .chain(payload_scopes.machine_removal_scope())
+        .map(|scope| plan_scope_task_removals(scope, registrations))
+        .collect())
 }
 
 impl WindowsPayloadScopes {

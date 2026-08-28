@@ -1,8 +1,11 @@
 use muniment_core::windows_payload::{
-    resolve_windows_payload, resolve_windows_payload_scopes, PayloadFileKind, PayloadRootError,
-    WindowsPayloadProbe, WindowsPayloadScopes,
+    plan_scope_task_removals, plan_windows_payload_removals, resolve_windows_payload,
+    resolve_windows_payload_scopes, PayloadFileKind, PayloadRootError, WindowsPayloadProbe,
+    WindowsPayloadScopes,
 };
-use muniment_core::windows_task::{RemovalScope, SidError};
+use muniment_core::windows_task::{
+    LogonType, ObservedRegistration, RemovalScope, RunLevel, SidError, TaskRemovalPlan,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -35,6 +38,18 @@ fn payload(root: &Path) -> PathBuf {
 }
 
 const SID: &str = "S-1-5-21-111-222-333-1001";
+const OTHER_SID: &str = "S-1-5-21-111-222-333-1002";
+
+fn registration(sid: &str, action_path: impl Into<PathBuf>) -> ObservedRegistration {
+    ObservedRegistration {
+        uri: format!(r"\Muniment\Runtime-{sid}"),
+        principal_sid: sid.to_owned(),
+        logon_type: LogonType::InteractiveToken,
+        run_level: RunLevel::LeastPrivilege,
+        action_path: action_path.into(),
+        action_arguments: None,
+    }
+}
 
 #[test]
 fn resolves_both_payload_scopes_independently() {
@@ -132,6 +147,84 @@ fn removal_scope_is_absent_when_its_payload_is_absent() {
 
     assert_eq!(scopes.per_user_removal_scope(SID), Ok(None));
     assert_eq!(scopes.machine_removal_scope(), None);
+}
+
+#[test]
+fn per_user_removal_repoints_its_registration_to_the_machine_payload() {
+    let machine_payload = PathBuf::from(r"C:\Program Files\muniment\muniment-runtime.exe");
+    let user_payload = PathBuf::from(r"C:\Users\Ada\AppData\Local\muniment\muniment-runtime.exe");
+    let registrations = [registration(SID, &user_payload)];
+    let scope = RemovalScope::PerUser {
+        user_sid: SID.to_owned(),
+        payload_path: user_payload,
+        machine_payload_path: Some(machine_payload.clone()),
+    };
+
+    let removal = plan_scope_task_removals(scope.clone(), &registrations);
+
+    assert_eq!(removal.scope, scope);
+    assert_eq!(removal.tasks.len(), 1);
+    assert_eq!(removal.tasks[0].registration, registrations[0]);
+    assert_eq!(
+        removal.tasks[0].plan,
+        TaskRemovalPlan::RepointTo(machine_payload)
+    );
+}
+
+#[test]
+fn machine_removal_stops_and_deletes_its_registration_without_a_user_payload() {
+    let machine_payload = PathBuf::from(r"C:\Program Files\muniment\muniment-runtime.exe");
+    let scopes = WindowsPayloadScopes {
+        machine_payload_path: Some(machine_payload.clone()),
+        per_user_payload_path: None,
+    };
+    let registrations = [registration(OTHER_SID, machine_payload)];
+
+    let removals = plan_windows_payload_removals(&scopes, SID, &registrations).unwrap();
+
+    assert_eq!(removals.len(), 1);
+    assert!(matches!(removals[0].scope, RemovalScope::Machine { .. }));
+    assert_eq!(removals[0].tasks[0].plan, TaskRemovalPlan::StopAndDelete);
+}
+
+#[test]
+fn removal_plans_leave_foreign_registrations_unchanged() {
+    let machine_payload = PathBuf::from(r"C:\Program Files\muniment\muniment-runtime.exe");
+    let user_payload = PathBuf::from(r"C:\Users\Ada\AppData\Local\muniment\muniment-runtime.exe");
+    let scopes = WindowsPayloadScopes {
+        machine_payload_path: Some(machine_payload),
+        per_user_payload_path: Some(user_payload),
+    };
+    let registrations = [registration(
+        SID,
+        r"C:\Foreign\muniment\muniment-runtime.exe",
+    )];
+
+    let removals = plan_windows_payload_removals(&scopes, SID, &registrations).unwrap();
+
+    assert_eq!(removals.len(), 2);
+    assert!(removals.iter().all(|removal| removal.tasks
+        == [muniment_core::windows_payload::PlannedTaskRemoval {
+            registration: registrations[0].clone(),
+            plan: TaskRemovalPlan::LeaveUnchanged,
+        }]));
+}
+
+#[test]
+fn absent_payloads_produce_no_uninstaller_entries() {
+    let scopes = WindowsPayloadScopes {
+        machine_payload_path: None,
+        per_user_payload_path: None,
+    };
+    let registrations = [registration(
+        SID,
+        r"C:\Foreign\muniment\muniment-runtime.exe",
+    )];
+
+    assert_eq!(
+        plan_windows_payload_removals(&scopes, SID, &registrations),
+        Ok(Vec::new())
+    );
 }
 
 #[test]
