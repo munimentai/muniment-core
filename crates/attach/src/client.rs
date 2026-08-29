@@ -508,7 +508,7 @@ mod linux {
     };
     use crate::client_stream::{
         read_approval_value, read_approval_value_with_prefix, read_exact_before, read_value,
-        write_all_before,
+        write_all_before, ClientStream,
     };
     use crate::{
         encode_frame, Authorization, Authorized, Client, DesktopClientAuthorizedGrant, Envelope,
@@ -2153,7 +2153,7 @@ mod linux {
 
     /// A connection-bound client for the peer-authorized desktop session.
     pub struct DesktopClient {
-        stream: UnixStream,
+        stream: Box<dyn ClientStream + Send>,
         runtime_version: String,
         profile_id: String,
         workspace_scopes: BTreeMap<String, BTreeSet<String>>,
@@ -2661,8 +2661,8 @@ mod linux {
                 body,
             };
             let bytes = encode_frame(&request).map_err(map_frame_error)?;
-            write_all_before(&mut self.stream, &bytes, request_deadline)?;
-            match serde_json::from_value(read_value(&mut self.stream, request_deadline)?)
+            write_all_before(self.stream.as_mut(), &bytes, request_deadline)?;
+            match serde_json::from_value(read_value(self.stream.as_mut(), request_deadline)?)
                 .map_err(|_| ClientError::UnexpectedMessage)?
             {
                 Envelope::Response(response) if response.request_id == request_id => Ok(response),
@@ -2990,7 +2990,7 @@ mod linux {
             if wait.is_zero() {
                 return Err(ClientError::AuthorizationExpired);
             }
-            let value = read_value(&mut self.stream, deadline(wait)).map_err(|error| {
+            let value = read_value(self.stream.as_mut(), deadline(wait)).map_err(|error| {
                 if error == ClientError::ConnectionClosed {
                     ClientError::DesktopUnavailable
                 } else {
@@ -3063,10 +3063,6 @@ mod linux {
                 return Err(ClientError::UnexpectedMessage);
             }
             Ok(body)
-        }
-
-        pub fn into_stream(self) -> UnixStream {
-            self.stream
         }
     }
 
@@ -3750,11 +3746,20 @@ mod linux {
 
     #[doc(hidden)]
     pub fn handshake_desktop_client_stream(
-        mut stream: UnixStream,
+        stream: UnixStream,
         client_version: &str,
         io_timeout: Duration,
     ) -> Result<DesktopClient, ClientError> {
         verify_connected_peer(&stream)?;
+        handshake_desktop_client(Box::new(stream), client_version, io_timeout)
+    }
+
+    #[doc(hidden)]
+    pub fn handshake_desktop_client(
+        mut stream: Box<dyn ClientStream + Send>,
+        client_version: &str,
+        io_timeout: Duration,
+    ) -> Result<DesktopClient, ClientError> {
         let hello = Hello {
             protocol: Protocol,
             client: Client {
@@ -3768,9 +3773,9 @@ mod linux {
             authorized_client_credential: None,
         };
         let bytes = encode_frame(&hello).map_err(map_frame_error)?;
-        write_all_before(&mut stream, &bytes, deadline(io_timeout))?;
+        write_all_before(stream.as_mut(), &bytes, deadline(io_timeout))?;
 
-        let welcome_value = read_value(&mut stream, deadline(io_timeout))?;
+        let welcome_value = read_value(stream.as_mut(), deadline(io_timeout))?;
         reject_protocol_error(&welcome_value)?;
         let welcome: Welcome = parse_message(welcome_value)?;
         if welcome.selected != 1
@@ -3780,7 +3785,7 @@ mod linux {
             return Err(ClientError::UnexpectedMessage);
         }
 
-        let authorized_value = read_value(&mut stream, deadline(io_timeout))?;
+        let authorized_value = read_value(stream.as_mut(), deadline(io_timeout))?;
         reject_protocol_error(&authorized_value)?;
         if authorized_value
             .get("authorized_client_credential")
@@ -4177,7 +4182,7 @@ mod linux {
         fn test_client(runtime_version: &str) -> DesktopClient {
             let (stream, _peer) = UnixStream::pair().unwrap();
             DesktopClient {
-                stream,
+                stream: Box::new(stream),
                 runtime_version: runtime_version.to_string(),
                 profile_id: "profile".to_string(),
                 workspace_scopes: BTreeMap::new(),
@@ -4279,7 +4284,7 @@ mod linux {
 #[cfg(unix)]
 pub use linux::{
     connect_approval_presenter, connect_approval_presenter_at, connect_desktop_client,
-    connect_desktop_client_at, handshake_approval_presenter_stream,
+    connect_desktop_client_at, handshake_approval_presenter_stream, handshake_desktop_client,
     handshake_desktop_client_stream, handshake_migration_control_stream, handshake_stream,
     handshake_stream_with_credential, interruptible_connect_with_state,
     serve_approval_presenter_at, serve_desktop_client_at, ApprovalPresenterClient,

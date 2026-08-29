@@ -40,6 +40,8 @@ mod workspace;
 
 #[cfg(feature = "client")]
 pub use client::*;
+#[cfg(feature = "client")]
+pub use client_stream::ClientStream;
 pub use envelope::*;
 pub use framing::*;
 pub use negotiation::*;

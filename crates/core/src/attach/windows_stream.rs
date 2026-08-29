@@ -12,6 +12,8 @@ use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
+use muniment_attach::ClientStream;
+
 use super::deadline_io::DeadlineStream;
 
 /// A connected Windows attach pipe that uses bounded overlapped I/O.
@@ -154,6 +156,16 @@ impl DeadlineStream for WindowsAttachStream {
     fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.write_timeout.set(timeout);
         Ok(())
+    }
+}
+
+impl ClientStream for WindowsAttachStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        DeadlineStream::set_read_timeout(self, timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        DeadlineStream::set_write_timeout(self, timeout)
     }
 }
 

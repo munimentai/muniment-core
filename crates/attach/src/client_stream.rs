@@ -5,7 +5,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-pub(crate) trait ClientStream: Read + Write {
+pub trait ClientStream: Read + Write {
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
     fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
 }
