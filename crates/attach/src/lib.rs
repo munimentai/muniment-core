@@ -34,6 +34,8 @@ mod client;
 mod client_stream;
 #[cfg(feature = "client")]
 mod desktop_client;
+#[cfg(feature = "client")]
+mod desktop_client_holder;
 mod envelope;
 pub mod fixtures;
 mod framing;
@@ -48,6 +50,8 @@ pub use client::*;
 pub use client_stream::ClientStream;
 #[cfg(feature = "client")]
 pub use desktop_client::{handshake_desktop_client, DesktopClient};
+#[cfg(feature = "client")]
+pub use desktop_client_holder::DesktopClientHolder;
 pub use envelope::*;
 pub use framing::*;
 pub use negotiation::*;
