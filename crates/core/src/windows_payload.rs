@@ -4,6 +4,7 @@ use crate::windows_task::{
     is_canonical_sid, plan_task_removal, ObservedRegistration, RemovalScope, SidError,
     TaskRemovalPlan,
 };
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "windows")]
@@ -11,6 +12,7 @@ use crate::windows_known_folders::{windows_payload_roots, WindowsKnownFolderErro
 
 const PAYLOAD_DIRECTORY: &str = "muniment";
 const PAYLOAD_FILE_NAME: &str = "muniment-runtime.exe";
+const DESKTOP_FILE_NAME: &str = "muniment.exe";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PayloadFileKind {
@@ -119,6 +121,44 @@ impl WindowsPayloadScopes {
                 per_user_payload_path: self.per_user_payload_path.clone(),
             })
     }
+}
+
+/// Maps an installed Windows runtime payload to its sibling desktop executable.
+pub fn installed_desktop_executable_from(runtime_payload: &Path) -> Option<PathBuf> {
+    if runtime_payload.is_absolute() {
+        if runtime_payload.file_name() != Some(OsStr::new(PAYLOAD_FILE_NAME)) {
+            return None;
+        }
+        let payload_directory = runtime_payload.parent()?;
+        if payload_directory.file_name() != Some(OsStr::new(PAYLOAD_DIRECTORY)) {
+            return None;
+        }
+        return Some(payload_directory.join(DESKTOP_FILE_NAME));
+    }
+
+    // Windows paths are not absolute to std::path on non-Windows test hosts.
+    let path_text = runtime_payload.to_str()?;
+    let segments: Vec<_> = path_text.split(['\\', '/']).collect();
+    if !is_absolute_windows_path(path_text, &segments)
+        || segments.last() != Some(&PAYLOAD_FILE_NAME)
+        || segments.iter().rev().nth(1) != Some(&PAYLOAD_DIRECTORY)
+    {
+        return None;
+    }
+
+    Some(PathBuf::from(format!(
+        "{}{}",
+        path_text.strip_suffix(PAYLOAD_FILE_NAME)?,
+        DESKTOP_FILE_NAME
+    )))
+}
+
+/// Resolves the live desktop executable beside the installed runtime payload.
+#[cfg(target_os = "windows")]
+pub fn resolve_live_windows_desktop_executable(
+) -> Result<Option<PathBuf>, LiveWindowsPayloadScopesError> {
+    Ok(resolve_live_windows_payload()?
+        .and_then(|payload| installed_desktop_executable_from(&payload.payload_path)))
 }
 
 /// Resolves the installed payload and its roots from Shell known folders.

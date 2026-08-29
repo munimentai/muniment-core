@@ -1,7 +1,7 @@
 use muniment_core::windows_payload::{
-    plan_scope_task_removals, plan_windows_payload_removals, resolve_windows_payload,
-    resolve_windows_payload_scopes, PayloadFileKind, PayloadRootError, WindowsPayloadProbe,
-    WindowsPayloadScopes,
+    installed_desktop_executable_from, plan_scope_task_removals, plan_windows_payload_removals,
+    resolve_windows_payload, resolve_windows_payload_scopes, PayloadFileKind, PayloadRootError,
+    WindowsPayloadProbe, WindowsPayloadScopes,
 };
 use muniment_core::windows_task::{
     LogonType, ObservedRegistration, RemovalScope, RunLevel, SidError, TaskRemovalPlan,
@@ -35,6 +35,40 @@ impl WindowsPayloadProbe for FakeProbe {
 
 fn payload(root: &Path) -> PathBuf {
     root.join("muniment").join("muniment-runtime.exe")
+}
+
+#[test]
+fn maps_installed_windows_payloads_to_the_desktop_executable() {
+    for (runtime_payload, desktop_executable) in [
+        (
+            r"C:\Program Files\muniment\muniment-runtime.exe",
+            r"C:\Program Files\muniment\muniment.exe",
+        ),
+        (
+            r"C:\Users\Ada\AppData\Local\muniment\muniment-runtime.exe",
+            r"C:\Users\Ada\AppData\Local\muniment\muniment.exe",
+        ),
+    ] {
+        assert_eq!(
+            installed_desktop_executable_from(Path::new(runtime_payload)),
+            Some(PathBuf::from(desktop_executable))
+        );
+    }
+}
+
+#[test]
+fn rejects_payloads_outside_the_installed_windows_layout() {
+    for runtime_payload in [
+        r"muniment\muniment-runtime.exe",
+        r"C:\Program Files\muniment\another-runtime.exe",
+        r"C:\Program Files\another\muniment-runtime.exe",
+    ] {
+        assert_eq!(
+            installed_desktop_executable_from(Path::new(runtime_payload)),
+            None,
+            "payload: {runtime_payload}"
+        );
+    }
 }
 
 const SID: &str = "S-1-5-21-111-222-333-1001";
