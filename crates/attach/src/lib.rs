@@ -36,6 +36,8 @@ mod envelope;
 pub mod fixtures;
 mod framing;
 mod negotiation;
+#[cfg(feature = "client")]
+mod protocol_helpers;
 mod workspace;
 
 #[cfg(feature = "client")]
