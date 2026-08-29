@@ -2,10 +2,12 @@
 mod unix_tests {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
     use muniment_core::attach::{
-        decode_frame, serve_windows_attach_session_with_reader, Welcome, WindowsAttachPeerReader,
+        decode_frame, serve_windows_attach_session_with_reader, Welcome,
+        WindowsAttachConnectionRoute, WindowsAttachPeerReader, WindowsAttachRouteReader,
         WindowsAttachSessionError, WindowsPeerError, WindowsPeerReadError, MAX_FRAME_LENGTH,
     };
 
@@ -24,11 +26,27 @@ mod unix_tests {
         }
     }
 
+    struct FakeRouteReader(PathBuf);
+
+    impl WindowsAttachRouteReader for FakeRouteReader {
+        fn peer_image_path(&self) -> Result<PathBuf, WindowsPeerReadError> {
+            Ok(self.0.clone())
+        }
+    }
+
     fn reader(peer_sid: &[u8], local_sid: &[u8]) -> FakePeerReader {
         FakePeerReader {
             peer_sid: peer_sid.to_vec(),
             local_sid: local_sid.to_vec(),
         }
+    }
+
+    fn route_reader(path: &str) -> FakeRouteReader {
+        FakeRouteReader(PathBuf::from(path))
+    }
+
+    fn expected_desktop_executable() -> &'static Path {
+        Path::new("/Program Files/Muniment/muniment.exe")
     }
 
     fn deadline() -> Instant {
@@ -58,7 +76,7 @@ mod unix_tests {
     }
 
     #[test]
-    fn accepted_peer_receives_one_welcome_frame() {
+    fn matching_desktop_peer_returns_desktop_client_route_and_one_welcome_frame() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         client.write_all(&hello_frame()).unwrap();
 
@@ -66,10 +84,12 @@ mod unix_tests {
             serve_windows_attach_session_with_reader(
                 &mut server,
                 &reader(&[1, 2, 3], &[1, 2, 3]),
+                &route_reader("/Program Files/Muniment/muniment.exe"),
+                Some(expected_desktop_executable()),
                 "1.2.3",
                 deadline(),
             ),
-            Ok(())
+            Ok(WindowsAttachConnectionRoute::DesktopClient)
         );
 
         drop(server);
@@ -83,6 +103,42 @@ mod unix_tests {
     }
 
     #[test]
+    fn other_peer_returns_companion_route() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client.write_all(&hello_frame()).unwrap();
+
+        assert_eq!(
+            serve_windows_attach_session_with_reader(
+                &mut server,
+                &reader(&[1, 2, 3], &[1, 2, 3]),
+                &route_reader("/Program Files/Other/other.exe"),
+                Some(expected_desktop_executable()),
+                "1.2.3",
+                deadline(),
+            ),
+            Ok(WindowsAttachConnectionRoute::Companion)
+        );
+    }
+
+    #[test]
+    fn absent_expected_desktop_executable_returns_companion_route() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client.write_all(&hello_frame()).unwrap();
+
+        assert_eq!(
+            serve_windows_attach_session_with_reader(
+                &mut server,
+                &reader(&[1, 2, 3], &[1, 2, 3]),
+                &route_reader("/Program Files/Muniment/muniment.exe"),
+                None,
+                "1.2.3",
+                deadline(),
+            ),
+            Ok(WindowsAttachConnectionRoute::Companion)
+        );
+    }
+
+    #[test]
     fn rejected_peer_gets_no_response_after_the_prefix_read() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         let mut unread = server.try_clone().unwrap();
@@ -93,6 +149,8 @@ mod unix_tests {
             serve_windows_attach_session_with_reader(
                 &mut server,
                 &reader(&[1, 2, 3], &[1, 2, 4]),
+                &route_reader("/Program Files/Muniment/muniment.exe"),
+                Some(expected_desktop_executable()),
                 "1.2.3",
                 deadline(),
             ),
@@ -122,6 +180,8 @@ mod unix_tests {
             serve_windows_attach_session_with_reader(
                 &mut server,
                 &reader(&[1, 2, 3], &[1, 2, 3]),
+                &route_reader("/Program Files/Muniment/muniment.exe"),
+                Some(expected_desktop_executable()),
                 "1.2.3",
                 deadline(),
             ),
@@ -144,6 +204,8 @@ mod unix_tests {
             serve_windows_attach_session_with_reader(
                 &mut server,
                 &reader(&[1, 2, 3], &[1, 2, 3]),
+                &route_reader("/Program Files/Muniment/muniment.exe"),
+                Some(expected_desktop_executable()),
                 "1.2.3",
                 deadline(),
             ),
@@ -160,9 +222,14 @@ fn native_session_wrapper_accepts_a_windows_stream() {
     use std::time::Instant;
 
     use muniment_core::attach::{
-        serve_windows_attach_session, WindowsAttachSessionError, WindowsAttachStream,
+        serve_windows_attach_session, WindowsAttachConnectionRoute, WindowsAttachSessionError,
+        WindowsAttachStream,
     };
 
-    let _: fn(WindowsAttachStream, &str, Instant) -> Result<(), WindowsAttachSessionError> =
+    let _: fn(
+        WindowsAttachStream,
+        &str,
+        Instant,
+    ) -> Result<WindowsAttachConnectionRoute, WindowsAttachSessionError> =
         serve_windows_attach_session;
 }
