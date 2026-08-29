@@ -13,6 +13,7 @@ mod connection_route;
 mod credential;
 mod cursor;
 mod deadline_io;
+mod desktop_admission;
 #[cfg(target_os = "linux")]
 mod desktop_client_admission;
 #[cfg(target_os = "linux")]
@@ -75,6 +76,7 @@ pub use cursor::{
 };
 #[doc(hidden)]
 pub use deadline_io::{read_exact_before, write_all_before, DeadlineStream};
+pub use desktop_admission::*;
 #[cfg(target_os = "linux")]
 pub use desktop_client_admission::*;
 #[cfg(target_os = "linux")]
