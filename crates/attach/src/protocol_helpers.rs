@@ -1,4 +1,7 @@
-use crate::{ClientError, ErrorCode, ErrorEnvelope, FrameError, Id, PROTOCOL};
+use crate::client::RunStreamMessage;
+use crate::{
+    ClientError, ErrorCode, ErrorEnvelope, EventName, FrameError, Id, MAX_TEXT_LENGTH, PROTOCOL,
+};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -88,4 +91,97 @@ pub(crate) fn map_frame_error(error: FrameError) -> ClientError {
         FrameError::PayloadTooLarge => ClientError::PayloadTooLarge,
         _ => ClientError::MalformedFrame,
     }
+}
+
+pub(crate) fn is_rfc3339(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || !matches!(bytes.get(10), Some(b'T' | b't'))
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+    {
+        return false;
+    }
+
+    let number = |start: usize, end: usize| {
+        bytes
+            .get(start..end)
+            .filter(|digits| digits.iter().all(u8::is_ascii_digit))
+            .and_then(|digits| std::str::from_utf8(digits).ok())
+            .and_then(|digits| digits.parse::<u32>().ok())
+    };
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        number(0, 4),
+        number(5, 7),
+        number(8, 10),
+        number(11, 13),
+        number(14, 16),
+        number(17, 19),
+    ) else {
+        return false;
+    };
+    let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap_year => 29,
+        2 => 28,
+        _ => return false,
+    };
+    if day == 0 || day > max_day || hour > 23 || minute > 59 || second > 60 {
+        return false;
+    }
+
+    let mut zone = 19;
+    if bytes.get(zone) == Some(&b'.') {
+        zone += 1;
+        let fraction_start = zone;
+        while bytes.get(zone).is_some_and(u8::is_ascii_digit) {
+            zone += 1;
+        }
+        if zone == fraction_start {
+            return false;
+        }
+    }
+    match bytes.get(zone..) {
+        Some([b'Z' | b'z']) => true,
+        Some([b'+' | b'-', h1, h2, b':', m1, m2]) => {
+            [h1, h2, m1, m2].iter().all(|digit| digit.is_ascii_digit())
+                && (h1 - b'0') * 10 + (h2 - b'0') <= 23
+                && (m1 - b'0') * 10 + (m2 - b'0') <= 59
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn validate_capability_revocation(
+    event: &crate::Event,
+) -> Result<Option<RunStreamMessage>, ClientError> {
+    if event.event != EventName::CapabilityRevoked {
+        return Ok(None);
+    }
+    if event.run_id.is_some() || event.run_seq.is_some() {
+        return Err(ClientError::UnexpectedMessage);
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body {
+        capability: String,
+        reason: String,
+    }
+    let body: Body =
+        serde_json::from_value(event.body.clone()).map_err(|_| ClientError::UnexpectedMessage)?;
+    if body.capability.trim().is_empty()
+        || body.capability.len() > MAX_TEXT_LENGTH
+        || body.reason.trim().is_empty()
+        || body.reason.len() > MAX_TEXT_LENGTH
+    {
+        return Err(ClientError::UnexpectedMessage);
+    }
+    Ok(Some(RunStreamMessage::CapabilityRevoked {
+        capability: body.capability,
+        reason: body.reason,
+    }))
 }

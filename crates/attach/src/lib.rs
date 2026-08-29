@@ -32,6 +32,8 @@ pub fn runtime_version_meets_minimum(version: &str, minimum: &str) -> bool {
 mod client;
 #[cfg(feature = "client")]
 mod client_stream;
+#[cfg(feature = "client")]
+mod desktop_client;
 mod envelope;
 pub mod fixtures;
 mod framing;
@@ -44,6 +46,8 @@ mod workspace;
 pub use client::*;
 #[cfg(feature = "client")]
 pub use client_stream::ClientStream;
+#[cfg(feature = "client")]
+pub use desktop_client::{handshake_desktop_client, DesktopClient};
 pub use envelope::*;
 pub use framing::*;
 pub use negotiation::*;
