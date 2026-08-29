@@ -1,5 +1,4 @@
 use std::ffi::OsStr;
-use std::fmt;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr::null_mut;
@@ -19,48 +18,13 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
 
 use super::{
-    verify_windows_endpoint_owner_with_reader, windows_attach_pipe_path, WindowsAttachStream,
-    WindowsPipeAccessControlEntry, WindowsPipeSecurityError, WindowsPipeSecurityReadError,
-    WindowsPipeSecurityReader,
+    verify_windows_endpoint_owner_with_reader, windows_attach_pipe_path, WindowsAttachConnectError,
+    WindowsAttachStream, WindowsPipeAccessControlEntry, WindowsPipeSecurityError,
+    WindowsPipeSecurityReadError, WindowsPipeSecurityReader,
 };
 use crate::windows_sid::{copy_sid_bytes, current_process_user_sid};
 
 const ATTACH_ENDPOINT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
-
-/// A failure while connecting to the current user's Windows attach endpoint.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WindowsAttachConnectError {
-    DeadlineExpired,
-    EndpointAbsent,
-    IdentityUnavailable,
-    InvalidPipePath,
-    Open(u32),
-    Wait(u32),
-    EndpointSecurity(WindowsPipeSecurityError),
-}
-
-impl fmt::Display for WindowsAttachConnectError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DeadlineExpired => formatter.write_str("the attach connection deadline expired"),
-            Self::EndpointAbsent => formatter.write_str("the Windows attach endpoint is absent"),
-            Self::IdentityUnavailable => {
-                formatter.write_str("the current process identity is unavailable")
-            }
-            Self::InvalidPipePath => formatter.write_str("the Windows attach pipe path is invalid"),
-            Self::Open(code) => {
-                write!(formatter, "could not open the Windows attach pipe ({code})")
-            }
-            Self::Wait(code) => write!(
-                formatter,
-                "could not wait for the Windows attach pipe ({code})"
-            ),
-            Self::EndpointSecurity(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for WindowsAttachConnectError {}
 
 /// Waits for and connects to the current user's Windows attach endpoint.
 pub fn wait_for_windows_attach_endpoint(
