@@ -6,6 +6,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::ptr::{null, null_mut};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
     GetLastError, LocalFree, ERROR_IO_PENDING, ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED,
@@ -42,6 +43,12 @@ use crate::windows_sid::{copy_sid_bytes, current_process_user_sid};
 
 const PIPE_ACCESS_MASK: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
 const WINDOWS_ATTACH_SESSION_TIMEOUT: Duration = Duration::from_secs(5);
+static FAIL_NEXT_PIPE_INSTANCE: AtomicBool = AtomicBool::new(false);
+
+#[doc(hidden)]
+pub fn fail_next_windows_attach_pipe_instance_for_tests() {
+    FAIL_NEXT_PIPE_INSTANCE.store(true, Ordering::SeqCst);
+}
 
 /// A failure while accepting a Windows attach connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -186,6 +193,9 @@ impl WindowsAttachListener {
         if Instant::now() >= deadline {
             return Err(WindowsAttachAcceptError::DeadlineExpired);
         }
+        if self.handle.is_none() {
+            self.handle = Some(self.create_listening_instance()?);
+        }
 
         let event = unsafe { CreateEventW(null(), 1, 0, null()) };
         if event.is_null() {
@@ -263,17 +273,22 @@ impl WindowsAttachListener {
     }
 
     fn take_stream_and_replace(&mut self) -> Result<WindowsAttachStream, WindowsAttachAcceptError> {
-        let next = create_pipe_instance(&self.path, false).map_err(|error| {
+        let connected = self
+            .handle
+            .take()
+            .expect("the listener has no server pipe handle");
+        // Keep the connected client. The next accept retries a failed replacement.
+        self.handle = self.create_listening_instance().ok();
+        Ok(WindowsAttachStream::new(connected))
+    }
+
+    fn create_listening_instance(&self) -> Result<OwnedHandle, WindowsAttachAcceptError> {
+        create_pipe_instance(&self.path, false).map_err(|error| {
             error
                 .raw_os_error()
                 .map(|code| WindowsAttachAcceptError::CreateInstance(code as u32))
                 .unwrap_or(WindowsAttachAcceptError::VerifyInstanceSecurity)
-        })?;
-        let connected = self
-            .handle
-            .replace(next)
-            .expect("the listener has no server pipe handle");
-        Ok(WindowsAttachStream::new(connected))
+        })
     }
 
     fn take_stream(&mut self) -> WindowsAttachStream {
@@ -291,6 +306,9 @@ impl WindowsAttachListener {
 }
 
 fn create_pipe_instance(path: &str, first: bool) -> io::Result<OwnedHandle> {
+    if FAIL_NEXT_PIPE_INSTANCE.swap(false, Ordering::SeqCst) {
+        return Err(io::Error::other("injected pipe instance creation failure"));
+    }
     let wide: Vec<u16> = OsStr::new(path).encode_wide().chain(Some(0)).collect();
     let mut security = OwnerSecurity::new(PIPE_ACCESS_MASK)?;
     let attributes = security.attributes();

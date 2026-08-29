@@ -8,9 +8,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use muniment_core::attach::{
-    decode_frame, serve_next_windows_attach, windows_attach_pipe_path, Welcome,
-    WindowsAttachAcceptError, WindowsAttachBindError, WindowsAttachInstanceLockError,
-    WindowsAttachListener,
+    decode_frame, fail_next_windows_attach_pipe_instance_for_tests, serve_next_windows_attach,
+    windows_attach_pipe_path, Welcome, WindowsAttachAcceptError, WindowsAttachBindError,
+    WindowsAttachInstanceLockError, WindowsAttachListener,
 };
 use muniment_core::windows_sid::current_process_user_sid;
 
@@ -45,6 +45,19 @@ fn connect_and_serve(listener: &mut WindowsAttachListener, path: String) -> File
     });
     serve_next_windows_attach(listener, "1.2.3", Instant::now() + Duration::from_secs(1)).unwrap();
     client.join().unwrap()
+}
+
+fn open_client_with_retry(path: String) -> File {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(client) => return client,
+            Err(_) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("could not open the recovered pipe: {error}"),
+        }
+    }
 }
 
 fn exchange_hello(client: &mut File) -> Welcome {
@@ -121,6 +134,43 @@ fn accepts_two_clients_while_both_connections_stay_open() {
     let second_client = second_client.join().unwrap();
 
     drop((first_stream, first_client, second_stream, second_client));
+}
+
+#[test]
+fn recovers_after_replacement_creation_fails() {
+    let _guard = LISTENER_TEST_LOCK.lock().unwrap();
+    let mut listener = bind_listener();
+    let path = listener.path().to_owned();
+    let first_client = thread::spawn({
+        let path = path.clone();
+        move || {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap()
+        }
+    });
+
+    fail_next_windows_attach_pipe_instance_for_tests();
+    serve_next_windows_attach(
+        &mut listener,
+        "1.2.3",
+        Instant::now() + Duration::from_secs(1),
+    )
+    .unwrap();
+    let mut first_client = first_client.join().unwrap();
+    assert_eq!(exchange_hello(&mut first_client).desktop_version, "1.2.3");
+
+    let second_client = thread::spawn(move || open_client_with_retry(path));
+    serve_next_windows_attach(
+        &mut listener,
+        "1.2.3",
+        Instant::now() + Duration::from_secs(1),
+    )
+    .unwrap();
+    let mut second_client = second_client.join().unwrap();
+    assert_eq!(exchange_hello(&mut second_client).desktop_version, "1.2.3");
 }
 
 #[test]
