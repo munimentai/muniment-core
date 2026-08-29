@@ -27,7 +27,9 @@ use windows_sys::Win32::System::Pipes::{
     PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
 };
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
-use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, SetEvent, WaitForMultipleObjects, WaitForSingleObject, INFINITE,
+};
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 use super::{
@@ -127,6 +129,34 @@ impl std::error::Error for WindowsAttachBindError {
     }
 }
 
+/// The result of waiting for a Windows attach connection or a stop signal.
+pub enum WindowsAttachAcceptOutcome {
+    Connected(WindowsAttachStream),
+    Stopped,
+}
+
+/// A manual-reset event that stops a Windows attach wait.
+pub struct WindowsAttachStopEvent {
+    handle: OwnedHandle,
+}
+
+impl WindowsAttachStopEvent {
+    /// Creates an unsignaled stop event.
+    pub fn new() -> Result<Self, WindowsAttachAcceptError> {
+        Ok(Self {
+            handle: create_accept_event()?,
+        })
+    }
+
+    /// Signals the stop event.
+    pub fn signal(&self) -> io::Result<()> {
+        if unsafe { SetEvent(self.handle.as_raw_handle()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
 /// A bound Windows attach pipe listener.
 pub struct WindowsAttachListener {
     path: String,
@@ -197,13 +227,7 @@ impl WindowsAttachListener {
             self.handle = Some(self.create_listening_instance()?);
         }
 
-        let event = unsafe { CreateEventW(null(), 1, 0, null()) };
-        if event.is_null() {
-            return Err(WindowsAttachAcceptError::CreateEvent(unsafe {
-                GetLastError()
-            }));
-        }
-        let event = unsafe { OwnedHandle::from_raw_handle(event) };
+        let event = create_accept_event()?;
         let mut overlapped = OVERLAPPED {
             hEvent: event.as_raw_handle(),
             ..OVERLAPPED::default()
@@ -219,6 +243,79 @@ impl WindowsAttachListener {
         }
 
         self.take_stream_and_replace()
+    }
+
+    /// Waits until one client connects or the stop event is signaled.
+    pub fn accept_until(
+        &mut self,
+        stop: &WindowsAttachStopEvent,
+    ) -> Result<WindowsAttachAcceptOutcome, WindowsAttachAcceptError> {
+        if self.handle.is_none() {
+            self.handle = Some(self.create_listening_instance()?);
+        }
+
+        let event = create_accept_event()?;
+        let mut overlapped = OVERLAPPED {
+            hEvent: event.as_raw_handle(),
+            ..OVERLAPPED::default()
+        };
+        let handle = self.handle().as_raw_handle();
+
+        if unsafe { ConnectNamedPipe(handle, &mut overlapped) } == 0 {
+            match unsafe { GetLastError() } {
+                ERROR_PIPE_CONNECTED => {}
+                ERROR_IO_PENDING => {
+                    let events = [overlapped.hEvent, stop.handle.as_raw_handle()];
+                    let wait = unsafe {
+                        WaitForMultipleObjects(events.len() as u32, events.as_ptr(), 0, INFINITE)
+                    };
+                    if wait == WAIT_OBJECT_0 + 1 {
+                        let cancelled = unsafe { CancelIoEx(handle, &overlapped) } != 0;
+                        let cancel_error = if cancelled {
+                            None
+                        } else {
+                            Some(unsafe { GetLastError() })
+                        };
+                        let mut transferred = 0;
+                        if unsafe { GetOverlappedResult(handle, &overlapped, &mut transferred, 1) }
+                            != 0
+                        {
+                            return self
+                                .take_stream_and_replace()
+                                .map(WindowsAttachAcceptOutcome::Connected);
+                        }
+                        let completion_error = unsafe { GetLastError() };
+                        if cancelled && completion_error == ERROR_OPERATION_ABORTED {
+                            return Ok(WindowsAttachAcceptOutcome::Stopped);
+                        }
+                        if cancel_error == Some(ERROR_NOT_FOUND) {
+                            return Err(WindowsAttachAcceptError::Connect(completion_error));
+                        }
+                        return Err(WindowsAttachAcceptError::Cancel(
+                            cancel_error.unwrap_or(completion_error),
+                        ));
+                    }
+                    if wait == WAIT_FAILED {
+                        let error = unsafe { GetLastError() };
+                        cancel_connect_and_wait(handle, &overlapped);
+                        return Err(WindowsAttachAcceptError::Wait(error));
+                    }
+                    if wait != WAIT_OBJECT_0 {
+                        cancel_connect_and_wait(handle, &overlapped);
+                        return Err(WindowsAttachAcceptError::Wait(wait));
+                    }
+                    let mut transferred = 0;
+                    if unsafe { GetOverlappedResult(handle, &overlapped, &mut transferred, 0) } == 0
+                    {
+                        return Err(WindowsAttachAcceptError::Connect(unsafe { GetLastError() }));
+                    }
+                }
+                error => return Err(WindowsAttachAcceptError::Connect(error)),
+            }
+        }
+
+        self.take_stream_and_replace()
+            .map(WindowsAttachAcceptOutcome::Connected)
     }
 
     fn wait_for_connection(
@@ -303,6 +400,16 @@ impl WindowsAttachListener {
     pub fn into_stream(mut self) -> WindowsAttachStream {
         self.take_stream()
     }
+}
+
+fn create_accept_event() -> Result<OwnedHandle, WindowsAttachAcceptError> {
+    let event = unsafe { CreateEventW(null(), 1, 0, null()) };
+    if event.is_null() {
+        return Err(WindowsAttachAcceptError::CreateEvent(unsafe {
+            GetLastError()
+        }));
+    }
+    Ok(unsafe { OwnedHandle::from_raw_handle(event) })
 }
 
 fn create_pipe_instance(path: &str, first: bool) -> io::Result<OwnedHandle> {

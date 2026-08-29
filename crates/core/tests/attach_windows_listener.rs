@@ -3,14 +3,15 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use muniment_core::attach::{
     decode_frame, fail_next_windows_attach_pipe_instance_for_tests, serve_next_windows_attach,
-    windows_attach_pipe_path, Welcome, WindowsAttachAcceptError, WindowsAttachBindError,
-    WindowsAttachInstanceLockError, WindowsAttachListener,
+    windows_attach_pipe_path, Welcome, WindowsAttachAcceptError, WindowsAttachAcceptOutcome,
+    WindowsAttachBindError, WindowsAttachInstanceLockError, WindowsAttachListener,
+    WindowsAttachStopEvent,
 };
 use muniment_core::windows_sid::current_process_user_sid;
 
@@ -97,6 +98,84 @@ fn binds_the_current_user_pipe_and_rejects_a_second_listener() {
 
     drop(listener);
     assert!(WindowsAttachListener::bind(state_directory(), Duration::ZERO).is_ok());
+}
+
+#[test]
+fn accept_until_stops_when_already_signaled_and_accepts_afterward() {
+    let _guard = LISTENER_TEST_LOCK.lock().unwrap();
+    let mut listener = bind_listener();
+    let stop = WindowsAttachStopEvent::new().unwrap();
+    stop.signal().unwrap();
+
+    assert!(matches!(
+        listener.accept_until(&stop).unwrap(),
+        WindowsAttachAcceptOutcome::Stopped
+    ));
+
+    let next_stop = WindowsAttachStopEvent::new().unwrap();
+    let path = listener.path().to_owned();
+    let client = thread::spawn(move || open_client_with_retry(path));
+    let stream = match listener.accept_until(&next_stop).unwrap() {
+        WindowsAttachAcceptOutcome::Connected(stream) => stream,
+        WindowsAttachAcceptOutcome::Stopped => panic!("the accept stopped unexpectedly"),
+    };
+    drop((stream, client.join().unwrap()));
+}
+
+#[test]
+fn accept_until_stops_when_signaled_during_the_wait() {
+    let _guard = LISTENER_TEST_LOCK.lock().unwrap();
+    let mut listener = bind_listener();
+    let stop = Arc::new(WindowsAttachStopEvent::new().unwrap());
+    let signaler = thread::spawn({
+        let stop = Arc::clone(&stop);
+        move || {
+            thread::sleep(Duration::from_millis(20));
+            stop.signal().unwrap();
+        }
+    });
+
+    assert!(matches!(
+        listener.accept_until(&stop).unwrap(),
+        WindowsAttachAcceptOutcome::Stopped
+    ));
+    signaler.join().unwrap();
+
+    let next_stop = WindowsAttachStopEvent::new().unwrap();
+    let path = listener.path().to_owned();
+    let client = thread::spawn(move || open_client_with_retry(path));
+    let stream = match listener.accept_until(&next_stop).unwrap() {
+        WindowsAttachAcceptOutcome::Connected(stream) => stream,
+        WindowsAttachAcceptOutcome::Stopped => panic!("the accept stopped unexpectedly"),
+    };
+    drop((stream, client.join().unwrap()));
+}
+
+#[test]
+fn accept_until_accepts_two_clients() {
+    let _guard = LISTENER_TEST_LOCK.lock().unwrap();
+    let mut listener = bind_listener();
+    let stop = WindowsAttachStopEvent::new().unwrap();
+    let path = listener.path().to_owned();
+
+    let first_client = thread::spawn({
+        let path = path.clone();
+        move || open_client_with_retry(path)
+    });
+    let first_stream = match listener.accept_until(&stop).unwrap() {
+        WindowsAttachAcceptOutcome::Connected(stream) => stream,
+        WindowsAttachAcceptOutcome::Stopped => panic!("the first accept stopped unexpectedly"),
+    };
+    let first_client = first_client.join().unwrap();
+
+    let second_client = thread::spawn(move || open_client_with_retry(path));
+    let second_stream = match listener.accept_until(&stop).unwrap() {
+        WindowsAttachAcceptOutcome::Connected(stream) => stream,
+        WindowsAttachAcceptOutcome::Stopped => panic!("the second accept stopped unexpectedly"),
+    };
+    let second_client = second_client.join().unwrap();
+
+    drop((first_stream, first_client, second_stream, second_client));
 }
 
 #[test]
