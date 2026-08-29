@@ -510,6 +510,7 @@ mod linux {
     };
     use crate::desktop_client::{handshake_desktop_client, DesktopClient};
     use crate::desktop_client_holder::DesktopClientHolder;
+    use crate::desktop_supervisor::{serve_desktop_client_with, DesktopClientSupervisorStop};
     use crate::protocol_helpers::{
         deadline, fresh_nonce, fresh_request_id, is_hex_secret, is_rfc3339, map_frame_error,
         map_protocol_error, parse_message, reject_protocol_error, validate_capability_revocation,
@@ -2148,6 +2149,66 @@ mod linux {
         }
     }
 
+    impl DesktopClientSupervisorStop for DesktopClientStopHandle {
+        fn stopped(&self) -> bool {
+            let (state, _) = &*self.inner;
+            state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .stopped
+        }
+
+        fn register_holder(&self, holder: DesktopClientHolder) -> bool {
+            let (state, _) = &*self.inner;
+            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.stopped {
+                return false;
+            }
+            state.holder = Some(holder);
+            true
+        }
+
+        fn notify_connected<P, N>(&self, publish: P, notify: N) -> bool
+        where
+            P: FnOnce(),
+            N: FnOnce(),
+        {
+            let (notification_lock, notification_wake) = &*self.notification;
+            let mut notification = notification_lock
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let (state, _) = &*self.inner;
+            let state = state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.stopped {
+                return false;
+            }
+            publish();
+            *notification = Some(std::thread::current().id());
+            drop(state);
+            drop(notification);
+            notify();
+            let mut notification = notification_lock
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            *notification = None;
+            notification_wake.notify_all();
+            true
+        }
+
+        fn wait_for_retry(&self, retry_interval: Duration) -> bool {
+            clear_desktop_stream(self);
+            let (state, wake) = &*self.inner;
+            let state = state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.stopped {
+                return false;
+            }
+            let (state, _) = wake
+                .wait_timeout_while(state, retry_interval, |state| !state.stopped)
+                .unwrap_or_else(|error| error.into_inner());
+            !state.stopped
+        }
+    }
+
     /// A connection-bound client for the peer-authorized approval presenter session.
     pub struct ApprovalPresenterClient {
         stream: UnixStream,
@@ -2542,83 +2603,24 @@ mod linux {
         retry_interval: Duration,
         stop: DesktopClientStopHandle,
         holder: DesktopClientHolder,
-        mut observe: impl FnMut(bool),
+        observe: impl FnMut(bool),
     ) {
-        {
-            let (state, _) = &*stop.inner;
-            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
-            if state.stopped {
-                return;
-            }
-            state.holder = Some(holder.clone());
-        }
-        loop {
-            let connected = interruptible_desktop_connect(endpoint, &stop);
-            if let Some(stream) = connected {
-                if let Ok(client) =
-                    handshake_desktop_client_stream(stream, client_version, io_timeout)
-                {
-                    let runtime_version = client.runtime_version().to_owned();
-                    let (notification_lock, notification_wake) = &*stop.notification;
-                    let mut notification = notification_lock
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    let (stop_state, _) = &*stop.inner;
-                    let stop_state = stop_state.lock().unwrap_or_else(|error| error.into_inner());
-                    if stop_state.stopped {
-                        return;
-                    }
-                    let (held, wake) = &*holder.inner;
-                    *held.lock().unwrap_or_else(|error| error.into_inner()) = Some(client);
-                    *holder
-                        .runtime_version
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner()) = Some(runtime_version);
-                    *notification = Some(std::thread::current().id());
-                    drop(stop_state);
-                    drop(notification);
-                    observe(true);
-                    let mut notification = notification_lock
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    *notification = None;
-                    notification_wake.notify_all();
-                    drop(notification);
-                    let connection = held.lock().unwrap_or_else(|error| error.into_inner());
-                    let mut connection = wake
-                        .wait_while(connection, |client| {
-                            if client.is_none() {
-                                return false;
-                            }
-                            let (state, _) = &*stop.inner;
-                            !state
-                                .lock()
-                                .unwrap_or_else(|error| error.into_inner())
-                                .stopped
-                        })
-                        .unwrap_or_else(|error| error.into_inner());
-                    *connection = None;
-                    *holder
-                        .runtime_version
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner()) = None;
-                    observe(false);
+        let connect_stop = stop.clone();
+        serve_desktop_client_with(
+            || {
+                let stream = interruptible_desktop_connect(endpoint, &connect_stop)?;
+                let client =
+                    handshake_desktop_client_stream(stream, client_version, io_timeout).ok();
+                if client.is_none() {
+                    clear_desktop_stream(&connect_stop);
                 }
-                clear_desktop_stream(&stop);
-            }
-
-            let (state, wake) = &*stop.inner;
-            let state = state.lock().unwrap_or_else(|error| error.into_inner());
-            if state.stopped {
-                return;
-            }
-            let (state, _) = wake
-                .wait_timeout_while(state, retry_interval, |state| !state.stopped)
-                .unwrap_or_else(|error| error.into_inner());
-            if state.stopped {
-                return;
-            }
-        }
+                client
+            },
+            stop,
+            holder,
+            retry_interval,
+            observe,
+        );
     }
 
     fn interruptible_desktop_connect(
