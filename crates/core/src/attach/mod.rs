@@ -49,6 +49,8 @@ mod windows_peer_native;
 mod windows_pipe;
 mod windows_pipe_security;
 mod windows_route;
+#[cfg(target_os = "windows")]
+mod windows_route_native;
 mod windows_session;
 #[cfg(target_os = "windows")]
 mod windows_stream;
@@ -107,6 +109,8 @@ pub use windows_peer_native::*;
 pub use windows_pipe::*;
 pub use windows_pipe_security::*;
 pub use windows_route::*;
+#[cfg(target_os = "windows")]
+pub use windows_route_native::*;
 pub use windows_session::*;
 #[cfg(target_os = "windows")]
 pub use windows_stream::*;
