@@ -3,9 +3,10 @@
 #[path = "../src/attach/deadline_io.rs"]
 mod deadline_io;
 
-use deadline_io::{is_timeout, read_exact_before, write_all_before, DeadlineStream};
+use deadline_io::{is_timeout, read_exact_before, write_all_before, DeadlineStream, ReadableWait};
 use std::cell::Cell;
 use std::io::{self, Read, Write};
+use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 struct FakeStream {
@@ -66,6 +67,10 @@ impl Write for FakeStream {
 }
 
 impl DeadlineStream for FakeStream {
+    fn wait_until_readable(&self, _deadline: Instant) -> ReadableWait {
+        ReadableWait::Ready
+    }
+
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         assert!(timeout.is_some_and(|timeout| !timeout.is_zero()));
         self.read_timeout_calls
@@ -83,6 +88,42 @@ impl DeadlineStream for FakeStream {
 
 fn future_deadline() -> Instant {
     Instant::now() + Duration::from_secs(1)
+}
+
+#[test]
+fn unix_stream_reports_readable_data_without_consuming_it() {
+    let (mut sender, mut stream) = UnixStream::pair().unwrap();
+    sender.write_all(b"x").unwrap();
+    drop(sender);
+
+    assert_eq!(
+        stream.wait_until_readable(future_deadline()),
+        ReadableWait::Ready
+    );
+    let mut byte = [0];
+    stream.read_exact(&mut byte).unwrap();
+    assert_eq!(&byte, b"x");
+}
+
+#[test]
+fn unix_stream_reports_a_readable_wait_timeout() {
+    let (_sender, stream) = UnixStream::pair().unwrap();
+
+    assert_eq!(
+        stream.wait_until_readable(Instant::now() + Duration::from_millis(10)),
+        ReadableWait::Timeout
+    );
+}
+
+#[test]
+fn unix_stream_reports_a_closed_peer() {
+    let (sender, stream) = UnixStream::pair().unwrap();
+    drop(sender);
+
+    assert_eq!(
+        stream.wait_until_readable(future_deadline()),
+        ReadableWait::Closed
+    );
 }
 
 #[test]

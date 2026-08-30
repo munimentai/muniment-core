@@ -2,19 +2,21 @@ use std::cell::Cell;
 use std::io::{self, Read, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::ptr::{null, null_mut};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
     GetLastError, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_NOT_FOUND, ERROR_NO_DATA,
     ERROR_OPERATION_ABORTED, ERROR_PIPE_NOT_CONNECTED, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 use muniment_attach::ClientStream;
 
-use super::deadline_io::DeadlineStream;
+use super::deadline_io::{DeadlineStream, ReadableWait};
 
 /// A connected Windows attach pipe that uses bounded overlapped I/O.
 pub struct WindowsAttachStream {
@@ -148,6 +150,32 @@ impl Write for WindowsAttachStream {
 }
 
 impl DeadlineStream for WindowsAttachStream {
+    fn wait_until_readable(&self, deadline: Instant) -> ReadableWait {
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return ReadableWait::Timeout;
+            };
+            let mut available = 0;
+            if unsafe {
+                PeekNamedPipe(
+                    self.handle.as_raw_handle(),
+                    null_mut(),
+                    0,
+                    null_mut(),
+                    &mut available,
+                    null_mut(),
+                )
+            } == 0
+            {
+                return ReadableWait::Closed;
+            }
+            if available > 0 {
+                return ReadableWait::Ready;
+            }
+            thread::sleep(remaining.min(Duration::from_millis(1)));
+        }
+    }
+
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.read_timeout.set(timeout);
         Ok(())

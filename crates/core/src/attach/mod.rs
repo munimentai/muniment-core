@@ -80,7 +80,7 @@ pub use cursor::{
     MAX_RUN_STREAM_WINDOW_TEXT_BYTES,
 };
 #[doc(hidden)]
-pub use deadline_io::{read_exact_before, write_all_before, DeadlineStream};
+pub use deadline_io::{read_exact_before, write_all_before, DeadlineStream, ReadableWait};
 pub use desktop_admission::*;
 #[cfg(target_os = "linux")]
 pub use desktop_client_admission::*;

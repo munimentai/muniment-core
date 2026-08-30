@@ -43,8 +43,8 @@ use super::{
     MAX_UNACKNOWLEDGED_ARTIFACT_BYTES,
 };
 use super::{
-    RunEventAdmission, RunStreamCursor, MAX_RUN_STREAM_WINDOW_BYTES, MAX_RUN_STREAM_WINDOW_EVENTS,
-    MAX_RUN_STREAM_WINDOW_TEXT_BYTES,
+    DeadlineStream, ReadableWait, RunEventAdmission, RunStreamCursor, MAX_RUN_STREAM_WINDOW_BYTES,
+    MAX_RUN_STREAM_WINDOW_EVENTS, MAX_RUN_STREAM_WINDOW_TEXT_BYTES,
 };
 use crate::browser_control::LinuxProcReader;
 use crate::journal::MAX_THREAD_TITLE_CHARS;
@@ -1360,14 +1360,13 @@ fn serve_desktop_client_requests<S: ThreadListService>(
             }
         }
 
-        match wait_until_readable(stream, Instant::now() + Duration::from_millis(50)) {
-            Ok(()) => {}
-            Err(AttachSessionError::Closed) if chat_subscription.is_some() => {
+        match stream.wait_until_readable(Instant::now() + Duration::from_millis(50)) {
+            ReadableWait::Ready => {}
+            ReadableWait::Closed if chat_subscription.is_some() => {
                 return Err(AttachSessionError::Closed);
             }
-            Err(AttachSessionError::Closed) => return Ok(()),
-            Err(AttachSessionError::Timeout) => continue,
-            Err(error) => return Err(error),
+            ReadableWait::Closed => return Ok(()),
+            ReadableWait::Timeout => continue,
         }
         let deadline = Instant::now() + HELLO_TIMEOUT;
         let request = match read_request_before(stream, deadline) {
@@ -1586,10 +1585,10 @@ where
             .min(Instant::now() + Duration::from_millis(50))
             .min(idle_deadline);
         let mut prefix = [0; 4];
-        match wait_until_readable(stream, poll_deadline) {
-            Ok(()) => {}
-            Err(AttachSessionError::Closed) => return Ok(()),
-            Err(AttachSessionError::Timeout) => {
+        match stream.wait_until_readable(poll_deadline) {
+            ReadableWait::Ready => {}
+            ReadableWait::Closed => return Ok(()),
+            ReadableWait::Timeout => {
                 if Instant::now() < idle_deadline {
                     continue;
                 }
@@ -1597,7 +1596,6 @@ where
                 write_protocol_error(stream, ProtocolError::unauthorized(), deadline);
                 return Err(AttachSessionError::Authorization);
             }
-            Err(error) => return Err(error),
         }
         match read_before(stream, &mut prefix, idle_deadline) {
             Ok(()) => {}
@@ -1817,35 +1815,6 @@ fn send_revocation(
     let frame = encode_frame(&event).map_err(|_| AttachSessionError::MalformedFrame)?;
     write_before(stream, &frame, Instant::now() + timeout)?;
     stream.flush().map_err(|_| AttachSessionError::Closed)
-}
-
-fn wait_until_readable(stream: &UnixStream, deadline: Instant) -> Result<(), AttachSessionError> {
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .ok_or(AttachSessionError::Timeout)?;
-    let millis = remaining.as_millis().clamp(1, libc::c_int::MAX as u128) as libc::c_int;
-    let mut descriptor = libc::pollfd {
-        fd: stream.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let result = unsafe { libc::poll(&mut descriptor, 1, millis) };
-    if result == 0 {
-        return Err(AttachSessionError::Timeout);
-    }
-    if result < 0 {
-        return if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-            Err(AttachSessionError::Timeout)
-        } else {
-            Err(AttachSessionError::Closed)
-        };
-    }
-    if descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
-        && descriptor.revents & libc::POLLIN == 0
-    {
-        return Err(AttachSessionError::Closed);
-    }
-    Ok(())
 }
 
 struct DispatchResult {
