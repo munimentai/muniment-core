@@ -42,6 +42,7 @@ mod presenter_admission;
 mod presenter_session;
 mod quiesce;
 mod runtime_activity;
+pub mod thread_service;
 #[cfg(target_os = "windows")]
 mod windows_connect;
 mod windows_desktop_client;
@@ -105,6 +106,7 @@ pub use presenter_admission::*;
 pub use presenter_session::*;
 pub use quiesce::*;
 pub use runtime_activity::*;
+pub use thread_service::CompanionRecord;
 #[cfg(target_os = "windows")]
 pub use windows_connect::*;
 pub use windows_desktop_client::*;
