@@ -26,12 +26,17 @@ pub use super::desktop_service_message::{
     RunResumeAccepted, RunResumeRequest, RunStartAccepted, RunStreamPage, RunSubmitAccepted,
     RunSubmitRequest, ThreadCreateAccepted,
 };
+use super::desktop_session::{
+    serve_desktop_client_requests, DesktopDispatchFailure, DesktopDispatchResult,
+    DesktopSessionService,
+};
 pub use super::live_connections::LiveConnectionRegistry;
 use super::live_connections::{LiveConnectionState, RegisteredConnection};
 pub use super::thread_service::{
     CompanionRecord, RedactedThreadEntry, RedactedThreadSummary, RunStartRequest, ThreadListPage,
     ThreadListRequest, ThreadListService, ThreadOpenPage, ThreadOpenRequest,
 };
+pub use super::AttachSessionError;
 pub use super::EntitlementSnapshotResult;
 use super::{
     encode_frame, welcome, Approval, ArtifactMetadata, ArtifactTransfer, ArtifactTransferRegistry,
@@ -549,37 +554,11 @@ pub struct PeerCredentials {
     pub gid: libc::gid_t,
 }
 
-/// Closed outcomes from the bounded, pre-authorization attach exchange.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AttachSessionError {
-    Closed,
-    Timeout,
-    MalformedFrame,
-    PayloadTooLarge,
-    ProtocolIncompatible,
-    Randomness,
-    Authorization,
-}
-
 struct AuthorizedSession<'a> {
     binding: &'a ConnectionBinding,
     provenance: &'a CompanionProvenance,
     workspace: &'a str,
     connection: &'a RegisteredConnection,
-}
-
-impl fmt::Display for AttachSessionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Closed => "attach stream closed",
-            Self::Timeout => "attach hello timed out",
-            Self::MalformedFrame => "attach frame is malformed",
-            Self::PayloadTooLarge => "attach payload exceeds the allowed size",
-            Self::ProtocolIncompatible => "attach protocol is incompatible",
-            Self::Randomness => "attach session randomness is unavailable",
-            Self::Authorization => "attach authorization failed",
-        })
-    }
 }
 
 /// The result of the explicit, visible desktop approval prompt.
@@ -658,8 +637,6 @@ pub struct SessionRegistryDependencies<'a> {
     pub migration: Option<MigrationControlSessionDependencies<'a>>,
     pub handoff_nonce: Option<&'a str>,
 }
-
-impl std::error::Error for AttachSessionError {}
 
 /// Completes the single hello/welcome exchange allowed before authorization.
 /// `credentials` must be the value returned alongside `stream` by [`AttachTransport::accept`].
@@ -1324,115 +1301,15 @@ pub fn serve_desktop_client_session<S: ThreadListService>(
     service: &mut S,
 ) -> Result<(), AttachSessionError> {
     service.bind_authorized_client(&session.client_identity);
-    let result = serve_desktop_client_requests(&mut stream, session, service);
+    let result = serve_desktop_client_requests(
+        &mut stream,
+        &session.capability,
+        &session.workspace,
+        session.provenance.clone(),
+        service,
+    );
     let _ = stream.shutdown(std::net::Shutdown::Both);
     result
-}
-
-fn serve_desktop_client_requests<S: ThreadListService>(
-    stream: &mut UnixStream,
-    session: &super::DesktopClientSession,
-    service: &mut S,
-) -> Result<(), AttachSessionError> {
-    let mut subscriptions = Vec::new();
-    let mut chat_subscription = None;
-    let mut registries = SessionRegistries::default();
-    loop {
-        let live_events = match poll_run_streams(service, &mut subscriptions) {
-            Ok(events) => events,
-            Err(error) => {
-                write_protocol_error(stream, error, Instant::now() + HELLO_TIMEOUT);
-                return Err(AttachSessionError::Closed);
-            }
-        };
-        for event in live_events {
-            let frame = encode_frame(&event).map_err(|_| AttachSessionError::MalformedFrame)?;
-            write_before(stream, &frame, Instant::now() + HELLO_TIMEOUT)?;
-        }
-        if let Some(subscription) = chat_subscription.as_ref() {
-            let (events, closed) = drain_chat_events(subscription)?;
-            for event in events {
-                let frame = encode_frame(&event).map_err(|_| AttachSessionError::MalformedFrame)?;
-                write_before(stream, &frame, Instant::now() + HELLO_TIMEOUT)?;
-            }
-            if closed {
-                return Ok(());
-            }
-        }
-
-        match stream.wait_until_readable(Instant::now() + Duration::from_millis(50)) {
-            ReadableWait::Ready => {}
-            ReadableWait::Closed if chat_subscription.is_some() => {
-                return Err(AttachSessionError::Closed);
-            }
-            ReadableWait::Closed => return Ok(()),
-            ReadableWait::Timeout => continue,
-        }
-        let deadline = Instant::now() + HELLO_TIMEOUT;
-        let request = match read_request_before(stream, deadline) {
-            Ok(request) => request,
-            Err(AttachSessionError::Closed) if chat_subscription.is_some() => {
-                return Err(AttachSessionError::Closed);
-            }
-            Err(AttachSessionError::Closed) => return Ok(()),
-            Err(error) => return Err(error),
-        };
-        let request_id = request.request_id.clone();
-        if request.capability != session.capability
-            || matches!(
-                request.operation,
-                Operation::MigrationControl | Operation::ApprovalPresent
-            )
-        {
-            write_request_error(
-                stream,
-                Some(request_id),
-                ProtocolError::unauthorized(),
-                deadline,
-            );
-            continue;
-        }
-        match dispatch_request(
-            request,
-            &session.workspace,
-            session.provenance.clone(),
-            service,
-            &mut subscriptions,
-            &mut chat_subscription,
-            &mut registries,
-        ) {
-            Ok(dispatched) => {
-                let response = Response {
-                    protocol: Protocol,
-                    request_id,
-                    ok: Success,
-                    body: dispatched.body,
-                };
-                write_before(
-                    stream,
-                    &encode_frame(&response).map_err(|_| AttachSessionError::MalformedFrame)?,
-                    deadline,
-                )?;
-                for event in dispatched.events {
-                    write_before(
-                        stream,
-                        &encode_frame(&event).map_err(|_| AttachSessionError::MalformedFrame)?,
-                        deadline,
-                    )?;
-                }
-            }
-            Err(failure) => {
-                write_request_error(stream, Some(request_id), failure.error, deadline);
-                for event in failure.events {
-                    write_before(
-                        stream,
-                        &encode_frame(&event).map_err(|_| AttachSessionError::MalformedFrame)?,
-                        deadline,
-                    )?;
-                }
-            }
-        }
-    }
 }
 
 fn read_request_before(
@@ -1860,6 +1737,69 @@ struct ActiveRunStream {
 struct ActiveChatSubscription {
     subscription_id: super::Id,
     receiver: crate::run_events::ChatEventSubscription,
+}
+
+pub(super) struct DesktopSessionState {
+    subscriptions: Vec<ActiveRunStream>,
+    chat_subscription: Option<ActiveChatSubscription>,
+    registries: SessionRegistries,
+}
+
+impl<S: ThreadListService> DesktopSessionService for S {
+    type State = DesktopSessionState;
+    type Provenance = CompanionProvenance;
+
+    fn new_session_state(&self) -> Self::State {
+        DesktopSessionState {
+            subscriptions: Vec::new(),
+            chat_subscription: None,
+            registries: SessionRegistries::default(),
+        }
+    }
+
+    fn poll_run_streams(&mut self, state: &mut Self::State) -> Result<Vec<Event>, ProtocolError> {
+        poll_run_streams(self, &mut state.subscriptions)
+    }
+
+    fn has_chat_subscription(&self, state: &Self::State) -> bool {
+        state.chat_subscription.is_some()
+    }
+
+    fn drain_chat_events(
+        &mut self,
+        state: &mut Self::State,
+    ) -> Result<(Vec<Event>, bool), AttachSessionError> {
+        state
+            .chat_subscription
+            .as_ref()
+            .map_or(Ok((Vec::new(), false)), drain_chat_events)
+    }
+
+    fn dispatch_request(
+        &mut self,
+        request: Request,
+        workspace: &str,
+        provenance: Self::Provenance,
+        state: &mut Self::State,
+    ) -> Result<DesktopDispatchResult, DesktopDispatchFailure> {
+        dispatch_request(
+            request,
+            workspace,
+            provenance,
+            self,
+            &mut state.subscriptions,
+            &mut state.chat_subscription,
+            &mut state.registries,
+        )
+        .map(|result| DesktopDispatchResult {
+            body: result.body,
+            events: result.events,
+        })
+        .map_err(|failure| DesktopDispatchFailure {
+            error: failure.error,
+            events: failure.events,
+        })
+    }
 }
 
 fn drain_chat_events(

@@ -19,6 +19,7 @@ mod desktop_client_admission;
 #[cfg(target_os = "linux")]
 mod desktop_service;
 pub mod desktop_service_message;
+mod desktop_session;
 mod handoff;
 mod handoff_probe;
 mod idempotency;
@@ -86,6 +87,7 @@ pub use desktop_admission::*;
 pub use desktop_client_admission::*;
 #[cfg(target_os = "linux")]
 pub use desktop_service::*;
+pub use desktop_session::AttachSessionError;
 pub use handoff::*;
 pub use handoff_probe::*;
 pub use idempotency::*;
