@@ -1,8 +1,10 @@
 //! Companion credentials and their live connection revocation state.
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use super::save_client_credentials;
 use super::{
-    linux::LiveConnectionRegistry, save_client_credentials, thread_service::CompanionRecord,
-    ClientCredential, ProtocolError,
+    live_connections::LiveConnectionRegistry, thread_service::CompanionRecord, ClientCredential,
+    ProtocolError,
 };
 use std::{
     collections::HashMap,
@@ -23,6 +25,7 @@ pub struct CompanionRegistry {
 }
 
 impl CompanionRegistry {
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub fn new(
         credentials: Arc<Mutex<HashMap<String, ClientCredential>>>,
         credential_path: impl AsRef<Path>,

@@ -5,7 +5,6 @@ mod approval;
 mod approval_present;
 mod artifact;
 mod authorization;
-#[cfg(target_os = "linux")]
 mod companion_registry;
 #[cfg(target_os = "linux")]
 mod connection_route;
@@ -69,7 +68,6 @@ pub use approval::*;
 pub use approval_present::*;
 pub use artifact::*;
 pub use authorization::*;
-#[cfg(target_os = "linux")]
 pub use companion_registry::*;
 #[cfg(target_os = "linux")]
 pub use connection_route::*;
