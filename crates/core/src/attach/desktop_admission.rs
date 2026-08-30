@@ -46,6 +46,23 @@ pub fn admit_desktop_client_over_stream<S: DeadlineStream + ?Sized>(
 ) -> Result<AdmittedDesktopClient, DesktopClientAdmissionError> {
     let mut prefix = [0_u8; 4];
     read_exact_before(stream, &mut prefix, deadline).map_err(map_io_error)?;
+    admit_desktop_client_over_stream_with_prefix(
+        stream,
+        prefix,
+        runtime_version,
+        approval,
+        deadline,
+    )
+}
+
+/// Admits a desktop client after the caller has read the frame length prefix.
+pub fn admit_desktop_client_over_stream_with_prefix<S: DeadlineStream + ?Sized>(
+    stream: &mut S,
+    prefix: [u8; 4],
+    runtime_version: &str,
+    approval: Option<&Approval>,
+    deadline: Instant,
+) -> Result<AdmittedDesktopClient, DesktopClientAdmissionError> {
     let length = u32::from_be_bytes(prefix) as usize;
     if length > MAX_FRAME_LENGTH {
         write_protocol_error(stream, ProtocolError::payload_too_large(), deadline);

@@ -6,9 +6,10 @@ mod unix_tests {
     use std::time::{Duration, Instant};
 
     use muniment_core::attach::{
-        decode_frame, serve_windows_attach_session_with_reader, Welcome,
-        WindowsAttachConnectionRoute, WindowsAttachPeerReader, WindowsAttachRouteReader,
-        WindowsAttachSessionError, WindowsPeerError, WindowsPeerReadError, MAX_FRAME_LENGTH,
+        decode_frame, serve_windows_attach_session_with_reader, Authorization,
+        DesktopClientAdmissionError, DesktopClientAuthorizedGrant, ErrorCode, ErrorEnvelope,
+        Welcome, WindowsAttachPeerReader, WindowsAttachRouteReader, WindowsAttachSessionError,
+        WindowsAttachSessionOutcome, WindowsPeerError, WindowsPeerReadError, MAX_FRAME_LENGTH,
     };
 
     struct FakePeerReader {
@@ -76,30 +77,40 @@ mod unix_tests {
     }
 
     #[test]
-    fn matching_desktop_peer_returns_desktop_client_route_and_one_welcome_frame() {
+    fn matching_desktop_peer_runs_desktop_client_admission() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         client.write_all(&hello_frame()).unwrap();
 
-        assert_eq!(
-            serve_windows_attach_session_with_reader(
-                &mut server,
-                &reader(&[1, 2, 3], &[1, 2, 3]),
-                &route_reader("/Program Files/Muniment/muniment.exe"),
-                Some(expected_desktop_executable()),
-                "1.2.3",
-                deadline(),
-            ),
-            Ok(WindowsAttachConnectionRoute::DesktopClient)
-        );
+        let outcome = serve_windows_attach_session_with_reader(
+            &mut server,
+            &reader(&[1, 2, 3], &[1, 2, 3]),
+            &route_reader("/Program Files/Muniment/muniment.exe"),
+            Some(expected_desktop_executable()),
+            "1.2.3",
+            deadline(),
+        )
+        .unwrap();
+        let WindowsAttachSessionOutcome::DesktopClient(admitted) = outcome else {
+            panic!("expected the desktop-client route");
+        };
 
         drop(server);
         let response = read_all(client);
-        let (welcome, consumed) = decode_frame::<Welcome>(&response).unwrap().unwrap();
-        assert_eq!(consumed, response.len());
+        let (welcome, welcome_length) = decode_frame::<Welcome>(&response).unwrap().unwrap();
         assert_eq!(welcome.selected, 1);
         assert_eq!(welcome.desktop_version, "1.2.3");
         assert_eq!(welcome.server_nonce.len(), 32);
-        assert_eq!(welcome.approval_challenge.len(), 32);
+        assert_eq!(welcome.authorization, Authorization::Authorized);
+        assert!(welcome.approval_challenge.is_empty());
+
+        let (grant, grant_length) =
+            decode_frame::<DesktopClientAuthorizedGrant>(&response[welcome_length..])
+                .unwrap()
+                .unwrap();
+        assert_eq!(welcome_length + grant_length, response.len());
+        assert_eq!(grant.capability, admitted.capability);
+        assert_eq!(grant.profile_id, "desktop-owner");
+        assert!(grant.workspace_scopes.is_empty());
     }
 
     #[test]
@@ -116,8 +127,18 @@ mod unix_tests {
                 "1.2.3",
                 deadline(),
             ),
-            Ok(WindowsAttachConnectionRoute::Companion)
+            Ok(WindowsAttachSessionOutcome::Companion)
         );
+
+        drop(server);
+        let response = read_all(client);
+        let (welcome, consumed) = decode_frame::<Welcome>(&response).unwrap().unwrap();
+        assert_eq!(consumed, response.len());
+        assert_eq!(welcome.selected, 1);
+        assert_eq!(welcome.desktop_version, "1.2.3");
+        assert_eq!(welcome.server_nonce.len(), 32);
+        assert_eq!(welcome.authorization, Authorization::PairingRequired);
+        assert_eq!(welcome.approval_challenge.len(), 32);
     }
 
     #[test]
@@ -134,7 +155,7 @@ mod unix_tests {
                 "1.2.3",
                 deadline(),
             ),
-            Ok(WindowsAttachConnectionRoute::Companion)
+            Ok(WindowsAttachSessionOutcome::Companion)
         );
     }
 
@@ -167,7 +188,7 @@ mod unix_tests {
     }
 
     #[test]
-    fn oversized_prefix_reads_no_body_and_writes_no_response() {
+    fn oversized_desktop_frame_reads_no_body_and_writes_protocol_error() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         let mut unread = server.try_clone().unwrap();
         let body = b"body stays unread";
@@ -185,18 +206,23 @@ mod unix_tests {
                 "1.2.3",
                 deadline(),
             ),
-            Err(WindowsAttachSessionError::MalformedFrame)
+            Err(WindowsAttachSessionError::DesktopClientAdmission(
+                DesktopClientAdmissionError::PayloadTooLarge
+            ))
         );
         let mut unread_body = vec![0_u8; body.len()];
         unread.read_exact(&mut unread_body).unwrap();
         assert_eq!(unread_body, body);
         drop(server);
         drop(unread);
-        assert!(read_all(client).is_empty());
+        let response = read_all(client);
+        let (error, consumed) = decode_frame::<ErrorEnvelope>(&response).unwrap().unwrap();
+        assert_eq!(consumed, response.len());
+        assert_eq!(error.error.code(), ErrorCode::PayloadTooLarge);
     }
 
     #[test]
-    fn malformed_body_writes_no_response() {
+    fn malformed_desktop_frame_writes_protocol_error() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         client.write_all(&frame(b"{")).unwrap();
 
@@ -209,10 +235,15 @@ mod unix_tests {
                 "1.2.3",
                 deadline(),
             ),
-            Err(WindowsAttachSessionError::MalformedFrame)
+            Err(WindowsAttachSessionError::DesktopClientAdmission(
+                DesktopClientAdmissionError::MalformedFrame
+            ))
         );
         drop(server);
-        assert!(read_all(client).is_empty());
+        let response = read_all(client);
+        let (error, consumed) = decode_frame::<ErrorEnvelope>(&response).unwrap().unwrap();
+        assert_eq!(consumed, response.len());
+        assert_eq!(error.error.code(), ErrorCode::MalformedFrame);
     }
 }
 
@@ -222,7 +253,7 @@ fn native_session_wrapper_accepts_a_windows_stream() {
     use std::time::Instant;
 
     use muniment_core::attach::{
-        serve_windows_attach_session, WindowsAttachConnectionRoute, WindowsAttachSessionError,
+        serve_windows_attach_session, WindowsAttachSessionError, WindowsAttachSessionOutcome,
         WindowsAttachStream,
     };
 
@@ -230,6 +261,6 @@ fn native_session_wrapper_accepts_a_windows_stream() {
         WindowsAttachStream,
         &str,
         Instant,
-    ) -> Result<WindowsAttachConnectionRoute, WindowsAttachSessionError> =
+    ) -> Result<WindowsAttachSessionOutcome, WindowsAttachSessionError> =
         serve_windows_attach_session;
 }
