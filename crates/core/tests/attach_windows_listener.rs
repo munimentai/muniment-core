@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 use muniment_core::attach::{
     decode_frame, fail_next_windows_attach_pipe_instance_for_tests, serve_next_windows_attach,
-    windows_attach_pipe_path, Welcome, WindowsAttachAcceptError, WindowsAttachAcceptOutcome,
-    WindowsAttachBindError, WindowsAttachInstanceLockError, WindowsAttachListener,
-    WindowsAttachStopEvent,
+    serve_next_windows_attach_until, windows_attach_pipe_path, Welcome, WindowsAttachAcceptError,
+    WindowsAttachAcceptOutcome, WindowsAttachBindError, WindowsAttachInstanceLockError,
+    WindowsAttachListener, WindowsAttachServeOutcome, WindowsAttachStopEvent,
 };
 use muniment_core::windows_sid::current_process_user_sid;
 
@@ -98,6 +98,19 @@ fn binds_the_current_user_pipe_and_rejects_a_second_listener() {
 
     drop(listener);
     assert!(WindowsAttachListener::bind(state_directory(), Duration::ZERO).is_ok());
+}
+
+#[test]
+fn serve_next_until_reports_an_already_signaled_stop() {
+    let _guard = LISTENER_TEST_LOCK.lock().unwrap();
+    let mut listener = bind_listener();
+    let stop = WindowsAttachStopEvent::new().unwrap();
+    stop.signal().unwrap();
+
+    assert_eq!(
+        serve_next_windows_attach_until(&mut listener, "1.2.3", &stop).unwrap(),
+        WindowsAttachServeOutcome::Stopped
+    );
 }
 
 #[test]

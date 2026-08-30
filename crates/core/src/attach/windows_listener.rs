@@ -135,6 +135,13 @@ pub enum WindowsAttachAcceptOutcome {
     Stopped,
 }
 
+/// The result of serving one Windows attach connection or receiving a stop signal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowsAttachServeOutcome {
+    Served,
+    Stopped,
+}
+
 /// A manual-reset event that stops a Windows attach wait.
 pub struct WindowsAttachStopEvent {
     handle: OwnedHandle,
@@ -171,12 +178,31 @@ pub fn serve_next_windows_attach(
     accept_deadline: Instant,
 ) -> Result<(), WindowsAttachAcceptError> {
     let stream = listener.accept(accept_deadline)?;
+    serve_windows_attach_on_worker(stream, desktop_version);
+    Ok(())
+}
+
+/// Accepts until stopped and serves one Windows attach stream on a worker thread.
+pub fn serve_next_windows_attach_until(
+    listener: &mut WindowsAttachListener,
+    desktop_version: &str,
+    stop: &WindowsAttachStopEvent,
+) -> Result<WindowsAttachServeOutcome, WindowsAttachAcceptError> {
+    match listener.accept_until(stop)? {
+        WindowsAttachAcceptOutcome::Connected(stream) => {
+            serve_windows_attach_on_worker(stream, desktop_version);
+            Ok(WindowsAttachServeOutcome::Served)
+        }
+        WindowsAttachAcceptOutcome::Stopped => Ok(WindowsAttachServeOutcome::Stopped),
+    }
+}
+
+fn serve_windows_attach_on_worker(stream: WindowsAttachStream, desktop_version: &str) {
     let desktop_version = desktop_version.to_owned();
     let session_deadline = Instant::now() + WINDOWS_ATTACH_SESSION_TIMEOUT;
     std::thread::spawn(move || {
         let _ = serve_windows_attach_session(stream, &desktop_version, session_deadline);
     });
-    Ok(())
 }
 
 impl WindowsAttachListener {
