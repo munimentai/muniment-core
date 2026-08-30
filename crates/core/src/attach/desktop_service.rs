@@ -2,14 +2,16 @@
 
 #![cfg(target_os = "linux")]
 
+use super::desktop_service_message::{
+    ArtifactFetchResult, CompanionProvenance, MigrationControlRequest, PermissionAnswerAccepted,
+    PermissionAnswerRequest, PermissionDecision, RunCancelAccepted, RunCancelRequest,
+    RunMessageAccepted, RunMessageRequest, RunPermissionAnswerAccepted, RunPermissionAnswerRequest,
+    RunResumeAccepted, RunResumeRequest, RunStartAccepted, RunStreamPage, RunSubmitAccepted,
+    RunSubmitRequest, ThreadCreateAccepted,
+};
 use super::linux::{
-    CompanionProvenance, EntitlementSnapshotResult, MigrationControlRequest,
-    PermissionAnswerAccepted, PermissionAnswerRequest, PermissionDecision, RunCancelAccepted,
-    RunCancelRequest, RunMessageAccepted, RunMessageRequest, RunPermissionAnswerAccepted,
-    RunPermissionAnswerRequest, RunResumeAccepted, RunResumeRequest, RunStartAccepted,
-    RunStartRequest as AttachRunStartRequest, RunStreamPage, RunSubmitAccepted, RunSubmitRequest,
-    ThreadCreateAccepted, ThreadListPage, ThreadListRequest, ThreadListService, ThreadOpenPage,
-    ThreadOpenRequest,
+    EntitlementSnapshotResult, RunStartRequest as AttachRunStartRequest, ThreadListPage,
+    ThreadListRequest, ThreadListService, ThreadOpenPage, ThreadOpenRequest,
 };
 use super::{
     bounded_claim, onboard_workspace_context,
@@ -1085,7 +1087,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         &mut self,
         workspace: &str,
         artifact_id: &Id,
-    ) -> Result<super::linux::ArtifactFetchResult, ProtocolError> {
+    ) -> Result<ArtifactFetchResult, ProtocolError> {
         self.boundaries.fetch_artifact(workspace, artifact_id)
     }
 

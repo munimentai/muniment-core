@@ -18,6 +18,7 @@ mod desktop_admission;
 mod desktop_client_admission;
 #[cfg(target_os = "linux")]
 mod desktop_service;
+pub mod desktop_service_message;
 mod handoff;
 mod handoff_probe;
 mod idempotency;
