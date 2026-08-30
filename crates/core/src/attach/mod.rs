@@ -11,6 +11,7 @@ mod companion_registry;
 mod connection_route;
 #[cfg(target_os = "linux")]
 mod credential;
+mod credential_store;
 mod cursor;
 mod deadline_io;
 mod desktop_admission;
@@ -71,6 +72,7 @@ pub use companion_registry::*;
 pub use connection_route::*;
 #[cfg(target_os = "linux")]
 pub use credential::*;
+pub use credential_store::*;
 pub use cursor::{
     RunEventAdmission, RunStreamCursor, RunStreamError, RunStreamWindow, StreamClose,
     StreamCloseCode, MAX_RUN_STREAM_WINDOW_BYTES, MAX_RUN_STREAM_WINDOW_EVENTS,

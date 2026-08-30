@@ -1,36 +1,8 @@
-use super::{bounded_claim, Id, ProtocolError};
-use serde_json::Value;
+use super::{decode_client_credentials, ClientCredential, ClientCredentialStore, ProtocolError};
 use std::collections::HashMap;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use uuid::Uuid;
-
-/// The companion credential store file name.
-pub const COMPANION_CREDENTIAL_FILE_NAME: &str = "attach-client-credentials.json";
-
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClientCredential {
-    pub credential: String,
-    pub claimed_kind: String,
-    pub claimed_version: String,
-    #[serde(deserialize_with = "deserialize_approval_time")]
-    pub approved_at: Option<String>,
-}
-
-fn deserialize_approval_time<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    <Option<String> as serde::Deserialize>::deserialize(deserializer)
-}
-
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-struct ClientCredentialStore {
-    version: u32,
-    companions: HashMap<String, ClientCredential>,
-}
 
 pub fn load_client_credentials(
     path: &Path,
@@ -48,51 +20,8 @@ pub fn load_client_credentials(
     if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
         return Err(ProtocolError::persistence_failed());
     }
-    let value: Value =
-        serde_json::from_reader(file).map_err(|_| ProtocolError::persistence_failed())?;
-    let credentials = if value.get("version").is_some() {
-        let store: ClientCredentialStore =
-            serde_json::from_value(value).map_err(|_| ProtocolError::persistence_failed())?;
-        if store.version != 1 {
-            return Err(ProtocolError::persistence_failed());
-        }
-        store.companions
-    } else {
-        let legacy: HashMap<String, String> =
-            serde_json::from_value(value).map_err(|_| ProtocolError::persistence_failed())?;
-        legacy
-            .into_iter()
-            .map(|(identity, credential)| {
-                (
-                    identity,
-                    ClientCredential {
-                        credential,
-                        claimed_kind: "unknown".into(),
-                        claimed_version: "unknown".into(),
-                        approved_at: None,
-                    },
-                )
-            })
-            .collect()
-    };
-    if credentials.iter().any(|(identity, entry)| {
-        Id::new(identity).is_err()
-            || entry.credential.len() != 64
-            || !entry
-                .credential
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-            || entry.claimed_kind != bounded_claim(&entry.claimed_kind)
-            || entry.claimed_version != bounded_claim(&entry.claimed_version)
-            || entry.approved_at.as_ref().is_some_and(|approved_at| {
-                chrono::DateTime::parse_from_rfc3339(approved_at)
-                    .map(|time| time.offset().local_minus_utc() != 0)
-                    .unwrap_or(true)
-            })
-    }) {
-        return Err(ProtocolError::persistence_failed());
-    }
-    Ok(credentials)
+    let value = serde_json::from_reader(file).map_err(|_| ProtocolError::persistence_failed())?;
+    decode_client_credentials(value)
 }
 
 pub fn save_client_credentials(
@@ -114,14 +43,8 @@ pub fn save_client_credentials(
         let file = options
             .open(&temporary)
             .map_err(|_| ProtocolError::persistence_failed())?;
-        serde_json::to_writer(
-            &file,
-            &ClientCredentialStore {
-                version: 1,
-                companions: credentials.clone(),
-            },
-        )
-        .map_err(|_| ProtocolError::persistence_failed())?;
+        serde_json::to_writer(&file, &ClientCredentialStore::new(credentials.clone()))
+            .map_err(|_| ProtocolError::persistence_failed())?;
         file.sync_all()
             .map_err(|_| ProtocolError::persistence_failed())?;
         std::fs::rename(&temporary, path).map_err(|_| ProtocolError::persistence_failed())?;
@@ -165,20 +88,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_file_loads_with_unknown_claims() {
-        let path = path("legacy");
-        let (identity, entry) = credential();
-        let legacy = HashMap::from([(identity, entry.credential)]);
-        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let loaded = load_client_credentials(&path).unwrap();
-        let entry = loaded.values().next().unwrap();
-        assert_eq!(entry.claimed_kind, "unknown");
-        assert_eq!(entry.claimed_version, "unknown");
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
     fn version_one_round_trips() {
         let path = path("round-trip");
         let credentials = HashMap::from([credential()]);
@@ -204,23 +113,5 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
         assert!(load_client_credentials(&path).is_err());
         std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn rejects_an_unsupported_version() {
-        let path = path("version");
-        let value = serde_json::json!({"version": 2, "companions": {}});
-        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(load_client_credentials(&path).is_err());
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn bounds_claims() {
-        assert_eq!(bounded_claim(&"x".repeat(80)), "x".repeat(80));
-        for claim in ["", "   ", "cli\nspoof", &"x".repeat(81)] {
-            assert_eq!(bounded_claim(claim), "unknown");
-        }
     }
 }
