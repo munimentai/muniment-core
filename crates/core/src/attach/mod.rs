@@ -26,6 +26,7 @@ mod idempotency;
 pub mod linux;
 #[cfg(target_os = "linux")]
 mod listener_lifecycle;
+pub mod live_connections;
 #[cfg(target_os = "macos")]
 mod macos_listener;
 #[cfg(target_os = "macos")]
