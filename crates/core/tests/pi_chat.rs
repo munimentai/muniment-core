@@ -420,8 +420,13 @@ fn adapter_queues_messages_without_consuming_interleaved_stream_events() {
 
 #[test]
 fn late_correlated_responses_do_not_become_stream_events() {
+    let temp = TempDir::new();
+    let release_marker = temp.path().join("release-response");
     let mut config = SidecarConfig::new(env!("CARGO_BIN_EXE_sidecar-test-stub"));
-    config.args = vec!["pi-chat-late-response".into()];
+    config.args = vec![
+        "pi-chat-late-response".into(),
+        release_marker.to_string_lossy().into_owned(),
+    ];
     config.health_interval = Duration::from_secs(60);
     let wiring = PiRpcWiring::new();
     let mut supervisor =
@@ -440,6 +445,7 @@ fn late_correlated_responses_do_not_become_stream_events() {
         .session_locator(std::path::Path::new("."), Duration::from_millis(1))
         .unwrap_err()
         .contains("timed out waiting for Pi RPC response"));
+    fs::write(release_marker, "").unwrap();
     assert_eq!(
         adapter.next(Duration::from_secs(1)).unwrap(),
         PiChatEvent::TextDelta("after late response".into())

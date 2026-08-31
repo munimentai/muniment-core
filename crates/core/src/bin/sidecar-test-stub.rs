@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::{self, BufRead, Write};
+use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
@@ -21,7 +22,7 @@ fn main() {
         Some("pi-chat-queue") => pi_chat_queue(),
         Some("pi-chat-capture") => pi_chat_capture(args.next().unwrap()),
         Some("pi-chat-extension-ui") => pi_chat_extension_ui(args.next().unwrap()),
-        Some("pi-chat-late-response") => pi_chat_late_response(),
+        Some("pi-chat-late-response") => pi_chat_late_response(args.next().unwrap()),
         Some("pi-session-deferred") => pi_session_deferred(args.next().unwrap(), args.next()),
         Some("pi-rpc-restart-once") => {
             let marker = args.next().unwrap();
@@ -402,7 +403,7 @@ fn pi_chat_extension_ui(output: String) {
     }
 }
 
-fn pi_chat_late_response() {
+fn pi_chat_late_response(release_marker: String) {
     let mut prompted = false;
     for line in io::stdin().lock().lines() {
         let request: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
@@ -410,7 +411,9 @@ fn pi_chat_late_response() {
         if command == "prompt" {
             prompted = true;
         } else if command == "get_state" && prompted {
-            thread::sleep(Duration::from_millis(25));
+            while !Path::new(&release_marker).exists() {
+                thread::sleep(Duration::from_millis(1));
+            }
         }
         println!(
             "{}",
