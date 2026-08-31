@@ -1,26 +1,33 @@
 //! Generic desktop attach service seam.
 
-#![cfg(target_os = "linux")]
-
+#[cfg(target_os = "linux")]
 use super::desktop_service_message::{
-    ArtifactFetchResult, CompanionProvenance, MigrationControlRequest, PermissionAnswerAccepted,
-    PermissionAnswerRequest, PermissionDecision, RunCancelAccepted, RunCancelRequest,
-    RunMessageAccepted, RunMessageRequest, RunPermissionAnswerAccepted, RunPermissionAnswerRequest,
-    RunResumeAccepted, RunResumeRequest, RunStartAccepted, RunStreamPage, RunSubmitAccepted,
-    RunSubmitRequest, ThreadCreateAccepted,
+    ArtifactFetchResult, MigrationControlRequest, PermissionAnswerAccepted,
+    PermissionAnswerRequest, PermissionDecision, RunMessageAccepted, RunMessageRequest,
+    RunPermissionAnswerAccepted, RunPermissionAnswerRequest, RunResumeAccepted, RunResumeRequest,
+    RunStreamPage, RunSubmitAccepted, RunSubmitRequest, ThreadCreateAccepted,
 };
-use super::linux::{
-    EntitlementSnapshotResult, RunStartRequest as AttachRunStartRequest, ThreadListPage,
-    ThreadListRequest, ThreadListService, ThreadOpenPage, ThreadOpenRequest,
+use super::desktop_service_message::{
+    CompanionProvenance, RunCancelAccepted, RunCancelRequest, RunStartAccepted,
 };
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use super::save_client_credentials as persist_client_credentials;
+use super::thread_service::{
+    RunStartRequest as AttachRunStartRequest, ThreadListPage, ThreadListRequest, ThreadListService,
+};
+#[cfg(target_os = "linux")]
+use super::thread_service::{ThreadOpenPage, ThreadOpenRequest};
 use super::{
-    bounded_claim, onboard_workspace_context,
-    save_client_credentials as persist_client_credentials, Approval, ClientCredential,
-    CommittedResult, Id, IdempotencyOutcome, IdempotencyStore, Operation, Protocol, ProtocolError,
+    bounded_claim, onboard_workspace_context, ClientCredential, CommittedResult, Id,
+    IdempotencyOutcome, IdempotencyStore, Operation, Protocol, ProtocolError,
     Request as AttachRequest, WorkspaceContextMap, WorkspaceOnboardRequest, WorkspaceOnboarded,
 };
+#[cfg(target_os = "linux")]
+use super::{Approval, EntitlementSnapshotResult};
+#[cfg(target_os = "linux")]
 use crate::active_run::ChatDelivery;
 use crate::journal::Provenance;
+#[cfg(target_os = "linux")]
 use crate::permission_gate::ChatPermissionAnswer;
 use crate::run_start::{
     prepare_desktop_run, RunAttachBoundaries, RunStartBoundaries, RunStartRequest,
@@ -29,14 +36,23 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
-#[cfg(not(test))]
+#[cfg(all(target_os = "linux", not(test)))]
 const PERMISSION_COMMIT_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(test)]
+#[cfg(all(target_os = "linux", test))]
 const PERMISSION_COMMIT_TIMEOUT: Duration = Duration::from_millis(50);
 
 pub type WorkspaceContexts = Arc<Mutex<WorkspaceContextMap>>;
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn persist_client_credentials(
+    _path: &std::path::Path,
+    _credentials: &HashMap<String, ClientCredential>,
+) -> Result<(), ProtocolError> {
+    Err(ProtocolError::persistence_failed())
+}
 
 pub struct AttachHome {
     config_directory: Option<PathBuf>,
@@ -81,7 +97,7 @@ impl From<PathBuf> for AttachHome {
     }
 }
 
-/// Production adapter from the authorized Linux attach seam into the desktop coordinator.
+/// Production adapter from the authorized attach seam into the desktop coordinator.
 pub trait RunStartIdempotency {
     fn execute<A, W>(
         &mut self,
@@ -126,6 +142,7 @@ pub struct DesktopAttachService<B, I = IdempotencyStore> {
     pub drain_state: crate::attach::DrainState,
 }
 
+#[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn queue_run_message<B: RunAttachBoundaries, I: RunStartIdempotency>(
     boundaries: &B,
@@ -178,7 +195,6 @@ fn queue_run_message<B: RunAttachBoundaries, I: RunStartIdempotency>(
     serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
 }
 
-#[cfg(target_os = "linux")]
 impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> ThreadListService
     for DesktopAttachService<B, I>
 {
@@ -190,14 +206,17 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         self.client_identity = Some(client_identity.to_owned());
     }
 
+    #[cfg(target_os = "linux")]
     fn reconnect_approval(&self) -> Option<Approval> {
         self.boundaries.attach_approval()
     }
 
+    #[cfg(target_os = "linux")]
     fn list_companions(&mut self) -> Result<Vec<super::CompanionRecord>, ProtocolError> {
         self.boundaries.list_companions()
     }
 
+    #[cfg(target_os = "linux")]
     fn revoke_companion(
         &mut self,
         client_identity: &str,
@@ -290,14 +309,17 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         crate::ensure_cross_project_home(&home).map_err(|_| ProtocolError::persistence_failed())
     }
 
+    #[cfg(target_os = "linux")]
     fn session_status(&mut self) -> Result<crate::auth::AuthStatus, ProtocolError> {
         self.boundaries.session_status()
     }
 
+    #[cfg(target_os = "linux")]
     fn entitlement_snapshot(&mut self) -> Result<EntitlementSnapshotResult, ProtocolError> {
         self.boundaries.entitlement_snapshot()
     }
 
+    #[cfg(target_os = "linux")]
     fn sign_in(
         &mut self,
         request_id: &Id,
@@ -334,6 +356,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
     }
 
+    #[cfg(target_os = "linux")]
     fn sign_out(
         &mut self,
         request_id: &Id,
@@ -370,10 +393,12 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
     }
 
+    #[cfg(target_os = "linux")]
     fn list_devices(&mut self) -> Result<crate::auth::NativeDeviceList, ProtocolError> {
         self.boundaries.list_devices()
     }
 
+    #[cfg(target_os = "linux")]
     fn control_migration(
         &mut self,
         request: MigrationControlRequest,
@@ -395,6 +420,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
             .map(|directory| directory.to_string_lossy().into_owned())
     }
 
+    #[cfg(target_os = "linux")]
     fn list_threads(
         &mut self,
         workspace: &str,
@@ -403,6 +429,16 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         self.boundaries.list_threads(workspace, request)
     }
 
+    #[cfg(not(target_os = "linux"))]
+    fn list_threads(
+        &mut self,
+        _workspace: &str,
+        _request: ThreadListRequest,
+    ) -> Result<ThreadListPage, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    #[cfg(target_os = "linux")]
     fn open_thread(
         &mut self,
         workspace: &str,
@@ -411,6 +447,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         self.boundaries.open_thread(workspace, request)
     }
 
+    #[cfg(target_os = "linux")]
     fn thread_summaries(
         &mut self,
         request: ThreadListRequest,
@@ -419,6 +456,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
             .map_err(|_| ProtocolError::persistence_failed())
     }
 
+    #[cfg(target_os = "linux")]
     fn select_thread(&mut self, thread_id: &Id) -> Result<(), ProtocolError> {
         if self.boundaries.select_thread(thread_id.as_str())? {
             Ok(())
@@ -427,11 +465,12 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn recheck_retention(&mut self) -> Result<(), ProtocolError> {
         self.boundaries.recheck_retention()
     }
 
-    #[cfg(feature = "keyring")]
+    #[cfg(all(target_os = "linux", feature = "keyring"))]
     fn thread_history(
         &mut self,
         request: ThreadOpenRequest,
@@ -440,6 +479,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
             .map_err(|_| ProtocolError::persistence_failed())
     }
 
+    #[cfg(target_os = "linux")]
     fn create_thread(
         &mut self,
         workspace: &str,
@@ -494,6 +534,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
     }
 
+    #[cfg(target_os = "linux")]
     fn rename_thread(
         &mut self,
         workspace: &str,
@@ -534,6 +575,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     fn delete_thread(
         &mut self,
         workspace: &str,
@@ -689,6 +731,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
     }
 
+    #[cfg(target_os = "linux")]
     fn answer_permission(
         &mut self,
         workspace: &str,
@@ -798,6 +841,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
     }
 
+    #[cfg(target_os = "linux")]
     fn submit_run(
         &mut self,
         workspace: &str,
@@ -854,6 +898,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
     }
 
+    #[cfg(target_os = "linux")]
     fn resume_run(
         &mut self,
         workspace: &str,
@@ -897,6 +942,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
     }
 
+    #[cfg(target_os = "linux")]
     fn steer_run(
         &mut self,
         workspace: &str,
@@ -918,6 +964,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         )
     }
 
+    #[cfg(target_os = "linux")]
     fn follow_up_run(
         &mut self,
         workspace: &str,
@@ -939,6 +986,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         )
     }
 
+    #[cfg(target_os = "linux")]
     fn answer_run_permission(
         &mut self,
         workspace: &str,
@@ -1074,6 +1122,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
     }
 
+    #[cfg(target_os = "linux")]
     fn stream_run(
         &mut self,
         workspace: &str,
@@ -1083,6 +1132,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         self.boundaries.stream_run(workspace, run_id, after_run_seq)
     }
 
+    #[cfg(target_os = "linux")]
     fn fetch_artifact(
         &mut self,
         workspace: &str,
@@ -1091,6 +1141,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         self.boundaries.fetch_artifact(workspace, artifact_id)
     }
 
+    #[cfg(target_os = "linux")]
     fn read_artifact_range(
         &mut self,
         workspace: &str,
@@ -1102,6 +1153,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
             .read_artifact_range(workspace, artifact_id, offset, length)
     }
 
+    #[cfg(target_os = "linux")]
     fn subscribe_run_commits(
         &mut self,
         run_id: &str,
@@ -1109,6 +1161,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         self.boundaries.subscribe_run_commits(run_id).map(Some)
     }
 
+    #[cfg(target_os = "linux")]
     fn subscribe_chat_events(
         &mut self,
     ) -> Result<crate::run_events::ChatEventSubscription, ProtocolError> {
@@ -1150,9 +1203,10 @@ mod tests {
     use std::sync::Mutex;
 
     #[cfg(target_os = "linux")]
-    use crate::attach::linux::{
-        RunStreamPage, ThreadListPage, ThreadListRequest, ThreadListService, ThreadOpenPage,
-        ThreadOpenRequest,
+    use crate::attach::desktop_service_message::RunStreamPage;
+    #[cfg(target_os = "linux")]
+    use crate::attach::thread_service::{
+        ThreadListPage, ThreadListRequest, ThreadListService, ThreadOpenPage, ThreadOpenRequest,
     };
     #[cfg(target_os = "linux")]
     use crate::attach::{ErrorCode, ProtocolError};
@@ -1304,6 +1358,7 @@ mod tests {
             .map_err(|_| ProtocolError::thread_not_found())
         }
 
+        #[cfg(target_os = "linux")]
         fn submit_run(
             &self,
             _workspace: &str,
@@ -1329,6 +1384,7 @@ mod tests {
             })
         }
 
+        #[cfg(target_os = "linux")]
         fn resume_run(
             &self,
             _workspace: &str,
@@ -1956,6 +2012,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn attach_submit_replays_and_rejects_conflicting_input_without_second_boundary_call() {
         let mut service = DesktopAttachService {
@@ -2018,6 +2075,7 @@ mod tests {
         assert_eq!(service.boundaries.submit_calls.load(Ordering::SeqCst), 1);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn attach_resume_replays_and_rejects_conflicting_input_without_second_boundary_call() {
         let mut service = DesktopAttachService {

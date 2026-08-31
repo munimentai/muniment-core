@@ -16,7 +16,6 @@ mod deadline_io;
 mod desktop_admission;
 #[cfg(target_os = "linux")]
 mod desktop_client_admission;
-#[cfg(target_os = "linux")]
 mod desktop_service;
 pub mod desktop_service_message;
 mod desktop_session;
@@ -85,7 +84,6 @@ pub use deadline_io::{read_exact_before, write_all_before, DeadlineStream, Reada
 pub use desktop_admission::*;
 #[cfg(target_os = "linux")]
 pub use desktop_client_admission::*;
-#[cfg(target_os = "linux")]
 pub use desktop_service::*;
 pub use desktop_session::AttachSessionError;
 pub use handoff::*;
