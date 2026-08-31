@@ -1,5 +1,6 @@
 #![cfg(target_os = "windows")]
 
+use std::convert::Infallible;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -7,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use muniment_core::attach::thread_service::ThreadListService;
 use muniment_core::attach::{
     decode_frame, fail_next_windows_attach_pipe_instance_for_tests, serve_next_windows_attach,
     serve_next_windows_attach_until, windows_attach_pipe_path, Welcome, WindowsAttachAcceptError,
@@ -14,6 +16,14 @@ use muniment_core::attach::{
     WindowsAttachListener, WindowsAttachServeOutcome, WindowsAttachStopEvent,
 };
 use muniment_core::windows_sid::current_process_user_sid;
+
+struct EmptyService;
+
+impl ThreadListService for EmptyService {}
+
+fn service_factory() -> Result<EmptyService, Infallible> {
+    Ok(EmptyService)
+}
 
 static LISTENER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -44,7 +54,13 @@ fn connect_and_serve(listener: &mut WindowsAttachListener, path: String) -> File
             .open(path)
             .unwrap()
     });
-    serve_next_windows_attach(listener, "1.2.3", Instant::now() + Duration::from_secs(1)).unwrap();
+    serve_next_windows_attach(
+        listener,
+        "1.2.3",
+        Instant::now() + Duration::from_secs(1),
+        Arc::new(service_factory),
+    )
+    .unwrap();
     client.join().unwrap()
 }
 
@@ -108,7 +124,8 @@ fn serve_next_until_reports_an_already_signaled_stop() {
     stop.signal().unwrap();
 
     assert_eq!(
-        serve_next_windows_attach_until(&mut listener, "1.2.3", &stop).unwrap(),
+        serve_next_windows_attach_until(&mut listener, "1.2.3", &stop, Arc::new(service_factory),)
+            .unwrap(),
         WindowsAttachServeOutcome::Stopped
     );
 }
@@ -249,6 +266,7 @@ fn recovers_after_replacement_creation_fails() {
         &mut listener,
         "1.2.3",
         Instant::now() + Duration::from_secs(1),
+        Arc::new(service_factory),
     )
     .unwrap();
     let mut first_client = first_client.join().unwrap();
@@ -259,6 +277,7 @@ fn recovers_after_replacement_creation_fails() {
         &mut listener,
         "1.2.3",
         Instant::now() + Duration::from_secs(1),
+        Arc::new(service_factory),
     )
     .unwrap();
     let mut second_client = second_client.join().unwrap();
@@ -286,7 +305,12 @@ fn serve_next_returns_the_accept_error() {
     let mut listener = bind_listener();
 
     assert_eq!(
-        serve_next_windows_attach(&mut listener, "1.2.3", Instant::now()),
+        serve_next_windows_attach(
+            &mut listener,
+            "1.2.3",
+            Instant::now(),
+            Arc::new(service_factory),
+        ),
         Err(WindowsAttachAcceptError::DeadlineExpired)
     );
 }

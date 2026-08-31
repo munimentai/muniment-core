@@ -3,11 +3,13 @@
 use std::path::Path;
 use std::time::Instant;
 
+use super::desktop_service_message::CompanionProvenance;
+use super::thread_service::ThreadListService;
 use super::{
     admit_desktop_client_over_stream_with_prefix, decode_frame, encode_frame,
     name_windows_attach_connection_route, negotiate_first, read_exact_before,
     verify_windows_attach_peer_with_reader, welcome, write_all_before, AdmittedDesktopClient,
-    DeadlineStream, DesktopClientAdmissionError, FirstMessage, VersionRange,
+    AttachSessionError, DeadlineStream, DesktopClientAdmissionError, FirstMessage, VersionRange,
     WindowsAttachConnectionRoute, WindowsAttachPeerReader, WindowsAttachRouteReader,
     WindowsPeerError, MAX_FRAME_LENGTH,
 };
@@ -17,6 +19,7 @@ pub enum WindowsAttachSessionError {
     Read,
     PeerRejected(WindowsPeerError),
     DesktopClientAdmission(DesktopClientAdmissionError),
+    DesktopClientSession(AttachSessionError),
     MalformedFrame,
     Randomness,
     Write,
@@ -30,14 +33,19 @@ pub enum WindowsAttachSessionOutcome {
 }
 
 /// Serves the exchange for the selected route after the prefix and peer checks pass.
-pub fn serve_windows_attach_session_with_reader<S: DeadlineStream>(
+pub fn serve_windows_attach_session_with_reader<S, H>(
     stream: &mut S,
     peer_reader: &impl WindowsAttachPeerReader,
     route_reader: &impl WindowsAttachRouteReader,
     expected_desktop_executable: Option<&Path>,
     desktop_version: &str,
     deadline: Instant,
-) -> Result<WindowsAttachSessionOutcome, WindowsAttachSessionError> {
+    service: &mut H,
+) -> Result<WindowsAttachSessionOutcome, WindowsAttachSessionError>
+where
+    S: DeadlineStream,
+    H: ThreadListService,
+{
     let mut prefix = [0_u8; 4];
     read_exact_before(stream, &mut prefix, deadline)
         .map_err(|_| WindowsAttachSessionError::Read)?;
@@ -49,15 +57,30 @@ pub fn serve_windows_attach_session_with_reader<S: DeadlineStream>(
         });
 
     if route == WindowsAttachConnectionRoute::DesktopClient {
-        return admit_desktop_client_over_stream_with_prefix(
+        let admitted = admit_desktop_client_over_stream_with_prefix(
             stream,
             prefix,
             desktop_version,
             None,
             deadline,
         )
-        .map(WindowsAttachSessionOutcome::DesktopClient)
-        .map_err(WindowsAttachSessionError::DesktopClientAdmission);
+        .map_err(WindowsAttachSessionError::DesktopClientAdmission)?;
+        service.bind_authorized_client(&admitted.client_identity);
+        super::desktop_session::serve_desktop_client_requests(
+            stream,
+            &admitted.capability,
+            &admitted.workspace,
+            CompanionProvenance {
+                profile: "desktop-owner".into(),
+                companion_kind: admitted.companion_kind.clone(),
+                companion_version: admitted.companion_version.clone(),
+                peer_uid: 0,
+                peer_pid: 0,
+            },
+            service,
+        )
+        .map_err(WindowsAttachSessionError::DesktopClientSession)?;
+        return Ok(WindowsAttachSessionOutcome::DesktopClient(admitted));
     }
 
     let length = u32::from_be_bytes(prefix) as usize;
@@ -94,10 +117,11 @@ pub fn serve_windows_attach_session_with_reader<S: DeadlineStream>(
 
 #[cfg(target_os = "windows")]
 /// Serves a connected native Windows attach stream.
-pub fn serve_windows_attach_session(
+pub fn serve_windows_attach_session<H: ThreadListService>(
     mut stream: super::WindowsAttachStream,
     desktop_version: &str,
     deadline: Instant,
+    service: &mut H,
 ) -> Result<WindowsAttachSessionOutcome, WindowsAttachSessionError> {
     use std::os::windows::io::{AsRawHandle, BorrowedHandle};
 
@@ -117,5 +141,6 @@ pub fn serve_windows_attach_session(
         expected_desktop_executable.as_deref(),
         desktop_version,
         deadline,
+        service,
     )
 }

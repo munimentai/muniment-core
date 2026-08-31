@@ -7,6 +7,7 @@ use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle,
 use std::path::Path;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
     GetLastError, LocalFree, ERROR_IO_PENDING, ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED,
@@ -36,6 +37,7 @@ use super::{
     verify_windows_pipe_security_with_reader, WindowsAttachStream, WindowsPipeAccessControlEntry,
     WindowsPipeSecurityReadError, WindowsPipeSecurityReader,
 };
+use crate::attach::thread_service::ThreadListService;
 use crate::attach::{
     acquire_windows_attach_instance_lock, serve_windows_attach_session, windows_attach_pipe_path,
     WindowsAttachInstanceLock, WindowsAttachInstanceLockError,
@@ -172,36 +174,57 @@ pub struct WindowsAttachListener {
 }
 
 /// Accepts and serves one Windows attach stream on a worker thread.
-pub fn serve_next_windows_attach(
+pub fn serve_next_windows_attach<S, F, E>(
     listener: &mut WindowsAttachListener,
     desktop_version: &str,
     accept_deadline: Instant,
-) -> Result<(), WindowsAttachAcceptError> {
+    service_factory: Arc<F>,
+) -> Result<(), WindowsAttachAcceptError>
+where
+    S: ThreadListService + Send + 'static,
+    F: Fn() -> Result<S, E> + Send + Sync + 'static,
+{
     let stream = listener.accept(accept_deadline)?;
-    serve_windows_attach_on_worker(stream, desktop_version);
+    serve_windows_attach_on_worker(stream, desktop_version, service_factory);
     Ok(())
 }
 
 /// Accepts until stopped and serves one Windows attach stream on a worker thread.
-pub fn serve_next_windows_attach_until(
+pub fn serve_next_windows_attach_until<S, F, E>(
     listener: &mut WindowsAttachListener,
     desktop_version: &str,
     stop: &WindowsAttachStopEvent,
-) -> Result<WindowsAttachServeOutcome, WindowsAttachAcceptError> {
+    service_factory: Arc<F>,
+) -> Result<WindowsAttachServeOutcome, WindowsAttachAcceptError>
+where
+    S: ThreadListService + Send + 'static,
+    F: Fn() -> Result<S, E> + Send + Sync + 'static,
+{
     match listener.accept_until(stop)? {
         WindowsAttachAcceptOutcome::Connected(stream) => {
-            serve_windows_attach_on_worker(stream, desktop_version);
+            serve_windows_attach_on_worker(stream, desktop_version, service_factory);
             Ok(WindowsAttachServeOutcome::Served)
         }
         WindowsAttachAcceptOutcome::Stopped => Ok(WindowsAttachServeOutcome::Stopped),
     }
 }
 
-fn serve_windows_attach_on_worker(stream: WindowsAttachStream, desktop_version: &str) {
+fn serve_windows_attach_on_worker<S, F, E>(
+    stream: WindowsAttachStream,
+    desktop_version: &str,
+    service_factory: Arc<F>,
+) where
+    S: ThreadListService + Send + 'static,
+    F: Fn() -> Result<S, E> + Send + Sync + 'static,
+{
     let desktop_version = desktop_version.to_owned();
     let session_deadline = Instant::now() + WINDOWS_ATTACH_SESSION_TIMEOUT;
     std::thread::spawn(move || {
-        let _ = serve_windows_attach_session(stream, &desktop_version, session_deadline);
+        let Ok(mut service) = service_factory() else {
+            return;
+        };
+        let _ =
+            serve_windows_attach_session(stream, &desktop_version, session_deadline, &mut service);
     });
 }
 

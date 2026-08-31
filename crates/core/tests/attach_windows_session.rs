@@ -1,16 +1,68 @@
 #[cfg(unix)]
 mod unix_tests {
     use std::io::{Read, Write};
+    use std::net::Shutdown;
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
+    use muniment_core::attach::desktop_service_message::{
+        CompanionProvenance, ThreadCreateAccepted,
+    };
+    use muniment_core::attach::thread_service::{
+        ThreadListPage, ThreadListRequest, ThreadListService,
+    };
     use muniment_core::attach::{
-        decode_frame, serve_windows_attach_session_with_reader, Authorization,
-        DesktopClientAdmissionError, DesktopClientAuthorizedGrant, ErrorCode, ErrorEnvelope,
-        Welcome, WindowsAttachPeerReader, WindowsAttachRouteReader, WindowsAttachSessionError,
+        decode_frame, encode_frame, serve_windows_attach_session_with_reader, Authorization,
+        DesktopClientAdmissionError, DesktopClientAuthorizedGrant, Envelope, ErrorCode,
+        ErrorEnvelope, Id, Operation, Protocol, ProtocolError, Request, Welcome,
+        WindowsAttachPeerReader, WindowsAttachRouteReader, WindowsAttachSessionError,
         WindowsAttachSessionOutcome, WindowsPeerError, WindowsPeerReadError, MAX_FRAME_LENGTH,
     };
+
+    struct EmptyService;
+
+    impl ThreadListService for EmptyService {}
+
+    const CREATED_THREAD_ID: &str = "018f0000-0000-7000-8000-000000000200";
+
+    #[derive(Default)]
+    struct ListService {
+        bound_identity: Option<String>,
+        listed_workspace: Option<String>,
+        create_provenance: Option<CompanionProvenance>,
+    }
+
+    impl ThreadListService for ListService {
+        fn bind_authorized_client(&mut self, client_identity: &str) {
+            self.bound_identity = Some(client_identity.to_owned());
+        }
+
+        fn list_threads(
+            &mut self,
+            workspace: &str,
+            _request: ThreadListRequest,
+        ) -> Result<ThreadListPage, ProtocolError> {
+            self.listed_workspace = Some(workspace.to_owned());
+            Ok(ThreadListPage {
+                threads: Vec::new(),
+                next_cursor: None,
+            })
+        }
+
+        fn create_thread(
+            &mut self,
+            _workspace: &str,
+            _request_id: &Id,
+            _idempotency_key: &Id,
+            provenance: CompanionProvenance,
+        ) -> Result<ThreadCreateAccepted, ProtocolError> {
+            self.create_provenance = Some(provenance);
+            Ok(ThreadCreateAccepted {
+                thread_id: CREATED_THREAD_ID.to_owned(),
+            })
+        }
+    }
 
     struct FakePeerReader {
         peer_sid: Vec<u8>,
@@ -76,41 +128,124 @@ mod unix_tests {
         bytes
     }
 
+    fn read_frame(stream: &mut UnixStream) -> Vec<u8> {
+        let mut prefix = [0_u8; 4];
+        stream.read_exact(&mut prefix).unwrap();
+        let length = u32::from_be_bytes(prefix) as usize;
+        let mut frame = vec![0_u8; 4 + length];
+        frame[..4].copy_from_slice(&prefix);
+        stream.read_exact(&mut frame[4..]).unwrap();
+        frame
+    }
+
     #[test]
-    fn matching_desktop_peer_runs_desktop_client_admission() {
+    fn matching_desktop_peer_serves_admitted_requests() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let session = std::thread::spawn(move || {
+            let mut service = ListService::default();
+            let outcome = serve_windows_attach_session_with_reader(
+                &mut server,
+                &reader(&[1, 2, 3], &[1, 2, 3]),
+                &route_reader("/Program Files/Muniment/muniment.exe"),
+                Some(expected_desktop_executable()),
+                "1.2.3",
+                deadline(),
+                &mut service,
+            );
+            (outcome, service)
+        });
         client.write_all(&hello_frame()).unwrap();
 
-        let outcome = serve_windows_attach_session_with_reader(
-            &mut server,
-            &reader(&[1, 2, 3], &[1, 2, 3]),
-            &route_reader("/Program Files/Muniment/muniment.exe"),
-            Some(expected_desktop_executable()),
-            "1.2.3",
-            deadline(),
-        )
-        .unwrap();
-        let WindowsAttachSessionOutcome::DesktopClient(admitted) = outcome else {
-            panic!("expected the desktop-client route");
-        };
-
-        drop(server);
-        let response = read_all(client);
-        let (welcome, welcome_length) = decode_frame::<Welcome>(&response).unwrap().unwrap();
+        let welcome_frame = read_frame(&mut client);
+        let (welcome, consumed) = decode_frame::<Welcome>(&welcome_frame).unwrap().unwrap();
+        assert_eq!(consumed, welcome_frame.len());
         assert_eq!(welcome.selected, 1);
         assert_eq!(welcome.desktop_version, "1.2.3");
         assert_eq!(welcome.server_nonce.len(), 32);
         assert_eq!(welcome.authorization, Authorization::Authorized);
         assert!(welcome.approval_challenge.is_empty());
 
-        let (grant, grant_length) =
-            decode_frame::<DesktopClientAuthorizedGrant>(&response[welcome_length..])
-                .unwrap()
-                .unwrap();
-        assert_eq!(welcome_length + grant_length, response.len());
-        assert_eq!(grant.capability, admitted.capability);
+        let grant_frame = read_frame(&mut client);
+        let (grant, consumed) = decode_frame::<DesktopClientAuthorizedGrant>(&grant_frame)
+            .unwrap()
+            .unwrap();
+        assert_eq!(consumed, grant_frame.len());
         assert_eq!(grant.profile_id, "desktop-owner");
         assert!(grant.workspace_scopes.is_empty());
+
+        let request_id = Id::new("018f0000-0000-7000-8000-000000000100").unwrap();
+        client
+            .write_all(
+                &encode_frame(&Request {
+                    protocol: Protocol,
+                    request_id: request_id.clone(),
+                    operation: Operation::ThreadList,
+                    capability: grant.capability.clone(),
+                    idempotency_key: None,
+                    body: serde_json::json!({"limit": 20}),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let response_frame = read_frame(&mut client);
+        let (Envelope::Response(response), consumed) =
+            decode_frame::<Envelope>(&response_frame).unwrap().unwrap()
+        else {
+            panic!("expected a service response");
+        };
+        assert_eq!(consumed, response_frame.len());
+        assert_eq!(response.request_id, request_id);
+        assert_eq!(response.body, serde_json::json!({"threads": []}));
+
+        let create_request_id = Id::new("018f0000-0000-7000-8000-000000000101").unwrap();
+        client
+            .write_all(
+                &encode_frame(&Request {
+                    protocol: Protocol,
+                    request_id: create_request_id.clone(),
+                    operation: Operation::ThreadCreate,
+                    capability: grant.capability,
+                    idempotency_key: Some(Id::new("018f0000-0000-7000-8000-000000000102").unwrap()),
+                    body: serde_json::json!({}),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let created_frame = read_frame(&mut client);
+        let (Envelope::Response(created), consumed) =
+            decode_frame::<Envelope>(&created_frame).unwrap().unwrap()
+        else {
+            panic!("expected a service response");
+        };
+        assert_eq!(consumed, created_frame.len());
+        assert_eq!(created.request_id, create_request_id);
+        assert_eq!(
+            created.body,
+            serde_json::json!({"thread_id": CREATED_THREAD_ID})
+        );
+
+        client.shutdown(Shutdown::Write).unwrap();
+        let (outcome, service) = session.join().unwrap();
+        let WindowsAttachSessionOutcome::DesktopClient(admitted) = outcome.unwrap() else {
+            panic!("expected the desktop-client route");
+        };
+        assert_eq!(admitted.companion_kind, "editor-extension");
+        assert_eq!(admitted.companion_version, "0.0.1");
+        assert_eq!(
+            service.create_provenance,
+            Some(CompanionProvenance {
+                profile: "desktop-owner".into(),
+                companion_kind: admitted.companion_kind,
+                companion_version: admitted.companion_version,
+                peer_uid: 0,
+                peer_pid: 0,
+            })
+        );
+        assert_eq!(service.bound_identity, Some(admitted.client_identity));
+        assert_eq!(service.listed_workspace, Some(admitted.workspace));
     }
 
     #[test]
@@ -126,6 +261,7 @@ mod unix_tests {
                 Some(expected_desktop_executable()),
                 "1.2.3",
                 deadline(),
+                &mut EmptyService,
             ),
             Ok(WindowsAttachSessionOutcome::Companion)
         );
@@ -154,6 +290,7 @@ mod unix_tests {
                 None,
                 "1.2.3",
                 deadline(),
+                &mut EmptyService,
             ),
             Ok(WindowsAttachSessionOutcome::Companion)
         );
@@ -174,6 +311,7 @@ mod unix_tests {
                 Some(expected_desktop_executable()),
                 "1.2.3",
                 deadline(),
+                &mut EmptyService,
             ),
             Err(WindowsAttachSessionError::PeerRejected(
                 WindowsPeerError::WrongOwner
@@ -205,6 +343,7 @@ mod unix_tests {
                 Some(expected_desktop_executable()),
                 "1.2.3",
                 deadline(),
+                &mut EmptyService,
             ),
             Err(WindowsAttachSessionError::DesktopClientAdmission(
                 DesktopClientAdmissionError::PayloadTooLarge
@@ -234,6 +373,7 @@ mod unix_tests {
                 Some(expected_desktop_executable()),
                 "1.2.3",
                 deadline(),
+                &mut EmptyService,
             ),
             Err(WindowsAttachSessionError::DesktopClientAdmission(
                 DesktopClientAdmissionError::MalformedFrame
@@ -257,10 +397,14 @@ fn native_session_wrapper_accepts_a_windows_stream() {
         WindowsAttachStream,
     };
 
+    struct EmptyService;
+    impl muniment_core::attach::thread_service::ThreadListService for EmptyService {}
+
     let _: fn(
         WindowsAttachStream,
         &str,
         Instant,
+        &mut EmptyService,
     ) -> Result<WindowsAttachSessionOutcome, WindowsAttachSessionError> =
-        serve_windows_attach_session;
+        serve_windows_attach_session::<EmptyService>;
 }

@@ -172,9 +172,11 @@ pub trait ThreadListService {
 
     fn list_threads(
         &mut self,
-        workspace: &str,
-        request: ThreadListRequest,
-    ) -> Result<ThreadListPage, ProtocolError>;
+        _workspace: &str,
+        _request: ThreadListRequest,
+    ) -> Result<ThreadListPage, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
 
     fn open_thread(
         &mut self,
