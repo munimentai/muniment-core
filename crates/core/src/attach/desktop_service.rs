@@ -1202,14 +1202,18 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     use crate::attach::desktop_service_message::RunStreamPage;
     #[cfg(target_os = "linux")]
+    use crate::attach::thread_service::ThreadListService;
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     use crate::attach::thread_service::{
-        ThreadListPage, ThreadListRequest, ThreadListService, ThreadOpenPage, ThreadOpenRequest,
+        ThreadListPage, ThreadListRequest, ThreadOpenPage, ThreadOpenRequest,
     };
     #[cfg(target_os = "linux")]
-    use crate::attach::{ErrorCode, ProtocolError};
+    use crate::attach::ErrorCode;
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    use crate::attach::ProtocolError;
     use crate::attach::{RuntimeActivityGuard, RuntimeActivityRegistry};
     use crate::auth::TokenSet;
     use crate::chat_grant::ChatGrant;
@@ -1348,6 +1352,53 @@ mod tests {
     }
 
     impl RunAttachBoundaries for FakeRunStartBoundaries {
+        #[cfg(target_os = "windows")]
+        fn list_threads(
+            &self,
+            _workspace: &str,
+            _request: ThreadListRequest,
+        ) -> Result<ThreadListPage, ProtocolError> {
+            unreachable!()
+        }
+
+        #[cfg(target_os = "windows")]
+        fn open_thread(
+            &self,
+            _workspace: &str,
+            _request: ThreadOpenRequest,
+        ) -> Result<ThreadOpenPage, ProtocolError> {
+            unreachable!()
+        }
+
+        #[cfg(target_os = "windows")]
+        fn stream_run(
+            &self,
+            _workspace: &str,
+            _run_id: &str,
+            _after_run_seq: u64,
+        ) -> Result<RunStreamPage, ProtocolError> {
+            unreachable!()
+        }
+
+        #[cfg(target_os = "windows")]
+        fn subscribe_run_commits(
+            &self,
+            _run_id: &str,
+        ) -> Result<crate::journal::CommitSubscription, ProtocolError> {
+            unreachable!()
+        }
+
+        #[cfg(target_os = "windows")]
+        fn queue_attach_permission_answer(
+            &self,
+            _workspace: &str,
+            _run_id: &str,
+            _gate_id: &str,
+            _answer: ChatPermissionAnswer,
+        ) -> Result<std::sync::mpsc::Receiver<Option<u64>>, RunStartError> {
+            unreachable!()
+        }
+
         #[cfg(target_os = "linux")]
         fn select_thread(&self, thread_id: &str) -> Result<bool, ProtocolError> {
             crate::thread_ownership::subject_owns_first_run(

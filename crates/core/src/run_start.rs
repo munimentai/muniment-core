@@ -7,9 +7,17 @@ use serde::Serialize;
 use uuid::Uuid;
 
 #[cfg(target_os = "linux")]
-use crate::attach::linux::{ThreadListPage, ThreadListRequest, ThreadOpenPage, ThreadOpenRequest};
+use crate::attach::desktop_service_message::MigrationControlRequest;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use crate::attach::desktop_service_message::{ArtifactFetchResult, RunStreamPage};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use crate::attach::thread_service::{
+    ThreadListPage, ThreadListRequest, ThreadOpenPage, ThreadOpenRequest,
+};
 use crate::attach::ProtocolError;
 use crate::attach::RuntimeActivityGuard;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use crate::attach::{EntitlementSnapshotResult, Id};
 use crate::auth::TokenSet;
 use crate::chat_grant::ChatGrant;
 use crate::chat_view::{ChatAttachment, SelectedFile};
@@ -88,7 +96,7 @@ pub struct RunStartLaunch {
 }
 
 pub trait RunAttachBoundaries {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn submit_run(
         &self,
         _workspace: &str,
@@ -101,7 +109,7 @@ pub trait RunAttachBoundaries {
         ))
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn resume_run(
         &self,
         _workspace: &str,
@@ -112,7 +120,7 @@ pub trait RunAttachBoundaries {
         ))
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn queue_attach_message(
         &self,
         _workspace: &str,
@@ -124,71 +132,69 @@ pub trait RunAttachBoundaries {
             "That reply is no longer active.".into(),
         ))
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn session_status(&self) -> Result<crate::auth::AuthStatus, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
-    #[cfg(target_os = "linux")]
-    fn entitlement_snapshot(
-        &self,
-    ) -> Result<crate::attach::linux::EntitlementSnapshotResult, ProtocolError> {
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn entitlement_snapshot(&self) -> Result<EntitlementSnapshotResult, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn sign_in(&self, _provenance: Provenance) -> Result<crate::auth::AuthStatus, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn sign_out(&self, _provenance: Provenance) -> Result<crate::auth::AuthStatus, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn list_devices(&self) -> Result<crate::auth::NativeDeviceList, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn list_companions(&self) -> Result<Vec<crate::attach::CompanionRecord>, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn revoke_companion(&self, _client_identity: &str) -> Result<(), ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn list_threads(
         &self,
         workspace: &str,
         request: ThreadListRequest,
     ) -> Result<ThreadListPage, ProtocolError>;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn open_thread(
         &self,
         workspace: &str,
         request: ThreadOpenRequest,
     ) -> Result<ThreadOpenPage, ProtocolError>;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn thread_summaries(
         &self,
         _request: ThreadListRequest,
     ) -> Result<crate::journal::thread_summaries::ThreadSummaryPage, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn select_thread(&self, _thread_id: &str) -> Result<bool, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn recheck_retention(&self) -> Result<(), ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
-    #[cfg(all(target_os = "linux", feature = "keyring"))]
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "keyring"))]
     fn thread_history(
         &self,
         _request: ThreadOpenRequest,
     ) -> Result<crate::thread_history::ChatThreadOpenPage, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn create_thread(
         &self,
         _workspace: &str,
@@ -196,7 +202,7 @@ pub trait RunAttachBoundaries {
     ) -> Result<String, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn rename_thread(
         &self,
         _thread_id: &str,
@@ -205,7 +211,7 @@ pub trait RunAttachBoundaries {
     ) -> Result<(), ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn delete_thread(
         &self,
         _thread_id: &str,
@@ -213,43 +219,43 @@ pub trait RunAttachBoundaries {
     ) -> Result<(), ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn stream_run(
         &self,
         workspace: &str,
         run_id: &str,
         after_run_seq: u64,
-    ) -> Result<crate::attach::linux::RunStreamPage, ProtocolError>;
-    #[cfg(target_os = "linux")]
+    ) -> Result<RunStreamPage, ProtocolError>;
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn fetch_artifact(
         &self,
         _workspace: &str,
-        _artifact_id: &crate::attach::Id,
-    ) -> Result<crate::attach::linux::ArtifactFetchResult, ProtocolError> {
+        _artifact_id: &Id,
+    ) -> Result<ArtifactFetchResult, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn read_artifact_range(
         &self,
         _workspace: &str,
-        _artifact_id: &crate::attach::Id,
+        _artifact_id: &Id,
         _offset: u64,
         _length: u64,
     ) -> Result<Vec<u8>, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn subscribe_run_commits(
         &self,
         run_id: &str,
     ) -> Result<crate::journal::CommitSubscription, ProtocolError>;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn subscribe_chat_events(
         &self,
     ) -> Result<crate::run_events::ChatEventSubscription, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn queue_attach_permission_answer(
         &self,
         workspace: &str,
@@ -278,7 +284,7 @@ pub trait RunStartBoundaries {
     #[cfg(target_os = "linux")]
     fn control_migration(
         &self,
-        _request: crate::attach::linux::MigrationControlRequest,
+        _request: MigrationControlRequest,
         _peer_pid: u32,
     ) -> Result<(), ProtocolError> {
         Err(ProtocolError::unsupported_operation())
@@ -523,7 +529,7 @@ mod tests {
     }
 
     impl RunAttachBoundaries for FakeRunStartBoundaries {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         fn list_threads(
             &self,
             _workspace: &str,
@@ -532,7 +538,7 @@ mod tests {
             unreachable!()
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         fn open_thread(
             &self,
             _workspace: &str,
@@ -541,22 +547,22 @@ mod tests {
             unreachable!()
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         fn select_thread(&self, _thread_id: &str) -> Result<bool, ProtocolError> {
             unreachable!()
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         fn stream_run(
             &self,
             _workspace: &str,
             _run_id: &str,
             _after_run_seq: u64,
-        ) -> Result<crate::attach::linux::RunStreamPage, ProtocolError> {
+        ) -> Result<RunStreamPage, ProtocolError> {
             unreachable!()
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         fn subscribe_run_commits(
             &self,
             _run_id: &str,
@@ -564,7 +570,7 @@ mod tests {
             unreachable!()
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         fn queue_attach_permission_answer(
             &self,
             _workspace: &str,
