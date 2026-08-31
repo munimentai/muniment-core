@@ -81,11 +81,14 @@ mod unix_tests {
         }
     }
 
-    struct FakeRouteReader(PathBuf);
+    struct FakeRouteReader {
+        peer_pid: u32,
+        image_path: PathBuf,
+    }
 
     impl WindowsAttachRouteReader for FakeRouteReader {
-        fn peer_image_path(&self) -> Result<PathBuf, WindowsPeerReadError> {
-            Ok(self.0.clone())
+        fn peer_process(&self) -> Result<(u32, PathBuf), WindowsPeerReadError> {
+            Ok((self.peer_pid, self.image_path.clone()))
         }
     }
 
@@ -97,7 +100,10 @@ mod unix_tests {
     }
 
     fn route_reader(path: &str) -> FakeRouteReader {
-        FakeRouteReader(PathBuf::from(path))
+        FakeRouteReader {
+            peer_pid: 42,
+            image_path: PathBuf::from(path),
+        }
     }
 
     fn expected_desktop_executable() -> &'static Path {
@@ -243,7 +249,7 @@ mod unix_tests {
                 companion_kind: admitted.companion_kind,
                 companion_version: admitted.companion_version,
                 peer_uid: 0,
-                peer_pid: 0,
+                peer_pid: 42,
             })
         );
         assert_eq!(service.bound_identity, Some(admitted.client_identity));

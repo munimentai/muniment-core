@@ -11,7 +11,7 @@ use windows_sys::Win32::System::Threading::{
 
 use super::{WindowsAttachRouteReader, WindowsPeerReadError};
 
-/// Reads the connected peer image path from a borrowed server pipe handle.
+/// Reads the connected peer process from a borrowed server pipe handle.
 pub struct NativeWindowsAttachRouteReader<'pipe> {
     pipe: BorrowedHandle<'pipe>,
 }
@@ -24,7 +24,7 @@ impl<'pipe> NativeWindowsAttachRouteReader<'pipe> {
 }
 
 impl WindowsAttachRouteReader for NativeWindowsAttachRouteReader<'_> {
-    fn peer_image_path(&self) -> Result<PathBuf, WindowsPeerReadError> {
+    fn peer_process(&self) -> Result<(u32, PathBuf), WindowsPeerReadError> {
         let mut process_id = 0;
         if unsafe { GetNamedPipeClientProcessId(self.pipe.as_raw_handle(), &mut process_id) } == 0 {
             return Err(WindowsPeerReadError);
@@ -49,7 +49,7 @@ impl WindowsAttachRouteReader for NativeWindowsAttachRouteReader<'_> {
             } != 0
             {
                 buffer.truncate(length as usize);
-                return Ok(OsString::from_wide(&buffer).into());
+                return Ok((process_id, OsString::from_wide(&buffer).into()));
             }
             if buffer.len() >= 32_768 {
                 return Err(WindowsPeerReadError);

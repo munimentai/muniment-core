@@ -18,7 +18,7 @@ use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject, I
 use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 
 #[test]
-fn reads_the_connected_peer_image_path() {
+fn reads_the_connected_peer_process() {
     let state_directory = std::env::temp_dir().join(format!(
         "muniment-windows-route-test-{}",
         std::process::id()
@@ -70,8 +70,8 @@ fn reads_the_connected_peer_image_path() {
 
     let reader = NativeWindowsAttachRouteReader::new(listener.handle());
     assert_eq!(
-        reader.peer_image_path().unwrap(),
-        std::env::current_exe().unwrap()
+        reader.peer_process().unwrap(),
+        (std::process::id(), std::env::current_exe().unwrap())
     );
 
     release_sender.send(()).unwrap();

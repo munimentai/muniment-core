@@ -40,7 +40,7 @@ fn admit_windows_attach_route<S: DeadlineStream>(
     expected_desktop_executable: Option<&Path>,
     desktop_version: &str,
     deadline: Instant,
-) -> Result<Option<AdmittedDesktopClient>, WindowsAttachSessionError> {
+) -> Result<Option<(AdmittedDesktopClient, u32)>, WindowsAttachSessionError> {
     let mut prefix = [0_u8; 4];
     read_exact_before(stream, &mut prefix, deadline)
         .map_err(|_| WindowsAttachSessionError::Read)?;
@@ -51,7 +51,7 @@ fn admit_windows_attach_route<S: DeadlineStream>(
             name_windows_attach_connection_route(route_reader, path)
         });
 
-    if route == WindowsAttachConnectionRoute::DesktopClient {
+    if let WindowsAttachConnectionRoute::DesktopClient { peer_pid } = route {
         return admit_desktop_client_over_stream_with_prefix(
             stream,
             prefix,
@@ -59,7 +59,7 @@ fn admit_windows_attach_route<S: DeadlineStream>(
             None,
             deadline,
         )
-        .map(Some)
+        .map(|admitted| Some((admitted, peer_pid)))
         .map_err(WindowsAttachSessionError::DesktopClientAdmission);
     }
 
@@ -98,6 +98,7 @@ fn admit_windows_attach_route<S: DeadlineStream>(
 fn serve_admitted_desktop_client<S: DeadlineStream, H: ThreadListService>(
     stream: &mut S,
     admitted: AdmittedDesktopClient,
+    peer_pid: u32,
     service: &mut H,
 ) -> Result<WindowsAttachSessionOutcome, WindowsAttachSessionError> {
     service.bind_authorized_client(&admitted.client_identity);
@@ -110,7 +111,7 @@ fn serve_admitted_desktop_client<S: DeadlineStream, H: ThreadListService>(
             companion_kind: admitted.companion_kind.clone(),
             companion_version: admitted.companion_version.clone(),
             peer_uid: 0,
-            peer_pid: 0,
+            peer_pid,
         },
         service,
     )
@@ -140,7 +141,9 @@ where
         desktop_version,
         deadline,
     )? {
-        Some(admitted) => serve_admitted_desktop_client(stream, admitted, service),
+        Some((admitted, peer_pid)) => {
+            serve_admitted_desktop_client(stream, admitted, peer_pid, service)
+        }
         None => Ok(WindowsAttachSessionOutcome::Companion),
     }
 }
@@ -160,7 +163,7 @@ where
     H: ThreadListService,
     F: FnOnce() -> Result<H, E>,
 {
-    let Some(admitted) = admit_windows_attach_route(
+    let Some((admitted, peer_pid)) = admit_windows_attach_route(
         stream,
         peer_reader,
         route_reader,
@@ -172,7 +175,7 @@ where
         return Ok(WindowsAttachSessionOutcome::Companion);
     };
     let mut service = service_factory().map_err(|_| WindowsAttachSessionError::ServiceOpen)?;
-    serve_admitted_desktop_client(stream, admitted, &mut service)
+    serve_admitted_desktop_client(stream, admitted, peer_pid, &mut service)
 }
 
 #[cfg(target_os = "windows")]
