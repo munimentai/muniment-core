@@ -16,6 +16,7 @@ mod deadline_io;
 mod desktop_admission;
 #[cfg(target_os = "linux")]
 mod desktop_client_admission;
+mod desktop_dispatch;
 mod desktop_service;
 pub mod desktop_service_message;
 mod desktop_session;
