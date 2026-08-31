@@ -218,6 +218,22 @@ fn defaults_an_omitted_run_level_to_least_privilege() {
 }
 
 #[test]
+fn defaults_an_omitted_logon_type_to_service_account() {
+    let definition = build_task_definition(SID, PAYLOAD).unwrap();
+    let xml = render_task_definition_xml(&definition)
+        .unwrap()
+        .replace("      <LogonType>InteractiveToken</LogonType>\n", "");
+    assert!(!xml.contains("LogonType"));
+
+    let observed = parse_observed_registration(&definition.uri, &xml).unwrap();
+    assert_eq!(observed.logon_type, LogonType::Other(5));
+    assert_eq!(
+        registration_verdict(&definition, &observed),
+        RegistrationVerdict::Different
+    );
+}
+
+#[test]
 fn parses_live_task_extras_entities_and_optional_arguments() {
     let uri = task_uri(SID).unwrap();
     let xml = format!(

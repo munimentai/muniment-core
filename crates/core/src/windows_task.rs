@@ -434,15 +434,21 @@ pub fn parse_observed_registration(
         return Err(Error::UriMismatch);
     }
     let principal_sid = take_observed_value(&mut values, ObservedField::UserId)?;
-    let logon_type = match take_observed_value(&mut values, ObservedField::LogonType)?.as_str() {
-        "InteractiveToken" => LogonType::InteractiveToken,
-        "None" => LogonType::Other(0),
-        "Password" => LogonType::Other(1),
-        "S4U" => LogonType::Other(2),
-        "Group" => LogonType::Other(4),
-        "ServiceAccount" => LogonType::Other(5),
-        "InteractiveTokenOrPassword" => LogonType::Other(6),
-        _ => return Err(Error::UnrecognizedLogonType),
+    // The store omits the LogonType element for a service-account principal.
+    let logon_type = match values
+        .iter()
+        .position(|(field, _)| *field == ObservedField::LogonType)
+        .map(|index| values.swap_remove(index).1)
+        .as_deref()
+    {
+        Some("InteractiveToken") => LogonType::InteractiveToken,
+        Some("None") => LogonType::Other(0),
+        Some("Password") => LogonType::Other(1),
+        Some("S4U") => LogonType::Other(2),
+        Some("Group") => LogonType::Other(4),
+        None | Some("ServiceAccount") => LogonType::Other(5),
+        Some("InteractiveTokenOrPassword") => LogonType::Other(6),
+        Some(_) => return Err(Error::UnrecognizedLogonType),
     };
     let run_level = match values
         .iter()
