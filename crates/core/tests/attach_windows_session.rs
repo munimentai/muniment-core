@@ -1,5 +1,6 @@
 #[cfg(unix)]
 mod unix_tests {
+    use std::cell::Cell;
     use std::io::{Read, Write};
     use std::net::Shutdown;
     use std::os::unix::net::UnixStream;
@@ -13,7 +14,8 @@ mod unix_tests {
         ThreadListPage, ThreadListRequest, ThreadListService,
     };
     use muniment_core::attach::{
-        decode_frame, encode_frame, serve_windows_attach_session_with_reader, Authorization,
+        decode_frame, encode_frame, serve_windows_attach_session_with_reader,
+        serve_windows_attach_session_with_reader_factory, Authorization,
         DesktopClientAdmissionError, DesktopClientAuthorizedGrant, Envelope, ErrorCode,
         ErrorEnvelope, Id, Operation, Protocol, ProtocolError, Request, Welcome,
         WindowsAttachPeerReader, WindowsAttachRouteReader, WindowsAttachSessionError,
@@ -246,6 +248,66 @@ mod unix_tests {
         );
         assert_eq!(service.bound_identity, Some(admitted.client_identity));
         assert_eq!(service.listed_workspace, Some(admitted.workspace));
+    }
+
+    #[test]
+    fn service_open_failure_closes_after_desktop_client_admission() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client.write_all(&hello_frame()).unwrap();
+        let factory_called = Cell::new(false);
+
+        let outcome = serve_windows_attach_session_with_reader_factory(
+            &mut server,
+            &reader(&[1, 2, 3], &[1, 2, 3]),
+            &route_reader("/Program Files/Muniment/muniment.exe"),
+            Some(expected_desktop_executable()),
+            "1.2.3",
+            deadline(),
+            || {
+                factory_called.set(true);
+                Err::<EmptyService, _>("journal open failed")
+            },
+        );
+
+        assert_eq!(outcome, Err(WindowsAttachSessionError::ServiceOpen));
+        assert!(factory_called.get());
+        drop(server);
+        let response = read_all(client);
+        let (_, welcome_length) = decode_frame::<Welcome>(&response).unwrap().unwrap();
+        let (grant, consumed) =
+            decode_frame::<DesktopClientAuthorizedGrant>(&response[welcome_length..])
+                .unwrap()
+                .unwrap();
+        assert_eq!(welcome_length + consumed, response.len());
+        assert!(!grant.capability.is_empty());
+    }
+
+    #[test]
+    fn companion_route_does_not_open_the_desktop_service() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client.write_all(&hello_frame()).unwrap();
+        let factory_called = Cell::new(false);
+
+        let outcome = serve_windows_attach_session_with_reader_factory(
+            &mut server,
+            &reader(&[1, 2, 3], &[1, 2, 3]),
+            &route_reader("/Program Files/Other/other.exe"),
+            Some(expected_desktop_executable()),
+            "1.2.3",
+            deadline(),
+            || {
+                factory_called.set(true);
+                Ok::<_, &str>(EmptyService)
+            },
+        );
+
+        assert_eq!(outcome, Ok(WindowsAttachSessionOutcome::Companion));
+        assert!(!factory_called.get());
+        drop(server);
+        let response = read_all(client);
+        let (welcome, consumed) = decode_frame::<Welcome>(&response).unwrap().unwrap();
+        assert_eq!(consumed, response.len());
+        assert_eq!(welcome.authorization, Authorization::PairingRequired);
     }
 
     #[test]

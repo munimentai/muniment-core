@@ -39,8 +39,8 @@ use super::{
 };
 use crate::attach::thread_service::ThreadListService;
 use crate::attach::{
-    acquire_windows_attach_instance_lock, serve_windows_attach_session, windows_attach_pipe_path,
-    WindowsAttachInstanceLock, WindowsAttachInstanceLockError,
+    acquire_windows_attach_instance_lock, serve_windows_attach_session_with_factory,
+    windows_attach_pipe_path, WindowsAttachInstanceLock, WindowsAttachInstanceLockError,
 };
 use crate::windows_security::OwnerSecurity;
 use crate::windows_sid::{copy_sid_bytes, current_process_user_sid};
@@ -220,11 +220,12 @@ fn serve_windows_attach_on_worker<S, F, E>(
     let desktop_version = desktop_version.to_owned();
     let session_deadline = Instant::now() + WINDOWS_ATTACH_SESSION_TIMEOUT;
     std::thread::spawn(move || {
-        let Ok(mut service) = service_factory() else {
-            return;
-        };
-        let _ =
-            serve_windows_attach_session(stream, &desktop_version, session_deadline, &mut service);
+        let _ = serve_windows_attach_session_with_factory(
+            stream,
+            &desktop_version,
+            session_deadline,
+            move || service_factory(),
+        );
     });
 }
 
