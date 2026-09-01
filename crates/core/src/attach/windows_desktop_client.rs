@@ -1,8 +1,10 @@
 use std::fmt;
+#[cfg(target_os = "windows")]
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
-use muniment_attach::DesktopClientStopHandle;
+use muniment_attach::{ChatEventSupervisorStop, DesktopClientStopHandle};
 use muniment_attach::{
     ClientError, ClientStream, DesktopClient, DesktopClientHolder, DesktopClientSupervisorStop,
 };
@@ -58,6 +60,82 @@ pub fn connect_windows_desktop_client(
         super::wait_for_windows_attach_endpoint,
         muniment_attach::handshake_desktop_client,
     )
+}
+
+/// Stops a Windows chat-event supervisor and its active pipe operation.
+#[cfg(target_os = "windows")]
+#[derive(Clone)]
+pub struct WindowsChatEventStopHandle {
+    inner: Arc<(Mutex<bool>, Condvar)>,
+    event: Arc<super::WindowsAttachStopEvent>,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsChatEventStopHandle {
+    pub fn new() -> Result<Self, super::WindowsAttachAcceptError> {
+        Ok(Self {
+            inner: Arc::new((Mutex::new(false), Condvar::new())),
+            event: Arc::new(super::WindowsAttachStopEvent::new()?),
+        })
+    }
+
+    pub fn stop(&self) {
+        let (stopped, wake) = &*self.inner;
+        *stopped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        let _ = self.event.signal();
+        wake.notify_all();
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl ChatEventSupervisorStop for WindowsChatEventStopHandle {
+    fn stopped(&self) -> bool {
+        *self
+            .inner
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn wait_for_retry(&self, retry_interval: Duration) -> bool {
+        let (stopped, wake) = &*self.inner;
+        let stopped = stopped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (stopped, _) = wake
+            .wait_timeout_while(stopped, retry_interval, |stopped| !*stopped)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !*stopped
+    }
+}
+
+/// Serves a reconnecting chat-event subscription over the current user's Windows attach endpoint.
+#[cfg(target_os = "windows")]
+pub fn serve_windows_chat_events(
+    client_version: &str,
+    io_timeout: Duration,
+    retry_interval: Duration,
+    stop: WindowsChatEventStopHandle,
+    observe: impl FnMut(bool),
+    deliver: impl FnMut(serde_json::Value),
+) {
+    let connection_stop = stop.clone();
+    muniment_attach::serve_chat_events_with(
+        || {
+            let now = Instant::now();
+            let connect_deadline = now.checked_add(retry_interval).unwrap_or(now);
+            let mut stream = super::wait_for_windows_attach_endpoint(connect_deadline).ok()?;
+            stream.set_stop_event(Arc::clone(&connection_stop.event));
+            muniment_attach::handshake_desktop_client(Box::new(stream), client_version, io_timeout)
+                .ok()
+        },
+        stop,
+        retry_interval,
+        observe,
+        deliver,
+    );
 }
 
 /// Serves a reconnecting desktop client over the current user's Windows attach endpoint.
