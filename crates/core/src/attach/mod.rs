@@ -8,7 +8,7 @@ mod authorization;
 mod companion_registry;
 #[cfg(target_os = "linux")]
 mod connection_route;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod credential;
 mod credential_store;
 mod cursor;
@@ -72,7 +72,7 @@ pub use authorization::*;
 pub use companion_registry::*;
 #[cfg(target_os = "linux")]
 pub use connection_route::*;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub use credential::*;
 pub use credential_store::*;
 pub use cursor::{

@@ -12,7 +12,7 @@ use super::desktop_service_message::{
 use super::desktop_service_message::{
     CompanionProvenance, RunCancelAccepted, RunCancelRequest, RunStartAccepted,
 };
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(unix, target_os = "windows"))]
 use super::save_client_credentials as persist_client_credentials;
 use super::thread_service::{
     RunStartRequest as AttachRunStartRequest, ThreadListPage, ThreadListRequest, ThreadListService,
@@ -50,7 +50,7 @@ const PERMISSION_COMMIT_TIMEOUT: Duration = Duration::from_millis(50);
 
 pub type WorkspaceContexts = Arc<Mutex<WorkspaceContextMap>>;
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(unix, target_os = "windows")))]
 fn persist_client_credentials(
     _path: &std::path::Path,
     _credentials: &HashMap<String, ClientCredential>,
