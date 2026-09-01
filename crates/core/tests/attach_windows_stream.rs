@@ -3,20 +3,24 @@
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::os::windows::io::AsRawHandle;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use muniment_core::attach::{
     encode_frame, read_exact_before, write_all_before, WindowsAttachListener,
+    WindowsAttachStopEvent,
 };
 use serde_json::json;
 use windows_sys::Win32::Foundation::{GetLastError, ERROR_PIPE_CONNECTED};
 use windows_sys::Win32::System::Pipes::ConnectNamedPipe;
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
+static WINDOWS_ATTACH_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 #[test]
 fn moves_frames_times_out_cleanly_and_reports_peer_close() {
+    let _test_lock = WINDOWS_ATTACH_TEST_LOCK.lock().unwrap();
     let state_directory = std::env::temp_dir().join(format!(
         "muniment-windows-stream-test-{}",
         std::process::id()
@@ -86,4 +90,69 @@ fn moves_frames_times_out_cleanly_and_reports_peer_close() {
     client.join().unwrap();
     let mut byte = [0];
     assert_eq!(stream.read(&mut byte).unwrap(), 0);
+}
+
+#[test]
+fn stop_event_interrupts_blocked_and_later_reads() {
+    let _test_lock = WINDOWS_ATTACH_TEST_LOCK.lock().unwrap();
+    let state_directory = std::env::temp_dir().join(format!(
+        "muniment-windows-stream-stop-test-{}",
+        std::process::id()
+    ));
+    let listener = WindowsAttachListener::bind(state_directory, Duration::ZERO).unwrap();
+    let path = listener.path().to_owned();
+    let (connected_sender, connected_receiver) = mpsc::channel();
+    let (close_sender, close_receiver) = mpsc::channel();
+
+    let client = thread::spawn(move || {
+        let _pipe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        connected_sender.send(()).unwrap();
+        close_receiver.recv().unwrap();
+    });
+
+    connected_receiver.recv().unwrap();
+    let mut overlapped = OVERLAPPED::default();
+    let connected = unsafe { ConnectNamedPipe(listener.handle().as_raw_handle(), &mut overlapped) };
+    assert!(connected != 0 || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED);
+
+    let stop_event = Arc::new(WindowsAttachStopEvent::new().unwrap());
+    let mut stream = listener.into_stream();
+    stream.set_stop_event(Arc::clone(&stop_event));
+    let (operation_pending_sender, operation_pending_receiver) = mpsc::channel();
+    stream.set_operation_pending_sender_for_tests(operation_pending_sender);
+    let reader = thread::spawn(move || {
+        let started = Instant::now();
+        let first_error =
+            read_exact_before(&mut stream, &mut [0], started + Duration::from_secs(5)).unwrap_err();
+        let first_elapsed = started.elapsed();
+
+        let started = Instant::now();
+        let second_error =
+            read_exact_before(&mut stream, &mut [0], started + Duration::from_secs(5)).unwrap_err();
+        (
+            first_error.kind(),
+            first_elapsed,
+            second_error.kind(),
+            started.elapsed(),
+        )
+    });
+
+    operation_pending_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    let signaler = thread::spawn(move || stop_event.signal().unwrap());
+
+    let (first_kind, first_elapsed, second_kind, second_elapsed) = reader.join().unwrap();
+    signaler.join().unwrap();
+    assert_eq!(first_kind, std::io::ErrorKind::Interrupted);
+    assert!(first_elapsed < Duration::from_secs(1));
+    assert_eq!(second_kind, std::io::ErrorKind::Interrupted);
+    assert!(second_elapsed < Duration::from_secs(1));
+
+    close_sender.send(()).unwrap();
+    client.join().unwrap();
 }

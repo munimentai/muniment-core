@@ -120,7 +120,7 @@ fn binds_the_current_user_pipe_and_rejects_a_second_listener() {
 fn serve_next_until_reports_an_already_signaled_stop() {
     let _guard = LISTENER_TEST_LOCK.lock().unwrap();
     let mut listener = bind_listener();
-    let stop = WindowsAttachStopEvent::new().unwrap();
+    let stop = Arc::new(WindowsAttachStopEvent::new().unwrap());
     stop.signal().unwrap();
 
     assert_eq!(
@@ -128,6 +128,38 @@ fn serve_next_until_reports_an_already_signaled_stop() {
             .unwrap(),
         WindowsAttachServeOutcome::Stopped
     );
+}
+
+#[test]
+fn serve_next_until_stop_closes_the_worker_connection() {
+    let _guard = LISTENER_TEST_LOCK.lock().unwrap();
+    let mut listener = bind_listener();
+    let stop = Arc::new(WindowsAttachStopEvent::new().unwrap());
+    let path = listener.path().to_owned();
+    let client = thread::spawn(move || open_client_with_retry(path));
+
+    assert_eq!(
+        serve_next_windows_attach_until(&mut listener, "1.2.3", &stop, Arc::new(service_factory),)
+            .unwrap(),
+        WindowsAttachServeOutcome::Served
+    );
+    let mut client = client.join().unwrap();
+    let signaler = thread::spawn(move || stop.signal().unwrap());
+    let (read_sender, read_receiver) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut byte = [0];
+        read_sender.send(client.read(&mut byte)).unwrap();
+    });
+
+    assert_eq!(
+        read_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the worker connection did not close after stop")
+            .unwrap(),
+        0
+    );
+    signaler.join().unwrap();
+    reader.join().unwrap();
 }
 
 #[test]

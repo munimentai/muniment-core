@@ -3,7 +3,9 @@ use std::fmt;
 use std::io;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{
+    AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle, RawHandle,
+};
 use std::path::Path;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -166,6 +168,12 @@ impl WindowsAttachStopEvent {
     }
 }
 
+impl AsRawHandle for WindowsAttachStopEvent {
+    fn as_raw_handle(&self) -> RawHandle {
+        self.handle.as_raw_handle()
+    }
+}
+
 /// A bound Windows attach pipe listener.
 pub struct WindowsAttachListener {
     path: String,
@@ -193,7 +201,7 @@ where
 pub fn serve_next_windows_attach_until<S, F, E>(
     listener: &mut WindowsAttachListener,
     desktop_version: &str,
-    stop: &WindowsAttachStopEvent,
+    stop: &Arc<WindowsAttachStopEvent>,
     service_factory: Arc<F>,
 ) -> Result<WindowsAttachServeOutcome, WindowsAttachAcceptError>
 where
@@ -201,7 +209,8 @@ where
     F: Fn() -> Result<S, E> + Send + Sync + 'static,
 {
     match listener.accept_until(stop)? {
-        WindowsAttachAcceptOutcome::Connected(stream) => {
+        WindowsAttachAcceptOutcome::Connected(mut stream) => {
+            stream.set_stop_event(Arc::clone(stop));
             serve_windows_attach_on_worker(stream, desktop_version, service_factory);
             Ok(WindowsAttachServeOutcome::Served)
         }
