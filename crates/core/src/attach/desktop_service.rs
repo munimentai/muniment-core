@@ -2,7 +2,7 @@
 
 #[cfg(target_os = "linux")]
 use super::desktop_service_message::MigrationControlRequest;
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(unix, target_os = "windows"))]
 use super::desktop_service_message::{
     ArtifactFetchResult, PermissionAnswerAccepted, PermissionAnswerRequest, PermissionDecision,
     RunMessageAccepted, RunMessageRequest, RunPermissionAnswerAccepted, RunPermissionAnswerRequest,
@@ -17,21 +17,21 @@ use super::save_client_credentials as persist_client_credentials;
 use super::thread_service::{
     RunStartRequest as AttachRunStartRequest, ThreadListPage, ThreadListRequest, ThreadListService,
 };
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(unix, target_os = "windows"))]
 use super::thread_service::{ThreadOpenPage, ThreadOpenRequest};
 #[cfg(target_os = "linux")]
 use super::Approval;
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(unix, target_os = "windows"))]
 use super::EntitlementSnapshotResult;
 use super::{
     bounded_claim, onboard_workspace_context, ClientCredential, CommittedResult, Id,
     IdempotencyOutcome, IdempotencyStore, Operation, Protocol, ProtocolError,
     Request as AttachRequest, WorkspaceContextMap, WorkspaceOnboardRequest, WorkspaceOnboarded,
 };
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(unix, target_os = "windows"))]
 use crate::active_run::ChatDelivery;
 use crate::journal::Provenance;
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(unix, target_os = "windows"))]
 use crate::permission_gate::ChatPermissionAnswer;
 use crate::run_start::{
     prepare_desktop_run, RunAttachBoundaries, RunStartBoundaries, RunStartRequest,
@@ -40,12 +40,12 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(unix, target_os = "windows"))]
 use std::time::Duration;
 
-#[cfg(all(any(target_os = "linux", target_os = "windows"), not(test)))]
+#[cfg(all(any(unix, target_os = "windows"), not(test)))]
 const PERMISSION_COMMIT_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(all(any(target_os = "linux", target_os = "windows"), test))]
+#[cfg(all(any(unix, target_os = "windows"), test))]
 const PERMISSION_COMMIT_TIMEOUT: Duration = Duration::from_millis(50);
 
 pub type WorkspaceContexts = Arc<Mutex<WorkspaceContextMap>>;
@@ -146,7 +146,7 @@ pub struct DesktopAttachService<B, I = IdempotencyStore> {
     pub drain_state: crate::attach::DrainState,
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(unix, target_os = "windows"))]
 #[allow(clippy::too_many_arguments)]
 fn queue_run_message<B: RunAttachBoundaries, I: RunStartIdempotency>(
     boundaries: &B,
@@ -215,12 +215,12 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         self.boundaries.attach_approval()
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn list_companions(&mut self) -> Result<Vec<super::CompanionRecord>, ProtocolError> {
         self.boundaries.list_companions()
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn revoke_companion(
         &mut self,
         client_identity: &str,
@@ -313,17 +313,17 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         crate::ensure_cross_project_home(&home).map_err(|_| ProtocolError::persistence_failed())
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn session_status(&mut self) -> Result<crate::auth::AuthStatus, ProtocolError> {
         self.boundaries.session_status()
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn entitlement_snapshot(&mut self) -> Result<EntitlementSnapshotResult, ProtocolError> {
         self.boundaries.entitlement_snapshot()
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn sign_in(
         &mut self,
         request_id: &Id,
@@ -360,7 +360,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn sign_out(
         &mut self,
         request_id: &Id,
@@ -397,7 +397,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn list_devices(&mut self) -> Result<crate::auth::NativeDeviceList, ProtocolError> {
         self.boundaries.list_devices()
     }
@@ -424,7 +424,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
             .map(|directory| directory.to_string_lossy().into_owned())
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn list_threads(
         &mut self,
         workspace: &str,
@@ -433,7 +433,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         self.boundaries.list_threads(workspace, request)
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(not(any(unix, target_os = "windows")))]
     fn list_threads(
         &mut self,
         _workspace: &str,
@@ -442,7 +442,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         Err(ProtocolError::unsupported_operation())
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn open_thread(
         &mut self,
         workspace: &str,
@@ -451,7 +451,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         self.boundaries.open_thread(workspace, request)
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn thread_summaries(
         &mut self,
         request: ThreadListRequest,
@@ -460,7 +460,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
             .map_err(|_| ProtocolError::persistence_failed())
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn select_thread(&mut self, thread_id: &Id) -> Result<(), ProtocolError> {
         if self.boundaries.select_thread(thread_id.as_str())? {
             Ok(())
@@ -469,12 +469,12 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn recheck_retention(&mut self) -> Result<(), ProtocolError> {
         self.boundaries.recheck_retention()
     }
 
-    #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "keyring"))]
+    #[cfg(all(any(unix, target_os = "windows"), feature = "keyring"))]
     fn thread_history(
         &mut self,
         request: ThreadOpenRequest,
@@ -483,7 +483,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
             .map_err(|_| ProtocolError::persistence_failed())
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn create_thread(
         &mut self,
         workspace: &str,
@@ -538,7 +538,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn rename_thread(
         &mut self,
         workspace: &str,
@@ -579,7 +579,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         Ok(())
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn delete_thread(
         &mut self,
         workspace: &str,
@@ -735,7 +735,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn answer_permission(
         &mut self,
         workspace: &str,
@@ -845,7 +845,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn submit_run(
         &mut self,
         workspace: &str,
@@ -902,7 +902,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn resume_run(
         &mut self,
         workspace: &str,
@@ -946,7 +946,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn steer_run(
         &mut self,
         workspace: &str,
@@ -968,7 +968,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         )
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn follow_up_run(
         &mut self,
         workspace: &str,
@@ -990,7 +990,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         )
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn answer_run_permission(
         &mut self,
         workspace: &str,
@@ -1126,7 +1126,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn stream_run(
         &mut self,
         workspace: &str,
@@ -1136,7 +1136,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         self.boundaries.stream_run(workspace, run_id, after_run_seq)
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn fetch_artifact(
         &mut self,
         workspace: &str,
@@ -1145,7 +1145,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         self.boundaries.fetch_artifact(workspace, artifact_id)
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn read_artifact_range(
         &mut self,
         workspace: &str,
@@ -1157,7 +1157,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
             .read_artifact_range(workspace, artifact_id, offset, length)
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn subscribe_run_commits(
         &mut self,
         run_id: &str,
@@ -1165,7 +1165,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         self.boundaries.subscribe_run_commits(run_id).map(Some)
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn subscribe_chat_events(
         &mut self,
     ) -> Result<crate::run_events::ChatEventSubscription, ProtocolError> {
