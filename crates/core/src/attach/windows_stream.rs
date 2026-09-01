@@ -218,7 +218,7 @@ impl DeadlineStream for WindowsAttachStream {
             if available > 0 {
                 return ReadableWait::Ready;
             }
-            thread::sleep(remaining.min(Duration::from_millis(1)));
+            thread::sleep(remaining.min(Duration::from_millis(50)));
         }
     }
 
