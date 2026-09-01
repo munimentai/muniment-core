@@ -37,6 +37,8 @@ mod desktop_client;
 #[cfg(feature = "client")]
 mod desktop_client_holder;
 #[cfg(feature = "client")]
+mod desktop_client_stop;
+#[cfg(feature = "client")]
 mod desktop_supervisor;
 mod envelope;
 pub mod fixtures;
@@ -54,6 +56,8 @@ pub use client_stream::ClientStream;
 pub use desktop_client::{handshake_desktop_client, DesktopClient};
 #[cfg(feature = "client")]
 pub use desktop_client_holder::DesktopClientHolder;
+#[cfg(feature = "client")]
+pub use desktop_client_stop::DesktopClientStopHandle;
 #[cfg(feature = "client")]
 pub use desktop_supervisor::{serve_desktop_client_with, DesktopClientSupervisorStop};
 pub use envelope::*;
