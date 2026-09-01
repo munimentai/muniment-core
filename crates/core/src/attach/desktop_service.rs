@@ -1206,17 +1206,17 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     use crate::attach::desktop_service_message::RunStreamPage;
     #[cfg(target_os = "linux")]
     use crate::attach::thread_service::ThreadListService;
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     use crate::attach::thread_service::{
         ThreadListPage, ThreadListRequest, ThreadOpenPage, ThreadOpenRequest,
     };
     #[cfg(target_os = "linux")]
     use crate::attach::ErrorCode;
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(unix, target_os = "windows"))]
     use crate::attach::ProtocolError;
     use crate::attach::{RuntimeActivityGuard, RuntimeActivityRegistry};
     use crate::auth::TokenSet;
@@ -1356,7 +1356,7 @@ mod tests {
     }
 
     impl RunAttachBoundaries for FakeRunStartBoundaries {
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         fn list_threads(
             &self,
             _workspace: &str,
@@ -1365,7 +1365,7 @@ mod tests {
             unreachable!()
         }
 
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         fn open_thread(
             &self,
             _workspace: &str,
@@ -1374,7 +1374,7 @@ mod tests {
             unreachable!()
         }
 
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         fn stream_run(
             &self,
             _workspace: &str,
@@ -1384,7 +1384,7 @@ mod tests {
             unreachable!()
         }
 
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         fn subscribe_run_commits(
             &self,
             _run_id: &str,
@@ -1392,7 +1392,7 @@ mod tests {
             unreachable!()
         }
 
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         fn queue_attach_permission_answer(
             &self,
             _workspace: &str,
