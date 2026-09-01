@@ -29,6 +29,8 @@ pub fn runtime_version_meets_minimum(version: &str, minimum: &str) -> bool {
 }
 
 #[cfg(feature = "client")]
+mod chat_event_supervisor;
+#[cfg(feature = "client")]
 mod client;
 #[cfg(feature = "client")]
 mod client_stream;
@@ -48,6 +50,8 @@ mod negotiation;
 mod protocol_helpers;
 mod workspace;
 
+#[cfg(feature = "client")]
+pub use chat_event_supervisor::{serve_chat_events_with, ChatEventSupervisorStop};
 #[cfg(feature = "client")]
 pub use client::*;
 #[cfg(feature = "client")]
