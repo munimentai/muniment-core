@@ -6,6 +6,7 @@ mod approval_present;
 mod artifact;
 mod authorization;
 mod companion_registry;
+mod companion_session;
 #[cfg(target_os = "linux")]
 mod connection_route;
 #[cfg(unix)]
