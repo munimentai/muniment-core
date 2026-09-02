@@ -32,6 +32,9 @@ pub mod live_connections;
 mod macos_listener;
 #[cfg(target_os = "macos")]
 mod macos_peer;
+mod macos_route;
+#[cfg(target_os = "macos")]
+mod macos_route_native;
 #[cfg(target_os = "linux")]
 mod peer_authority;
 #[cfg(unix)]
@@ -96,6 +99,9 @@ pub use listener_lifecycle::*;
 pub use macos_listener::*;
 #[cfg(target_os = "macos")]
 pub use macos_peer::*;
+pub use macos_route::*;
+#[cfg(target_os = "macos")]
+pub use macos_route_native::*;
 pub use muniment_attach::*;
 #[cfg(target_os = "linux")]
 pub use peer_authority::*;

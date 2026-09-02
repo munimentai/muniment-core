@@ -4,9 +4,7 @@ use std::fmt;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 
-/// Opaque failure from the injected macOS identity boundary.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MacosPeerReadError;
+use super::MacosPeerReadError;
 
 /// Injected boundary around `getpeereid` and `geteuid`.
 pub trait MacosAttachPeerReader {
