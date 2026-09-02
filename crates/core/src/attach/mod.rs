@@ -35,6 +35,8 @@ mod macos_peer;
 mod macos_route;
 #[cfg(target_os = "macos")]
 mod macos_route_native;
+#[cfg(unix)]
+mod macos_session;
 #[cfg(target_os = "linux")]
 mod peer_authority;
 #[cfg(unix)]
@@ -102,6 +104,8 @@ pub use macos_peer::*;
 pub use macos_route::*;
 #[cfg(target_os = "macos")]
 pub use macos_route_native::*;
+#[cfg(unix)]
+pub use macos_session::*;
 pub use muniment_attach::*;
 #[cfg(target_os = "linux")]
 pub use peer_authority::*;

@@ -75,18 +75,31 @@ pub fn probe_handoff(
     expected_nonce: &str,
     readiness_deadline: Instant,
 ) -> Result<ConfirmedHandoff, HandoffProbeError> {
+    probe_handoff_with(
+        expected_nonce,
+        readiness_deadline,
+        |deadline| read_handoff_probe_welcome(endpoint.as_ref(), deadline),
+        Instant::now,
+        thread::sleep,
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn probe_handoff_with(
+    expected_nonce: &str,
+    readiness_deadline: Instant,
+    mut read_welcome: impl FnMut(Instant) -> Result<Welcome, HandoffProbeError>,
+    mut now: impl FnMut() -> Instant,
+    mut sleep: impl FnMut(Duration),
+) -> Result<ConfirmedHandoff, HandoffProbeError> {
     loop {
-        match read_handoff_probe_welcome(endpoint.as_ref(), readiness_deadline) {
+        match read_welcome(readiness_deadline) {
             Ok(welcome) => {
-                return confirm_handoff_probe(
-                    &welcome,
-                    expected_nonce,
-                    readiness_deadline,
-                    Instant::now(),
-                )
+                return confirm_handoff_probe(&welcome, expected_nonce, readiness_deadline, now())
             }
             Err(HandoffProbeError::ConnectionRefused) => {
-                wait_before_retry(readiness_deadline, Instant::now, thread::sleep)?;
+                wait_before_retry(readiness_deadline, &mut now, &mut sleep)?;
             }
             Err(error) => return Err(error),
         }

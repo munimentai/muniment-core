@@ -1,9 +1,10 @@
 #![cfg(target_os = "linux")]
 
 use muniment_core::attach::{
-    confirm_handoff_probe, decode_frame, encode_frame, probe_handoff, read_handoff_probe_welcome,
-    Authorization, HandoffProbeError, Hello, Welcome,
+    confirm_handoff_probe, decode_frame, encode_frame, probe_handoff, probe_handoff_with,
+    read_handoff_probe_welcome, Authorization, HandoffProbeError, Hello, Welcome,
 };
+use std::cell::Cell;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -187,17 +188,41 @@ fn confirms_after_the_listener_binds() {
 
 #[test]
 fn stops_retrying_when_an_endpoint_never_binds() {
-    let socket = TestSocket::new();
     let started = Instant::now();
     let deadline = started + Duration::from_millis(35);
+    let now = Cell::new(started);
+    let attempts = Cell::new(0);
+    let waits = Cell::new(Vec::new());
 
     assert_eq!(
-        probe_handoff(&socket.0, "handoff-nonce", deadline),
+        probe_handoff_with(
+            "handoff-nonce",
+            deadline,
+            |_| {
+                attempts.set(attempts.get() + 1);
+                Err(HandoffProbeError::ConnectionRefused)
+            },
+            || now.get(),
+            |delay| {
+                let mut recorded = waits.take();
+                recorded.push(delay);
+                waits.set(recorded);
+                now.set(now.get() + delay);
+            },
+        ),
         Err(HandoffProbeError::ReadinessDeadlineReached)
     );
-    let elapsed = started.elapsed();
-    assert!(elapsed >= Duration::from_millis(35));
-    assert!(elapsed < Duration::from_secs(1));
+    assert_eq!(attempts.get(), 5);
+    assert_eq!(
+        waits.take(),
+        [
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            Duration::from_millis(5),
+        ]
+    );
+    assert_eq!(now.get(), deadline);
 }
 
 #[test]

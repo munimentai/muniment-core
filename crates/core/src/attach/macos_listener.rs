@@ -9,21 +9,13 @@ use std::path::{Path, PathBuf};
 use super::{
     decode_frame, encode_frame, negotiate_first, verify_macos_attach_peer,
     verify_macos_attach_peer_with_reader, welcome, FirstMessage, MacosAttachPeerReader,
-    VersionRange, MAX_FRAME_LENGTH,
+    MacosAttachSessionError, VersionRange, MAX_FRAME_LENGTH,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MacosAttachAcceptError {
     Accept,
     PeerRejected,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MacosAttachSessionError {
-    Read,
-    MalformedFrame,
-    Randomness,
-    Write,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,7 +77,7 @@ impl Drop for MacosAttachListener {
 
 /// Writes one Welcome frame after peer admission, then closes the stream.
 /// Authorization arrives in a later slice.
-pub fn serve_macos_attach_session(
+fn serve_macos_companion_session(
     mut stream: UnixStream,
     desktop_version: &str,
 ) -> Result<(), MacosAttachSessionError> {
@@ -150,7 +142,7 @@ pub fn serve_next_macos_attach_with_reader(
 fn spawn_macos_attach_session(stream: UnixStream, desktop_version: &str) {
     let desktop_version = desktop_version.to_owned();
     std::thread::spawn(move || {
-        let _ = serve_macos_attach_session(stream, &desktop_version);
+        let _ = serve_macos_companion_session(stream, &desktop_version);
     });
 }
 
