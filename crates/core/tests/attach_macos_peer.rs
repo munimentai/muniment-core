@@ -3,8 +3,8 @@
 use muniment_core::attach::{
     accept_macos_attach_with_reader, decode_frame, encode_frame,
     serve_next_macos_attach_with_reader, verify_macos_attach_peer_with_reader, Client, Hello, Id,
-    MacosAttachAcceptError, MacosAttachListener, MacosAttachPeerReader, MacosPeerError,
-    MacosPeerReadError, Protocol, VersionRange, Welcome,
+    MacosAttachAcceptError, MacosAttachListener, MacosAttachPeerReader, MacosAttachStopEvent,
+    MacosAttachWaitOutcome, MacosPeerError, MacosPeerReadError, Protocol, VersionRange, Welcome,
 };
 use std::cell::Cell;
 use std::io::{self, Read};
@@ -61,6 +61,22 @@ fn listener_preserves_a_live_endpoint() {
 
     drop(live);
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn stop_signal_wakes_a_pending_accept() {
+    let path =
+        std::env::temp_dir().join(format!("muniment-attach-stop-{}.sock", std::process::id()));
+    let listener = MacosAttachListener::bind(&path).unwrap();
+    let stop = std::sync::Arc::new(MacosAttachStopEvent::new().unwrap());
+    let signal = std::sync::Arc::clone(&stop);
+    let signaler = std::thread::spawn(move || signal.signal().unwrap());
+
+    assert!(matches!(
+        listener.accept_until(&stop),
+        Ok(MacosAttachWaitOutcome::Stopped)
+    ));
+    signaler.join().unwrap();
 }
 
 impl MacosAttachPeerReader for FakePeerReader {
