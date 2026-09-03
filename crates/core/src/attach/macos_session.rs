@@ -6,16 +6,18 @@ use std::time::Instant;
 use super::desktop_service_message::CompanionProvenance;
 use super::thread_service::ThreadListService;
 use super::{
-    admit_desktop_client_over_stream_with_prefix, decode_frame, encode_frame,
-    name_macos_attach_connection_route, negotiate_first, read_exact_before, welcome,
-    write_all_before, AdmittedDesktopClient, AttachSessionError, DeadlineStream,
-    DesktopClientAdmissionError, FirstMessage, MacosAttachConnectionRoute, MacosAttachRouteReader,
-    VersionRange, MAX_FRAME_LENGTH,
+    admit_desktop_client_over_stream_with_frame, decode_frame, encode_frame,
+    name_macos_attach_connection_route, name_macos_desktop_attach_connection_route,
+    negotiate_first, read_exact_before, welcome, write_all_before, AdmittedDesktopClient,
+    AttachSessionError, DeadlineStream, DesktopClientAdmissionError, FirstMessage,
+    MacosAttachConnectionRoute, MacosAttachRouteReader, ProtocolError, VersionRange,
+    MAX_FRAME_LENGTH,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MacosAttachSessionError {
     Read,
+    ApprovalPresenterUnavailable,
     DesktopClientAdmission(DesktopClientAdmissionError),
     DesktopClientSession(AttachSessionError),
     MalformedFrame,
@@ -80,36 +82,104 @@ where
 
     match route {
         MacosAttachConnectionRoute::DesktopClient { peer_pid } => {
-            let admitted = admit_desktop_client_over_stream_with_prefix(
-                stream,
-                prefix,
-                desktop_version,
-                None,
-                deadline,
-            )
-            .map_err(MacosAttachSessionError::DesktopClientAdmission)?;
-            service.bind_authorized_client(&admitted.client_identity);
-            super::desktop_session::serve_desktop_client_requests(
-                stream,
-                &admitted.capability,
-                &admitted.workspace,
-                CompanionProvenance {
-                    profile: "desktop-owner".into(),
-                    companion_kind: admitted.companion_kind.clone(),
-                    companion_version: admitted.companion_version.clone(),
-                    peer_uid: 0,
+            let frame = read_first_frame(stream, prefix, deadline)?;
+            match name_macos_desktop_attach_connection_route(peer_pid, &frame) {
+                MacosAttachConnectionRoute::ApprovalPresenter => {
+                    super::desktop_admission::write_protocol_error(
+                        stream,
+                        ProtocolError::unauthorized(),
+                        deadline,
+                    );
+                    Err(MacosAttachSessionError::ApprovalPresenterUnavailable)
+                }
+                MacosAttachConnectionRoute::DesktopClient { peer_pid } => serve_desktop_client(
+                    stream,
+                    &frame,
                     peer_pid,
-                },
-                service,
-            )
-            .map_err(MacosAttachSessionError::DesktopClientSession)?;
-            Ok(MacosAttachSessionOutcome::DesktopClient(admitted))
+                    desktop_version,
+                    deadline,
+                    service,
+                ),
+                MacosAttachConnectionRoute::Companion => {
+                    serve_companion_exchange_with_frame(stream, &frame, desktop_version, deadline)?;
+                    Ok(MacosAttachSessionOutcome::Companion)
+                }
+            }
+        }
+        MacosAttachConnectionRoute::ApprovalPresenter => {
+            super::desktop_admission::write_protocol_error(
+                stream,
+                ProtocolError::unauthorized(),
+                deadline,
+            );
+            Err(MacosAttachSessionError::ApprovalPresenterUnavailable)
         }
         MacosAttachConnectionRoute::Companion => {
             serve_companion_exchange(stream, prefix, desktop_version, deadline)?;
             Ok(MacosAttachSessionOutcome::Companion)
         }
     }
+}
+
+fn read_first_frame<S: DeadlineStream>(
+    stream: &mut S,
+    prefix: [u8; 4],
+    deadline: Instant,
+) -> Result<Vec<u8>, MacosAttachSessionError> {
+    let length = u32::from_be_bytes(prefix) as usize;
+    if length > MAX_FRAME_LENGTH {
+        super::desktop_admission::write_protocol_error(
+            stream,
+            ProtocolError::payload_too_large(),
+            deadline,
+        );
+        return Err(MacosAttachSessionError::DesktopClientAdmission(
+            DesktopClientAdmissionError::PayloadTooLarge,
+        ));
+    }
+    let mut frame = vec![0_u8; 4 + length];
+    frame[..4].copy_from_slice(&prefix);
+    read_exact_before(stream, &mut frame[4..], deadline).map_err(|error| {
+        MacosAttachSessionError::DesktopClientAdmission(if super::deadline_io::is_timeout(&error) {
+            DesktopClientAdmissionError::Timeout
+        } else {
+            DesktopClientAdmissionError::Closed
+        })
+    })?;
+    Ok(frame)
+}
+
+fn serve_desktop_client<S, H>(
+    stream: &mut S,
+    frame: &[u8],
+    peer_pid: u32,
+    desktop_version: &str,
+    deadline: Instant,
+    service: &mut H,
+) -> Result<MacosAttachSessionOutcome, MacosAttachSessionError>
+where
+    S: DeadlineStream,
+    H: ThreadListService,
+{
+    let admitted =
+        admit_desktop_client_over_stream_with_frame(stream, frame, desktop_version, None, deadline)
+            .map_err(MacosAttachSessionError::DesktopClientAdmission)?;
+    service.bind_authorized_client(&admitted.client_identity);
+    super::desktop_session::serve_desktop_client_requests(
+        stream,
+        &admitted.capability,
+        &admitted.workspace,
+        CompanionProvenance {
+            profile: "desktop-owner".into(),
+            companion_kind: admitted.companion_kind.clone(),
+            companion_version: admitted.companion_version.clone(),
+            peer_uid: 0,
+            peer_pid,
+        },
+        service,
+    )
+    .map_err(MacosAttachSessionError::DesktopClientSession)?;
+    Ok(MacosAttachSessionOutcome::DesktopClient(admitted))
 }
 
 fn serve_companion_exchange<S: DeadlineStream>(
@@ -126,7 +196,16 @@ fn serve_companion_exchange<S: DeadlineStream>(
     frame[..4].copy_from_slice(&prefix);
     read_exact_before(stream, &mut frame[4..], deadline)
         .map_err(|_| MacosAttachSessionError::Read)?;
-    let message = decode_frame::<FirstMessage>(&frame)
+    serve_companion_exchange_with_frame(stream, &frame, desktop_version, deadline)
+}
+
+fn serve_companion_exchange_with_frame<S: DeadlineStream>(
+    stream: &mut S,
+    frame: &[u8],
+    desktop_version: &str,
+    deadline: Instant,
+) -> Result<(), MacosAttachSessionError> {
+    let message = decode_frame::<FirstMessage>(frame)
         .map_err(|_| MacosAttachSessionError::MalformedFrame)?
         .ok_or(MacosAttachSessionError::MalformedFrame)?
         .0;

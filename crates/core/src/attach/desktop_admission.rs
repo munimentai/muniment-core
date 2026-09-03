@@ -71,7 +71,24 @@ pub fn admit_desktop_client_over_stream_with_prefix<S: DeadlineStream + ?Sized>(
     let mut frame = vec![0_u8; length + 4];
     frame[..4].copy_from_slice(&prefix);
     read_exact_before(stream, &mut frame[4..], deadline).map_err(map_io_error)?;
-    let message = match decode_frame::<FirstMessage>(&frame) {
+    admit_desktop_client_over_stream_with_frame(stream, &frame, runtime_version, approval, deadline)
+}
+
+/// Admits a desktop client after the caller has read the first frame.
+pub fn admit_desktop_client_over_stream_with_frame<S: DeadlineStream + ?Sized>(
+    stream: &mut S,
+    frame: &[u8],
+    runtime_version: &str,
+    approval: Option<&Approval>,
+    deadline: Instant,
+) -> Result<AdmittedDesktopClient, DesktopClientAdmissionError> {
+    if frame.len() >= 4
+        && u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize > MAX_FRAME_LENGTH
+    {
+        write_protocol_error(stream, ProtocolError::payload_too_large(), deadline);
+        return Err(DesktopClientAdmissionError::PayloadTooLarge);
+    }
+    let message = match decode_frame::<FirstMessage>(frame) {
         Ok(Some((message, consumed))) if consumed == frame.len() => message,
         _ => {
             write_protocol_error(stream, ProtocolError::malformed_frame(), deadline);

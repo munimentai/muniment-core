@@ -12,9 +12,9 @@ mod unix_tests {
     use muniment_core::attach::thread_service::ThreadListService;
     use muniment_core::attach::{
         decode_frame, encode_frame, serve_macos_attach_session_with_reader, Authorization,
-        DesktopClientAuthorizedGrant, Envelope, Id, MacosAttachRouteReader,
-        MacosAttachSessionOutcome, MacosPeerReadError, Operation, Protocol, ProtocolError, Request,
-        Welcome,
+        DesktopClientAuthorizedGrant, Envelope, ErrorCode, ErrorEnvelope, Id,
+        MacosAttachRouteReader, MacosAttachSessionError, MacosAttachSessionOutcome,
+        MacosPeerReadError, Operation, Protocol, ProtocolError, Request, Welcome,
     };
 
     const CREATED_THREAD_ID: &str = "018f0000-0000-7000-8000-000000000200";
@@ -70,11 +70,13 @@ mod unix_tests {
         Instant::now() + Duration::from_secs(2)
     }
 
-    fn hello_frame() -> Vec<u8> {
-        let body = br#"{"protocol":"muniment.attach/1","client":{"kind":"editor-extension","version":"0.0.1"},"supported":{"min":1,"max":1},"client_nonce":"nonce","authorized_client_id":"018f0000-0000-7000-8000-000000000099"}"#;
+    fn hello_frame(client_kind: &str) -> Vec<u8> {
+        let body = format!(
+            r#"{{"protocol":"muniment.attach/1","client":{{"kind":"{client_kind}","version":"0.0.1"}},"supported":{{"min":1,"max":1}},"client_nonce":"nonce","authorized_client_id":"018f0000-0000-7000-8000-000000000099"}}"#
+        );
         let mut frame = Vec::with_capacity(4 + body.len());
         frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        frame.extend_from_slice(body);
+        frame.extend_from_slice(body.as_bytes());
         frame
     }
 
@@ -106,7 +108,7 @@ mod unix_tests {
             );
             (outcome, service)
         });
-        client.write_all(&hello_frame()).unwrap();
+        client.write_all(&hello_frame("desktop-client")).unwrap();
 
         let welcome_frame = read_frame(&mut client);
         let (welcome, consumed) = decode_frame::<Welcome>(&welcome_frame).unwrap().unwrap();
@@ -156,7 +158,7 @@ mod unix_tests {
             service.create_provenance,
             Some(CompanionProvenance {
                 profile: "desktop-owner".into(),
-                companion_kind: "editor-extension".into(),
+                companion_kind: "desktop-client".into(),
                 companion_version: "0.0.1".into(),
                 peer_uid: 0,
                 peer_pid: 42,
@@ -165,12 +167,39 @@ mod unix_tests {
     }
 
     #[test]
-    fn companion_route_writes_one_welcome_frame() {
+    fn presenter_route_writes_protocol_error() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
-        client.write_all(&hello_frame()).unwrap();
+        client.write_all(&hello_frame("desktop")).unwrap();
         let outcome = serve_macos_attach_session_with_reader(
             &mut server,
-            &route_reader("/Applications/Other.app/Contents/MacOS/other"),
+            &route_reader("/Applications/Muniment.app/Contents/MacOS/muniment"),
+            expected_desktop_executable(),
+            "1.2.3",
+            deadline(),
+            &mut TestService::default(),
+        );
+
+        assert_eq!(
+            outcome,
+            Err(MacosAttachSessionError::ApprovalPresenterUnavailable)
+        );
+        drop(server);
+        let error_frame = read_frame(&mut client);
+        let (error, consumed) = decode_frame::<ErrorEnvelope>(&error_frame)
+            .unwrap()
+            .unwrap();
+        assert_eq!(consumed, error_frame.len());
+        assert_eq!(error.error.code(), ErrorCode::Unauthorized);
+        assert_eq!(client.read(&mut [0_u8]).unwrap(), 0);
+    }
+
+    #[test]
+    fn other_desktop_client_kind_keeps_the_companion_exchange() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client.write_all(&hello_frame("editor-extension")).unwrap();
+        let outcome = serve_macos_attach_session_with_reader(
+            &mut server,
+            &route_reader("/Applications/Muniment.app/Contents/MacOS/muniment"),
             expected_desktop_executable(),
             "1.2.3",
             deadline(),
