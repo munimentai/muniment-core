@@ -4,7 +4,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
-use muniment_attach::{ChatEventSupervisorStop, DesktopClientStopHandle};
+use muniment_attach::{
+    ApprovalDecision, ApprovalPresentRequest, ApprovalPresenterStopHandle, ChatEventSupervisorStop,
+    DesktopClientStopHandle,
+};
 use muniment_attach::{
     ClientError, ClientStream, DesktopClient, DesktopClientHolder, DesktopClientSupervisorStop,
 };
@@ -135,6 +138,48 @@ pub fn serve_windows_chat_events(
         retry_interval,
         observe,
         deliver,
+    );
+}
+
+/// Serves approval requests over the current user's Windows attach endpoint.
+#[cfg(target_os = "windows")]
+pub fn serve_windows_approval_presenter(
+    client_version: &str,
+    io_timeout: Duration,
+    retry_interval: Duration,
+    stop: ApprovalPresenterStopHandle,
+    observe: impl FnMut(bool),
+    choose: impl FnMut(&ApprovalPresentRequest) -> ApprovalDecision,
+) {
+    let Ok(event) = super::WindowsAttachStopEvent::new() else {
+        return;
+    };
+    let event = Arc::new(event);
+    let connection_stop = stop.clone();
+    let connection_event = Arc::clone(&event);
+    muniment_attach::serve_approval_presenter_with(
+        || {
+            let shutdown_event = Arc::clone(&connection_event);
+            if !connection_stop.register_shutdown(move || {
+                let _ = shutdown_event.signal();
+            }) {
+                return None;
+            }
+            let now = Instant::now();
+            let connect_deadline = now.checked_add(retry_interval).unwrap_or(now);
+            let mut stream = super::wait_for_windows_attach_endpoint(connect_deadline).ok()?;
+            stream.set_stop_event(Arc::clone(&connection_event));
+            muniment_attach::handshake_approval_presenter(
+                Box::new(stream),
+                client_version,
+                io_timeout,
+            )
+            .ok()
+        },
+        stop,
+        retry_interval,
+        observe,
+        choose,
     );
 }
 

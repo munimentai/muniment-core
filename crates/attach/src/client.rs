@@ -497,36 +497,35 @@ impl fmt::Debug for ThreadListPage {
 #[cfg(unix)]
 mod linux {
     use super::{
-        ApprovalDecision, ApprovalPresentRequest, ApprovalPresenterServeOutcome, ArtifactChunk,
-        ArtifactTransferEvent, ArtifactTransferMetadata, ArtifactTransferTerminalCode,
-        ArtifactWindowGrant, AuthorizationSummary, ClientError, MigrationControlFailure,
-        MigrationControlOutcome, PendingPermission, PermissionAnswerAccepted, PermissionDecision,
-        RedactedRunEvent, RunCancelAccepted, RunOpenPage, RunStartAccepted, RunStreamMessage,
-        RunStreamSubscription, ThreadCreateAccepted, ThreadListPage, ThreadOpenPage,
+        ApprovalDecision, ApprovalPresentRequest, ArtifactChunk, ArtifactTransferEvent,
+        ArtifactTransferMetadata, ArtifactTransferTerminalCode, ArtifactWindowGrant,
+        AuthorizationSummary, ClientError, MigrationControlFailure, MigrationControlOutcome,
+        PendingPermission, PermissionAnswerAccepted, PermissionDecision, RedactedRunEvent,
+        RunCancelAccepted, RunOpenPage, RunStartAccepted, RunStreamMessage, RunStreamSubscription,
+        ThreadCreateAccepted, ThreadListPage, ThreadOpenPage,
     };
-    use crate::client_stream::{
-        map_io_error, read_approval_value, read_approval_value_with_prefix, read_exact_before,
-        read_value, write_all_before,
-    };
+    use crate::client_stream::{read_value, write_all_before};
     use crate::desktop_client::{handshake_desktop_client, DesktopClient};
     use crate::desktop_client_holder::DesktopClientHolder;
-    use crate::desktop_client_stop::{
-        DesktopClientStopHandle, DesktopClientStopState, ShutdownHook,
-    };
+    use crate::desktop_client_stop::{DesktopClientStopHandle, DesktopClientStopState};
     use crate::desktop_supervisor::serve_desktop_client_with;
+    use crate::presenter_client::{
+        handshake_approval_presenter, serve_approval_presenter_with, ApprovalPresenterClient,
+        ApprovalPresenterStopHandle, ApprovalPresenterStopState,
+    };
     use crate::protocol_helpers::{
         deadline, fresh_nonce, fresh_request_id, is_hex_secret, is_rfc3339, map_frame_error,
         map_protocol_error, parse_message, reject_protocol_error, validate_capability_revocation,
     };
     use crate::{
-        encode_frame, Authorization, Authorized, Client, Envelope, ErrorCode, ErrorEnvelope,
-        EventName, Hello, Id, Operation, PeerAuthorizedGrant, Protocol, Request, Response,
-        VersionRange, Welcome, WorkspaceOnboarded, MAX_TEXT_LENGTH, PROTOCOL,
+        encode_frame, Authorization, Authorized, Client, Envelope, ErrorCode, EventName, Hello, Id,
+        Operation, PeerAuthorizedGrant, Protocol, Request, Response, VersionRange, Welcome,
+        WorkspaceOnboarded, MAX_TEXT_LENGTH, PROTOCOL,
     };
     use serde_json::Value;
     use std::collections::{BTreeMap, VecDeque};
     use std::env;
-    use std::io::{self, Read, Write};
+    use std::io::{self, Write};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::{AsRawFd, FromRawFd};
     use std::os::unix::net::UnixStream;
@@ -668,7 +667,6 @@ mod linux {
     const MAX_RUN_STREAM_WINDOW_TEXT_BYTES: usize = 262_144;
     const MAX_HANDOFF_NONCE_BYTES: usize = 128;
     const MAX_HANDOFF_DEADLINE_MS: u64 = 60_000;
-    const MAX_APPROVAL_DEADLINE_MS: u64 = 120_000;
 
     struct ActiveRunStream {
         subscription_id: Id,
@@ -2041,22 +2039,6 @@ mod linux {
         }
     }
 
-    #[cfg(test)]
-    mod sha256_tests {
-        use super::Sha256;
-
-        #[test]
-        fn hashes_across_the_padding_block_boundary() {
-            let mut digest = Sha256::new();
-            digest.update(&[b'a'; 17]);
-            digest.update(&[b'a'; 39]);
-            assert_eq!(
-                digest.finalize_hex(),
-                "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a"
-            );
-        }
-    }
-
     fn decode_artifact_closure(
         value: Value,
     ) -> Result<(String, ArtifactTransferEvent), ClientError> {
@@ -2107,203 +2089,6 @@ mod linux {
         capability: String,
         summary: AuthorizationSummary,
         io_timeout: Duration,
-    }
-
-    /// A connection-bound client for the peer-authorized approval presenter session.
-    pub struct ApprovalPresenterClient {
-        stream: UnixStream,
-        capability: String,
-        summary: AuthorizationSummary,
-        io_timeout: Duration,
-    }
-
-    #[derive(Clone, Debug, Default)]
-    pub struct ApprovalPresenterStopHandle {
-        inner: Arc<(Mutex<ApprovalPresenterStopState>, Condvar)>,
-    }
-
-    #[derive(Default)]
-    struct ApprovalPresenterStopState {
-        stopped: bool,
-        shutdown: Option<ShutdownHook>,
-    }
-
-    impl std::fmt::Debug for ApprovalPresenterStopState {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter
-                .debug_struct("ApprovalPresenterStopState")
-                .field("stopped", &self.stopped)
-                .field("shutdown", &self.shutdown.is_some())
-                .finish()
-        }
-    }
-
-    impl ApprovalPresenterStopHandle {
-        pub fn new() -> Self {
-            Self::default()
-        }
-
-        pub fn stop(&self) {
-            let (state, wake) = &*self.inner;
-            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
-            state.stopped = true;
-            if let Some(shutdown) = state.shutdown.take() {
-                shutdown();
-            }
-            wake.notify_all();
-        }
-
-        fn wait_for_retry(&self, retry_interval: Duration) -> bool {
-            let (state, wake) = &*self.inner;
-            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
-            state.shutdown = None;
-            if state.stopped {
-                return false;
-            }
-            let (state, _) = wake
-                .wait_timeout_while(state, retry_interval, |state| !state.stopped)
-                .unwrap_or_else(|error| error.into_inner());
-            !state.stopped
-        }
-    }
-
-    impl std::fmt::Debug for ApprovalPresenterClient {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("ApprovalPresenterClient { .. }")
-        }
-    }
-
-    impl ApprovalPresenterClient {
-        pub fn capability(&self) -> &str {
-            &self.capability
-        }
-
-        pub fn authorization_summary(&self) -> AuthorizationSummary {
-            self.summary.clone()
-        }
-
-        pub fn present(
-            &mut self,
-            choose: impl FnOnce(&ApprovalPresentRequest) -> ApprovalDecision,
-        ) -> Result<(), ClientError> {
-            let request_deadline = deadline(self.io_timeout);
-            let envelope: Envelope =
-                serde_json::from_value(read_approval_value(&mut self.stream, request_deadline)?)
-                    .map_err(|_| ClientError::UnexpectedMessage)?;
-            let Envelope::Request(request) = envelope else {
-                return Err(ClientError::UnexpectedMessage);
-            };
-
-            self.answer_present_request(request, choose)
-        }
-
-        fn answer_present_request(
-            &mut self,
-            request: Request,
-            choose: impl FnOnce(&ApprovalPresentRequest) -> ApprovalDecision,
-        ) -> Result<(), ClientError> {
-            #[derive(serde::Deserialize)]
-            #[serde(deny_unknown_fields)]
-            struct Body {
-                challenge: String,
-                claimed_kind: String,
-                claimed_version: String,
-                workspace: String,
-                scopes: Vec<String>,
-                deadline_ms: u64,
-            }
-
-            let body = serde_json::from_value::<Body>(request.body.clone());
-            let valid_text = |value: &str| {
-                !value.is_empty()
-                    && value.len() <= MAX_TEXT_LENGTH
-                    && !value.chars().any(char::is_control)
-            };
-            let valid = request.capability == self.capability
-                && request.operation == Operation::ApprovalPresent
-                && request.idempotency_key.is_none()
-                && body.as_ref().is_ok_and(|body| {
-                    valid_text(&body.challenge)
-                        && valid_text(&body.claimed_kind)
-                        && valid_text(&body.claimed_version)
-                        && valid_text(&body.workspace)
-                        && body.scopes.len() <= crate::MAX_JSON_COLLECTION_ENTRIES
-                        && body.scopes.iter().all(|scope| valid_text(scope))
-                        && (1..=MAX_APPROVAL_DEADLINE_MS).contains(&body.deadline_ms)
-                });
-            if !valid {
-                let error = ErrorEnvelope {
-                    protocol: Protocol,
-                    request_id: Some(request.request_id),
-                    ok: crate::Failure,
-                    error: crate::ProtocolError::unauthorized(),
-                };
-                let bytes = encode_frame(&error).map_err(map_frame_error)?;
-                write_all_before(&mut self.stream, &bytes, deadline(self.io_timeout))?;
-                return Err(ClientError::UnexpectedMessage);
-            }
-
-            let body = body.expect("validated approval request body");
-            let approval = ApprovalPresentRequest {
-                challenge: body.challenge,
-                claimed_kind: body.claimed_kind,
-                claimed_version: body.claimed_version,
-                workspace: body.workspace,
-                scopes: body.scopes,
-                deadline_ms: body.deadline_ms,
-            };
-            let decision = choose(&approval);
-            let response = Response {
-                protocol: Protocol,
-                request_id: request.request_id,
-                ok: crate::Success,
-                body: serde_json::json!({
-                    "challenge": approval.challenge,
-                    "decision": decision,
-                }),
-            };
-            let bytes = encode_frame(&response).map_err(map_frame_error)?;
-            write_all_before(&mut self.stream, &bytes, deadline(self.io_timeout))
-        }
-
-        pub fn serve(
-            &mut self,
-            mut choose: impl FnMut(&ApprovalPresentRequest) -> ApprovalDecision,
-        ) -> Result<ApprovalPresenterServeOutcome, ClientError> {
-            loop {
-                self.stream
-                    .set_read_timeout(None)
-                    .map_err(|_| ClientError::DesktopUnavailable)?;
-                let mut first = [0u8; 1];
-                match self.stream.read(&mut first).map_err(map_io_error)? {
-                    0 => return Ok(ApprovalPresenterServeOutcome::ConnectionClosed),
-                    1 => {}
-                    _ => unreachable!("a one-byte read returned more than one byte"),
-                }
-
-                let request_deadline = deadline(self.io_timeout);
-                let mut prefix = [0u8; 4];
-                prefix[0] = first[0];
-                read_exact_before(&mut self.stream, &mut prefix[1..], request_deadline)?;
-                let value =
-                    read_approval_value_with_prefix(&mut self.stream, prefix, request_deadline)?;
-                self.present_value(value, &mut choose)?;
-            }
-        }
-
-        fn present_value(
-            &mut self,
-            value: Value,
-            choose: &mut impl FnMut(&ApprovalPresentRequest) -> ApprovalDecision,
-        ) -> Result<(), ClientError> {
-            let envelope: Envelope =
-                serde_json::from_value(value).map_err(|_| ClientError::UnexpectedMessage)?;
-            let Envelope::Request(request) = envelope else {
-                return Err(ClientError::UnexpectedMessage);
-            };
-
-            self.answer_present_request(request, |approval| choose(approval))
-        }
     }
 
     impl std::fmt::Debug for MigrationControlClient {
@@ -2479,26 +2264,20 @@ mod linux {
         io_timeout: Duration,
         retry_interval: Duration,
         stop: ApprovalPresenterStopHandle,
-        mut observe: impl FnMut(bool),
-        mut choose: impl FnMut(&ApprovalPresentRequest) -> ApprovalDecision,
+        observe: impl FnMut(bool),
+        choose: impl FnMut(&ApprovalPresentRequest) -> ApprovalDecision,
     ) {
-        loop {
-            let connected = interruptible_connect(endpoint, &stop);
-
-            if let Some(stream) = connected {
-                if let Ok(mut presenter) =
-                    handshake_approval_presenter_stream(stream, client_version, io_timeout)
-                {
-                    observe(true);
-                    let _ = presenter.serve(&mut choose);
-                    observe(false);
-                }
-            }
-
-            if !stop.wait_for_retry(retry_interval) {
-                return;
-            }
-        }
+        let connect_stop = stop.clone();
+        serve_approval_presenter_with(
+            || {
+                let stream = interruptible_connect(endpoint, &connect_stop)?;
+                handshake_approval_presenter_stream(stream, client_version, io_timeout).ok()
+            },
+            stop,
+            retry_interval,
+            observe,
+            choose,
+        );
     }
 
     pub fn serve_desktop_client_at(
@@ -2659,15 +2438,15 @@ mod linux {
 
     impl InterruptibleConnectState for ApprovalPresenterStopState {
         fn stopped(&self) -> bool {
-            self.stopped
+            self.stopped()
         }
 
         fn set_stream(&mut self, stream: Option<UnixStream>) {
-            self.shutdown = stream.map(|stream| {
+            self.set_shutdown(stream.map(|stream| {
                 Box::new(move || {
                     let _ = stream.shutdown(std::net::Shutdown::Both);
-                }) as ShutdownHook
-            });
+                }) as Box<dyn FnOnce() + Send>
+            }));
         }
     }
 
@@ -2862,62 +2641,12 @@ mod linux {
 
     #[doc(hidden)]
     pub fn handshake_approval_presenter_stream(
-        mut stream: UnixStream,
+        stream: UnixStream,
         client_version: &str,
         io_timeout: Duration,
     ) -> Result<ApprovalPresenterClient, ClientError> {
         verify_connected_peer(&stream)?;
-        let hello = Hello {
-            protocol: Protocol,
-            client: Client {
-                kind: "desktop".into(),
-                version: client_version.into(),
-            },
-            supported: VersionRange { min: 1, max: 1 },
-            client_nonce: fresh_nonce()?,
-            authorized_client_id: Id::new(fresh_request_id()?.as_str())
-                .map_err(|_| ClientError::UnexpectedMessage)?,
-            authorized_client_credential: None,
-        };
-        let bytes = encode_frame(&hello).map_err(map_frame_error)?;
-        write_all_before(&mut stream, &bytes, deadline(io_timeout))?;
-
-        let welcome_value = read_value(&mut stream, deadline(io_timeout))?;
-        reject_protocol_error(&welcome_value)?;
-        let welcome: Welcome = parse_message(welcome_value)?;
-        if welcome.selected != 1
-            || welcome.authorization != Authorization::Authorized
-            || !is_hex_secret(&welcome.server_nonce, 32)
-        {
-            return Err(ClientError::UnexpectedMessage);
-        }
-
-        let authorized_value = read_value(&mut stream, deadline(io_timeout))?;
-        reject_protocol_error(&authorized_value)?;
-        if authorized_value
-            .get("authorized_client_credential")
-            .is_some()
-        {
-            return Err(ClientError::UnexpectedMessage);
-        }
-        let authorized: PeerAuthorizedGrant = parse_message(authorized_value)?;
-        if !is_hex_secret(&authorized.capability, 64)
-            || authorized.expires_at == 0
-            || authorized.expires_at > 8 * 60 * 60
-            || authorized.idle_timeout_seconds == 0
-            || authorized.idle_timeout_seconds > 15 * 60
-        {
-            return Err(ClientError::UnexpectedMessage);
-        }
-        Ok(ApprovalPresenterClient {
-            stream,
-            capability: authorized.capability,
-            summary: AuthorizationSummary {
-                expires_in_seconds: authorized.expires_at,
-                idle_timeout_seconds: authorized.idle_timeout_seconds,
-            },
-            io_timeout,
-        })
+        handshake_approval_presenter(Box::new(stream), client_version, io_timeout)
     }
 
     fn handshake_stream_with_identity(
@@ -3115,6 +2844,22 @@ mod linux {
         }
         hash.iter().map(|word| format!("{word:08x}")).collect()
     }
+
+    #[cfg(test)]
+    mod sha256_tests {
+        use super::Sha256;
+
+        #[test]
+        fn hashes_across_the_padding_block_boundary() {
+            let mut digest = Sha256::new();
+            digest.update(&[b'a'; 17]);
+            digest.update(&[b'a'; 39]);
+            assert_eq!(
+                digest.finalize_hex(),
+                "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a"
+            );
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -3123,9 +2868,8 @@ pub use linux::{
     connect_desktop_client_at, handshake_approval_presenter_stream,
     handshake_desktop_client_stream, handshake_migration_control_stream, handshake_stream,
     handshake_stream_with_credential, interruptible_connect_with_state,
-    serve_approval_presenter_at, serve_desktop_client_at, ApprovalPresenterClient,
-    ApprovalPresenterStopHandle, AuthorizedClient, InterruptibleConnectState,
-    MigrationControlClient,
+    serve_approval_presenter_at, serve_desktop_client_at, AuthorizedClient,
+    InterruptibleConnectState, MigrationControlClient,
 };
 
 #[cfg(target_os = "macos")]

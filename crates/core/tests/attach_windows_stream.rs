@@ -8,8 +8,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use muniment_core::attach::{
-    encode_frame, read_exact_before, write_all_before, WindowsAttachListener,
-    WindowsAttachStopEvent,
+    encode_frame, read_exact_before, write_all_before, ApprovalPresenterStopHandle,
+    WindowsAttachListener, WindowsAttachStopEvent,
 };
 use serde_json::json;
 use windows_sys::Win32::Foundation::{GetLastError, ERROR_PIPE_CONNECTED};
@@ -93,7 +93,7 @@ fn moves_frames_times_out_cleanly_and_reports_peer_close() {
 }
 
 #[test]
-fn stop_event_interrupts_blocked_and_later_reads() {
+fn approval_presenter_stop_interrupts_blocked_and_later_reads() {
     let _test_lock = WINDOWS_ATTACH_TEST_LOCK.lock().unwrap();
     let state_directory = std::env::temp_dir().join(format!(
         "muniment-windows-stream-stop-test-{}",
@@ -120,6 +120,11 @@ fn stop_event_interrupts_blocked_and_later_reads() {
     assert!(connected != 0 || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED);
 
     let stop_event = Arc::new(WindowsAttachStopEvent::new().unwrap());
+    let stop = ApprovalPresenterStopHandle::new();
+    let signal_event = Arc::clone(&stop_event);
+    assert!(stop.register_shutdown(move || {
+        signal_event.signal().unwrap();
+    }));
     let mut stream = listener.into_stream();
     stream.set_stop_event(Arc::clone(&stop_event));
     let (operation_pending_sender, operation_pending_receiver) = mpsc::channel();
@@ -144,7 +149,7 @@ fn stop_event_interrupts_blocked_and_later_reads() {
     operation_pending_receiver
         .recv_timeout(Duration::from_secs(1))
         .unwrap();
-    let signaler = thread::spawn(move || stop_event.signal().unwrap());
+    let signaler = thread::spawn(move || stop.stop());
 
     let (first_kind, first_elapsed, second_kind, second_elapsed) = reader.join().unwrap();
     signaler.join().unwrap();
