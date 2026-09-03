@@ -1,17 +1,21 @@
 //! macOS attach session negotiation.
 
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 
 use super::desktop_service_message::CompanionProvenance;
+use super::live_connections::LiveConnectionRegistry;
 use super::thread_service::ThreadListService;
 use super::{
     admit_desktop_client_over_stream_with_frame, decode_frame, encode_frame,
     name_macos_attach_connection_route, name_macos_desktop_attach_connection_route,
-    negotiate_first, read_exact_before, welcome, write_all_before, AdmittedDesktopClient,
-    AttachSessionError, DeadlineStream, DesktopClientAdmissionError, FirstMessage,
-    MacosAttachConnectionRoute, MacosAttachRouteReader, ProtocolError, VersionRange,
-    MAX_FRAME_LENGTH,
+    negotiate_first, read_exact_before, welcome, write_all_before, AdmittedDesktopClient, Approval,
+    ApprovalCoordinator, ApprovalWaiter, AttachSessionError, DeadlineStream,
+    DesktopClientAdmissionError, FirstMessage, MacosAttachConnectionRoute, MacosAttachRouteReader,
+    ProtocolError, VersionRange, MAX_FRAME_LENGTH,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,6 +24,7 @@ pub enum MacosAttachSessionError {
     ApprovalPresenterUnavailable,
     DesktopClientAdmission(DesktopClientAdmissionError),
     DesktopClientSession(AttachSessionError),
+    CompanionSession(AttachSessionError),
     MalformedFrame,
     Randomness,
     Write,
@@ -28,8 +33,171 @@ pub enum MacosAttachSessionError {
 /// The route selected for an admitted macOS attach session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MacosAttachSessionOutcome {
+    ApprovalPresenter,
     Companion,
     DesktopClient(AdmittedDesktopClient),
+}
+
+#[cfg(target_os = "macos")]
+/// Serves every macOS route with the state shared by one runtime activation.
+pub fn serve_macos_attach_session_with_state<H, W>(
+    stream: UnixStream,
+    expected_desktop_executable: &Path,
+    desktop_version: &str,
+    timeout: Duration,
+    service: &mut H,
+    approval: Option<Approval>,
+    coordinator: ApprovalCoordinator,
+    approvals: W,
+    registry: &LiveConnectionRegistry,
+) -> Result<MacosAttachSessionOutcome, MacosAttachSessionError>
+where
+    H: ThreadListService,
+    W: ApprovalWaiter,
+{
+    let route = {
+        let route_reader = super::NativeMacosAttachRouteReader::new(&stream);
+        name_macos_attach_connection_route(&route_reader, expected_desktop_executable)
+    };
+    serve_macos_attach_route_with_state(
+        stream,
+        route,
+        desktop_version,
+        timeout,
+        service,
+        approval,
+        coordinator,
+        approvals,
+        registry,
+    )
+}
+
+#[cfg(unix)]
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn serve_macos_attach_session_with_reader_and_state<H, W>(
+    stream: UnixStream,
+    route_reader: &impl MacosAttachRouteReader,
+    expected_desktop_executable: &Path,
+    desktop_version: &str,
+    timeout: Duration,
+    service: &mut H,
+    approval: Option<Approval>,
+    coordinator: ApprovalCoordinator,
+    approvals: W,
+    registry: &LiveConnectionRegistry,
+) -> Result<MacosAttachSessionOutcome, MacosAttachSessionError>
+where
+    H: ThreadListService,
+    W: ApprovalWaiter,
+{
+    let route = name_macos_attach_connection_route(route_reader, expected_desktop_executable);
+    serve_macos_attach_route_with_state(
+        stream,
+        route,
+        desktop_version,
+        timeout,
+        service,
+        approval,
+        coordinator,
+        approvals,
+        registry,
+    )
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn serve_macos_attach_route_with_state<H, W>(
+    mut stream: UnixStream,
+    route: MacosAttachConnectionRoute,
+    desktop_version: &str,
+    timeout: Duration,
+    service: &mut H,
+    approval: Option<Approval>,
+    coordinator: ApprovalCoordinator,
+    approvals: W,
+    registry: &LiveConnectionRegistry,
+) -> Result<MacosAttachSessionOutcome, MacosAttachSessionError>
+where
+    H: ThreadListService,
+    W: ApprovalWaiter,
+{
+    use super::companion_pairing::{
+        serve_pairing_exchange, AuthorizationSessionDependencies, NoMigration, PairingPeer,
+        PairingSession, SessionClock, SessionTokens,
+    };
+    use super::{serve_approval_presenter, ApprovalPresenterConnection};
+
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(MacosAttachSessionError::Read)?;
+    let mut prefix = [0_u8; 4];
+    read_exact_before(&mut stream, &mut prefix, deadline)
+        .map_err(|_| MacosAttachSessionError::Read)?;
+    let frame = read_first_frame(&mut stream, prefix, deadline)?;
+    let (route, peer_pid) = match route {
+        MacosAttachConnectionRoute::DesktopClient { peer_pid } => (
+            name_macos_desktop_attach_connection_route(peer_pid, &frame),
+            peer_pid,
+        ),
+        route => (route, 0),
+    };
+
+    match route {
+        MacosAttachConnectionRoute::ApprovalPresenter => {
+            let admitted = admit_desktop_client_over_stream_with_frame(
+                &mut stream,
+                &frame,
+                desktop_version,
+                None,
+                deadline,
+            )
+            .map_err(MacosAttachSessionError::DesktopClientAdmission)?;
+            let connection = ApprovalPresenterConnection::new(stream, admitted.capability);
+            let Some(session) = serve_approval_presenter(coordinator, connection) else {
+                return Err(MacosAttachSessionError::ApprovalPresenterUnavailable);
+            };
+            session.wait_until_closed();
+            Ok(MacosAttachSessionOutcome::ApprovalPresenter)
+        }
+        MacosAttachConnectionRoute::DesktopClient { peer_pid } => serve_desktop_client(
+            &mut stream,
+            &frame,
+            peer_pid,
+            desktop_version,
+            deadline,
+            approval.as_ref(),
+            service,
+        ),
+        MacosAttachConnectionRoute::Companion => {
+            let mut random = |bytes: &mut [u8]| getrandom::fill(bytes).map_err(|_| ());
+            serve_pairing_exchange(
+                &mut stream,
+                PairingSession {
+                    peer: PairingPeer {
+                        companion_identity: format!("0:{peer_pid}"),
+                        peer_uid: 0,
+                        peer_pid,
+                    },
+                    first_frame: Some(&frame),
+                    registry,
+                    handoff_nonce: None,
+                },
+                desktop_version,
+                deadline.saturating_duration_since(Instant::now()),
+                AuthorizationSessionDependencies {
+                    fill_random: &mut random,
+                    clock: SessionClock(Instant::now()),
+                    tokens: SessionTokens,
+                    approvals,
+                },
+                service,
+                NoMigration,
+            )
+            .map_err(MacosAttachSessionError::CompanionSession)?;
+            Ok(MacosAttachSessionOutcome::Companion)
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -98,6 +266,7 @@ where
                     peer_pid,
                     desktop_version,
                     deadline,
+                    None,
                     service,
                 ),
                 MacosAttachConnectionRoute::Companion => {
@@ -155,15 +324,21 @@ fn serve_desktop_client<S, H>(
     peer_pid: u32,
     desktop_version: &str,
     deadline: Instant,
+    approval: Option<&Approval>,
     service: &mut H,
 ) -> Result<MacosAttachSessionOutcome, MacosAttachSessionError>
 where
     S: DeadlineStream,
     H: ThreadListService,
 {
-    let admitted =
-        admit_desktop_client_over_stream_with_frame(stream, frame, desktop_version, None, deadline)
-            .map_err(MacosAttachSessionError::DesktopClientAdmission)?;
+    let admitted = admit_desktop_client_over_stream_with_frame(
+        stream,
+        frame,
+        desktop_version,
+        approval,
+        deadline,
+    )
+    .map_err(MacosAttachSessionError::DesktopClientAdmission)?;
     service.bind_authorized_client(&admitted.client_identity);
     super::desktop_session::serve_desktop_client_requests(
         stream,

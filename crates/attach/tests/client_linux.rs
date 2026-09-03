@@ -1870,7 +1870,7 @@ fn desktop_client_supervisor_keeps_one_connection_until_failure() {
         holder.request(Operation::ThreadList, None, serde_json::json!({})),
         Err(ClientError::ConnectionClosed)
     );
-    reconnected.recv_timeout(SHORT + SHORT).unwrap();
+    reconnected.recv_timeout(Duration::from_secs(1)).unwrap();
     stop.stop();
     worker.join().unwrap();
     server.join().unwrap();

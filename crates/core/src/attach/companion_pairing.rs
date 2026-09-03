@@ -109,6 +109,7 @@ pub(super) struct PairingPeer {
 /// The peer and the shared state for one pairing exchange.
 pub(super) struct PairingSession<'a> {
     pub peer: PairingPeer,
+    pub first_frame: Option<&'a [u8]>,
     pub registry: &'a LiveConnectionRegistry,
     pub handoff_nonce: Option<&'a str>,
 }
@@ -127,6 +128,25 @@ pub(super) trait MigrationDetour<S: ?Sized, H> {
         fill_random: &mut dyn FnMut(&mut [u8]) -> Result<(), ()>,
         service: &mut H,
     ) -> Result<(), AttachSessionError>;
+}
+
+pub(super) struct NoMigration;
+
+impl<S: ?Sized, H> MigrationDetour<S, H> for NoMigration {
+    fn admits_peer(&self) -> bool {
+        false
+    }
+
+    fn serve(
+        self,
+        _stream: &mut S,
+        _selected: u32,
+        _server_nonce: String,
+        _fill_random: &mut dyn FnMut(&mut [u8]) -> Result<(), ()>,
+        _service: &mut H,
+    ) -> Result<(), AttachSessionError> {
+        unreachable!("a rejected migration peer cannot start a migration session")
+    }
 }
 
 /// Pairs a companion, authorizes it, and then serves its requests.
@@ -156,24 +176,33 @@ where
     } = dependencies;
     let PairingSession {
         peer,
+        first_frame,
         registry,
         handoff_nonce,
     } = session;
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or(AttachSessionError::Timeout)?;
-    let mut prefix = [0u8; 4];
-    read_before(stream, &mut prefix, deadline)?;
-    let length = u32::from_be_bytes(prefix) as usize;
-    if length > MAX_FRAME_LENGTH {
-        write_protocol_error(stream, ProtocolError::payload_too_large(), deadline);
-        return Err(AttachSessionError::PayloadTooLarge);
-    }
-    let mut frame = Vec::with_capacity(4 + length);
-    frame.extend_from_slice(&prefix);
-    frame.resize(4 + length, 0);
-    read_before(stream, &mut frame[4..], deadline)?;
-    let message = match super::decode_frame::<FirstMessage>(&frame) {
+    let owned_frame;
+    let frame = match first_frame {
+        Some(frame) => frame,
+        None => {
+            let mut prefix = [0u8; 4];
+            read_before(stream, &mut prefix, deadline)?;
+            let length = u32::from_be_bytes(prefix) as usize;
+            if length > MAX_FRAME_LENGTH {
+                write_protocol_error(stream, ProtocolError::payload_too_large(), deadline);
+                return Err(AttachSessionError::PayloadTooLarge);
+            }
+            let mut received = Vec::with_capacity(4 + length);
+            received.extend_from_slice(&prefix);
+            received.resize(4 + length, 0);
+            read_before(stream, &mut received[4..], deadline)?;
+            owned_frame = received;
+            &owned_frame
+        }
+    };
+    let message = match super::decode_frame::<FirstMessage>(frame) {
         Ok(Some((message, _))) => message,
         _ => {
             write_protocol_error(stream, ProtocolError::malformed_frame(), deadline);

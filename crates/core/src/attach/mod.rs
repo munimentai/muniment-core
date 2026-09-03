@@ -78,6 +78,9 @@ pub use approval::*;
 pub use approval_present::*;
 pub use artifact::*;
 pub use authorization::*;
+pub use companion_pairing::{
+    approval_waiter_with_claims, ApprovalDecision, ApprovalWaiter, ClaimedApprovalWaiter,
+};
 pub use companion_registry::*;
 #[cfg(target_os = "linux")]
 pub use connection_route::*;

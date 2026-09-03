@@ -800,6 +800,7 @@ where
                 peer_uid: credentials.uid,
                 peer_pid: credentials.pid as u32,
             },
+            first_frame: None,
             registry,
             handoff_nonce,
         },
