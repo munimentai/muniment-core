@@ -121,10 +121,22 @@ mod unix_tests {
         frame
     }
 
-    fn hello_frame() -> Vec<u8> {
+    fn hello_frame_for_kind(kind: &str) -> Vec<u8> {
         frame(
-            br#"{"protocol":"muniment.attach/1","client":{"kind":"editor-extension","version":"0.0.1"},"supported":{"min":1,"max":1},"client_nonce":"nonce","authorized_client_id":"018f0000-0000-7000-8000-000000000099"}"#,
+            serde_json::json!({
+                "protocol": "muniment.attach/1",
+                "client": {"kind": kind, "version": "0.0.1"},
+                "supported": {"min": 1, "max": 1},
+                "client_nonce": "nonce",
+                "authorized_client_id": "018f0000-0000-7000-8000-000000000099"
+            })
+            .to_string()
+            .as_bytes(),
         )
+    }
+
+    fn hello_frame() -> Vec<u8> {
+        hello_frame_for_kind("desktop-client")
     }
 
     fn read_all(mut stream: UnixStream) -> Vec<u8> {
@@ -240,7 +252,7 @@ mod unix_tests {
         let WindowsAttachSessionOutcome::DesktopClient(admitted) = outcome.unwrap() else {
             panic!("expected the desktop-client route");
         };
-        assert_eq!(admitted.companion_kind, "editor-extension");
+        assert_eq!(admitted.companion_kind, "desktop-client");
         assert_eq!(admitted.companion_version, "0.0.1");
         assert_eq!(
             service.create_provenance,
@@ -286,6 +298,58 @@ mod unix_tests {
                 .unwrap();
         assert_eq!(welcome_length + consumed, response.len());
         assert!(!grant.capability.is_empty());
+    }
+
+    #[test]
+    fn matching_desktop_presenter_is_rejected_as_unauthorized() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client.write_all(&hello_frame_for_kind("desktop")).unwrap();
+
+        assert_eq!(
+            serve_windows_attach_session_with_reader(
+                &mut server,
+                &reader(&[1, 2, 3], &[1, 2, 3]),
+                &route_reader("/Program Files/Muniment/muniment.exe"),
+                Some(expected_desktop_executable()),
+                "1.2.3",
+                deadline(),
+                &mut EmptyService,
+            ),
+            Err(WindowsAttachSessionError::ApprovalPresenterUnavailable)
+        );
+
+        drop(server);
+        let response = read_all(client);
+        let (error, consumed) = decode_frame::<ErrorEnvelope>(&response).unwrap().unwrap();
+        assert_eq!(consumed, response.len());
+        assert_eq!(error.error.code(), ErrorCode::Unauthorized);
+    }
+
+    #[test]
+    fn matching_desktop_companion_reaches_companion_exchange() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client
+            .write_all(&hello_frame_for_kind("editor-extension"))
+            .unwrap();
+
+        assert_eq!(
+            serve_windows_attach_session_with_reader(
+                &mut server,
+                &reader(&[1, 2, 3], &[1, 2, 3]),
+                &route_reader("/Program Files/Muniment/muniment.exe"),
+                Some(expected_desktop_executable()),
+                "1.2.3",
+                deadline(),
+                &mut EmptyService,
+            ),
+            Ok(WindowsAttachSessionOutcome::Companion)
+        );
+
+        drop(server);
+        let response = read_all(client);
+        let (welcome, consumed) = decode_frame::<Welcome>(&response).unwrap().unwrap();
+        assert_eq!(consumed, response.len());
+        assert_eq!(welcome.authorization, Authorization::PairingRequired);
     }
 
     #[test]
@@ -429,7 +493,7 @@ mod unix_tests {
     }
 
     #[test]
-    fn malformed_desktop_frame_writes_protocol_error() {
+    fn malformed_desktop_frame_returns_malformed_frame() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         client.write_all(&frame(b"{")).unwrap();
 
@@ -443,15 +507,10 @@ mod unix_tests {
                 deadline(),
                 &mut EmptyService,
             ),
-            Err(WindowsAttachSessionError::DesktopClientAdmission(
-                DesktopClientAdmissionError::MalformedFrame
-            ))
+            Err(WindowsAttachSessionError::MalformedFrame)
         );
         drop(server);
-        let response = read_all(client);
-        let (error, consumed) = decode_frame::<ErrorEnvelope>(&response).unwrap().unwrap();
-        assert_eq!(consumed, response.len());
-        assert_eq!(error.error.code(), ErrorCode::MalformedFrame);
+        assert!(read_all(client).is_empty());
     }
 }
 

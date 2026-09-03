@@ -6,10 +6,11 @@ use std::time::Instant;
 use super::desktop_service_message::CompanionProvenance;
 use super::thread_service::ThreadListService;
 use super::{
-    admit_desktop_client_over_stream_with_prefix, decode_frame, encode_frame,
-    name_windows_attach_connection_route, negotiate_first, read_exact_before,
-    verify_windows_attach_peer_with_reader, welcome, write_all_before, AdmittedDesktopClient,
-    AttachSessionError, DeadlineStream, DesktopClientAdmissionError, FirstMessage, VersionRange,
+    admit_desktop_client_over_stream_with_frame, decode_frame, encode_frame,
+    name_windows_attach_connection_route, name_windows_desktop_attach_connection_route,
+    negotiate_first, read_exact_before, verify_windows_attach_peer_with_reader, welcome,
+    write_all_before, AdmittedDesktopClient, AttachSessionError, DeadlineStream,
+    DesktopClientAdmissionError, FirstMessage, ProtocolError, VersionRange,
     WindowsAttachConnectionRoute, WindowsAttachPeerReader, WindowsAttachRouteReader,
     WindowsPeerError, MAX_FRAME_LENGTH,
 };
@@ -17,6 +18,7 @@ use super::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowsAttachSessionError {
     Read,
+    ApprovalPresenterUnavailable,
     PeerRejected(WindowsPeerError),
     DesktopClientAdmission(DesktopClientAdmissionError),
     DesktopClientSession(AttachSessionError),
@@ -52,15 +54,32 @@ fn admit_windows_attach_route<S: DeadlineStream>(
         });
 
     if let WindowsAttachConnectionRoute::DesktopClient { peer_pid } = route {
-        return admit_desktop_client_over_stream_with_prefix(
-            stream,
-            prefix,
-            desktop_version,
-            None,
-            deadline,
-        )
-        .map(|admitted| Some((admitted, peer_pid)))
-        .map_err(WindowsAttachSessionError::DesktopClientAdmission);
+        let frame = read_desktop_first_frame(stream, prefix, deadline)?;
+        return match name_windows_desktop_attach_connection_route(peer_pid, &frame) {
+            WindowsAttachConnectionRoute::ApprovalPresenter => {
+                super::desktop_admission::write_protocol_error(
+                    stream,
+                    ProtocolError::unauthorized(),
+                    deadline,
+                );
+                Err(WindowsAttachSessionError::ApprovalPresenterUnavailable)
+            }
+            WindowsAttachConnectionRoute::DesktopClient { peer_pid } => {
+                admit_desktop_client_over_stream_with_frame(
+                    stream,
+                    &frame,
+                    desktop_version,
+                    None,
+                    deadline,
+                )
+                .map(|admitted| Some((admitted, peer_pid)))
+                .map_err(WindowsAttachSessionError::DesktopClientAdmission)
+            }
+            WindowsAttachConnectionRoute::Companion => {
+                serve_companion_exchange_with_frame(stream, &frame, desktop_version, deadline)?;
+                Ok(None)
+            }
+        };
     }
 
     let length = u32::from_be_bytes(prefix) as usize;
@@ -71,8 +90,49 @@ fn admit_windows_attach_route<S: DeadlineStream>(
     frame[..4].copy_from_slice(&prefix);
     read_exact_before(stream, &mut frame[4..], deadline)
         .map_err(|_| WindowsAttachSessionError::Read)?;
-    let message = decode_frame::<FirstMessage>(&frame)
+    serve_companion_exchange_with_frame(stream, &frame, desktop_version, deadline)?;
+    Ok(None)
+}
+
+fn read_desktop_first_frame<S: DeadlineStream>(
+    stream: &mut S,
+    prefix: [u8; 4],
+    deadline: Instant,
+) -> Result<Vec<u8>, WindowsAttachSessionError> {
+    let length = u32::from_be_bytes(prefix) as usize;
+    if length > MAX_FRAME_LENGTH {
+        super::desktop_admission::write_protocol_error(
+            stream,
+            ProtocolError::payload_too_large(),
+            deadline,
+        );
+        return Err(WindowsAttachSessionError::DesktopClientAdmission(
+            DesktopClientAdmissionError::PayloadTooLarge,
+        ));
+    }
+    let mut frame = vec![0_u8; 4 + length];
+    frame[..4].copy_from_slice(&prefix);
+    read_exact_before(stream, &mut frame[4..], deadline).map_err(|error| {
+        WindowsAttachSessionError::DesktopClientAdmission(
+            if super::deadline_io::is_timeout(&error) {
+                DesktopClientAdmissionError::Timeout
+            } else {
+                DesktopClientAdmissionError::Closed
+            },
+        )
+    })?;
+    Ok(frame)
+}
+
+fn serve_companion_exchange_with_frame<S: DeadlineStream>(
+    stream: &mut S,
+    frame: &[u8],
+    desktop_version: &str,
+    deadline: Instant,
+) -> Result<(), WindowsAttachSessionError> {
+    let message = decode_frame::<FirstMessage>(frame)
         .map_err(|_| WindowsAttachSessionError::MalformedFrame)?
+        .filter(|(_, consumed)| *consumed == frame.len())
         .ok_or(WindowsAttachSessionError::MalformedFrame)?
         .0;
     let selected = negotiate_first(message, VersionRange { min: 1, max: 1 })
@@ -91,8 +151,7 @@ fn admit_windows_attach_route<S: DeadlineStream>(
     let response = welcome(selected, desktop_version, server_nonce, approval_challenge);
     let response =
         encode_frame(&response).map_err(|_| WindowsAttachSessionError::MalformedFrame)?;
-    write_all_before(stream, &response, deadline).map_err(|_| WindowsAttachSessionError::Write)?;
-    Ok(None)
+    write_all_before(stream, &response, deadline).map_err(|_| WindowsAttachSessionError::Write)
 }
 
 fn serve_admitted_desktop_client<S: DeadlineStream, H: ThreadListService>(

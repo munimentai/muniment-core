@@ -2,11 +2,14 @@
 
 use std::path::{Path, PathBuf};
 
+use muniment_attach::{decode_frame, Hello};
+
 use super::WindowsPeerReadError;
 
 /// The handler for a new Windows attach connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowsAttachConnectionRoute {
+    ApprovalPresenter,
     DesktopClient { peer_pid: u32 },
     Companion,
 }
@@ -36,6 +39,25 @@ pub fn name_windows_attach_connection_route(
         WindowsAttachConnectionRoute::DesktopClient { peer_pid }
     } else {
         WindowsAttachConnectionRoute::Companion
+    }
+}
+
+/// Names the final route for a desktop-executable peer from its first frame.
+pub fn name_windows_desktop_attach_connection_route(
+    peer_pid: u32,
+    first_frame: &[u8],
+) -> WindowsAttachConnectionRoute {
+    let Ok(Some((hello, consumed))) = decode_frame::<Hello>(first_frame) else {
+        return WindowsAttachConnectionRoute::Companion;
+    };
+    if consumed != first_frame.len() {
+        return WindowsAttachConnectionRoute::Companion;
+    }
+
+    match hello.client.kind.as_str() {
+        "desktop" => WindowsAttachConnectionRoute::ApprovalPresenter,
+        "desktop-client" => WindowsAttachConnectionRoute::DesktopClient { peer_pid },
+        _ => WindowsAttachConnectionRoute::Companion,
     }
 }
 
