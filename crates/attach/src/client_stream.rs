@@ -104,7 +104,7 @@ fn remaining(deadline: Instant) -> Result<Duration, ClientError> {
         .ok_or(ClientError::Timeout)
 }
 
-fn map_io_error(error: io::Error) -> ClientError {
+pub(crate) fn map_io_error(error: io::Error) -> ClientError {
     match error.kind() {
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => ClientError::Timeout,
         io::ErrorKind::UnexpectedEof

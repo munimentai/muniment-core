@@ -505,8 +505,8 @@ mod linux {
         RunStreamSubscription, ThreadCreateAccepted, ThreadListPage, ThreadOpenPage,
     };
     use crate::client_stream::{
-        read_approval_value, read_approval_value_with_prefix, read_exact_before, read_value,
-        write_all_before,
+        map_io_error, read_approval_value, read_approval_value_with_prefix, read_exact_before,
+        read_value, write_all_before,
     };
     use crate::desktop_client::{handshake_desktop_client, DesktopClient};
     use crate::desktop_client_holder::DesktopClientHolder;
@@ -2304,10 +2304,6 @@ mod linux {
 
             self.answer_present_request(request, |approval| choose(approval))
         }
-
-        pub fn into_stream(self) -> UnixStream {
-            self.stream
-        }
     }
 
     impl std::fmt::Debug for MigrationControlClient {
@@ -2390,10 +2386,6 @@ mod linux {
                 }
                 _ => Err(ClientError::UnexpectedMessage.into()),
             }
-        }
-
-        pub fn into_stream(self) -> UnixStream {
-            self.stream
         }
     }
 
@@ -3122,16 +3114,6 @@ mod linux {
             }
         }
         hash.iter().map(|word| format!("{word:08x}")).collect()
-    }
-
-    fn map_io_error(error: io::Error) -> ClientError {
-        match error.kind() {
-            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => ClientError::Timeout,
-            io::ErrorKind::UnexpectedEof
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::BrokenPipe => ClientError::ConnectionClosed,
-            _ => ClientError::DesktopUnavailable,
-        }
     }
 }
 
