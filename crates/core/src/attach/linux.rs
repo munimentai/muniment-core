@@ -14,12 +14,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+pub use super::companion_pairing::{
+    approval_waiter_with_claims, ApprovalDecision, ApprovalWaiter,
+    AuthorizationSessionDependencies, ClaimedApprovalWaiter,
+};
+use super::companion_pairing::{
+    serve_pairing_exchange, MigrationDetour, PairingPeer, PairingSession, SessionClock,
+    SessionTokens,
+};
 #[cfg(test)]
 use super::companion_session::post_dispatch_deadline;
-use super::companion_session::{
-    read_before, read_request_before, serve_requests as serve_companion_requests, write_before,
-    write_protocol_error, write_request_error, AuthorizedSession,
-};
+use super::companion_session::{read_request_before, write_before, write_request_error};
 use super::desktop_dispatch::{dispatch_request, hex, SessionRegistries};
 pub use super::desktop_dispatch::{
     MAX_PERMISSION_GATE_ID_LENGTH, MAX_RUN_MESSAGE_TEXT_LENGTH, MAX_RUN_START_CONTEXT_LENGTH,
@@ -42,9 +47,8 @@ pub use super::thread_service::{
 pub use super::AttachSessionError;
 pub use super::EntitlementSnapshotResult;
 use super::{
-    encode_frame, welcome, Approval, AuthorizationClock, AuthorizationError, AuthorizationState,
-    AuthorizationTokenGenerator, ConnectionBinding, FirstMessage, NegotiationError, Operation,
-    Protocol, ProtocolError, Response, Success, VersionRange, CHALLENGE_LIFETIME, MAX_FRAME_LENGTH,
+    encode_frame, AuthorizationClock, AuthorizationTokenGenerator, Operation, Protocol,
+    ProtocolError, Response, Success,
 };
 use crate::browser_control::LinuxProcReader;
 
@@ -55,7 +59,6 @@ const PRIVATE_MODE: libc::mode_t = 0o700;
 const PRIVATE_FILE_MODE: libc::mode_t = 0o600;
 const SOCKET_MODE: libc::mode_t = 0o600;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
-const DESKTOP_PROTOCOL: VersionRange = VersionRange { min: 1, max: 1 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttachListenerStartFailure {
@@ -467,70 +470,6 @@ pub struct PeerCredentials {
     pub gid: libc::gid_t,
 }
 
-/// The result of the explicit, visible desktop approval prompt.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ApprovalDecision {
-    Approve(Approval),
-    Deny,
-}
-
-/// Bounded seam for receiving desktop approval actions.
-pub trait ApprovalWaiter {
-    /// Returns the next action available within `remaining`, or `None` when that
-    /// bound expires. Implementations must not wait longer than `remaining`.
-    fn wait(
-        &mut self,
-        challenge: &super::PairingChallenge,
-        claimed_kind: &str,
-        claimed_version: &str,
-        remaining: Duration,
-    ) -> Option<ApprovalDecision>;
-}
-
-impl<F> ApprovalWaiter for F
-where
-    F: FnMut(&super::PairingChallenge, Duration) -> Option<ApprovalDecision>,
-{
-    fn wait(
-        &mut self,
-        challenge: &super::PairingChallenge,
-        _: &str,
-        _: &str,
-        remaining: Duration,
-    ) -> Option<ApprovalDecision> {
-        self(challenge, remaining)
-    }
-}
-
-pub struct ClaimedApprovalWaiter<F>(F);
-
-pub fn approval_waiter_with_claims<F>(waiter: F) -> ClaimedApprovalWaiter<F> {
-    ClaimedApprovalWaiter(waiter)
-}
-
-impl<F> ApprovalWaiter for ClaimedApprovalWaiter<F>
-where
-    F: FnMut(&super::PairingChallenge, &str, &str, Duration) -> Option<ApprovalDecision>,
-{
-    fn wait(
-        &mut self,
-        challenge: &super::PairingChallenge,
-        claimed_kind: &str,
-        claimed_version: &str,
-        remaining: Duration,
-    ) -> Option<ApprovalDecision> {
-        (self.0)(challenge, claimed_kind, claimed_version, remaining)
-    }
-}
-
-/// Injectable dependencies for the authorization phase of a Linux session.
-pub struct AuthorizationSessionDependencies<R, C, G, W> {
-    pub fill_random: R,
-    pub clock: C,
-    pub tokens: G,
-    pub approvals: W,
-}
-
 /// Injectable authority for migration control session admission.
 pub struct MigrationControlSessionDependencies<'a> {
     pub expected_executable: &'a Path,
@@ -742,21 +681,6 @@ where
     )
 }
 
-#[derive(Clone)]
-struct SessionClock(Instant);
-impl AuthorizationClock for SessionClock {
-    fn now(&self) -> Duration {
-        self.0.elapsed()
-    }
-}
-
-struct SessionTokens;
-impl AuthorizationTokenGenerator for SessionTokens {
-    fn fill(&mut self, bytes: &mut [u8]) -> Result<(), super::AuthorizationRandomnessError> {
-        getrandom::fill(bytes).map_err(|_| super::AuthorizationRandomnessError)
-    }
-}
-
 /// Negotiates and waits for a deterministic desktop approval decision.
 #[doc(hidden)]
 pub fn run_authenticated_session_with_authorization<R, C, G, W, S>(
@@ -863,67 +787,49 @@ where
     W: ApprovalWaiter,
     S: ThreadListService,
 {
-    let AuthorizationSessionDependencies {
-        mut fill_random,
-        clock,
-        tokens,
-        mut approvals,
-    } = dependencies;
-    let result = (|| {
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .ok_or(AttachSessionError::Timeout)?;
-        let mut prefix = [0u8; 4];
-        read_before(&mut stream, &mut prefix, deadline)?;
-        let length = u32::from_be_bytes(prefix) as usize;
-        if length > MAX_FRAME_LENGTH {
-            write_protocol_error(&mut stream, ProtocolError::payload_too_large(), deadline);
-            return Err(AttachSessionError::PayloadTooLarge);
-        }
-        let mut frame = Vec::with_capacity(4 + length);
-        frame.extend_from_slice(&prefix);
-        frame.resize(4 + length, 0);
-        read_before(&mut stream, &mut frame[4..], deadline)?;
-        let message = match super::decode_frame::<FirstMessage>(&frame) {
-            Ok(Some((message, _))) => message,
-            _ => {
-                write_protocol_error(&mut stream, ProtocolError::malformed_frame(), deadline);
-                return Err(AttachSessionError::MalformedFrame);
-            }
-        };
-        let (
-            client_nonce,
-            authorized_client_id,
-            authorized_client_credential,
-            companion_kind,
-            companion_version,
-        ) = match &message {
-            FirstMessage::Hello(hello) => (
-                hello.client_nonce.clone(),
-                hello.authorized_client_id.as_str().to_owned(),
-                hello.authorized_client_credential.clone(),
-                hello.client.kind.clone(),
-                hello.client.version.clone(),
-            ),
-            _ => {
-                write_protocol_error(&mut stream, ProtocolError::malformed_frame(), deadline);
-                return Err(AttachSessionError::MalformedFrame);
-            }
-        };
-        let selected = match super::negotiate_first(message, DESKTOP_PROTOCOL) {
-            Ok(selected) => selected,
-            Err(NegotiationError::Incompatible(error)) => {
-                write_protocol_error(&mut stream, error, deadline);
-                return Err(AttachSessionError::ProtocolIncompatible);
-            }
-            Err(_) => {
-                write_protocol_error(&mut stream, ProtocolError::malformed_frame(), deadline);
-                return Err(AttachSessionError::MalformedFrame);
-            }
-        };
+    let SessionRegistryDependencies {
+        registry,
+        migration,
+        handoff_nonce,
+    } = session;
+    let result = serve_pairing_exchange(
+        &mut stream,
+        PairingSession {
+            peer: PairingPeer {
+                companion_identity: format!("{}:{}", credentials.uid, credentials.pid),
+                peer_uid: credentials.uid,
+                peer_pid: credentials.pid as u32,
+            },
+            registry,
+            handoff_nonce,
+        },
+        desktop_version,
+        timeout,
+        dependencies,
+        service,
+        LinuxMigrationDetour {
+            migration,
+            credentials,
+            desktop_version,
+            timeout,
+        },
+    );
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    result
+}
 
-        let migration_peer = session.migration.as_ref().is_some_and(|migration| {
-            u32::try_from(credentials.pid).is_ok_and(|peer_pid| {
+/// Supplies the Linux migration control detour to the pairing exchange.
+struct LinuxMigrationDetour<'a> {
+    migration: Option<MigrationControlSessionDependencies<'a>>,
+    credentials: PeerCredentials,
+    desktop_version: &'a str,
+    timeout: Duration,
+}
+
+impl<S: ThreadListService> MigrationDetour<UnixStream, S> for LinuxMigrationDetour<'_> {
+    fn admits_peer(&self) -> bool {
+        self.migration.as_ref().is_some_and(|migration| {
+            u32::try_from(self.credentials.pid).is_ok_and(|peer_pid| {
                 super::verify_migration_control_peer_with_reader(
                     peer_pid,
                     migration.expected_executable,
@@ -931,179 +837,30 @@ where
                 )
                 .is_ok()
             })
-        });
+        })
+    }
 
-        let mut nonce = [0u8; 16];
-        fill_random(&mut nonce).map_err(|_| AttachSessionError::Randomness)?;
-        let server_nonce = hex(&nonce);
-        let binding = ConnectionBinding {
-            connection_id: server_nonce.clone(),
-            client_nonce,
-            server_nonce: server_nonce.clone(),
-            companion_identity: format!("{}:{}", credentials.uid, credentials.pid),
-            companion_kind: companion_kind.clone(),
-        };
-        if migration_peer {
-            return run_migration_control_session(
-                MigrationSessionInputs {
-                    stream: &mut stream,
-                    credentials,
-                    desktop_version,
-                    selected,
-                    timeout,
-                    server_nonce,
-                },
-                &mut fill_random,
-                service,
-            );
-        }
-        let reconnect = authorized_client_credential
-            .as_deref()
-            .and_then(|credential| {
-                let approval = service.reconnect_approval()?;
-                service
-                    .authorize_client(
-                        &authorized_client_id,
-                        Some(credential),
-                        "",
-                        &companion_kind,
-                        &companion_version,
-                    )
-                    .ok()
-                    .map(|credential| (approval, credential))
-            });
-        let mut authorization = AuthorizationState::new(clock.clone(), tokens, binding.clone());
-        let challenge_expires_at = clock.now() + CHALLENGE_LIFETIME;
-        let challenge = authorization
-            .issue_challenge()
-            .map_err(|error| match error {
-                AuthorizationError::Randomness => AttachSessionError::Randomness,
-                _ => AttachSessionError::Authorization,
-            })?;
-        let authorization_deadline = Instant::now()
-            .checked_add(CHALLENGE_LIFETIME)
-            .ok_or(AttachSessionError::Timeout)?;
-        let response = if reconnect.is_some() {
-            muniment_attach::reconnect_welcome(
+    fn serve(
+        self,
+        stream: &mut UnixStream,
+        selected: u32,
+        server_nonce: String,
+        fill_random: &mut dyn FnMut(&mut [u8]) -> Result<(), ()>,
+        service: &mut S,
+    ) -> Result<(), AttachSessionError> {
+        run_migration_control_session(
+            MigrationSessionInputs {
+                stream,
+                credentials: self.credentials,
+                desktop_version: self.desktop_version,
                 selected,
-                desktop_version,
+                timeout: self.timeout,
                 server_nonce,
-                challenge.as_str(),
-            )
-        } else {
-            welcome(selected, desktop_version, server_nonce, challenge.as_str())
-        };
-        let response = match session.handoff_nonce {
-            Some(handoff_nonce) => response.with_handoff_nonce(handoff_nonce),
-            None => response,
-        };
-        write_before(
-            &mut stream,
-            &encode_frame(&response).map_err(|_| AttachSessionError::MalformedFrame)?,
-            deadline,
-        )?;
-
-        let (approval, reconnect_credential) = match reconnect {
-            Some((approval, credential)) => (approval, Some(credential)),
-            None => {
-                let remaining = challenge_expires_at.saturating_sub(clock.now());
-                let Some(ApprovalDecision::Approve(approval)) =
-                    approvals.wait(&challenge, &companion_kind, &companion_version, remaining)
-                else {
-                    return Ok(());
-                };
-                (approval, None)
-            }
-        };
-        let (capability, grant) = authorization
-            .approve(&challenge, approval)
-            .map_err(|error| match error {
-                AuthorizationError::Randomness => AttachSessionError::Randomness,
-                AuthorizationError::ChallengeExpired => AttachSessionError::Timeout,
-                _ => AttachSessionError::Authorization,
-            })?;
-        if reconnect_credential.is_none() {
-            // Reject one already-queued repeat action against the consumed challenge.
-            if let Some(ApprovalDecision::Approve(approval)) = approvals.wait(
-                &challenge,
-                &companion_kind,
-                &companion_version,
-                Duration::ZERO,
-            ) {
-                if authorization.approve(&challenge, approval)
-                    != Err(AuthorizationError::ChallengeConsumed)
-                {
-                    return Err(AttachSessionError::Authorization);
-                }
-            }
-        }
-        let remaining = grant.expires_at.saturating_sub(clock.now()).as_secs();
-        let mut workspace_scopes = std::collections::BTreeMap::new();
-        workspace_scopes.insert(grant.workspace.clone(), grant.scopes.clone());
-        let client_credential = match reconnect_credential {
-            Some(credential) => credential,
-            None => {
-                let mut credential_bytes = [0u8; 32];
-                fill_random(&mut credential_bytes).map_err(|_| AttachSessionError::Randomness)?;
-                let issued_credential = hex(&credential_bytes);
-                match service.authorize_client(
-                    &authorized_client_id,
-                    authorized_client_credential.as_deref(),
-                    &issued_credential,
-                    &companion_kind,
-                    &companion_version,
-                ) {
-                    Ok(credential) => credential,
-                    Err(error) => {
-                        write_protocol_error(&mut stream, error, authorization_deadline);
-                        return Err(AttachSessionError::Authorization);
-                    }
-                }
-            }
-        };
-        let response = super::authorized_with_client_credential(
-            &grant.profile,
-            capability.as_str(),
-            remaining,
-            grant.idle_timeout.as_secs(),
-            workspace_scopes,
-            client_credential.clone(),
-        );
-        let connection_event_id = super::Id::new(uuid::Uuid::new_v4().to_string())
-            .map_err(|_| AttachSessionError::Randomness)?;
-        let connection = session.registry.register(
-            client_credential,
-            capability.as_str().to_owned(),
-            connection_event_id,
-        );
-        write_before(
-            &mut stream,
-            &encode_frame(&response).map_err(|_| AttachSessionError::MalformedFrame)?,
-            authorization_deadline,
-        )?;
-        let provenance = CompanionProvenance {
-            profile: grant.profile.clone(),
-            companion_kind: binding.companion_kind.clone(),
-            companion_version,
-            peer_uid: credentials.uid,
-            peer_pid: credentials.pid as u32,
-        };
-        serve_requests(
-            &mut stream,
-            timeout,
-            AuthorizedSession {
-                binding: &binding,
-                provenance: &provenance,
-                workspace: &grant.workspace,
-                connection: &connection,
             },
-            &mut authorization,
+            fill_random,
             service,
-        )?;
-        Ok(())
-    })();
-    let _ = stream.shutdown(std::net::Shutdown::Both);
-    result
+        )
+    }
 }
 
 struct MigrationSessionInputs<'a> {
@@ -1117,7 +874,7 @@ struct MigrationSessionInputs<'a> {
 
 fn run_migration_control_session<S: ThreadListService>(
     inputs: MigrationSessionInputs<'_>,
-    fill_random: &mut impl FnMut(&mut [u8]) -> Result<(), ()>,
+    fill_random: &mut dyn FnMut(&mut [u8]) -> Result<(), ()>,
     service: &mut S,
 ) -> Result<(), AttachSessionError> {
     let MigrationSessionInputs {
@@ -1216,21 +973,6 @@ pub fn serve_desktop_client_session<S: ThreadListService>(
     );
     let _ = stream.shutdown(std::net::Shutdown::Both);
     result
-}
-
-fn serve_requests<C, G, S>(
-    stream: &mut UnixStream,
-    timeout: Duration,
-    session: AuthorizedSession<'_>,
-    authorization: &mut AuthorizationState<C, G>,
-    service: &mut S,
-) -> Result<(), AttachSessionError>
-where
-    C: AuthorizationClock,
-    G: AuthorizationTokenGenerator,
-    S: ThreadListService,
-{
-    serve_companion_requests(stream, timeout, session, authorization, service)
 }
 
 #[cfg(test)]

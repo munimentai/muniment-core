@@ -5,6 +5,7 @@ mod approval;
 mod approval_present;
 mod artifact;
 mod authorization;
+mod companion_pairing;
 mod companion_registry;
 mod companion_session;
 #[cfg(target_os = "linux")]
