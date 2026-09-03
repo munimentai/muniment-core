@@ -510,7 +510,9 @@ mod linux {
     };
     use crate::desktop_client::{handshake_desktop_client, DesktopClient};
     use crate::desktop_client_holder::DesktopClientHolder;
-    use crate::desktop_client_stop::{DesktopClientStopHandle, DesktopClientStopState};
+    use crate::desktop_client_stop::{
+        DesktopClientStopHandle, DesktopClientStopState, ShutdownHook,
+    };
     use crate::desktop_supervisor::serve_desktop_client_with;
     use crate::protocol_helpers::{
         deadline, fresh_nonce, fresh_request_id, is_hex_secret, is_rfc3339, map_frame_error,
@@ -2120,10 +2122,20 @@ mod linux {
         inner: Arc<(Mutex<ApprovalPresenterStopState>, Condvar)>,
     }
 
-    #[derive(Debug, Default)]
+    #[derive(Default)]
     struct ApprovalPresenterStopState {
         stopped: bool,
-        stream: Option<UnixStream>,
+        shutdown: Option<ShutdownHook>,
+    }
+
+    impl std::fmt::Debug for ApprovalPresenterStopState {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("ApprovalPresenterStopState")
+                .field("stopped", &self.stopped)
+                .field("shutdown", &self.shutdown.is_some())
+                .finish()
+        }
     }
 
     impl ApprovalPresenterStopHandle {
@@ -2135,10 +2147,23 @@ mod linux {
             let (state, wake) = &*self.inner;
             let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
             state.stopped = true;
-            if let Some(stream) = state.stream.take() {
-                let _ = stream.shutdown(std::net::Shutdown::Both);
+            if let Some(shutdown) = state.shutdown.take() {
+                shutdown();
             }
             wake.notify_all();
+        }
+
+        fn wait_for_retry(&self, retry_interval: Duration) -> bool {
+            let (state, wake) = &*self.inner;
+            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+            state.shutdown = None;
+            if state.stopped {
+                return false;
+            }
+            let (state, _) = wake
+                .wait_timeout_while(state, retry_interval, |state| !state.stopped)
+                .unwrap_or_else(|error| error.into_inner());
+            !state.stopped
         }
     }
 
@@ -2466,7 +2491,6 @@ mod linux {
         mut choose: impl FnMut(&ApprovalPresentRequest) -> ApprovalDecision,
     ) {
         loop {
-            let (state, wake) = &*stop.inner;
             let connected = interruptible_connect(endpoint, &stop);
 
             if let Some(stream) = connected {
@@ -2477,18 +2501,9 @@ mod linux {
                     let _ = presenter.serve(&mut choose);
                     observe(false);
                 }
-                let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
-                state.stream = None;
             }
 
-            let state = state.lock().unwrap_or_else(|error| error.into_inner());
-            if state.stopped {
-                return;
-            }
-            let (state, _) = wake
-                .wait_timeout_while(state, retry_interval, |state| !state.stopped)
-                .unwrap_or_else(|error| error.into_inner());
-            if state.stopped {
+            if !stop.wait_for_retry(retry_interval) {
                 return;
             }
         }
@@ -2654,8 +2669,13 @@ mod linux {
         fn stopped(&self) -> bool {
             self.stopped
         }
+
         fn set_stream(&mut self, stream: Option<UnixStream>) {
-            self.stream = stream;
+            self.shutdown = stream.map(|stream| {
+                Box::new(move || {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                }) as ShutdownHook
+            });
         }
     }
 
