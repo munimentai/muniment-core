@@ -5,7 +5,7 @@ mod unix_tests {
     use std::net::Shutdown;
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use muniment_core::attach::desktop_service_message::{
         CompanionProvenance, ThreadCreateAccepted,
@@ -14,9 +14,8 @@ mod unix_tests {
     use muniment_core::attach::thread_service::ThreadListService;
     use muniment_core::attach::{
         approval_waiter_with_claims, decode_frame, encode_frame,
-        serve_macos_attach_session_with_reader, serve_macos_attach_session_with_reader_and_state,
-        Approval, ApprovalCoordinator, ApprovalDecision, Authorization,
-        DesktopClientAuthorizedGrant, Envelope, ErrorCode, ErrorEnvelope, Id,
+        serve_macos_attach_session_with_reader_and_state, Approval, ApprovalCoordinator,
+        ApprovalDecision, Authorization, DesktopClientAuthorizedGrant, Envelope, Id,
         MacosAttachRouteReader, MacosAttachSessionError, MacosAttachSessionOutcome,
         MacosPeerReadError, Operation, Protocol, ProtocolError, Request, Welcome,
     };
@@ -64,10 +63,6 @@ mod unix_tests {
         Path::new("/Applications/Muniment.app/Contents/MacOS/muniment")
     }
 
-    fn deadline() -> Instant {
-        Instant::now() + Duration::from_secs(2)
-    }
-
     fn hello_frame(client_kind: &str) -> Vec<u8> {
         let body = format!(
             r#"{{"protocol":"muniment.attach/1","client":{{"kind":"{client_kind}","version":"0.0.1"}},"supported":{{"min":1,"max":1}},"client_nonce":"nonce","authorized_client_id":"018f0000-0000-7000-8000-000000000099"}}"#
@@ -90,20 +85,29 @@ mod unix_tests {
 
     #[test]
     fn desktop_route_serves_requests_with_live_peer_pid() {
-        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         let session = std::thread::spawn(move || {
             let mut service = TestService::default();
-            let outcome = serve_macos_attach_session_with_reader(
-                &mut server,
+            let outcome = serve_macos_attach_session_with_reader_and_state(
+                server,
                 &route_reader("/Applications/Muniment.app/Contents/MacOS/muniment"),
                 501,
                 expected_desktop_executable(),
                 "1.2.3",
-                deadline(),
+                Duration::from_secs(2),
                 &mut service,
+                None,
+                ApprovalCoordinator::default(),
+                approval_waiter_with_claims(
+                    |_: &muniment_core::attach::PairingChallenge, _: &str, _: &str, _: Duration| {
+                        None::<ApprovalDecision>
+                    },
+                ),
+                &LiveConnectionRegistry::default(),
+                |_| {},
             );
             (outcome, service)
         });
@@ -257,54 +261,69 @@ mod unix_tests {
     }
 
     #[test]
-    fn presenter_route_writes_protocol_error() {
-        let (mut client, mut server) = UnixStream::pair().unwrap();
+    fn presenter_route_rejects_a_second_presenter() {
+        let (mut client, server) = UnixStream::pair().unwrap();
         client.write_all(&hello_frame("desktop")).unwrap();
-        let outcome = serve_macos_attach_session_with_reader(
-            &mut server,
+        let coordinator = ApprovalCoordinator::default();
+        let _presenter = coordinator.claim_presenter(|_| false).unwrap();
+        let outcome = serve_macos_attach_session_with_reader_and_state(
+            server,
             &route_reader("/Applications/Muniment.app/Contents/MacOS/muniment"),
             501,
             expected_desktop_executable(),
             "1.2.3",
-            deadline(),
+            Duration::from_secs(2),
             &mut TestService::default(),
+            None,
+            coordinator,
+            approval_waiter_with_claims(
+                |_: &muniment_core::attach::PairingChallenge, _: &str, _: &str, _: Duration| {
+                    None::<ApprovalDecision>
+                },
+            ),
+            &LiveConnectionRegistry::default(),
+            |_| {},
         );
 
         assert_eq!(
             outcome,
             Err(MacosAttachSessionError::ApprovalPresenterUnavailable)
         );
-        drop(server);
-        let error_frame = read_frame(&mut client);
-        let (error, consumed) = decode_frame::<ErrorEnvelope>(&error_frame)
-            .unwrap()
-            .unwrap();
-        assert_eq!(consumed, error_frame.len());
-        assert_eq!(error.error.code(), ErrorCode::Unauthorized);
+        let _: Welcome = decode_frame(&read_frame(&mut client)).unwrap().unwrap().0;
+        let _: DesktopClientAuthorizedGrant =
+            decode_frame(&read_frame(&mut client)).unwrap().unwrap().0;
         assert_eq!(client.read(&mut [0_u8]).unwrap(), 0);
     }
 
     #[test]
-    fn other_desktop_client_kind_keeps_the_companion_exchange() {
-        let (mut client, mut server) = UnixStream::pair().unwrap();
+    fn other_desktop_client_kind_uses_the_pairing_welcome_challenge() {
+        let (mut client, server) = UnixStream::pair().unwrap();
         client.write_all(&hello_frame("editor-extension")).unwrap();
-        let outcome = serve_macos_attach_session_with_reader(
-            &mut server,
+        let outcome = serve_macos_attach_session_with_reader_and_state(
+            server,
             &route_reader("/Applications/Muniment.app/Contents/MacOS/muniment"),
             501,
             expected_desktop_executable(),
             "1.2.3",
-            deadline(),
+            Duration::from_secs(2),
             &mut TestService::default(),
+            None,
+            ApprovalCoordinator::default(),
+            approval_waiter_with_claims(
+                |_: &muniment_core::attach::PairingChallenge, _: &str, _: &str, _: Duration| {
+                    None::<ApprovalDecision>
+                },
+            ),
+            &LiveConnectionRegistry::default(),
+            |_| {},
         );
 
         assert_eq!(outcome, Ok(MacosAttachSessionOutcome::Companion));
-        drop(server);
-        let mut response = Vec::new();
-        client.read_to_end(&mut response).unwrap();
-        let (welcome, consumed) = decode_frame::<Welcome>(&response).unwrap().unwrap();
-        assert_eq!(consumed, response.len());
+        let welcome_frame = read_frame(&mut client);
+        let (welcome, consumed) = decode_frame::<Welcome>(&welcome_frame).unwrap().unwrap();
+        assert_eq!(consumed, welcome_frame.len());
         assert_eq!(welcome.authorization, Authorization::PairingRequired);
         assert_eq!(welcome.desktop_version, "1.2.3");
+        assert_eq!(welcome.approval_challenge.len(), 32);
     }
 }
