@@ -1,46 +1,30 @@
-use std::io;
-use std::net::Shutdown;
-use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::{ApprovalCoordinator, ApprovalPresenterConnection, PresenterGuard, CHALLENGE_LIFETIME};
+use super::{
+    ApprovalCoordinator, ApprovalPresenterConnection, ApprovalPresenterStream, PresenterGuard,
+    CHALLENGE_LIFETIME,
+};
 
 /// Holds the exclusive approval presenter claim for one connection.
-pub struct ApprovalPresenterSession {
+pub struct ApprovalPresenterSession<S: ApprovalPresenterStream> {
     presenter: Option<PresenterGuard>,
-    shutdown: UnixStream,
+    shutdown: S,
 }
 
-impl ApprovalPresenterSession {
+impl<S: ApprovalPresenterStream> ApprovalPresenterSession<S> {
     /// Waits until the peer closes the presenter connection.
     pub fn wait_until_closed(&self) {
-        let mut descriptor = libc::pollfd {
-            fd: self.shutdown.as_raw_fd(),
-            events: 0,
-            revents: 0,
-        };
-        loop {
-            let result = unsafe { libc::poll(&mut descriptor, 1, -1) };
-            if result > 0
-                && descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
-            {
-                return;
-            }
-            if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-                return;
-            }
-        }
+        self.shutdown.wait_until_closed();
     }
 }
 
 /// Claims the coordinator and serves its approval requests over the connection.
-pub fn serve_approval_presenter(
+pub fn serve_approval_presenter<S: ApprovalPresenterStream>(
     coordinator: ApprovalCoordinator,
-    connection: ApprovalPresenterConnection,
-) -> Option<ApprovalPresenterSession> {
+    connection: ApprovalPresenterConnection<S>,
+) -> Option<ApprovalPresenterSession<S>> {
     let shutdown = connection.try_clone_stream().ok()?;
     let connection = Mutex::new(connection);
     let decision_coordinator = coordinator.clone();
@@ -79,9 +63,9 @@ fn lock_before<T>(mutex: &Mutex<T>, deadline: Instant) -> Option<std::sync::Mute
     }
 }
 
-impl Drop for ApprovalPresenterSession {
+impl<S: ApprovalPresenterStream> Drop for ApprovalPresenterSession<S> {
     fn drop(&mut self) {
-        let _ = self.shutdown.shutdown(Shutdown::Both);
+        self.shutdown.close_presenter_stream();
         drop(self.presenter.take());
     }
 }

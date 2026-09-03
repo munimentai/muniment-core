@@ -4,6 +4,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use super::desktop_service_message::CompanionProvenance;
+use super::live_connections::LiveConnectionRegistry;
 use super::thread_service::ThreadListService;
 use super::{
     admit_desktop_client_over_stream_with_frame, decode_frame, encode_frame,
@@ -22,6 +23,7 @@ pub enum WindowsAttachSessionError {
     PeerRejected(WindowsPeerError),
     DesktopClientAdmission(DesktopClientAdmissionError),
     DesktopClientSession(AttachSessionError),
+    CompanionSession(AttachSessionError),
     ServiceOpen,
     MalformedFrame,
     Randomness,
@@ -31,6 +33,7 @@ pub enum WindowsAttachSessionError {
 /// The route selected for an admitted Windows attach session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WindowsAttachSessionOutcome {
+    ApprovalPresenter,
     Companion,
     DesktopClient(AdmittedDesktopClient),
 }
@@ -235,6 +238,158 @@ where
     };
     let mut service = service_factory().map_err(|_| WindowsAttachSessionError::ServiceOpen)?;
     serve_admitted_desktop_client(stream, admitted, peer_pid, &mut service)
+}
+
+/// Serves every Windows route with the state shared by one runtime activation.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn serve_windows_attach_session_with_reader_and_state<S, H, W>(
+    stream: &mut S,
+    peer_reader: &impl WindowsAttachPeerReader,
+    route_reader: &impl WindowsAttachRouteReader,
+    expected_desktop_executable: Option<&Path>,
+    desktop_version: &str,
+    deadline: Instant,
+    service: &mut H,
+    approval: Option<super::Approval>,
+    coordinator: super::ApprovalCoordinator,
+    approvals: W,
+    registry: &LiveConnectionRegistry,
+) -> Result<WindowsAttachSessionOutcome, WindowsAttachSessionError>
+where
+    S: DeadlineStream + super::ApprovalPresenterStream,
+    H: ThreadListService,
+    W: super::ApprovalWaiter,
+{
+    use super::companion_pairing::{
+        serve_pairing_exchange, AuthorizationSessionDependencies, NoMigration, PairingPeer,
+        PairingSession, SessionClock, SessionTokens,
+    };
+    use super::{serve_approval_presenter, ApprovalPresenterConnection};
+
+    let mut prefix = [0_u8; 4];
+    read_exact_before(stream, &mut prefix, deadline)
+        .map_err(|_| WindowsAttachSessionError::Read)?;
+    verify_windows_attach_peer_with_reader(peer_reader)
+        .map_err(WindowsAttachSessionError::PeerRejected)?;
+    let peer_pid = route_reader
+        .peer_process()
+        .map(|(peer_pid, _)| peer_pid)
+        .unwrap_or(0);
+    let initial_route = expected_desktop_executable
+        .map(|path| name_windows_attach_connection_route(route_reader, path))
+        .unwrap_or(WindowsAttachConnectionRoute::Companion);
+    let frame = read_desktop_first_frame(stream, prefix, deadline)?;
+    let route = match initial_route {
+        WindowsAttachConnectionRoute::DesktopClient { peer_pid } => {
+            name_windows_desktop_attach_connection_route(peer_pid, &frame)
+        }
+        route => route,
+    };
+
+    match route {
+        WindowsAttachConnectionRoute::ApprovalPresenter => {
+            let admitted = admit_desktop_client_over_stream_with_frame(
+                stream,
+                &frame,
+                desktop_version,
+                None,
+                deadline,
+            )
+            .map_err(WindowsAttachSessionError::DesktopClientAdmission)?;
+            let owned_stream = stream
+                .try_clone_presenter_stream()
+                .map_err(|_| WindowsAttachSessionError::ApprovalPresenterUnavailable)?;
+            let connection = ApprovalPresenterConnection::new(owned_stream, admitted.capability);
+            let Some(session) = serve_approval_presenter(coordinator, connection) else {
+                return Err(WindowsAttachSessionError::ApprovalPresenterUnavailable);
+            };
+            session.wait_until_closed();
+            Ok(WindowsAttachSessionOutcome::ApprovalPresenter)
+        }
+        WindowsAttachConnectionRoute::DesktopClient { peer_pid } => {
+            let admitted = admit_desktop_client_over_stream_with_frame(
+                stream,
+                &frame,
+                desktop_version,
+                approval.as_ref(),
+                deadline,
+            )
+            .map_err(WindowsAttachSessionError::DesktopClientAdmission)?;
+            serve_admitted_desktop_client(stream, admitted, peer_pid, service)
+        }
+        WindowsAttachConnectionRoute::Companion => {
+            let mut random = |bytes: &mut [u8]| getrandom::fill(bytes).map_err(|_| ());
+            serve_pairing_exchange(
+                stream,
+                PairingSession {
+                    peer: PairingPeer {
+                        companion_identity: format!("0:{peer_pid}"),
+                        peer_uid: 0,
+                        peer_pid,
+                    },
+                    first_frame: Some(&frame),
+                    registry,
+                    handoff_nonce: None,
+                },
+                desktop_version,
+                deadline.saturating_duration_since(Instant::now()),
+                AuthorizationSessionDependencies {
+                    fill_random: &mut random,
+                    clock: SessionClock(Instant::now()),
+                    tokens: SessionTokens,
+                    approvals,
+                },
+                service,
+                NoMigration,
+            )
+            .map_err(WindowsAttachSessionError::CompanionSession)?;
+            Ok(WindowsAttachSessionOutcome::Companion)
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+/// Serves a connected native Windows stream with shared activation state.
+#[allow(clippy::too_many_arguments)]
+pub fn serve_windows_attach_session_with_state<H, W>(
+    mut stream: super::WindowsAttachStream,
+    desktop_version: &str,
+    deadline: Instant,
+    service: &mut H,
+    approval: Option<super::Approval>,
+    coordinator: super::ApprovalCoordinator,
+    approvals: W,
+    registry: &LiveConnectionRegistry,
+) -> Result<WindowsAttachSessionOutcome, WindowsAttachSessionError>
+where
+    H: ThreadListService,
+    W: super::ApprovalWaiter,
+{
+    use std::os::windows::io::{AsRawHandle, BorrowedHandle};
+
+    use super::{NativeWindowsAttachPeerReader, NativeWindowsAttachRouteReader};
+    use crate::windows_payload::resolve_live_windows_desktop_executable;
+
+    let handle = stream.as_raw_handle();
+    let peer_reader =
+        NativeWindowsAttachPeerReader::new(unsafe { BorrowedHandle::borrow_raw(handle) });
+    let route_reader =
+        NativeWindowsAttachRouteReader::new(unsafe { BorrowedHandle::borrow_raw(handle) });
+    let expected_desktop_executable = resolve_live_windows_desktop_executable().ok().flatten();
+    serve_windows_attach_session_with_reader_and_state(
+        &mut stream,
+        &peer_reader,
+        &route_reader,
+        expected_desktop_executable.as_deref(),
+        desktop_version,
+        deadline,
+        service,
+        approval,
+        coordinator,
+        approvals,
+        registry,
+    )
 }
 
 #[cfg(target_os = "windows")]

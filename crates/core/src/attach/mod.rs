@@ -1,7 +1,7 @@
 //! Companion attach server support.
 
 mod approval;
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "windows"))]
 mod approval_present;
 mod artifact;
 mod authorization;
@@ -45,7 +45,7 @@ mod peer_authority;
 mod presented_approval;
 #[cfg(target_os = "linux")]
 mod presenter_admission;
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "windows"))]
 mod presenter_session;
 mod quiesce;
 mod runtime_activity;
@@ -74,7 +74,7 @@ mod windows_stream;
 mod workspace_context;
 
 pub use approval::*;
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "windows"))]
 pub use approval_present::*;
 pub use artifact::*;
 pub use authorization::*;
@@ -120,7 +120,7 @@ pub use peer_authority::*;
 pub use presented_approval::*;
 #[cfg(target_os = "linux")]
 pub use presenter_admission::*;
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "windows"))]
 pub use presenter_session::*;
 pub use quiesce::*;
 pub use runtime_activity::*;

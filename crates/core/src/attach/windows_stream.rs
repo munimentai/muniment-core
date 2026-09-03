@@ -7,13 +7,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    GetLastError, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_NOT_FOUND, ERROR_NO_DATA,
-    ERROR_OPERATION_ABORTED, ERROR_PIPE_NOT_CONNECTED, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF,
+    ERROR_NOT_FOUND, ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_NOT_CONNECTED, WAIT_FAILED,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
-use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+use windows_sys::Win32::System::Pipes::{DisconnectNamedPipe, PeekNamedPipe};
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, WaitForMultipleObjects, WaitForSingleObject, INFINITE,
+    CreateEventW, GetCurrentProcess, WaitForMultipleObjects, WaitForSingleObject, INFINITE,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
@@ -51,6 +52,63 @@ impl WindowsAttachStream {
     #[doc(hidden)]
     pub fn set_operation_pending_sender_for_tests(&mut self, sender: mpsc::Sender<()>) {
         self.operation_pending_sender = Some(sender);
+    }
+
+    pub(crate) fn try_clone(&self) -> io::Result<Self> {
+        let process = unsafe { GetCurrentProcess() };
+        let mut duplicated = null_mut();
+        if unsafe {
+            DuplicateHandle(
+                process,
+                self.handle.as_raw_handle(),
+                process,
+                &mut duplicated,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let handle = unsafe { OwnedHandle::from_raw_handle(duplicated) };
+        Ok(Self {
+            handle,
+            read_timeout: Cell::new(self.read_timeout.get()),
+            write_timeout: Cell::new(self.write_timeout.get()),
+            stop_event: self.stop_event.clone(),
+            operation_pending_sender: None,
+        })
+    }
+
+    pub(crate) fn wait_until_closed(&self) {
+        loop {
+            if self.stop_event.as_ref().is_some_and(|stop_event| unsafe {
+                WaitForSingleObject(stop_event.as_raw_handle(), 0) == WAIT_OBJECT_0
+            }) {
+                return;
+            }
+            if unsafe {
+                PeekNamedPipe(
+                    self.handle.as_raw_handle(),
+                    null_mut(),
+                    0,
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                )
+            } == 0
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    pub(crate) fn disconnect(&self) {
+        unsafe {
+            DisconnectNamedPipe(self.handle.as_raw_handle());
+        }
     }
 
     fn operate(
