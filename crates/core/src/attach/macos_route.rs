@@ -9,7 +9,7 @@ use muniment_attach::{decode_frame, Hello};
 pub enum MacosAttachConnectionRoute {
     ApprovalPresenter,
     DesktopClient { peer_pid: u32 },
-    Companion,
+    Companion { peer_pid: u32 },
 }
 
 /// Opaque failure from an injected macOS peer read.
@@ -27,16 +27,16 @@ pub fn name_macos_attach_connection_route(
     expected_desktop_executable: &Path,
 ) -> MacosAttachConnectionRoute {
     let Ok((peer_pid, peer_image_path)) = reader.peer_process() else {
-        return MacosAttachConnectionRoute::Companion;
+        return MacosAttachConnectionRoute::Companion { peer_pid: 0 };
     };
     if !peer_image_path.is_absolute() || !expected_desktop_executable.is_absolute() {
-        return MacosAttachConnectionRoute::Companion;
+        return MacosAttachConnectionRoute::Companion { peer_pid };
     }
 
     if peer_image_path == expected_desktop_executable {
         MacosAttachConnectionRoute::DesktopClient { peer_pid }
     } else {
-        MacosAttachConnectionRoute::Companion
+        MacosAttachConnectionRoute::Companion { peer_pid }
     }
 }
 
@@ -46,16 +46,16 @@ pub fn name_macos_desktop_attach_connection_route(
     first_frame: &[u8],
 ) -> MacosAttachConnectionRoute {
     let Ok(Some((hello, consumed))) = decode_frame::<Hello>(first_frame) else {
-        return MacosAttachConnectionRoute::Companion;
+        return MacosAttachConnectionRoute::Companion { peer_pid };
     };
     if consumed != first_frame.len() {
-        return MacosAttachConnectionRoute::Companion;
+        return MacosAttachConnectionRoute::Companion { peer_pid };
     }
 
     match hello.client.kind.as_str() {
         "desktop" => MacosAttachConnectionRoute::ApprovalPresenter,
         "desktop-client" => MacosAttachConnectionRoute::DesktopClient { peer_pid },
-        _ => MacosAttachConnectionRoute::Companion,
+        _ => MacosAttachConnectionRoute::Companion { peer_pid },
     }
 }
 
@@ -96,7 +96,7 @@ mod tests {
                 &reader,
                 Path::new("/Applications/Muniment.app/Contents/MacOS/muniment")
             ),
-            MacosAttachConnectionRoute::Companion
+            MacosAttachConnectionRoute::Companion { peer_pid: 0 }
         );
     }
 
@@ -109,7 +109,7 @@ mod tests {
                 &reader,
                 Path::new("/Applications/Muniment.app/Contents/MacOS/muniment")
             ),
-            MacosAttachConnectionRoute::Companion
+            MacosAttachConnectionRoute::Companion { peer_pid: 42 }
         );
     }
 
@@ -122,7 +122,7 @@ mod tests {
 
         assert_eq!(
             name_macos_attach_connection_route(&reader, Path::new("muniment")),
-            MacosAttachConnectionRoute::Companion
+            MacosAttachConnectionRoute::Companion { peer_pid: 42 }
         );
     }
 
@@ -138,7 +138,7 @@ mod tests {
                 &reader,
                 Path::new("/Applications/Muniment.app/Contents/MacOS/muniment")
             ),
-            MacosAttachConnectionRoute::Companion
+            MacosAttachConnectionRoute::Companion { peer_pid: 42 }
         );
     }
 }
