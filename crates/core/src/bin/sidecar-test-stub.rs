@@ -132,6 +132,13 @@ fn pi_resume(args: Vec<String>) {
     if let Ok(path) = std::env::var("PI_RESUME_STUB_ARGS") {
         fs::write(path, args.join("\n")).unwrap();
     }
+    if let Ok(path) = std::env::var("PI_RESUME_STUB_ENV_CAPTURE") {
+        let captured = ["OPENAI_API_KEY", "OPENAI_BASE_URL", "PI_DEFAULT_MODEL"]
+            .into_iter()
+            .filter_map(|name| std::env::var(name).ok().map(|value| (name, value)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        fs::write(path, serde_json::to_vec(&captured).unwrap()).unwrap();
+    }
     let session_file = args
         .windows(2)
         .find(|pair| pair[0] == "--session")
@@ -209,6 +216,22 @@ fn pi_resume(args: Vec<String>) {
                         "{}",
                         serde_json::json!({"type":"message_update", "assistantMessageEvent":{"type":"text_delta", "delta":" resumed"}})
                     );
+                    if std::env::var_os("PI_RESUME_STUB_TOOL_EVENTS").is_some() {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "type":"tool_execution_start", "toolCallId":"tool-1",
+                                "toolName":"read", "args":{"path":"test.txt"}
+                            })
+                        );
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "type":"tool_execution_end", "toolCallId":"tool-1",
+                                "toolName":"read", "result":{"content":[]}, "isError":false
+                            })
+                        );
+                    }
                     println!("{}", serde_json::json!({"type":"agent_end"}));
                 }
             }

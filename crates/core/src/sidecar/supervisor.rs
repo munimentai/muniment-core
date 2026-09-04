@@ -53,6 +53,7 @@ pub struct SidecarConfig {
     pub program: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
+    pub env_remove: Vec<String>,
     pub restart: RestartPolicy,
     pub health_interval: Duration,
     /// Maximum time a spawned generation may report `Loading` before restart.
@@ -70,6 +71,7 @@ impl SidecarConfig {
             program: program.into(),
             args: Vec::new(),
             env: HashMap::new(),
+            env_remove: Vec::new(),
             restart: RestartPolicy::default(),
             health_interval: Duration::from_secs(5),
             startup_timeout: Duration::from_secs(60),
@@ -528,9 +530,12 @@ fn spawn_child(
     err: Arc<StderrRing>,
     generation: u64,
 ) -> Result<(Child, JoinHandle<()>), std::io::Error> {
-    let mut child = Command::new(&config.program)
-        .args(&config.args)
-        .envs(&config.env)
+    let mut command = Command::new(&config.program);
+    command.args(&config.args).envs(&config.env);
+    for name in &config.env_remove {
+        command.env_remove(name);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

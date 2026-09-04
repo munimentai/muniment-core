@@ -18,6 +18,26 @@ pub struct ChatGrant {
     pub receipt_url: String,
 }
 
+impl ChatGrant {
+    pub fn local() -> Self {
+        Self {
+            workspace: "local".into(),
+            gateway_url: String::new(),
+            virtual_key: String::new(),
+            model: None,
+            minimum_cacheable_prefix_characters: 8_192,
+            receipt_url: String::new(),
+        }
+    }
+
+    pub fn is_local(&self) -> bool {
+        self.workspace == "local"
+            && self.gateway_url.is_empty()
+            && self.virtual_key.is_empty()
+            && self.receipt_url.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FetchGrantError {
     Unauthorized,

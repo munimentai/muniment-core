@@ -1,11 +1,16 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use muniment_core::chat_grant::ChatGrant;
 use muniment_core::pi_launch::{
     pi_launch_config, pi_launch_config_for_executable, PiLaunchBoundaries, PiLaunchError,
 };
+use muniment_core::sidecar::{PiRpcWiring, SidecarStatus, SidecarSupervisor};
 use uuid::Uuid;
+
+static ENVIRONMENT: Mutex<()> = Mutex::new(());
 
 struct Boundaries {
     session_root: Result<PathBuf, PiLaunchError>,
@@ -106,6 +111,79 @@ fn appends_a_present_extension_file_and_environment() {
         .args
         .windows(2)
         .any(|args| args == ["--extension", extension.to_string_lossy().as_ref()]));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn local_launch_uses_pis_credential_store_without_cloud_credentials() {
+    let root = temporary_directory();
+    let boundaries = Boundaries {
+        session_root: Ok(root.clone()),
+        extension: None,
+    };
+    let config =
+        pi_launch_config_for_executable(&boundaries, "pi".into(), &ChatGrant::local(), None)
+            .unwrap();
+    assert!(!config.env.contains_key("OPENAI_API_KEY"));
+    assert!(!config.env.contains_key("OPENAI_BASE_URL"));
+    assert!(!config.env.contains_key("PI_DEFAULT_MODEL"));
+    assert_eq!(config.args[0..2], ["--mode", "rpc"]);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn local_launch_clears_inherited_cloud_environment_in_the_child() {
+    let _environment = ENVIRONMENT.lock().unwrap();
+    let root = temporary_directory();
+    let capture = root.join("environment.json");
+    let boundaries = Boundaries {
+        session_root: Ok(root.clone()),
+        extension: None,
+    };
+    let executable_name = if cfg!(windows) {
+        "sidecar-test-stub.exe"
+    } else {
+        "sidecar-test-stub"
+    };
+    let executable = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(executable_name);
+    let mut config =
+        pi_launch_config_for_executable(&boundaries, executable, &ChatGrant::local(), None)
+            .unwrap();
+    config.env.insert(
+        "PI_RESUME_STUB_ENV_CAPTURE".into(),
+        capture.to_string_lossy().into_owned(),
+    );
+    for (name, value) in [
+        ("OPENAI_API_KEY", "inherited-key"),
+        ("OPENAI_BASE_URL", "https://inherited.example.com"),
+        ("PI_DEFAULT_MODEL", "inherited-model"),
+    ] {
+        std::env::set_var(name, value);
+    }
+
+    let wiring = PiRpcWiring::new();
+    let mut supervisor =
+        SidecarSupervisor::spawn(config, wiring.readiness_probe(Duration::from_millis(100)))
+            .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (!capture.is_file() || supervisor.status() != SidecarStatus::Healthy)
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for name in ["OPENAI_API_KEY", "OPENAI_BASE_URL", "PI_DEFAULT_MODEL"] {
+        std::env::remove_var(name);
+    }
+
+    assert_eq!(supervisor.status(), SidecarStatus::Healthy);
+    assert_eq!(fs::read_to_string(&capture).unwrap(), "{}");
+    supervisor.shutdown().unwrap();
     fs::remove_dir_all(root).unwrap();
 }
 

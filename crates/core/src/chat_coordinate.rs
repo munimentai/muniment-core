@@ -651,7 +651,12 @@ pub fn coordinate(
                 break;
             }
             Ok(PiChatEvent::Completed) => {
-                match fetch_receipt(&grant.receipt_url, &access_token, &run_id) {
+                let receipt = if grant.is_local() {
+                    Ok(crate::sidecar::pi_chat::Receipt::default())
+                } else {
+                    fetch_receipt(&grant.receipt_url, &access_token, &run_id)
+                };
+                match receipt {
                     Ok(receipt) => {
                         let _ = append_terminal(
                             &app,
