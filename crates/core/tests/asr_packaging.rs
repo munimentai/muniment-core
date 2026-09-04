@@ -4,6 +4,11 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+#[path = "../../asr_rpath.rs"]
+mod asr_rpath;
+
+use asr_rpath::ExecutableLocation;
+
 const RUNTIME: &str = "../third-party/sherpa-onnx-v1.13.2";
 type RuntimeFile = (&'static str, &'static str, &'static str);
 type PlatformCase = (&'static str, &'static str, &'static [RuntimeFile]);
@@ -67,6 +72,7 @@ fn every_supported_target_bundles_the_pinned_linked_runtime_at_its_loader_path()
         ),
     ];
     let build_script = fs::read_to_string(root.join("../build.rs")).unwrap();
+    assert!(build_script.contains("asr_rpath::link_arg(&os, ExecutableLocation::Desktop)"));
 
     for (platform, loader_path, files) in cases {
         let config: Value = serde_json::from_slice(
@@ -75,7 +81,8 @@ fn every_supported_target_bundles_the_pinned_linked_runtime_at_its_loader_path()
         .unwrap();
         let resources = config["bundle"]["resources"].as_object().unwrap();
         if *platform != "windows" {
-            assert!(build_script.contains(loader_path));
+            let link_arg = asr_rpath::link_arg(platform, ExecutableLocation::Desktop).unwrap();
+            assert_eq!(link_arg, format!("-Wl,-rpath,{loader_path}"));
         }
 
         for (source, filename, expected_hash) in *files {
@@ -94,6 +101,26 @@ fn every_supported_target_bundles_the_pinned_linked_runtime_at_its_loader_path()
             assert_eq!(sha256(&linked), *expected_hash);
         }
     }
+}
+
+#[test]
+fn runtime_loader_paths_resolve_from_the_installed_runtime_binary() {
+    assert_eq!(
+        asr_rpath::link_arg("linux", ExecutableLocation::Runtime).as_deref(),
+        Some("-Wl,-rpath,$ORIGIN/asr-runtime")
+    );
+    assert_eq!(
+        asr_rpath::link_arg("macos", ExecutableLocation::Runtime).as_deref(),
+        Some("-Wl,-rpath,@executable_path/../../Resources/asr-runtime")
+    );
+    assert_eq!(
+        asr_rpath::link_arg("windows", ExecutableLocation::Runtime),
+        None
+    );
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runtime_build_script = fs::read_to_string(root.join("../runtime/build.rs")).unwrap();
+    assert!(runtime_build_script.contains("asr_rpath::link_arg(&os, ExecutableLocation::Runtime)"));
 }
 
 fn sha256(path: &PathBuf) -> String {
