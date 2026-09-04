@@ -37,6 +37,7 @@ pub mod memory_index;
 pub mod memory_runtime;
 pub mod memory_secret;
 pub mod model_acquisition_transport;
+pub mod model_artifact;
 pub mod model_install;
 pub mod model_install_native;
 pub mod owned_threads;

@@ -9,6 +9,10 @@ use crate::asr::acquisition::{
 use crate::kokoro::acquisition::{
     KokoroDownloadRequest, KokoroDownloadResponse, KokoroDownloadTransport, KokoroTransportError,
 };
+use crate::model_artifact::acquisition::{
+    ModelArtifactDownloadRequest, ModelArtifactDownloadResponse, ModelArtifactDownloadTransport,
+    ModelArtifactTransportError,
+};
 use crate::sidecar::pi_install::{
     PiDownloadRequest, PiDownloadResponse, PiDownloadTransport, PiTransportError,
 };
@@ -18,6 +22,7 @@ const MAX_REDIRECTS: usize = 5;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HostPolicy {
     HuggingFace,
+    MunimentHuggingFace,
     GitHub,
 }
 
@@ -87,6 +92,34 @@ impl NativeModelAcquisitionTransport {
             deadline,
             |request| self.backend.execute(request),
         )
+    }
+}
+
+impl ModelArtifactDownloadTransport for NativeModelAcquisitionTransport {
+    type Body = ModelResponseBody;
+
+    fn download(
+        &mut self,
+        request: &ModelArtifactDownloadRequest,
+    ) -> Result<ModelArtifactDownloadResponse<Self::Body>, ModelArtifactTransportError> {
+        self.request(
+            request.url(),
+            HostPolicy::MunimentHuggingFace,
+            request.offset,
+            request.limits.connect_timeout,
+            request.limits.read_timeout,
+            request.limits.deadline,
+        )
+        .map(|response| ModelArtifactDownloadResponse {
+            status: response.status,
+            content_range: response.content_range,
+            body: response.body,
+        })
+        .map_err(|error| match error {
+            TransportFailure::Transient => ModelArtifactTransportError::Transient,
+            TransportFailure::Unavailable => ModelArtifactTransportError::Unavailable,
+            TransportFailure::Rejected => ModelArtifactTransportError::Rejected,
+        })
     }
 }
 
@@ -298,10 +331,14 @@ where
 fn checked_initial_url(value: &str, host_policy: HostPolicy) -> Result<url::Url, TransportFailure> {
     let parsed = url::Url::parse(value).map_err(|_| TransportFailure::Rejected)?;
     let expected_host = match host_policy {
-        HostPolicy::HuggingFace => "huggingface.co",
+        HostPolicy::HuggingFace | HostPolicy::MunimentHuggingFace => "huggingface.co",
         HostPolicy::GitHub => "github.com",
     };
     if !has_secure_origin(&parsed) || parsed.host_str() != Some(expected_host) {
+        return Err(TransportFailure::Rejected);
+    }
+    if host_policy == HostPolicy::MunimentHuggingFace && !parsed.path().starts_with("/munimentai/")
+    {
         return Err(TransportFailure::Rejected);
     }
     Ok(parsed)
@@ -314,7 +351,7 @@ fn checked_redirect_url(
     let parsed = url::Url::parse(value).map_err(|_| TransportFailure::Rejected)?;
     let host = parsed.host_str().unwrap_or_default();
     let allowed_host = match host_policy {
-        HostPolicy::HuggingFace => {
+        HostPolicy::HuggingFace | HostPolicy::MunimentHuggingFace => {
             host_equals_or_has_dot_suffix(host, "hf.co")
                 || host_equals_or_has_dot_suffix(host, "huggingface.co")
         }
@@ -356,6 +393,7 @@ fn parse_content_range(value: &str) -> Result<Option<(u64, u64, u64)>, Transport
 mod tests {
     use super::*;
     use crate::asr::acquisition::AsrAcquisitionLimits;
+    use crate::model_artifact::acquisition::ModelArtifactAcquisitionLimits;
     use std::collections::VecDeque;
     use std::io::Cursor;
 
@@ -398,6 +436,19 @@ mod tests {
         })
     }
 
+    fn model_artifact_request() -> ModelArtifactDownloadRequest {
+        ModelArtifactDownloadRequest::for_transport_test(
+            "https://huggingface.co/munimentai/extractor/resolve/revision/model.onnx".into(),
+            7,
+            ModelArtifactAcquisitionLimits {
+                connect_timeout: Duration::from_secs(10),
+                read_timeout: Duration::from_secs(30),
+                deadline: Duration::from_secs(5),
+                max_attempts: 1,
+            },
+        )
+    }
+
     fn asr_request() -> AsrDownloadRequest {
         AsrDownloadRequest::for_transport_test(
             "https://huggingface.co/repo/resolve/revision/model?secret=value".into(),
@@ -423,6 +474,30 @@ mod tests {
                 max_attempts: 1,
             },
         )
+    }
+
+    #[test]
+    fn model_artifact_uses_strict_initial_origin_and_provider_redirects() {
+        let mut allowed = transport(vec![
+            Ok(reply(302, Some("https://us.aws.cdn.hf.co/file"), None, b"")),
+            Ok(reply(206, None, Some("bytes 7-9/10"), b"abc")),
+        ]);
+        assert!(
+            ModelArtifactDownloadTransport::download(&mut allowed, &model_artifact_request())
+                .is_ok()
+        );
+        assert_eq!(
+            checked_initial_url(
+                "https://huggingface.co/other/extractor/resolve/revision/model.onnx",
+                HostPolicy::MunimentHuggingFace
+            ),
+            Err(TransportFailure::Rejected)
+        );
+        assert!(checked_redirect_url(
+            "https://us.aws.cdn.hf.co/file",
+            HostPolicy::MunimentHuggingFace
+        )
+        .is_ok());
     }
 
     #[test]

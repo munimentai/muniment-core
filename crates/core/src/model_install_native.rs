@@ -11,6 +11,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::asr::acquisition::{AsrAcquisitionClock, AsrCancellation, AsrRetryWait};
 use crate::asr::{AsrLifecycleBoundary, AsrPersistenceError};
+use crate::model_artifact::acquisition::{
+    ModelArtifactAcquisitionClock, ModelArtifactCancellation, ModelArtifactRetryWait,
+};
+use crate::model_artifact::lifecycle::{
+    ModelArtifactLifecycleBoundary, ModelArtifactPersistenceError,
+};
 use crate::model_install::{
     AvailableSpace, AvailableSpaceError, InstallCancellation, InstallLock, InstallLockError,
     InstallLockState,
@@ -40,6 +46,11 @@ impl InstallCancellation for NativeInstallCancellation {
     }
 }
 impl AsrCancellation for NativeInstallCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.is_cancelled()
+    }
+}
+impl ModelArtifactCancellation for NativeInstallCancellation {
     fn is_cancelled(&self) -> bool {
         self.is_cancelled()
     }
@@ -124,12 +135,28 @@ impl AsrAcquisitionClock for NativeAcquisitionClock {
         self.0.elapsed()
     }
 }
+impl ModelArtifactAcquisitionClock for NativeAcquisitionClock {
+    fn now(&self) -> Duration {
+        self.0.elapsed()
+    }
+}
 
 /// Bounded jittered retry sleep which polls cancellation every 10ms.
 #[derive(Debug, Default)]
 pub struct NativeRetryWait;
 impl AsrRetryWait for NativeRetryWait {
     fn wait(&mut self, maximum_delay: Duration, cancellation: &dyn AsrCancellation) -> bool {
+        cancellable_sleep(jittered_delay(maximum_delay), || {
+            cancellation.is_cancelled()
+        })
+    }
+}
+impl ModelArtifactRetryWait for NativeRetryWait {
+    fn wait(
+        &mut self,
+        maximum_delay: Duration,
+        cancellation: &dyn ModelArtifactCancellation,
+    ) -> bool {
         cancellable_sleep(jittered_delay(maximum_delay), || {
             cancellation.is_cancelled()
         })
@@ -162,6 +189,61 @@ fn cancellable_sleep(duration: Duration, cancelled: impl Fn() -> bool) -> bool {
     }
 }
 
+/// Native durable filesystem operations for model artifact publication.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NativeModelArtifactLifecycleBoundary;
+impl ModelArtifactLifecycleBoundary for NativeModelArtifactLifecycleBoundary {
+    type LockGuard = File;
+
+    fn lock_exclusive(
+        &self,
+        path: &Path,
+    ) -> Result<Self::LockGuard, ModelArtifactPersistenceError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|_| ModelArtifactPersistenceError::Failed)?;
+        file.lock_exclusive()
+            .map_err(|_| ModelArtifactPersistenceError::Failed)?;
+        Ok(file)
+    }
+
+    fn sync_file(&self, path: &Path) -> Result<(), ModelArtifactPersistenceError> {
+        File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| ModelArtifactPersistenceError::Failed)
+    }
+
+    fn sync_directory(&self, path: &Path) -> Result<(), ModelArtifactPersistenceError> {
+        #[cfg(unix)]
+        File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| ModelArtifactPersistenceError::Failed)?;
+        let _ = path;
+        Ok(())
+    }
+
+    fn replace_revision(
+        &self,
+        staged: &Path,
+        destination: &Path,
+    ) -> Result<(), ModelArtifactPersistenceError> {
+        atomic_replace_directory(staged, destination)
+    }
+
+    fn replace_pointer(
+        &self,
+        temporary: &Path,
+        destination: &Path,
+    ) -> Result<(), ModelArtifactPersistenceError> {
+        crate::atomic_file::replace(temporary, destination)
+            .map_err(|_| ModelArtifactPersistenceError::Failed)
+    }
+}
+
 /// Native durable filesystem operations for Parakeet publication.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NativeAsrLifecycleBoundary;
@@ -187,6 +269,57 @@ impl AsrLifecycleBoundary for NativeAsrLifecycleBoundary {
         destination: &Path,
     ) -> Result<(), AsrPersistenceError> {
         fs::rename(temporary, destination).map_err(|_| AsrPersistenceError::Failed)
+    }
+}
+
+fn atomic_replace_directory(
+    staged: &Path,
+    destination: &Path,
+) -> Result<(), ModelArtifactPersistenceError> {
+    if !destination.exists() {
+        return fs::rename(staged, destination).map_err(|_| ModelArtifactPersistenceError::Failed);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        const AT_FDCWD: i32 = -100;
+        const RENAME_EXCHANGE: u32 = 2;
+        unsafe extern "C" {
+            fn renameat2(
+                olddirfd: i32,
+                oldpath: *const i8,
+                newdirfd: i32,
+                newpath: *const i8,
+                flags: u32,
+            ) -> i32;
+        }
+        let old = CString::new(staged.as_os_str().as_bytes())
+            .map_err(|_| ModelArtifactPersistenceError::Failed)?;
+        let new = CString::new(destination.as_os_str().as_bytes())
+            .map_err(|_| ModelArtifactPersistenceError::Failed)?;
+        if unsafe {
+            renameat2(
+                AT_FDCWD,
+                old.as_ptr(),
+                AT_FDCWD,
+                new.as_ptr(),
+                RENAME_EXCHANGE,
+            )
+        } != 0
+        {
+            return Err(ModelArtifactPersistenceError::Failed);
+        }
+        fs::remove_dir_all(staged).map_err(|_| ModelArtifactPersistenceError::Failed)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let quarantine = destination.with_extension("replaced");
+        if quarantine.exists() {
+            fs::remove_dir_all(&quarantine).map_err(|_| ModelArtifactPersistenceError::Failed)?;
+        }
+        fs::rename(destination, &quarantine).map_err(|_| ModelArtifactPersistenceError::Failed)?;
+        fs::rename(staged, destination).map_err(|_| ModelArtifactPersistenceError::Failed)
     }
 }
 
@@ -236,6 +369,23 @@ mod tests {
         );
         fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn model_artifact_replacement_publishes_the_complete_stage() {
+        let root = temp_dir("artifact-replace");
+        let staged = root.join("staged");
+        let destination = root.join("revision");
+        fs::create_dir(&staged).unwrap();
+        fs::write(staged.join("value"), b"new").unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("value"), b"old").unwrap();
+        NativeModelArtifactLifecycleBoundary
+            .replace_revision(&staged, &destination)
+            .unwrap();
+        assert_eq!(fs::read(destination.join("value")).unwrap(), b"new");
+        assert!(!staged.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn retry_wait_stops_promptly_when_cancelled_at_start() {
         let cancellation = NativeInstallCancellation::new();
