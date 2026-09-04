@@ -41,7 +41,7 @@ mod macos_route_native;
 mod macos_session;
 #[cfg(target_os = "linux")]
 mod peer_authority;
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "windows"))]
 mod presented_approval;
 #[cfg(target_os = "linux")]
 mod presenter_admission;
@@ -116,7 +116,7 @@ pub use macos_session::*;
 pub use muniment_attach::*;
 #[cfg(target_os = "linux")]
 pub use peer_authority::*;
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "windows"))]
 pub use presented_approval::*;
 #[cfg(target_os = "linux")]
 pub use presenter_admission::*;
