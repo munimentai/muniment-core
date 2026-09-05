@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::attach::{RuntimeActivityGuard, RuntimeActivityRegistry};
 use crate::chat_grant::{fetch_receipt, ChatGrant};
@@ -196,6 +196,13 @@ impl MarkedGate {
     }
 }
 
+fn local_receipt(elapsed: Duration) -> crate::sidecar::pi_chat::Receipt {
+    crate::sidecar::pi_chat::Receipt {
+        time: Some(format!("{:.1}s", elapsed.as_secs_f64())),
+        ..Default::default()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn coordinate(
     app: impl ChatEventSink + PiLaunchBoundaries,
@@ -216,6 +223,7 @@ pub fn coordinate(
     resume_result: Option<std::sync::mpsc::Sender<Result<(), String>>>,
     prepared: Option<(u64, ChatProjector)>,
 ) {
+    let run_started = Instant::now();
     let mut resume_attempt = ResumeAttempt::new(resume_result);
     let (mut seq, mut projector) = prepared.unwrap_or_else(|| {
         (
@@ -652,7 +660,7 @@ pub fn coordinate(
             }
             Ok(PiChatEvent::Completed) => {
                 let receipt = if grant.is_local() {
-                    Ok(crate::sidecar::pi_chat::Receipt::default())
+                    Ok(local_receipt(run_started.elapsed()))
                 } else {
                     fetch_receipt(&grant.receipt_url, &access_token, &run_id)
                 };
@@ -964,6 +972,35 @@ mod tests {
     use std::cell::RefCell;
     use std::io;
     use uuid::Uuid;
+
+    fn assert_local_receipt(duration: Duration, expected_range: std::ops::Range<f64>) {
+        let receipt = local_receipt(duration);
+        let time = receipt.time.as_deref().expect("local receipt records time");
+        let seconds = time
+            .strip_suffix('s')
+            .expect("local receipt time ends in seconds");
+        let (whole, tenths) = seconds
+            .split_once('.')
+            .expect("local receipt time has a decimal point");
+        assert!(!whole.is_empty() && whole.chars().all(|character| character.is_ascii_digit()));
+        assert_eq!(tenths.len(), 1);
+        assert!(tenths.chars().all(|character| character.is_ascii_digit()));
+        assert!(expected_range.contains(&seconds.parse::<f64>().unwrap()));
+        assert_eq!(receipt.route, None);
+        assert_eq!(receipt.model, None);
+        assert_eq!(receipt.cost, None);
+        assert!(receipt.capabilities.is_empty());
+    }
+
+    #[test]
+    fn local_receipt_records_sub_second_time_alone() {
+        assert_local_receipt(Duration::from_millis(200), 0.0..1.0);
+    }
+
+    #[test]
+    fn local_receipt_records_multi_second_time_alone() {
+        assert_local_receipt(Duration::from_millis(6_200), 6.0..7.0);
+    }
 
     #[derive(Default)]
     struct FakeChatEventSink;
