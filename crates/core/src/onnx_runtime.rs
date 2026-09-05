@@ -1,16 +1,84 @@
 //! Native access to the bundled ONNX Runtime C API.
 
-use std::ffi::{c_char, CStr};
+use std::ffi::{c_char, c_void, CStr};
 use std::io::ErrorKind;
 use std::path::Path;
 use std::ptr::NonNull;
 
 use libloading::Library;
 
-/// The opaque ONNX Runtime API table.
+pub(crate) enum OrtEnv {}
+pub(crate) enum OrtStatus {}
+pub(crate) enum OrtSession {}
+pub(crate) enum OrtSessionOptions {}
+pub(crate) enum OrtAllocator {}
+pub(crate) enum OrtModelMetadata {}
+
+#[cfg(windows)]
+pub(crate) type OrtChar = u16;
+#[cfg(not(windows))]
+pub(crate) type OrtChar = c_char;
+
+/// The ONNX Runtime API table prefix used by the classifier loader.
+///
+/// Field order matches `onnxruntime_c_api.h` from ONNX Runtime v1.24.4.
 #[repr(C)]
 pub struct OrtApi {
-    _private: [u8; 0],
+    pub(crate) create_status:
+        unsafe extern "system" fn(code: i32, message: *const c_char) -> *mut OrtStatus,
+    pub(crate) get_error_code: unsafe extern "system" fn(status: *const OrtStatus) -> i32,
+    pub(crate) get_error_message:
+        unsafe extern "system" fn(status: *const OrtStatus) -> *const c_char,
+    pub(crate) create_env: unsafe extern "system" fn(
+        logging_level: i32,
+        log_id: *const c_char,
+        env: *mut *mut OrtEnv,
+    ) -> *mut OrtStatus,
+    _unused_4_6: [*const c_void; 3],
+    pub(crate) create_session: unsafe extern "system" fn(
+        env: *const OrtEnv,
+        model_path: *const OrtChar,
+        options: *const OrtSessionOptions,
+        session: *mut *mut OrtSession,
+    ) -> *mut OrtStatus,
+    _unused_8_9: [*const c_void; 2],
+    pub(crate) create_session_options:
+        unsafe extern "system" fn(options: *mut *mut OrtSessionOptions) -> *mut OrtStatus,
+    _unused_11_23: [*const c_void; 13],
+    pub(crate) set_intra_op_num_threads:
+        unsafe extern "system" fn(options: *mut OrtSessionOptions, threads: i32) -> *mut OrtStatus,
+    pub(crate) set_inter_op_num_threads:
+        unsafe extern "system" fn(options: *mut OrtSessionOptions, threads: i32) -> *mut OrtStatus,
+    _unused_26_75: [*const c_void; 50],
+    pub(crate) allocator_free: unsafe extern "system" fn(
+        allocator: *mut OrtAllocator,
+        pointer: *mut c_void,
+    ) -> *mut OrtStatus,
+    _unused_77: *const c_void,
+    pub(crate) get_allocator_with_default_options:
+        unsafe extern "system" fn(allocator: *mut *mut OrtAllocator) -> *mut OrtStatus,
+    _unused_79_91: [*const c_void; 13],
+    pub(crate) release_env: unsafe extern "system" fn(env: *mut OrtEnv),
+    pub(crate) release_status: unsafe extern "system" fn(status: *mut OrtStatus),
+    _unused_94: *const c_void,
+    pub(crate) release_session: unsafe extern "system" fn(session: *mut OrtSession),
+    _unused_96_99: [*const c_void; 4],
+    pub(crate) release_session_options: unsafe extern "system" fn(options: *mut OrtSessionOptions),
+    _unused_101_110: [*const c_void; 10],
+    pub(crate) session_get_model_metadata: unsafe extern "system" fn(
+        session: *const OrtSession,
+        metadata: *mut *mut OrtModelMetadata,
+    ) -> *mut OrtStatus,
+    _unused_112_115: [*const c_void; 4],
+    pub(crate) model_metadata_lookup_custom_metadata_map:
+        unsafe extern "system" fn(
+            metadata: *const OrtModelMetadata,
+            allocator: *mut OrtAllocator,
+            key: *const c_char,
+            value: *mut *mut c_char,
+        ) -> *mut OrtStatus,
+    _unused_117: *const c_void,
+    pub(crate) release_model_metadata: unsafe extern "system" fn(metadata: *mut OrtModelMetadata),
 }
 
 #[repr(C)]
