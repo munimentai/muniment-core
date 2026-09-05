@@ -2824,6 +2824,7 @@ dependencies = [
  "image",
  "keyring",
  "libc",
+ "libloading",
  "muniment-attach",
  "muniment-code-diff",
  "quick-xml",
