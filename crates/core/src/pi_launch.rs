@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::chat_grant::ChatGrant;
-use crate::sidecar::pi_install::{resolve_current_for, PiArtifactDescriptor, PI_ARTIFACT};
+use crate::sidecar::pi_install::{resolve_current_for, PiArtifactDescriptor, PI_SELECTED_ARTIFACT};
 use crate::sidecar::{pi_sidecar_config, PiSessionLocator, SidecarConfig};
 
 const LOCAL_MODE_ENV_REMOVE: &[&str] = &[
@@ -55,7 +55,7 @@ pub trait PiLaunchBoundaries {
     fn pi_session_root(&self) -> Result<PathBuf, PiLaunchError>;
     fn memory_agent_extension_path(&self) -> Option<PathBuf>;
     fn pi_artifact(&self) -> PiArtifactDescriptor {
-        PI_ARTIFACT
+        PI_SELECTED_ARTIFACT
     }
 }
 

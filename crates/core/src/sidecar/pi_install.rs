@@ -12,6 +12,8 @@ use crate::model_install::{
 };
 
 pub const PI_RELEASE_BASE: &str = "https://github.com/earendil-works/pi/releases/download/v0.73.1";
+pub const PI_CANDIDATE_RELEASE_BASE: &str =
+    "https://github.com/earendil-works/pi/releases/download/v0.85.1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PiArtifactDescriptor {
@@ -67,6 +69,77 @@ pub const PI_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
     sha256: "8bdb8e612a4b820f939a524652709b167ac5f1d4d1bba25988a631bff0bbe80b",
     executable: "pi/pi.exe",
 };
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub const PI_CANDIDATE_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
+    version: "0.85.1",
+    archive: "pi-linux-x64.tar.gz",
+    byte_size: 42_560_927,
+    sha256: "494e498f47d74d21f40b3386f6a5e921a3d49531a169cab55bbdaca0ea1fe25a",
+    executable: "pi/pi",
+};
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+pub const PI_CANDIDATE_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
+    version: "0.85.1",
+    archive: "pi-linux-arm64.tar.gz",
+    byte_size: 42_628_180,
+    sha256: "042d20ae885ee4f3b102815f3280b962c377b2e9fb44de4037908cc530eae4d4",
+    executable: "pi/pi",
+};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub const PI_CANDIDATE_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
+    version: "0.85.1",
+    archive: "pi-darwin-arm64.tar.gz",
+    byte_size: 31_035_676,
+    sha256: "d5f70e3c0cf7398eac239fd0261ee074d98b7ba7f6b43fe3617f052ed5b79d06",
+    executable: "pi/pi",
+};
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+pub const PI_CANDIDATE_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
+    version: "0.85.1",
+    archive: "pi-darwin-x64.tar.gz",
+    byte_size: 33_544_584,
+    sha256: "adb918b845625f184d8bea408d55eacaf21aa87238793c0f5b4f3b9737bce62b",
+    executable: "pi/pi",
+};
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub const PI_CANDIDATE_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
+    version: "0.85.1",
+    archive: "pi-windows-x64.zip",
+    byte_size: 45_009_021,
+    sha256: "002fa95b90d521245b9985d8f168caebc237ad56e7e30b319807dee1b2e17e1c",
+    executable: "pi/pi.exe",
+};
+
+pub const PI_CANDIDATE_PREVIOUS_ARTIFACT: Option<PiArtifactDescriptor> = Some(PI_ARTIFACT);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PiTrack {
+    artifact: PiArtifactDescriptor,
+    previous: Option<PiArtifactDescriptor>,
+    release_base: &'static str,
+}
+
+const fn pi_track(candidate: Option<&str>) -> PiTrack {
+    if matches!(candidate, Some(value) if matches!(value.as_bytes(), [b'1'])) {
+        PiTrack {
+            artifact: PI_CANDIDATE_ARTIFACT,
+            previous: PI_CANDIDATE_PREVIOUS_ARTIFACT,
+            release_base: PI_CANDIDATE_RELEASE_BASE,
+        }
+    } else {
+        PiTrack {
+            artifact: PI_ARTIFACT,
+            previous: PI_PREVIOUS_ARTIFACT,
+            release_base: PI_RELEASE_BASE,
+        }
+    }
+}
+
+// The nightly sets this switch at build time. Installed services need no
+// inherited environment, and a runtime variable cannot change the track.
+const PI_SELECTED_TRACK: PiTrack = pi_track(option_env!("MUNIMENT_PI_CANDIDATE"));
+pub const PI_SELECTED_ARTIFACT: PiArtifactDescriptor = PI_SELECTED_TRACK.artifact;
 
 const POINTER_HEADER: &str = "muniment-pi-pointer-v1";
 
@@ -221,7 +294,7 @@ pub fn install_pi<
         lock,
         space,
         cancellation,
-        || Ok(PI_ARTIFACT.byte_size),
+        || Ok(PI_SELECTED_ARTIFACT.byte_size),
         || acquire_stage(&stage, transport),
         |stage| publish_stage(root, &stage, boundary),
     )
@@ -243,9 +316,12 @@ fn acquire_stage<T: PiDownloadTransport>(
         return Err(PiInstallError::InvalidStage);
     }
     fs::create_dir_all(stage).map_err(|_| PiInstallError::Persistence)?;
-    let archive = stage.join(PI_ARTIFACT.archive);
+    let archive = stage.join(PI_SELECTED_ARTIFACT.archive);
     let request = PiDownloadRequest {
-        url: format!("{PI_RELEASE_BASE}/{}", PI_ARTIFACT.archive),
+        url: format!(
+            "{}/{}",
+            PI_SELECTED_TRACK.release_base, PI_SELECTED_ARTIFACT.archive
+        ),
         connect_timeout: Duration::from_secs(10),
         read_timeout: Duration::from_secs(30),
         deadline: Duration::from_secs(30 * 60),
@@ -261,7 +337,7 @@ fn acquire_stage<T: PiDownloadTransport>(
         .create_new(true)
         .open(&archive)
         .map_err(|_| PiInstallError::Persistence)?;
-    let mut limited = response.body.take(PI_ARTIFACT.byte_size + 1);
+    let mut limited = response.body.take(PI_SELECTED_ARTIFACT.byte_size + 1);
     std::io::copy(&mut limited, &mut output).map_err(|_| PiInstallError::Download)?;
     output.sync_all().map_err(|_| PiInstallError::Persistence)?;
     verify_archive(&archive)?;
@@ -271,7 +347,7 @@ fn acquire_stage<T: PiDownloadTransport>(
 }
 
 pub fn verify_archive(path: &Path) -> Result<(), PiInstallError> {
-    verify_archive_for(path, PI_ARTIFACT)
+    verify_archive_for(path, PI_SELECTED_ARTIFACT)
 }
 
 fn verify_archive_for(path: &Path, descriptor: PiArtifactDescriptor) -> Result<(), PiInstallError> {
@@ -293,6 +369,26 @@ fn safe_name(path: &Path) -> bool {
         .all(|part| matches!(part, Component::Normal(_)))
         && path.components().next() == Some(Component::Normal("pi".as_ref()))
 }
+#[cfg(any(windows, test))]
+fn zip_entry_path(path: &Path, flat_root: bool) -> Result<PathBuf, PiInstallError> {
+    if path.as_os_str().is_empty()
+        || !path
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+    {
+        return Err(PiInstallError::UnsafeArchive);
+    }
+    let output = if flat_root {
+        Path::new("pi").join(path)
+    } else {
+        path.to_owned()
+    };
+    if !safe_name(&output) {
+        return Err(PiInstallError::UnsafeArchive);
+    }
+    Ok(output)
+}
+
 fn extract_archive(archive: &Path, stage: &Path) -> Result<(), PiInstallError> {
     #[cfg(windows)]
     {
@@ -303,8 +399,12 @@ fn extract_archive(archive: &Path, stage: &Path) -> Result<(), PiInstallError> {
             let mut entry = zip
                 .by_index(index)
                 .map_err(|_| PiInstallError::UnsafeArchive)?;
-            let enclosed = entry.enclosed_name().ok_or(PiInstallError::UnsafeArchive)?;
-            if !safe_name(&enclosed) || (!entry.is_dir() && !entry.is_file()) {
+            // The candidate ZIP has a flat root. Keep the installed pi/ layout.
+            let enclosed = zip_entry_path(
+                &entry.enclosed_name().ok_or(PiInstallError::UnsafeArchive)?,
+                PI_SELECTED_ARTIFACT == PI_CANDIDATE_ARTIFACT,
+            )?;
+            if !entry.is_dir() && !entry.is_file() {
                 return Err(PiInstallError::UnsafeArchive);
             }
             let output = stage.join(enclosed);
@@ -345,7 +445,7 @@ fn extract_archive(archive: &Path, stage: &Path) -> Result<(), PiInstallError> {
 }
 
 fn verify_executable(root: &Path) -> Result<PathBuf, PiInstallError> {
-    verify_executable_for(root, PI_ARTIFACT)
+    verify_executable_for(root, PI_SELECTED_ARTIFACT)
 }
 
 fn verify_executable_for(
@@ -372,24 +472,34 @@ fn publish_stage<B: PiLifecycleBoundary>(
     stage: &Path,
     boundary: &B,
 ) -> Result<PathBuf, PiInstallError> {
-    verify_archive(&stage.join(PI_ARTIFACT.archive))?;
+    verify_archive(&stage.join(PI_SELECTED_ARTIFACT.archive))?;
     verify_executable(stage)?;
     let revisions = root.join("revisions");
     fs::create_dir_all(&revisions).map_err(|_| PiInstallError::Persistence)?;
-    let destination = revisions.join(PI_ARTIFACT.version);
-    boundary.sync_file(&stage.join(PI_ARTIFACT.archive))?;
-    boundary.sync_file(&stage.join(PI_ARTIFACT.executable))?;
+    let destination = revisions.join(PI_SELECTED_ARTIFACT.version);
+    boundary.sync_file(&stage.join(PI_SELECTED_ARTIFACT.archive))?;
+    boundary.sync_file(&stage.join(PI_SELECTED_ARTIFACT.executable))?;
     boundary.sync_directory(stage)?;
-    if resolve_revision(&destination, PI_ARTIFACT).is_err() {
+    if resolve_revision(&destination, PI_SELECTED_ARTIFACT).is_err() {
         boundary.replace_revision(stage, &destination)?;
         boundary.sync_directory(&revisions)?;
     }
-    if let Ok(current) = read_pointer(root, "current") {
-        write_pointer(root, "previous", &current, boundary)?;
-    }
-    write_pointer(root, "current", PI_ARTIFACT.version, boundary)?;
-    boundary.sync_directory(root)?;
+    publish_pointers(root, boundary, PI_SELECTED_TRACK)?;
     resolve_current(root)
+}
+
+fn publish_pointers<B: PiLifecycleBoundary>(
+    root: &Path,
+    boundary: &B,
+    track: PiTrack,
+) -> Result<(), PiInstallError> {
+    if let Ok(current) = read_pointer_for(root, "current", track.artifact, track.previous) {
+        if current != track.artifact.version {
+            write_pointer(root, "previous", &current, boundary)?;
+        }
+    }
+    write_pointer(root, "current", track.artifact.version, boundary)?;
+    boundary.sync_directory(root)
 }
 
 pub fn resolve_current(root: &Path) -> Result<PathBuf, PiInstallError> {
@@ -400,8 +510,13 @@ pub fn resolve_current_for(
     root: &Path,
     descriptor: PiArtifactDescriptor,
 ) -> Result<PathBuf, PiInstallError> {
-    resolve_pointer_for(root, "current", descriptor, None)
-        .or_else(|_| resolve_pointer_for(root, "previous", descriptor, None))
+    let retained = if descriptor == PI_SELECTED_ARTIFACT {
+        PI_SELECTED_TRACK.previous
+    } else {
+        None
+    };
+    resolve_pointer_for(root, "current", descriptor, retained)
+        .or_else(|_| resolve_pointer_for(root, "previous", descriptor, retained))
 }
 
 /// Atomically reactivates the retained verified predecessor after the newly
@@ -410,7 +525,12 @@ pub fn rollback_to_previous<B: PiLifecycleBoundary>(
     root: &Path,
     boundary: &B,
 ) -> Result<PathBuf, PiInstallError> {
-    rollback_to_previous_for(root, boundary, PI_ARTIFACT, PI_PREVIOUS_ARTIFACT)
+    rollback_to_previous_for(
+        root,
+        boundary,
+        PI_SELECTED_ARTIFACT,
+        PI_SELECTED_TRACK.previous,
+    )
 }
 
 /// Resolves the new pin for supervisor startup and rolls the durable pointer
@@ -424,8 +544,8 @@ pub fn activate_or_rollback<B: PiLifecycleBoundary>(
     activate_or_rollback_for(
         root,
         boundary,
-        PI_ARTIFACT,
-        PI_PREVIOUS_ARTIFACT,
+        PI_SELECTED_ARTIFACT,
+        PI_SELECTED_TRACK.previous,
         activation_healthy,
     )
 }
@@ -452,7 +572,8 @@ fn rollback_to_previous_for<B: PiLifecycleBoundary>(
     retained: Option<PiArtifactDescriptor>,
 ) -> Result<PathBuf, PiInstallError> {
     let previous = read_pointer_for(root, "previous", current, retained)?;
-    let descriptor = descriptor_for_version_from(&previous, current, retained)
+    let descriptor = retained
+        .filter(|descriptor| descriptor.version == previous)
         .ok_or(PiInstallError::NotInstalled)?;
     resolve_revision(&root.join("revisions").join(&previous), descriptor)?;
     write_pointer(root, "current", &previous, boundary)?;
@@ -461,7 +582,12 @@ fn rollback_to_previous_for<B: PiLifecycleBoundary>(
 }
 
 fn resolve_pointer(root: &Path, pointer: &str) -> Result<PathBuf, PiInstallError> {
-    resolve_pointer_for(root, pointer, PI_ARTIFACT, PI_PREVIOUS_ARTIFACT)
+    resolve_pointer_for(
+        root,
+        pointer,
+        PI_SELECTED_ARTIFACT,
+        PI_SELECTED_TRACK.previous,
+    )
 }
 
 fn resolve_pointer_for(
@@ -495,10 +621,6 @@ fn resolve_revision(
     let archive = revision.join(descriptor.archive);
     verify_archive_for(&archive, descriptor)?;
     verify_executable_for(revision, descriptor)
-}
-
-fn read_pointer(root: &Path, name: &str) -> Result<String, PiInstallError> {
-    read_pointer_for(root, name, PI_ARTIFACT, PI_PREVIOUS_ARTIFACT)
 }
 
 fn read_pointer_for(
@@ -617,22 +739,104 @@ mod tests {
     }
 
     #[test]
-    fn pin_upgrade_rolls_back_only_to_the_retained_verified_descriptor() {
+    fn only_the_explicit_build_switch_selects_the_candidate() {
+        for switch in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("true"),
+            Some("01"),
+            Some("1 "),
+        ] {
+            let track = pi_track(switch);
+            assert_eq!(track.artifact, PI_ARTIFACT);
+            assert_eq!(track.release_base, PI_RELEASE_BASE);
+            assert_eq!(track.previous, None);
+        }
+        let candidate = pi_track(Some("1"));
+        assert_eq!(candidate.artifact, PI_CANDIDATE_ARTIFACT);
+        assert_eq!(candidate.release_base, PI_CANDIDATE_RELEASE_BASE);
+        assert_eq!(candidate.previous, Some(PI_ARTIFACT));
+        assert_eq!(PI_ARTIFACT.version, "0.73.1");
+        assert_eq!(PI_CANDIDATE_ARTIFACT.version, "0.85.1");
+    }
+
+    #[test]
+    fn zip_layouts_keep_entries_beneath_the_installed_pi_directory() {
+        assert_eq!(
+            zip_entry_path(Path::new("pi/pi.exe"), false).unwrap(),
+            Path::new("pi/pi.exe")
+        );
+        for path in ["pi.exe", "examples/plugin/index.ts"] {
+            assert_eq!(
+                zip_entry_path(Path::new(path), true).unwrap(),
+                Path::new("pi").join(path)
+            );
+            assert_eq!(
+                zip_entry_path(Path::new(path), false),
+                Err(PiInstallError::UnsafeArchive)
+            );
+        }
+        for flat_root in [false, true] {
+            for path in ["", ".", "..", "../pi.exe", "pi/../../pi.exe", "/pi.exe"] {
+                assert_eq!(
+                    zip_entry_path(Path::new(path), flat_root),
+                    Err(PiInstallError::UnsafeArchive)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn both_descriptors_reject_wrong_sizes_and_digests() {
+        let root =
+            std::env::temp_dir().join(format!("muniment-pi-descriptors-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        for artifact in [PI_ARTIFACT, PI_CANDIDATE_ARTIFACT] {
+            assert!(artifact.byte_size > 0);
+            assert_eq!(artifact.sha256.len(), 64);
+            assert!(artifact.sha256.bytes().all(|b| b.is_ascii_hexdigit()));
+            assert!(safe_component(artifact.version));
+            assert!(safe_component(artifact.archive));
+            assert!(safe_name(Path::new(artifact.executable)));
+            let archive = root.join(artifact.archive);
+            fs::write(&archive, b"").unwrap();
+            assert_eq!(
+                verify_archive_for(&archive, artifact),
+                Err(PiInstallError::WrongSize)
+            );
+            let file = File::create(&archive).unwrap();
+            file.set_len(artifact.byte_size).unwrap();
+            assert_eq!(
+                verify_archive_for(&archive, artifact),
+                Err(PiInstallError::DigestMismatch)
+            );
+            file.set_len(artifact.byte_size + 1).unwrap();
+            assert_eq!(
+                verify_archive_for(&archive, artifact),
+                Err(PiInstallError::WrongSize)
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn candidate_activation_rolls_back_only_to_the_verified_production_pin() {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
             "muniment-pi-upgrade-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let descriptor = |version, archive| PiArtifactDescriptor {
-            version,
-            archive,
+        // Fixture bytes replace only the archive size and digest.
+        let descriptor = |artifact: PiArtifactDescriptor| PiArtifactDescriptor {
             byte_size: 1,
             sha256: "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
-            executable: "pi/pi",
+            ..artifact
         };
-        let old = descriptor("0.72.0", "old.tar.gz");
-        let new = descriptor("0.73.1", "new.tar.gz");
+        let candidate = pi_track(Some("1"));
+        let old = descriptor(candidate.previous.unwrap());
+        let new = descriptor(candidate.artifact);
         for artifact in [old, new] {
             let revision = root.join("revisions").join(artifact.version);
             fs::create_dir_all(revision.join("pi")).unwrap();
@@ -641,19 +845,38 @@ mod tests {
         }
         fs::write(
             root.join("current"),
-            format!("{POINTER_HEADER}\n{}\n", new.version),
-        )
-        .unwrap();
-        fs::write(
-            root.join("previous"),
             format!("{POINTER_HEADER}\n{}\n", old.version),
         )
         .unwrap();
+        let track = PiTrack {
+            artifact: new,
+            previous: Some(old),
+            ..candidate
+        };
+        publish_pointers(&root, &FsPiLifecycleBoundary, track).unwrap();
+        // A repeated candidate install must retain the production predecessor.
+        publish_pointers(&root, &FsPiLifecycleBoundary, track).unwrap();
+        assert_eq!(
+            read_pointer_for(&root, "previous", new, Some(old)).unwrap(),
+            old.version
+        );
 
+        let candidate_path = root
+            .join("revisions")
+            .join(new.version)
+            .join(new.executable);
+        assert_eq!(
+            activate_or_rollback_for(&root, &FsPiLifecycleBoundary, new, Some(old), |_| true)
+                .unwrap(),
+            candidate_path
+        );
         let restored =
-            activate_or_rollback_for(&root, &FsPiLifecycleBoundary, new, Some(old), |_| false)
-                .unwrap();
-        assert_eq!(restored, root.join("revisions/0.72.0/pi/pi"));
+            activate_or_rollback_for(&root, &FsPiLifecycleBoundary, new, Some(old), |path| {
+                assert_eq!(path, candidate_path);
+                false
+            })
+            .unwrap();
+        assert_eq!(restored, root.join("revisions/0.73.1").join(old.executable));
         assert_eq!(
             read_pointer_for(&root, "current", new, Some(old)).unwrap(),
             old.version
@@ -672,11 +895,38 @@ mod tests {
             read_pointer_for(&root, "current", new, Some(old)).unwrap(),
             new.version
         );
-        fs::write(root.join("previous"), format!("{POINTER_HEADER}\nother\n")).unwrap();
         assert_eq!(
-            rollback_to_previous_for(&root, &FsPiLifecycleBoundary, new, Some(old)),
+            rollback_to_previous_for(&root, &FsPiLifecycleBoundary, new, None),
             Err(PiInstallError::NotInstalled)
         );
+        fs::write(
+            root.join("revisions").join(old.version).join(old.archive),
+            b"b",
+        )
+        .unwrap();
+        assert_eq!(
+            activate_or_rollback_for(&root, &FsPiLifecycleBoundary, new, Some(old), |_| false),
+            Err(PiInstallError::DigestMismatch)
+        );
+        assert_eq!(
+            read_pointer_for(&root, "current", new, Some(old)).unwrap(),
+            new.version
+        );
+        for version in [new.version, "other", "../0.73.1", ""] {
+            fs::write(
+                root.join("previous"),
+                format!("{POINTER_HEADER}\n{version}\n"),
+            )
+            .unwrap();
+            assert_eq!(
+                rollback_to_previous_for(&root, &FsPiLifecycleBoundary, new, Some(old)),
+                Err(PiInstallError::NotInstalled)
+            );
+            assert_eq!(
+                read_pointer_for(&root, "current", new, Some(old)).unwrap(),
+                new.version
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 }
