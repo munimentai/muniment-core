@@ -21,6 +21,7 @@ pub mod loopback;
 pub mod native_authorization;
 pub mod native_credentials_store;
 pub mod native_devices;
+mod native_http;
 pub mod native_registration;
 pub mod native_revocation;
 pub mod native_session;

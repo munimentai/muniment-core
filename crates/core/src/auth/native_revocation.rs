@@ -110,17 +110,18 @@ impl RevocationTransport for UreqRevocationTransport {
         url: &str,
         request: &NativeRevocationRequest,
     ) -> Result<NativeRevocationResponse, NativeRevocationError> {
-        let response = ureq::post(url)
-            .timeout(self.timeout)
-            .set("Content-Type", "application/json")
-            .set("Authorization", request.authorization())
-            .send_json(request)
-            .map_err(|error| match error {
-                ureq::Error::Status(status, _) => NativeRevocationError::HttpStatus(status),
-                ureq::Error::Transport(_) => {
-                    NativeRevocationError::Transport("request failed".into())
-                }
-            })?;
+        let response = super::native_http::request("POST", REVOCATION_PATH, || {
+            ureq::post(url)
+                .timeout(self.timeout)
+                .set("Content-Type", "application/json")
+                .set("Authorization", request.authorization())
+                .send_json(request)
+                .map_err(Box::new)
+        })
+        .map_err(|error| match *error {
+            ureq::Error::Status(status, _) => NativeRevocationError::HttpStatus(status),
+            ureq::Error::Transport(_) => NativeRevocationError::Transport("request failed".into()),
+        })?;
         if response.status() != 200 {
             return Err(NativeRevocationError::HttpStatus(response.status()));
         }

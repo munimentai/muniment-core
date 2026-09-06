@@ -129,19 +129,22 @@ impl RegistrationTransport for UreqRegistrationTransport {
         url: &str,
         request: &NativeDeviceRegistrationRequest,
     ) -> Result<NativeDeviceRegistrationResponse, NativeRegistrationError> {
-        let response = ureq::post(url)
-            .timeout(self.timeout)
-            .set("Content-Type", "application/json")
-            .send_json(request)
-            .map_err(|error| match error {
-                ureq::Error::Status(429, response) => NativeRegistrationError::RateLimited(
-                    retry_delay(response.header("Retry-After")),
-                ),
-                ureq::Error::Status(status, _) => NativeRegistrationError::HttpStatus(status),
-                ureq::Error::Transport(_) => {
-                    NativeRegistrationError::Transport("request failed".into())
-                }
-            })?;
+        let response = super::native_http::request("POST", REGISTRATION_PATH, || {
+            ureq::post(url)
+                .timeout(self.timeout)
+                .set("Content-Type", "application/json")
+                .send_json(request)
+                .map_err(Box::new)
+        })
+        .map_err(|error| match *error {
+            ureq::Error::Status(429, response) => {
+                NativeRegistrationError::RateLimited(retry_delay(response.header("Retry-After")))
+            }
+            ureq::Error::Status(status, _) => NativeRegistrationError::HttpStatus(status),
+            ureq::Error::Transport(_) => {
+                NativeRegistrationError::Transport("request failed".into())
+            }
+        })?;
         response.into_json().map_err(|_| {
             NativeRegistrationError::MalformedResponse(
                 "response was not valid contract JSON".into(),

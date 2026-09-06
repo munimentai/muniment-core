@@ -224,14 +224,17 @@ impl TokenTransport for UreqTokenTransport {
         url: &str,
         request: &NativeTokenRequest,
     ) -> Result<NativeTokenResponse, NativeTokenError> {
-        let response = ureq::post(url)
-            .timeout(self.timeout)
-            .set("Content-Type", "application/json")
-            .send_json(request)
-            .map_err(|error| match error {
-                ureq::Error::Status(status, _) => NativeTokenError::HttpStatus(status),
-                ureq::Error::Transport(_) => NativeTokenError::Transport("request failed".into()),
-            })?;
+        let response = super::native_http::request("POST", TOKEN_PATH, || {
+            ureq::post(url)
+                .timeout(self.timeout)
+                .set("Content-Type", "application/json")
+                .send_json(request)
+                .map_err(Box::new)
+        })
+        .map_err(|error| match *error {
+            ureq::Error::Status(status, _) => NativeTokenError::HttpStatus(status),
+            ureq::Error::Transport(_) => NativeTokenError::Transport("request failed".into()),
+        })?;
         if response.status() != 200 {
             return Err(NativeTokenError::HttpStatus(response.status()));
         }

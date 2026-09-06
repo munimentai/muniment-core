@@ -125,16 +125,17 @@ impl NativeDeviceListTransport for UreqNativeDeviceListTransport {
         url: &str,
         request: &NativeDeviceListRequest,
     ) -> Result<NativeDeviceList, NativeDeviceListError> {
-        let response = ureq::get(url)
-            .timeout(self.timeout)
-            .set("Authorization", request.authorization())
-            .call()
-            .map_err(|error| match error {
-                ureq::Error::Status(status, _) => NativeDeviceListError::HttpStatus(status),
-                ureq::Error::Transport(_) => {
-                    NativeDeviceListError::Transport("request failed".into())
-                }
-            })?;
+        let response = super::native_http::request("GET", DEVICES_PATH, || {
+            ureq::get(url)
+                .timeout(self.timeout)
+                .set("Authorization", request.authorization())
+                .call()
+                .map_err(Box::new)
+        })
+        .map_err(|error| match *error {
+            ureq::Error::Status(status, _) => NativeDeviceListError::HttpStatus(status),
+            ureq::Error::Transport(_) => NativeDeviceListError::Transport("request failed".into()),
+        })?;
         if response.status() != 200 {
             return Err(NativeDeviceListError::HttpStatus(response.status()));
         }

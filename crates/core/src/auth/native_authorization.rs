@@ -272,16 +272,19 @@ impl AuthorizationTransport for UreqAuthorizationTransport {
         url: &str,
         request: &NativeAuthorizationRequest,
     ) -> Result<NativeAuthorizationResponse, NativeAuthorizationError> {
-        let response = ureq::post(url)
-            .timeout(self.timeout)
-            .set("Content-Type", "application/json")
-            .send_json(request)
-            .map_err(|error| match error {
-                ureq::Error::Status(status, _) => NativeAuthorizationError::HttpStatus(status),
-                ureq::Error::Transport(_) => {
-                    NativeAuthorizationError::Transport("request failed".into())
-                }
-            })?;
+        let response = super::native_http::request("POST", AUTHORIZATION_PATH, || {
+            ureq::post(url)
+                .timeout(self.timeout)
+                .set("Content-Type", "application/json")
+                .send_json(request)
+                .map_err(Box::new)
+        })
+        .map_err(|error| match *error {
+            ureq::Error::Status(status, _) => NativeAuthorizationError::HttpStatus(status),
+            ureq::Error::Transport(_) => {
+                NativeAuthorizationError::Transport("request failed".into())
+            }
+        })?;
         if response.status() != 200 {
             return Err(NativeAuthorizationError::HttpStatus(response.status()));
         }
@@ -593,6 +596,116 @@ mod tests {
         assert!(saved.registration_token.is_empty());
         assert_eq!(saved.registration_expires_at, 0);
         assert_eq!(saved.device_challenge, URL_SAFE_NO_PAD.encode([11; 32]));
+    }
+
+    #[test]
+    fn authorize_logs_status_without_request_or_response_secrets() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+
+        let request = NativeAuthorizationRequest {
+            client_id: CLIENT_ID.into(),
+            redirect_uri: "http://127.0.0.1/callback".into(),
+            response_type: "code".into(),
+            code_challenge: "secret-pkce".into(),
+            code_challenge_method: "S256".into(),
+            state: "secret-state".into(),
+            device_id: Uuid::new_v4(),
+            client_role: CLIENT_ROLE.into(),
+            org_id: Some(Uuid::new_v4()),
+            registration_token: "known-registration-secret".into(),
+            device_proof: NativeDeviceProof {
+                challenge: "known-proof-secret".into(),
+                issued_at: "secret-issued-at".into(),
+                jti: "secret-jti".into(),
+                signature: "known-signature-secret".into(),
+            },
+        };
+        for (status, body) in [
+            (
+                200,
+                r#"{"authorization_url":"https://example.com/secret-continuation","device_challenge":"secret-response-proof"}"#,
+            ),
+            (200, "malformed-secret-body"),
+            (401, "secret-error-body"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!(
+                "http://{}{AUTHORIZATION_PATH}?secret-query",
+                listener.local_addr().unwrap()
+            );
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                let mut sent = vec![0; length];
+                reader.read_exact(&mut sent).unwrap();
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nSet-Cookie: secret-session-cookie\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                String::from_utf8(sent).unwrap()
+            });
+            let (result, lines) = super::super::native_http::capture(|| {
+                UreqAuthorizationTransport::new(Duration::from_secs(5)).authorize(&url, &request)
+            });
+            let sent = server.join().unwrap();
+            assert!(sent.contains(&request.registration_token));
+            if status == 401 {
+                assert!(matches!(
+                    result,
+                    Err(NativeAuthorizationError::HttpStatus(401))
+                ));
+            } else if body.starts_with('{') {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(NativeAuthorizationError::MalformedResponse(_))
+                ));
+            }
+            assert_eq!(lines.len(), 2);
+            assert_eq!(
+                lines[0],
+                "muniment-runtime: native-auth start method=POST path=/v1/auth/native/authorize"
+            );
+            let prefix = format!("muniment-runtime: native-auth end method=POST path=/v1/auth/native/authorize status={status} elapsed_ms=");
+            lines[1]
+                .strip_prefix(&prefix)
+                .unwrap()
+                .parse::<u128>()
+                .unwrap();
+            let log = lines.join("\n");
+            for secret in [
+                request.registration_token.as_str(),
+                request.device_proof.challenge.as_str(),
+                request.device_proof.signature.as_str(),
+                request.device_proof.issued_at.as_str(),
+                request.device_proof.jti.as_str(),
+                request.state.as_str(),
+                request.code_challenge.as_str(),
+                &request.device_id.to_string(),
+                &request.org_id.unwrap().to_string(),
+                "secret-query",
+                "secret-continuation",
+                "secret-response-proof",
+                "malformed-secret-body",
+                "secret-error-body",
+                "secret-session-cookie",
+            ] {
+                assert!(!log.contains(secret));
+            }
+        }
     }
 
     #[test]

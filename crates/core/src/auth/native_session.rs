@@ -246,14 +246,17 @@ impl SessionTransport for UreqSessionTransport {
         url: &str,
         request: &NativeSessionRequest,
     ) -> Result<NativeSession, NativeSessionError> {
-        let response = ureq::get(url)
-            .timeout(self.timeout)
-            .set("Authorization", request.authorization())
-            .call()
-            .map_err(|error| match error {
-                ureq::Error::Status(status, _) => NativeSessionError::HttpStatus(status),
-                ureq::Error::Transport(_) => NativeSessionError::Transport("request failed".into()),
-            })?;
+        let response = super::native_http::request("GET", SESSION_PATH, || {
+            ureq::get(url)
+                .timeout(self.timeout)
+                .set("Authorization", request.authorization())
+                .call()
+                .map_err(Box::new)
+        })
+        .map_err(|error| match *error {
+            ureq::Error::Status(status, _) => NativeSessionError::HttpStatus(status),
+            ureq::Error::Transport(_) => NativeSessionError::Transport("request failed".into()),
+        })?;
         if response.status() != 200 {
             return Err(NativeSessionError::HttpStatus(response.status()));
         }
