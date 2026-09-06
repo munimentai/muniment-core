@@ -4,6 +4,13 @@ use crate::chat_grant::ChatGrant;
 use crate::sidecar::pi_install::{resolve_current_for, PiArtifactDescriptor, PI_SELECTED_ARTIFACT};
 use crate::sidecar::{pi_sidecar_config, PiSessionLocator, SidecarConfig};
 
+const BASH_TIMEOUT_INSTRUCTIONS: &str =
+    "- `bash` reads its `timeout` in SECONDS, never milliseconds, and applies
+  NO timeout at all when you omit it. Pass one on every call: 60 for a
+  quick command, up to 600 for a build or a test suite. A four- or
+  five-digit value is a millisecond habit from another harness and leaves
+  the command unbounded, so it runs until the engine kills the whole run.";
+
 const LOCAL_MODE_ENV_REMOVE: &[&str] = &[
     "AI_GATEWAY_API_KEY",
     "ANTHROPIC_API_KEY",
@@ -88,6 +95,10 @@ pub fn pi_launch_config_for_executable(
     let session_root = boundaries.pi_session_root()?;
     let mut config = pi_sidecar_config(executable.to_string_lossy(), &session_root, reopen)
         .map_err(|_| PiLaunchError::RejectedConfig)?;
+    config.args.extend([
+        "--append-system-prompt".into(),
+        BASH_TIMEOUT_INSTRUCTIONS.into(),
+    ]);
     if grant.is_local() {
         config.env_remove = LOCAL_MODE_ENV_REMOVE
             .iter()

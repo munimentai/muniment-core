@@ -7,7 +7,7 @@ use muniment_core::chat_grant::ChatGrant;
 use muniment_core::pi_launch::{
     pi_launch_config, pi_launch_config_for_executable, PiLaunchBoundaries, PiLaunchError,
 };
-use muniment_core::sidecar::{PiRpcWiring, SidecarStatus, SidecarSupervisor};
+use muniment_core::sidecar::{validate_pi_session, PiRpcWiring, SidecarStatus, SidecarSupervisor};
 use uuid::Uuid;
 
 static ENVIRONMENT: Mutex<()> = Mutex::new(());
@@ -112,6 +112,69 @@ fn appends_a_present_extension_file_and_environment() {
         .windows(2)
         .any(|args| args == ["--extension", extension.to_string_lossy().as_ref()]));
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn appends_the_exact_timeout_rule_for_every_launch() {
+    let root = temporary_directory();
+    let extension = root.join("memory.js");
+    fs::write(&extension, "").unwrap();
+    fs::write(root.join("session.jsonl"), "").unwrap();
+    let (locator, _) = validate_pi_session(&root, "session.jsonl").unwrap();
+    for grant in [ChatGrant::local(), grant()] {
+        for reopen in [None, Some(&locator)] {
+            for extension in [None, Some(root.join("missing.js")), Some(extension.clone())] {
+                let boundaries = Boundaries {
+                    session_root: Ok(root.clone()),
+                    extension,
+                };
+                let config =
+                    pi_launch_config_for_executable(&boundaries, "pi".into(), &grant, reopen)
+                        .unwrap();
+                let appended: Vec<_> = config
+                    .args
+                    .windows(2)
+                    .filter(|args| args[0] == "--append-system-prompt")
+                    .map(|args| args[1].as_str())
+                    .collect();
+                assert_eq!(
+                    appended,
+                    [
+                        "- `bash` reads its `timeout` in SECONDS, never milliseconds, and applies
+  NO timeout at all when you omit it. Pass one on every call: 60 for a
+  quick command, up to 600 for a build or a test suite. A four- or
+  five-digit value is a millisecond habit from another harness and leaves
+  the command unbounded, so it runs until the engine kills the whole run."
+                    ]
+                );
+                assert!(!config.args.iter().any(|arg| arg == "--system-prompt"));
+            }
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn workspace_agents_file_does_not_remove_the_timeout_rule() {
+    let workspace = temporary_directory();
+    let instructions = "Use the workspace instructions.\n";
+    fs::write(workspace.join("AGENTS.md"), instructions).unwrap();
+    // A child changes the working directory without affecting parallel tests.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "appends_the_exact_timeout_rule_for_every_launch"])
+        .current_dir(&workspace)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+        "{output:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("AGENTS.md")).unwrap(),
+        instructions
+    );
+    fs::remove_dir_all(workspace).unwrap();
 }
 
 #[test]
