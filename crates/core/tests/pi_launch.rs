@@ -25,6 +25,14 @@ impl PiLaunchBoundaries for Boundaries {
     fn memory_agent_extension_path(&self) -> Option<PathBuf> {
         self.extension.clone()
     }
+
+    fn prepare_pi_settings(
+        &self,
+        _artifact: muniment_core::sidecar::pi_install::PiArtifactDescriptor,
+        _executable: &std::path::Path,
+    ) -> Result<(), PiLaunchError> {
+        Ok(())
+    }
 }
 
 fn grant() -> ChatGrant {
@@ -42,6 +50,95 @@ fn temporary_directory() -> PathBuf {
     let path = std::env::temp_dir().join(format!("muniment-pi-launch-{}", Uuid::new_v4()));
     fs::create_dir(&path).unwrap();
     path
+}
+
+struct TrackBoundaries {
+    root: PathBuf,
+    artifact: muniment_core::sidecar::pi_install::PiArtifactDescriptor,
+}
+
+impl PiLaunchBoundaries for TrackBoundaries {
+    fn pi_session_root(&self) -> Result<PathBuf, PiLaunchError> {
+        Ok(self.root.clone())
+    }
+
+    fn memory_agent_extension_path(&self) -> Option<PathBuf> {
+        None
+    }
+
+    fn pi_artifact(&self) -> muniment_core::sidecar::pi_install::PiArtifactDescriptor {
+        self.artifact
+    }
+
+    fn prepare_pi_settings(
+        &self,
+        artifact: muniment_core::sidecar::pi_install::PiArtifactDescriptor,
+        _executable: &std::path::Path,
+    ) -> Result<(), PiLaunchError> {
+        muniment_core::pi_settings::store_pi_settings(&self.root.join("settings.json"), artifact)
+            .map_err(|_| PiLaunchError::RejectedConfig)
+    }
+}
+
+#[test]
+fn every_launch_renders_the_selected_track_before_spawn() {
+    use muniment_core::sidecar::pi_install::{PI_ARTIFACT, PI_CANDIDATE_ARTIFACT};
+    for artifact in [PI_ARTIFACT, PI_CANDIDATE_ARTIFACT] {
+        for grant in [ChatGrant::local(), grant()] {
+            let root = temporary_directory();
+            fs::write(root.join("session.jsonl"), "").unwrap();
+            let (locator, _) = validate_pi_session(&root, "session.jsonl").unwrap();
+            for reopen in [None, Some(&locator)] {
+                let path = root.join("settings.json");
+                fs::write(&path, br#"{"defaultProvider":"ollama","foreign":true}"#).unwrap();
+                let boundaries = TrackBoundaries {
+                    root: root.clone(),
+                    artifact,
+                };
+                let config =
+                    pi_launch_config_for_executable(&boundaries, "pi".into(), &grant, reopen)
+                        .unwrap();
+                let settings: serde_json::Value =
+                    serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+                assert_eq!(settings["defaultProvider"], "ollama");
+                assert_eq!(settings["foreign"], true);
+                if artifact == PI_CANDIDATE_ARTIFACT {
+                    assert_eq!(settings["packages"].as_array().unwrap().len(), 4);
+                    assert_eq!(settings["defaultTools"].as_array().unwrap().len(), 8);
+                    assert_eq!(config.startup_timeout, Duration::from_secs(120));
+                } else {
+                    assert!(settings.get("packages").is_none());
+                    assert!(settings.get("defaultTools").is_none());
+                    assert_eq!(config.startup_timeout, Duration::from_secs(30));
+                }
+                assert!(!config.args.iter().any(|arg| arg == "--tools"));
+                assert!(config.env_remove.iter().any(|name| name == "BUN_BE_BUN"));
+                assert!(!config.env.contains_key("BUN_BE_BUN"));
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
+#[test]
+fn rejects_a_candidate_launch_when_settings_cannot_be_saved() {
+    let root = temporary_directory();
+    fs::write(root.join("settings.json"), "null").unwrap();
+    let boundaries = TrackBoundaries {
+        root: root.clone(),
+        artifact: muniment_core::sidecar::pi_install::PI_CANDIDATE_ARTIFACT,
+    };
+    for grant in [ChatGrant::local(), grant()] {
+        assert_eq!(
+            pi_launch_config_for_executable(&boundaries, "pi".into(), &grant, None).unwrap_err(),
+            PiLaunchError::RejectedConfig,
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(root.join("settings.json")).unwrap(),
+        "null"
+    );
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -148,6 +245,7 @@ fn appends_the_exact_timeout_rule_for_every_launch() {
                     ]
                 );
                 assert!(!config.args.iter().any(|arg| arg == "--system-prompt"));
+                assert!(!config.args.iter().any(|arg| arg == "--tools"));
             }
         }
     }

@@ -170,7 +170,16 @@ impl PiRpcWiring {
         &self,
         timeout: Duration,
     ) -> impl Fn(&SidecarIo) -> Result<ProbeOutcome, String> + Send + Sync + 'static {
+        self.readiness_probe_with_startup_timeout(timeout, timeout)
+    }
+
+    pub fn readiness_probe_with_startup_timeout(
+        &self,
+        startup_timeout: Duration,
+        health_timeout: Duration,
+    ) -> impl Fn(&SidecarIo) -> Result<ProbeOutcome, String> + Send + Sync + 'static {
         let shared = Arc::clone(&self.transport);
+        let ready_generation = Mutex::new(None);
         move |io| {
             let generation = io.stdin.generation();
             let transport = {
@@ -187,7 +196,19 @@ impl PiRpcWiring {
                     }
                 }
             };
-            transport.health_probe(timeout)(io)
+            let mut ready = ready_generation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let timeout = if *ready == Some(generation) {
+                health_timeout
+            } else {
+                startup_timeout
+            };
+            let outcome = transport.health_probe(timeout)(io)?;
+            if outcome == ProbeOutcome::Ready {
+                *ready = Some(generation);
+            }
+            Ok(outcome)
         }
     }
 }

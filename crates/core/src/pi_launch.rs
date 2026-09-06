@@ -61,6 +61,14 @@ const LOCAL_MODE_ENV_REMOVE: &[&str] = &[
 pub trait PiLaunchBoundaries {
     fn pi_session_root(&self) -> Result<PathBuf, PiLaunchError>;
     fn memory_agent_extension_path(&self) -> Option<PathBuf>;
+    fn prepare_pi_settings(
+        &self,
+        artifact: PiArtifactDescriptor,
+        executable: &Path,
+    ) -> Result<(), PiLaunchError> {
+        crate::pi_settings::prepare_pi_settings(artifact, executable)
+            .map_err(|_| PiLaunchError::RejectedConfig)
+    }
     fn pi_artifact(&self) -> PiArtifactDescriptor {
         PI_SELECTED_ARTIFACT
     }
@@ -95,15 +103,21 @@ pub fn pi_launch_config_for_executable(
     let session_root = boundaries.pi_session_root()?;
     let mut config = pi_sidecar_config(executable.to_string_lossy(), &session_root, reopen)
         .map_err(|_| PiLaunchError::RejectedConfig)?;
+    boundaries.prepare_pi_settings(boundaries.pi_artifact(), &executable)?;
+    config.env_remove.push("BUN_BE_BUN".into());
+    if boundaries.pi_artifact().version == crate::sidecar::pi_install::PI_CANDIDATE_ARTIFACT.version
+    {
+        // Extension loading precedes the first RPC response.
+        config.startup_timeout = std::time::Duration::from_secs(120);
+    }
     config.args.extend([
         "--append-system-prompt".into(),
         BASH_TIMEOUT_INSTRUCTIONS.into(),
     ]);
     if grant.is_local() {
-        config.env_remove = LOCAL_MODE_ENV_REMOVE
-            .iter()
-            .map(|name| (*name).to_owned())
-            .collect();
+        config
+            .env_remove
+            .extend(LOCAL_MODE_ENV_REMOVE.iter().map(|name| (*name).to_owned()));
     } else {
         config
             .env

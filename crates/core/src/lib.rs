@@ -45,6 +45,8 @@ pub mod owned_threads;
 pub mod permission_gate;
 pub mod pi_execution;
 pub mod pi_launch;
+pub mod pi_packages;
+pub mod pi_settings;
 pub mod retention_record;
 pub mod router_classifier;
 pub mod run_events;

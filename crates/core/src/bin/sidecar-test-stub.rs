@@ -19,6 +19,19 @@ fn main() {
         Some("echo") => echo(),
         Some("json-rpc") => json_rpc(args.next()),
         Some("pi-rpc-interleaved") => pi_rpc_interleaved(),
+        Some("pi-rpc-slow-probes") => {
+            for line in io::stdin().lock().lines() {
+                let request: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+                thread::sleep(Duration::from_millis(200));
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "type": "response", "command": "get_state", "success": true, "id": request["id"]
+                    })
+                );
+                io::stdout().flush().unwrap();
+            }
+        }
         Some("pi-chat-queue") => pi_chat_queue(),
         Some("pi-chat-capture") => pi_chat_capture(args.next().unwrap()),
         Some("pi-chat-extension-ui") => pi_chat_extension_ui(args.next().unwrap()),

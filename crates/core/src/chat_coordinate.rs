@@ -296,7 +296,7 @@ pub fn coordinate(
     // A local run owns one Pi conversation. Do not carry a previous run's
     // active session into this prompt.
     *runtime = None;
-    {
+    let startup_timeout = {
         let root = std::env::var("MUNIMENT_PI_ROOT").ok();
         let config = pi_launch_config(
             &app,
@@ -333,29 +333,32 @@ pub fn coordinate(
                 return;
             }
         };
+        let startup_timeout = config.startup_timeout;
         let wiring = PiRpcWiring::new();
-        let supervisor =
-            match SidecarSupervisor::spawn(config, wiring.readiness_probe(Duration::from_secs(10)))
-            {
-                Ok(value) => value,
-                Err(_) => {
-                    fail_start(
-                        &app,
-                        &journal,
-                        &mut projector,
-                        &run_id,
-                        &mut seq,
-                        "The agent runtime could not start.",
-                        subject.as_deref(),
-                        resume.is_some(),
-                    );
-                    return;
-                }
-            };
+        let supervisor = match SidecarSupervisor::spawn(
+            config,
+            wiring.readiness_probe_with_startup_timeout(startup_timeout, Duration::from_secs(10)),
+        ) {
+            Ok(value) => value,
+            Err(_) => {
+                fail_start(
+                    &app,
+                    &journal,
+                    &mut projector,
+                    &run_id,
+                    &mut seq,
+                    "The agent runtime could not start.",
+                    subject.as_deref(),
+                    resume.is_some(),
+                );
+                return;
+            }
+        };
         *runtime = Some(PiRuntime { supervisor, wiring });
-    }
+        startup_timeout
+    };
     let runtime = runtime.as_mut().expect("runtime was initialized");
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + startup_timeout;
     while runtime.supervisor.status() == SidecarStatus::Starting
         && std::time::Instant::now() < deadline
     {

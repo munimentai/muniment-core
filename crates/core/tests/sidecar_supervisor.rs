@@ -605,6 +605,23 @@ fn json_rpc_probe_keeps_supervisor_healthy_across_intervals() {
 }
 
 #[test]
+fn pi_allows_package_resolution_only_during_startup() {
+    let mut cfg = config(&["pi-rpc-slow-probes"]);
+    cfg.startup_timeout = STUB_RESPONSE_DEADLINE;
+    let wiring = PiRpcWiring::new();
+    let probe =
+        Arc::new(wiring.readiness_probe_with_startup_timeout(
+            STUB_RESPONSE_DEADLINE,
+            Duration::from_millis(20),
+        ));
+    let startup_probe = Arc::clone(&probe);
+    let mut supervisor = SidecarSupervisor::spawn(cfg, move |io| startup_probe(io)).unwrap();
+    wait_for(&supervisor, SidecarStatus::Healthy);
+    assert!(probe(&supervisor.io()).is_err());
+    supervisor.shutdown().unwrap();
+}
+
+#[test]
 fn pi_probe_routes_interleaved_frames_before_its_response() {
     let mut cfg = config(&["pi-rpc-interleaved"]);
     cfg.health_interval = Duration::from_secs(60);
