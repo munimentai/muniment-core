@@ -10,11 +10,14 @@ pub mod assistant_text;
 pub mod atomic_file;
 pub mod attach;
 pub mod attachment;
+#[cfg(feature = "desktop-integration")]
 pub mod auth;
+#[cfg(feature = "desktop-integration")]
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub mod browser_control;
 pub mod cas;
 pub mod chat_coordinate;
+#[cfg(feature = "desktop-integration")]
 pub mod chat_grant;
 pub mod chat_profile;
 #[cfg(feature = "keyring")]
