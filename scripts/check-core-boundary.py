@@ -212,7 +212,8 @@ def check_tree(text, staying_crates, package):
             if package in (CORE, "muniment-runtime"):
                 allowed.add(STAY_FEATURE)
             if package == "muniment-runtime":
-                allowed.add("default")
+                # The installed runtime needs TLS for native-auth cloud calls.
+                allowed.update({"default", "tls"})
             require(features <= allowed,
                     f"{package} enables unexpected core features: {sorted(features - allowed)}")
 
