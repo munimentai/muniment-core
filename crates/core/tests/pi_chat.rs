@@ -570,6 +570,27 @@ fn invalid_session_state_cancels_accepted_agent_work() {
     supervisor.shutdown().unwrap();
 }
 
+#[test]
+fn expired_state_request_preserves_stdin_for_cancellation() {
+    let temp = TempDir::new();
+    let marker = temp.path().join("cancelled");
+    let session_file = temp.path().join("session.jsonl");
+    let (mut supervisor, wiring) = deferred_session_supervisor(&session_file, Some(&marker));
+    let transport = wiring.transport().unwrap();
+    let (adapter, _) =
+        PiRunAdapter::start("run-1", &transport, "prompt", Duration::from_secs(1)).unwrap();
+
+    assert!(transport
+        .session_locator(temp.path(), Duration::ZERO)
+        .unwrap_err()
+        .contains("timed out writing Pi RPC stdin"));
+    adapter
+        .cancel_and_drain(&transport, Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(fs::read_to_string(marker).unwrap(), "cancelled");
+    supervisor.shutdown().unwrap();
+}
+
 fn extension_ui_supervisor(capture: &std::path::Path) -> (SidecarSupervisor, PiRpcWiring) {
     let mut config = SidecarConfig::new(env!("CARGO_BIN_EXE_sidecar-test-stub"));
     config.args = vec![

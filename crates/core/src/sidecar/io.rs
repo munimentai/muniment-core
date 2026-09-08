@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::io::Write;
 use std::process::ChildStdin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -72,6 +72,11 @@ impl LineWriter {
             }
             guard.writer.clone().ok_or(SidecarError::Disconnected)?
         };
+        const PENDING: u8 = 0;
+        const WRITING: u8 = 1;
+        const CANCELLED: u8 = 2;
+        let attempt = Arc::new(AtomicU8::new(PENDING));
+        let worker_attempt = Arc::clone(&attempt);
         let state = Arc::clone(&self.0);
         let (sender, receiver) = mpsc::channel();
         // The supervisor kills the child to release a pipe write that outlives the deadline.
@@ -102,6 +107,13 @@ impl LineWriter {
                             return Err(SidecarError::Disconnected);
                         }
                     }
+                    // The caller can cancel a queued write without closing an untouched pipe.
+                    if worker_attempt
+                        .compare_exchange(PENDING, WRITING, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_err()
+                    {
+                        return Err(write_timeout());
+                    }
                     writer
                         .write_all(format!("{line}\n").as_bytes())
                         .map_err(SidecarError::Io)
@@ -115,7 +127,7 @@ impl LineWriter {
             Err(mpsc::RecvTimeoutError::Timeout) => Err(write_timeout()),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(SidecarError::Disconnected),
         };
-        if result.is_err() {
+        if result.is_err() && attempt.swap(CANCELLED, Ordering::SeqCst) == WRITING {
             // A partial frame makes this pipe unusable. Keep cleanup off the writer lock.
             let mut guard = self.0.lock().unwrap();
             if guard.generation == generation {
