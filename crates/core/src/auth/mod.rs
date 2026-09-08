@@ -75,9 +75,10 @@ pub use native_revocation::{
 pub use native_session::{
     ensure_fresh_native_session, ensure_native_session, inspect_native_session, native_status,
     EntitlementSnapshotAlgorithm, EntitlementSnapshotView, FreshNativeSession,
-    FreshNativeSessionError, NativeEntitlementGroup, NativeEntitlementPayload,
+    FreshNativeSessionError, NativeEntitlementGrant, NativeEntitlementPayload,
     NativeEntitlementSnapshot, NativeSession, NativeSessionError, NativeSessionIdentity,
-    NativeSessionRequest, NativeSessionRole, SessionTransport, UreqSessionTransport,
+    NativeSessionOrganization, NativeSessionRequest, NativeSessionRole, NativeSessionUser,
+    SessionTransport, UreqSessionTransport,
 };
 pub use native_sign_in::{run_native_sign_in, NativeSignInError};
 pub use native_token::{

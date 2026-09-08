@@ -19,8 +19,7 @@ use muniment_core::attach::{
     WorkspaceOnboarded,
 };
 use muniment_core::auth::{
-    AuthStatus, EntitlementSnapshotView, NativeDeviceList, NativeEntitlementGroup,
-    NativeSessionRole,
+    AuthStatus, EntitlementSnapshotView, NativeDeviceList, NativeSessionRole,
 };
 use muniment_core::journal::MAX_THREAD_TITLE_CHARS;
 use muniment_core::journal::{CommitSubscription, JournalCommitHint, RunEventProjection};
@@ -1282,12 +1281,13 @@ impl ThreadListService for SessionService {
         Ok(EntitlementSnapshotResult {
             snapshot: EntitlementSnapshotView {
                 snapshot_version: 7,
-                org_id: uuid::Uuid::parse_str("20000000-0000-4000-8000-000000000002").unwrap(),
-                user_id: uuid::Uuid::parse_str("30000000-0000-4000-8000-000000000003").unwrap(),
+                org_id: "20000000-0000-4000-8000-000000000002".into(),
+                user_id: "30000000-0000-4000-8000-000000000003".into(),
                 role: NativeSessionRole::Owner,
                 user_display_name: Some("User".into()),
                 organization_display_name: Some("Muniment".into()),
-                groups: Vec::<NativeEntitlementGroup>::new(),
+                capabilities: vec![],
+                grants: vec![],
             },
             changed_snapshot_version: Some(7),
         })
@@ -1375,7 +1375,8 @@ fn desktop_client_dispatches_session_operations() {
                     "role": "owner",
                     "user_display_name": "User",
                     "organization_display_name": "Muniment",
-                    "groups": []
+                    "capabilities": [],
+                    "grants": []
                 },
                 "changed_snapshot_version": 7
             }),

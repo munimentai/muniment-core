@@ -44,26 +44,39 @@ pub enum NativeSessionRole {
     Owner,
 }
 
-/// The strictly typed, display-only portion of the signed entitlement payload.
+/// The server supplies display hints, not local authorization rules.
+/// The v1 inspection contract permits unknown response fields.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct NativeEntitlementPayload {
-    #[serde(rename = "version")]
-    pub snapshot_version: u64,
-    #[serde(default)]
-    pub user_display_name: Option<String>,
-    #[serde(default)]
-    pub organization_display_name: Option<String>,
-    pub groups: Vec<NativeEntitlementGroup>,
+    pub org_id: String,
+    pub user_id: String,
+    #[serde(deserialize_with = "deserialize_version")]
+    pub entitlement_version: u64,
+    pub issued_at: chrono::DateTime<chrono::Utc>,
+    pub capabilities: Vec<String>,
+    pub grants: Vec<NativeEntitlementGrant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct NativeEntitlementGroup {
-    pub name: String,
-    pub models: Vec<String>,
-    pub connections: Vec<String>,
-    pub capabilities: Vec<String>,
+pub struct NativeEntitlementGrant {
+    pub id: String,
+    pub principal_type: String,
+    pub principal_id: Option<String>,
+    pub resource_type: String,
+    pub resource_id: Option<String>,
+    pub action: String,
+    pub effect: String,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+fn deserialize_version<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    let version = u64::deserialize(deserializer)?;
+    if version > 9_007_199_254_740_991 {
+        return Err(serde::de::Error::custom(
+            "entitlement version exceeds the safe integer range",
+        ));
+    }
+    Ok(version)
 }
 
 /// Safe webview projection. The signed envelope and native credentials have no
@@ -72,12 +85,13 @@ pub struct NativeEntitlementGroup {
 #[serde(deny_unknown_fields)]
 pub struct EntitlementSnapshotView {
     pub snapshot_version: u64,
-    pub org_id: Uuid,
-    pub user_id: Uuid,
+    pub org_id: String,
+    pub user_id: String,
     pub role: NativeSessionRole,
     pub user_display_name: Option<String>,
     pub organization_display_name: Option<String>,
-    pub groups: Vec<NativeEntitlementGroup>,
+    pub capabilities: Vec<String>,
+    pub grants: Vec<NativeEntitlementGrant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -87,7 +101,6 @@ pub enum EntitlementSnapshotAlgorithm {
 }
 
 #[derive(Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct NativeEntitlementSnapshot {
     pub payload: NativeEntitlementPayload,
     pub signature: String,
@@ -105,19 +118,36 @@ impl fmt::Debug for NativeEntitlementSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct NativeSessionIdentity {
-    pub org_id: Uuid,
-    pub user_id: Uuid,
+    pub org_id: String,
+    pub user_id: String,
     pub role: NativeSessionRole,
-    pub device_id: Uuid,
+    pub device_id: String,
     pub client_role: String,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
+pub struct NativeSessionUser {
+    pub id: String,
+    pub email: String,
+    pub status: String,
+    pub role: NativeSessionRole,
+    #[serde(deserialize_with = "deserialize_version")]
+    pub entitlement_version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct NativeSessionOrganization {
+    pub id: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct NativeSession {
     pub session: NativeSessionIdentity,
+    pub user: NativeSessionUser,
+    pub org: NativeSessionOrganization,
     pub entitlement_snapshot: NativeEntitlementSnapshot,
 }
 
@@ -391,13 +421,14 @@ pub fn ensure_fresh_native_session(
     Ok(FreshNativeSession {
         status,
         entitlement_snapshot: Some(EntitlementSnapshotView {
-            snapshot_version: payload.snapshot_version,
+            snapshot_version: payload.entitlement_version,
             org_id: session.session.org_id,
             user_id: session.session.user_id,
             role: session.session.role,
-            user_display_name: payload.user_display_name,
-            organization_display_name: payload.organization_display_name,
-            groups: payload.groups,
+            user_display_name: Some(session.user.email),
+            organization_display_name: Some(session.org.display_name),
+            capabilities: payload.capabilities,
+            grants: payload.grants,
         }),
         credentials: Some(credentials),
     })
@@ -442,8 +473,18 @@ fn validate_response(
     response: &NativeSession,
     expected_device_id: Uuid,
 ) -> Result<(), NativeSessionError> {
-    if response.session.device_id != expected_device_id
+    let payload = &response.entitlement_snapshot.payload;
+    if response.session.device_id != expected_device_id.to_string()
         || response.session.client_role != CLIENT_ROLE
+        || response.session.org_id.is_empty()
+        || response.session.user_id.is_empty()
+        || response.org.id != response.session.org_id
+        || response.user.id != response.session.user_id
+        || payload.org_id != response.session.org_id
+        || payload.user_id != response.session.user_id
+        || response.user.role != response.session.role
+        || response.user.status != "active"
+        || response.user.entitlement_version != payload.entitlement_version
         || response.entitlement_snapshot.signature.is_empty()
     {
         return Err(NativeSessionError::MalformedResponse(

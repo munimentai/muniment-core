@@ -66,9 +66,55 @@ fn store() -> MemoryStore {
 }
 
 fn success() -> String {
-    format!(
-        r#"{{"session":{{"org_id":"20000000-0000-4000-8000-000000000002","user_id":"30000000-0000-4000-8000-000000000003","role":"owner","device_id":"{DEVICE_ID}","client_role":"desktop"}},"entitlement_snapshot":{{"payload":{{"version":7,"user_display_name":"Mikey","organization_display_name":"DNSFilter","groups":[{{"name":"data-team","models":["glm-5.2"],"connections":["warehouse"],"capabilities":["analysis"]}}]}},"signature":"signature-secret","algorithm":"hmac-sha256"}}}}"#
-    )
+    // Section 2.2 uses an opaque example device ID. Registration stores a UUID.
+    CONTRACT_EXAMPLE.replace("dev_desktop_1", DEVICE_ID)
+}
+
+const CONTRACT_EXAMPLE: &str = r#"{
+  "session": {
+    "org_id": "org_acme",
+    "user_id": "usr_7",
+    "role": "user",
+    "device_id": "dev_desktop_1",
+    "client_role": "desktop",
+    "expires_at": "2026-07-11T12:15:00.000Z"
+  },
+  "user": {
+    "id": "usr_7",
+    "email": "ada@example.test",
+    "status": "active",
+    "role": "user",
+    "entitlement_version": 42
+  },
+  "org": { "id": "org_acme", "display_name": "Acme" },
+  "entitlement_snapshot": {
+    "payload": {
+      "org_id": "org_acme",
+      "user_id": "usr_7",
+      "entitlement_version": 42,
+      "issued_at": "2026-07-11T12:00:00.000Z",
+      "capabilities": ["mcp.local_stdio"],
+      "grants": [{
+        "id": "grt_stub",
+        "principal_type": "org",
+        "principal_id": "org_acme",
+        "resource_type": "model",
+        "resource_id": "muniment-stub-chat",
+        "action": "use",
+        "effect": "allow",
+        "expires_at": null
+      }]
+    },
+    "signature": "base64url-signature-redacted",
+    "algorithm": "hmac-sha256"
+  }
+}"#;
+
+#[test]
+fn canonical_example_decodes_with_opaque_identifiers() {
+    let session: NativeSession = serde_json::from_str(CONTRACT_EXAMPLE).unwrap();
+    assert_eq!(session.session.device_id, "dev_desktop_1");
+    assert_eq!(session.session.user_id, "usr_7");
 }
 
 struct Server {
@@ -113,15 +159,9 @@ fn exact_authenticated_get_decodes_typed_contract() {
         &server.base_url,
     )
     .unwrap();
-    assert_eq!(
-        result.session.user_id,
-        Uuid::parse_str("30000000-0000-4000-8000-000000000003").unwrap()
-    );
-    assert_eq!(result.entitlement_snapshot.payload.snapshot_version, 7);
-    assert_eq!(
-        result.entitlement_snapshot.payload.groups[0].name,
-        "data-team"
-    );
+    assert_eq!(result.session.user_id, "usr_7");
+    assert_eq!(result.entitlement_snapshot.payload.entitlement_version, 42);
+    assert_eq!(result.entitlement_snapshot.payload.grants[0].id, "grt_stub");
     let request = server.request.lock().unwrap().clone().unwrap();
     assert!(request.starts_with("GET /v1/auth/native/session HTTP/1.1\r\n"));
     assert_eq!(
@@ -152,6 +192,152 @@ fn composed_native_session_uses_the_local_server() {
 }
 
 #[test]
+fn contract_and_compatible_fields_return_the_same_signed_in_projection() {
+    let body: serde_json::Value = serde_json::from_str(&success()).unwrap();
+    let mut extended = body.clone();
+    for pointer in [
+        "",
+        "/session",
+        "/user",
+        "/org",
+        "/entitlement_snapshot",
+        "/entitlement_snapshot/payload",
+        "/entitlement_snapshot/payload/grants/0",
+    ] {
+        extended
+            .pointer_mut(pointer)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "future_field".into(),
+                serde_json::json!({"secret": "not-for-webview"}),
+            );
+    }
+    let mut projections = Vec::new();
+    for body in [body, extended] {
+        let server = Server::spawn(200, body.to_string());
+        let result =
+            ensure_native_session(&orchestration_store(2_000, 4_000), &server.base_url, 1_000)
+                .unwrap();
+        assert!(result.status.signed_in);
+        assert_eq!(result.status.subject.as_deref(), Some("usr_7"));
+        let view = result.entitlement_snapshot.unwrap();
+        assert_eq!(view.organization_display_name.as_deref(), Some("Acme"));
+        assert_eq!(view.user_display_name.as_deref(), Some("ada@example.test"));
+        assert_eq!(view.role, muniment_core::auth::NativeSessionRole::User);
+        assert_eq!(view.snapshot_version, 42);
+        assert_eq!(view.org_id, "org_acme");
+        assert_eq!(view.user_id, "usr_7");
+        assert_eq!(view.capabilities, ["mcp.local_stdio"]);
+        assert_eq!(
+            view.grants,
+            session_result().entitlement_snapshot.payload.grants
+        );
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("not-for-webview"));
+        assert!(!json.contains("signature"));
+        projections.push(view);
+    }
+    assert_eq!(projections[0], projections[1]);
+}
+
+#[test]
+fn rejects_inconsistent_identity_and_invalid_versions_without_changing_credentials() {
+    for (pointer, value) in [
+        ("/session/device_id", serde_json::json!("")),
+        ("/session/client_role", serde_json::json!("")),
+        ("/session/org_id", serde_json::json!("")),
+        ("/user/id", serde_json::json!("other-user")),
+        ("/org/id", serde_json::json!("other-org")),
+        ("/user/role", serde_json::json!("owner")),
+        ("/user/status", serde_json::json!("inactive")),
+        ("/user/entitlement_version", serde_json::json!(43)),
+        (
+            "/entitlement_snapshot/payload/org_id",
+            serde_json::json!("other-org"),
+        ),
+        (
+            "/entitlement_snapshot/payload/user_id",
+            serde_json::json!("other-user"),
+        ),
+        (
+            "/entitlement_snapshot/payload/entitlement_version",
+            serde_json::json!(-1),
+        ),
+        (
+            "/entitlement_snapshot/payload/entitlement_version",
+            serde_json::json!(1.5),
+        ),
+        (
+            "/entitlement_snapshot/payload/entitlement_version",
+            serde_json::json!(9_007_199_254_740_992_u64),
+        ),
+        ("/session/expires_at", serde_json::json!("not-a-time")),
+        (
+            "/entitlement_snapshot/payload/issued_at",
+            serde_json::json!(null),
+        ),
+        ("/entitlement_snapshot/signature", serde_json::json!("")),
+    ] {
+        let mut body: serde_json::Value = serde_json::from_str(&success()).unwrap();
+        *body.pointer_mut(pointer).unwrap() = value;
+        let server = Server::spawn(200, body.to_string());
+        let store = orchestration_store(2_000, 4_000);
+        let before = store.load_credentials().unwrap().unwrap();
+        assert_eq!(
+            ensure_native_session(&store, &server.base_url, 1_000).unwrap_err(),
+            muniment_core::auth::FreshNativeSessionError::SessionInspection,
+            "{pointer}"
+        );
+        let after = store.load_credentials().unwrap().unwrap();
+        assert_eq!(after.tokens.access_token, before.tokens.access_token);
+        assert_eq!(after.tokens.refresh_token, before.tokens.refresh_token);
+        assert_eq!(after.tokens.expires_at, before.tokens.expires_at);
+        assert_eq!(after.installation.device_id, before.installation.device_id);
+        assert_eq!(
+            after.installation.device_challenge,
+            before.installation.device_challenge
+        );
+        assert_eq!(after.refresh_expires_at, before.refresh_expires_at);
+    }
+}
+
+#[test]
+fn zero_and_max_versions_empty_grants_and_deny_records_remain_display_hints() {
+    for version in [0, 9_007_199_254_740_991_u64] {
+        for empty in [true, false] {
+            let mut body: serde_json::Value = serde_json::from_str(&success()).unwrap();
+            body["user"]["entitlement_version"] = version.into();
+            let payload = &mut body["entitlement_snapshot"]["payload"];
+            payload["entitlement_version"] = version.into();
+            payload["capabilities"] = serde_json::json!([]);
+            if empty {
+                payload["grants"] = serde_json::json!([]);
+            } else {
+                let mut deny = payload["grants"][0].clone();
+                deny["id"] = "grt_deny".into();
+                deny["effect"] = "deny".into();
+                deny["expires_at"] = "2000-01-01T00:00:00Z".into();
+                deny["resource_id"] = serde_json::Value::Null;
+                deny["principal_id"] = serde_json::Value::Null;
+                payload["grants"].as_array_mut().unwrap().push(deny);
+            }
+            let expected: NativeSession = serde_json::from_value(body.clone()).unwrap();
+            let server = Server::spawn(200, body.to_string());
+            let result =
+                ensure_native_session(&orchestration_store(2_000, 4_000), &server.base_url, 1_000)
+                    .unwrap();
+            assert!(result.status.signed_in);
+            let view = result.entitlement_snapshot.unwrap();
+            assert_eq!(view.snapshot_version, version);
+            assert!(view.capabilities.is_empty());
+            assert_eq!(view.grants, expected.entitlement_snapshot.payload.grants);
+        }
+    }
+}
+
+#[test]
 fn signed_out_and_bad_configuration_make_no_request() {
     let server = Server::spawn(200, success());
     assert_eq!(
@@ -178,13 +364,13 @@ fn signed_out_and_bad_configuration_make_no_request() {
 fn rejects_wrong_device_role_algorithm_and_schema_without_mutation() {
     let cases = [
         success().replace(DEVICE_ID, "10000000-0000-4000-8000-000000000009"),
-        success().replace("\"client_role\":\"desktop\"", "\"client_role\":\"mobile\""),
-        success().replace("\"role\":\"owner\"", "\"role\":\"superuser\""),
-        success().replace("hmac-sha256", "ed25519"),
         success().replace(
-            "\"client_role\":\"desktop\"",
-            "\"client_role\":\"desktop\",\"extra\":true",
+            "\"client_role\": \"desktop\"",
+            "\"client_role\": \"mobile\"",
         ),
+        success().replace("\"role\": \"user\"", "\"role\": \"superuser\""),
+        success().replace("hmac-sha256", "ed25519"),
+        success().replace("\"client_role\": \"desktop\",", ""),
     ];
     for body in cases {
         let server = Server::spawn(200, body);
@@ -212,9 +398,15 @@ fn rejects_wrong_device_role_algorithm_and_schema_without_mutation() {
 #[test]
 fn rejects_malformed_required_entitlement_fields() {
     for body in [
-        success().replace("\"version\":7", "\"version\":\"seven\""),
-        success().replace("\"models\":[\"glm-5.2\"]", "\"models\":null"),
-        success().replace("\"capabilities\":[\"analysis\"]", "\"capabilities\":[4]"),
+        success().replace(
+            "\"entitlement_version\": 42",
+            "\"entitlement_version\": \"seven\"",
+        ),
+        success().replace("\"grants\": [{", "\"grants\": [null, {"),
+        success().replace(
+            "\"capabilities\": [\"mcp.local_stdio\"]",
+            "\"capabilities\": [4]",
+        ),
     ] {
         let server = Server::spawn(200, body);
         assert!(matches!(
@@ -247,7 +439,7 @@ fn failures_and_debug_output_redact_all_secrets() {
     }
     let session: muniment_core::auth::NativeSession = serde_json::from_str(&success()).unwrap();
     let rendered = format!("{session:?}");
-    assert!(!rendered.contains("signature-secret"));
+    assert!(!rendered.contains("base64url-signature-redacted"));
     assert!(matches!(
         inspect_native_session(
             &store(),
@@ -354,18 +546,19 @@ fn fresh_credentials_skip_exchange_but_still_validate_the_session() {
     )
     .unwrap();
     assert!(result.status.signed_in);
-    assert_eq!(
-        result.status.subject.as_deref(),
-        Some("30000000-0000-4000-8000-000000000003")
-    );
+    assert_eq!(result.status.subject.as_deref(), Some("usr_7"));
     assert_eq!(tokens.calls.load(Ordering::SeqCst), 0);
     assert_eq!(sessions.calls.load(Ordering::SeqCst), 1);
     let projection = result.entitlement_snapshot.unwrap();
     assert_eq!(
         projection.role,
-        muniment_core::auth::NativeSessionRole::Owner
+        muniment_core::auth::NativeSessionRole::User
     );
-    assert_eq!(projection.groups[0].models, ["glm-5.2"]);
+    assert_eq!(
+        projection.grants[0].resource_id.as_deref(),
+        Some("muniment-stub-chat")
+    );
+    assert_eq!(projection.capabilities, ["mcp.local_stdio"]);
     let json = serde_json::to_string(&projection).unwrap();
     for forbidden in [
         "signature",
