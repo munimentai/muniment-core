@@ -1723,6 +1723,8 @@ mod tests {
                 gateway_url: "https://gateway.invalid".into(),
                 virtual_key: "virtual-key".into(),
                 model: None,
+                expires_at: None,
+                native_access_token: None,
                 minimum_cacheable_prefix_characters: 8_192,
                 receipt_url: "https://receipt.invalid".into(),
             })

@@ -464,7 +464,17 @@ impl PiRunAdapter {
         session_root: &Path,
         timeout: Duration,
     ) -> Result<(super::PiSessionLocator, Vec<PiChatEvent>), String> {
-        let deadline = std::time::Instant::now() + timeout;
+        self.await_session_binding_with_handler(transport, session_root, timeout, |_| false)
+    }
+
+    pub fn await_session_binding_with_handler(
+        &self,
+        transport: &PiRpcTransport,
+        session_root: &Path,
+        timeout: Duration,
+        mut consume: impl FnMut(&PiChatEvent) -> bool,
+    ) -> Result<(super::PiSessionLocator, Vec<PiChatEvent>), String> {
+        let mut deadline = std::time::Instant::now() + timeout;
         let mut buffered = Vec::new();
         while std::time::Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -473,7 +483,15 @@ impl PiRunAdapter {
                 return Ok((locator, buffered));
             }
             match self.next(Duration::from_millis(10).min(remaining)) {
-                Ok(event) => buffered.push(event),
+                Ok(event) => {
+                    let started = std::time::Instant::now();
+                    if consume(&event) {
+                        // Native recovery has its own timeout. Keep Pi's binding wait separate.
+                        deadline += started.elapsed();
+                    } else {
+                        buffered.push(event);
+                    }
+                }
                 Err(error) if error == "timed out waiting for Pi stream" => {}
                 Err(_) => break,
             }

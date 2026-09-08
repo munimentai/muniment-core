@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use muniment_core::chat_grant::ChatGrant;
+use muniment_core::chat_grant::{ChatGrant, FetchGrantError};
+
+#[path = "pi_launch/gateway_coordinate.rs"]
+mod gateway_coordinate;
 use muniment_core::pi_launch::{
     pi_launch_config, pi_launch_config_for_executable, PiLaunchBoundaries, PiLaunchError,
 };
@@ -41,6 +44,8 @@ fn grant() -> ChatGrant {
         gateway_url: "https://gateway.example.com".into(),
         virtual_key: "secret-key".into(),
         model: Some("model".into()),
+        expires_at: None,
+        native_access_token: None,
         minimum_cacheable_prefix_characters: 8_192,
         receipt_url: "https://receipts.example.com".into(),
     }
@@ -111,6 +116,13 @@ fn every_launch_renders_the_selected_track_before_spawn() {
                     assert!(settings.get("defaultTools").is_none());
                     assert_eq!(config.startup_timeout, Duration::from_secs(30));
                 }
+                assert_eq!(
+                    config
+                        .args
+                        .windows(2)
+                        .any(|args| args == ["--api-key", "muniment-runtime-boundary"]),
+                    !grant.is_local()
+                );
                 assert!(!config.args.iter().any(|arg| arg == "--tools"));
                 assert!(config.env_remove.iter().any(|name| name == "BUN_BE_BUN"));
                 assert!(!config.env.contains_key("BUN_BE_BUN"));
@@ -139,6 +151,28 @@ fn rejects_a_candidate_launch_when_settings_cannot_be_saved() {
         "null"
     );
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn pinned_pi_cloud_wire_contract() {
+    let Ok(executable) = std::env::var("MUNIMENT_PI_WIRE_EXECUTABLE") else {
+        eprintln!("The wire test requires MUNIMENT_PI_WIRE_EXECUTABLE for Pi 0.73.1 or 0.85.1.");
+        return;
+    };
+    let output = std::process::Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/pi_cloud_wire.py"
+        ))
+        .arg(executable)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -192,10 +226,8 @@ fn appends_a_present_extension_file_and_environment() {
         extension: Some(extension.clone()),
     };
     let config = pi_launch_config_for_executable(&boundaries, "pi".into(), &grant(), None).unwrap();
-    assert_eq!(
-        config.env.get("OPENAI_API_KEY").map(String::as_str),
-        Some("secret-key")
-    );
+    assert!(!config.env.contains_key("OPENAI_API_KEY"));
+    assert!(!config.args.iter().any(|arg| arg.contains("secret-key")));
     assert_eq!(
         config.env.get("OPENAI_BASE_URL").map(String::as_str),
         Some("https://gateway.example.com")
@@ -208,6 +240,20 @@ fn appends_a_present_extension_file_and_environment() {
         .args
         .windows(2)
         .any(|args| args == ["--extension", extension.to_string_lossy().as_ref()]));
+    assert!(config
+        .args
+        .windows(2)
+        .any(|args| args == ["--provider", "muniment"]));
+    assert!(config
+        .args
+        .windows(2)
+        .any(|args| args == ["--model", "model"]));
+    let provider = fs::read_to_string(root.join("muniment-cloud-provider.mjs")).unwrap();
+    assert!(provider.contains("pi.registerProvider('muniment'"));
+    assert!(provider.contains("process.env.OPENAI_BASE_URL"));
+    assert!(provider.contains("apiKey: 'muniment-runtime-boundary'"));
+    assert!(provider.contains("process.env.PI_DEFAULT_MODEL"));
+    assert!(!provider.contains("secret-key"));
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -356,6 +402,19 @@ fn omits_an_absent_extension_file() {
         extension: Some(root.join("missing.js")),
     };
     let config = pi_launch_config_for_executable(&boundaries, "pi".into(), &grant(), None).unwrap();
-    assert!(!config.args.iter().any(|arg| arg == "--extension"));
+    let extensions: Vec<_> = config
+        .args
+        .windows(2)
+        .filter(|args| args[0] == "--extension")
+        .map(|args| args[1].as_str())
+        .collect();
+    assert_eq!(
+        extensions,
+        [root.join("muniment-cloud-provider.mjs").to_str().unwrap()]
+    );
+    let local =
+        pi_launch_config_for_executable(&boundaries, "pi".into(), &ChatGrant::local(), None)
+            .unwrap();
+    assert!(!local.args.iter().any(|arg| arg == "--extension"));
     fs::remove_dir_all(root).unwrap();
 }

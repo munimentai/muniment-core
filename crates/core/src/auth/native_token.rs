@@ -150,6 +150,24 @@ pub trait NativeCredentialStore: Send + Sync {
     fn save_credentials(&self, credentials: &NativeCredentials) -> Result<(), NativeTokenError>;
     fn load_credentials(&self) -> Result<Option<NativeCredentials>, NativeTokenError>;
     fn clear_session(&self) -> Result<(), NativeTokenError>;
+    fn clear_credentials_if_current(
+        &self,
+        _expected_access_token: &str,
+        _installation: bool,
+    ) -> Result<(), NativeTokenError> {
+        Err(NativeTokenError::Persistence(
+            "The credential store cannot remove credentials conditionally.".into(),
+        ))
+    }
+    fn replace_credentials(
+        &self,
+        _expected_access_token: &str,
+        _credentials: &NativeCredentials,
+    ) -> Result<(), NativeTokenError> {
+        Err(NativeTokenError::Persistence(
+            "The credential store cannot replace credentials conditionally.".into(),
+        ))
+    }
 }
 
 pub trait TokenTransport: Send + Sync {

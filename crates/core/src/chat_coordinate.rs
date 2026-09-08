@@ -212,9 +212,9 @@ pub fn coordinate(
     memory_runtime: Arc<ApplicationMemoryRuntime>,
     run_id: String,
     prompt: String,
-    access_token: String,
+    mut access_token: String,
     subject: Option<String>,
-    grant: ChatGrant,
+    mut grant: ChatGrant,
     cancelled: Arc<AtomicBool>,
     active_transport: Arc<Mutex<Option<Arc<PiRpcTransport>>>>,
     active_adapter: Arc<Mutex<Option<Arc<PiRunAdapter>>>>,
@@ -223,6 +223,9 @@ pub fn coordinate(
     resume_result: Option<std::sync::mpsc::Sender<Result<(), String>>>,
     prepared: Option<(u64, ChatProjector)>,
 ) {
+    if let Some(token) = grant.native_access_token.take() {
+        access_token = token;
+    }
     let run_started = Instant::now();
     let mut resume_attempt = ResumeAttempt::new(resume_result);
     let (mut seq, mut projector) = prepared.unwrap_or_else(|| {
@@ -297,6 +300,35 @@ pub fn coordinate(
     // active session into this prompt.
     *runtime = None;
     let startup_timeout = {
+        if let Err(error) = crate::chat_grant::renew_grant_if_needed(&mut grant, || {
+            app.renew_chat_grant(&access_token)
+        }) {
+            let message = match error {
+                crate::chat_grant::FetchGrantError::Unauthorized => {
+                    "The capability is not authorized."
+                }
+                crate::chat_grant::FetchGrantError::Unavailable => {
+                    "Chat configuration is temporarily unavailable."
+                }
+                crate::chat_grant::FetchGrantError::InvalidResponse => {
+                    "The chat configuration response was invalid."
+                }
+            };
+            fail_start(
+                &app,
+                &journal,
+                &mut projector,
+                &run_id,
+                &mut seq,
+                message,
+                subject.as_deref(),
+                resume.is_some(),
+            );
+            return;
+        }
+        if let Some(token) = grant.native_access_token.take() {
+            access_token = token;
+        }
         let root = std::env::var("MUNIMENT_PI_ROOT").ok();
         let config = pi_launch_config(
             &app,
@@ -410,6 +442,7 @@ pub fn coordinate(
         }
         return;
     }
+    let mut gateway_failure = None;
     let (adapter, buffered_events) = if resume.is_some() {
         let (adapter, _) =
             match PiRunAdapter::start(run_id.clone(), &transport, &prompt, RPC_TIMEOUT) {
@@ -505,7 +538,22 @@ pub fn coordinate(
                     .pi_session_root()
                     .map_err(|_| PreparedPromptError::SessionRoot)?;
                 let (locator, events) = adapter
-                    .await_session_binding(&transport, &session_root, RPC_TIMEOUT)
+                    .await_session_binding_with_handler(
+                        &transport,
+                        &session_root,
+                        RPC_TIMEOUT,
+                        |event| {
+                            answer_gateway_boundary(
+                                &app,
+                                &adapter,
+                                &transport,
+                                &mut grant,
+                                &mut access_token,
+                                &mut gateway_failure,
+                                event,
+                            )
+                        },
+                    )
                     .map_err(|_| PreparedPromptError::Binding)?;
                 Ok((adapter, locator, events))
             },
@@ -572,6 +620,25 @@ pub fn coordinate(
     let mut open_effects = MarkedEffects::open_effects(Some(runtime_activity.clone()));
     let mut pending_permission = MarkedGate::pending_permission(Some(runtime_activity));
     'coordinate: loop {
+        if let Some(error) = gateway_failure.filter(|_| buffered_events.len() == 0) {
+            if adapter
+                .cancel_and_drain(&transport, Duration::from_secs(2))
+                .is_err()
+            {
+                let _ = runtime.supervisor.shutdown();
+            }
+            fail_with_open_effects(
+                &app,
+                &journal,
+                &mut projector,
+                &run_id,
+                &mut seq,
+                &mut open_effects,
+                crate::chat_grant::grant_error_message(error),
+                subject.as_deref(),
+            );
+            break;
+        }
         if cancelled.swap(false, Ordering::SeqCst) {
             aborting = true;
             let _ = transport.call(cancel_command(), Duration::from_secs(2));
@@ -647,6 +714,7 @@ pub fn coordinate(
                     }
                 }
             }
+            Ok(PiChatEvent::Completed | PiChatEvent::Failed) if gateway_failure.is_some() => {}
             Ok(PiChatEvent::Completed) if aborting => {
                 let _ = append_terminal(
                     &app,
@@ -745,6 +813,17 @@ pub fn coordinate(
                 }
             }
             Ok(event @ PiChatEvent::ExtensionUiRequest(_)) => {
+                if answer_gateway_boundary(
+                    &app,
+                    &adapter,
+                    &transport,
+                    &mut grant,
+                    &mut access_token,
+                    &mut gateway_failure,
+                    &event,
+                ) {
+                    continue;
+                }
                 if coordinate_memory_search(
                     &app,
                     &memory_runtime,
@@ -813,6 +892,39 @@ pub fn coordinate(
             }
         }
     }
+}
+
+fn answer_gateway_boundary(
+    boundaries: &impl PiLaunchBoundaries,
+    adapter: &PiRunAdapter,
+    transport: &PiRpcTransport,
+    grant: &mut ChatGrant,
+    access_token: &mut String,
+    failure: &mut Option<crate::chat_grant::FetchGrantError>,
+    event: &PiChatEvent,
+) -> bool {
+    let PiChatEvent::ExtensionUiRequest(request) = event else {
+        return false;
+    };
+    if let Some(error) = *failure {
+        if !matches!(&request.dialog, ExtensionUiDialog::Editor { title, .. } if title == "muniment:chat-grant")
+        {
+            return false;
+        }
+        let answer = ExtensionUiAnswer::Editor(
+            json!({"error": crate::chat_grant::grant_error_message(error)}).to_string(),
+        );
+        let _ = adapter.answer_extension_ui(transport, request, answer);
+        return true;
+    }
+    let Some((answer, error)) =
+        crate::chat_grant::answer_grant_request(boundaries, grant, access_token, request)
+    else {
+        return false;
+    };
+    *failure = error;
+    let _ = adapter.answer_extension_ui(transport, request, answer);
+    true
 }
 
 #[allow(clippy::too_many_arguments)]

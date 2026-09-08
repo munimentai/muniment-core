@@ -215,6 +215,14 @@ fn pi_resume(args: Vec<String>) {
                             "title":"Allow this action?", "message":"The test stub needs permission."
                         })
                     );
+                } else if let Ok(denial) = std::env::var("PI_RESUME_STUB_GRANT_DENIAL") {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "extension_ui_request", "id": "grant-1", "method": "editor",
+                            "title": "muniment:chat-grant", "prefill": denial
+                        })
+                    );
                 } else if let Ok(query) = std::env::var("PI_RESUME_STUB_MEMORY_QUERY") {
                     println!(
                         "{}",

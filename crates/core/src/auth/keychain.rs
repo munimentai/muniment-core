@@ -87,6 +87,24 @@ impl NativeCredentialStore for KeyringNativeCredentialStore {
         self.0.load_credentials()
     }
 
+    fn clear_credentials_if_current(
+        &self,
+        expected_access_token: &str,
+        installation: bool,
+    ) -> Result<(), NativeTokenError> {
+        self.0
+            .clear_credentials_if_current(expected_access_token, installation)
+    }
+
+    fn replace_credentials(
+        &self,
+        expected_access_token: &str,
+        credentials: &NativeCredentials,
+    ) -> Result<(), NativeTokenError> {
+        self.0
+            .replace_credentials(expected_access_token, credentials)
+    }
+
     fn clear_session(&self) -> Result<(), NativeTokenError> {
         self.0.clear_session()
     }

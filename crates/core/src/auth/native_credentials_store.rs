@@ -8,6 +8,14 @@ use super::{
 };
 
 const RECORD_VERSION: u8 = 1;
+// All record mutations share this lock, including sign-out and refresh publication.
+static RECORD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn record_lock() -> Result<std::sync::MutexGuard<'static, ()>, String> {
+    RECORD_LOCK
+        .lock()
+        .map_err(|_| "The native credential lock failed.".into())
+}
 
 pub trait NativeCredentialBackend: Send + Sync {
     fn get(&self, key: &str) -> Result<Option<String>, String>;
@@ -88,6 +96,7 @@ impl<B: NativeCredentialBackend> CoherentNativeCredentialStore<B> {
 
 impl<B: NativeCredentialBackend> InstallationStore for CoherentNativeCredentialStore<B> {
     fn save(&self, installation: &InstallationRecord) -> Result<(), NativeRegistrationError> {
+        let _guard = record_lock().map_err(NativeRegistrationError::Persistence)?;
         self.save_record(&NativeCredentialRecord {
             version: RECORD_VERSION,
             installation: installation.clone(),
@@ -97,6 +106,7 @@ impl<B: NativeCredentialBackend> InstallationStore for CoherentNativeCredentialS
     }
 
     fn load(&self) -> Result<Option<InstallationRecord>, NativeRegistrationError> {
+        let _guard = record_lock().map_err(NativeRegistrationError::Persistence)?;
         self.load_record()
             .map(|record| record.map(|value| value.installation))
             .map_err(NativeRegistrationError::Persistence)
@@ -105,12 +115,14 @@ impl<B: NativeCredentialBackend> InstallationStore for CoherentNativeCredentialS
 
 impl<B: NativeCredentialBackend> NativeCredentialStore for CoherentNativeCredentialStore<B> {
     fn load_installation(&self) -> Result<Option<InstallationRecord>, NativeTokenError> {
+        let _guard = record_lock().map_err(NativeTokenError::Persistence)?;
         self.load_record()
             .map(|record| record.map(|value| value.installation))
             .map_err(NativeTokenError::Persistence)
     }
 
     fn save_credentials(&self, credentials: &NativeCredentials) -> Result<(), NativeTokenError> {
+        let _guard = record_lock().map_err(NativeTokenError::Persistence)?;
         self.save_record(&NativeCredentialRecord {
             version: RECORD_VERSION,
             installation: credentials.installation.clone(),
@@ -123,6 +135,7 @@ impl<B: NativeCredentialBackend> NativeCredentialStore for CoherentNativeCredent
     }
 
     fn load_credentials(&self) -> Result<Option<NativeCredentials>, NativeTokenError> {
+        let _guard = record_lock().map_err(NativeTokenError::Persistence)?;
         self.load_record()
             .map(|record| {
                 record.and_then(|value| {
@@ -136,7 +149,67 @@ impl<B: NativeCredentialBackend> NativeCredentialStore for CoherentNativeCredent
             .map_err(NativeTokenError::Persistence)
     }
 
+    fn clear_credentials_if_current(
+        &self,
+        expected_access_token: &str,
+        installation: bool,
+    ) -> Result<(), NativeTokenError> {
+        let _guard = record_lock().map_err(NativeTokenError::Persistence)?;
+        let record = self
+            .load_record()
+            .map_err(NativeTokenError::Persistence)?
+            .ok_or(NativeTokenError::CredentialsMissing)?;
+        if record
+            .session
+            .as_ref()
+            .is_none_or(|session| session.tokens.access_token != expected_access_token)
+        {
+            return Err(NativeTokenError::CredentialsMissing);
+        }
+        if installation {
+            self.backend
+                .delete(self.keys.legacy_installation)
+                .map_err(NativeTokenError::Persistence)?;
+            self.backend
+                .delete(self.keys.record)
+                .map_err(NativeTokenError::Persistence)
+        } else {
+            self.save_record(&NativeCredentialRecord {
+                session: None,
+                ..record
+            })
+            .map_err(NativeTokenError::Persistence)
+        }
+    }
+
+    fn replace_credentials(
+        &self,
+        expected_access_token: &str,
+        credentials: &NativeCredentials,
+    ) -> Result<(), NativeTokenError> {
+        let _guard = record_lock().map_err(NativeTokenError::Persistence)?;
+        let current = self.load_record().map_err(NativeTokenError::Persistence)?;
+        if current.is_none_or(|record| {
+            record.installation.device_id != credentials.installation.device_id
+                || record
+                    .session
+                    .is_none_or(|session| session.tokens.access_token != expected_access_token)
+        }) {
+            return Err(NativeTokenError::CredentialsMissing);
+        }
+        self.save_record(&NativeCredentialRecord {
+            version: RECORD_VERSION,
+            installation: credentials.installation.clone(),
+            session: Some(NativeCredentialSession {
+                tokens: credentials.tokens.clone(),
+                refresh_expires_at: credentials.refresh_expires_at,
+            }),
+        })
+        .map_err(NativeTokenError::Persistence)
+    }
+
     fn clear_session(&self) -> Result<(), NativeTokenError> {
+        let _guard = record_lock().map_err(NativeTokenError::Persistence)?;
         let Some(record) = self.load_record().map_err(NativeTokenError::Persistence)? else {
             return Ok(());
         };
@@ -234,6 +307,103 @@ mod tests {
             refresh_token: Some("refresh-secret".into()),
             expires_at: Some(2_000),
             subject: Some("user-id".into()),
+        }
+    }
+
+    #[test]
+    fn device_removal_clears_credentials_and_the_installation_challenge() {
+        let backend =
+            MemoryBackend::with_legacy_installation_and_oidc(&installation("challenge"), &tokens());
+        let store = CoherentNativeCredentialStore::new(backend.clone(), KEYS);
+        store
+            .save_credentials(&NativeCredentials {
+                installation: installation("challenge"),
+                tokens: tokens(),
+                refresh_expires_at: 9000,
+            })
+            .unwrap();
+        store
+            .clear_credentials_if_current("access-secret", true)
+            .unwrap();
+        assert!(store.load_credentials().unwrap().is_none());
+        assert!(store.load_installation().unwrap().is_none());
+        let values = backend.values.lock().unwrap();
+        assert!(!values.contains_key(KEYS.record));
+        assert!(!values.contains_key(KEYS.legacy_installation));
+        assert!(values.contains_key(OIDC_KEY));
+    }
+
+    #[test]
+    fn grant_refresh_cannot_restore_a_signed_out_or_replaced_session() {
+        use crate::auth::{NativeTokenRequest, NativeTokenResponse, TokenTransport};
+        struct DuringRefresh<'a> {
+            store: &'a dyn NativeCredentialStore,
+            mutation: u8,
+        }
+        impl TokenTransport for DuringRefresh<'_> {
+            fn exchange(
+                &self,
+                _: &str,
+                _: &NativeTokenRequest,
+            ) -> Result<NativeTokenResponse, NativeTokenError> {
+                match self.mutation {
+                    1 => self.store.clear_session()?,
+                    2 => self
+                        .store
+                        .clear_credentials_if_current("access-secret", true)?,
+                    3 => {
+                        let mut replacement = self.store.load_credentials()?.unwrap();
+                        replacement.tokens.access_token = "concurrent-sign-in".into();
+                        self.store.save_credentials(&replacement)?;
+                    }
+                    _ => {}
+                }
+                Ok(serde_json::from_value(serde_json::json!({
+                    "access_token": "refreshed-secret", "token_type": "Bearer", "expires_in": 900,
+                    "refresh_token": "refreshed-refresh-secret", "refresh_expires_in": 86400,
+                    "session": {"org_id": "20000000-0000-4000-8000-000000000002",
+                        "user_id": "30000000-0000-4000-8000-000000000003", "role": "user",
+                        "device_id": "10000000-0000-4000-8000-000000000001", "client_role": "desktop"},
+                    "entitlement_snapshot": {"payload": {}, "signature": "signature", "algorithm": "hmac-sha256"},
+                    "device_challenge": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                })).unwrap())
+            }
+        }
+        for mutation in 0..4 {
+            let backend = MemoryBackend::default();
+            let store = CoherentNativeCredentialStore::new(backend, KEYS);
+            let challenge =
+                base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, [8; 32]);
+            let expected = NativeCredentials {
+                installation: installation(&challenge),
+                tokens: tokens(),
+                refresh_expires_at: 9000,
+            };
+            store.save_credentials(&expected).unwrap();
+            let result = crate::chat_grant::refresh_chat_credentials(
+                &store,
+                &DuringRefresh {
+                    store: &store,
+                    mutation,
+                },
+                "https://api.example",
+                &expected,
+                100,
+                [1; 16],
+            );
+            assert_eq!(result.is_ok(), mutation == 0);
+            let current = store.load_credentials().unwrap();
+            match mutation {
+                0 => assert_eq!(current.unwrap().tokens.access_token, "refreshed-secret"),
+                3 => {
+                    assert_eq!(current.unwrap().tokens.access_token, "concurrent-sign-in");
+                    assert!(store
+                        .clear_credentials_if_current("access-secret", false)
+                        .is_err());
+                    assert!(store.load_credentials().unwrap().is_some());
+                }
+                _ => assert!(current.is_none()),
+            }
         }
     }
 
