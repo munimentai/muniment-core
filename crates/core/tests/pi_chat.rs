@@ -702,6 +702,15 @@ fn transport_send_completes_while_call_waits() {
     assert!(waiting.exists());
 
     let started = Instant::now();
+    assert_eq!(
+        transport
+            .call(json!({"type":"get_state"}), Duration::from_millis(20))
+            .unwrap_err(),
+        "timed out waiting for Pi RPC call lock"
+    );
+    assert!(started.elapsed() < Duration::from_millis(500));
+
+    let started = Instant::now();
     transport
         .send(json!({
             "type":"extension_ui_response", "id":"gate-1", "confirmed":true

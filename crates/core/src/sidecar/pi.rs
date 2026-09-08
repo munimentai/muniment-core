@@ -300,10 +300,20 @@ impl PiRpcTransport {
     /// Sends a Pi command and waits for its correlated response. The command
     /// must be a JSON object with a `type`; the transport supplies its own ID.
     pub fn call(&self, mut command: Value, timeout: Duration) -> Result<Value, String> {
-        let guard = self
-            .call_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let deadline = std::time::Instant::now() + timeout;
+        let guard = loop {
+            match self.call_lock.try_lock() {
+                Ok(guard) => break guard,
+                Err(TryLockError::Poisoned(error)) => break error.into_inner(),
+                Err(TryLockError::WouldBlock) => {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err("timed out waiting for Pi RPC call lock".into());
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(1)));
+                }
+            }
+        };
         let id = format!(
             "muniment-pi-{}",
             self.next_id.fetch_add(1, Ordering::Relaxed)
@@ -315,17 +325,22 @@ impl PiRpcTransport {
             return Err("Pi RPC command must contain a string `type`".into());
         }
         object.insert("id".into(), Value::String(id.clone()));
-        self.call_locked(command, &id, timeout, guard)
+        self.call_locked(command, &id, deadline, guard)
     }
 
     /// Sends one pre-correlated Pi frame without waiting for a response.
+    /// The stdin write has a ten-second bound.
     pub fn send(&self, frame: Value) -> Result<(), String> {
         if self.io.stdin.generation() != self.generation {
             return Err("Pi RPC transport belongs to a replaced child generation".into());
         }
         self.io
             .stdin
-            .write_line(&frame.to_string())
+            .write_line_until(
+                frame.to_string(),
+                self.generation,
+                std::time::Instant::now() + Duration::from_secs(10),
+            )
             .map_err(|error| error.to_string())
     }
 
@@ -350,7 +365,7 @@ impl PiRpcTransport {
             let response = transport.call_locked(
                 json!({"id": id, "type": "get_state"}),
                 &id,
-                timeout,
+                std::time::Instant::now() + timeout,
                 guard,
             )?;
             if response.get("type").and_then(Value::as_str) != Some("response")
@@ -367,7 +382,7 @@ impl PiRpcTransport {
         &self,
         command: Value,
         id: &str,
-        timeout: Duration,
+        deadline: std::time::Instant,
         _guard: std::sync::MutexGuard<'_, ()>,
     ) -> Result<Value, String> {
         if self.io.stdin.generation() != self.generation {
@@ -378,14 +393,22 @@ impl PiRpcTransport {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(id.to_owned(), Some(sender));
-        if let Err(error) = self.io.stdin.write_line(&command.to_string()) {
-            self.pending
+        if let Err(error) =
+            self.io
+                .stdin
+                .write_line_until(command.to_string(), self.generation, deadline)
+        {
+            if let Some(waiter) = self
+                .pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(id);
+                .get_mut(id)
+            {
+                *waiter = None;
+            }
             return Err(error.to_string());
         }
-        match receiver.recv_timeout(timeout) {
+        match receiver.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
             Ok(response) => response,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Keep a tombstone until the response arrives (or the

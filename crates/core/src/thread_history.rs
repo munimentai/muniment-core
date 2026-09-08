@@ -84,7 +84,7 @@ pub fn project_history_entry(
     Ok(HistoryEntry {
         prompt: load_prompt(&run_id, subject)?,
         phase: projection_phase(&projection.status).into(),
-        text: projection.text,
+        text: crate::chat_view::reply_text(projection.text, &projection.status),
         receipt: projection.receipt,
         tool_activity: chat_tool_activity(&projection.tool_activity),
         attachments: chat_attachments(&projection.attachments),

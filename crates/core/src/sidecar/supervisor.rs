@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::io::{BufRead, BufReader, BufWriter};
+use std::io::{BufRead, BufReader};
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
@@ -544,7 +544,7 @@ fn spawn_child(
     {
         let mut stdin = io.stdin.0.lock().unwrap();
         stdin.generation = generation;
-        stdin.writer = child.stdin.take().map(BufWriter::new);
+        stdin.writer = child.stdin.take().map(|pipe| Arc::new(Mutex::new(pipe)));
     }
     pipe_lines(child.stdout.take().unwrap(), out, generation);
     let stderr_reader = pipe_error_lines(child.stderr.take().unwrap(), err, generation);

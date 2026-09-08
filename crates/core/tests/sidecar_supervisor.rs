@@ -605,6 +605,68 @@ fn json_rpc_probe_keeps_supervisor_healthy_across_intervals() {
 }
 
 #[test]
+fn pi_stdin_write_timeout_does_not_block_shutdown() {
+    let wiring = PiRpcWiring::new();
+    let mut supervisor = SidecarSupervisor::spawn(
+        config(&["pi-rpc-blocked-stdin"]),
+        wiring.readiness_probe(STUB_RESPONSE_DEADLINE),
+    )
+    .unwrap();
+    wait_for(&supervisor, SidecarStatus::Healthy);
+    let transport = wiring.transport().unwrap();
+    let started = Instant::now();
+    let error = transport
+        .call(
+            json!({"type": "prompt", "message": "x".repeat(128 * 1024)}),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+    assert!(error.contains("timed out writing Pi RPC stdin"), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(transport
+        .call(json!({"type": "abort"}), Duration::from_millis(100))
+        .is_err());
+    assert!(transport.send(json!({"type": "abort"})).is_err());
+    let stopped = Instant::now();
+    supervisor.shutdown().unwrap();
+    assert!(stopped.elapsed() < SHUTDOWN_COMPLETION_DEADLINE);
+    assert_eq!(supervisor.status(), SidecarStatus::Stopped);
+    assert_eq!(
+        supervisor.recent_stderr(),
+        ["Pi stub stopped reading stdin."]
+    );
+}
+
+#[test]
+fn pi_writer_lock_wait_uses_the_call_deadline() {
+    let wiring = PiRpcWiring::new();
+    let mut supervisor = SidecarSupervisor::spawn(
+        config(&["pi-rpc-blocked-stdin"]),
+        wiring.readiness_probe(STUB_RESPONSE_DEADLINE),
+    )
+    .unwrap();
+    wait_for(&supervisor, SidecarStatus::Healthy);
+    let writer = supervisor.io().stdin;
+    let (sent, received) = std::sync::mpsc::channel();
+    let blocked = thread::spawn(move || {
+        let result = writer.write_line(&"x".repeat(128 * 1024));
+        sent.send(()).unwrap();
+        result
+    });
+    assert!(received.recv_timeout(Duration::from_millis(100)).is_err());
+    let started = Instant::now();
+    let error = wiring
+        .transport()
+        .unwrap()
+        .call(json!({"type": "abort"}), Duration::from_millis(100))
+        .unwrap_err();
+    assert!(error.contains("timed out writing Pi RPC stdin"), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(1));
+    supervisor.shutdown().unwrap();
+    assert!(blocked.join().unwrap().is_err());
+}
+
+#[test]
 fn pi_allows_package_resolution_only_during_startup() {
     let mut cfg = config(&["pi-rpc-slow-probes"]);
     cfg.startup_timeout = STUB_RESPONSE_DEADLINE;

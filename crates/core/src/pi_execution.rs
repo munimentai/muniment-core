@@ -96,6 +96,7 @@ pub enum PreparedPromptError {
     Start,
     SessionRoot,
     Binding,
+    FirstEventTimeout,
     Journal,
 }
 

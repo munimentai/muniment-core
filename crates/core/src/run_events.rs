@@ -105,7 +105,7 @@ pub fn chat_event(
         run_id: run_id.into(),
         thread_id: None,
         phase: projection_phase(&projection.status).into(),
-        text: projection.text,
+        text: crate::chat_view::reply_text(projection.text, &projection.status),
         receipt: projection.receipt,
         tool_activity: chat_tool_activity(&projection.tool_activity),
         attachments: chat_attachments(&projection.attachments),
@@ -414,6 +414,57 @@ mod tests {
         let events = sink.events.lock().unwrap();
         let phases: Vec<_> = events.iter().map(|event| event.phase.as_str()).collect();
         assert_eq!(phases, ["thinking", "failed"]);
+    }
+
+    #[test]
+    fn first_event_timeout_reaches_the_shell_and_the_failed_reply_record() {
+        let sink = RecordingSink::default();
+        let storage = storage();
+        let mut projector = ChatProjector::new();
+        let mut seq = 0;
+        let run_id = Uuid::now_v7().to_string();
+        let reason = "Pi sent no reply event within 30 seconds. Try again.";
+        append_emit(
+            &sink,
+            &storage,
+            &mut projector,
+            &run_id,
+            &mut seq,
+            "run.started",
+            json!({}),
+            None,
+        )
+        .unwrap();
+        fail(
+            &sink,
+            &storage,
+            &mut projector,
+            &run_id,
+            &mut seq,
+            reason,
+            None,
+        );
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.last().unwrap().phase, "failed");
+        assert_eq!(events.last().unwrap().text, reason);
+        let stored = storage.lock().unwrap().journal.events(&run_id).unwrap();
+        assert_eq!(stored.last().unwrap().event_type, "run.failed");
+        let (projection, _) = crate::journal::reducer::project_chat_with_state(&stored).unwrap();
+        assert_eq!(
+            projection.status,
+            Some(crate::journal::reducer::RunStatus::Failed {
+                reason: Some(reason.into()),
+            })
+        );
+        assert_eq!(
+            crate::chat_view::reply_text(projection.text, &projection.status),
+            reason
+        );
+        assert_eq!(
+            crate::chat_view::reply_text("partial reply".into(), &projection.status),
+            "partial reply"
+        );
+        assert_eq!(crate::chat_view::reply_text(String::new(), &None), "");
     }
 
     #[test]

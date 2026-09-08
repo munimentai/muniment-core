@@ -109,6 +109,19 @@ pub fn chat_tool_activity(activity: &[ToolActivity]) -> Vec<ChatToolActivity> {
         .collect()
 }
 
+/// Shows the recorded cause when a failed reply has no assistant text.
+pub fn reply_text(text: String, status: &Option<RunStatus>) -> String {
+    if text.is_empty() {
+        if let Some(RunStatus::Failed {
+            reason: Some(reason),
+        }) = status
+        {
+            return reason.clone();
+        }
+    }
+    text
+}
+
 pub fn projection_phase(status: &Option<RunStatus>) -> &'static str {
     match status {
         Some(RunStatus::Streaming) => "streaming",

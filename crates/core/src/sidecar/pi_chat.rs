@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{mpsc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -259,7 +259,23 @@ pub fn parse_frame(frame: &Value) -> Result<PiChatEvent, &'static str> {
         Some("extension_ui_request") => parse_extension_ui_request(frame),
         // Pi owns generation, not billing/routing provenance. Any similarly
         // named member is deliberately ignored; the control plane supplies it.
-        Some("agent_end") => Ok(PiChatEvent::Completed),
+        Some("agent_end") => {
+            let stop_reason = frame
+                .get("messages")
+                .and_then(Value::as_array)
+                .and_then(|messages| {
+                    messages.iter().rev().find(|message| {
+                        message.get("role").and_then(Value::as_str) == Some("assistant")
+                    })
+                })
+                .and_then(|message| message.get("stopReason"))
+                .and_then(Value::as_str);
+            match stop_reason {
+                Some("error") => Ok(PiChatEvent::Failed),
+                Some("aborted") => Ok(PiChatEvent::Cancelled),
+                _ => Ok(PiChatEvent::Completed),
+            }
+        }
         Some("cancelled") => Ok(PiChatEvent::Cancelled),
         Some("error") => Ok(PiChatEvent::Failed),
         Some(_) => Ok(PiChatEvent::Interleaved),
@@ -397,11 +413,17 @@ fn require_queue_ack(response: &Value, command: &str) -> Result<(), String> {
     }
 }
 
+/// Pi must produce a reply event within 30 seconds of prompt submission.
+/// Prompt acknowledgments and unrelated lifecycle frames do not count.
+pub const FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(30);
+pub const FIRST_EVENT_TIMEOUT_REASON: &str = "Pi sent no reply event within 30 seconds. Try again.";
+
 /// Binds Pi's single active stream to a locally-owned run. Construct this
 /// before sending the prompt so no post-ack frame can be lost.
 pub struct PiRunAdapter {
     run_id: String,
     frames: Mutex<mpsc::Receiver<Value>>,
+    first_event_deadline: Mutex<Option<Instant>>,
 }
 
 impl PiRunAdapter {
@@ -421,19 +443,38 @@ impl PiRunAdapter {
         images: Vec<PiImageContent>,
         timeout: Duration,
     ) -> Result<(Self, PiChatEvent), String> {
+        let run_id = run_id.into();
         let frames = transport.subscribe();
-        let response = transport.call(
-            PromptCommand::with_images(prompt, images).into_value(),
-            timeout,
-        )?;
+        let deadline = Instant::now() + FIRST_EVENT_TIMEOUT;
+        let response = transport
+            .call(
+                PromptCommand::with_images(prompt, images).into_value(),
+                timeout.min(deadline.saturating_duration_since(Instant::now())),
+            )
+            .map_err(|error| {
+                if Instant::now() >= deadline {
+                    format!("Pi did not acknowledge the prompt within 30 seconds. {error}")
+                } else {
+                    error
+                }
+            })?;
         let accepted = parse_frame(&response).map_err(str::to_owned)?;
         if accepted != PiChatEvent::PromptAccepted {
+            let detail: String = response
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("Pi rejected the prompt")
+                .chars()
+                .take(4096)
+                .collect();
+            eprintln!("muniment-runtime: run_id={run_id} provider_request outcome=not_started prompt_error={detail:?}");
             return Err("Pi rejected the prompt".into());
         }
         Ok((
             Self {
-                run_id: run_id.into(),
+                run_id,
                 frames: Mutex::new(frames),
+                first_event_deadline: Mutex::new(Some(deadline)),
             },
             accepted,
         ))
@@ -493,8 +534,17 @@ impl PiRunAdapter {
                     }
                 }
                 Err(error) if error == "timed out waiting for Pi stream" => {}
+                Err(error) if error == FIRST_EVENT_TIMEOUT_REASON => return Err(error),
                 Err(_) => break,
             }
+        }
+        if self
+            .first_event_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(FIRST_EVENT_TIMEOUT_REASON.into());
         }
         let _ = self.cancel_and_drain(transport, Duration::from_secs(2));
         Err("Pi session binding failed".into())
@@ -552,16 +602,84 @@ impl PiRunAdapter {
     }
 
     pub fn next(&self, timeout: Duration) -> Result<PiChatEvent, String> {
+        let mut deadline = self
+            .first_event_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let timeout = if let Some(deadline) = *deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(FIRST_EVENT_TIMEOUT_REASON.into());
+            }
+            timeout.min(remaining)
+        } else {
+            timeout
+        };
         let frame = self
             .frames
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .recv_timeout(timeout)
             .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout
+                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) =>
+                {
+                    FIRST_EVENT_TIMEOUT_REASON.to_string()
+                }
                 mpsc::RecvTimeoutError::Timeout => "timed out waiting for Pi stream".to_string(),
                 mpsc::RecvTimeoutError::Disconnected => "Pi process stream ended".to_string(),
             })?;
-        parse_frame(&frame).map_err(str::to_owned)
+        let event = parse_frame(&frame).map_err(str::to_owned)?;
+        if frame.get("type").and_then(Value::as_str) == Some("message_end")
+            && frame.pointer("/message/role").and_then(Value::as_str) == Some("assistant")
+        {
+            let outcome = match frame.pointer("/message/stopReason").and_then(Value::as_str) {
+                Some("stop" | "length" | "toolUse") => "completed",
+                Some("error") => "failed",
+                Some("aborted") => "cancelled",
+                _ => "unknown",
+            };
+            eprintln!("muniment-runtime: run_id={} provider_request outcome={outcome} source=pi_message_end", self.run_id);
+        }
+        let kind = match &event {
+            PiChatEvent::TextDelta(_) => Some("text_delta"),
+            PiChatEvent::ToolStarted { .. } => Some("tool_start"),
+            PiChatEvent::ToolFinished { .. } => Some("tool_end"),
+            PiChatEvent::ExtensionUiRequest(_) => Some("extension_ui_request"),
+            PiChatEvent::Completed => Some("completed"),
+            PiChatEvent::Cancelled => Some("cancelled"),
+            PiChatEvent::Failed => Some("failed"),
+            _ => match frame.get("type").and_then(Value::as_str) {
+                Some(
+                    kind @ ("agent_start" | "turn_start" | "turn_end" | "message_start"
+                    | "message_update" | "message_end"),
+                ) => Some(kind),
+                _ => None,
+            },
+        };
+        if let Some(kind) = kind.filter(|_| deadline.take().is_some()) {
+            eprintln!(
+                "muniment-runtime: run_id={} first_event {kind}",
+                self.run_id
+            );
+        }
+        Ok(event)
+    }
+}
+
+impl Drop for PiRunAdapter {
+    fn drop(&mut self) {
+        if self
+            .first_event_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+        {
+            eprintln!(
+                "muniment-runtime: run_id={} first_event absent",
+                self.run_id
+            );
+        }
     }
 }
 
@@ -575,6 +693,7 @@ mod tests {
         let adapter = PiRunAdapter {
             run_id: "0190a100-0000-7000-8000-000000000001".into(),
             frames: Mutex::new(frames),
+            first_event_deadline: Mutex::new(Some(Instant::now() + Duration::from_secs(1))),
         };
         drop(sender);
 
@@ -582,6 +701,133 @@ mod tests {
             adapter.next(Duration::from_millis(1)).unwrap_err(),
             "Pi process stream ended"
         );
+    }
+
+    fn bounded_adapter(timeout: Duration) -> (mpsc::Sender<Value>, PiRunAdapter) {
+        let (sender, frames) = mpsc::channel();
+        (
+            sender,
+            PiRunAdapter {
+                run_id: "run-bound".into(),
+                frames: Mutex::new(frames),
+                first_event_deadline: Mutex::new(Some(Instant::now() + timeout)),
+            },
+        )
+    }
+
+    #[test]
+    fn silence_ends_at_the_first_event_bound() {
+        let (_sender, adapter) = bounded_adapter(Duration::from_millis(20));
+        let started = Instant::now();
+        assert_eq!(
+            adapter.next(Duration::from_secs(1)).unwrap_err(),
+            "Pi sent no reply event within 30 seconds. Try again."
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(
+            adapter.next(Duration::ZERO).unwrap_err(),
+            "Pi sent no reply event within 30 seconds. Try again."
+        );
+    }
+
+    #[test]
+    fn acknowledgments_and_unrelated_frames_do_not_extend_the_bound() {
+        let (sender, adapter) = bounded_adapter(Duration::from_millis(20));
+        for frame in [
+            json!({"type":"queue_update"}),
+            json!({"type":"response", "command":"prompt", "success":true}),
+        ] {
+            sender.send(frame).unwrap();
+            adapter.next(Duration::ZERO).unwrap();
+        }
+        assert_eq!(
+            adapter.next(Duration::from_secs(1)).unwrap_err(),
+            "Pi sent no reply event within 30 seconds. Try again."
+        );
+    }
+
+    #[test]
+    fn a_reply_event_disarms_the_bound_but_a_late_event_does_not() {
+        let (sender, adapter) = bounded_adapter(Duration::from_secs(1));
+        sender
+            .send(json!({"type":"message_update", "assistantMessageEvent":{
+                "type":"text_delta", "delta":"hello"
+            }}))
+            .unwrap();
+        assert_eq!(
+            adapter.next(Duration::ZERO).unwrap(),
+            PiChatEvent::TextDelta("hello".into())
+        );
+        assert!(adapter.first_event_deadline.lock().unwrap().is_none());
+        assert_eq!(
+            adapter.next(Duration::ZERO).unwrap_err(),
+            "timed out waiting for Pi stream"
+        );
+
+        let (sender, adapter) = bounded_adapter(Duration::ZERO);
+        sender.send(json!({"type":"agent_end"})).unwrap();
+        assert_eq!(
+            adapter.next(Duration::ZERO).unwrap_err(),
+            "Pi sent no reply event within 30 seconds. Try again."
+        );
+    }
+
+    #[test]
+    fn run_lifecycle_events_disarm_the_bound_before_text_arrives() {
+        for kind in [
+            "agent_start",
+            "turn_start",
+            "message_start",
+            "message_update",
+        ] {
+            let (sender, adapter) = bounded_adapter(Duration::from_secs(1));
+            sender.send(json!({"type":kind})).unwrap();
+            assert_eq!(
+                adapter.next(Duration::ZERO).unwrap(),
+                PiChatEvent::Interleaved
+            );
+            assert!(adapter.first_event_deadline.lock().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn provider_error_and_abort_do_not_become_success_at_agent_end() {
+        for (reason, expected) in [
+            ("error", PiChatEvent::Failed),
+            ("aborted", PiChatEvent::Cancelled),
+        ] {
+            assert_eq!(
+                parse_frame(&json!({"type":"agent_end", "messages":[{
+                    "role":"assistant", "stopReason":reason, "errorMessage":"private detail"
+                }]}))
+                .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            parse_frame(&json!({"type":"message_end", "message":{
+                "role":"assistant", "stopReason":"error"
+            }}))
+            .unwrap(),
+            PiChatEvent::Interleaved
+        );
+        assert_eq!(
+            parse_frame(&json!({"type":"agent_end", "messages":[
+                {"role":"assistant", "stopReason":"error"},
+                {"role":"assistant", "stopReason":"stop"}
+            ]}))
+            .unwrap(),
+            PiChatEvent::Completed
+        );
+        for role in ["user", "toolResult"] {
+            assert_eq!(
+                parse_frame(&json!({"type":"message_end", "message":{
+                    "role":role, "stopReason":"error"
+                }}))
+                .unwrap(),
+                PiChatEvent::Interleaved
+            );
+        }
     }
 
     #[test]

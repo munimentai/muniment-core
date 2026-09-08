@@ -1,9 +1,9 @@
 use std::collections::VecDeque;
 use std::fmt;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::process::ChildStdin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -29,7 +29,8 @@ impl std::error::Error for SidecarError {}
 
 pub(super) struct WriterState {
     pub(super) generation: u64,
-    pub(super) writer: Option<BufWriter<ChildStdin>>,
+    // Keep pipe ownership separate from its write lock so shutdown can kill a blocked child.
+    pub(super) writer: Option<Arc<Mutex<ChildStdin>>>,
 }
 
 #[derive(Clone)]
@@ -45,16 +46,91 @@ impl LineWriter {
     }
 
     pub(super) fn write_line_in_generation(&self, line: &str) -> Result<u64, SidecarError> {
-        let mut guard = self.0.lock().unwrap();
-        let generation = guard.generation;
-        let writer = guard.writer.as_mut().ok_or(SidecarError::Disconnected)?;
+        let (generation, writer) = {
+            let guard = self.0.lock().unwrap();
+            let writer = guard.writer.clone().ok_or(SidecarError::Disconnected)?;
+            (guard.generation, writer)
+        };
+        let mut writer = writer.lock().unwrap();
         writer
-            .write_all(line.as_bytes())
+            .write_all(format!("{line}\n").as_bytes())
             .map_err(SidecarError::Io)?;
-        writer.write_all(b"\n").map_err(SidecarError::Io)?;
-        writer.flush().map_err(SidecarError::Io)?;
         Ok(generation)
     }
+
+    /// Bounds the writer lock and pipe write without blocking supervisor cleanup.
+    pub(super) fn write_line_until(
+        &self,
+        line: String,
+        generation: u64,
+        deadline: Instant,
+    ) -> Result<(), SidecarError> {
+        let writer = {
+            let guard = self.0.lock().unwrap();
+            if guard.generation != generation {
+                return Err(SidecarError::Disconnected);
+            }
+            guard.writer.clone().ok_or(SidecarError::Disconnected)?
+        };
+        let state = Arc::clone(&self.0);
+        let (sender, receiver) = mpsc::channel();
+        // The supervisor kills the child to release a pipe write that outlives the deadline.
+        std::thread::Builder::new()
+            .name("pi-rpc-writer".into())
+            .spawn(move || {
+                let result = (|| {
+                    let mut writer = loop {
+                        if Instant::now() >= deadline {
+                            return Err(write_timeout());
+                        }
+                        match writer.try_lock() {
+                            Ok(writer) => break writer,
+                            Err(TryLockError::Poisoned(error)) => break error.into_inner(),
+                            Err(TryLockError::WouldBlock) => std::thread::sleep(
+                                deadline
+                                    .saturating_duration_since(Instant::now())
+                                    .min(Duration::from_millis(1)),
+                            ),
+                        }
+                    };
+                    if Instant::now() >= deadline {
+                        return Err(write_timeout());
+                    }
+                    {
+                        let state = state.lock().unwrap();
+                        if state.generation != generation || state.writer.is_none() {
+                            return Err(SidecarError::Disconnected);
+                        }
+                    }
+                    writer
+                        .write_all(format!("{line}\n").as_bytes())
+                        .map_err(SidecarError::Io)
+                })();
+                let _ = sender.send(result);
+            })
+            .map_err(SidecarError::Io)?;
+        let result = match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(write_timeout()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(SidecarError::Disconnected),
+        };
+        if result.is_err() {
+            // A partial frame makes this pipe unusable. Keep cleanup off the writer lock.
+            let mut guard = self.0.lock().unwrap();
+            if guard.generation == generation {
+                guard.writer = None;
+            }
+        }
+        result
+    }
+}
+
+fn write_timeout() -> SidecarError {
+    SidecarError::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "timed out writing Pi RPC stdin",
+    ))
 }
 
 pub(super) struct LineReceiver {
@@ -142,6 +218,23 @@ pub(super) enum LineReaderInner {
 }
 
 impl LineReader {
+    pub(crate) fn stderr_tail(&self) -> Vec<String> {
+        match &self.0 {
+            LineReaderInner::Stderr(ring) => {
+                let lines = ring.snapshot();
+                lines
+                    .into_iter()
+                    .rev()
+                    .take(20)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect()
+            }
+            LineReaderInner::Channel(_) => Vec::new(),
+        }
+    }
+
     pub fn read_line(&self) -> Result<String, SidecarError> {
         if let LineReaderInner::Stderr(ring) = &self.0 {
             return ring.read(None)?.ok_or(SidecarError::Disconnected);
@@ -246,4 +339,36 @@ pub struct SidecarIo {
     pub stdin: LineWriter,
     pub stdout: LineReader,
     pub stderr: LineReader,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_tail_keeps_the_last_twenty_lines_without_consuming_stderr() {
+        let ring = Arc::new(StderrRing {
+            state: Mutex::new(StderrState {
+                lines: VecDeque::new(),
+                first_sequence: 0,
+                next_sequence: 0,
+                read_sequence: 0,
+                generation: 1,
+            }),
+            available: Condvar::new(),
+            capacity: 25,
+        });
+        let reader = LineReader(LineReaderInner::Stderr(Arc::clone(&ring)));
+        assert!(reader.stderr_tail().is_empty());
+        for index in 0..30 {
+            ring.push(1, format!("Pi stderr {index}"));
+        }
+        let expected: Vec<_> = (10..30).map(|index| format!("Pi stderr {index}")).collect();
+        assert_eq!(reader.stderr_tail(), expected);
+        assert_eq!(reader.read_line().unwrap(), "Pi stderr 5");
+        assert_eq!(reader.stderr_tail(), expected);
+        ring.begin_generation(2);
+        ring.push(1, "stale stderr".into());
+        assert!(reader.stderr_tail().is_empty());
+    }
 }
