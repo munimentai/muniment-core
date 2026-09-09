@@ -41,6 +41,7 @@ Module rows name the module below `muniment-core`.
 | module | code_diff_journal | It projects code-diff events. |
 | module | code_diff_observe | It verifies workspace state before writes. |
 | module | code_diff_staging | It stages file operations. |
+| module | harness_scan | It counts durable assistant memory in user-level roots. |
 | module | home | It owns the local memory filesystem. |
 | module | import_preview | It previews bounded assistant exports. |
 | module | journal | It owns the run journal and reader projections. |
