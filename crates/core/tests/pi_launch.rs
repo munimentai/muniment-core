@@ -44,7 +44,10 @@ mod stdin_deadline {
     const RUN_ID: &str = "01900000-0000-7000-8000-000000000001";
     const FAILURE: &str = "Pi did not acknowledge the prompt. Try again.";
 
-    struct Boundary(PathBuf);
+    struct Boundary {
+        root: PathBuf,
+        started: Instant,
+    }
 
     impl ChatEventSink for Boundary {
         fn provenance(&self) -> (&str, &str) {
@@ -53,13 +56,20 @@ mod stdin_deadline {
 
         fn deliver(&self, event: ChatEvent) -> Result<(), ()> {
             eprintln!("shell-event: {}", serde_json::to_string(&event).unwrap());
+            if event.phase == "failed" && event.text == FAILURE {
+                // Measure delivery here, not when the parent gets CPU time to read stderr.
+                // Allow one second for readiness and scheduling, not another timeout.
+                let bound = FIRST_EVENT_TIMEOUT + Duration::from_secs(1);
+                let elapsed = self.started.elapsed();
+                assert!(elapsed <= bound, "Late shell failure: {elapsed:?}");
+            }
             Ok(())
         }
     }
 
     impl PiLaunchBoundaries for Boundary {
         fn pi_session_root(&self) -> Result<PathBuf, PiLaunchError> {
-            Ok(self.0.join("sessions"))
+            Ok(self.root.join("sessions"))
         }
 
         fn memory_agent_extension_path(&self) -> Option<PathBuf> {
@@ -111,47 +121,45 @@ mod stdin_deadline {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut started = Instant::now();
-        let mut lines = Vec::new();
-        for line in BufReader::new(child.stderr.take().unwrap()).lines() {
-            let line = line.unwrap();
-            if line == format!("muniment-runtime: run_id={RUN_ID} run_start") {
-                started = Instant::now();
-            }
-            lines.push((started.elapsed(), line));
-        }
+        let lines: Vec<String> = BufReader::new(child.stderr.take().unwrap())
+            .lines()
+            .collect::<Result<_, _>>()
+            .unwrap();
         let status = child.wait().unwrap();
         std::fs::remove_dir_all(root).unwrap();
         assert!(status.success(), "{lines:?}");
-        // Allow one second for readiness and shared-runner scheduling, not another timeout.
-        let bound = FIRST_EVENT_TIMEOUT + Duration::from_secs(1);
+        let failure_index = lines
+            .iter()
+            .position(|line| {
+                line.strip_prefix("shell-event: ")
+                    .and_then(|event| serde_json::from_str::<serde_json::Value>(event).ok())
+                    .is_some_and(|event| event["phase"] == "failed" && event["text"] == FAILURE)
+            })
+            .unwrap_or_else(|| panic!("Missing shell failure: {lines:?}"));
+        // The child checks the delivery bound. Both diagnostics must precede that delivery.
         for expected in [
             format!("muniment-runtime: run_id={RUN_ID} first_event absent"),
             format!("muniment-runtime: run_id={RUN_ID} pi_stderr_tail="),
-            "shell-event: ".into(),
         ] {
-            let (elapsed, line) = lines
+            let index = lines
                 .iter()
-                .find(|(_, line)| {
-                    line.starts_with(&expected)
-                        && (!expected.starts_with("shell-event") || line.contains(FAILURE))
-                })
+                .position(|line| line.starts_with(&expected))
                 .unwrap_or_else(|| panic!("Missing {expected}: {lines:?}"));
             assert!(
-                *elapsed <= bound,
-                "Late diagnostic or shell failure: {elapsed:?}: {line}"
+                index < failure_index,
+                "Diagnostic followed shell failure: {lines:?}"
             );
         }
-        assert!(lines.iter().any(|(_, line)| {
+        assert!(lines.iter().any(|line| {
             line.contains("pi_stderr_tail=") && line.contains("Pi stub stopped reading stdin.")
         }));
         assert!(lines
             .iter()
-            .any(|(_, line)| line.contains("timed out writing Pi RPC stdin")));
+            .any(|line| line.contains("timed out writing Pi RPC stdin")));
         assert!(lines
             .iter()
-            .any(|(_, line)| line.contains("pi_spawn") && line.contains("Healthy")));
-        assert!(lines.iter().any(|(_, line)| {
+            .any(|line| line.contains("pi_spawn") && line.contains("Healthy")));
+        assert!(lines.iter().any(|line| {
             line.contains("provider_request outcome=unknown_prompt_not_acknowledged")
         }));
     }
@@ -179,7 +187,10 @@ mod stdin_deadline {
         .unwrap();
         let runtime = Arc::new(Mutex::new(None));
         coordinate(
-            Boundary(root.clone()),
+            Boundary {
+                root: root.clone(),
+                started: Instant::now(),
+            },
             Arc::clone(&storage),
             Arc::clone(&runtime),
             RuntimeActivityRegistry::new(),
