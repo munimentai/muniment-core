@@ -259,6 +259,7 @@ where
     )
     .map_err(MacosAttachSessionError::DesktopClientAdmission)?;
     service.bind_authorized_client(&admitted.client_identity);
+    // The deadline bounds admission only. The request loop has no session lifetime bound.
     super::desktop_session::serve_desktop_client_requests(
         stream,
         &admitted.capability,

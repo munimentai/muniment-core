@@ -15,8 +15,8 @@ mod unix_tests {
     use muniment_core::attach::{
         approval_waiter_with_claims, decode_frame, encode_frame,
         serve_macos_attach_session_with_reader_and_state, Approval, ApprovalCoordinator,
-        ApprovalDecision, Authorization, DesktopClientAuthorizedGrant, Envelope, Id,
-        MacosAttachRouteReader, MacosAttachSessionError, MacosAttachSessionOutcome,
+        ApprovalDecision, Authorization, DesktopClientAdmissionError, DesktopClientAuthorizedGrant,
+        Envelope, Id, MacosAttachRouteReader, MacosAttachSessionError, MacosAttachSessionOutcome,
         MacosPeerReadError, Operation, Protocol, ProtocolError, Request, Welcome,
     };
 
@@ -85,6 +85,15 @@ mod unix_tests {
 
     #[test]
     fn desktop_route_serves_requests_with_live_peer_pid() {
+        desktop_request_after_idle(Duration::from_secs(2), Duration::ZERO);
+    }
+
+    #[test]
+    fn desktop_route_serves_a_request_after_the_handshake_bound() {
+        desktop_request_after_idle(Duration::from_secs(1), Duration::from_secs(2));
+    }
+
+    fn desktop_request_after_idle(handshake_timeout: Duration, idle: Duration) {
         let (mut client, server) = UnixStream::pair().unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -97,7 +106,7 @@ mod unix_tests {
                 501,
                 expected_desktop_executable(),
                 "1.2.3",
-                Duration::from_secs(2),
+                handshake_timeout,
                 &mut service,
                 None,
                 ApprovalCoordinator::default(),
@@ -123,6 +132,12 @@ mod unix_tests {
             .unwrap()
             .unwrap();
         assert_eq!(consumed, grant_frame.len());
+
+        std::thread::sleep(idle);
+        assert!(
+            !session.is_finished(),
+            "the admitted desktop session closed while idle"
+        );
 
         let request_id = Id::new("018f0000-0000-7000-8000-000000000101").unwrap();
         client
@@ -167,6 +182,40 @@ mod unix_tests {
                 peer_pid: 42,
             })
         );
+    }
+
+    #[test]
+    fn handshake_bound_rejects_silent_and_partial_first_frames() {
+        for bytes in [vec![], vec![0], vec![0, 0, 0, 10, b'{']] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client.write_all(&bytes).unwrap();
+            let outcome = serve_macos_attach_session_with_reader_and_state(
+                server,
+                &route_reader("/Applications/Muniment.app/Contents/MacOS/muniment"),
+                501,
+                expected_desktop_executable(),
+                "1.2.3",
+                Duration::from_millis(100),
+                &mut TestService::default(),
+                None,
+                ApprovalCoordinator::default(),
+                approval_waiter_with_claims(
+                    |_: &muniment_core::attach::PairingChallenge, _: &str, _: &str, _: Duration| {
+                        None::<ApprovalDecision>
+                    },
+                ),
+                &LiveConnectionRegistry::default(),
+                |_| {},
+            );
+            let expected = if bytes.len() < 4 {
+                MacosAttachSessionError::Read
+            } else {
+                MacosAttachSessionError::DesktopClientAdmission(
+                    DesktopClientAdmissionError::Timeout,
+                )
+            };
+            assert_eq!(outcome, Err(expected));
+        }
     }
 
     fn run_companion_session(route_reader: StubRouteReader) -> (String, CompanionProvenance) {
