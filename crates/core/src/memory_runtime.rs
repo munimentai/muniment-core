@@ -65,7 +65,7 @@ impl ApplicationMemoryRuntime {
         )
         .map_err(|_| MemoryIndexError::InvalidToolArguments)?;
         let source = format!(
-            "const definition = JSON.parse({encoded});\nexport default function (pi) {{\n  pi.registerTool({{\n    name: definition.name,\n    label: \"Memory search\",\n    description: definition.description,\n    parameters: definition.inputSchema,\n    async execute(_id, arguments, _signal, _update, context) {{\n      const value = await context.ui.editor(\"muniment:memory-search\", JSON.stringify(arguments));\n      if (value === undefined) throw new Error(\"The memory search failed.\");\n      const result = JSON.parse(value);\n      return {{ content: [{{ type: \"text\", text: JSON.stringify(result) }}], details: result.recall }};\n    }}\n  }});\n}}\n"
+            "const definition = JSON.parse({encoded});\nexport default function (pi) {{\n  pi.registerTool({{\n    name: definition.name,\n    label: \"Memory search\",\n    description: definition.description,\n    parameters: definition.inputSchema,\n    async execute(_id, args, _signal, _update, context) {{\n      const value = await context.ui.editor(\"muniment:memory-search\", JSON.stringify(args));\n      if (value === undefined) throw new Error(\"The memory search failed.\");\n      const result = JSON.parse(value);\n      return {{ content: [{{ type: \"text\", text: JSON.stringify(result) }}], details: result.recall }};\n    }}\n  }});\n}}\n"
         );
         std::fs::create_dir_all(&self.database_root).map_err(MemoryIndexError::Io)?;
         let temporary = self
@@ -204,7 +204,7 @@ mod tests {
     use std::sync::{mpsc, Arc, Barrier};
 
     #[test]
-    fn agent_extension_contains_the_session_scoped_declaration() {
+    fn agent_extension_parses_as_a_module_and_contains_the_session_scoped_declaration() {
         let root = std::env::temp_dir().join(format!("muniment-app-memory-{}", Uuid::now_v7()));
         let home = root.join("home");
         fs::create_dir_all(home.join("memory")).unwrap();
@@ -225,6 +225,17 @@ mod tests {
         assert!(source.contains("memory-search"));
         assert!(source.contains("text: JSON.stringify(result)"));
         assert!(!source.contains("if (result.error)"));
+        // Parse the whole generated file as an ES module, where every binding uses strict mode.
+        let output = std::process::Command::new("node")
+            .args(["--check", "--input-type=module"])
+            .stdin(fs::File::open(runtime.agent_extension_path()).unwrap())
+            .output()
+            .expect("Node.js must be available to parse the memory search extension");
+        assert!(
+            output.status.success(),
+            "The memory search extension must parse as an ES module: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
