@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 
 use muniment_core::chat_grant::{ChatGrant, FetchGrantError};
 
+#[path = "pi_launch/acquisition_coordinate.rs"]
+mod acquisition_coordinate;
 #[path = "pi_launch/gateway_coordinate.rs"]
 mod gateway_coordinate;
 use muniment_core::pi_launch::{

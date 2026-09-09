@@ -87,6 +87,30 @@ pub trait PiLaunchBoundaries {
         }
     }
 
+    fn pi_install_root(&self) -> Result<PathBuf, PiLaunchError> {
+        if let Some(root) = std::env::var_os("MUNIMENT_PI_ROOT") {
+            return if root.is_empty() {
+                Err(PiLaunchError::MissingRoot)
+            } else {
+                Ok(root.into())
+            };
+        }
+        let sessions = self.pi_session_root()?;
+        let profile = sessions.parent().ok_or(PiLaunchError::MissingRoot)?;
+        Ok(crate::chat_profile::ChatProfile::new(profile).pi_install_root())
+    }
+
+    fn acquire_pi(
+        &self,
+        root: &Path,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<PathBuf, PiLaunchError> {
+        if self.pi_artifact() != PI_SELECTED_ARTIFACT {
+            return Err(PiLaunchError::RejectedConfig);
+        }
+        crate::sidecar::pi_install::acquire_pi(root, cancelled).map_err(PiLaunchError::Acquisition)
+    }
+
     fn pi_session_root(&self) -> Result<PathBuf, PiLaunchError>;
     fn memory_agent_extension_path(&self) -> Option<PathBuf>;
     fn prepare_pi_settings(
@@ -102,12 +126,13 @@ pub trait PiLaunchBoundaries {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PiLaunchError {
     MissingRoot,
     UnresolvableExecutable,
     UnavailableSessionRoot,
     RejectedConfig,
+    Acquisition(crate::sidecar::pi_install::CoordinatedPiInstallError),
 }
 
 fn install_cloud_provider(path: &Path) -> Result<(), PiLaunchError> {

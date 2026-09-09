@@ -45,6 +45,48 @@ fn stream(spec: &[(&str, Value)]) -> Vec<EventEnvelope> {
 }
 
 #[test]
+fn pi_acquisition_projects_progress_and_rejects_invalid_transitions() {
+    let started = stream(&[
+        ("run.started", json!({})),
+        ("runtime.pi_acquire.started", json!({})),
+    ]);
+    assert_eq!(
+        project_chat(&started).unwrap().status,
+        Some(RunStatus::AcquiringPi { interrupted: None })
+    );
+    for kind in [
+        "runtime.pi_acquire.started",
+        "model.stream.delta",
+        "run.completed",
+    ] {
+        let mut invalid = started.clone();
+        invalid.push(event(3, kind, json!({"text": "early"})));
+        assert!(reduce(&invalid).is_err(), "{kind}");
+    }
+    for kind in [
+        "run.failed",
+        "run.cancelled",
+        "runtime.pi_acquire.completed",
+    ] {
+        let mut settled = started.clone();
+        settled.push(event(3, kind, json!({})));
+        assert!(reduce(&settled).is_ok(), "{kind}");
+    }
+    for prefix in [vec![], vec![event(1, "run.started", json!({}))]] {
+        let mut invalid = prefix;
+        invalid.push(event(
+            invalid.len() as u64 + 1,
+            "runtime.pi_acquire.completed",
+            json!({}),
+        ));
+        assert!(reduce(&invalid).is_err());
+    }
+    let mut terminal = stream(&[("run.started", json!({})), ("run.cancelled", json!({}))]);
+    terminal.push(event(3, "runtime.pi_acquire.started", json!({})));
+    assert!(reduce(&terminal).is_err());
+}
+
+#[test]
 fn model_stream_delta_slices_respect_the_utf8_byte_bound() {
     let exact = "a".repeat(MAX_MODEL_STREAM_DELTA_BYTES);
     assert_eq!(
@@ -400,6 +442,47 @@ fn recorded_attention_clears_all_concurrent_effects() {
             reason: "operator review".into()
         })
     );
+}
+
+#[test]
+fn pi_acquisition_preserves_the_explicit_resume_gate() {
+    let mut events = stream(&[
+        ("run.started", json!({})),
+        (
+            "runtime.pi_session.bound",
+            json!({"run_id": RUN, "locator": "session.jsonl"}),
+        ),
+        ("run.needs_attention", json!({"reason": "interrupted"})),
+        ("runtime.pi_acquire.started", json!({})),
+    ]);
+    let acquiring = reduce(&events).unwrap();
+    assert!(matches!(
+        acquiring.status,
+        RunStatus::AcquiringPi {
+            interrupted: Some(_)
+        }
+    ));
+    for kind in ["run.resumed", "model.stream.delta"] {
+        let mut premature = events.clone();
+        premature.push(event(5, kind, json!({"text": "early"})));
+        assert!(reduce(&premature).is_err());
+    }
+    events.push(event(5, "runtime.pi_acquire.completed", json!({})));
+    assert_eq!(
+        reduce(&events).unwrap().status,
+        RunStatus::NeedsAttention(AttentionReason::Recorded {
+            reason: "interrupted".into()
+        })
+    );
+    events.push(event(6, "run.resumed", json!({})));
+    assert_eq!(reduce(&events).unwrap().status, RunStatus::Active);
+
+    let unsafe_run = stream(&[
+        ("run.started", json!({})),
+        ("run.needs_attention", json!({"reason": "interrupted"})),
+        ("runtime.pi_acquire.started", json!({})),
+    ]);
+    assert!(reduce(&unsafe_run).is_err());
 }
 
 #[test]

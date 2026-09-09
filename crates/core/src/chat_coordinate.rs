@@ -333,13 +333,90 @@ pub fn coordinate(
         if let Some(token) = grant.native_access_token.take() {
             access_token = token;
         }
-        let root = std::env::var("MUNIMENT_PI_ROOT").ok();
-        let config = pi_launch_config(
-            &app,
-            root.as_deref().map(std::path::Path::new),
-            &grant,
-            resume.as_ref().map(|resume| &resume.locator),
-        );
+        let config = (|| {
+            let root = app.pi_install_root()?;
+            if crate::sidecar::pi_install::resolve_current_for(&root, app.pi_artifact()).is_err() {
+                eprintln!("muniment-runtime: run_id={run_id} pi_acquire started");
+                if append_emit(
+                    &app,
+                    &journal,
+                    &mut projector,
+                    &run_id,
+                    &mut seq,
+                    "runtime.pi_acquire.started",
+                    json!({}),
+                    subject.as_deref(),
+                )
+                .is_err()
+                {
+                    return Err(PiLaunchError::RejectedConfig);
+                }
+                let result = app.acquire_pi(&root, &cancelled);
+                match &result {
+                    Ok(_) => eprintln!("muniment-runtime: run_id={run_id} pi_acquire completed"),
+                    Err(_) if cancelled.load(Ordering::SeqCst) => {
+                        eprintln!("muniment-runtime: run_id={run_id} pi_acquire cancelled");
+                    }
+                    Err(error) => eprintln!(
+                        "muniment-runtime: run_id={run_id} pi_acquire failed error={error:?}"
+                    ),
+                }
+                result?;
+            }
+            if cancelled.load(Ordering::SeqCst) {
+                return Err(PiLaunchError::Acquisition(
+                    crate::model_install::ModelInstallError::Cancelled,
+                ));
+            }
+            let config = pi_launch_config(
+                &app,
+                Some(&root),
+                &grant,
+                resume.as_ref().map(|resume| &resume.locator),
+            )?;
+            if matches!(
+                projector
+                    .projection()
+                    .map_err(|_| PiLaunchError::RejectedConfig)?
+                    .status,
+                Some(crate::journal::reducer::RunStatus::AcquiringPi { .. })
+            ) {
+                append_emit(
+                    &app,
+                    &journal,
+                    &mut projector,
+                    &run_id,
+                    &mut seq,
+                    "runtime.pi_acquire.completed",
+                    json!({}),
+                    subject.as_deref(),
+                )
+                .map_err(|_| PiLaunchError::RejectedConfig)?;
+            }
+            Ok(config)
+        })();
+        if cancelled.load(Ordering::SeqCst) {
+            eprintln!("muniment-runtime: run_id={run_id} pi_spawn cancelled");
+            let (kind, payload) = if resume.is_some() {
+                (
+                    "run.needs_attention",
+                    json!({"reason": "Pi installation stopped. Resume the reply to try again."}),
+                )
+            } else {
+                ("run.cancelled", json!({}))
+            };
+            let _ = append_emit(
+                &app,
+                &journal,
+                &mut projector,
+                &run_id,
+                &mut seq,
+                kind,
+                payload,
+                subject.as_deref(),
+            );
+            return;
+        }
         let config = match config {
             Ok(config) => config,
             Err(PiLaunchError::MissingRoot) => {
@@ -358,13 +435,18 @@ pub fn coordinate(
             }
             Err(error) => {
                 eprintln!("muniment-runtime: run_id={run_id} pi_spawn config_error={error:?}");
+                let message = if matches!(error, PiLaunchError::Acquisition(_)) {
+                    "Pi installation failed. Check your connection and available storage, then try again."
+                } else {
+                    "The agent runtime is unavailable."
+                };
                 fail_start(
                     &app,
                     &journal,
                     &mut projector,
                     &run_id,
                     &mut seq,
-                    "The agent runtime is unavailable.",
+                    message,
                     subject.as_deref(),
                     resume.is_some(),
                 );
@@ -436,6 +518,7 @@ pub fn coordinate(
         let _ = runtime.supervisor.shutdown();
         return;
     }
+    eprintln!("muniment-runtime: run_id={run_id} pi_spawn started");
     let Some(transport) = runtime.wiring.transport() else {
         fail_start(
             &app,

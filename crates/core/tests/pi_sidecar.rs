@@ -38,6 +38,129 @@ impl PiDownloadTransport for ArchiveTransport {
     }
 }
 
+#[test]
+fn concurrent_installs_download_once_and_reuse_the_verified_executable() {
+    use muniment_core::model_install_native::{NativeAvailableSpace, NativeInstallLock};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    let Ok(archive) = std::env::var("MUNIMENT_PI_ARCHIVE") else {
+        eprintln!("The acquisition test requires MUNIMENT_PI_ARCHIVE.");
+        return;
+    };
+    struct CountingTransport {
+        archive: ArchiveTransport,
+        downloads: Arc<AtomicUsize>,
+    }
+    impl PiDownloadTransport for CountingTransport {
+        type Body = File;
+        fn download(
+            &mut self,
+            request: &PiDownloadRequest,
+        ) -> Result<PiDownloadResponse<File>, PiTransportError> {
+            self.downloads.fetch_add(1, Ordering::SeqCst);
+            self.archive.download(request)
+        }
+    }
+    let root = std::env::temp_dir().join(format!("muniment-pi-acquire-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(Barrier::new(2));
+    let workers: Vec<_> = (0..2)
+        .map(|index| {
+            let root = root.clone();
+            let downloads = Arc::clone(&downloads);
+            let barrier = Arc::clone(&barrier);
+            let archive = archive.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                install_pi(
+                    &root,
+                    &format!("run-{index}"),
+                    &mut CountingTransport {
+                        archive: ArchiveTransport(archive.into()),
+                        downloads,
+                    },
+                    &|| false,
+                    &mut NativeInstallLock::new(root.join("install.lock")),
+                    &mut NativeAvailableSpace::new(&root),
+                    &FsPiLifecycleBoundary,
+                )
+                .unwrap()
+            })
+        })
+        .collect();
+    let paths: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    assert_eq!(paths[0], paths[1]);
+    assert_eq!(downloads.load(Ordering::SeqCst), 1);
+    assert_eq!(resolve_current(&root).unwrap(), paths[0]);
+    assert_eq!(
+        muniment_core::sidecar::pi_install::acquire_pi(
+            &root,
+            &std::sync::atomic::AtomicBool::new(false)
+        )
+        .unwrap(),
+        paths[0]
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn acquisition_rejects_wrong_size_and_cancellation_without_publication() {
+    use muniment_core::model_install::ModelInstallError;
+    use muniment_core::sidecar::pi_install::PiInstallError;
+
+    let root = std::env::temp_dir().join(format!("muniment-pi-reject-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let archive = root.join("invalid-archive");
+    std::fs::write(&archive, b"not Pi").unwrap();
+    for cancelled in [false, true] {
+        let result = install_pi(
+            &root,
+            if cancelled { "cancelled" } else { "wrong-size" },
+            &mut ArchiveTransport(archive.clone()),
+            &|| cancelled,
+            &mut Lock,
+            &mut || Ok(Some(u64::MAX)),
+            &FsPiLifecycleBoundary,
+        );
+        let expected = if cancelled {
+            ModelInstallError::Cancelled
+        } else {
+            ModelInstallError::Acquisition(PiInstallError::WrongSize)
+        };
+        assert_eq!(result, Err(expected));
+        assert!(!root.join("current").exists());
+        assert!(resolve_current(&root).is_err());
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(feature = "network-tests")]
+#[test]
+fn native_acquisition_downloads_the_selected_release_and_reuses_it() {
+    if std::env::var_os("MUNIMENT_PI_ARCHIVE").is_none() {
+        eprintln!("The native acquisition test requires MUNIMENT_PI_ARCHIVE.");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("muniment-pi-native-{}", uuid::Uuid::new_v4()));
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let first = muniment_core::sidecar::pi_install::acquire_pi(&root, &cancelled).unwrap();
+    assert_eq!(resolve_current(&root).unwrap(), first);
+    let modified = std::fs::metadata(&first).unwrap().modified().unwrap();
+    let second = muniment_core::sidecar::pi_install::acquire_pi(&root, &cancelled).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(
+        std::fs::metadata(second).unwrap().modified().unwrap(),
+        modified
+    );
+    assert_eq!(std::fs::read_dir(root.join("staging")).unwrap().count(), 0);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 struct Lock;
 impl InstallLock for Lock {
     type Guard = ();

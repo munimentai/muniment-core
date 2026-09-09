@@ -271,6 +271,37 @@ impl std::fmt::Display for PiInstallError {
 impl std::error::Error for PiInstallError {}
 pub type CoordinatedPiInstallError = ModelInstallError<PiInstallError, PiInstallError>;
 
+pub fn acquire_pi(
+    root: &Path,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<PathBuf, CoordinatedPiInstallError> {
+    use crate::model_acquisition_transport::NativeModelAcquisitionTransport;
+    use crate::model_install_native::{NativeAvailableSpace, NativeInstallLock};
+
+    if let Ok(executable) = resolve_current(root) {
+        return Ok(executable);
+    }
+    fs::create_dir_all(root)
+        .map_err(|_| ModelInstallError::Acquisition(PiInstallError::Persistence))?;
+    let install_id = uuid::Uuid::new_v4().to_string();
+    let result = install_pi(
+        root,
+        &install_id,
+        &mut NativeModelAcquisitionTransport::new(),
+        &|| cancelled.load(std::sync::atomic::Ordering::SeqCst),
+        &mut NativeInstallLock::new(root.join("install.lock")),
+        &mut NativeAvailableSpace::new(root),
+        &FsPiLifecycleBoundary,
+    );
+    let _ = fs::remove_dir_all(root.join("staging").join(install_id));
+    result
+}
+
+enum AcquiredPi {
+    Current(PathBuf),
+    Staged(PathBuf),
+}
+
 pub fn install_pi<
     T: PiDownloadTransport,
     C: InstallCancellation,
@@ -290,14 +321,30 @@ pub fn install_pi<
         return Err(ModelInstallError::Acquisition(PiInstallError::InvalidStage));
     }
     let stage = root.join("staging").join(install_id);
-    install_model(
+    let result = install_model(
         lock,
         space,
         cancellation,
         || Ok(PI_SELECTED_ARTIFACT.byte_size),
-        || acquire_stage(&stage, transport),
-        |stage| publish_stage(root, &stage, boundary),
-    )
+        || {
+            // Recheck under the install lock after another run may have published Pi.
+            if let Ok(executable) = resolve_pointer_for(root, "current", PI_SELECTED_ARTIFACT, None)
+            {
+                Ok(AcquiredPi::Current(executable))
+            } else {
+                acquire_stage(&stage, transport, cancellation).map(AcquiredPi::Staged)
+            }
+        },
+        |acquired| match acquired {
+            AcquiredPi::Current(executable) => Ok(executable),
+            AcquiredPi::Staged(stage) => publish_stage(root, &stage, boundary),
+        },
+    );
+    if cancellation.is_cancelled() {
+        Err(ModelInstallError::Cancelled)
+    } else {
+        result
+    }
 }
 
 fn safe_component(value: &str) -> bool {
@@ -311,6 +358,7 @@ fn safe_component(value: &str) -> bool {
 fn acquire_stage<T: PiDownloadTransport>(
     stage: &Path,
     transport: &mut T,
+    cancellation: &impl InstallCancellation,
 ) -> Result<PathBuf, PiInstallError> {
     if stage.file_name().is_none() || stage.exists() {
         return Err(PiInstallError::InvalidStage);
@@ -338,7 +386,21 @@ fn acquire_stage<T: PiDownloadTransport>(
         .open(&archive)
         .map_err(|_| PiInstallError::Persistence)?;
     let mut limited = response.body.take(PI_SELECTED_ARTIFACT.byte_size + 1);
-    std::io::copy(&mut limited, &mut output).map_err(|_| PiInstallError::Download)?;
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(PiInstallError::Download);
+        }
+        let count = limited
+            .read(&mut buffer)
+            .map_err(|_| PiInstallError::Download)?;
+        if count == 0 {
+            break;
+        }
+        output
+            .write_all(&buffer[..count])
+            .map_err(|_| PiInstallError::Persistence)?;
+    }
     output.sync_all().map_err(|_| PiInstallError::Persistence)?;
     verify_archive(&archive)?;
     extract_archive(&archive, stage)?;

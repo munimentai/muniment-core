@@ -411,11 +411,16 @@ pub enum AttentionReason {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunStatus {
     Active,
+    AcquiringPi {
+        interrupted: Option<AttentionReason>,
+    },
     Streaming,
     PendingPermission(PermissionGate),
     Completed,
     Cancelled,
-    Failed { reason: Option<String> },
+    Failed {
+        reason: Option<String>,
+    },
     NeedsAttention(AttentionReason),
 }
 
@@ -735,7 +740,7 @@ impl RunReducer {
         if terminal
             && !matches!(
                 event.event_type.as_str(),
-                "run.needs_attention" | "run.resumed"
+                "run.needs_attention" | "run.resumed" | "runtime.pi_acquire.started"
             )
             && is_state_event(&event.event_type)
         {
@@ -748,6 +753,30 @@ impl RunReducer {
                     return Err(invalid(event, "run may only start once"));
                 }
                 self.set_status(event, RunStatus::Active);
+            }
+            "runtime.pi_acquire.started" => {
+                if self.pending_gate.is_some() || !self.open_effects.is_empty() {
+                    return Err(invalid(event, "run cannot acquire Pi"));
+                }
+                let interrupted = match self.state.as_ref().map(|state| &state.status) {
+                    Some(RunStatus::Active) => None,
+                    Some(RunStatus::NeedsAttention(reason)) if self.pi_session.is_some() => {
+                        Some(reason.clone())
+                    }
+                    _ => return Err(invalid(event, "run cannot acquire Pi")),
+                };
+                self.set_status(event, RunStatus::AcquiringPi { interrupted });
+            }
+            "runtime.pi_acquire.completed" => {
+                let Some(RunStatus::AcquiringPi { interrupted }) =
+                    self.state.as_ref().map(|state| &state.status)
+                else {
+                    return Err(invalid(event, "Pi acquisition has not started"));
+                };
+                let status = interrupted
+                    .clone()
+                    .map_or(RunStatus::Active, RunStatus::NeedsAttention);
+                self.set_status(event, status);
             }
             "chat.attachment.ingested" => {
                 self.require_active(event)?;
@@ -888,7 +917,13 @@ impl RunReducer {
         Ok(())
     }
     fn terminal(&mut self, event: &EventEnvelope, status: RunStatus) -> Result<(), ReduceError> {
-        self.require_active(event)?;
+        if !matches!(
+            self.state.as_ref().map(|state| &state.status),
+            Some(RunStatus::AcquiringPi { .. })
+        ) || !matches!(status, RunStatus::Cancelled | RunStatus::Failed { .. })
+        {
+            self.require_active(event)?;
+        }
         if !self.open_effects.is_empty() {
             return Err(invalid(event, "effect outcome is unknown"));
         }
@@ -968,6 +1003,7 @@ fn is_safety_event(t: &str) -> bool {
         || t.starts_with("permission.")
         || t.starts_with("tool.effect.")
         || t.starts_with("runtime.pi_session.")
+        || t.starts_with("runtime.pi_acquire.")
 }
 fn is_known_safety_event(t: &str) -> bool {
     matches!(
@@ -979,6 +1015,8 @@ fn is_known_safety_event(t: &str) -> bool {
             | "tool.effect.completed"
             | "tool.effect.failed"
             | "runtime.pi_session.bound"
+            | "runtime.pi_acquire.started"
+            | "runtime.pi_acquire.completed"
             | "run.resumed"
     )
 }
@@ -989,4 +1027,5 @@ fn is_state_event(t: &str) -> bool {
         || t.starts_with("permission.")
         || t.starts_with("tool.")
         || t.starts_with("runtime.pi_session.")
+        || t.starts_with("runtime.pi_acquire.")
 }

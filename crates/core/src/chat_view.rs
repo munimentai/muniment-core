@@ -124,6 +124,7 @@ pub fn reply_text(text: String, status: &Option<RunStatus>) -> String {
 
 pub fn projection_phase(status: &Option<RunStatus>) -> &'static str {
     match status {
+        Some(RunStatus::AcquiringPi { .. }) => "acquiring-pi",
         Some(RunStatus::Streaming) => "streaming",
         Some(RunStatus::Completed) => "complete",
         Some(RunStatus::Cancelled) => "cancelled",

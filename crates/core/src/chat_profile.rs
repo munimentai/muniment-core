@@ -26,6 +26,10 @@ impl ChatProfile {
         self.directory.join("cas")
     }
 
+    pub fn pi_install_root(&self) -> PathBuf {
+        self.directory.join("pi")
+    }
+
     pub fn pi_session_root(&self) -> PathBuf {
         self.directory.join("pi-sessions")
     }
