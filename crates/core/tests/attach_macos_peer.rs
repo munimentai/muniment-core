@@ -1,5 +1,9 @@
 #![cfg(target_os = "macos")]
 
+#[path = "../../test_support/socket_path.rs"]
+mod socket_path;
+use socket_path::socket_temp_path;
+
 use muniment_core::attach::{
     accept_macos_attach_with_reader, decode_frame, encode_frame,
     serve_next_macos_attach_with_reader, verify_macos_attach_peer_with_reader, Client, Hello, Id,
@@ -19,10 +23,7 @@ struct FakePeerReader {
 
 #[test]
 fn listener_removes_its_endpoint_and_restarts_at_the_same_path() {
-    let path = std::env::temp_dir().join(format!(
-        "muniment-attach-restart-{}.sock",
-        std::process::id()
-    ));
+    let path = socket_temp_path();
     {
         let listener = MacosAttachListener::bind(&path).unwrap();
         assert!(path.exists());
@@ -37,8 +38,7 @@ fn listener_removes_its_endpoint_and_restarts_at_the_same_path() {
 
 #[test]
 fn listener_recovers_an_owned_stale_endpoint() {
-    let path =
-        std::env::temp_dir().join(format!("muniment-attach-stale-{}.sock", std::process::id()));
+    let path = socket_temp_path();
     drop(UnixListener::bind(&path).unwrap());
 
     let listener = MacosAttachListener::bind(&path).unwrap();
@@ -49,8 +49,7 @@ fn listener_recovers_an_owned_stale_endpoint() {
 
 #[test]
 fn listener_preserves_a_live_endpoint() {
-    let path =
-        std::env::temp_dir().join(format!("muniment-attach-live-{}.sock", std::process::id()));
+    let path = socket_temp_path();
     let live = UnixListener::bind(&path).unwrap();
 
     assert_eq!(
@@ -65,8 +64,7 @@ fn listener_preserves_a_live_endpoint() {
 
 #[test]
 fn stop_signal_wakes_a_pending_accept() {
-    let path =
-        std::env::temp_dir().join(format!("muniment-attach-stop-{}.sock", std::process::id()));
+    let path = socket_temp_path();
     let listener = MacosAttachListener::bind(&path).unwrap();
     let stop = std::sync::Arc::new(MacosAttachStopEvent::new().unwrap());
     let signal = std::sync::Arc::clone(&stop);
@@ -107,11 +105,7 @@ fn verify_and_assert_no_response(reader: &FakePeerReader) -> Result<(), MacosPee
 }
 
 fn accept_and_assert_no_response(reader: &FakePeerReader) {
-    let path = std::env::temp_dir().join(format!(
-        "muniment-attach-peer-{}-{}.sock",
-        std::process::id(),
-        reader as *const FakePeerReader as usize
-    ));
+    let path = socket_temp_path();
     let listener = UnixListener::bind(&path).unwrap();
     let mut client = UnixStream::connect(&path).unwrap();
 
@@ -179,10 +173,7 @@ fn verified_listener_stream_serves_a_valid_first_frame() {
         local_uid: 501,
         reads: Cell::new(0),
     };
-    let path = std::env::temp_dir().join(format!(
-        "muniment-attach-session-{}.sock",
-        std::process::id()
-    ));
+    let path = socket_temp_path();
     let listener = UnixListener::bind(&path).unwrap();
     let mut client = UnixStream::connect(&path).unwrap();
     let hello = Hello {
