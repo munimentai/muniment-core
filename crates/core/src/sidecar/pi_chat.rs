@@ -4,6 +4,7 @@
 //! event with the locally-owned run id; callers must create a fresh adapter for
 //! each accepted prompt and discard unrelated frames.
 
+use crate::runtime_eprintln as eprintln;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{mpsc, Mutex};

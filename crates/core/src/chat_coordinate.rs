@@ -1,5 +1,6 @@
 mod diagnostics;
 
+use crate::runtime_eprintln as eprintln;
 use diagnostics::RunDiagnostics;
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};

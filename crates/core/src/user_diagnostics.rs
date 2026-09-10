@@ -1,6 +1,6 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::Path;
 #[cfg(target_os = "macos")]
@@ -49,12 +49,9 @@ pub fn append_owner_only_record(
     max_bytes: u64,
     record: &[u8],
 ) -> io::Result<()> {
-    match fs::symlink_metadata(directory) {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir(directory)?;
-            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
-        }
+    match fs::DirBuilder::new().mode(0o700).create(directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error),
     }
 

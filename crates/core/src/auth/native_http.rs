@@ -1,5 +1,6 @@
 //! Native HTTP diagnostics contain only fixed labels, status codes, and durations.
 
+use crate::runtime_eprintln as eprintln;
 use std::time::Instant;
 
 pub(super) fn request(

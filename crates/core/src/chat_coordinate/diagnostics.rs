@@ -1,3 +1,4 @@
+use crate::runtime_eprintln as eprintln;
 use crate::sidecar::{LineReader, SidecarEvent, SidecarSupervisor};
 use std::sync::mpsc::Receiver;
 

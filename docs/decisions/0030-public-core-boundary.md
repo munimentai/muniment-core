@@ -67,6 +67,7 @@ Module rows name the module below `muniment-core`.
 | module | run_events | It appends and projects run events. |
 | module | run_preparation | It prepares journaled runs. |
 | module | run_start | It starts runtime runs. |
+| module | runtime_diagnostics | It writes bounded runtime diagnostics. |
 | module | session_thread | It binds sessions to journal threads. |
 | module | sidecar | It supervises Pi and its RPC transport. |
 | module | thread_history | It reads journal-backed thread history. |
