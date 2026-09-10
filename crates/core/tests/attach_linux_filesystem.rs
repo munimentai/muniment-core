@@ -67,6 +67,34 @@ fn instance_lock_conflicts_across_independent_opens_and_releases_on_drop() {
 }
 
 #[test]
+fn startup_lock_conflicts_across_independent_opens_and_releases_on_drop() {
+    let runtime = TestDirectory::new();
+    let first_filesystem = AttachFilesystem::from_runtime_directory(&runtime.0).unwrap();
+    let second_filesystem = AttachFilesystem::from_runtime_directory(&runtime.0).unwrap();
+
+    let first_lock = first_filesystem.acquire_startup_lock().unwrap();
+    assert_eq!(
+        second_filesystem.acquire_startup_lock().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    // Startup does not block the runtime's instance lock.
+    let instance_lock = second_filesystem.acquire_instance_lock().unwrap();
+    drop(first_lock);
+    let second_lock = second_filesystem.acquire_startup_lock().unwrap();
+    assert_eq!(
+        first_filesystem.acquire_startup_lock().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        first_filesystem.acquire_instance_lock().unwrap_err(),
+        InstanceLockError::AlreadyHeld
+    );
+    drop(second_lock);
+    first_filesystem.acquire_startup_lock().unwrap();
+    drop(instance_lock);
+}
+
+#[test]
 fn instance_lock_does_not_follow_a_symlink() {
     let runtime = TestDirectory::new();
     let filesystem = AttachFilesystem::from_runtime_directory(&runtime.0).unwrap();

@@ -183,6 +183,21 @@ impl AttachFilesystem {
         self.attach_directory.as_fd()
     }
 
+    /// Tries to lock desktop startup without taking the runtime's instance lock.
+    pub fn acquire_startup_lock(&self) -> io::Result<StartupLock<'_>> {
+        // SAFETY: The filesystem owns this open directory descriptor.
+        if unsafe {
+            libc::flock(
+                self.attach_directory.as_raw_fd(),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(StartupLock(self))
+    }
+
     /// Acquires the non-blocking exclusive lock for this attach directory.
     pub fn acquire_instance_lock(&self) -> Result<InstanceLock, InstanceLockError> {
         let descriptor = unsafe {
@@ -208,6 +223,17 @@ impl AttachFilesystem {
         Ok(InstanceLock {
             _descriptor: descriptor,
         })
+    }
+}
+
+/// Serializes desktop starts across independent attach filesystem opens.
+#[derive(Debug)]
+pub struct StartupLock<'a>(&'a AttachFilesystem);
+
+impl Drop for StartupLock<'_> {
+    fn drop(&mut self) {
+        // SAFETY: The filesystem keeps the directory descriptor open until this guard drops.
+        unsafe { libc::flock(self.0.attach_directory.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 

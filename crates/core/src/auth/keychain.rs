@@ -30,10 +30,12 @@ impl NativeCredentialBackend for PlatformKeychain {
     }
 
     fn set(&self, user: &str, value: &str) -> Result<(), String> {
-        Entry::new(SERVICE, user)
-            .map_err(|error| error.to_string())?
-            .set_password(value)
-            .map_err(|error| error.to_string())
+        let entry = Entry::new(SERVICE, user).map_err(|error| error.to_string())?;
+        #[cfg(target_os = "macos")]
+        if entry.get_credential().is::<keyring::macos::MacCredential>() {
+            return set_macos_password(user, value).map_err(|error| error.to_string());
+        }
+        entry.set_password(value).map_err(|error| error.to_string())
     }
 
     fn delete(&self, user: &str) -> Result<(), String> {
@@ -44,6 +46,42 @@ impl NativeCredentialBackend for PlatformKeychain {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(error) => Err(error.to_string()),
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_password(user: &str, value: &str) -> keyring::Result<()> {
+    use security_framework::os::macos::keychain::{SecKeychain, SecPreferencesDomain};
+
+    let keychain = SecKeychain::default_for_domain(SecPreferencesDomain::User)
+        .map_err(keyring::macos::decode_error)?;
+    update_or_create(
+        keychain
+            .find_generic_password(SERVICE, user)
+            .map_err(keyring::macos::decode_error),
+        |(_, mut item)| {
+            item.set_password(value.as_bytes())
+                .map_err(keyring::macos::decode_error)
+        },
+        || {
+            keychain
+                .add_generic_password(SERVICE, user, value.as_bytes())
+                .map_err(keyring::macos::decode_error)
+        },
+    )
+}
+
+// Only a missing item permits creation. Access failures never replace the item or its access list.
+#[cfg(any(target_os = "macos", test))]
+fn update_or_create<T>(
+    found: keyring::Result<T>,
+    update: impl FnOnce(T) -> keyring::Result<()>,
+    create: impl FnOnce() -> keyring::Result<()>,
+) -> keyring::Result<()> {
+    match found {
+        Ok(item) => update(item),
+        Err(keyring::Error::NoEntry) => create(),
+        Err(error) => Err(error),
     }
 }
 
@@ -107,5 +145,70 @@ impl NativeCredentialStore for KeyringNativeCredentialStore {
 
     fn clear_session(&self) -> Result<(), NativeTokenError> {
         self.0.clear_session()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::update_or_create;
+    use std::cell::Cell;
+
+    #[test]
+    fn renewal_updates_the_existing_item_without_creation() {
+        let item = Cell::new("old-token");
+        update_or_create(
+            Ok(&item),
+            |item| {
+                item.set("new-token");
+                Ok(())
+            },
+            || panic!("A renewal must not create an item."),
+        )
+        .unwrap();
+        assert_eq!(item.get(), "new-token");
+    }
+
+    #[test]
+    fn only_a_missing_item_allows_creation() {
+        let created = Cell::new(false);
+        update_or_create::<()>(
+            Err(keyring::Error::NoEntry),
+            |_| panic!("A missing item cannot receive an update."),
+            || {
+                created.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(created.get());
+
+        let denied =
+            keyring::Error::NoStorageAccess(Box::new(std::io::Error::other("Access denied.")));
+        let result = update_or_create::<()>(
+            Err(denied),
+            |_| panic!("A failed lookup must not update an item."),
+            || panic!("A failed lookup must not create an item."),
+        );
+        assert!(matches!(result, Err(keyring::Error::NoStorageAccess(_))));
+    }
+
+    #[test]
+    fn failed_update_and_duplicate_creation_do_not_retry() {
+        let result = update_or_create(
+            Ok(()),
+            |_| Err(keyring::Error::NoEntry),
+            || panic!("A failed update must not recreate an item."),
+        );
+        assert!(matches!(result, Err(keyring::Error::NoEntry)));
+        let result = update_or_create::<()>(
+            Err(keyring::Error::NoEntry),
+            |_| unreachable!(),
+            || {
+                Err(keyring::Error::PlatformFailure(Box::new(
+                    std::io::Error::other("Duplicate item."),
+                )))
+            },
+        );
+        assert!(matches!(result, Err(keyring::Error::PlatformFailure(_))));
     }
 }

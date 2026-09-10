@@ -1,10 +1,10 @@
-//! OIDC authorization-code + PKCE engine for the desktop app.
+//! Native auth and OIDC authorization-code + PKCE engines.
 //!
 //! Implements the RFC 8252 native-app flow: system browser + loopback
 //! redirect on 127.0.0.1, PKCE S256, `state` binding, endpoints resolved via
-//! OIDC discovery. The Tauri layer (`src-tauri/src/auth/`) only wires these
-//! pieces to commands and the platform keychain, so everything here stays
-//! testable without a GUI stack (see `tests/oidc_flow.rs`).
+//! OIDC discovery. The runtime owns the platform credential store and native-auth calls.
+//! The Tauri layer sends auth commands over attach without opening the store.
+//! The core tests need no GUI stack (see `tests/oidc_flow.rs`).
 //!
 //! Security invariants (harness-spec §3.1/§8):
 //! - Tokens are never logged and never written to plaintext disk; the only
@@ -12,6 +12,8 @@
 //! - [`AuthError`] values never carry token material, so they are safe to
 //!   surface to the webview.
 
+#[cfg(test)]
+mod desktop_boundary;
 pub mod discovery;
 pub mod entitlement_snapshot;
 pub mod flow;

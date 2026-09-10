@@ -17,7 +17,7 @@ default = ["desktop-integration"]
 desktop-integration = []
 # The desktop crate turns on rustls with the ring provider through ureq.
 tls = ["ureq/tls", "ureq/native-certs", "ureq/proxy-from-env"]
-keyring = ["dep:keyring"]
+keyring = ["dep:keyring", "dep:security-framework"]
 network-tests = ["tls"]
 
 [dependencies]
@@ -52,6 +52,7 @@ uuid = { version = "1", features = ["serde", "v4", "v7"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+syn = { version = "2", features = ["full", "visit"] }
 # Tests need to author AES-encrypted entries to exercise the encrypted-entry
 # rejection; the library itself only ever reads and needs no crypto stack.
 zip = { version = "2", default-features = false, features = ["deflate", "aes-crypto"] }
@@ -61,6 +62,7 @@ libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+security-framework = { version = "3", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.61", features = ["Win32_System_Com", "Win32_System_Ole", "Win32_System_TaskScheduler", "Win32_System_Variant"] }
