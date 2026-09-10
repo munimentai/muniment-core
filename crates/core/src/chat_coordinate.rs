@@ -401,7 +401,7 @@ pub fn coordinate(
             let (kind, payload) = if resume.is_some() {
                 (
                     "run.needs_attention",
-                    json!({"reason": "Pi installation stopped. Resume the reply to try again."}),
+                    json!({"reason": "Reply setup stopped. Resume the reply to try again."}),
                 )
             } else {
                 ("run.cancelled", json!({}))
@@ -437,7 +437,7 @@ pub fn coordinate(
             Err(error) => {
                 eprintln!("muniment-runtime: run_id={run_id} pi_spawn config_error={error:?}");
                 let message = if matches!(error, PiLaunchError::Acquisition(_)) {
-                    "Pi installation failed. Check your connection and available storage, then try again."
+                    "Reply setup failed. Check your connection and storage, then retry."
                 } else {
                     "The agent runtime is unavailable."
                 };
@@ -512,7 +512,7 @@ pub fn coordinate(
             &mut projector,
             &run_id,
             &mut seq,
-            "Pi did not become ready within its startup bound. Try again.",
+            "Reply setup timed out. Try again.",
             subject.as_deref(),
             resume.is_some(),
         );
@@ -565,7 +565,7 @@ pub fn coordinate(
                         &mut projector,
                         &run_id,
                         &mut seq,
-                        "Pi did not acknowledge the prompt. Try again.",
+                        "The reply did not start. Try again.",
                         subject.as_deref(),
                         true,
                     );
@@ -745,7 +745,7 @@ pub fn coordinate(
                     &mut projector,
                     &run_id,
                     &mut seq,
-                    "Pi did not acknowledge the prompt. Try again.",
+                    "The reply did not start. Try again.",
                     subject.as_deref(),
                 );
                 let _ = runtime.supervisor.shutdown();

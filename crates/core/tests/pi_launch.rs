@@ -44,7 +44,7 @@ mod stdin_deadline {
         ..PI_ARTIFACT
     };
     const RUN_ID: &str = "01900000-0000-7000-8000-000000000001";
-    const FAILURE: &str = "Pi did not acknowledge the prompt. Try again.";
+    const FAILURE: &str = "The reply did not start. Try again.";
 
     struct Boundary {
         root: PathBuf,

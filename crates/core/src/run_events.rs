@@ -423,7 +423,7 @@ mod tests {
         let mut projector = ChatProjector::new();
         let mut seq = 0;
         let run_id = Uuid::now_v7().to_string();
-        let reason = "Pi sent no reply event within 30 seconds. Try again.";
+        let reason = "No reply arrived within 30 seconds. Try again.";
         append_emit(
             &sink,
             &storage,

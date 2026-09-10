@@ -168,7 +168,7 @@ fn coordinate_acquires_from_the_profile_once_without_an_environment_root() {
                     .last()
                     .unwrap()
                     .text
-                    .starts_with("Pi installation failed."));
+                    .starts_with("Reply setup failed."));
             }
             assert_eq!(
                 events.iter().any(|event| event.phase == "acquiring-pi"),

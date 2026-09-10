@@ -417,7 +417,7 @@ fn require_queue_ack(response: &Value, command: &str) -> Result<(), String> {
 /// Pi must produce a reply event within 30 seconds of prompt submission.
 /// Prompt acknowledgments and unrelated lifecycle frames do not count.
 pub const FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(30);
-pub const FIRST_EVENT_TIMEOUT_REASON: &str = "Pi sent no reply event within 30 seconds. Try again.";
+pub const FIRST_EVENT_TIMEOUT_REASON: &str = "No reply arrived within 30 seconds. Try again.";
 
 /// Binds Pi's single active stream to a locally-owned run. Construct this
 /// before sending the prompt so no post-ack frame can be lost.
@@ -722,12 +722,12 @@ mod tests {
         let started = Instant::now();
         assert_eq!(
             adapter.next(Duration::from_secs(1)).unwrap_err(),
-            "Pi sent no reply event within 30 seconds. Try again."
+            "No reply arrived within 30 seconds. Try again."
         );
         assert!(started.elapsed() < Duration::from_millis(500));
         assert_eq!(
             adapter.next(Duration::ZERO).unwrap_err(),
-            "Pi sent no reply event within 30 seconds. Try again."
+            "No reply arrived within 30 seconds. Try again."
         );
     }
 
@@ -743,7 +743,7 @@ mod tests {
         }
         assert_eq!(
             adapter.next(Duration::from_secs(1)).unwrap_err(),
-            "Pi sent no reply event within 30 seconds. Try again."
+            "No reply arrived within 30 seconds. Try again."
         );
     }
 
@@ -769,7 +769,7 @@ mod tests {
         sender.send(json!({"type":"agent_end"})).unwrap();
         assert_eq!(
             adapter.next(Duration::ZERO).unwrap_err(),
-            "Pi sent no reply event within 30 seconds. Try again."
+            "No reply arrived within 30 seconds. Try again."
         );
     }
 
