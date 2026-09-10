@@ -610,6 +610,42 @@ fn extension_ui_supervisor(capture: &std::path::Path) -> (SidecarSupervisor, PiR
     (supervisor, wiring)
 }
 
+fn read_complete_capture(path: &std::path::Path) -> Option<String> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => panic!("could not read capture: {error}"),
+    };
+    // The stub creates the file before it writes each newline-delimited frame.
+    bytes
+        .ends_with(b"\n")
+        .then(|| String::from_utf8(bytes).unwrap())
+}
+
+#[test]
+fn capture_reader_waits_for_complete_frames() {
+    let temp = TempDir::new();
+    let capture = temp.path().join("answers.jsonl");
+    assert_eq!(read_complete_capture(&capture), None);
+    let first = "{\"value\":\"café\"}\n";
+    let frames = format!("{first}{{\"cancelled\":true}}\n");
+    for end in 0..=frames.len() {
+        fs::write(&capture, &frames.as_bytes()[..end]).unwrap();
+        let expected = if end == first.len() {
+            Some(first.to_owned())
+        } else if end == frames.len() {
+            Some(frames.clone())
+        } else {
+            None
+        };
+        assert_eq!(read_complete_capture(&capture), expected, "prefix {end}");
+    }
+    // A complete malformed frame must reach the parser, not trigger a retry.
+    fs::write(&capture, "invalid JSON\n").unwrap();
+    let captured = read_complete_capture(&capture).unwrap();
+    assert!(serde_json::from_str::<serde_json::Value>(&captured).is_err());
+}
+
 #[test]
 fn adapter_sends_exact_extension_ui_answer_frames() {
     let temp = TempDir::new();
@@ -666,7 +702,7 @@ fn adapter_sends_exact_extension_ui_answer_frames() {
     }
     let deadline = Instant::now() + Duration::from_secs(1);
     let captured = loop {
-        let frames = fs::read_to_string(&capture).unwrap_or_default();
+        let frames = read_complete_capture(&capture).unwrap_or_default();
         let captured: Vec<serde_json::Value> = frames
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
@@ -739,11 +775,14 @@ fn transport_send_completes_while_call_waits() {
         .unwrap();
     assert!(started.elapsed() < Duration::from_millis(100));
     let deadline = Instant::now() + Duration::from_secs(1);
-    while !capture.exists() && Instant::now() < deadline {
+    let frames = loop {
+        if let Some(frames) = read_complete_capture(&capture) {
+            break frames;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for capture");
         std::thread::sleep(Duration::from_millis(5));
-    }
-    let captured: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(capture).unwrap()).unwrap();
+    };
+    let captured: serde_json::Value = serde_json::from_str(&frames).unwrap();
     assert_eq!(
         captured,
         json!({"type":"extension_ui_response", "id":"gate-1", "confirmed":true})
