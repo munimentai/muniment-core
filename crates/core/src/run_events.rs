@@ -29,6 +29,8 @@ pub struct ChatEvent {
     pub phase: String,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub receipt: Option<Value>,
     pub tool_activity: Vec<ChatToolActivity>,
     pub attachments: Vec<ChatAttachment>,
@@ -105,7 +107,8 @@ pub fn chat_event(
         run_id: run_id.into(),
         thread_id: None,
         phase: projection_phase(&projection.status).into(),
-        text: crate::chat_view::reply_text(projection.text, &projection.status),
+        text: projection.text,
+        failure_reason: crate::chat_view::failure_reason(&projection.status),
         receipt: projection.receipt,
         tool_activity: chat_tool_activity(&projection.tool_activity),
         attachments: chat_attachments(&projection.attachments),
@@ -446,7 +449,13 @@ mod tests {
         );
         let events = sink.events.lock().unwrap();
         assert_eq!(events.last().unwrap().phase, "failed");
-        assert_eq!(events.last().unwrap().text, reason);
+        assert_eq!(events.last().unwrap().text, "");
+        assert_eq!(
+            events.last().unwrap().failure_reason.as_deref(),
+            Some(reason)
+        );
+        let payload = serde_json::to_value(events.last().unwrap()).unwrap();
+        assert_eq!(payload["failureReason"], reason);
         let stored = storage.lock().unwrap().journal.events(&run_id).unwrap();
         assert_eq!(stored.last().unwrap().event_type, "run.failed");
         let (projection, _) = crate::journal::reducer::project_chat_with_state(&stored).unwrap();
@@ -457,14 +466,32 @@ mod tests {
             })
         );
         assert_eq!(
-            crate::chat_view::reply_text(projection.text, &projection.status),
-            reason
+            crate::chat_view::failure_reason(&projection.status).as_deref(),
+            Some(reason)
         );
-        assert_eq!(
-            crate::chat_view::reply_text("partial reply".into(), &projection.status),
-            "partial reply"
-        );
-        assert_eq!(crate::chat_view::reply_text(String::new(), &None), "");
+        let mut partial = projection;
+        partial.text = "partial reply".into();
+        let event = chat_event(&run_id, partial, None, Vec::new());
+        assert_eq!(event.text, "partial reply");
+        assert_eq!(event.failure_reason.as_deref(), Some(reason));
+        assert_eq!(crate::chat_view::failure_reason(&None), None);
+
+        #[cfg(feature = "keyring")]
+        {
+            crate::chat_prompt::use_mock_keyring_for_tests();
+            let root = std::env::temp_dir();
+            let history = crate::thread_history::project_history_entry(
+                &mut storage.lock().unwrap().journal,
+                None,
+                run_id,
+                None,
+                &root,
+            )
+            .unwrap();
+            assert_eq!(history.text, "");
+            let payload = serde_json::to_value(history).unwrap();
+            assert_eq!(payload["failureReason"], reason);
+        }
     }
 
     #[test]

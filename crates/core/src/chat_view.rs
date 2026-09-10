@@ -109,17 +109,12 @@ pub fn chat_tool_activity(activity: &[ToolActivity]) -> Vec<ChatToolActivity> {
         .collect()
 }
 
-/// Shows the recorded cause when a failed reply has no assistant text.
-pub fn reply_text(text: String, status: &Option<RunStatus>) -> String {
-    if text.is_empty() {
-        if let Some(RunStatus::Failed {
-            reason: Some(reason),
-        }) = status
-        {
-            return reason.clone();
-        }
+/// Keeps the recorded cause separate from assistant text.
+pub fn failure_reason(status: &Option<RunStatus>) -> Option<String> {
+    match status {
+        Some(RunStatus::Failed { reason }) => reason.clone(),
+        _ => None,
     }
-    text
 }
 
 pub fn projection_phase(status: &Option<RunStatus>) -> &'static str {

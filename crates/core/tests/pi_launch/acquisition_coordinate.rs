@@ -167,8 +167,11 @@ fn coordinate_acquires_from_the_profile_once_without_an_environment_root() {
                 assert!(events
                     .last()
                     .unwrap()
-                    .text
+                    .failure_reason
+                    .as_deref()
+                    .unwrap()
                     .starts_with("Reply setup failed."));
+                assert!(events.last().unwrap().text.is_empty());
             }
             assert_eq!(
                 events.iter().any(|event| event.phase == "acquiring-pi"),

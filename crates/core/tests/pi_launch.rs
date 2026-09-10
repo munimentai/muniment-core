@@ -58,7 +58,7 @@ mod stdin_deadline {
 
         fn deliver(&self, event: ChatEvent) -> Result<(), ()> {
             eprintln!("shell-event: {}", serde_json::to_string(&event).unwrap());
-            if event.phase == "failed" && event.text == FAILURE {
+            if event.phase == "failed" && event.failure_reason.as_deref() == Some(FAILURE) {
                 // Measure delivery here, not when the parent gets CPU time to read stderr.
                 // Allow one second for readiness and scheduling, not another timeout.
                 let bound = FIRST_EVENT_TIMEOUT + Duration::from_secs(1);
@@ -135,7 +135,11 @@ mod stdin_deadline {
             .position(|line| {
                 line.strip_prefix("shell-event: ")
                     .and_then(|event| serde_json::from_str::<serde_json::Value>(event).ok())
-                    .is_some_and(|event| event["phase"] == "failed" && event["text"] == FAILURE)
+                    .is_some_and(|event| {
+                        event["phase"] == "failed"
+                            && event["failureReason"] == FAILURE
+                            && event["text"] == ""
+                    })
             })
             .unwrap_or_else(|| panic!("Missing shell failure: {lines:?}"));
         // The child checks the delivery bound. Both diagnostics must precede that delivery.

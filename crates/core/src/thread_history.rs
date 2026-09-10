@@ -22,6 +22,8 @@ pub struct HistoryEntry {
     pub phase: String,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub receipt: Option<Value>,
     pub tool_activity: Vec<ChatToolActivity>,
     pub attachments: Vec<ChatAttachment>,
@@ -84,7 +86,8 @@ pub fn project_history_entry(
     Ok(HistoryEntry {
         prompt: load_prompt(&run_id, subject)?,
         phase: projection_phase(&projection.status).into(),
-        text: crate::chat_view::reply_text(projection.text, &projection.status),
+        text: projection.text,
+        failure_reason: crate::chat_view::failure_reason(&projection.status),
         receipt: projection.receipt,
         tool_activity: chat_tool_activity(&projection.tool_activity),
         attachments: chat_attachments(&projection.attachments),
