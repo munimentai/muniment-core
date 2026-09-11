@@ -32,6 +32,10 @@ pub fn runtime_version_meets_minimum(version: &str, minimum: &str) -> bool {
 mod chat_event_supervisor;
 #[cfg(feature = "client")]
 mod client;
+#[cfg(all(feature = "client", target_os = "linux"))]
+mod linux_connect_diagnostic;
+#[cfg(all(feature = "client", target_os = "linux"))]
+pub use linux_connect_diagnostic::LinuxConnectDiagnostic;
 #[cfg(feature = "client")]
 mod client_stream;
 #[cfg(feature = "client")]

@@ -2268,10 +2268,19 @@ mod linux {
         choose: impl FnMut(&ApprovalPresentRequest) -> ApprovalDecision,
     ) {
         let connect_stop = stop.clone();
+        #[cfg(target_os = "linux")]
+        let mut diagnostic = crate::LinuxConnectDiagnostic::default();
         serve_approval_presenter_with(
             || {
-                let stream = interruptible_connect(endpoint, &connect_stop)?;
-                handshake_approval_presenter_stream(stream, client_version, io_timeout).ok()
+                #[cfg(target_os = "linux")]
+                return diagnostic.connect(endpoint, "presenter", &connect_stop.inner, |stream| {
+                    handshake_approval_presenter_stream(stream, client_version, io_timeout)
+                });
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let stream = interruptible_connect(endpoint, &connect_stop)?;
+                    handshake_approval_presenter_stream(stream, client_version, io_timeout).ok()
+                }
             },
             stop,
             retry_interval,
@@ -2290,11 +2299,20 @@ mod linux {
         observe: impl FnMut(bool),
     ) {
         let connect_stop = stop.clone();
+        #[cfg(target_os = "linux")]
+        let mut diagnostic = crate::LinuxConnectDiagnostic::default();
         serve_desktop_client_with(
             || {
-                let stream = interruptible_desktop_connect(endpoint, &connect_stop)?;
+                #[cfg(target_os = "linux")]
                 let client =
-                    handshake_desktop_client_stream(stream, client_version, io_timeout).ok();
+                    diagnostic.connect(endpoint, "desktop", &connect_stop.inner, |stream| {
+                        handshake_desktop_client_stream(stream, client_version, io_timeout)
+                    });
+                #[cfg(not(target_os = "linux"))]
+                let client = {
+                    let stream = interruptible_desktop_connect(endpoint, &connect_stop)?;
+                    handshake_desktop_client_stream(stream, client_version, io_timeout).ok()
+                };
                 if client.is_none() {
                     clear_desktop_stream(&connect_stop);
                 }
@@ -2307,6 +2325,7 @@ mod linux {
         );
     }
 
+    #[cfg(not(target_os = "linux"))]
     fn interruptible_desktop_connect(
         endpoint: &Path,
         stop: &DesktopClientStopHandle,
@@ -2314,6 +2333,7 @@ mod linux {
         interruptible_connect_with_state(endpoint, &stop.inner)
     }
 
+    #[cfg(not(target_os = "linux"))]
     fn interruptible_connect(
         endpoint: &Path,
         stop: &ApprovalPresenterStopHandle,
@@ -2328,16 +2348,26 @@ mod linux {
     where
         S: InterruptibleConnectState,
     {
+        interruptible_connect_result(endpoint, stop).ok().flatten()
+    }
+
+    pub fn interruptible_connect_result<S>(
+        endpoint: &Path,
+        stop: &Arc<(Mutex<S>, Condvar)>,
+    ) -> io::Result<Option<UnixStream>>
+    where
+        S: InterruptibleConnectState,
+    {
         let path = endpoint.as_os_str().as_bytes();
         let path_capacity =
             std::mem::size_of_val(&unsafe { std::mem::zeroed::<UnixSocketAddress>() }.path);
         if path.is_empty() || path.len() >= path_capacity || path.contains(&0) {
-            return None;
+            return Err(io::ErrorKind::InvalidInput.into());
         }
         // SAFETY: The constants and arguments match the platform socket(2) interface.
         let descriptor = unsafe { socket(AF_UNIX, SOCK_STREAM, 0) };
         if descriptor < 0 {
-            return None;
+            return Err(io::Error::last_os_error());
         }
         // SAFETY: `descriptor` is a new owned descriptor from socket(2).
         let stream = unsafe { UnixStream::from_raw_fd(descriptor) };
@@ -2346,12 +2376,10 @@ mod linux {
         if descriptor_flags < 0
             || unsafe { fcntl(descriptor, F_SETFD, descriptor_flags | FD_CLOEXEC) } < 0
         {
-            return None;
+            return Err(io::Error::last_os_error());
         }
-        let interrupt = stream.try_clone().ok()?;
-        if stream.set_nonblocking(true).is_err() {
-            return None;
-        }
+        let interrupt = stream.try_clone()?;
+        stream.set_nonblocking(true)?;
         // SAFETY: A zeroed sockaddr_un is valid after its family and path are set.
         let mut address = unsafe { std::mem::zeroed::<UnixSocketAddress>() };
         address.family = AF_UNIX as _;
@@ -2365,19 +2393,23 @@ mod linux {
             address.length = address_length as u8;
         }
 
-        let connect_result = {
+        let (connect_result, connect_error) = {
             let (state, _) = &**stop;
             let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
             if state.stopped() {
-                return None;
+                return Ok(None);
             }
             state.set_stream(Some(interrupt));
             // SAFETY: `address` has a valid AF_UNIX family and a terminated pathname.
-            unsafe { connect(descriptor, std::ptr::from_ref(&address), address_length) }
+            let result =
+                unsafe { connect(descriptor, std::ptr::from_ref(&address), address_length) };
+            (result, (result < 0).then(io::Error::last_os_error))
         };
-        if connect_result < 0 && io::Error::last_os_error().raw_os_error() != Some(EINPROGRESS) {
-            clear_interruptible_stream(stop);
-            return None;
+        if let Some(error) = connect_error {
+            if error.raw_os_error() != Some(EINPROGRESS) {
+                clear_interruptible_stream(stop);
+                return Err(error);
+            }
         }
 
         if connect_result < 0 {
@@ -2389,6 +2421,7 @@ mod linux {
             loop {
                 // SAFETY: `ready` points to one valid pollfd for this call.
                 let result = unsafe { poll(&mut ready, 1, 50) };
+                let poll_error = (result < 0).then(io::Error::last_os_error);
                 let (state, _) = &**stop;
                 if state
                     .lock()
@@ -2396,14 +2429,16 @@ mod linux {
                     .stopped()
                 {
                     clear_interruptible_stream(stop);
-                    return None;
+                    return Ok(None);
                 }
                 if result > 0 {
                     break;
                 }
-                if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-                    clear_interruptible_stream(stop);
-                    return None;
+                if let Some(error) = poll_error {
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        clear_interruptible_stream(stop);
+                        return Err(error);
+                    }
                 }
             }
             let mut error = 0;
@@ -2418,17 +2453,21 @@ mod linux {
                     &mut length,
                 )
             } < 0
-                || error != 0
             {
+                let error = io::Error::last_os_error();
                 clear_interruptible_stream(stop);
-                return None;
+                return Err(error);
+            }
+            if error != 0 {
+                clear_interruptible_stream(stop);
+                return Err(io::Error::from_raw_os_error(error));
             }
         }
-        if stream.set_nonblocking(false).is_err() {
+        if let Err(error) = stream.set_nonblocking(false) {
             clear_interruptible_stream(stop);
-            return None;
+            return Err(error);
         }
-        Some(stream)
+        Ok(Some(stream))
     }
 
     pub trait InterruptibleConnectState {
@@ -2861,6 +2900,9 @@ mod linux {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+pub use linux::interruptible_connect_result;
 
 #[cfg(unix)]
 pub use linux::{
