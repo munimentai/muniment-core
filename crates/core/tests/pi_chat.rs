@@ -441,10 +441,15 @@ fn late_correlated_responses_do_not_become_stream_events() {
     let (adapter, _) =
         PiRunAdapter::start("run-1", &transport, "prompt", Duration::from_secs(1)).unwrap();
 
-    assert!(transport
-        .session_locator(std::path::Path::new("."), Duration::from_millis(1))
-        .unwrap_err()
-        .contains("timed out waiting for Pi RPC response"));
+    // Give the stdin writer time to run. The release marker keeps the response
+    // late regardless of the request timeout.
+    let error = transport
+        .session_locator(std::path::Path::new("."), Duration::from_secs(1))
+        .unwrap_err();
+    assert!(
+        error.contains("timed out waiting for Pi RPC response"),
+        "expected a response timeout, got: {error}"
+    );
     fs::write(release_marker, "").unwrap();
     assert_eq!(
         adapter.next(Duration::from_secs(1)).unwrap(),
