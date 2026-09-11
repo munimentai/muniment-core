@@ -160,7 +160,10 @@ where
             )
             .map_err(MacosAttachSessionError::DesktopClientAdmission)?;
             let connection = ApprovalPresenterConnection::new(stream, admitted.capability);
-            let Some(session) = serve_approval_presenter(coordinator, connection) else {
+            let Some(session) = serve_approval_presenter(coordinator.clone(), connection) else {
+                if let Some(line) = coordinator.presenter_refusal_diagnostic() {
+                    crate::runtime_eprintln!("{line}");
+                }
                 return Err(MacosAttachSessionError::ApprovalPresenterUnavailable);
             };
             session.wait_until_closed();

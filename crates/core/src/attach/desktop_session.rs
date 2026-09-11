@@ -369,6 +369,21 @@ mod tests {
         ) -> Result<ThreadListPage, ProtocolError> {
             Err(ProtocolError::persistence_failed())
         }
+
+        fn submit_run(
+            &mut self,
+            _: &str,
+            _: super::super::desktop_service_message::RunSubmitRequest,
+            _: &muniment_attach::Id,
+            _: &muniment_attach::Id,
+            _: super::super::desktop_service_message::CompanionProvenance,
+        ) -> Result<super::super::desktop_service_message::RunSubmitAccepted, ProtocolError>
+        {
+            Err(crate::run_start::RunStartError::InvalidRequest(
+                "Conversation history is unavailable.".into(),
+            )
+            .desktop_protocol_error())
+        }
     }
 
     fn read_error(stream: &mut UnixStream) {
@@ -381,6 +396,98 @@ mod tests {
                 .as_bool()
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn run_submit_logs_the_same_specific_reason_it_sends_on_the_wire() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut lines = Vec::new();
+            let result = serve_desktop_client_requests_with_diagnostics(
+                &mut server,
+                "capability",
+                "workspace",
+                super::super::desktop_service_message::CompanionProvenance {
+                    profile: "desktop-owner".into(),
+                    companion_kind: "desktop-client".into(),
+                    companion_version: "1.0.0".into(),
+                    peer_uid: 1,
+                    peer_pid: 2,
+                },
+                &mut Service,
+                |line| lines.push(line),
+            );
+            (result, lines)
+        });
+        let cases = [
+            (
+                serde_json::json!({"text": "hello", "files": []}),
+                "Conversation history is unavailable.",
+            ),
+            (
+                serde_json::json!({"text": "  ", "files": []}),
+                "Enter a message before sending.",
+            ),
+            (
+                serde_json::json!({"text": "x".repeat(super::super::desktop_dispatch::MAX_RUN_START_TEXT_LENGTH), "files": []}),
+                "Conversation history is unavailable.",
+            ),
+            (
+                serde_json::json!({"text": "x".repeat(super::super::desktop_dispatch::MAX_RUN_START_TEXT_LENGTH + 1), "files": []}),
+                "The message exceeds the allowed size.",
+            ),
+            (
+                serde_json::json!({"text": "hello", "files": [""]}),
+                "A selected file path is invalid.",
+            ),
+            (
+                serde_json::json!({"text": "hello", "files": [], "thread_id": "invalid"}),
+                "The thread ID is invalid.",
+            ),
+            (
+                serde_json::json!({"text": 0, "files": []}),
+                "The run request body is invalid.",
+            ),
+        ];
+        for (body, reason) in &cases {
+            client
+                .write_all(
+                    &encode_frame(&serde_json::json!({
+                        "protocol": "muniment.attach/1",
+                        "request_id": "018f0000-0000-7000-8000-000000000201",
+                        "idempotency_key": "018f0000-0000-7000-8000-000000000202",
+                        "operation": "run.submit", "capability": "capability", "body": body,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            let mut prefix = [0; 4];
+            client.read_exact(&mut prefix).unwrap();
+            let mut frame = vec![0; 4 + u32::from_be_bytes(prefix) as usize];
+            frame[..4].copy_from_slice(&prefix);
+            client.read_exact(&mut frame[4..]).unwrap();
+            let (Envelope::Error(envelope), _) = decode_frame::<Envelope>(&frame).unwrap().unwrap()
+            else {
+                panic!("expected a run rejection");
+            };
+            assert_eq!(
+                serde_json::to_value(envelope.error).unwrap()["details"]["reason"],
+                *reason
+            );
+        }
+        drop(client);
+        let (result, lines) = worker.join().unwrap();
+        assert_eq!(result, Ok(()));
+        assert_eq!(lines.len(), cases.len() + 1);
+        for (line, (_, reason)) in lines.iter().zip(cases) {
+            assert_eq!(line, &format!(
+                "muniment-runtime: desktop request rejected operation=\"run.submit\" code=\"invalid_request\" reason={}",
+                serde_json::json!(reason),
+            ));
+        }
     }
 
     #[test]

@@ -852,6 +852,42 @@ fn incompatibility_is_actionable_and_discloses_no_runtime_state() {
 }
 
 #[test]
+fn invalid_request_reason_round_trips_without_relaxing_other_error_schemas() {
+    let error = ProtocolError::invalid_request_with_reason("Conversation history is unavailable.");
+    let wire = serde_json::to_value(&error).unwrap();
+    assert_eq!(
+        wire["details"]["reason"],
+        "Conversation history is unavailable."
+    );
+    assert_eq!(
+        serde_json::from_value::<ProtocolError>(wire.clone()).unwrap(),
+        error
+    );
+    assert_eq!(
+        error.to_string(),
+        "code=\"invalid_request\" reason=\"Conversation history is unavailable.\""
+    );
+
+    for (code, message) in [
+        ("unauthorized", "The capability is not authorized."),
+        ("malformed_frame", "The frame is malformed."),
+    ] {
+        let mut invalid = wire.clone();
+        invalid["code"] = json!(code);
+        invalid["message"] = json!(message);
+        assert!(serde_json::from_value::<ProtocolError>(invalid).is_err());
+    }
+    for field in ["token", "supported"] {
+        let mut invalid = wire.clone();
+        invalid["details"][field] = json!("unexpected");
+        assert!(serde_json::from_value::<ProtocolError>(invalid).is_err());
+    }
+    let mut invalid = wire;
+    invalid["retryable"] = json!(true);
+    assert!(serde_json::from_value::<ProtocolError>(invalid).is_err());
+}
+
+#[test]
 fn error_schema_rejects_arbitrary_messages_and_mismatched_details() {
     let approved = [
         ProtocolError::malformed_frame(),

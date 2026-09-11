@@ -888,7 +888,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
                             .collect(),
                         request.thread_id,
                     )
-                    .map_err(|error| error.protocol_error())?;
+                    .map_err(|error| error.desktop_protocol_error())?;
                 Ok(CommittedResult {
                     body: serde_json::to_value(accepted)
                         .map_err(|_| ProtocolError::persistence_failed())?,

@@ -166,6 +166,31 @@ fn wait_returns_after_the_peer_closes_and_releases_the_coordinator() {
 }
 
 #[test]
+fn wait_releases_the_claim_when_the_peer_closes_with_unread_data() {
+    let coordinator = ApprovalCoordinator::default();
+    let (runtime, mut desktop) = UnixStream::pair().unwrap();
+    let session = serve_approval_presenter(
+        coordinator.clone(),
+        ApprovalPresenterConnection::new(runtime, "first"),
+    )
+    .unwrap();
+    let (closed_sender, closed) = mpsc::channel();
+    let waiter = thread::spawn(move || {
+        session.wait_until_closed();
+        drop(session);
+        closed_sender.send(()).unwrap();
+    });
+
+    desktop.write_all(b"unread reply").unwrap();
+    assert!(closed.recv_timeout(Duration::from_millis(50)).is_err());
+    assert!(coordinator.claim_presenter(|_| true).is_none());
+    drop(desktop);
+    closed.recv_timeout(Duration::from_secs(1)).unwrap();
+    waiter.join().unwrap();
+    assert!(coordinator.claim_presenter(|_| true).is_some());
+}
+
+#[test]
 fn wait_stays_blocked_while_a_presentation_completes() {
     let coordinator = ApprovalCoordinator::default();
     let (runtime, mut desktop) = UnixStream::pair().unwrap();

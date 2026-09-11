@@ -54,6 +54,7 @@ type Presenter = dyn Fn(&ApprovalRequest, Instant) -> bool + Send + Sync;
 struct ApprovalState {
     presenter: Option<Arc<Presenter>>,
     presenter_claimed: bool,
+    presenter_refusal_logged: bool,
     pending: HashMap<String, PendingDecision>,
     next_id: u64,
 }
@@ -101,9 +102,27 @@ impl ApprovalCoordinator {
         }
         state.presenter = Some(Arc::new(presenter));
         state.presenter_claimed = true;
+        state.presenter_refusal_logged = false;
         Some(PresenterGuard {
             state: self.state.clone(),
         })
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn presenter_refusal_diagnostic(&self) -> Option<String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.presenter_refusal_logged {
+            return None;
+        }
+        state.presenter_refusal_logged = true;
+        Some(format!(
+            "muniment-runtime: attach session closed reason=ApprovalPresenterUnavailable holder_claimed={} holder_pending_requests={}",
+            state.presenter_claimed,
+            state.pending.len(),
+        ))
     }
 
     pub fn request(&self, request: ApprovalRequest, remaining: Duration) -> bool {
@@ -173,6 +192,7 @@ impl Drop for PresenterGuard {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.presenter = None;
             state.presenter_claimed = false;
+            state.presenter_refusal_logged = false;
             std::mem::take(&mut state.pending)
         };
         for decision in pending.into_values() {
@@ -281,6 +301,31 @@ mod tests {
         assert!(coordinator.decide("repeat", false));
         assert!(!coordinator.decide("repeat", true));
         assert!(!result.join().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logs_one_refusal_per_holder_and_reports_its_pending_requests() {
+        let coordinator = ApprovalCoordinator::default();
+        for _ in 0..2 {
+            let (sender, presented) = channel();
+            let guard = coordinator
+                .claim_presenter(move |_| sender.send(()).is_ok())
+                .unwrap();
+            let waiter = coordinator.clone();
+            let waiting =
+                thread::spawn(move || waiter.request(request("pending"), Duration::from_secs(60)));
+            presented.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(coordinator.claim_presenter(|_| true).is_none());
+            assert_eq!(coordinator.presenter_refusal_diagnostic().unwrap(),
+                "muniment-runtime: attach session closed reason=ApprovalPresenterUnavailable holder_claimed=true holder_pending_requests=1");
+            for _ in 0..250 {
+                assert!(coordinator.claim_presenter(|_| true).is_none());
+                assert!(coordinator.presenter_refusal_diagnostic().is_none());
+            }
+            drop(guard);
+            assert!(!waiting.join().unwrap());
+        }
     }
 
     #[test]

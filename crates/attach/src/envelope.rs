@@ -597,6 +597,14 @@ impl ProtocolError {
         Self::simple(ErrorCode::InvalidRequest, ErrorMessage::InvalidRequest)
     }
 
+    pub fn invalid_request_with_reason(reason: impl Into<String>) -> Self {
+        let mut error = Self::invalid_request();
+        error.details = Some(ErrorDetails::RequestReason {
+            reason: reason.into(),
+        });
+        error
+    }
+
     pub fn thread_not_found() -> Self {
         Self::simple(ErrorCode::ThreadNotFound, ErrorMessage::ThreadNotFound)
     }
@@ -675,7 +683,11 @@ impl std::fmt::Display for ProtocolError {
             formatter,
             "code={} reason={}",
             serde_json::to_value(self.code).map_err(|_| std::fmt::Error)?,
-            serde_json::to_value(self.message).map_err(|_| std::fmt::Error)?,
+            match &self.details {
+                Some(ErrorDetails::RequestReason { reason }) => serde_json::to_value(reason),
+                _ => serde_json::to_value(self.message),
+            }
+            .map_err(|_| std::fmt::Error)?,
         )
     }
 }
@@ -710,6 +722,9 @@ impl<'de> Deserialize<'de> for ProtocolError {
             (ErrorCode::InvalidArtifactCursor, None, None) => Self::invalid_artifact_cursor(),
             (ErrorCode::SlowConsumer, None, None) => Self::slow_consumer(),
             (ErrorCode::InvalidRequest, None, None) => Self::invalid_request(),
+            (ErrorCode::InvalidRequest, None, Some(ErrorDetails::RequestReason { reason })) => {
+                Self::invalid_request_with_reason(reason)
+            }
             (ErrorCode::ThreadNotFound, None, None) => Self::thread_not_found(),
             (ErrorCode::TransferNotFound, None, None) => Self::transfer_not_found(),
             (ErrorCode::Unauthorized, None, None) => Self::unauthorized(),
@@ -733,25 +748,28 @@ impl<'de> Deserialize<'de> for ProtocolError {
     }
 }
 
-/// Closed, deliberately non-secret error detail vocabulary for this slice.
+/// Structured error details. Request reasons come from runtime validation.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum ErrorDetails {
     SupportedVersions { supported: VersionRange },
+    RequestReason { reason: String },
 }
 
 impl<'de> Deserialize<'de> for ErrorDetails {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
-        struct SupportedVersions {
-            supported: VersionRange,
+        #[serde(untagged)]
+        enum Details {
+            SupportedVersions { supported: VersionRange },
+            RequestReason { reason: String },
         }
 
-        let details = SupportedVersions::deserialize(deserializer)?;
-        Ok(Self::SupportedVersions {
-            supported: details.supported,
-        })
+        match Details::deserialize(deserializer)? {
+            Details::SupportedVersions { supported } => Ok(Self::SupportedVersions { supported }),
+            Details::RequestReason { reason } => Ok(Self::RequestReason { reason }),
+        }
     }
 }
 

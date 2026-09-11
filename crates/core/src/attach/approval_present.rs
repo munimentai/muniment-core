@@ -23,6 +23,82 @@ impl ApprovalPresenterStream for std::os::unix::net::UnixStream {
         self.try_clone()
     }
 
+    #[cfg(target_os = "macos")]
+    fn wait_until_closed(&self) {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        // macOS poll can lose a hangup after readable data. Watch EOF without consuming replies.
+        let descriptor = unsafe { libc::kqueue() };
+        if descriptor < 0 {
+            crate::runtime_eprintln!(
+                "muniment-runtime: approval presenter watch failed step=kqueue reason={}",
+                io::Error::last_os_error()
+            );
+            return;
+        }
+        // SAFETY: kqueue returned a new descriptor that this guard owns.
+        let queue = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        // SAFETY: The queue owns a live descriptor. F_SETFD accepts FD_CLOEXEC.
+        if unsafe { libc::fcntl(queue.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            crate::runtime_eprintln!(
+                "muniment-runtime: approval presenter watch failed step=close_on_exec reason={}",
+                io::Error::last_os_error()
+            );
+            return;
+        }
+        let change = libc::kevent {
+            ident: self.as_raw_fd() as libc::uintptr_t,
+            filter: libc::EVFILT_READ,
+            flags: libc::EV_ADD | libc::EV_CLEAR,
+            fflags: 0,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        // SAFETY: The change references a live socket. No output buffer is requested.
+        if unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                &change,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        } < 0
+        {
+            crate::runtime_eprintln!(
+                "muniment-runtime: approval presenter watch failed step=register reason={}",
+                io::Error::last_os_error()
+            );
+            return;
+        }
+        loop {
+            let mut event = change;
+            // SAFETY: The queue and output buffer remain valid throughout the wait.
+            let result = unsafe {
+                libc::kevent(
+                    queue.as_raw_fd(),
+                    std::ptr::null(),
+                    0,
+                    &mut event,
+                    1,
+                    std::ptr::null(),
+                )
+            };
+            if result > 0 && event.flags & (libc::EV_EOF | libc::EV_ERROR) != 0 {
+                return;
+            }
+            if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                crate::runtime_eprintln!(
+                    "muniment-runtime: approval presenter watch failed step=wait reason={}",
+                    io::Error::last_os_error()
+                );
+                return;
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
     fn wait_until_closed(&self) {
         use std::os::fd::AsRawFd;
 

@@ -1205,20 +1205,30 @@ pub(super) fn dispatch_request<S: ThreadListService>(
             files: Vec<String>,
             thread_id: Option<String>,
         }
-        let body: Body =
-            serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
-        if body.text.trim().is_empty()
-            || body.text.len() > MAX_RUN_START_TEXT_LENGTH
-            || body
-                .files
-                .iter()
-                .any(|path| path.is_empty() || path.len() > MAX_TEXT_LENGTH)
-            || body
-                .thread_id
-                .as_ref()
-                .is_some_and(|value| super::Id::new(value.clone()).is_err())
+        let body: Body = serde_json::from_value(request.body).map_err(|_| {
+            ProtocolError::invalid_request_with_reason("The run request body is invalid.")
+        })?;
+        let reason = if body.text.trim().is_empty() {
+            Some("Enter a message before sending.")
+        } else if body.text.len() > MAX_RUN_START_TEXT_LENGTH {
+            Some("The message exceeds the allowed size.")
+        } else if body
+            .files
+            .iter()
+            .any(|path| path.is_empty() || path.len() > MAX_TEXT_LENGTH)
         {
-            return Err(ProtocolError::invalid_request().into());
+            Some("A selected file path is invalid.")
+        } else if body
+            .thread_id
+            .as_ref()
+            .is_some_and(|value| super::Id::new(value.clone()).is_err())
+        {
+            Some("The thread ID is invalid.")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(ProtocolError::invalid_request_with_reason(reason).into());
         }
         let idempotency_key = request
             .idempotency_key
