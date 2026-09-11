@@ -2861,6 +2861,7 @@ dependencies = [
  "muniment-core",
  "muniment-runtime",
  "objc2",
+ "objc2-app-kit",
  "objc2-foundation",
  "objc2-service-management",
  "rusqlite",
