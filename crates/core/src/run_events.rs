@@ -29,6 +29,8 @@ pub struct ChatEvent {
     pub phase: String,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_storage_notice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receipt: Option<Value>,
@@ -108,6 +110,7 @@ pub fn chat_event(
         thread_id: None,
         phase: projection_phase(&projection.status).into(),
         text: projection.text,
+        prompt_storage_notice: projection.prompt_storage_notice,
         failure_reason: crate::chat_view::failure_reason(&projection.status),
         receipt: projection.receipt,
         tool_activity: chat_tool_activity(&projection.tool_activity),

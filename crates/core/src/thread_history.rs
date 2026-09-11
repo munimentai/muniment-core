@@ -19,6 +19,8 @@ use crate::thread_ownership::subject_owns_first_run;
 pub struct HistoryEntry {
     pub run_id: String,
     pub prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_storage_notice: Option<String>,
     pub phase: String,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -84,7 +86,13 @@ pub fn project_history_entry(
             .collect(),
     };
     Ok(HistoryEntry {
-        prompt: load_prompt(&run_id, subject)?,
+        // A refused write leaves no prompt history to read from the keyring.
+        prompt: if projection.prompt_storage_notice.is_some() {
+            None
+        } else {
+            load_prompt(&run_id, subject)?
+        },
+        prompt_storage_notice: projection.prompt_storage_notice,
         phase: projection_phase(&projection.status).into(),
         text: projection.text,
         failure_reason: crate::chat_view::failure_reason(&projection.status),

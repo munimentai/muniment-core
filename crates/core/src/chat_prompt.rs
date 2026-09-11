@@ -1,7 +1,7 @@
 use keyring::Entry;
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 const PROMPT_SERVICE: &str = "ai.muniment.desktop.chat";
@@ -77,6 +77,81 @@ pub fn use_mock_keyring_for_tests() {
     keyring::set_default_credential_builder(Box::new(SharedCredentialBuilder(Arc::new(
         Mutex::new(HashMap::new()),
     ))));
+}
+
+#[doc(hidden)]
+pub fn use_refused_keyring_for_tests(
+    code: i32,
+    message: &'static str,
+    refuse_entry: bool,
+    writes: Arc<AtomicUsize>,
+) {
+    #[derive(Clone, Debug)]
+    struct RefusedKeyring {
+        code: i32,
+        message: &'static str,
+        refuse_entry: bool,
+        writes: Arc<AtomicUsize>,
+    }
+
+    impl std::fmt::Display for RefusedKeyring {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}: {}", self.code, self.message)
+        }
+    }
+
+    impl std::error::Error for RefusedKeyring {}
+
+    impl RefusedKeyring {
+        fn error(&self) -> keyring::Error {
+            keyring::Error::PlatformFailure(Box::new(self.clone()))
+        }
+    }
+
+    impl keyring::credential::CredentialBuilderApi for RefusedKeyring {
+        fn build(
+            &self,
+            _target: Option<&str>,
+            _service: &str,
+            _user: &str,
+        ) -> keyring::Result<Box<keyring::Credential>> {
+            if self.refuse_entry {
+                self.writes.fetch_add(1, Ordering::SeqCst);
+                return Err(self.error());
+            }
+            Ok(Box::new(self.clone()))
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    impl keyring::credential::CredentialApi for RefusedKeyring {
+        fn set_secret(&self, _secret: &[u8]) -> keyring::Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Err(self.error())
+        }
+
+        fn get_secret(&self) -> keyring::Result<Vec<u8>> {
+            panic!("The runtime must not read a prompt that the keyring refused.");
+        }
+
+        fn delete_credential(&self) -> keyring::Result<()> {
+            panic!("Retention must not delete a prompt that the keyring refused.");
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    keyring::set_default_credential_builder(Box::new(RefusedKeyring {
+        code,
+        message,
+        refuse_entry,
+        writes,
+    }));
 }
 
 #[doc(hidden)]

@@ -1,6 +1,6 @@
 //! Deterministic retention for completed run history.
 
-use super::reducer::{reduce, RunStatus};
+use super::reducer::{project_chat_fragment, reduce, RunStatus};
 use super::{JournalError, RunJournal};
 use crate::cas::{CasError, ContentHash, LocalCas};
 use chrono::{DateTime, Duration, Utc};
@@ -21,6 +21,7 @@ pub struct RetentionOutcome {
 pub struct DeletedRun {
     pub run_id: String,
     pub subject: Option<String>,
+    pub prompt_stored: bool,
 }
 
 #[derive(Debug)]
@@ -126,9 +127,13 @@ pub fn apply_retention_with(
         let subject = events
             .first()
             .and_then(|event| event.provenance.actor_id.clone());
+        let Ok(projection) = project_chat_fragment(&events) else {
+            continue;
+        };
         let deleted_run = DeletedRun {
             run_id: newest.run_id.clone(),
             subject,
+            prompt_stored: projection.prompt_storage_notice.is_none(),
         };
         before_delete(&deleted_run)?;
         journal.delete_run(&newest.run_id)?;

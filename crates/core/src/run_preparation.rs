@@ -106,6 +106,39 @@ pub fn prepare_opened_run<F>(
 where
     F: FnOnce() -> Result<(), String>,
 {
+    prepare_opened_run_with_prompt_storage(
+        storage,
+        session_thread,
+        run_id,
+        workspace,
+        subject,
+        files,
+        provenance,
+        requested_thread_id,
+        source,
+        source_version,
+        || after_validation().map(|()| None),
+    )
+}
+
+/// Commits the prompt storage outcome with run creation before attachment ingestion.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_opened_run_with_prompt_storage<F>(
+    storage: &SharedStorage,
+    session_thread: SessionThreadStart<'_>,
+    run_id: &str,
+    workspace: &str,
+    subject: Option<&str>,
+    files: Vec<OpenSelectedFile>,
+    provenance: Option<Provenance>,
+    requested_thread_id: Option<&str>,
+    source: &str,
+    source_version: &str,
+    after_validation: F,
+) -> Result<(u64, ChatProjector), String>
+where
+    F: FnOnce() -> Result<Option<String>, String>,
+{
     let mut storage = storage.lock().map_err(|_| attachment_error())?;
     let ChatStorage { journal, cas } = &mut *storage;
     let mut projector = ChatProjector::new();
@@ -125,18 +158,27 @@ where
             ..provenance
         };
     }
-    projector.apply(&started).map_err(|_| attachment_error())?;
-    let mut after_validation = Some(after_validation);
+    let mut after_validation = Some(|payload: &mut EventPayload| {
+        if let Some(notice) = after_validation()? {
+            *payload = EventPayload::Inline {
+                payload_json: json!({"prompt_storage_notice": notice}),
+            };
+        }
+        Ok::<(), String>(())
+    });
     if !workspace.is_empty() {
         let thread_id = if let Some(thread_id) = requested_thread_id {
             journal
-                .append_new_run_in_thread_after_validation(workspace, thread_id, &started, || {
-                    after_validation.take().unwrap()()
-                })
+                .append_new_run_in_thread_with_payload_after_validation(
+                    workspace,
+                    thread_id,
+                    &mut started,
+                    after_validation.take().unwrap(),
+                )
                 .and_then(|result| result.map_err(|_| JournalError::Corrupt(attachment_error())))
                 .map(|()| thread_id.to_owned())
         } else {
-            after_validation.take().unwrap()()?;
+            after_validation.take().unwrap()(&mut started.payload)?;
             if session_thread.continue_existing {
                 let offered = match session_thread.tracker.offered(workspace, subject) {
                     OfferedThread::AdoptNewest => {
@@ -169,12 +211,13 @@ where
             session_thread.tracker.record(thread_id, workspace, subject);
         }
     } else {
-        after_validation.take().unwrap()()?;
+        after_validation.take().unwrap()(&mut started.payload)?;
         journal
             .append(0, &started)
             .map_err(|_| attachment_error())?;
     }
 
+    projector.apply(&started).map_err(|_| attachment_error())?;
     for mut selected in files {
         let next_seq = seq + 1;
         let envelope_subject = subject.map(str::to_owned);

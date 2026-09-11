@@ -1212,13 +1212,31 @@ impl RunJournal {
     where
         F: FnOnce() -> Result<(), E>,
     {
+        self.append_new_run_in_thread_with_payload_after_validation(
+            workspace,
+            thread_id,
+            &mut event.clone(),
+            |_| after_validation(),
+        )
+    }
+
+    /// Commits the prepared payload with run creation after checking the thread.
+    pub fn append_new_run_in_thread_with_payload_after_validation<F, E>(
+        &mut self,
+        workspace: &str,
+        thread_id: &str,
+        event: &mut EventEnvelope,
+        after_validation: F,
+    ) -> Result<Result<(), E>, JournalError>
+    where
+        F: FnOnce(&mut EventPayload) -> Result<(), E>,
+    {
         if workspace.is_empty() || event.run_seq != 1 {
             return Err(JournalError::InvalidEnvelope(
                 "new run workspace and sequence must be valid".into(),
             ));
         }
         validate_envelope(event)?;
-        let canonical = canonical_envelope(event)?;
         let coordination = self.coordination.clone();
         let _operation = coordination
             .as_ref()
@@ -1288,9 +1306,11 @@ impl RunJournal {
                 "thread belongs to another profile".into(),
             ));
         }
-        if let Err(error) = after_validation() {
+        if let Err(error) = after_validation(&mut event.payload) {
             return Ok(Err(error));
         }
+        validate_envelope(event)?;
+        let canonical = canonical_envelope(event)?;
         let next_ordinal: u64 = tx.query_row(
             "SELECT COALESCE(MAX(thread_run_ordinal), 0) + 1 \
              FROM run_threads WHERE thread_id=?1",
