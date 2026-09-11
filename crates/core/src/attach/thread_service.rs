@@ -364,6 +364,9 @@ pub trait ThreadListService {
         Ok(None)
     }
 
+    #[cfg(target_os = "linux")]
+    fn record_chat_delivery_failure(&mut self, _run_id: &str, _cause: &str) {}
+
     fn subscribe_chat_events(
         &mut self,
     ) -> Result<crate::run_events::ChatEventSubscription, ProtocolError> {

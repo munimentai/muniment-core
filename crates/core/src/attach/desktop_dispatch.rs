@@ -156,6 +156,11 @@ impl<S: ThreadListService> DesktopSessionService for S {
         state.chat_subscription.is_some()
     }
 
+    #[cfg(target_os = "linux")]
+    fn record_chat_delivery_failure(&mut self, run_id: &str, cause: &str) {
+        ThreadListService::record_chat_delivery_failure(self, run_id, cause);
+    }
+
     fn drain_chat_events(
         &mut self,
         state: &mut Self::State,

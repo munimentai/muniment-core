@@ -249,6 +249,9 @@ pub trait RunAttachBoundaries {
         &self,
         run_id: &str,
     ) -> Result<crate::journal::CommitSubscription, ProtocolError>;
+    #[cfg(target_os = "linux")]
+    fn record_chat_delivery_failure(&self, _run_id: &str, _cause: &str) {}
+
     #[cfg(any(unix, target_os = "windows"))]
     fn subscribe_chat_events(
         &self,

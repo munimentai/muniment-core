@@ -1165,6 +1165,11 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         self.boundaries.subscribe_run_commits(run_id).map(Some)
     }
 
+    #[cfg(target_os = "linux")]
+    fn record_chat_delivery_failure(&mut self, run_id: &str, cause: &str) {
+        self.boundaries.record_chat_delivery_failure(run_id, cause);
+    }
+
     #[cfg(any(unix, target_os = "windows"))]
     fn subscribe_chat_events(
         &mut self,
