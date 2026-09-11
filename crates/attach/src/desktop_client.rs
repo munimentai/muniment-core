@@ -32,6 +32,7 @@ pub struct DesktopClient {
     authorized_at: Instant,
     chat_subscription_id: Option<Id>,
     io_timeout: Duration,
+    last_request_error: Option<crate::ProtocolError>,
 }
 
 impl std::fmt::Debug for DesktopClient {
@@ -61,6 +62,11 @@ impl DesktopClient {
         self.summary.clone()
     }
 
+    /// Returns the protocol error from the most recent wire request, if it failed.
+    pub fn last_request_error(&self) -> Option<&crate::ProtocolError> {
+        self.last_request_error.as_ref()
+    }
+
     pub fn request(
         &mut self,
         operation: Operation,
@@ -77,6 +83,7 @@ impl DesktopClient {
         body: Value,
         request_deadline: Instant,
     ) -> Result<Response, ClientError> {
+        self.last_request_error = None;
         let request_id = fresh_request_id()?;
         let request = Request {
             protocol: Protocol,
@@ -93,7 +100,9 @@ impl DesktopClient {
         {
             Envelope::Response(response) if response.request_id == request_id => Ok(response),
             Envelope::Error(error) if error.request_id.as_ref() == Some(&request_id) => {
-                Err(map_protocol_error(error.error.code()))
+                let outcome = map_protocol_error(error.error.code());
+                self.last_request_error = Some(error.error);
+                Err(outcome)
             }
             _ => Err(ClientError::UnexpectedMessage),
         }
@@ -509,6 +518,7 @@ pub(crate) fn desktop_client_for_test(
         authorized_at: Instant::now(),
         chat_subscription_id: None,
         io_timeout,
+        last_request_error: None,
     }
 }
 
@@ -588,5 +598,69 @@ pub fn handshake_desktop_client(
         authorized_at: Instant::now(),
         chat_subscription_id: None,
         io_timeout,
+        last_request_error: None,
     })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn request_errors_do_not_survive_success_mismatched_responses_or_disconnects() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let worker = std::thread::spawn(move || {
+            for index in 0..4 {
+                let mut prefix = [0; 4];
+                server.read_exact(&mut prefix).unwrap();
+                let mut body = vec![0; u32::from_be_bytes(prefix) as usize];
+                server.read_exact(&mut body).unwrap();
+                let request: Request = serde_json::from_slice(&body).unwrap();
+                let response = if index == 1 {
+                    serde_json::json!({
+                        "protocol": "muniment.attach/1", "request_id": request.request_id,
+                        "ok": true, "body": {},
+                    })
+                } else {
+                    serde_json::json!({
+                        "protocol": "muniment.attach/1",
+                        "request_id": if index == 3 { fresh_request_id().unwrap() } else { request.request_id },
+                        "ok": false, "error": crate::ProtocolError::runtime_draining(),
+                    })
+                };
+                server.write_all(&encode_frame(&response).unwrap()).unwrap();
+            }
+        });
+        let mut client =
+            desktop_client_for_test(Box::new(client), "1.0.0".into(), Duration::from_secs(5));
+        for expected in [
+            Some(ClientError::RequestRejected),
+            None,
+            Some(ClientError::RequestRejected),
+            Some(ClientError::UnexpectedMessage),
+        ] {
+            assert_eq!(
+                client
+                    .request(Operation::SessionStatus, None, serde_json::json!({}))
+                    .err(),
+                expected
+            );
+            assert_eq!(
+                client.last_request_error().cloned(),
+                (expected == Some(ClientError::RequestRejected))
+                    .then(crate::ProtocolError::runtime_draining)
+            );
+        }
+        worker.join().unwrap();
+        assert_eq!(
+            client.request(Operation::SessionStatus, None, serde_json::json!({})),
+            Err(ClientError::ConnectionClosed)
+        );
+        assert_eq!(client.last_request_error(), None);
+    }
 }

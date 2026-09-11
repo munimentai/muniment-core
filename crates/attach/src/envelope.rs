@@ -669,6 +669,17 @@ impl ProtocolError {
     }
 }
 
+impl std::fmt::Display for ProtocolError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "code={} reason={}",
+            serde_json::to_value(self.code).map_err(|_| std::fmt::Error)?,
+            serde_json::to_value(self.message).map_err(|_| std::fmt::Error)?,
+        )
+    }
+}
+
 impl<'de> Deserialize<'de> for ProtocolError {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
