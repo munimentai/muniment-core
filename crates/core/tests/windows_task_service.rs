@@ -307,8 +307,9 @@ fn starts_a_registered_task_with_a_matching_expected_payload_outside_the_test_di
     let payload_directory = payload.parent().unwrap();
     std::fs::create_dir_all(payload_directory).unwrap();
     fixture.payload_directory = Some(payload_directory.to_owned());
-    let system_root = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
-    std::fs::copy(system_root.join("System32").join("where.exe"), &payload).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_windows-task-test-helper"), &payload).unwrap();
+    let report = payload.with_extension("session");
+    assert!(!report.exists());
     fixture.payload = Some(payload.clone());
     fixture.owns_task = true;
     fixture.register_task(sid.as_str(), &payload);
@@ -321,6 +322,43 @@ fn starts_a_registered_task_with_a_matching_expected_payload_outside_the_test_di
 
     assert_eq!(result, Ok(StartRegisteredTaskResult::Started));
     assert_eq!(clear_count, 1);
+
+    let mut session_id = 0;
+    assert_ne!(
+        unsafe {
+            windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId(
+                std::process::id(),
+                &mut session_id,
+            )
+        },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(&report) {
+            if let Some(session) = contents.strip_suffix('\n') {
+                assert_eq!(session.parse::<u32>().unwrap(), session_id);
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the helper did not report its session"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let folder = unsafe { fixture.service.GetFolder(&BSTR::from(TASK_FOLDER)) }.unwrap();
+    let task = unsafe { folder.GetTask(&BSTR::from(fixture.task_name.as_str())) }.unwrap();
+    assert_eq!(unsafe { task.State() }.unwrap(), TASK_STATE_RUNNING);
+    assert_eq!(
+        start_registered_task(sid.as_str(), &payload, || {
+            clear_count += 1;
+            Ok::<(), ()>(())
+        }),
+        Ok(StartRegisteredTaskResult::AlreadyRunning)
+    );
+    assert_eq!(clear_count, 1);
+    unsafe { task.Stop(0) }.unwrap();
     fixture.wait_until_task_stops();
 }
 
@@ -512,6 +550,7 @@ impl Drop for SchedulerFixture {
         }
         if self.remove_machine_payload {
             let _ = std::fs::remove_file(MACHINE_PAYLOAD);
+            let _ = std::fs::remove_file(Path::new(MACHINE_PAYLOAD).with_extension("session"));
         }
         if self.remove_machine_root {
             let _ = std::fs::remove_dir(MACHINE_ROOT);
@@ -526,6 +565,7 @@ impl Drop for SchedulerFixture {
         }
         if let Some(payload) = &self.payload {
             let _ = std::fs::remove_file(payload);
+            let _ = std::fs::remove_file(payload.with_extension("session"));
         }
         if let Some(payload_directory) = &self.payload_directory {
             let _ = std::fs::remove_dir(payload_directory);

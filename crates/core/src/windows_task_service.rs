@@ -14,6 +14,7 @@ use crate::windows_task::{
 use std::fmt;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
+use std::time::{Duration, Instant};
 use windows::core::{Interface, BSTR, HRESULT};
 use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, SCHED_E_ALREADY_RUNNING};
 use windows::Win32::System::Com::{
@@ -22,7 +23,8 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::TaskScheduler::{
     IExecAction, ITaskDefinition, ITaskFolder, ITaskService, TaskScheduler, TASK_ACTION_EXEC,
     TASK_CREATE_OR_UPDATE, TASK_ENUM_HIDDEN, TASK_LOGON_INTERACTIVE_TOKEN, TASK_LOGON_NONE,
-    TASK_LOGON_TYPE, TASK_STATE_RUNNING, TASK_UPDATE,
+    TASK_LOGON_TYPE, TASK_RUN_IGNORE_CONSTRAINTS, TASK_RUN_USE_SESSION_ID, TASK_STATE,
+    TASK_STATE_QUEUED, TASK_STATE_RUNNING, TASK_UPDATE,
 };
 use windows::Win32::System::Variant::VARIANT;
 
@@ -304,8 +306,11 @@ pub enum StartRegisteredTaskError<E> {
     InvalidTaskXmlText,
     ParseTaskXml(ParseObservedRegistrationError),
     ReadTaskState(HRESULT),
+    ReadProcessSession(u32),
+    InvalidProcessSession(u32),
     ClearCrashWindow(E),
     RunTask(HRESULT),
+    Queued { session_id: u32 },
 }
 
 impl<E> fmt::Display for StartRegisteredTaskError<E> {
@@ -324,8 +329,18 @@ impl<E> fmt::Display for StartRegisteredTaskError<E> {
             Self::InvalidTaskXmlText => "the runtime task XML contains invalid text",
             Self::ParseTaskXml(_) => "could not parse the runtime task XML",
             Self::ReadTaskState(_) => "could not read the runtime task state",
+            Self::ReadProcessSession(_) => "The desktop could not read the process session id.",
+            Self::InvalidProcessSession(session_id) => {
+                return write!(
+                    formatter,
+                    "The process session id {session_id} is outside the interactive range."
+                );
+            }
             Self::ClearCrashWindow(_) => "could not clear the runtime crash window",
             Self::RunTask(_) => "could not start the runtime task",
+            Self::Queued { session_id } => {
+                return write!(formatter, "Task Scheduler kept the runtime task in state Queued for session id {session_id}.");
+            }
         };
         formatter.write_str(message)
     }
@@ -392,13 +407,54 @@ where
         return Ok(StartRegisteredTaskResult::AlreadyRunning);
     }
 
+    let mut session_id = 0;
+    if unsafe {
+        windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId(
+            std::process::id(),
+            &mut session_id,
+        )
+    } == 0
+    {
+        return Err(StartRegisteredTaskError::ReadProcessSession(unsafe {
+            windows_sys::Win32::Foundation::GetLastError()
+        }));
+    }
+    start_task_in_session(session_id, clear_crash_window, |flags, session_id| {
+        let _running = unsafe { task.RunEx(&empty, flags, session_id, &BSTR::new()) }
+            .map_err(|error| StartRegisteredTaskError::RunTask(error.code()))?;
+        // Give the scheduler time to place the instance before reporting Queued.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = unsafe { task.State() }
+                .map_err(|error| StartRegisteredTaskError::ReadTaskState(error.code()))?;
+            if state != TASK_STATE_QUEUED || Instant::now() >= deadline {
+                return Ok(state);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    })
+}
+
+fn start_task_in_session<E>(
+    session_id: u32,
+    clear_crash_window: impl FnOnce() -> Result<(), E>,
+    run: impl FnOnce(i32, i32) -> Result<TASK_STATE, StartRegisteredTaskError<E>>,
+) -> Result<StartRegisteredTaskResult, StartRegisteredTaskError<E>> {
+    let session = i32::try_from(session_id)
+        .ok()
+        .filter(|session| *session > 0)
+        .ok_or(StartRegisteredTaskError::InvalidProcessSession(session_id))?;
     clear_crash_window().map_err(StartRegisteredTaskError::ClearCrashWindow)?;
-    match unsafe { task.Run(&empty) } {
+    // An app launch must not wait for idle or power constraints in the scheduler.
+    // Keep the caller's session explicit without changing the registered task.
+    let flags = TASK_RUN_USE_SESSION_ID.0 | TASK_RUN_IGNORE_CONSTRAINTS.0;
+    match run(flags, session) {
+        Ok(TASK_STATE_QUEUED) => Err(StartRegisteredTaskError::Queued { session_id }),
         Ok(_) => Ok(StartRegisteredTaskResult::Started),
-        Err(error) if error.code() == SCHED_E_ALREADY_RUNNING => {
+        Err(StartRegisteredTaskError::RunTask(SCHED_E_ALREADY_RUNNING)) => {
             Ok(StartRegisteredTaskResult::AlreadyRunning)
         }
-        Err(error) => Err(StartRegisteredTaskError::RunTask(error.code())),
+        Err(error) => Err(error),
     }
 }
 
@@ -825,9 +881,92 @@ impl Drop for ComApartment {
 
 #[cfg(test)]
 mod tests {
-    use super::{after_successful_stop, ApplyTaskRemovalError};
+    use super::*;
     use std::cell::Cell;
-    use windows::Win32::Foundation::S_FALSE;
+    use windows::Win32::Foundation::{E_ACCESSDENIED, S_FALSE};
+
+    #[test]
+    fn start_passes_the_process_session_and_reports_a_queued_instance() {
+        for session_id in [1, 7, i32::MAX as u32] {
+            for state in [TASK_STATE_RUNNING, TASK_STATE_QUEUED] {
+                let cleared = Cell::new(false);
+                let result = start_task_in_session(
+                    session_id,
+                    || {
+                        cleared.set(true);
+                        Ok::<(), ()>(())
+                    },
+                    |flags, session| {
+                        assert!(cleared.get());
+                        assert_eq!(flags, 6);
+                        assert_eq!(
+                            flags,
+                            TASK_RUN_USE_SESSION_ID.0 | TASK_RUN_IGNORE_CONSTRAINTS.0
+                        );
+                        assert_eq!(session, session_id as i32);
+                        Ok(state)
+                    },
+                );
+                if state == TASK_STATE_QUEUED {
+                    let error = StartRegisteredTaskError::<()>::Queued { session_id };
+                    assert_eq!(error.to_string(), format!(
+                        "Task Scheduler kept the runtime task in state Queued for session id {session_id}."
+                    ));
+                    assert_eq!(result, Err(error));
+                } else {
+                    assert_eq!(result, Ok(StartRegisteredTaskResult::Started));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_sessions_do_not_clear_the_crash_window_or_run_the_task() {
+        for session_id in [0, i32::MAX as u32 + 1, u32::MAX] {
+            let result = start_task_in_session::<()>(
+                session_id,
+                || panic!("The crash window must stay intact."),
+                |_, _| panic!("The task must not run."),
+            );
+            assert_eq!(
+                result,
+                Err(StartRegisteredTaskError::InvalidProcessSession(session_id))
+            );
+        }
+    }
+
+    #[test]
+    fn a_clear_failure_prevents_the_session_start() {
+        let result =
+            start_task_in_session(1, || Err("locked"), |_, _| panic!("The task must not run."));
+        assert_eq!(
+            result,
+            Err(StartRegisteredTaskError::ClearCrashWindow("locked"))
+        );
+    }
+
+    #[test]
+    fn session_start_preserves_races_and_scheduler_errors() {
+        for (error, expected) in [
+            (
+                StartRegisteredTaskError::RunTask(SCHED_E_ALREADY_RUNNING),
+                Ok(StartRegisteredTaskResult::AlreadyRunning),
+            ),
+            (
+                StartRegisteredTaskError::RunTask(E_ACCESSDENIED),
+                Err(StartRegisteredTaskError::RunTask(E_ACCESSDENIED)),
+            ),
+            (
+                StartRegisteredTaskError::ReadTaskState(E_ACCESSDENIED),
+                Err(StartRegisteredTaskError::ReadTaskState(E_ACCESSDENIED)),
+            ),
+        ] {
+            assert_eq!(
+                start_task_in_session(1, || Ok::<(), ()>(()), |_, _| Err(error)),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn s_false_from_stop_prevents_the_write() {
