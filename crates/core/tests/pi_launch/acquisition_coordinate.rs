@@ -12,7 +12,9 @@ use muniment_core::pi_launch::{PiLaunchBoundaries, PiLaunchError};
 use muniment_core::run_events::{ChatEvent, ChatEventSink, ChatStorage};
 use muniment_core::run_preparation::{prepare_new_run_with_session_thread, SessionThreadStart};
 use muniment_core::session_thread::SessionThread;
-use muniment_core::sidecar::pi_install::{PiArtifactDescriptor, PI_ARTIFACT};
+use muniment_core::sidecar::pi_install::{
+    FsPiLifecycleBoundary, PiArtifactDescriptor, PiLifecycleBoundary, PI_ARTIFACT,
+};
 
 const ARCHIVE: &[u8] = b"muniment-sidecar-test-stub\n";
 const ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
@@ -62,6 +64,14 @@ impl PiLaunchBoundaries for Boundary {
         if self.outcome == "cancelled" {
             cancelled.store(true, Ordering::SeqCst);
         }
+        if self.outcome == "publication-failed" {
+            let error = FsPiLifecycleBoundary
+                .sync_file(&root.join("missing-archive"))
+                .unwrap_err();
+            return Err(PiLaunchError::Acquisition(
+                muniment_core::model_install::ModelInstallError::Publication(error),
+            ));
+        }
         if self.outcome != "complete" {
             return Err(PiLaunchError::Acquisition(
                 muniment_core::model_install::ModelInstallError::Acquisition(
@@ -102,10 +112,23 @@ fn coordinate_acquires_from_the_profile_once_without_an_environment_root() {
         assert!(stderr.contains("pi_acquire completed"), "{stderr}");
         assert!(stderr.contains("pi_spawn started"), "{stderr}");
         assert!(stderr.contains("first_event"), "{stderr}");
+        let publication = stderr
+            .lines()
+            .find(|line| {
+                line.contains("pi_acquire failed") && line.contains("Publication(PersistenceIo")
+            })
+            .unwrap_or_else(|| panic!("Missing publication diagnostic: {stderr}"));
+        assert!(publication.contains("run_id="), "{publication}");
+        assert!(
+            publication.contains("step: \"open_sync_file\""),
+            "{publication}"
+        );
+        assert!(publication.contains("kind: NotFound"), "{publication}");
+        assert!(publication.contains("os_error: Some("), "{publication}");
         return;
     }
     assert!(std::env::var_os("MUNIMENT_PI_ROOT").is_none());
-    for outcome in ["complete", "failed", "cancelled"] {
+    for outcome in ["complete", "failed", "publication-failed", "cancelled"] {
         let directory =
             std::env::temp_dir().join(format!("muniment-pi-coordinate-{}", uuid::Uuid::new_v4()));
         let profile = ChatProfile::new(&directory);
@@ -139,6 +162,7 @@ fn coordinate_acquires_from_the_profile_once_without_an_environment_root() {
             )
             .unwrap();
             let runtime = Arc::new(Mutex::new(None));
+            let started = std::time::Instant::now();
             coordinate(
                 boundary.clone(),
                 Arc::clone(&storage),
@@ -162,8 +186,14 @@ fn coordinate_acquires_from_the_profile_once_without_an_environment_root() {
                 Some(prepared),
             );
             let events = boundary.events.lock().unwrap();
-            assert_eq!(events.last().unwrap().phase, outcome);
-            if outcome == "failed" {
+            let phase = if outcome == "publication-failed" {
+                "failed"
+            } else {
+                outcome
+            };
+            assert_eq!(events.last().unwrap().phase, phase);
+            if phase == "failed" {
+                assert!(started.elapsed() < std::time::Duration::from_secs(30));
                 assert!(events
                     .last()
                     .unwrap()
@@ -186,6 +216,19 @@ fn coordinate_acquires_from_the_profile_once_without_an_environment_root() {
                 assert!(runtime.lock().unwrap().is_none());
             }
             let history = storage.lock().unwrap().journal.events(&run_id).unwrap();
+            if phase == "failed" {
+                let terminal = history.last().unwrap();
+                assert_eq!(terminal.event_type, "run.failed");
+                let muniment_core::journal::EventPayload::Inline { payload_json } =
+                    &terminal.payload
+                else {
+                    panic!("Missing failure reason")
+                };
+                assert_eq!(
+                    payload_json["reason"].as_str(),
+                    events.last().unwrap().failure_reason.as_deref()
+                );
+            }
             assert_eq!(
                 history
                     .iter()

@@ -156,27 +156,37 @@ pub struct FsPiLifecycleBoundary;
 
 impl PiLifecycleBoundary for FsPiLifecycleBoundary {
     fn sync_file(&self, path: &Path) -> Result<(), PiInstallError> {
-        File::open(path)
-            .and_then(|file| file.sync_all())
-            .map_err(|_| PiInstallError::Persistence)
+        let mut options = OpenOptions::new();
+        options.read(true);
+        // Windows FlushFileBuffers requires GENERIC_WRITE, even after a read-only check.
+        #[cfg(windows)]
+        options.write(true);
+        let file = options
+            .open(path)
+            .map_err(|error| persistence_error("open_sync_file", error))?;
+        file.sync_all()
+            .map_err(|error| persistence_error("sync_file", error))
     }
     fn sync_directory(&self, path: &Path) -> Result<(), PiInstallError> {
         #[cfg(unix)]
         File::open(path)
             .and_then(|file| file.sync_all())
-            .map_err(|_| PiInstallError::Persistence)?;
+            .map_err(|error| persistence_error("sync_directory", error))?;
         let _ = path;
         Ok(())
     }
     fn replace_revision(&self, staged: &Path, destination: &Path) -> Result<(), PiInstallError> {
         let quarantine = destination.with_extension("replaced");
         if quarantine.exists() {
-            fs::remove_dir_all(&quarantine).map_err(|_| PiInstallError::Persistence)?;
+            fs::remove_dir_all(&quarantine)
+                .map_err(|error| persistence_error("remove_replaced_revision", error))?;
         }
         if fs::symlink_metadata(destination).is_ok() {
-            fs::rename(destination, &quarantine).map_err(|_| PiInstallError::Persistence)?;
+            fs::rename(destination, &quarantine)
+                .map_err(|error| persistence_error("quarantine_revision", error))?;
         }
-        fs::rename(staged, destination).map_err(|_| PiInstallError::Persistence)
+        fs::rename(staged, destination)
+            .map_err(|error| persistence_error("replace_revision", error))
     }
     fn replace_pointer(&self, temporary: &Path, destination: &Path) -> Result<(), PiInstallError> {
         replace_pointer_file(temporary, destination)
@@ -185,7 +195,7 @@ impl PiLifecycleBoundary for FsPiLifecycleBoundary {
 
 #[cfg(not(windows))]
 fn replace_pointer_file(temporary: &Path, destination: &Path) -> Result<(), PiInstallError> {
-    fs::rename(temporary, destination).map_err(|_| PiInstallError::Persistence)
+    fs::rename(temporary, destination).map_err(|error| persistence_error("replace_pointer", error))
 }
 
 #[cfg(windows)]
@@ -217,7 +227,10 @@ fn replace_pointer_file(temporary: &Path, destination: &Path) -> Result<(), PiIn
         )
     };
     if replaced == 0 {
-        Err(PiInstallError::Persistence)
+        Err(persistence_error(
+            "replace_pointer",
+            std::io::Error::last_os_error(),
+        ))
     } else {
         Ok(())
     }
@@ -261,8 +274,21 @@ pub enum PiInstallError {
     DigestMismatch,
     UnsafeArchive,
     Persistence,
+    PersistenceIo {
+        step: &'static str,
+        kind: std::io::ErrorKind,
+        os_error: Option<i32>,
+    },
     NotInstalled,
 }
+fn persistence_error(step: &'static str, error: std::io::Error) -> PiInstallError {
+    PiInstallError::PersistenceIo {
+        step,
+        kind: error.kind(),
+        os_error: error.raw_os_error(),
+    }
+}
+
 impl std::fmt::Display for PiInstallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Pi installation failed: {:?}", self)
@@ -537,7 +563,7 @@ fn publish_stage<B: PiLifecycleBoundary>(
     verify_archive(&stage.join(PI_SELECTED_ARTIFACT.archive))?;
     verify_executable(stage)?;
     let revisions = root.join("revisions");
-    fs::create_dir_all(&revisions).map_err(|_| PiInstallError::Persistence)?;
+    fs::create_dir_all(&revisions).map_err(|error| persistence_error("create_revisions", error))?;
     let destination = revisions.join(PI_SELECTED_ARTIFACT.version);
     boundary.sync_file(&stage.join(PI_SELECTED_ARTIFACT.archive))?;
     boundary.sync_file(&stage.join(PI_SELECTED_ARTIFACT.executable))?;
@@ -717,16 +743,16 @@ fn write_pointer<B: PiLifecycleBoundary>(
     version: &str,
     boundary: &B,
 ) -> Result<(), PiInstallError> {
-    fs::create_dir_all(root).map_err(|_| PiInstallError::Persistence)?;
+    fs::create_dir_all(root).map_err(|error| persistence_error("create_pointer_root", error))?;
     let temporary = root.join(format!(".{name}.tmp"));
     let _ = fs::remove_file(&temporary);
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temporary)
-        .map_err(|_| PiInstallError::Persistence)?;
+        .map_err(|error| persistence_error("open_pointer", error))?;
     file.write_all(format!("{POINTER_HEADER}\n{version}\n").as_bytes())
-        .map_err(|_| PiInstallError::Persistence)?;
+        .map_err(|error| persistence_error("write_pointer", error))?;
     drop(file);
     boundary.sync_file(&temporary)?;
     if let Err(error) = boundary.replace_pointer(&temporary, &root.join(name)) {
@@ -755,6 +781,57 @@ mod tests {
         fn replace_pointer(&self, _: &Path, _: &Path) -> Result<(), PiInstallError> {
             Err(PiInstallError::Persistence)
         }
+    }
+
+    #[test]
+    fn native_sync_preserves_files_after_read_only_verification() {
+        let root = std::env::temp_dir().join(format!("muniment-pi-sync-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("pi")).unwrap();
+        for name in [
+            PI_SELECTED_ARTIFACT.archive,
+            PI_SELECTED_ARTIFACT.executable,
+            ".current.tmp",
+        ] {
+            let path = root.join(name);
+            fs::write(&path, b"durable bytes").unwrap();
+            let mut reader = File::open(&path).unwrap();
+            let mut contents = Vec::new();
+            reader.read_to_end(&mut contents).unwrap();
+            FsPiLifecycleBoundary.sync_file(&path).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), contents);
+        }
+        // A sync must not create a missing file or hide the OS error.
+        let missing = root.join("missing");
+        let os_error = File::open(&missing).unwrap_err().raw_os_error();
+        assert_eq!(
+            FsPiLifecycleBoundary.sync_file(&missing),
+            Err(PiInstallError::PersistenceIo {
+                step: "open_sync_file",
+                kind: std::io::ErrorKind::NotFound,
+                os_error,
+            })
+        );
+        assert!(!missing.exists());
+        write_pointer(
+            &root,
+            "current",
+            PI_SELECTED_ARTIFACT.version,
+            &FsPiLifecycleBoundary,
+        )
+        .unwrap();
+        write_pointer(
+            &root,
+            "current",
+            PI_SELECTED_ARTIFACT.version,
+            &FsPiLifecycleBoundary,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("current")).unwrap(),
+            format!("{POINTER_HEADER}\n{}\n", PI_SELECTED_ARTIFACT.version)
+        );
+        assert!(!root.join(".current.tmp").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -792,10 +869,14 @@ mod tests {
         let original = format!("{POINTER_HEADER}\n{}\n", PI_ARTIFACT.version);
         fs::write(&destination, &original).unwrap();
 
-        assert_eq!(
+        assert!(matches!(
             FsPiLifecycleBoundary.replace_pointer(&root.join("missing.tmp"), &destination),
-            Err(PiInstallError::Persistence)
-        );
+            Err(PiInstallError::PersistenceIo {
+                step: "replace_pointer",
+                kind: std::io::ErrorKind::NotFound,
+                os_error: Some(_),
+            })
+        ));
         assert_eq!(fs::read_to_string(destination).unwrap(), original);
         fs::remove_dir_all(root).unwrap();
     }
