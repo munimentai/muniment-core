@@ -193,7 +193,13 @@ impl DesktopClientHolder {
         let (client, wake) = &*self.inner;
         let mut client = Self::lock_client(client)?;
         let result = call(client.as_mut().ok_or(ClientError::DesktopUnavailable)?);
-        if !matches!(&result, Err(ClientError::RuntimeUpgradePending)) && result.is_err() {
+        // An authorization refusal does not break the transport. Keep the client so the shell can
+        // report the refusal without a reconnect that repeats the same request.
+        if !matches!(
+            &result,
+            Err(ClientError::RuntimeUpgradePending | ClientError::AuthorizationExpired)
+        ) && result.is_err()
+        {
             *client = None;
             *self
                 .runtime_version
@@ -235,6 +241,60 @@ mod tests {
     fn test_client(runtime_version: &str) -> DesktopClient {
         let (stream, _peer) = UnixStream::pair().unwrap();
         desktop_client_for_test(Box::new(stream), runtime_version.to_string(), IO_TIMEOUT)
+    }
+
+    #[test]
+    fn unauthorized_request_keeps_the_connection_for_an_explicit_retry() {
+        use std::io::{Read, Write};
+
+        let holder = DesktopClientHolder::new();
+        let (stream, mut server) = UnixStream::pair().unwrap();
+        server.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+        *holder.inner.0.lock().unwrap() = Some(desktop_client_for_test(
+            Box::new(stream),
+            "1.0.0".into(),
+            IO_TIMEOUT,
+        ));
+        *holder.runtime_version.lock().unwrap() = Some("1.0.0".into());
+        let worker = std::thread::spawn(move || {
+            for refused in [true, false] {
+                let mut prefix = [0; 4];
+                server.read_exact(&mut prefix).unwrap();
+                let mut body = vec![0; u32::from_be_bytes(prefix) as usize];
+                server.read_exact(&mut body).unwrap();
+                let request: crate::Request = serde_json::from_slice(&body).unwrap();
+                assert_eq!(request.operation, Operation::ThreadSummaries);
+                let response = if refused {
+                    serde_json::json!({
+                        "protocol": "muniment.attach/1", "request_id": request.request_id,
+                        "ok": false, "error": crate::ProtocolError::unauthorized(),
+                    })
+                } else {
+                    serde_json::json!({
+                        "protocol": "muniment.attach/1", "request_id": request.request_id,
+                        "ok": true, "body": {"summaries": [], "next_cursor": null},
+                    })
+                };
+                server
+                    .write_all(&crate::encode_frame(&response).unwrap())
+                    .unwrap();
+            }
+        });
+
+        assert_eq!(
+            holder.thread_summaries(20, None),
+            Err(ClientError::AuthorizationExpired)
+        );
+        assert!(holder.inner.0.lock().unwrap().is_some());
+        assert_eq!(holder.runtime_version().as_deref(), Some("1.0.0"));
+        assert!(holder.thread_summaries(20, None).is_ok());
+        worker.join().unwrap();
+        assert_eq!(
+            holder.thread_summaries(20, None),
+            Err(ClientError::ConnectionClosed)
+        );
+        assert!(holder.inner.0.lock().unwrap().is_none());
+        assert_eq!(holder.runtime_version(), None);
     }
 
     #[test]
