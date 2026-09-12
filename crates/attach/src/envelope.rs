@@ -570,6 +570,14 @@ impl ProtocolError {
         error
     }
 
+    pub fn persistence_failed_with_reason(reason: impl Into<String>) -> Self {
+        let mut error = Self::persistence_failed();
+        error.details = Some(ErrorDetails::RequestReason {
+            reason: reason.into(),
+        });
+        error
+    }
+
     pub fn desktop_busy() -> Self {
         let mut error = Self::simple(ErrorCode::DesktopBusy, ErrorMessage::DesktopBusy);
         error.retryable = true;
@@ -717,6 +725,9 @@ impl<'de> Deserialize<'de> for ProtocolError {
             (ErrorCode::IdempotencyKeyForbidden, None, None) => Self::idempotency_key_forbidden(),
             (ErrorCode::IdempotencyConflict, None, None) => Self::idempotency_conflict(),
             (ErrorCode::PersistenceFailed, None, None) => Self::persistence_failed(),
+            (ErrorCode::PersistenceFailed, None, Some(ErrorDetails::RequestReason { reason })) => {
+                Self::persistence_failed_with_reason(reason)
+            }
             (ErrorCode::DesktopBusy, None, None) => Self::desktop_busy(),
             (ErrorCode::InvalidCursor, None, None) => Self::invalid_cursor(),
             (ErrorCode::InvalidArtifactCursor, None, None) => Self::invalid_artifact_cursor(),

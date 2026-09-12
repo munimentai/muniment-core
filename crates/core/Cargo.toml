@@ -24,6 +24,7 @@ network-tests = ["tls"]
 base64 = "0.22"
 cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
+dirs = "6"
 ed25519-dalek = "2"
 getrandom = "0.3"
 hmac = "0.12"

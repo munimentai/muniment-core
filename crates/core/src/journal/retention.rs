@@ -29,6 +29,7 @@ pub enum RetentionError {
     Journal(JournalError),
     Cas(CasError),
     BeforeDelete,
+    BeforeDeleteWithReason(String),
     InvalidPolicy,
 }
 
@@ -38,6 +39,9 @@ impl fmt::Display for RetentionError {
             Self::Journal(error) => write!(formatter, "retention journal error: {error}"),
             Self::Cas(error) => write!(formatter, "retention object store error: {error}"),
             Self::BeforeDelete => formatter.write_str("retention pre-delete action failed"),
+            Self::BeforeDeleteWithReason(error) => {
+                write!(formatter, "retention pre-delete action failed: {error}")
+            }
             Self::InvalidPolicy => formatter.write_str("retention max age must not be negative"),
         }
     }

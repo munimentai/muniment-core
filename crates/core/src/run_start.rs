@@ -344,6 +344,7 @@ impl RunStartError {
     pub fn desktop_protocol_error(&self) -> ProtocolError {
         match self {
             Self::InvalidRequest(message) => ProtocolError::invalid_request_with_reason(message),
+            Self::Persistence(message) => ProtocolError::persistence_failed_with_reason(message),
             _ => self.protocol_error(),
         }
     }

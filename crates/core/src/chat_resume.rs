@@ -409,6 +409,8 @@ mod tests {
     fn memory_session_failure_leaves_no_active_run() {
         let root =
             std::env::temp_dir().join(format!("muniment-resume-memory-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::write(root.join("config/home.json"), "invalid json").unwrap();
         let memory = ApplicationMemoryRuntime::new(root.join("config"), root.join("cache"));
         let activity = RuntimeActivityRegistry::new();
         let active = Mutex::new(None);
@@ -428,6 +430,11 @@ mod tests {
         assert!(memory
             .dispatch_tool_call("run-1", "memory-search", br#"{"query":"saffron"}"#)
             .is_err());
-        assert!(!root.exists());
+        assert!(!root.join("cache").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("config/home.json")).unwrap(),
+            "invalid json"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

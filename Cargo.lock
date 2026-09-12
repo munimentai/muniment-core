@@ -2815,6 +2815,7 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "chrono",
+ "dirs",
  "ed25519-dalek",
  "flate2",
  "fs2",

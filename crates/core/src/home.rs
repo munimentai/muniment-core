@@ -1085,6 +1085,30 @@ pub fn confirm_home(config_dir: &Path, home: &Path) -> Result<(), HomeError> {
     persist_home(config_dir, home)
 }
 
+/// Keeps a saved Home or publishes the default under the shared Home lock.
+pub fn initialize_default_home(config_dir: &Path) -> Result<PathBuf, HomeError> {
+    initialize_home_with(config_dir, || {
+        choose_default_home(dirs::document_dir(), dirs::home_dir()).map_err(|error| {
+            HomeError::io("The default Home is unavailable.", io::Error::other(error))
+        })
+    })
+}
+
+fn initialize_home_with(
+    config_dir: &Path,
+    default_home: impl FnOnce() -> Result<PathBuf, HomeError>,
+) -> Result<PathBuf, HomeError> {
+    let _lock = lock_home(config_dir)?;
+    if let Some(home) = configured_home(config_dir)? {
+        return Ok(home);
+    }
+    let home = default_home()?;
+    validate_home_selection(config_dir, &home)?;
+    scaffold_home(&home)?;
+    persist_home_locked(config_dir, &home)?;
+    Ok(home)
+}
+
 /// Validates a Home selection without creating it or recording configuration.
 pub fn validate_home_selection(config_dir: &Path, home: &Path) -> Result<(), HomeError> {
     validate_home(home)?;
@@ -1197,12 +1221,13 @@ fn create_visible_directory(path: &Path) -> Result<(), HomeError> {
 }
 
 fn persist_home(config_dir: &Path, home: &Path) -> Result<(), HomeError> {
+    let _lock = lock_home(config_dir)?;
+    persist_home_locked(config_dir, home)
+}
+
+fn lock_home(config_dir: &Path) -> Result<fs::File, HomeError> {
     fs::create_dir_all(config_dir)
         .map_err(|error| HomeError::io("The Home selection could not be saved.", error))?;
-    let contents = serde_json::to_vec_pretty(&HomeConfig {
-        location: home.to_path_buf(),
-    })
-    .map_err(|_| HomeError::invalid("The Home selection could not be saved."))?;
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -1212,7 +1237,14 @@ fn persist_home(config_dir: &Path, home: &Path) -> Result<(), HomeError> {
         .map_err(|error| HomeError::io("The Home selection could not be saved.", error))?;
     lock.lock_exclusive()
         .map_err(|error| HomeError::io("The Home selection could not be saved.", error))?;
+    Ok(lock)
+}
 
+fn persist_home_locked(config_dir: &Path, home: &Path) -> Result<(), HomeError> {
+    let contents = serde_json::to_vec_pretty(&HomeConfig {
+        location: home.to_path_buf(),
+    })
+    .map_err(|_| HomeError::invalid("The Home selection could not be saved."))?;
     let destination = config_dir.join(CONFIG_FILE);
     let temporary = config_dir.join(format!("home.json.{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| {
@@ -1285,6 +1317,32 @@ mod tests {
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn default_initialization_preserves_a_concurrent_explicit_selection() {
+        let root = std::env::temp_dir().join(format!("home-init-{}", uuid::Uuid::new_v4()));
+        let config = root.join("config");
+        let explicit = root.join("Selected");
+        let lock = super::lock_home(&config).unwrap();
+        assert!(super::configured_home(&config).unwrap().is_none());
+        let (ready, started) = std::sync::mpsc::channel();
+        let initializing_config = config.clone();
+        let initializer = std::thread::spawn(move || {
+            ready.send(()).unwrap();
+            super::initialize_home_with(&initializing_config, || {
+                panic!("a saved Home must take precedence over the default")
+            })
+            .unwrap()
+        });
+        started.recv().unwrap();
+        // The explicit client holds the same lock that confirm_home uses to save its selection.
+        super::scaffold_home(&explicit).unwrap();
+        super::persist_home_locked(&config, &explicit).unwrap();
+        drop(lock);
+        assert_eq!(initializer.join().unwrap(), explicit);
+        assert_eq!(super::configured_home(&config).unwrap(), Some(explicit));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     struct TempRoot(PathBuf);
 

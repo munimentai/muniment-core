@@ -12,7 +12,7 @@ use crate::chat_view::{
 use crate::code_diff_journal::{load_applied_code_diffs, load_pending_code_diff};
 use crate::journal::reducer::{project_chat_with_state, ProjectedRecall, RunState};
 use crate::journal::{EventEnvelope, RunJournal};
-use crate::thread_ownership::subject_owns_first_run;
+use crate::thread_ownership::{subject_owns_first_run, ThreadOwnershipError};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,14 +43,14 @@ pub struct ChatThreadOpenPage {
     pub next_cursor: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThreadHistoryError {
-    ThreadOwnershipUnavailable,
+    ThreadOwnershipUnavailable(ThreadOwnershipError),
     ThreadNotOwned,
-    ThreadRunsUnavailable,
-    RunEventsUnavailable,
-    ProjectionUnavailable,
-    PromptUnavailable,
+    ThreadRunsUnavailable(String),
+    RunEventsUnavailable(String),
+    ProjectionUnavailable(String),
+    PromptUnavailable(String),
 }
 
 pub fn load_prompt(
@@ -58,7 +58,7 @@ pub fn load_prompt(
     subject: Option<&str>,
 ) -> Result<Option<String>, ThreadHistoryError> {
     crate::chat_prompt::load_prompt(run_id, subject)
-        .map_err(|_| ThreadHistoryError::PromptUnavailable)
+        .map_err(|error| ThreadHistoryError::PromptUnavailable(format!("{error:?}")))
 }
 
 pub fn project_history_entry(
@@ -70,9 +70,9 @@ pub fn project_history_entry(
 ) -> Result<HistoryEntry, ThreadHistoryError> {
     let events = journal
         .events(&run_id)
-        .map_err(|_| ThreadHistoryError::RunEventsUnavailable)?;
-    let (projection, state) =
-        project_chat_with_state(&events).map_err(|_| ThreadHistoryError::ProjectionUnavailable)?;
+        .map_err(|error| ThreadHistoryError::RunEventsUnavailable(error.to_string()))?;
+    let (projection, state) = project_chat_with_state(&events)
+        .map_err(|error| ThreadHistoryError::ProjectionUnavailable(error.to_string()))?;
     let resumable = history_resumable(&events, &state, subject, session_root);
     let code_diff = cas.and_then(|cas| {
         load_pending_code_diff(journal, cas, &run_id, &projection.pending_permission)
@@ -126,13 +126,13 @@ pub fn chat_thread_open_page(
     cursor: Option<&str>,
 ) -> Result<ChatThreadOpenPage, ThreadHistoryError> {
     if !subject_owns_first_run(journal, thread_id, subject)
-        .map_err(|_| ThreadHistoryError::ThreadOwnershipUnavailable)?
+        .map_err(ThreadHistoryError::ThreadOwnershipUnavailable)?
     {
         return Err(ThreadHistoryError::ThreadNotOwned);
     }
     let page = journal
         .thread_run_ids(thread_id, limit, cursor)
-        .map_err(|_| ThreadHistoryError::ThreadRunsUnavailable)?;
+        .map_err(|error| ThreadHistoryError::ThreadRunsUnavailable(format!("{error:?}")))?;
     let entries = page
         .run_ids
         .into_iter()

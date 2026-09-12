@@ -425,6 +425,12 @@ pub(super) fn write_request_error<S: DeadlineStream + ?Sized>(
     error: ProtocolError,
     deadline: Instant,
 ) {
+    // Desktop diagnostics can name local paths. Companion errors keep the public persistence reason.
+    let error = if error.code() == super::ErrorCode::PersistenceFailed {
+        ProtocolError::persistence_failed()
+    } else {
+        error
+    };
     let envelope = ErrorEnvelope {
         protocol: Protocol,
         request_id,
@@ -433,6 +439,50 @@ pub(super) fn write_request_error<S: DeadlineStream + ?Sized>(
     };
     if let Ok(frame) = encode_frame(&envelope) {
         let _ = write_before(stream, &frame, deadline);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn companion_wire_redacts_desktop_persistence_diagnostics() {
+        let request_id = super::super::Id::new("01900000-0000-7000-8000-000000000001").unwrap();
+        for error in [
+            ProtocolError::persistence_failed_with_reason(
+                "Conversation history lock failed: poisoned lock",
+            ),
+            ProtocolError::persistence_failed_with_reason(
+                "Conversation history journal failed: no such table: thread_events",
+            ),
+        ] {
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            write_request_error(
+                &mut server,
+                Some(request_id.clone()),
+                error,
+                Instant::now() + Duration::from_secs(2),
+            );
+            let mut prefix = [0; 4];
+            client.read_exact(&mut prefix).unwrap();
+            let mut frame = vec![0; 4 + u32::from_be_bytes(prefix) as usize];
+            frame[..4].copy_from_slice(&prefix);
+            client.read_exact(&mut frame[4..]).unwrap();
+            let (Envelope::Error(envelope), _) = super::super::decode_frame::<Envelope>(&frame)
+                .unwrap()
+                .unwrap()
+            else {
+                panic!("the companion must receive an error");
+            };
+            assert_eq!(envelope.request_id, Some(request_id.clone()));
+            assert_eq!(envelope.error, ProtocolError::persistence_failed());
+        }
     }
 }
 

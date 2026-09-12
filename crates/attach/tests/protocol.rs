@@ -852,6 +852,35 @@ fn incompatibility_is_actionable_and_discloses_no_runtime_state() {
 }
 
 #[test]
+fn persistence_reason_round_trips_and_appears_in_the_log_text() {
+    let reason = "Conversation history journal failed: database is locked";
+    let error = ProtocolError::persistence_failed_with_reason(reason);
+    let wire = serde_json::to_value(&error).unwrap();
+    assert_eq!(wire["details"]["reason"], reason);
+    assert_eq!(
+        serde_json::from_value::<ProtocolError>(wire.clone()).unwrap(),
+        error
+    );
+    assert_eq!(
+        error.to_string(),
+        format!("code=\"persistence_failed\" reason={reason:?}")
+    );
+    assert!(error.retryable());
+    for (field, value) in [
+        ("retryable", json!(false)),
+        ("message", json!("arbitrary message")),
+        ("action", json!("upgrade_desktop")),
+    ] {
+        let mut invalid = wire.clone();
+        invalid[field] = value;
+        assert!(serde_json::from_value::<ProtocolError>(invalid).is_err());
+    }
+    let mut invalid = wire;
+    invalid["details"]["token"] = json!("unexpected");
+    assert!(serde_json::from_value::<ProtocolError>(invalid).is_err());
+}
+
+#[test]
 fn invalid_request_reason_round_trips_without_relaxing_other_error_schemas() {
     let error = ProtocolError::invalid_request_with_reason("Conversation history is unavailable.");
     let wire = serde_json::to_value(&error).unwrap();

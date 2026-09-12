@@ -28,9 +28,16 @@ impl ApplicationMemoryRuntime {
         thread: &str,
         capability: ModelMemoryCapability,
     ) -> Result<(), MemoryIndexError> {
-        let home = muniment_core::home::configured_home(&self.config)
-            .map_err(|error| MemoryIndexError::Io(std::io::Error::other(error.to_string())))?
-            .ok_or(MemoryIndexError::InvalidPath)?;
+        let home_error = |error: muniment_core::home::HomeError| {
+            use std::error::Error;
+            let message = match error.source() {
+                Some(source) => format!("{error} {source}"),
+                None => error.to_string(),
+            };
+            MemoryIndexError::Io(std::io::Error::other(message))
+        };
+        let home =
+            muniment_core::home::initialize_default_home(&self.config).map_err(home_error)?;
         let database = self.database_root.join("memory-index.sqlite3");
         self.open_session_for_home(session, thread, capability, &home, database);
         if let Err(error) = self.write_agent_extension(session) {

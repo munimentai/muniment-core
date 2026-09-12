@@ -1,10 +1,10 @@
 use crate::journal::RunJournal;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThreadOwnershipError {
-    ThreadRunsUnavailable,
+    ThreadRunsUnavailable(String),
     MissingFirstRun,
-    FirstEnvelopeUnavailable,
+    FirstEnvelopeUnavailable(String),
 }
 
 pub fn subject_owns_first_run(
@@ -14,14 +14,14 @@ pub fn subject_owns_first_run(
 ) -> Result<bool, ThreadOwnershipError> {
     let first_run = journal
         .thread_run_ids(thread_id, 1, None)
-        .map_err(|_| ThreadOwnershipError::ThreadRunsUnavailable)?
+        .map_err(|error| ThreadOwnershipError::ThreadRunsUnavailable(format!("{error:?}")))?
         .run_ids
         .into_iter()
         .next()
         .ok_or(ThreadOwnershipError::MissingFirstRun)?;
     let first = journal
         .first_envelope(&first_run)
-        .map_err(|_| ThreadOwnershipError::FirstEnvelopeUnavailable)?;
+        .map_err(|error| ThreadOwnershipError::FirstEnvelopeUnavailable(error.to_string()))?;
     Ok(!matches!(
         first.provenance.actor_id.as_deref(),
         Some(owner) if Some(owner) != subject

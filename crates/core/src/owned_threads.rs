@@ -1,14 +1,14 @@
 use crate::journal::thread_summaries::ThreadSummaryPage;
 use crate::journal::RunJournal;
-use crate::thread_ownership::subject_owns_first_run;
+use crate::thread_ownership::{subject_owns_first_run, ThreadOwnershipError};
 
 pub const MAX_THREAD_SUMMARY_CORE_PAGES: usize = 100;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnedThreadsError {
     InvalidLimit,
-    ThreadSummariesUnavailable,
-    ThreadOwnershipUnavailable,
+    ThreadSummariesUnavailable(String),
+    ThreadOwnershipUnavailable(ThreadOwnershipError),
 }
 
 pub fn newest_owned_workspace_thread(
@@ -20,10 +20,10 @@ pub fn newest_owned_workspace_thread(
     for _ in 0..MAX_THREAD_SUMMARY_CORE_PAGES {
         let page = journal
             .workspace_thread_summaries(workspace, 100, cursor.as_deref())
-            .map_err(|_| OwnedThreadsError::ThreadSummariesUnavailable)?;
+            .map_err(|error| OwnedThreadsError::ThreadSummariesUnavailable(error.to_string()))?;
         for summary in page.summaries {
             if subject_owns_first_run(journal, &summary.thread_id, subject)
-                .map_err(|_| OwnedThreadsError::ThreadOwnershipUnavailable)?
+                .map_err(OwnedThreadsError::ThreadOwnershipUnavailable)?
             {
                 return Ok(Some(summary.thread_id));
             }
@@ -50,10 +50,10 @@ pub fn chat_thread_summaries_page(
     for _ in 0..MAX_THREAD_SUMMARY_CORE_PAGES {
         let page = journal
             .thread_summaries(limit - summaries.len(), next_cursor.as_deref())
-            .map_err(|_| OwnedThreadsError::ThreadSummariesUnavailable)?;
+            .map_err(|error| OwnedThreadsError::ThreadSummariesUnavailable(error.to_string()))?;
         for summary in page.summaries {
             if subject_owns_first_run(journal, &summary.thread_id, subject)
-                .map_err(|_| OwnedThreadsError::ThreadOwnershipUnavailable)?
+                .map_err(OwnedThreadsError::ThreadOwnershipUnavailable)?
             {
                 summaries.push(summary);
             }
