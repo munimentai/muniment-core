@@ -12,7 +12,7 @@ use muniment_attach::{
 use super::deadline_io::DeadlineStream;
 use super::ReadableWait;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const READABLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Closed outcomes from an attach session.
@@ -109,7 +109,7 @@ enum SessionClose {
     RunStreamFailed(ProtocolError),
 }
 
-fn serve_desktop_client_requests_with_diagnostics<S, H>(
+pub(super) fn serve_desktop_client_requests_with_diagnostics<S, H>(
     stream: &mut S,
     capability: &str,
     workspace: &str,
@@ -220,21 +220,35 @@ where
         };
         let request_id = request.request_id.clone();
         let operation = request.operation;
-        if request.capability != capability
+        let sign_in_started = (operation == Operation::SessionSignIn).then(|| {
+            diagnostic(
+                "muniment-runtime: native-auth start method=RPC path=session.sign_in".into(),
+            );
+            Instant::now()
+        });
+        let dispatched = if request.capability != capability
             || matches!(
                 request.operation,
                 Operation::MigrationControl | Operation::ApprovalPresent
-            )
-        {
-            let error = ProtocolError::unauthorized();
-            diagnostic(request_rejection_line(Some(operation), &error));
-            write_request_error(stream, Some(request_id), error, deadline);
-            continue;
+            ) {
+            Err(DesktopDispatchFailure {
+                error: ProtocolError::unauthorized(),
+                events: Vec::new(),
+            })
+        } else {
+            service.dispatch_request(request, workspace, provenance.clone(), &mut state)
+        };
+        if let Some(started) = sign_in_started {
+            let outcome = match &dispatched {
+                Ok(_) => "status=ok".into(),
+                Err(failure) => format!("error={:?}", failure.error.code()),
+            };
+            diagnostic(format!(
+                "muniment-runtime: native-auth end method=RPC path=session.sign_in {outcome} elapsed_ms={}",
+                started.elapsed().as_millis(),
+            ));
         }
-        let dispatched =
-            service.dispatch_request(request, workspace, provenance.clone(), &mut state);
         // Dispatch can wait for browser sign-in. Its elapsed time is not frame I/O time.
-        #[cfg(target_os = "linux")]
         let deadline = Instant::now() + REQUEST_TIMEOUT;
         match dispatched {
             Ok(dispatched) => {
@@ -513,7 +527,6 @@ mod tests {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn dispatch_time_does_not_consume_the_response_frame_deadline() {
         struct SlowService;

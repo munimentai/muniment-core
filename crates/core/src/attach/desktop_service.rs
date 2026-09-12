@@ -1242,6 +1242,142 @@ mod tests {
     use crate::pi_execution::attachment_error;
     use uuid::Uuid;
 
+    #[cfg(unix)]
+    #[test]
+    fn sign_in_returns_a_result_and_keeps_the_session_open_after_slow_dispatch() {
+        use super::super::desktop_service_message::CompanionProvenance;
+        use super::super::desktop_session::{
+            serve_desktop_client_requests_with_diagnostics, REQUEST_TIMEOUT,
+        };
+        use muniment_attach::{encode_frame, Id};
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        struct SignInService(&'static str);
+        impl ThreadListService for SignInService {
+            fn list_threads(
+                &mut self,
+                _: &str,
+                _: ThreadListRequest,
+            ) -> Result<ThreadListPage, ProtocolError> {
+                Ok(ThreadListPage {
+                    threads: Vec::new(),
+                    next_cursor: None,
+                })
+            }
+            fn sign_in(
+                &mut self,
+                _: &Id,
+                _: &Id,
+                _: CompanionProvenance,
+            ) -> Result<crate::auth::AuthStatus, ProtocolError> {
+                assert!(matches!(self.0, "ok" | "failure"));
+                std::thread::sleep(REQUEST_TIMEOUT + Duration::from_millis(10));
+                if self.0 == "failure" {
+                    Err(ProtocolError::persistence_failed_with_reason(
+                        "The browser sign-in timed out.",
+                    ))
+                } else {
+                    Ok(crate::auth::AuthStatus {
+                        signed_in: true,
+                        subject: Some("secret-subject".into()),
+                        expires_at: Some(1900),
+                    })
+                }
+            }
+        }
+
+        for outcome in ["ok", "failure", "unauthorized", "invalid"] {
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(15)))
+                .unwrap();
+            let worker = std::thread::spawn(move || {
+                let mut lines = Vec::new();
+                let result = serve_desktop_client_requests_with_diagnostics(
+                    &mut server,
+                    "capability",
+                    "workspace",
+                    CompanionProvenance {
+                        profile: "desktop-owner".into(),
+                        companion_kind: "desktop-client".into(),
+                        companion_version: "1.0.0".into(),
+                        peer_uid: 1,
+                        peer_pid: 2,
+                    },
+                    &mut SignInService(outcome),
+                    |line| lines.push(line),
+                );
+                (result, lines)
+            });
+            let request_id = "018f0000-0000-7000-8000-000000000201";
+            for operation in ["session.sign_in", "thread.list"] {
+                let body = if operation == "thread.list" {
+                    serde_json::json!({"limit": 20})
+                } else if outcome == "invalid" {
+                    serde_json::json!({"unexpected": "secret-input"})
+                } else {
+                    serde_json::json!({})
+                };
+                let mut request = serde_json::json!({
+                    "protocol": "muniment.attach/1", "request_id": request_id,
+                    "operation": operation, "capability": "capability", "body": body,
+                });
+                if operation == "session.sign_in" {
+                    request["idempotency_key"] = serde_json::json!(request_id);
+                    if outcome == "unauthorized" {
+                        request["capability"] = serde_json::json!("secret-wrong-capability");
+                    }
+                }
+                client.write_all(&encode_frame(&request).unwrap()).unwrap();
+                let mut prefix = [0; 4];
+                client.read_exact(&mut prefix).unwrap();
+                let mut body = vec![0; u32::from_be_bytes(prefix) as usize];
+                client.read_exact(&mut body).unwrap();
+                let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(response["request_id"], request_id);
+                if operation == "thread.list" || outcome == "ok" {
+                    assert_eq!(response["ok"], true);
+                    if operation == "session.sign_in" {
+                        assert_eq!(response["body"]["status"]["signed_in"], true);
+                    }
+                } else {
+                    let code = match outcome {
+                        "failure" => "persistence_failed",
+                        "unauthorized" => "unauthorized",
+                        _ => "invalid_request",
+                    };
+                    assert_eq!(response["error"]["code"], code);
+                }
+            }
+            drop(client);
+            let (result, lines) = worker.join().unwrap();
+            assert_eq!(result, Ok(()));
+            let auth_lines: Vec<_> = lines
+                .iter()
+                .filter(|line| line.contains("native-auth"))
+                .collect();
+            assert_eq!(auth_lines.len(), 2);
+            assert_eq!(
+                auth_lines[0],
+                "muniment-runtime: native-auth start method=RPC path=session.sign_in"
+            );
+            let expected = match outcome {
+                "ok" => "status=ok",
+                "failure" => "error=PersistenceFailed",
+                "unauthorized" => "error=Unauthorized",
+                _ => "error=InvalidRequest",
+            };
+            let elapsed = auth_lines[1].strip_prefix(&format!(
+                "muniment-runtime: native-auth end method=RPC path=session.sign_in {expected} elapsed_ms="
+            )).unwrap().parse::<u128>().unwrap();
+            if matches!(outcome, "ok" | "failure") {
+                assert!(elapsed >= REQUEST_TIMEOUT.as_millis());
+            }
+            assert!(!lines.join("\n").contains("secret"));
+        }
+    }
+
     fn event_envelope(
         run_id: &str,
         run_seq: u64,

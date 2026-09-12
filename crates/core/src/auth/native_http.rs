@@ -40,7 +40,7 @@ fn after_line(
     )
 }
 
-fn log(line: &str) {
+pub(super) fn log(line: &str) {
     eprintln!("{line}");
     #[cfg(test)]
     CAPTURE.with(|capture| {
