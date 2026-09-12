@@ -770,20 +770,25 @@ impl RunJournal {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.busy_timeout(busy_timeout)?;
-        let mut current_version = version;
-        while current_version < SCHEMA_VERSION {
-            let migration = MIGRATIONS
-                .iter()
-                .find(|migration| migration.version == current_version + 1)
-                .ok_or_else(|| {
-                    JournalError::Corrupt(format!("unsupported schema version {current_version}"))
-                })?;
+        if version < SCHEMA_VERSION {
+            // Commit the upgrade once so startup does not sync each intermediate schema.
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            (migration.apply)(&tx)?;
-            validate_database(&tx)?;
-            tx.pragma_update(None, "user_version", migration.version)?;
+            let mut current_version = version;
+            while current_version < SCHEMA_VERSION {
+                let migration = MIGRATIONS
+                    .iter()
+                    .find(|migration| migration.version == current_version + 1)
+                    .ok_or_else(|| {
+                        JournalError::Corrupt(format!(
+                            "unsupported schema version {current_version}"
+                        ))
+                    })?;
+                (migration.apply)(&tx)?;
+                validate_database(&tx)?;
+                tx.pragma_update(None, "user_version", migration.version)?;
+                current_version = migration.version;
+            }
             tx.commit()?;
-            current_version = migration.version;
         }
         validate_database(&connection)?;
         let cursor_key = load_or_create_cursor_key(&connection)?;

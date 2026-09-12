@@ -30,7 +30,7 @@ pub fn choose_default_home(
     documents: Option<PathBuf>,
     home: Option<PathBuf>,
 ) -> Result<PathBuf, String> {
-    if let Some(documents) = documents {
+    if let Some(documents) = documents.filter(|path| path.is_dir()) {
         return Ok(documents.join("Muniment"));
     }
 
@@ -1017,6 +1017,7 @@ pub enum HomeErrorKind {
 pub struct HomeError {
     kind: HomeErrorKind,
     message: &'static str,
+    path: Option<PathBuf>,
     source: Option<io::Error>,
 }
 
@@ -1025,6 +1026,7 @@ impl HomeError {
         Self {
             kind: HomeErrorKind::Io,
             message,
+            path: None,
             source: Some(source),
         }
     }
@@ -1033,8 +1035,14 @@ impl HomeError {
         Self {
             kind: HomeErrorKind::InvalidInput,
             message,
+            path: None,
             source: None,
         }
+    }
+
+    fn with_path(mut self, path: &Path) -> Self {
+        self.path = Some(path.to_path_buf());
+        self
     }
 
     pub fn kind(&self) -> HomeErrorKind {
@@ -1044,7 +1052,14 @@ impl HomeError {
 
 impl fmt::Display for HomeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.message)
+        formatter.write_str(self.message)?;
+        if let Some(path) = &self.path {
+            write!(formatter, " Path: {}.", path.display())?;
+        }
+        if let Some(source) = &self.source {
+            write!(formatter, " {source}")?;
+        }
+        Ok(())
     }
 }
 
@@ -1178,11 +1193,13 @@ pub fn scaffold_home(home: &Path) -> Result<(), HomeError> {
         let directory = home.join(name);
         create_visible_directory(&directory)?;
         let heading = format!("# {}\n", name[..1].to_uppercase() + &name[1..]);
-        muniment_attach::write_scaffold_file_if_missing(
-            &directory.join("README.md"),
-            heading.as_bytes(),
-        )
-        .map_err(|error| HomeError::io("Muniment Home README could not be created.", error))?;
+        let readme = directory.join("README.md");
+        muniment_attach::write_scaffold_file_if_missing(&readme, heading.as_bytes()).map_err(
+            |error| {
+                HomeError::io("Muniment Home README could not be created.", error)
+                    .with_path(&readme)
+            },
+        )?;
     }
     Ok(())
 }
@@ -1218,6 +1235,7 @@ fn create_visible_directory(path: &Path) -> Result<(), HomeError> {
             error,
         )),
     }
+    .map_err(|error| error.with_path(path))
 }
 
 fn persist_home(config_dir: &Path, home: &Path) -> Result<(), HomeError> {
@@ -1367,6 +1385,7 @@ mod tests {
     fn default_home_uses_resolved_documents_directory() {
         let root = TempRoot::new("resolved-documents");
         let documents = root.0.join("Custom Documents");
+        fs::create_dir(&documents).unwrap();
 
         assert_eq!(
             choose_default_home(Some(documents.clone()), None).unwrap(),
@@ -1394,6 +1413,97 @@ mod tests {
             choose_default_home(None, Some(root.0.clone())).unwrap(),
             root.0.join("Muniment")
         );
+    }
+
+    #[test]
+    fn default_home_with_missing_resolved_documents_can_be_confirmed() {
+        let root = TempRoot::new("missing-documents");
+        let documents = root.0.join("Documents");
+        let config = root.0.join("config");
+
+        let home = choose_default_home(Some(documents.clone()), Some(root.0.clone())).unwrap();
+
+        assert_eq!(home, root.0.join("Muniment"));
+        assert!(!home.exists());
+        assert!(!documents.exists());
+        super::confirm_home(&config, &home).unwrap();
+        for name in super::HOME_DIRECTORIES {
+            assert!(home.join(name).join("README.md").is_file());
+        }
+        assert_eq!(super::configured_home(&config).unwrap(), Some(home));
+        assert!(!documents.exists());
+    }
+
+    #[test]
+    fn default_home_ignores_a_resolved_documents_file() {
+        let root = TempRoot::new("documents-file");
+        let documents = root.0.join("Documents");
+        fs::write(&documents, b"keep").unwrap();
+
+        assert_eq!(
+            choose_default_home(Some(documents.clone()), Some(root.0.clone())).unwrap(),
+            root.0.join("Muniment")
+        );
+        assert_eq!(fs::read(documents).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn default_home_falls_back_to_existing_home_documents() {
+        let root = TempRoot::new("missing-custom-documents");
+        let documents = root.0.join("Documents");
+        fs::create_dir(&documents).unwrap();
+
+        assert_eq!(
+            choose_default_home(Some(root.0.join("missing")), Some(root.0.clone())).unwrap(),
+            documents.join("Muniment")
+        );
+    }
+
+    #[test]
+    fn default_home_fails_when_resolved_documents_and_home_are_missing() {
+        let root = TempRoot::new("missing-directories");
+
+        assert_eq!(
+            choose_default_home(Some(root.0.join("Documents")), Some(root.0.join("missing")))
+                .unwrap_err(),
+            "The Documents folder is unavailable."
+        );
+    }
+
+    #[test]
+    fn failed_home_creation_names_the_path_and_io_error() {
+        let root = TempRoot::new("creation-error");
+        let config = root.0.join("config");
+        let home = root.0.join("missing").join("Muniment");
+        let expected = fs::create_dir(&home).unwrap_err();
+
+        let error = super::confirm_home(&config, &home).unwrap_err();
+
+        assert_eq!(error.kind(), super::HomeErrorKind::Io);
+        assert!(error.to_string().contains(&home.display().to_string()));
+        assert!(error.to_string().contains(&expected.to_string()));
+        assert_eq!(
+            std::error::Error::source(&error).unwrap().to_string(),
+            expected.to_string()
+        );
+        assert!(super::configured_home(&config).unwrap().is_none());
+    }
+
+    #[test]
+    fn refused_scaffold_names_the_path_without_changing_the_file() {
+        let root = TempRoot::new("refused-scaffold");
+        let config = root.0.join("config");
+        let home = root.0.join("Muniment");
+        fs::create_dir(&home).unwrap();
+        let refused = home.join("agents");
+        fs::write(&refused, b"keep").unwrap();
+
+        let error = super::confirm_home(&config, &home).unwrap_err();
+
+        assert_eq!(error.kind(), super::HomeErrorKind::InvalidInput);
+        assert!(error.to_string().contains(&refused.display().to_string()));
+        assert_eq!(fs::read(refused).unwrap(), b"keep");
+        assert!(super::configured_home(&config).unwrap().is_none());
     }
 
     #[test]

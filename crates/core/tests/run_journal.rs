@@ -1549,6 +1549,46 @@ fn head_schema_missing_journal_metadata_fails_without_recreating_it() {
 }
 
 #[test]
+fn failed_later_migration_rolls_back_the_entire_upgrade() {
+    let db = TestDb::new();
+    let raw = Connection::open(db.as_ref()).unwrap();
+    // This view allows the first two migrations but refuses the thread index.
+    raw.execute_batch("CREATE VIEW thread_events AS SELECT 1 AS marker")
+        .unwrap();
+    drop(raw);
+
+    assert!(matches!(
+        RunJournal::open(db.as_ref()),
+        Err(JournalError::Sqlite(_))
+    ));
+    let raw = Connection::open(db.as_ref()).unwrap();
+    assert_eq!(
+        raw.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    let objects: Vec<(String, String)> = raw
+        .prepare("SELECT type,name FROM sqlite_schema ORDER BY name")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(objects, vec![("view".into(), "thread_events".into())]);
+
+    raw.execute_batch("DROP VIEW thread_events").unwrap();
+    drop(raw);
+    RunJournal::open(db.as_ref()).unwrap();
+    RunJournal::open(db.as_ref()).unwrap();
+    let raw = Connection::open(db.as_ref()).unwrap();
+    assert_eq!(
+        raw.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        4
+    );
+}
+
+#[test]
 fn failed_migration_rolls_back_schema_and_version() {
     let db = TestDb::new();
     RunJournal::open(db.as_ref()).unwrap();
