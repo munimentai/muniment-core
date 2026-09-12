@@ -12,8 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
-    GetLastError, LocalFree, ERROR_IO_PENDING, ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED,
-    ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    GetLastError, LocalFree, ERROR_IO_PENDING, ERROR_NOT_FOUND, ERROR_NO_DATA,
+    ERROR_OPERATION_ABORTED, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
 use windows_sys::Win32::Security::{
@@ -26,8 +27,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     PIPE_ACCESS_DUPLEX,
 };
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-    PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
 };
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
 use windows_sys::Win32::System::Threading::{
@@ -36,8 +37,8 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 use super::{
-    verify_windows_pipe_security_with_reader, WindowsAttachStream, WindowsPipeAccessControlEntry,
-    WindowsPipeSecurityReadError, WindowsPipeSecurityReader,
+    verify_windows_pipe_security_with_reader, WindowsAttachAcceptError, WindowsAttachStream,
+    WindowsPipeAccessControlEntry, WindowsPipeSecurityReadError, WindowsPipeSecurityReader,
 };
 use crate::attach::thread_service::ThreadListService;
 use crate::attach::{
@@ -55,52 +56,6 @@ static FAIL_NEXT_PIPE_INSTANCE: AtomicBool = AtomicBool::new(false);
 pub fn fail_next_windows_attach_pipe_instance_for_tests() {
     FAIL_NEXT_PIPE_INSTANCE.store(true, Ordering::SeqCst);
 }
-
-/// A failure while accepting a Windows attach connection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WindowsAttachAcceptError {
-    DeadlineExpired,
-    CreateEvent(u32),
-    CreateInstance(u32),
-    VerifyInstanceSecurity,
-    Connect(u32),
-    Wait(u32),
-    Cancel(u32),
-}
-
-impl fmt::Display for WindowsAttachAcceptError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DeadlineExpired => formatter.write_str("the attach accept deadline expired"),
-            Self::CreateEvent(code) => {
-                write!(formatter, "could not create an accept event ({code})")
-            }
-            Self::CreateInstance(code) => {
-                write!(
-                    formatter,
-                    "could not create the next attach pipe instance ({code})"
-                )
-            }
-            Self::VerifyInstanceSecurity => {
-                formatter.write_str("could not verify the next attach pipe instance security")
-            }
-            Self::Connect(code) => write!(
-                formatter,
-                "could not accept the Windows attach pipe ({code})"
-            ),
-            Self::Wait(code) => write!(
-                formatter,
-                "could not wait for a Windows attach client ({code})"
-            ),
-            Self::Cancel(code) => write!(
-                formatter,
-                "could not cancel the Windows attach wait ({code})"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for WindowsAttachAcceptError {}
 
 /// A failure while binding the Windows attach listener.
 #[derive(Debug)]
@@ -252,7 +207,9 @@ impl WindowsAttachListener {
         let path = windows_attach_pipe_path(sid.as_str())
             .map_err(|_| io::Error::other("could not derive the Windows attach pipe path"))
             .map_err(WindowsAttachBindError::Pipe)?;
-        let handle = create_pipe_instance(&path, true).map_err(WindowsAttachBindError::Pipe)?;
+        let handle = create_pipe_instance(&path, true)
+            .map_err(io::Error::other)
+            .map_err(WindowsAttachBindError::Pipe)?;
 
         Ok(Self {
             path,
@@ -276,6 +233,18 @@ impl WindowsAttachListener {
 
     /// Waits until one client connects or the deadline expires.
     pub fn accept(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<WindowsAttachStream, WindowsAttachAcceptError> {
+        loop {
+            match self.accept_once(deadline) {
+                Err(WindowsAttachAcceptError::Connect(ERROR_NO_DATA)) => self.disconnect_probe()?,
+                result => return result,
+            }
+        }
+    }
+
+    fn accept_once(
         &mut self,
         deadline: Instant,
     ) -> Result<WindowsAttachStream, WindowsAttachAcceptError> {
@@ -306,6 +275,36 @@ impl WindowsAttachListener {
 
     /// Waits until one client connects or the stop event is signaled.
     pub fn accept_until(
+        &mut self,
+        stop: &WindowsAttachStopEvent,
+    ) -> Result<WindowsAttachAcceptOutcome, WindowsAttachAcceptError> {
+        loop {
+            match unsafe { WaitForSingleObject(stop.as_raw_handle(), 0) } {
+                WAIT_OBJECT_0 => return Ok(WindowsAttachAcceptOutcome::Stopped),
+                WAIT_TIMEOUT => {}
+                WAIT_FAILED => {
+                    return Err(WindowsAttachAcceptError::Wait(unsafe { GetLastError() }));
+                }
+                wait => return Err(WindowsAttachAcceptError::Wait(wait)),
+            }
+            match self.accept_until_once(stop) {
+                Err(WindowsAttachAcceptError::Connect(ERROR_NO_DATA)) => self.disconnect_probe()?,
+                result => return result,
+            }
+        }
+    }
+
+    fn disconnect_probe(&self) -> Result<(), WindowsAttachAcceptError> {
+        // A probe can close before ConnectNamedPipe. Reset the same owner-only instance.
+        if unsafe { DisconnectNamedPipe(self.handle().as_raw_handle()) } == 0 {
+            return Err(WindowsAttachAcceptError::Disconnect(unsafe {
+                GetLastError()
+            }));
+        }
+        Ok(())
+    }
+
+    fn accept_until_once(
         &mut self,
         stop: &WindowsAttachStopEvent,
     ) -> Result<WindowsAttachAcceptOutcome, WindowsAttachAcceptError> {
@@ -439,12 +438,7 @@ impl WindowsAttachListener {
     }
 
     fn create_listening_instance(&self) -> Result<OwnedHandle, WindowsAttachAcceptError> {
-        create_pipe_instance(&self.path, false).map_err(|error| {
-            error
-                .raw_os_error()
-                .map(|code| WindowsAttachAcceptError::CreateInstance(code as u32))
-                .unwrap_or(WindowsAttachAcceptError::VerifyInstanceSecurity)
-        })
+        create_pipe_instance(&self.path, false)
     }
 
     fn take_stream(&mut self) -> WindowsAttachStream {
@@ -471,12 +465,12 @@ fn create_accept_event() -> Result<OwnedHandle, WindowsAttachAcceptError> {
     Ok(unsafe { OwnedHandle::from_raw_handle(event) })
 }
 
-fn create_pipe_instance(path: &str, first: bool) -> io::Result<OwnedHandle> {
+fn create_pipe_instance(path: &str, first: bool) -> Result<OwnedHandle, WindowsAttachAcceptError> {
     if FAIL_NEXT_PIPE_INSTANCE.swap(false, Ordering::SeqCst) {
-        return Err(io::Error::other("injected pipe instance creation failure"));
+        return Err(WindowsAttachAcceptError::VerifyInstanceSecurity(None));
     }
     let wide: Vec<u16> = OsStr::new(path).encode_wide().chain(Some(0)).collect();
-    let mut security = OwnerSecurity::new(PIPE_ACCESS_MASK)?;
+    let mut security = OwnerSecurity::new(PIPE_ACCESS_MASK).map_err(instance_security_error)?;
     let attributes = security.attributes();
     let first_instance = if first {
         FILE_FLAG_FIRST_PIPE_INSTANCE
@@ -496,13 +490,20 @@ fn create_pipe_instance(path: &str, first: bool) -> io::Result<OwnedHandle> {
         )
     };
     if handle == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
+        return Err(WindowsAttachAcceptError::CreateInstance(unsafe {
+            GetLastError()
+        }));
     }
     let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
     let reader = NativeWindowsPipeSecurityReader::read(handle.as_raw_handle())
-        .map_err(|_| io::Error::other("could not read the Windows attach pipe security"))?;
-    verify_windows_pipe_security_with_reader(&reader).map_err(io::Error::other)?;
+        .map_err(instance_security_error)?;
+    verify_windows_pipe_security_with_reader(&reader)
+        .map_err(|_| WindowsAttachAcceptError::VerifyInstanceSecurity(None))?;
     Ok(handle)
+}
+
+fn instance_security_error(error: io::Error) -> WindowsAttachAcceptError {
+    WindowsAttachAcceptError::VerifyInstanceSecurity(error.raw_os_error().map(|code| code as u32))
 }
 
 fn deadline_millis(remaining: std::time::Duration) -> u32 {
@@ -532,7 +533,7 @@ pub struct NativeWindowsPipeSecurityReader {
 }
 
 impl NativeWindowsPipeSecurityReader {
-    fn read(handle: HANDLE) -> Result<Self, WindowsPipeSecurityReadError> {
+    fn read(handle: HANDLE) -> io::Result<Self> {
         let mut owner = null_mut();
         let mut dacl = null_mut();
         let mut descriptor = null_mut();
@@ -548,15 +549,18 @@ impl NativeWindowsPipeSecurityReader {
                 &mut descriptor,
             )
         };
-        if result != 0 || descriptor.is_null() {
-            return Err(WindowsPipeSecurityReadError);
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result as i32));
+        }
+        if descriptor.is_null() {
+            return Err(io::Error::other("the pipe security descriptor is null"));
         }
 
         let snapshot = read_security_snapshot(owner, dacl, descriptor);
         unsafe { LocalFree(descriptor) };
         let (owner_sid, protected, entries) = snapshot?;
         let local_sid = current_process_user_sid()
-            .map_err(|_| WindowsPipeSecurityReadError)?
+            .map_err(io::Error::other)?
             .as_bytes()
             .to_vec();
         Ok(Self {
@@ -592,15 +596,16 @@ fn read_security_snapshot(
     owner: PSID,
     dacl: *mut ACL,
     descriptor: *mut c_void,
-) -> Result<(Vec<u8>, bool, Vec<WindowsPipeAccessControlEntry>), WindowsPipeSecurityReadError> {
-    let owner_sid = copy_sid_bytes(owner).ok_or(WindowsPipeSecurityReadError)?;
+) -> io::Result<(Vec<u8>, bool, Vec<WindowsPipeAccessControlEntry>)> {
+    let owner_sid =
+        copy_sid_bytes(owner).ok_or_else(|| io::Error::other("the pipe owner SID is invalid"))?;
     if dacl.is_null() {
-        return Err(WindowsPipeSecurityReadError);
+        return Err(io::Error::other("the pipe DACL is null"));
     }
     let mut control = 0;
     let mut revision = 0;
     if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
-        return Err(WindowsPipeSecurityReadError);
+        return Err(io::Error::last_os_error());
     }
 
     let mut information = ACL_SIZE_INFORMATION::default();
@@ -613,14 +618,17 @@ fn read_security_snapshot(
         )
     } == 0
     {
-        return Err(WindowsPipeSecurityReadError);
+        return Err(io::Error::last_os_error());
     }
 
     let mut entries = Vec::with_capacity(information.AceCount as usize);
     for index in 0..information.AceCount {
         let mut ace: *mut c_void = null_mut();
-        if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
-            return Err(WindowsPipeSecurityReadError);
+        if unsafe { GetAce(dacl, index, &mut ace) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if ace.is_null() {
+            return Err(io::Error::other("the pipe ACE is null"));
         }
         let header = unsafe { &*ace.cast::<ACE_HEADER>() };
         let (access_mask, sid, allows) = match header.AceType as u32 {
@@ -640,10 +648,11 @@ fn read_security_snapshot(
                     false,
                 )
             }
-            _ => return Err(WindowsPipeSecurityReadError),
+            _ => return Err(io::Error::other("the pipe ACE type is unexpected")),
         };
         entries.push(WindowsPipeAccessControlEntry {
-            sid: copy_sid_bytes(sid).ok_or(WindowsPipeSecurityReadError)?,
+            sid: copy_sid_bytes(sid)
+                .ok_or_else(|| io::Error::other("the pipe ACE SID is invalid"))?,
             access_mask,
             allows,
             inherited: u32::from(header.AceFlags) & INHERITED_ACE != 0,
@@ -651,4 +660,22 @@ fn read_security_snapshot(
     }
 
     Ok((owner_sid, control & SE_DACL_PROTECTED != 0, entries))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE;
+
+    #[test]
+    fn a_security_read_failure_keeps_its_win32_code() {
+        let error = match NativeWindowsPipeSecurityReader::read(null_mut()) {
+            Err(error) => error,
+            Ok(_) => panic!("the security reader accepted a null handle"),
+        };
+        assert_eq!(
+            instance_security_error(error),
+            WindowsAttachAcceptError::VerifyInstanceSecurity(Some(ERROR_INVALID_HANDLE))
+        );
+    }
 }

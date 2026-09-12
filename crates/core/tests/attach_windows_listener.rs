@@ -241,6 +241,86 @@ fn accept_until_accepts_two_clients() {
 }
 
 #[test]
+fn a_probe_that_closes_before_accept_does_not_block_the_next_client() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
+
+    let _guard = LISTENER_TEST_LOCK.lock().unwrap();
+    for until_stop in [false, true] {
+        let mut listener = bind_listener();
+        let stop = Arc::new(WindowsAttachStopEvent::new().unwrap());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let timeout_stop = Arc::clone(&stop);
+        let timeout = thread::spawn(move || {
+            if done_rx.recv_timeout(Duration::from_secs(3)).is_err() {
+                timeout_stop.signal().unwrap();
+            }
+        });
+
+        // Close the probe before the server calls ConnectNamedPipe.
+        drop(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .security_qos_flags(SECURITY_IDENTIFICATION)
+                .open(listener.path())
+                .unwrap(),
+        );
+        let path = listener.path().to_owned();
+        let client = thread::spawn(move || open_client_with_retry(path));
+        if until_stop {
+            assert_eq!(
+                serve_next_windows_attach_until(
+                    &mut listener,
+                    "1.2.3",
+                    &stop,
+                    Arc::new(service_factory)
+                )
+                .unwrap(),
+                WindowsAttachServeOutcome::Served
+            );
+        } else {
+            serve_next_windows_attach(
+                &mut listener,
+                "1.2.3",
+                Instant::now() + Duration::from_secs(1),
+                Arc::new(service_factory),
+            )
+            .unwrap();
+        }
+        let mut client = client.join().unwrap();
+        assert_eq!(exchange_hello(&mut client).desktop_version, "1.2.3");
+        done_tx.send(()).unwrap();
+        timeout.join().unwrap();
+    }
+}
+
+#[test]
+fn a_disconnected_probe_still_obeys_the_deadline_and_stop() {
+    let _guard = LISTENER_TEST_LOCK.lock().unwrap();
+    let mut listener = bind_listener();
+    drop(open_client_with_retry(listener.path().to_owned()));
+    assert!(matches!(
+        listener.accept(Instant::now() + Duration::from_millis(20)),
+        Err(WindowsAttachAcceptError::DeadlineExpired)
+    ));
+    let stop = Arc::new(WindowsAttachStopEvent::new().unwrap());
+    drop(open_client_with_retry(listener.path().to_owned()));
+    let signaler = thread::spawn({
+        let stop = Arc::clone(&stop);
+        move || {
+            thread::sleep(Duration::from_millis(20));
+            stop.signal().unwrap();
+        }
+    });
+    assert!(matches!(
+        listener.accept_until(&stop).unwrap(),
+        WindowsAttachAcceptOutcome::Stopped
+    ));
+    signaler.join().unwrap();
+}
+
+#[test]
 fn accepts_two_clients_while_both_connections_stay_open() {
     let _guard = LISTENER_TEST_LOCK.lock().unwrap();
     let mut listener = bind_listener();

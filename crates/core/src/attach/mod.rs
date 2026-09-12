@@ -52,6 +52,7 @@ mod runtime_activity;
 #[cfg(unix)]
 mod termination;
 pub mod thread_service;
+mod windows_accept_error;
 #[cfg(target_os = "windows")]
 mod windows_connect;
 #[cfg(target_os = "windows")]
@@ -127,6 +128,7 @@ pub use runtime_activity::*;
 #[cfg(unix)]
 pub use termination::*;
 pub use thread_service::CompanionRecord;
+pub use windows_accept_error::*;
 #[cfg(target_os = "windows")]
 pub use windows_connect::*;
 #[cfg(target_os = "windows")]
