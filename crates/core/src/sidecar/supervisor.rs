@@ -396,7 +396,7 @@ fn supervise(
             }
             match child.try_wait() {
                 Ok(Some(exit)) => {
-                    let _ = stderr_reader.join();
+                    drain_stderr(stderr_reader, &config);
                     break process_exit_cause(exit, &stderr);
                 }
                 Err(error) => {
@@ -426,7 +426,7 @@ fn supervise(
                         config.shutdown_timeout,
                         config.poll_interval,
                     );
-                    let _ = stderr_reader.join();
+                    drain_stderr(stderr_reader, &config);
                     break SidecarEventCause::StartupTimeout {
                         timeout: config.startup_timeout,
                         stderr_tail: stderr_tail(&stderr),
@@ -457,7 +457,7 @@ fn supervise(
                             config.shutdown_timeout,
                             config.poll_interval,
                         );
-                        let _ = stderr_reader.join();
+                        drain_stderr(stderr_reader, &config);
                         break SidecarEventCause::HealthProbeFailure {
                             message: "probe reported loading after readiness".into(),
                             stderr_tail: stderr_tail(&stderr),
@@ -470,7 +470,7 @@ fn supervise(
                             config.shutdown_timeout,
                             config.poll_interval,
                         );
-                        let _ = stderr_reader.join();
+                        drain_stderr(stderr_reader, &config);
                         break SidecarEventCause::HealthProbeFailure {
                             message,
                             stderr_tail: stderr_tail(&stderr),
@@ -486,7 +486,7 @@ fn supervise(
                     config.shutdown_timeout,
                     config.poll_interval,
                 );
-                let _ = stderr_reader.join();
+                drain_stderr(stderr_reader, &config);
                 break SidecarEventCause::StartupTimeout {
                     timeout: config.startup_timeout,
                     stderr_tail: stderr_tail(&stderr),
@@ -502,6 +502,21 @@ fn supervise(
             return;
         }
         consecutive_failures = consecutive_failures.saturating_add(1);
+    }
+}
+
+fn drain_stderr(reader: JoinHandle<()>, config: &SidecarConfig) {
+    // A descendant can keep stderr open after Pi exits. Do not hold the run for EOF.
+    let deadline = Instant::now() + config.shutdown_timeout;
+    while !reader.is_finished() && Instant::now() < deadline {
+        thread::sleep(
+            config
+                .poll_interval
+                .min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+    if reader.is_finished() {
+        let _ = reader.join();
     }
 }
 

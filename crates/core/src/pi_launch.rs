@@ -189,6 +189,8 @@ pub fn pi_launch_config_for_executable(
             .env_remove
             .extend(LOCAL_MODE_ENV_REMOVE.iter().map(|name| (*name).to_owned()));
     } else {
+        // Cloud setup must release the run before the shell's receipt deadline.
+        config.startup_timeout = std::time::Duration::from_secs(30);
         config.env_remove.push("OPENAI_API_KEY".into());
         config
             .env

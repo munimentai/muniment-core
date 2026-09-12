@@ -331,7 +331,10 @@ fn every_launch_renders_the_selected_track_before_spawn() {
                 if artifact == PI_CANDIDATE_ARTIFACT {
                     assert_eq!(settings["packages"].as_array().unwrap().len(), 4);
                     assert_eq!(settings["defaultTools"].as_array().unwrap().len(), 8);
-                    assert_eq!(config.startup_timeout, Duration::from_secs(120));
+                    assert_eq!(
+                        config.startup_timeout,
+                        Duration::from_secs(if grant.is_local() { 120 } else { 30 })
+                    );
                 } else {
                     assert!(settings.get("packages").is_none());
                     assert!(settings.get("defaultTools").is_none());

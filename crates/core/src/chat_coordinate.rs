@@ -504,15 +504,26 @@ pub fn coordinate(
         std::thread::sleep(Duration::from_millis(10));
     }
     diagnostics.log_lifecycle();
-    if runtime.supervisor.status() != SidecarStatus::Healthy {
-        diagnostics.outcome = "not_started_pi_not_ready";
+    let readiness_status = runtime.supervisor.status();
+    if readiness_status != SidecarStatus::Healthy {
+        diagnostics.readiness_failed(readiness_status, startup_timeout);
+        let reason = if grant.is_local() {
+            "Reply setup timed out. Try again.".to_owned()
+        } else if readiness_status != SidecarStatus::Starting {
+            "Reply setup stopped before it became ready. Try again.".to_owned()
+        } else {
+            format!(
+                "Reply setup did not become ready within {} seconds. Try again.",
+                startup_timeout.as_secs()
+            )
+        };
         fail_start(
             &app,
             &journal,
             &mut projector,
             &run_id,
             &mut seq,
-            "Reply setup timed out. Try again.",
+            &reason,
             subject.as_deref(),
             resume.is_some(),
         );

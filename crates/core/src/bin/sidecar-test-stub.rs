@@ -12,6 +12,12 @@ fn main() {
         return;
     }
     if first.as_deref() == Some("--mode") {
+        if std::env::var_os("PI_STUB_STAY_STARTING").is_some() {
+            eprintln!("Pi stub cannot finish cloud extension setup.");
+            io::stderr().flush().unwrap();
+            thread::sleep(Duration::from_secs(60));
+            return;
+        }
         if std::env::var_os("PI_STUB_BLOCK_STDIN").is_some() {
             pi_rpc_blocked_stdin();
             return;
@@ -20,6 +26,21 @@ fn main() {
         return;
     }
     match first.as_deref() {
+        Some("hold-stderr") => thread::sleep(Duration::from_secs(10)),
+        Some("stderr-descendant") => {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("hold-stderr")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            thread::spawn(move || child.wait().unwrap());
+            eprintln!("Pi stub left a descendant with stderr open.");
+            io::stderr().flush().unwrap();
+            if args.next().as_deref() == Some("hang") {
+                thread::sleep(Duration::from_secs(60));
+            }
+        }
         Some("echo") => echo(),
         Some("json-rpc") => json_rpc(args.next()),
         Some("pi-rpc-interleaved") => pi_rpc_interleaved(),

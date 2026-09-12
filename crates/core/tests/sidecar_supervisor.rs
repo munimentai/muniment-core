@@ -32,6 +32,44 @@ fn config(args: &[&str]) -> SidecarConfig {
     cfg
 }
 
+#[test]
+fn descendant_stderr_cannot_hold_startup_failure_or_shutdown() {
+    check_descendant_stderr(false);
+}
+
+#[test]
+fn descendant_stderr_cannot_hold_startup_timeout_or_shutdown() {
+    check_descendant_stderr(true);
+}
+
+fn check_descendant_stderr(timeout: bool) {
+    let mut cfg = config(&["stderr-descendant", if timeout { "hang" } else { "exit" }]);
+    cfg.restart.max_restarts = 0;
+    let mut supervisor = SidecarSupervisor::spawn(cfg, |_| Ok(ProbeOutcome::Loading)).unwrap();
+    let events = supervisor.subscribe();
+    let deadline = Instant::now() + SHUTDOWN_COMPLETION_DEADLINE;
+    loop {
+        let event = events
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("The supervisor must report the failure before the descendant closes stderr.");
+        if event.status == SidecarStatus::Failed {
+            let stderr_tail = match event.cause {
+                Some(SidecarEventCause::StartupTimeout { stderr_tail, .. }) if timeout => {
+                    stderr_tail
+                }
+                Some(SidecarEventCause::ProcessExit { stderr_tail, .. }) if !timeout => stderr_tail,
+                cause => panic!("The supervisor reported the wrong failure: {cause:?}"),
+            };
+            assert_eq!(stderr_tail, ["Pi stub left a descendant with stderr open."]);
+            break;
+        }
+        assert_ne!(event.status, SidecarStatus::Healthy);
+    }
+    let started = Instant::now();
+    let _ = supervisor.shutdown();
+    assert!(started.elapsed() < SHUTDOWN_COMPLETION_DEADLINE);
+}
+
 fn temp_marker(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("muniment-sidecar-{name}-{}", std::process::id()))
 }

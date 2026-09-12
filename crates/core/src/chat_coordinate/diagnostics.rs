@@ -33,6 +33,20 @@ impl RunDiagnostics {
         self.log_stderr();
     }
 
+    pub fn readiness_failed(
+        &mut self,
+        status: crate::sidecar::SidecarStatus,
+        timeout: std::time::Duration,
+    ) {
+        self.outcome = "not_started_pi_not_ready";
+        eprintln!(
+            "muniment-runtime: run_id={} pi_spawn rejected cause=pi_not_ready status={status:?} readiness_bound_ms={}",
+            self.run_id,
+            timeout.as_millis()
+        );
+        self.log_stderr();
+    }
+
     fn log_stderr(&self) {
         let tail = self
             .stderr
