@@ -41,7 +41,7 @@ pub fn append_owner_only_record(
     validate_kind(root, &root_handle, true)?;
 
     let application_directory = directory.parent().expect("the resolver adds two segments");
-    // The MSI creates this directory with an inherited ACL.
+    // The application directory can have an inherited ACL.
     // Only the logs directory and runtime.log require owner-only access.
     let _application_handle = create_directory(application_directory, &mut security)?;
     let _directory_handle = create_owner_directory(directory, &mut security)?;
