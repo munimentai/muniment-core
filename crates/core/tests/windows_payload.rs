@@ -42,11 +42,11 @@ fn maps_installed_windows_payloads_to_the_desktop_executable() {
     for (runtime_payload, desktop_executable) in [
         (
             r"C:\Program Files\muniment\muniment-runtime.exe",
-            r"C:\Program Files\muniment\muniment.exe",
+            r"C:\Program Files\muniment\muniment-desktop.exe",
         ),
         (
             r"C:\Users\Ada\AppData\Local\muniment\muniment-runtime.exe",
-            r"C:\Users\Ada\AppData\Local\muniment\muniment.exe",
+            r"C:\Users\Ada\AppData\Local\muniment\muniment-desktop.exe",
         ),
     ] {
         assert_eq!(

@@ -12,7 +12,7 @@ use crate::windows_known_folders::{windows_payload_roots, WindowsKnownFolderErro
 
 const PAYLOAD_DIRECTORY: &str = "muniment";
 const PAYLOAD_FILE_NAME: &str = "muniment-runtime.exe";
-const DESKTOP_FILE_NAME: &str = "muniment.exe";
+const DESKTOP_FILE_NAME: &str = "muniment-desktop.exe";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PayloadFileKind {

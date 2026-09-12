@@ -164,6 +164,91 @@ mod unix_tests {
     }
 
     #[test]
+    fn installed_desktop_connects_through_the_windows_runtime_route() {
+        use muniment_core::attach::{
+            handshake_desktop_client, serve_windows_desktop_client_with, DesktopClientHolder,
+            DesktopClientStopHandle, WindowsAttachConnectError,
+        };
+        use muniment_core::windows_payload::installed_desktop_executable_from;
+
+        // Use host-absolute paths to test Windows admission over a Unix stream.
+        for root in [
+            "/Program Files/muniment",
+            "/Users/Ada/AppData/Local/muniment",
+        ] {
+            let expected =
+                installed_desktop_executable_from(&Path::new(root).join("muniment-runtime.exe"))
+                    .unwrap();
+            for (image, admitted) in [
+                (Path::new(root).join("muniment-desktop.exe"), true),
+                (Path::new(root).join("muniment.exe"), false),
+                (
+                    PathBuf::from("/build/target/release/muniment-desktop.exe"),
+                    false,
+                ),
+            ] {
+                let (client, mut server) = UnixStream::pair().unwrap();
+                let expected = expected.clone();
+                let session = std::thread::spawn(move || {
+                    let mut service = ListService::default();
+                    serve_windows_attach_session_with_reader(
+                        &mut server,
+                        &reader(&[1, 2, 3], &[1, 2, 3]),
+                        &FakeRouteReader {
+                            peer_pid: 42,
+                            image_path: image,
+                        },
+                        Some(&expected),
+                        "1.2.3",
+                        deadline(),
+                        &mut service,
+                    )
+                });
+                let stop = DesktopClientStopHandle::new();
+                let connect_stop = stop.clone();
+                let observe_stop = stop.clone();
+                let holder = DesktopClientHolder::new();
+                let observed_holder = holder.clone();
+                let mut stream = Some(client);
+                let mut connected = false;
+                serve_windows_desktop_client_with(
+                    "1.2.3",
+                    Duration::from_secs(1),
+                    Duration::from_millis(10),
+                    stop,
+                    holder,
+                    |status| {
+                        if status {
+                            connected = true;
+                            assert_eq!(observed_holder.runtime_version().as_deref(), Some("1.2.3"));
+                            observe_stop.stop();
+                        }
+                    },
+                    (
+                        |_| match stream.take() {
+                            Some(stream) => Ok(stream),
+                            None => {
+                                connect_stop.stop();
+                                Err(WindowsAttachConnectError::EndpointAbsent)
+                            }
+                        },
+                        handshake_desktop_client,
+                    ),
+                );
+                let outcome = session.join().unwrap().unwrap();
+                assert_eq!(
+                    connected, admitted,
+                    "The connection result must match admission for {root}."
+                );
+                assert_eq!(
+                    matches!(outcome, WindowsAttachSessionOutcome::DesktopClient(_)),
+                    admitted,
+                );
+            }
+        }
+    }
+
+    #[test]
     fn matching_desktop_peer_serves_admitted_requests() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         client
