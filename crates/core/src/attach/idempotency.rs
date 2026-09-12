@@ -66,7 +66,11 @@ impl IdempotencyStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|_| ProtocolError::persistence_failed())?;
+            .map_err(|_| {
+                ProtocolError::persistence_failed_with_reason(
+                    "The runtime could not start the idempotency transaction.",
+                )
+            })?;
         let existing: Option<(i64, Vec<u8>, String)> = transaction
             .query_row(
                 "SELECT hash_version, canonical_hash, committed_result FROM attach_idempotency
@@ -75,18 +79,28 @@ impl IdempotencyStore {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
-            .map_err(|_| ProtocolError::persistence_failed())?;
+            .map_err(|_| {
+                ProtocolError::persistence_failed_with_reason(
+                    "The runtime could not read the idempotency result.",
+                )
+            })?;
         if let Some((version, recorded_hash, encoded)) = existing {
             if version != HASH_VERSION || recorded_hash != hash {
                 return Err(ProtocolError::idempotency_conflict());
             }
-            let result =
-                serde_json::from_str(&encoded).map_err(|_| ProtocolError::persistence_failed())?;
+            let result = serde_json::from_str(&encoded).map_err(|_| {
+                ProtocolError::persistence_failed_with_reason(
+                    "The runtime could not decode the idempotency result.",
+                )
+            })?;
             return Ok(IdempotencyOutcome::Replayed(result));
         }
         let result = work_and_commit(&transaction)?;
-        let encoded =
-            serde_json::to_string(&result).map_err(|_| ProtocolError::persistence_failed())?;
+        let encoded = serde_json::to_string(&result).map_err(|_| {
+            ProtocolError::persistence_failed_with_reason(
+                "The runtime could not encode the idempotency result.",
+            )
+        })?;
         transaction
             .execute(
                 "INSERT INTO attach_idempotency
@@ -101,10 +115,16 @@ impl IdempotencyStore {
                     encoded
                 ],
             )
-            .map_err(|_| ProtocolError::persistence_failed())?;
-        transaction
-            .commit()
-            .map_err(|_| ProtocolError::persistence_failed())?;
+            .map_err(|_| {
+                ProtocolError::persistence_failed_with_reason(
+                    "The runtime could not save the idempotency result.",
+                )
+            })?;
+        transaction.commit().map_err(|_| {
+            ProtocolError::persistence_failed_with_reason(
+                "The runtime could not commit the idempotency result.",
+            )
+        })?;
         Ok(IdempotencyOutcome::Committed(result))
     }
 

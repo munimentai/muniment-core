@@ -268,6 +268,55 @@ fn failed_commit_rolls_back_work_and_record_and_profile_deletion_is_explicit() {
 }
 
 #[test]
+fn sign_in_persistence_failures_name_the_ledger_step_without_sql_or_credentials() {
+    for (setup, expected) in [
+        (
+            "DROP TABLE attach_idempotency",
+            "The runtime could not read the idempotency result.",
+        ),
+        (
+            "CREATE TRIGGER reject_result BEFORE INSERT ON attach_idempotency
+             BEGIN SELECT RAISE(ABORT, 'private-token'); END;",
+            "The runtime could not save the idempotency result.",
+        ),
+        (
+            "CREATE TABLE parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE child(id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+             CREATE TRIGGER reject_commit AFTER INSERT ON attach_idempotency
+             BEGIN INSERT INTO child VALUES (1); END;",
+            "The runtime could not commit the idempotency result.",
+        ),
+    ] {
+        let path = path("sign-in-failure");
+        let mut store = IdempotencyStore::open(&path).unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch(setup).unwrap();
+        let error = store
+            .execute(
+                "profile",
+                &request(Operation::SessionSignIn, Some(id(5))),
+                &json!({}),
+                || Ok(()),
+                |_| {
+                    Ok(CommittedResult {
+                        body: json!({"signed_in": true}),
+                        cursor: None,
+                    })
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ProtocolError::persistence_failed_with_reason(expected)
+        );
+        assert!(!error.to_string().contains("private-token"));
+        drop(connection);
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
 fn protocol_errors_are_closed_and_redacted() {
     for error in [
         ProtocolError::idempotency_key_required(),
