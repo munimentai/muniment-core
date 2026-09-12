@@ -41,7 +41,9 @@ pub fn append_owner_only_record(
     validate_kind(root, &root_handle, true)?;
 
     let application_directory = directory.parent().expect("the resolver adds two segments");
-    let _application_handle = create_owner_directory(application_directory, &mut security)?;
+    // The MSI creates this directory with an inherited ACL.
+    // Only the logs directory and runtime.log require owner-only access.
+    let _application_handle = create_directory(application_directory, &mut security)?;
     let _directory_handle = create_owner_directory(directory, &mut security)?;
 
     let path = directory.join("runtime.log");
@@ -98,6 +100,12 @@ fn reject_reparse_points(path: &Path) -> io::Result<()> {
 }
 
 fn create_owner_directory(path: &Path, security: &mut OwnerSecurity) -> io::Result<OwnedHandle> {
+    let handle = create_directory(path, security)?;
+    validate_owner_access(handle.as_raw_handle(), security.sid())?;
+    Ok(handle)
+}
+
+fn create_directory(path: &Path, security: &mut OwnerSecurity) -> io::Result<OwnedHandle> {
     let wide = wide(path);
     let attributes = security.attributes();
     if unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) } == 0 {
@@ -108,7 +116,6 @@ fn create_owner_directory(path: &Path, security: &mut OwnerSecurity) -> io::Resu
     }
     let handle = open_directory(path)?;
     validate_kind(path, &handle, true)?;
-    validate_owner_access(handle.as_raw_handle(), security.sid())?;
     Ok(handle)
 }
 
