@@ -49,6 +49,41 @@ mod tests {
     }
 
     #[test]
+    fn macos_config_link_shares_the_marker_without_runner_environment() {
+        let root = std::env::temp_dir().join(format!(
+            "muniment-config-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let login_home = root.join("login home");
+        let runtime_config =
+            macos_config_directory_from(None, Some(login_home.as_os_str())).unwrap();
+        std::fs::create_dir_all(runtime_config.parent().unwrap()).unwrap();
+        for spec in ["degraded", "ready"] {
+            let spec_home = root.join(spec);
+            let desktop_config =
+                macos_config_directory_from(None, Some(spec_home.as_os_str())).unwrap();
+            std::fs::create_dir_all(&desktop_config).unwrap();
+            std::os::unix::fs::symlink(&desktop_config, &runtime_config).unwrap();
+            assert_eq!(
+                std::fs::canonicalize(&runtime_config).unwrap(),
+                std::fs::canonicalize(&desktop_config).unwrap()
+            );
+            assert!(!is_local_mode(&runtime_config));
+            let marker = desktop_config.join(LOCAL_MODE_MARKER);
+            std::fs::write(&marker, []).unwrap();
+            assert!(is_local_mode(&runtime_config));
+            std::fs::remove_file(marker).unwrap();
+            assert!(!is_local_mode(&runtime_config));
+            std::fs::remove_file(&runtime_config).unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn macos_config_override_keeps_launchd_and_the_desktop_in_the_spec_home() {
         let config = OsStr::new("/tmp/wdio state/degraded/Library/Application Support");
         for home in [
