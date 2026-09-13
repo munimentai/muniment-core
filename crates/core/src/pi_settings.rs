@@ -106,20 +106,24 @@ fn normalize_shell_path(value: &str, windows: bool) -> String {
     value.to_owned()
 }
 
-pub fn prepare_pi_settings(artifact: PiArtifactDescriptor, executable: &Path) -> io::Result<()> {
+pub fn prepare_pi_settings(
+    artifact: PiArtifactDescriptor,
+    executable: &Path,
+) -> Result<(), crate::pi_launch::PiLaunchError> {
+    use crate::pi_launch::PiLaunchError;
     if artifact.version != PI_CANDIDATE_ARTIFACT.version {
         return Ok(());
     }
     let home = std::env::home_dir().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "Cannot locate the Pi home directory.",
-        )
+        PiLaunchError::rejected("agent_home_resolve", "Cannot locate the Pi home directory.")
     })?;
     let agent_directory = std::env::var_os("PI_CODING_AGENT_DIR");
-    let directory = pi_agent_directory(&home, agent_directory.as_deref())?;
-    store_pi_settings(&directory.join("settings.json"), artifact)?;
+    let directory = pi_agent_directory(&home, agent_directory.as_deref())
+        .map_err(|error| PiLaunchError::rejected("agent_directory_resolve", error))?;
+    store_pi_settings(&directory.join("settings.json"), artifact)
+        .map_err(|error| PiLaunchError::rejected("settings_write", error))?;
     crate::pi_packages::prepare_pi_packages(&directory, executable)
+        .map_err(|error| PiLaunchError::rejected("package_install", error))
 }
 
 // proper-lockfile defaults to a 10-second stale threshold and a 5-second heartbeat.

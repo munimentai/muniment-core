@@ -52,6 +52,12 @@ impl PiLaunchBoundaries for Boundary {
         ARTIFACT
     }
     fn prepare_pi_settings(&self, _: PiArtifactDescriptor, _: &Path) -> Result<(), PiLaunchError> {
+        if self.outcome == "config-failed" {
+            return Err(PiLaunchError::rejected(
+                "package_install",
+                "Pi package install failed: exit status: 7 stderr_tail=registry refused password=hidden-value",
+            ));
+        }
         Ok(())
     }
     fn acquire_pi(&self, root: &Path, cancelled: &AtomicBool) -> Result<PathBuf, PiLaunchError> {
@@ -72,7 +78,7 @@ impl PiLaunchBoundaries for Boundary {
                 muniment_core::model_install::ModelInstallError::Publication(error),
             ));
         }
-        if self.outcome != "complete" {
+        if !matches!(self.outcome, "complete" | "config-failed") {
             return Err(PiLaunchError::Acquisition(
                 muniment_core::model_install::ModelInstallError::Acquisition(
                     muniment_core::sidecar::pi_install::PiInstallError::Download,
@@ -112,6 +118,19 @@ fn coordinate_acquires_from_the_profile_once_without_an_environment_root() {
         assert!(stderr.contains("pi_acquire completed"), "{stderr}");
         assert!(stderr.contains("pi_spawn started"), "{stderr}");
         assert!(stderr.contains("first_event"), "{stderr}");
+        let config = stderr
+            .lines()
+            .find(|line| line.contains("step=package_install"))
+            .unwrap_or_else(|| panic!("Missing config diagnostic: {stderr}"));
+        assert!(config.contains("config_error=RejectedConfig"));
+        assert!(config.contains("exit status: 7 stderr_tail=registry refused"));
+        assert!(!config.contains("hidden-value"));
+        let run = config
+            .split_whitespace()
+            .find(|word| word.starts_with("run_id="))
+            .unwrap();
+        assert!(stderr.contains(&format!("{run} pi_acquire completed")));
+        assert!(stderr.contains(&format!("{run} pi_spawn not_started")));
         let publication = stderr
             .lines()
             .find(|line| {
@@ -128,7 +147,13 @@ fn coordinate_acquires_from_the_profile_once_without_an_environment_root() {
         return;
     }
     assert!(std::env::var_os("MUNIMENT_PI_ROOT").is_none());
-    for outcome in ["complete", "failed", "publication-failed", "cancelled"] {
+    for outcome in [
+        "complete",
+        "failed",
+        "publication-failed",
+        "cancelled",
+        "config-failed",
+    ] {
         let directory =
             std::env::temp_dir().join(format!("muniment-pi-coordinate-{}", uuid::Uuid::new_v4()));
         let profile = ChatProfile::new(&directory);
@@ -186,7 +211,7 @@ fn coordinate_acquires_from_the_profile_once_without_an_environment_root() {
                 Some(prepared),
             );
             let events = boundary.events.lock().unwrap();
-            let phase = if outcome == "publication-failed" {
+            let phase = if matches!(outcome, "publication-failed" | "config-failed") {
                 "failed"
             } else {
                 outcome
@@ -194,13 +219,12 @@ fn coordinate_acquires_from_the_profile_once_without_an_environment_root() {
             assert_eq!(events.last().unwrap().phase, phase);
             if phase == "failed" {
                 assert!(started.elapsed() < std::time::Duration::from_secs(30));
-                assert!(events
-                    .last()
-                    .unwrap()
-                    .failure_reason
-                    .as_deref()
-                    .unwrap()
-                    .starts_with("Reply setup failed."));
+                let reason = events.last().unwrap().failure_reason.as_deref().unwrap();
+                if outcome == "config-failed" {
+                    assert_eq!(reason, "The agent runtime is unavailable.");
+                } else {
+                    assert!(reason.starts_with("Reply setup failed."));
+                }
                 assert!(events.last().unwrap().text.is_empty());
             }
             assert_eq!(

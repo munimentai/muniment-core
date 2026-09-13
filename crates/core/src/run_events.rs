@@ -132,12 +132,31 @@ pub fn append_emit(
     payload: Value,
     subject: Option<&str>,
 ) -> Result<(), ()> {
+    append_emit_detailed(
+        sink, storage, projector, run_id, seq, kind, payload, subject,
+    )
+    .map_err(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_emit_detailed(
+    sink: &impl ChatEventSink,
+    storage: &SharedStorage,
+    projector: &mut ChatProjector,
+    run_id: &str,
+    seq: &mut u64,
+    kind: &str,
+    payload: Value,
+    subject: Option<&str>,
+) -> Result<(), String> {
     *seq += 1;
     let envelope = event_envelope(sink, run_id, *seq, kind, payload, subject);
     let (projection, code_diff, applied_diffs) = {
-        let mut storage = storage.lock().map_err(|_| ())?;
-        let projection =
-            append_run_event(&mut storage.journal, projector, &envelope).map_err(|_| ())?;
+        let mut storage = storage
+            .lock()
+            .map_err(|error| format!("Journal lock failed: {error}"))?;
+        let projection = append_run_event(&mut storage.journal, projector, &envelope)
+            .map_err(|error| format!("Journal append failed: {error:?}"))?;
         let gate = projection.pending_permission.clone();
         let ChatStorage { journal, cas } = &mut *storage;
         let code_diff = load_pending_code_diff(journal, cas, run_id, &gate);
@@ -146,6 +165,7 @@ pub fn append_emit(
         (projection, code_diff, applied_diffs)
     };
     sink.deliver(chat_event(run_id, projection, code_diff, applied_diffs))
+        .map_err(|()| "The shell event sink rejected the projection.".into())
 }
 
 #[allow(clippy::result_unit_err, clippy::too_many_arguments)]
@@ -327,6 +347,57 @@ mod tests {
         assert_eq!(events[0].phase, "thinking");
         let stored = storage.lock().unwrap().journal.events(&run_id).unwrap();
         assert_eq!(stored[0].provenance.actor_id.as_deref(), Some("actor-1"));
+    }
+
+    #[test]
+    fn detailed_append_keeps_journal_conflicts_and_sink_failures_distinct() {
+        struct RejectingSink;
+        impl ChatEventSink for RejectingSink {
+            fn provenance(&self) -> (&str, &str) {
+                ("test", "1")
+            }
+            fn deliver(&self, _: ChatEvent) -> Result<(), ()> {
+                Err(())
+            }
+        }
+        let storage = storage();
+        let run_id = Uuid::now_v7().to_string();
+        let mut projector = ChatProjector::new();
+        let mut seq = 0;
+        let error = append_emit_detailed(
+            &RejectingSink,
+            &storage,
+            &mut projector,
+            &run_id,
+            &mut seq,
+            "run.started",
+            json!({}),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error, "The shell event sink rejected the projection.");
+        assert_eq!(
+            storage
+                .lock()
+                .unwrap()
+                .journal
+                .events(&run_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        let error = append_emit_detailed(
+            &RecordingSink::default(),
+            &storage,
+            &mut ChatProjector::new(),
+            &run_id,
+            &mut 0,
+            "run.started",
+            json!({}),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("Append(Conflict("), "{error}");
     }
 
     #[test]

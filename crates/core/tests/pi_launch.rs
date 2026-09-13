@@ -302,7 +302,7 @@ impl PiLaunchBoundaries for TrackBoundaries {
         _executable: &std::path::Path,
     ) -> Result<(), PiLaunchError> {
         muniment_core::pi_settings::store_pi_settings(&self.root.join("settings.json"), artifact)
-            .map_err(|_| PiLaunchError::RejectedConfig)
+            .map_err(|error| PiLaunchError::rejected("settings_write", error))
     }
 }
 
@@ -365,9 +365,11 @@ fn rejects_a_candidate_launch_when_settings_cannot_be_saved() {
         artifact: muniment_core::sidecar::pi_install::PI_CANDIDATE_ARTIFACT,
     };
     for grant in [ChatGrant::local(), grant()] {
-        assert_eq!(
-            pi_launch_config_for_executable(&boundaries, "pi".into(), &grant, None).unwrap_err(),
-            PiLaunchError::RejectedConfig,
+        let error =
+            pi_launch_config_for_executable(&boundaries, "pi".into(), &grant, None).unwrap_err();
+        assert!(
+            matches!(error, PiLaunchError::RejectedConfig { step: "settings_write", ref cause }
+            if cause.contains("invalid type: null"))
         );
     }
     assert_eq!(
@@ -433,10 +435,31 @@ fn reports_a_rejected_config() {
         session_root: Ok(missing),
         extension: None,
     };
-    assert_eq!(
-        pi_launch_config_for_executable(&boundaries, "pi".into(), &grant(), None).unwrap_err(),
-        PiLaunchError::RejectedConfig
+    let error =
+        pi_launch_config_for_executable(&boundaries, "pi".into(), &grant(), None).unwrap_err();
+    assert!(
+        matches!(error, PiLaunchError::RejectedConfig { step: "session_root_check", ref cause }
+        if cause.contains("canonicalization failed") && cause.contains("os error"))
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn cloud_extension_failure_keeps_the_cause_and_local_mode_skips_the_write() {
+    let root = temporary_directory();
+    fs::create_dir(root.join("muniment-cloud-provider.mjs")).unwrap();
+    let boundaries = Boundaries {
+        session_root: Ok(root.clone()),
+        extension: None,
+    };
+    pi_launch_config_for_executable(&boundaries, "pi".into(), &ChatGrant::local(), None).unwrap();
+    let error =
+        pi_launch_config_for_executable(&boundaries, "pi".into(), &grant(), None).unwrap_err();
+    assert!(
+        matches!(error, PiLaunchError::RejectedConfig { step: "cloud_extension_write", ref cause }
+        if cause.contains("os error"))
+    );
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
     fs::remove_dir_all(root).unwrap();
 }
 

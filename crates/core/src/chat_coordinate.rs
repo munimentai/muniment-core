@@ -328,7 +328,7 @@ pub fn coordinate(
             let root = app.pi_install_root()?;
             if crate::sidecar::pi_install::resolve_current_for(&root, app.pi_artifact()).is_err() {
                 eprintln!("muniment-runtime: run_id={run_id} pi_acquire started");
-                if append_emit(
+                crate::run_events::append_emit_detailed(
                     &app,
                     &journal,
                     &mut projector,
@@ -338,10 +338,7 @@ pub fn coordinate(
                     json!({}),
                     subject.as_deref(),
                 )
-                .is_err()
-                {
-                    return Err(PiLaunchError::RejectedConfig);
-                }
+                .map_err(|error| PiLaunchError::rejected("pi_acquire_started_append", error))?;
                 let result = app.acquire_pi(&root, &cancelled);
                 match &result {
                     Ok(_) => eprintln!("muniment-runtime: run_id={run_id} pi_acquire completed"),
@@ -368,11 +365,14 @@ pub fn coordinate(
             if matches!(
                 projector
                     .projection()
-                    .map_err(|_| PiLaunchError::RejectedConfig)?
+                    .map_err(|error| PiLaunchError::rejected(
+                        "pi_acquire_completed_projection",
+                        format!("{error:?}")
+                    ))?
                     .status,
                 Some(crate::journal::reducer::RunStatus::AcquiringPi { .. })
             ) {
-                append_emit(
+                crate::run_events::append_emit_detailed(
                     &app,
                     &journal,
                     &mut projector,
@@ -382,7 +382,7 @@ pub fn coordinate(
                     json!({}),
                     subject.as_deref(),
                 )
-                .map_err(|_| PiLaunchError::RejectedConfig)?;
+                .map_err(|error| PiLaunchError::rejected("pi_acquire_completed_append", error))?;
             }
             Ok(config)
         })();
@@ -425,7 +425,7 @@ pub fn coordinate(
                 return;
             }
             Err(error) => {
-                eprintln!("muniment-runtime: run_id={run_id} pi_spawn config_error={error:?}");
+                eprintln!("{}", diagnostics::config_error_line(&run_id, &error));
                 let message = if matches!(error, PiLaunchError::Acquisition(_)) {
                     "Reply setup failed. Check your connection and storage, then retry."
                 } else {

@@ -99,6 +99,16 @@ impl Drop for RunDiagnostics {
     }
 }
 
+pub(super) fn config_error_line(run_id: &str, error: &crate::pi_launch::PiLaunchError) -> String {
+    match error {
+        crate::pi_launch::PiLaunchError::RejectedConfig { step, cause } => format!(
+            "muniment-runtime: run_id={run_id} pi_spawn config_error=RejectedConfig step={step} error={}",
+            serde_json::to_string(&crate::pi_launch::diagnostic_text(cause)).unwrap()
+        ),
+        _ => format!("muniment-runtime: run_id={run_id} pi_spawn config_error={error:?}"),
+    }
+}
+
 fn stderr_line(run_id: &str, tail: Vec<String>) -> String {
     // Keep diagnostics bounded even when Pi emits a long stderr line.
     let tail: Vec<String> = tail
@@ -119,6 +129,128 @@ fn stderr_line(run_id: &str, tail: Vec<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_failure_names_the_run_step_and_redacted_cause() {
+        let error = crate::pi_launch::PiLaunchError::rejected(
+            "package_install",
+            "The agent runtime package install failed: exit status: 1\nstderr_tail=registry refused password=hidden-value",
+        );
+        let line = config_error_line("run-config", &error);
+        assert!(line.contains(
+            "run_id=run-config pi_spawn config_error=RejectedConfig step=package_install"
+        ));
+        assert!(line.contains("exit status: 1"));
+        assert!(line.contains("stderr_tail=registry refused"));
+        assert!(!line.contains("hidden-value"));
+        assert_eq!(line.lines().count(), 1);
+    }
+
+    #[test]
+    fn config_log_redacts_terminal_escapes_and_multiline_credentials() {
+        for input in [
+            "password\u{1b}[0m=short",
+            "{\"password\":\n\"opaque-credential\"}",
+            "{\"password\":\n\n\"opaque-credential\"}",
+            "{\"password\":\"\nopaque-credential\n\"}",
+            "{\"password\":\"short\",\"token\":\n\"opaque-credential\"}",
+            "{\"password\":\"token=short\nopaque-credential\n\"}",
+            "{\"password\":\"escaped\\\"\nopaque-credential\n\"}",
+            "password\u{1b}]0;title\u{7}=short",
+            "password\u{1b}]0;title\u{1b}\\=short",
+            "password\u{9b}0m=short",
+            "password\u{1b}[\n0m=short",
+        ] {
+            let cause = format!("registry refused\n{input}\nlast diagnostic");
+            for cause in [
+                cause.clone(),
+                crate::pi_packages::captured_stderr_for_test(cause.as_bytes()),
+            ] {
+                let error = crate::pi_launch::PiLaunchError::rejected("package_install", &cause);
+                // Check both the constructor and the formatter's defense against a raw cause.
+                let raw = crate::pi_launch::PiLaunchError::RejectedConfig {
+                    step: "package_install",
+                    cause,
+                };
+                for error in [error, raw] {
+                    let line = config_error_line("run-config", &error);
+                    assert!(line.contains("run_id=run-config"), "{line}");
+                    assert!(line.contains("step=package_install"), "{line}");
+                    assert!(line.contains("registry refused"), "{line}");
+                    assert!(line.contains("last diagnostic"), "{line}");
+                    assert!(line.contains("[redacted]"), "{line}");
+                    assert!(!line.contains("short"), "{line}");
+                    assert!(!line.contains("opaque-credential"), "{line}");
+                    assert!(!line.contains("title"), "{line}");
+                    assert_eq!(line.lines().count(), 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn config_log_suppresses_credentials_after_stderr_overflow() {
+        for hidden_header in ["password:", "-----BEGIN PRIVATE KEY-----"] {
+            let input = format!(
+                "registry refused\n{}{hidden_header}\nopaque-credential\nlast diagnostic",
+                " ".repeat(65_536),
+            );
+            let cause = crate::pi_packages::captured_stderr_for_test(input.as_bytes());
+            let error = crate::pi_launch::PiLaunchError::rejected("package_install", cause);
+            let line = config_error_line("run-overflow", &error);
+            assert!(line.contains("run_id=run-overflow"), "{line}");
+            assert!(line.contains("step=package_install"), "{line}");
+            assert!(line.contains("registry refused"), "{line}");
+            assert!(line.contains("[redacted]"), "{line}");
+            assert!(!line.contains("opaque-credential"), "{line}");
+            assert!(!line.contains("last diagnostic"), "{line}");
+        }
+    }
+
+    #[test]
+    fn config_log_redacts_multiline_environment_secrets_before_stderr_tail_bounds() {
+        const SECRET: &str = "opaque-part-one\nopaque-part-two";
+        // A child process scopes the environment without mutating concurrent tests.
+        if std::env::var("PROBE_PASSWORD").as_deref() != Ok(SECRET) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "chat_coordinate::diagnostics::tests::config_log_redacts_multiline_environment_secrets_before_stderr_tail_bounds",
+                    "--nocapture",
+                ])
+                .env("PROBE_PASSWORD", SECRET)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        for input in [
+            SECRET.to_owned(),
+            SECRET.replace('\n', "\r\n"),
+            format!("{SECRET}\n{}last diagnostic", "detail\n".repeat(18)),
+            format!("{SECRET}\n{}\nlast diagnostic", "x ".repeat(2032)),
+            format!("{}{SECRET}", "x ".repeat(4090)),
+            "opaque-part-two".into(),
+        ] {
+            let cause = crate::pi_packages::captured_stderr_for_test(input.as_bytes());
+            assert!(!cause.contains("opaque"), "{cause}");
+            assert!(!cause.contains("part-"), "{cause}");
+            assert!(!cause.contains("two"), "{cause}");
+            let error = crate::pi_launch::PiLaunchError::rejected("package_install", cause);
+            let line = config_error_line("run-environment", &error);
+            assert!(line.contains("run_id=run-environment"), "{line}");
+            assert!(line.contains("step=package_install"), "{line}");
+            assert!(line.contains("[redacted]"), "{line}");
+            assert!(!line.contains("opaque-part"), "{line}");
+            assert!(!line.contains("part-two"), "{line}");
+            assert_eq!(line.lines().count(), 1);
+        }
+    }
 
     #[test]
     fn stderr_tail_is_bounded_and_stays_on_one_runtime_line() {
