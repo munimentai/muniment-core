@@ -33,7 +33,36 @@ fn installed(directory: &Path) -> bool {
     })
 }
 
+#[cfg(windows)]
+fn bun_install_directory(directory: &Path) -> std::path::PathBuf {
+    use std::ffi::OsString;
+    use std::path::{Component, Prefix};
+
+    let mut components = directory.components();
+    let mut plain = match components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::VerbatimDisk(drive) => OsString::from(format!("{}:", char::from(drive))),
+            Prefix::VerbatimUNC(server, share) => {
+                let mut plain = OsString::from(r"\\");
+                plain.push(server);
+                plain.push("\\");
+                plain.push(share);
+                plain
+            }
+            _ => return directory.to_owned(),
+        },
+        _ => return directory.to_owned(),
+    };
+    plain.push(components.as_path());
+    plain.into()
+}
+
 fn install_command(executable: &Path, directory: &Path) -> Command {
+    // Bun joins package.json with a forward slash, which Windows verbatim paths reject.
+    #[cfg(windows)]
+    let directory = bun_install_directory(directory);
+    #[cfg(windows)]
+    let directory = directory.as_path();
     let mut command = Command::new(executable);
     command
         // Bun's documented BUN_BE_BUN switch exposes the embedded package manager.
@@ -499,9 +528,61 @@ mod tests {
         .unwrap();
         prepare_pi_packages(&agent, Path::new("pi.exe")).unwrap();
         let command = install_command(Path::new("pi.exe"), &npm.canonicalize().unwrap());
-        assert_eq!(command.get_current_dir(), Some(npm.as_path()));
-        assert_eq!(command.get_args().last().unwrap(), npm.as_os_str());
+        let resolved = command.get_current_dir().unwrap();
+        assert!(resolved.is_absolute());
+        assert!(!resolved.as_os_str().to_string_lossy().starts_with(r"\\?\"));
+        assert_eq!(resolved.canonicalize().unwrap(), npm);
+        assert_eq!(command.get_args().last().unwrap(), resolved.as_os_str());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn install_uses_plain_windows_paths_for_argument_and_working_directory() {
+        for (resolved, expected) in [
+            (
+                r"\\?\C:\Users\harness.DESKTOP-27SP6A1\.pi\agent\npm",
+                r"C:\Users\harness.DESKTOP-27SP6A1\.pi\agent\npm",
+            ),
+            (
+                r"\\?\D:\agent with spaces\日本語\npm",
+                r"D:\agent with spaces\日本語\npm",
+            ),
+            (r"\\?\C:\", r"C:\"),
+            (
+                r"\\?\UNC\server\share\agent\npm",
+                r"\\server\share\agent\npm",
+            ),
+            (r"C:\agent\npm", r"C:\agent\npm"),
+            (r"\\server\share\agent\npm", r"\\server\share\agent\npm"),
+        ] {
+            let command = install_command(Path::new("pi.exe"), Path::new(resolved));
+            assert_eq!(command.get_current_dir(), Some(Path::new(expected)));
+            assert_eq!(command.get_args().last().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn install_directory_preserves_non_unicode_windows_paths() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        let mut expected: Vec<_> = r"C:\agent\".encode_utf16().collect();
+        expected.push(0xD800);
+        expected.extend(r"\npm".encode_utf16());
+        let verbatim: Vec<_> = r"\\?\"
+            .encode_utf16()
+            .chain(expected.iter().copied())
+            .collect();
+        let directory = OsString::from_wide(&verbatim);
+        let command = install_command(Path::new("pi.exe"), Path::new(&directory));
+        let resolved = command.get_current_dir().unwrap();
+        assert_eq!(
+            resolved.as_os_str().encode_wide().collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(command.get_args().last().unwrap(), resolved.as_os_str());
     }
 
     #[test]
