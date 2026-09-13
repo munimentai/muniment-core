@@ -133,6 +133,26 @@ impl DesktopClientHolder {
         })
     }
 
+    /// Captures the refusal under the client lock, before another request can replace it.
+    pub fn run_submit_with_reason(
+        &self,
+        text: &str,
+        files: &[String],
+        thread_id: Option<&str>,
+        compatible: impl FnOnce(&str) -> bool,
+    ) -> Result<RunSubmitAccepted, (ClientError, Option<crate::ProtocolError>)> {
+        let mut reason = None;
+        let result = self.with_compatible_client(compatible, |client| {
+            client.take_request_error();
+            let result = client.run_submit(text, files, thread_id);
+            if result.is_err() {
+                reason = client.take_request_error();
+            }
+            result
+        });
+        result.map_err(|error| (error, reason))
+    }
+
     pub fn run_cancel(&self, run_id: &str) -> Result<RunCancelAccepted, ClientError> {
         self.with_client(|client| client.run_cancel(run_id))
     }
@@ -310,6 +330,126 @@ mod tests {
             holder.thread_summaries(20, None),
             Err(ClientError::ConnectionClosed)
         );
+        assert!(holder.inner.0.lock().unwrap().is_none());
+        assert_eq!(holder.runtime_version(), None);
+    }
+
+    #[test]
+    fn submit_captures_each_refusal_without_stale_reasons_or_disconnects() {
+        use std::io::{Read, Write};
+
+        let holder = DesktopClientHolder::new();
+        let (stream, mut server) = UnixStream::pair().unwrap();
+        server.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+        *holder.inner.0.lock().unwrap() = Some(desktop_client_for_test(
+            Box::new(stream),
+            "1.0.0".into(),
+            IO_TIMEOUT,
+        ));
+        let reasons = [
+            "chat_not_entitled: No chat model is currently available for this account.",
+            "chat_not_entitled: The account has no allowed model.",
+        ];
+        let worker = std::thread::spawn(move || {
+            for reason in reasons {
+                let mut prefix = [0; 4];
+                server.read_exact(&mut prefix).unwrap();
+                let mut body = vec![0; u32::from_be_bytes(prefix) as usize];
+                server.read_exact(&mut body).unwrap();
+                let request: crate::Request = serde_json::from_slice(&body).unwrap();
+                assert_eq!(request.operation, Operation::RunSubmit);
+                let response = serde_json::json!({
+                    "protocol": "muniment.attach/1", "request_id": request.request_id,
+                    "ok": false, "error": crate::ProtocolError::unauthorized_with_reason(reason),
+                });
+                server
+                    .write_all(&crate::encode_frame(&response).unwrap())
+                    .unwrap();
+            }
+        });
+        for reason in reasons {
+            let started = Instant::now();
+            assert_eq!(
+                holder.run_submit_with_reason("prompt", &[], None, |_| true),
+                Err((
+                    ClientError::AuthorizationExpired,
+                    Some(crate::ProtocolError::unauthorized_with_reason(reason))
+                ))
+            );
+            assert!(started.elapsed() < Duration::from_secs(30));
+            assert!(holder.inner.0.lock().unwrap().is_some());
+            assert_eq!(
+                holder.run_submit_with_reason("prompt", &[], None, |_| false),
+                Err((ClientError::RuntimeUpgradePending, None))
+            );
+        }
+        worker.join().unwrap();
+        assert_eq!(
+            holder.run_submit_with_reason(" ", &[], None, |_| true),
+            Err((ClientError::UnexpectedMessage, None))
+        );
+    }
+
+    #[test]
+    fn delayed_submit_refusal_keeps_reason_connection_and_other_request_deadlines() {
+        use std::io::{Read, Write};
+        use std::sync::mpsc;
+
+        let holder = DesktopClientHolder::new();
+        let (stream, mut server) = UnixStream::pair().unwrap();
+        server.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+        *holder.inner.0.lock().unwrap() = Some(desktop_client_for_test(
+            Box::new(stream),
+            "1.0.0".into(),
+            IO_TIMEOUT,
+        ));
+        *holder.runtime_version.lock().unwrap() = Some("1.0.0".into());
+        let reason = crate::ProtocolError::unauthorized_with_reason(
+            "chat_not_entitled: No chat model is currently available for this account.",
+        );
+        let expected = reason.clone();
+        let (release, released) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            for operation in [Operation::RunSubmit, Operation::SessionStatus] {
+                let mut prefix = [0; 4];
+                server.read_exact(&mut prefix).unwrap();
+                let mut body = vec![0; u32::from_be_bytes(prefix) as usize];
+                server.read_exact(&mut body).unwrap();
+                let request: crate::Request = serde_json::from_slice(&body).unwrap();
+                assert_eq!(request.operation, operation);
+                if operation == Operation::RunSubmit {
+                    std::thread::sleep(Duration::from_secs(6));
+                    let response = serde_json::json!({
+                        "protocol": "muniment.attach/1", "request_id": request.request_id,
+                        "ok": false, "error": reason,
+                    });
+                    server
+                        .write_all(&crate::encode_frame(&response).unwrap())
+                        .unwrap();
+                } else {
+                    // Keep the socket open without a response to test the next request's deadline.
+                    let _ = released.recv_timeout(Duration::from_secs(35));
+                }
+            }
+        });
+
+        let started = Instant::now();
+        assert_eq!(
+            holder.run_submit_with_reason("prompt", &[], None, |_| true),
+            Err((ClientError::AuthorizationExpired, Some(expected)))
+        );
+        assert!(started.elapsed() >= Duration::from_secs(6));
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert!(holder.inner.0.lock().unwrap().is_some());
+        assert_eq!(holder.runtime_version().as_deref(), Some("1.0.0"));
+
+        let started = Instant::now();
+        assert_eq!(holder.session_status(), Err(ClientError::Timeout));
+        let elapsed = started.elapsed();
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(elapsed >= IO_TIMEOUT);
+        assert!(elapsed < IO_TIMEOUT + Duration::from_secs(2));
         assert!(holder.inner.0.lock().unwrap().is_none());
         assert_eq!(holder.runtime_version(), None);
     }

@@ -16,6 +16,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
+// Grant issuance can take longer than the default desktop request deadline.
+const RUN_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_THREAD_ID_LENGTH: usize = 36;
 const MAX_CURSOR_LENGTH: usize = 1024;
 const MAX_RUN_MESSAGE_TEXT_LENGTH: usize = 32 * 1024;
@@ -65,6 +67,10 @@ impl DesktopClient {
     /// Returns the protocol error from the most recent wire request, if it failed.
     pub fn last_request_error(&self) -> Option<&crate::ProtocolError> {
         self.last_request_error.as_ref()
+    }
+
+    pub(crate) fn take_request_error(&mut self) -> Option<crate::ProtocolError> {
+        self.last_request_error.take()
     }
 
     pub fn request(
@@ -176,10 +182,11 @@ impl DesktopClient {
         {
             return Err(ClientError::UnexpectedMessage);
         }
-        let response = self.request(
+        let response = self.request_before(
             Operation::RunSubmit,
             Some(fresh_request_id()?),
             serde_json::json!({"text": text, "files": files, "thread_id": thread_id}),
+            deadline(RUN_SUBMIT_TIMEOUT),
         )?;
         let accepted: RunSubmitAccepted =
             serde_json::from_value(response.body).map_err(|_| ClientError::UnexpectedMessage)?;

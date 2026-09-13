@@ -74,11 +74,23 @@ impl std::fmt::Debug for ChatGrant {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchGrantError {
     Unauthorized,
+    NotEntitled { message: String },
     Unavailable,
     InvalidResponse,
+}
+
+impl FetchGrantError {
+    pub fn into_message(self) -> String {
+        match self {
+            Self::Unauthorized => "The capability is not authorized.".into(),
+            Self::NotEntitled { message } => format!("chat_not_entitled: {message}"),
+            Self::Unavailable => "Chat configuration is temporarily unavailable.".into(),
+            Self::InvalidResponse => "The chat configuration response was invalid.".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,7 +356,7 @@ fn grant_status_error(status: u16, response: ureq::Response) -> recovery::GrantF
     match (status, error.code.as_str()) {
         (401, "session_invalid") => GrantFailure::SessionInvalid,
         (403, "device_removed") => GrantFailure::DeviceRemoved,
-        (403, "chat_not_entitled") => GrantFailure::NotEntitled,
+        (403, "chat_not_entitled") => GrantFailure::NotEntitled(error.message),
         (409, "entitlement_changed") => GrantFailure::EntitlementChanged,
         (503, "temporarily_unavailable") => {
             GrantFailure::Wait(error.retry_after_seconds.unwrap_or(1))
@@ -549,7 +561,7 @@ mod tests {
 
     #[test]
     fn maps_authentication_statuses_to_unauthorized() {
-        for (status, code) in [(401, "session_invalid"), (403, "chat_not_entitled")] {
+        for (status, code) in [(401, "session_invalid"), (403, "device_removed")] {
             let body = json!({"protocol": PROTOCOL, "error": {"code": code, "message": "Denied."}});
             let response = ureq::Response::new(status, "Error", &body.to_string()).unwrap();
             assert_eq!(
@@ -740,6 +752,66 @@ mod tests {
     }
 
     #[test]
+    fn entitlement_refusal_keeps_the_cloud_message_without_recovery() {
+        let message = "No chat model is currently available for this account.";
+        let body = json!({"protocol": PROTOCOL, "error": {
+            "code": "chat_not_entitled", "message": message
+        }});
+        let (base, stub) = serve(vec![(403, body.to_string())]);
+        let mut probe = RecoveryProbe {
+            base,
+            token: "token".into(),
+            actions: Vec::new(),
+            refresh_fails: false,
+            inspection_failures: Default::default(),
+            session_expires_at: None,
+        };
+        let started = std::time::Instant::now();
+        let error = recovery::recover_grant(&mut probe).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert_eq!(
+            error,
+            FetchGrantError::NotEntitled {
+                message: message.into()
+            }
+        );
+        assert_eq!(
+            error.into_message(),
+            format!("chat_not_entitled: {message}")
+        );
+        assert_eq!(probe.actions, ["issue"]);
+        assert_eq!(stub.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn entitlement_refusal_rejects_invalid_and_contradictory_envelopes() {
+        for (status, protocol, message, extra) in [
+            (401, PROTOCOL, json!("Denied."), json!({})),
+            (403, "v2", json!("Denied."), json!({})),
+            (403, PROTOCOL, json!(" "), json!({})),
+            (403, PROTOCOL, json!(null), json!({})),
+            (
+                403,
+                PROTOCOL,
+                json!("Denied."),
+                json!({"retry_after_seconds": 0}),
+            ),
+        ] {
+            let mut error = json!({"code": "chat_not_entitled", "message": message});
+            error
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let body = json!({"protocol": protocol, "error": error});
+            let response = ureq::Response::new(status, "Error", &body.to_string()).unwrap();
+            assert_eq!(
+                grant_status_error(status, response).shell_error(),
+                FetchGrantError::InvalidResponse
+            );
+        }
+    }
+
+    #[test]
     fn issuance_limits_refresh_inspection_and_backoff() {
         use recovery::{recover_grant, GrantFailure};
         for (responses, refresh_fails, inspections, expected) in [
@@ -804,7 +876,13 @@ mod tests {
             (400, "invalid_request", FetchGrantError::InvalidResponse),
             (401, "session_invalid", FetchGrantError::Unauthorized),
             (403, "device_removed", FetchGrantError::Unauthorized),
-            (403, "chat_not_entitled", FetchGrantError::Unauthorized),
+            (
+                403,
+                "chat_not_entitled",
+                FetchGrantError::NotEntitled {
+                    message: "Denied.".into(),
+                },
+            ),
             (409, "entitlement_changed", FetchGrantError::Unavailable),
             (429, "rate_limited", FetchGrantError::Unavailable),
             (503, "temporarily_unavailable", FetchGrantError::Unavailable),

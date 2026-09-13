@@ -898,7 +898,7 @@ fn invalid_request_reason_round_trips_without_relaxing_other_error_schemas() {
     );
 
     for (code, message) in [
-        ("unauthorized", "The capability is not authorized."),
+        ("payload_too_large", "The payload exceeds the allowed size."),
         ("malformed_frame", "The frame is malformed."),
     ] {
         let mut invalid = wire.clone();
@@ -914,6 +914,32 @@ fn invalid_request_reason_round_trips_without_relaxing_other_error_schemas() {
     let mut invalid = wire;
     invalid["retryable"] = json!(true);
     assert!(serde_json::from_value::<ProtocolError>(invalid).is_err());
+}
+
+#[test]
+fn unauthorized_reason_keeps_the_fixed_code_message_and_retry_policy() {
+    let reason = "chat_not_entitled: No chat model is currently available for this account.";
+    let error = ProtocolError::unauthorized_with_reason(reason);
+    let wire = serde_json::to_value(&error).unwrap();
+    assert_eq!(wire["code"], "unauthorized");
+    assert_eq!(wire["message"], "The capability is not authorized.");
+    assert_eq!(wire["retryable"], false);
+    assert_eq!(wire["details"]["reason"], reason);
+    assert_eq!(
+        serde_json::from_value::<ProtocolError>(wire.clone()).unwrap(),
+        error
+    );
+    for (field, value) in [
+        ("message", json!(reason)),
+        ("retryable", json!(true)),
+        ("action", json!("upgrade_desktop")),
+        ("details", json!({"reason": reason, "token": "unexpected"})),
+        ("details", json!({"supported": {"min": 1, "max": 1}})),
+    ] {
+        let mut invalid = wire.clone();
+        invalid[field] = value;
+        assert!(serde_json::from_value::<ProtocolError>(invalid).is_err());
+    }
 }
 
 #[test]

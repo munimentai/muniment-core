@@ -6,12 +6,8 @@ use crate::sidecar::pi_chat::{ExtensionUiAnswer, ExtensionUiDialog, ExtensionUiR
 use serde::Deserialize;
 use serde_json::json;
 
-pub fn grant_error_message(error: FetchGrantError) -> &'static str {
-    match error {
-        FetchGrantError::Unauthorized => "The capability is not authorized.",
-        FetchGrantError::Unavailable => "Chat configuration is temporarily unavailable.",
-        FetchGrantError::InvalidResponse => "The chat configuration response was invalid.",
-    }
+pub fn grant_error_message(error: FetchGrantError) -> String {
+    error.into_message()
 }
 
 #[derive(Deserialize)]
@@ -102,7 +98,7 @@ pub fn answer_grant_request(
         access_token,
         prefill.as_deref().unwrap_or(""),
     );
-    let failure = result.err();
+    let failure = result.as_ref().err().cloned();
     let answer = match result {
         Ok(()) => json!({"gateway_url": grant.gateway_url, "virtual_key": grant.virtual_key, "model": grant.model}).to_string(),
         Err(error) => json!({"error": grant_error_message(error)}).to_string(),

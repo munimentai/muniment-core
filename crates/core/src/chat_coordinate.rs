@@ -308,24 +308,14 @@ pub fn coordinate(
         if let Err(error) = crate::chat_grant::renew_grant_if_needed(&mut grant, || {
             app.renew_chat_grant(&access_token)
         }) {
-            let message = match error {
-                crate::chat_grant::FetchGrantError::Unauthorized => {
-                    "The capability is not authorized."
-                }
-                crate::chat_grant::FetchGrantError::Unavailable => {
-                    "Chat configuration is temporarily unavailable."
-                }
-                crate::chat_grant::FetchGrantError::InvalidResponse => {
-                    "The chat configuration response was invalid."
-                }
-            };
+            let message = error.into_message();
             fail_start(
                 &app,
                 &journal,
                 &mut projector,
                 &run_id,
                 &mut seq,
-                message,
+                &message,
                 subject.as_deref(),
                 resume.is_some(),
             );
@@ -770,7 +760,10 @@ pub fn coordinate(
     let mut pending_permission = MarkedGate::pending_permission(Some(runtime_activity));
     'coordinate: loop {
         diagnostics.log_lifecycle();
-        if let Some(error) = gateway_failure.filter(|_| buffered_events.len() == 0) {
+        if let Some(error) = gateway_failure
+            .as_ref()
+            .filter(|_| buffered_events.len() == 0)
+        {
             if adapter
                 .cancel_and_drain(&transport, Duration::from_secs(2))
                 .is_err()
@@ -784,7 +777,7 @@ pub fn coordinate(
                 &run_id,
                 &mut seq,
                 &mut open_effects,
-                crate::chat_grant::grant_error_message(error),
+                &crate::chat_grant::grant_error_message(error.clone()),
                 subject.as_deref(),
             );
             break;
@@ -1076,13 +1069,13 @@ fn answer_gateway_boundary(
     let PiChatEvent::ExtensionUiRequest(request) = event else {
         return false;
     };
-    if let Some(error) = *failure {
+    if let Some(error) = failure.as_ref() {
         if !matches!(&request.dialog, ExtensionUiDialog::Editor { title, .. } if title == "muniment:chat-grant")
         {
             return false;
         }
         let answer = ExtensionUiAnswer::Editor(
-            json!({"error": crate::chat_grant::grant_error_message(error)}).to_string(),
+            json!({"error": crate::chat_grant::grant_error_message(error.clone())}).to_string(),
         );
         let _ = adapter.answer_extension_ui(transport, request, answer);
         return true;

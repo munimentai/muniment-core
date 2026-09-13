@@ -4,11 +4,11 @@
 use crate::chat_grant::ChatGrant;
 use crate::chat_grant::FetchGrantError;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GrantFailure {
     SessionInvalid,
     DeviceRemoved,
-    NotEntitled,
+    NotEntitled(String),
     EntitlementChanged,
     Wait(u64),
     Other(FetchGrantError),
@@ -17,9 +17,8 @@ pub(crate) enum GrantFailure {
 impl GrantFailure {
     pub(crate) fn shell_error(self) -> FetchGrantError {
         match self {
-            Self::SessionInvalid | Self::DeviceRemoved | Self::NotEntitled => {
-                FetchGrantError::Unauthorized
-            }
+            Self::SessionInvalid | Self::DeviceRemoved => FetchGrantError::Unauthorized,
+            Self::NotEntitled(message) => FetchGrantError::NotEntitled { message },
             Self::EntitlementChanged | Self::Wait(_) => FetchGrantError::Unavailable,
             Self::Other(error) => error,
         }
@@ -94,7 +93,7 @@ impl RecoveryBudget {
                             failure,
                             GrantFailure::SessionInvalid | GrantFailure::DeviceRemoved
                         ) {
-                            self.recover(recovery, failure)?;
+                            self.recover(recovery, failure.clone())?;
                         }
                         Err(failure.shell_error())
                     }

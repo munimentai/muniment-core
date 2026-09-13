@@ -639,6 +639,14 @@ impl ProtocolError {
         Self::simple(ErrorCode::Unauthorized, ErrorMessage::Unauthorized)
     }
 
+    pub fn unauthorized_with_reason(reason: impl Into<String>) -> Self {
+        let mut error = Self::unauthorized();
+        error.details = Some(ErrorDetails::RequestReason {
+            reason: reason.into(),
+        });
+        error
+    }
+
     pub fn unsupported_operation() -> Self {
         Self::simple(
             ErrorCode::UnsupportedOperation,
@@ -758,6 +766,9 @@ impl<'de> Deserialize<'de> for ProtocolError {
             (ErrorCode::ThreadNotFound, None, None) => Self::thread_not_found(),
             (ErrorCode::TransferNotFound, None, None) => Self::transfer_not_found(),
             (ErrorCode::Unauthorized, None, None) => Self::unauthorized(),
+            (ErrorCode::Unauthorized, None, Some(ErrorDetails::RequestReason { reason })) => {
+                Self::unauthorized_with_reason(reason)
+            }
             (ErrorCode::UnsupportedOperation, None, None) => Self::unsupported_operation(),
             (ErrorCode::MigrationNotReady, None, None) => Self::migration_not_ready(),
             (ErrorCode::RuntimeDraining, None, None) => Self::runtime_draining(),

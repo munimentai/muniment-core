@@ -343,6 +343,7 @@ impl RunStartError {
     /// Returns the runtime reason to the desktop owner, not to companion callers.
     pub fn desktop_protocol_error(&self) -> ProtocolError {
         match self {
+            Self::Unauthorized(message) => ProtocolError::unauthorized_with_reason(message),
             Self::InvalidRequest(message) => ProtocolError::invalid_request_with_reason(message),
             Self::Persistence(message) => ProtocolError::persistence_failed_with_reason(message),
             _ => self.protocol_error(),
