@@ -13,7 +13,7 @@ use super::{
 #[derive(Clone, PartialEq, Eq)]
 pub enum NativeSignInError {
     Registration,
-    Authorization,
+    Authorization(String),
     TokenExchange,
     Randomness,
 }
@@ -28,7 +28,7 @@ impl fmt::Display for NativeSignInError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Registration => write!(f, "native installation registration failed"),
-            Self::Authorization => write!(f, "native browser sign-in was not completed"),
+            Self::Authorization(cause) => write!(f, "native authorization failed: {cause}"),
             Self::TokenExchange => write!(f, "native token exchange failed"),
             Self::Randomness => write!(f, "native sign-in could not create a secure proof"),
         }
@@ -106,6 +106,9 @@ fn map_authorization(error: NativeBrowserAuthorizationError) -> NativeSignInErro
             NativeAuthorizationError::RegistrationExpired => "RegistrationExpired".into(),
             NativeAuthorizationError::Transport(_) => "Transport".into(),
             NativeAuthorizationError::HttpStatus(status) => format!("HttpStatus status={status}"),
+            NativeAuthorizationError::HttpFailure(status, failure) => {
+                format!("HttpStatus status={status} {}", failure.diagnostic())
+            }
             NativeAuthorizationError::MalformedResponse(_) => "MalformedResponse".into(),
             NativeAuthorizationError::Persistence(_) => "Persistence".into(),
         },
@@ -116,7 +119,7 @@ fn map_authorization(error: NativeBrowserAuthorizationError) -> NativeSignInErro
         NativeBrowserAuthorizationError::Callback => "Callback".into(),
     };
     failure("authorization", &cause);
-    NativeSignInError::Authorization
+    NativeSignInError::Authorization(cause)
 }
 
 fn map_token(error: NativeTokenError) -> NativeSignInError {
@@ -128,6 +131,26 @@ fn map_token(error: NativeTokenError) -> NativeSignInError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authorization_failure_retains_the_safe_http_code_and_edge_id() {
+        let response: ureq::Response = "HTTP/1.1 400 Bad Request\r\nCF-Ray: 0123456789abcdef-IAD\r\n\r\n{\"error\":{\"code\":\"invalid_device_proof\",\"message\":\"secret\"}}".parse().unwrap();
+        let failure = super::super::native_http::NativeHttpFailure::from_response(response);
+        let (error, lines) = super::super::native_http::capture(|| {
+            map_authorization(NativeBrowserAuthorizationError::Authorization(
+                NativeAuthorizationError::HttpFailure(400, failure),
+            ))
+        });
+        let cause =
+            "HttpStatus status=400 error_code=invalid_device_proof cf_ray=0123456789abcdef-IAD";
+        assert_eq!(error, NativeSignInError::Authorization(cause.into()));
+        assert_eq!(
+            error.to_string(),
+            format!("native authorization failed: {cause}")
+        );
+        assert!(lines[0].ends_with(cause));
+        assert!(!lines.join("\n").contains("secret"));
+    }
 
     #[test]
     fn failure_diagnostics_name_the_stage_and_redact_error_data() {
@@ -143,28 +166,55 @@ mod tests {
             ] {
                 assert_eq!(map_registration(error), NativeSignInError::Registration);
             }
-            for error in [
-                NativeAuthorizationError::Config("secret".into()),
-                NativeAuthorizationError::Transport("secret".into()),
-                NativeAuthorizationError::MalformedResponse("secret".into()),
-                NativeAuthorizationError::Persistence("secret".into()),
-                NativeAuthorizationError::HttpStatus(401),
-                NativeAuthorizationError::InstallationMissing,
-                NativeAuthorizationError::RegistrationExpired,
+            for (error, cause) in [
+                (NativeAuthorizationError::Config("secret".into()), "Config"),
+                (
+                    NativeAuthorizationError::Transport("secret".into()),
+                    "Transport",
+                ),
+                (
+                    NativeAuthorizationError::MalformedResponse("secret".into()),
+                    "MalformedResponse",
+                ),
+                (
+                    NativeAuthorizationError::Persistence("secret".into()),
+                    "Persistence",
+                ),
+                (
+                    NativeAuthorizationError::HttpStatus(401),
+                    "HttpStatus status=401",
+                ),
+                (
+                    NativeAuthorizationError::InstallationMissing,
+                    "InstallationMissing",
+                ),
+                (
+                    NativeAuthorizationError::RegistrationExpired,
+                    "RegistrationExpired",
+                ),
+            ] {
+                let result =
+                    map_authorization(NativeBrowserAuthorizationError::Authorization(error));
+                assert_eq!(result, NativeSignInError::Authorization(cause.into()));
+                assert!(!result.to_string().contains("secret"));
+            }
+            for (error, cause) in [
+                (NativeBrowserAuthorizationError::BrowserOpen, "BrowserOpen"),
+                (
+                    NativeBrowserAuthorizationError::StateMismatch,
+                    "StateMismatch",
+                ),
+                (
+                    NativeBrowserAuthorizationError::ProviderDenied,
+                    "ProviderDenied",
+                ),
+                (NativeBrowserAuthorizationError::Timeout, "Timeout"),
+                (NativeBrowserAuthorizationError::Callback, "Callback"),
             ] {
                 assert_eq!(
-                    map_authorization(NativeBrowserAuthorizationError::Authorization(error)),
-                    NativeSignInError::Authorization,
+                    map_authorization(error),
+                    NativeSignInError::Authorization(cause.into())
                 );
-            }
-            for error in [
-                NativeBrowserAuthorizationError::BrowserOpen,
-                NativeBrowserAuthorizationError::StateMismatch,
-                NativeBrowserAuthorizationError::ProviderDenied,
-                NativeBrowserAuthorizationError::Timeout,
-                NativeBrowserAuthorizationError::Callback,
-            ] {
-                assert_eq!(map_authorization(error), NativeSignInError::Authorization);
             }
             for error in [
                 NativeTokenError::Config("secret".into()),

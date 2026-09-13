@@ -302,7 +302,7 @@ fn cancellation_exchange_and_persistence_failures_are_safe() {
             Store::default(),
             200,
             true,
-            NativeSignInError::Authorization,
+            NativeSignInError::Authorization("ProviderDenied".into()),
         ),
         (
             Store::default(),

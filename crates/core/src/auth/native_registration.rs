@@ -137,11 +137,13 @@ impl RegistrationTransport for UreqRegistrationTransport {
                 .map_err(Box::new)
         })
         .map_err(|error| match *error {
-            ureq::Error::Status(429, response) => {
-                NativeRegistrationError::RateLimited(retry_delay(response.header("Retry-After")))
+            super::native_http::Error::Status(429, response) => {
+                NativeRegistrationError::RateLimited(retry_delay(response.retry_after()))
             }
-            ureq::Error::Status(status, _) => NativeRegistrationError::HttpStatus(status),
-            ureq::Error::Transport(_) => {
+            super::native_http::Error::Status(status, _) => {
+                NativeRegistrationError::HttpStatus(status)
+            }
+            super::native_http::Error::Transport(_) => {
                 NativeRegistrationError::Transport("request failed".into())
             }
         })?;

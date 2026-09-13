@@ -30,6 +30,7 @@ pub(crate) fn map_protocol_error(code: ErrorCode) -> ClientError {
     match code {
         ErrorCode::ProtocolIncompatible => ClientError::ProtocolIncompatible,
         ErrorCode::Unauthorized => ClientError::AuthorizationExpired,
+        ErrorCode::AuthorizationFailed => ClientError::AuthorizationFailed,
         ErrorCode::ThreadNotFound => ClientError::ThreadNotFound,
         ErrorCode::PersistenceFailed => ClientError::DesktopFailed,
         _ => ClientError::RequestRejected,

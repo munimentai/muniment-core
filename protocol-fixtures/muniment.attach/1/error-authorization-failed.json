@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"0000000000000000000000000000013f","ok":false,"error":{"code":"authorization_failed","message":"Native authorization failed. Try sign-in again.","retryable":false,"details":{"reason":"native authorization failed: HttpStatus status=400 error_code=invalid_device_proof cf_ray=unavailable"}}}

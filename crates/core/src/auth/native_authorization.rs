@@ -230,6 +230,7 @@ pub enum NativeAuthorizationError {
     RegistrationExpired,
     Transport(String),
     HttpStatus(u16),
+    HttpFailure(u16, super::native_http::NativeHttpFailure),
     MalformedResponse(String),
     Persistence(String),
 }
@@ -245,6 +246,13 @@ impl fmt::Display for NativeAuthorizationError {
             Self::Transport(message) => write!(f, "native authorization unavailable: {message}"),
             Self::HttpStatus(status) => {
                 write!(f, "native authorization rejected with HTTP {status}")
+            }
+            Self::HttpFailure(status, failure) => {
+                write!(
+                    f,
+                    "native authorization rejected with HTTP {status}: {}",
+                    failure.diagnostic()
+                )
             }
             Self::MalformedResponse(message) => {
                 write!(f, "malformed native authorization response: {message}")
@@ -280,8 +288,10 @@ impl AuthorizationTransport for UreqAuthorizationTransport {
                 .map_err(Box::new)
         })
         .map_err(|error| match *error {
-            ureq::Error::Status(status, _) => NativeAuthorizationError::HttpStatus(status),
-            ureq::Error::Transport(_) => {
+            super::native_http::Error::Status(status, failure) => {
+                NativeAuthorizationError::HttpFailure(status, failure)
+            }
+            super::native_http::Error::Transport(_) => {
                 NativeAuthorizationError::Transport("request failed".into())
             }
         })?;
@@ -628,6 +638,13 @@ mod tests {
             ),
             (200, "malformed-secret-body"),
             (401, "secret-error-body"),
+            (
+                400,
+                r#"{"error":{"code":"invalid_request","message":"secret-error-body"},"token":"secret-response-token"}"#,
+            ),
+            (400, r#"{"error":{"code":"invalid_registration"}}"#),
+            (400, r#"{"error":{"code":"invalid_client"}}"#),
+            (400, r#"{"error":{"code":"invalid_device_proof"}}"#),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let url = format!(
@@ -653,7 +670,7 @@ mod tests {
                 }
                 let mut sent = vec![0; length];
                 reader.read_exact(&mut sent).unwrap();
-                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nSet-Cookie: secret-session-cookie\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nSet-Cookie: secret-session-cookie\r\nCF-Ray: 0123456789abcdef-IAD\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                 String::from_utf8(sent).unwrap()
             });
             let (result, lines) = super::super::native_http::capture(|| {
@@ -661,11 +678,21 @@ mod tests {
             });
             let sent = server.join().unwrap();
             assert!(sent.contains(&request.registration_token));
-            if status == 401 {
-                assert!(matches!(
-                    result,
-                    Err(NativeAuthorizationError::HttpStatus(401))
-                ));
+            let expected_code = serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .pointer("/error/code")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                });
+            if status >= 400 {
+                let Err(NativeAuthorizationError::HttpFailure(actual_status, failure)) = &result
+                else {
+                    panic!("expected an HTTP failure")
+                };
+                assert_eq!(*actual_status, status);
+                assert_eq!(failure.code(), expected_code.as_deref());
             } else if body.starts_with('{') {
                 assert!(result.is_ok());
             } else {
@@ -679,7 +706,15 @@ mod tests {
                 lines[0],
                 "muniment-runtime: native-auth start method=POST path=/v1/auth/native/authorize"
             );
-            let prefix = format!("muniment-runtime: native-auth end method=POST path=/v1/auth/native/authorize status={status} elapsed_ms=");
+            let details = if status >= 400 {
+                format!(
+                    " error_code={} cf_ray=0123456789abcdef-IAD",
+                    expected_code.as_deref().unwrap_or("unavailable")
+                )
+            } else {
+                String::new()
+            };
+            let prefix = format!("muniment-runtime: native-auth end method=POST path=/v1/auth/native/authorize status={status}{details} elapsed_ms=");
             lines[1]
                 .strip_prefix(&prefix)
                 .unwrap()
@@ -702,6 +737,7 @@ mod tests {
                 "malformed-secret-body",
                 "secret-error-body",
                 "secret-session-cookie",
+                "secret-response-token",
             ] {
                 assert!(!log.contains(secret));
             }

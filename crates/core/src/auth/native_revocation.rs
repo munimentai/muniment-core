@@ -119,8 +119,12 @@ impl RevocationTransport for UreqRevocationTransport {
                 .map_err(Box::new)
         })
         .map_err(|error| match *error {
-            ureq::Error::Status(status, _) => NativeRevocationError::HttpStatus(status),
-            ureq::Error::Transport(_) => NativeRevocationError::Transport("request failed".into()),
+            super::native_http::Error::Status(status, _) => {
+                NativeRevocationError::HttpStatus(status)
+            }
+            super::native_http::Error::Transport(_) => {
+                NativeRevocationError::Transport("request failed".into())
+            }
         })?;
         if response.status() != 200 {
             return Err(NativeRevocationError::HttpStatus(response.status()));

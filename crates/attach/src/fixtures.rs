@@ -700,6 +700,7 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         crate::ErrorCode::AlreadyCompleted,
         crate::ErrorCode::TransferNotFound,
         crate::ErrorCode::SlowConsumer,
+        crate::ErrorCode::AuthorizationFailed,
     ];
     for (index, code) in errors.into_iter().enumerate() {
         let (name, error) = error_fixture(code);
@@ -890,6 +891,7 @@ fn error_fixture(code: crate::ErrorCode) -> (&'static str, ProtocolError) {
             ProtocolError::idempotency_conflict(),
         ),
         PersistenceFailed => ("persistence-failed", ProtocolError::persistence_failed()),
+        AuthorizationFailed => ("authorization-failed", ProtocolError::authorization_failed("native authorization failed: HttpStatus status=400 error_code=invalid_device_proof cf_ray=unavailable")),
         DesktopBusy => ("desktop-busy", ProtocolError::desktop_busy()),
         InvalidCursor => ("invalid-cursor", ProtocolError::invalid_cursor()),
         InvalidArtifactCursor => (
@@ -1091,6 +1093,7 @@ mod tests {
             crate::ErrorCode::SubscriptionNotFound,
             crate::ErrorCode::AlreadyCompleted,
             crate::ErrorCode::SlowConsumer,
+            crate::ErrorCode::AuthorizationFailed,
         ];
         for code in error_codes {
             let (name, _) = error_fixture(code);
@@ -1115,7 +1118,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            78,
+            79,
             "every canonical fixture must be inventoried"
         );
     }

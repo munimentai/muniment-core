@@ -229,6 +229,7 @@ pub enum ErrorCode {
     IdempotencyKeyForbidden,
     IdempotencyConflict,
     PersistenceFailed,
+    AuthorizationFailed,
     DesktopBusy,
     InvalidCursor,
     InvalidArtifactCursor,
@@ -485,6 +486,8 @@ pub enum ErrorMessage {
     IdempotencyConflict,
     #[serde(rename = "The request could not be committed.")]
     PersistenceFailed,
+    #[serde(rename = "Native authorization failed. Try sign-in again.")]
+    AuthorizationFailed,
     #[serde(rename = "The desktop is busy with another request.")]
     DesktopBusy,
     #[serde(rename = "The stream cursor is invalid.")]
@@ -572,6 +575,17 @@ impl ProtocolError {
 
     pub fn persistence_failed_with_reason(reason: impl Into<String>) -> Self {
         let mut error = Self::persistence_failed();
+        error.details = Some(ErrorDetails::RequestReason {
+            reason: reason.into(),
+        });
+        error
+    }
+
+    pub fn authorization_failed(reason: impl Into<String>) -> Self {
+        let mut error = Self::simple(
+            ErrorCode::AuthorizationFailed,
+            ErrorMessage::AuthorizationFailed,
+        );
         error.details = Some(ErrorDetails::RequestReason {
             reason: reason.into(),
         });
@@ -728,6 +742,11 @@ impl<'de> Deserialize<'de> for ProtocolError {
             (ErrorCode::PersistenceFailed, None, Some(ErrorDetails::RequestReason { reason })) => {
                 Self::persistence_failed_with_reason(reason)
             }
+            (
+                ErrorCode::AuthorizationFailed,
+                None,
+                Some(ErrorDetails::RequestReason { reason }),
+            ) => Self::authorization_failed(reason),
             (ErrorCode::DesktopBusy, None, None) => Self::desktop_busy(),
             (ErrorCode::InvalidCursor, None, None) => Self::invalid_cursor(),
             (ErrorCode::InvalidArtifactCursor, None, None) => Self::invalid_artifact_cursor(),

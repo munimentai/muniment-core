@@ -133,8 +133,12 @@ impl NativeDeviceListTransport for UreqNativeDeviceListTransport {
                 .map_err(Box::new)
         })
         .map_err(|error| match *error {
-            ureq::Error::Status(status, _) => NativeDeviceListError::HttpStatus(status),
-            ureq::Error::Transport(_) => NativeDeviceListError::Transport("request failed".into()),
+            super::native_http::Error::Status(status, _) => {
+                NativeDeviceListError::HttpStatus(status)
+            }
+            super::native_http::Error::Transport(_) => {
+                NativeDeviceListError::Transport("request failed".into())
+            }
         })?;
         if response.status() != 200 {
             return Err(NativeDeviceListError::HttpStatus(response.status()));

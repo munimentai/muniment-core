@@ -64,6 +64,7 @@ pub use native_devices::{
     NativeDeviceListRequest, NativeDeviceListTransport, NativeDevicePlatform,
     UreqNativeDeviceListTransport,
 };
+pub use native_http::NativeHttpFailure;
 pub use native_registration::{
     register_installation, register_installation_with_retry, InstallationRecord, InstallationStore,
     NativeDeviceRegistrationRequest, NativeDeviceRegistrationResponse, NativeRegistrationError,

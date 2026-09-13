@@ -609,6 +609,36 @@ mod tests {
     use std::os::unix::net::UnixStream;
 
     #[test]
+    fn sign_in_keeps_the_authorization_code_for_the_shell() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let failure = crate::ProtocolError::authorization_failed(
+            "native authorization failed: HttpStatus status=400 error_code=invalid_device_proof cf_ray=0123456789abcdef-IAD",
+        );
+        let expected = failure.clone();
+        let worker = std::thread::spawn(move || {
+            let mut prefix = [0; 4];
+            server.read_exact(&mut prefix).unwrap();
+            let mut body = vec![0; u32::from_be_bytes(prefix) as usize];
+            server.read_exact(&mut body).unwrap();
+            let request: Request = serde_json::from_slice(&body).unwrap();
+            assert_eq!(request.operation, Operation::SessionSignIn);
+            let response = serde_json::json!({
+                "protocol": "muniment.attach/1", "request_id": request.request_id,
+                "ok": false, "error": failure,
+            });
+            server.write_all(&encode_frame(&response).unwrap()).unwrap();
+        });
+        let mut client =
+            desktop_client_for_test(Box::new(client), "1.0.0".into(), Duration::from_secs(5));
+        assert_eq!(client.sign_in(), Err(ClientError::AuthorizationFailed));
+        assert_eq!(client.last_request_error(), Some(&expected));
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn request_errors_do_not_survive_success_mismatched_responses_or_disconnects() {
         let (client, mut server) = UnixStream::pair().unwrap();
         server

@@ -5,6 +5,7 @@ use std::fmt;
 pub enum ClientError {
     UnsupportedPlatform,
     AuthorizationExpired,
+    AuthorizationFailed,
     ThreadNotFound,
     RequestRejected,
     DesktopFailed,
@@ -29,6 +30,7 @@ impl fmt::Display for ClientError {
         f.write_str(match self {
             Self::UnsupportedPlatform => "desktop attach is unsupported on this platform",
             Self::AuthorizationExpired => "desktop authorization is no longer valid",
+            Self::AuthorizationFailed => "native authorization failed",
             Self::ThreadNotFound => "the desktop could not find the thread",
             Self::RequestRejected => "the desktop rejected the thread request",
             Self::DesktopFailed => "the desktop could not read threads",
