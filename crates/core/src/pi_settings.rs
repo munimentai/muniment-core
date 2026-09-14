@@ -111,9 +111,6 @@ pub fn prepare_pi_settings(
     executable: &Path,
 ) -> Result<(), crate::pi_launch::PiLaunchError> {
     use crate::pi_launch::PiLaunchError;
-    if artifact.version != PI_CANDIDATE_ARTIFACT.version {
-        return Ok(());
-    }
     let home = std::env::home_dir().ok_or_else(|| {
         PiLaunchError::rejected("agent_home_resolve", "Cannot locate the Pi home directory.")
     })?;
@@ -122,6 +119,9 @@ pub fn prepare_pi_settings(
         .map_err(|error| PiLaunchError::rejected("agent_directory_resolve", error))?;
     store_pi_settings(&directory.join("settings.json"), artifact)
         .map_err(|error| PiLaunchError::rejected("settings_write", error))?;
+    if artifact.version != PI_CANDIDATE_ARTIFACT.version {
+        return Ok(());
+    }
     crate::pi_packages::prepare_pi_packages(&directory, executable)
         .map_err(|error| PiLaunchError::rejected("package_install", error))
 }
@@ -246,7 +246,9 @@ fn lock_settings_with_timeout(path: &Path, timeout: Duration) -> io::Result<Sett
 }
 
 pub fn store_pi_settings(path: &Path, artifact: PiArtifactDescriptor) -> io::Result<()> {
-    if artifact.version != PI_CANDIDATE_ARTIFACT.version {
+    // The production track writes no settings of its own. It clears the keys the
+    // candidate owns, so an absent file already holds what that track needs.
+    if artifact.version != PI_CANDIDATE_ARTIFACT.version && !path.exists() {
         return Ok(());
     }
     let parent = path
@@ -286,9 +288,20 @@ pub fn store_pi_settings(path: &Path, artifact: PiArtifactDescriptor) -> io::Res
     result
 }
 
-/// The candidate owns packages and defaultTools and preserves all other settings.
+/// The keys the candidate owns. The production track carries none of them:
+/// Pi 0.73.1 resolves a user-scope `npm:` package through `npm root -g`, and
+/// the runtime environment holds no npm, so a package left by the candidate
+/// ends the sidecar before its first RPC.
+const CANDIDATE_OWNED_KEYS: [&str; 2] = ["packages", "defaultTools"];
+
+/// The candidate owns packages and defaultTools and preserves all other
+/// settings. The production track removes those two keys and preserves the
+/// rest, so a rollback onto the predecessor reads a file it can resolve.
 pub fn merge_pi_settings(settings: &mut Map<String, Value>, artifact: PiArtifactDescriptor) {
     if artifact.version != PI_CANDIDATE_ARTIFACT.version {
+        for key in CANDIDATE_OWNED_KEYS {
+            settings.remove(key);
+        }
         return;
     }
     settings.insert(
@@ -497,6 +510,33 @@ mod tests {
         assert_eq!(rendered["foreign"], json!({"nested": 42}));
         store_pi_settings(&path, PI_CANDIDATE_ARTIFACT).unwrap();
         assert_eq!(fs::read(&path).unwrap(), bytes);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clears_the_candidates_keys_when_the_production_track_runs() {
+        let root = temporary_directory();
+        let path = root.join("agent/settings.json");
+        store_pi_settings(&path, PI_CANDIDATE_ARTIFACT).unwrap();
+        let rendered: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(rendered.get("packages").is_some());
+        assert!(rendered.get("defaultTools").is_some());
+        store_pi_settings(&path, PI_ARTIFACT).unwrap();
+        let rendered: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(rendered.get("packages").is_none());
+        assert!(rendered.get("defaultTools").is_none());
+        // The production track keeps every key the candidate does not own.
+        fs::write(
+            &path,
+            br#"{"defaultProvider":"ollama","packages":["npm:pi-web-access@0.28.0"],"foreign":{"nested":42}}"#,
+        )
+        .unwrap();
+        store_pi_settings(&path, PI_ARTIFACT).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let rendered: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(rendered["defaultProvider"], "ollama");
+        assert_eq!(rendered["foreign"], json!({"nested": 42}));
+        assert!(rendered.get("packages").is_none());
         store_pi_settings(&path, PI_ARTIFACT).unwrap();
         assert_eq!(fs::read(&path).unwrap(), bytes);
         fs::remove_dir_all(root).unwrap();
@@ -598,7 +638,14 @@ mod tests {
         });
         let mut settings = original.as_object().unwrap().clone();
         merge_pi_settings(&mut settings, PI_ARTIFACT);
-        assert_eq!(Value::Object(settings.clone()), original);
+        assert_eq!(
+            Value::Object(settings.clone()),
+            json!({
+                "defaultProvider": "ollama",
+                "defaultModel": "local-model",
+                "foreign": {"nested": [null, true, 42]}
+            })
+        );
         merge_pi_settings(&mut settings, PI_CANDIDATE_ARTIFACT);
         for key in ["defaultProvider", "defaultModel", "foreign"] {
             assert_eq!(settings[key], original[key]);
