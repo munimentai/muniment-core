@@ -2,7 +2,7 @@ use super::{
     ExecutableIdentity, MacOsProcessReader, NativeProcessReader, ProcessReadError, ProcessSocket,
 };
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::{c_int, c_void};
 
 // Values exported by the macOS SDK's <libproc.h> and <sys/proc_info.h>.
 const PROC_UID_ONLY: u32 = 4;
@@ -91,7 +91,7 @@ impl NativeProcessReader for MacOsProcessReader {
             .try_into()
             .map_err(|_| ProcessReadError)?;
         let read = unsafe { proc_listpids(PROC_UID_ONLY, uid, pids.as_mut_ptr().cast(), capacity) };
-        if read <= 0 || read == capacity || read as usize % size_of::<u32>() != 0 {
+        if read <= 0 || read == capacity || !(read as usize).is_multiple_of(size_of::<u32>()) {
             return Err(ProcessReadError);
         }
         pids.truncate(read as usize / size_of::<u32>());
@@ -159,18 +159,18 @@ impl NativeProcessReader for MacOsProcessReader {
     fn tcp_sockets(&self, pid: u32) -> Result<Vec<ProcessSocket>, ProcessReadError> {
         let pid: c_int = pid.try_into().map_err(|_| ProcessReadError)?;
         let needed = unsafe { proc_pidinfo(pid, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
-        if needed < 0 || needed as usize % 8 != 0 {
+        if needed < 0 || !(needed as usize).is_multiple_of(8) {
             return Err(ProcessReadError);
         }
         let mut fds = vec![0u8; needed as usize + 8 * 64];
         let capacity: c_int = fds.len().try_into().map_err(|_| ProcessReadError)?;
         let read =
             unsafe { proc_pidinfo(pid, PROC_PIDLISTFDS, 0, fds.as_mut_ptr().cast(), capacity) };
-        if read < 0 || read == capacity || read as usize % 8 != 0 {
+        if read < 0 || read == capacity || !(read as usize).is_multiple_of(8) {
             return Err(ProcessReadError);
         }
         let mut sockets = Vec::new();
-        for fd in fds[..read as usize].chunks_exact(8) {
+        for fd in fds[..read as usize].as_chunks::<8>().0 {
             if read_u32(fd, 4)? != PROX_FDTYPE_SOCKET {
                 continue;
             }

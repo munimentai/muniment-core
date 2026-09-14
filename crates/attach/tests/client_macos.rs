@@ -5,10 +5,10 @@ use std::io::{self, Read};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
-struct FakePeerReader(Result<u32, ()>, u32);
+struct FakePeerReader(Option<u32>, u32);
 
 impl MacosPeerReader for FakePeerReader {
-    fn peer_effective_uid(&self, _socket: i32) -> Result<u32, ()> {
+    fn peer_effective_uid(&self, _socket: i32) -> Option<u32> {
         self.0
     }
 
@@ -38,10 +38,10 @@ fn rejection_writes_no_frame(reader: FakePeerReader) {
 
 #[test]
 fn uid_mismatch_closes_before_the_first_frame_write() {
-    rejection_writes_no_frame(FakePeerReader(Ok(502), 501));
+    rejection_writes_no_frame(FakePeerReader(Some(502), 501));
 }
 
 #[test]
 fn syscall_failure_closes_before_the_first_frame_write() {
-    rejection_writes_no_frame(FakePeerReader(Err(()), 501));
+    rejection_writes_no_frame(FakePeerReader(None, 501));
 }

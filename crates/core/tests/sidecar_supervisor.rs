@@ -517,6 +517,8 @@ fn shutdown_during_loading_is_prompt_and_reaps_child() {
     .unwrap();
     let events = supervisor.subscribe();
     assert_eq!(next_event(&events).status, SidecarStatus::Starting);
+    // Only Linux reads the child back through /proc.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     let pid = wait_for_stub_pid(&pid_file.0);
     let until = Instant::now() + Duration::from_secs(2);
     while probe_started.load(Ordering::SeqCst) == 0 {
@@ -866,6 +868,8 @@ fn graceful_shutdown_leaves_no_child() {
     let mut supervisor =
         SidecarSupervisor::spawn(config(&["pid", &pid_arg]), |_| Ok(ProbeOutcome::Ready)).unwrap();
     wait_for(&supervisor, SidecarStatus::Healthy);
+    // Only Linux reads the child back through /proc.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     let pid = wait_for_stub_pid(&pid_file.0);
     #[cfg(target_os = "linux")]
     let child_identity = ProcessIdentity::read(pid).unwrap();
@@ -886,6 +890,8 @@ fn shutdown_forces_and_reaps_an_uncooperative_child() {
     cfg.shutdown_timeout = Duration::from_millis(30);
     let mut supervisor = SidecarSupervisor::spawn(cfg, |_| Ok(ProbeOutcome::Ready)).unwrap();
     wait_for(&supervisor, SidecarStatus::Healthy);
+    // Only Linux reads the child back through /proc.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     let pid = wait_for_stub_pid(&pid_file.0);
     #[cfg(target_os = "linux")]
     let child_identity = ProcessIdentity::read(pid).unwrap();

@@ -7,11 +7,13 @@ use super::desktop_dispatch::{dispatch_request, poll_run_streams, SessionRegistr
 use super::desktop_service_message::CompanionProvenance;
 use super::live_connections::{LiveConnectionState, RegisteredConnection};
 use super::thread_service::ThreadListService;
+#[cfg(target_os = "linux")]
+use super::Request;
 use super::{
     encode_frame, AttachSessionError, AuthorizationClock, AuthorizationState,
     AuthorizationTokenGenerator, ConnectionBinding, DeadlineStream, Envelope, ErrorEnvelope, Event,
-    EventName, Failure, Operation, Protocol, ProtocolError, ReadableWait, Request, Response,
-    Success, MAX_FRAME_LENGTH,
+    EventName, Failure, Operation, Protocol, ProtocolError, ReadableWait, Response, Success,
+    MAX_FRAME_LENGTH,
 };
 
 pub(super) struct AuthorizedSession<'a> {
@@ -21,6 +23,7 @@ pub(super) struct AuthorizedSession<'a> {
     pub connection: &'a RegisteredConnection,
 }
 
+#[cfg(target_os = "linux")]
 pub(super) fn read_request_before<S: DeadlineStream + ?Sized>(
     stream: &mut S,
     deadline: Instant,

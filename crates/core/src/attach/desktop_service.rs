@@ -1207,39 +1207,54 @@ fn attach_provenance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::collections::BTreeMap;
+    #[cfg(target_os = "linux")]
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(target_os = "linux")]
     use std::sync::Mutex;
 
-    #[cfg(any(unix, target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     use crate::attach::desktop_service_message::RunStreamPage;
     #[cfg(target_os = "linux")]
     use crate::attach::thread_service::ThreadListService;
     #[cfg(any(unix, target_os = "windows"))]
-    use crate::attach::thread_service::{
-        ThreadListPage, ThreadListRequest, ThreadOpenPage, ThreadOpenRequest,
-    };
+    use crate::attach::thread_service::{ThreadListPage, ThreadListRequest};
+    #[cfg(target_os = "linux")]
+    use crate::attach::thread_service::{ThreadOpenPage, ThreadOpenRequest};
     #[cfg(target_os = "linux")]
     use crate::attach::ErrorCode;
     #[cfg(any(unix, target_os = "windows"))]
     use crate::attach::ProtocolError;
+    #[cfg(target_os = "linux")]
     use crate::attach::{RuntimeActivityGuard, RuntimeActivityRegistry};
+    #[cfg(target_os = "linux")]
     use crate::auth::TokenSet;
+    #[cfg(target_os = "linux")]
     use crate::chat_grant::ChatGrant;
+    #[cfg(target_os = "linux")]
     use crate::chat_view::{chat_attachments, ChatAttachment, SelectedFile};
+    #[cfg(target_os = "linux")]
     use crate::journal::reducer::{reduce, ChatProjector};
     #[cfg(target_os = "linux")]
     use crate::journal::RunJournal;
+    #[cfg(target_os = "linux")]
     use crate::journal::{EventEnvelope, JournalCommitHint, Provenance};
+    #[cfg(target_os = "linux")]
     use crate::permission_gate::ChatPermissionAnswer;
+    #[cfg(target_os = "linux")]
     use serde_json::json;
+    #[cfg(target_os = "linux")]
     use serde_json::Value;
 
+    #[cfg(target_os = "linux")]
     use crate::run_start::{
         ActiveRun, RunAttachBoundaries, RunStartBoundaries, RunStartError, RunStartLaunch,
     };
 
+    #[cfg(target_os = "linux")]
     use crate::pi_execution::attachment_error;
+    #[cfg(target_os = "linux")]
     use uuid::Uuid;
 
     #[cfg(unix)]
@@ -1378,6 +1393,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn event_envelope(
         run_id: &str,
         run_seq: u64,
@@ -1396,6 +1412,7 @@ mod tests {
         )
     }
 
+    #[cfg(target_os = "linux")]
     fn append_test_event(
         journal: &mut crate::journal::RunJournal,
         run_id: &str,
@@ -1412,6 +1429,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     struct FakeRunStartBoundaries {
         active: bool,
         granted_workspaces: Vec<String>,
@@ -1452,6 +1470,7 @@ mod tests {
         journal: Mutex<RunJournal>,
     }
 
+    #[cfg(target_os = "linux")]
     impl FakeRunStartBoundaries {
         fn accepting() -> Self {
             Self {
@@ -1496,6 +1515,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     impl RunAttachBoundaries for FakeRunStartBoundaries {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         fn list_threads(
@@ -1813,6 +1833,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     impl RunStartBoundaries for FakeRunStartBoundaries {
         fn mark_active_run(&self) -> RuntimeActivityGuard {
             self.runtime_activity.mark_active_run()
@@ -2200,6 +2221,7 @@ mod tests {
         std::fs::remove_file(database_path).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     fn test_companion_provenance() -> CompanionProvenance {
         CompanionProvenance {
             profile: "default".into(),

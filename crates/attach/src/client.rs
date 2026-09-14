@@ -537,7 +537,7 @@ mod linux {
 
     #[cfg(target_os = "macos")]
     pub trait MacosPeerReader {
-        fn peer_effective_uid(&self, socket: i32) -> Result<u32, ()>;
+        fn peer_effective_uid(&self, socket: i32) -> Option<u32>;
         fn local_effective_uid(&self) -> u32;
     }
 
@@ -552,14 +552,10 @@ mod linux {
 
     #[cfg(target_os = "macos")]
     impl MacosPeerReader for NativeMacosPeerReader {
-        fn peer_effective_uid(&self, socket: i32) -> Result<u32, ()> {
+        fn peer_effective_uid(&self, socket: i32) -> Option<u32> {
             let mut uid = 0;
             let mut gid = 0;
-            if unsafe { getpeereid(socket, &mut uid, &mut gid) } == 0 {
-                Ok(uid)
-            } else {
-                Err(())
-            }
+            (unsafe { getpeereid(socket, &mut uid, &mut gid) } == 0).then_some(uid)
         }
 
         fn local_effective_uid(&self) -> u32 {
@@ -580,7 +576,7 @@ mod linux {
     ) -> Result<(), ClientError> {
         let peer_uid = reader
             .peer_effective_uid(stream.as_raw_fd())
-            .map_err(|_| ClientError::ConnectionClosed)?;
+            .ok_or(ClientError::ConnectionClosed)?;
         if peer_uid != reader.local_effective_uid() {
             return Err(ClientError::ConnectionClosed);
         }

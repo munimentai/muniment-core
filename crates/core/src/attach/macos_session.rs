@@ -38,6 +38,7 @@ pub enum MacosAttachSessionOutcome {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 /// Serves every macOS route with the state shared by one runtime activation.
 pub fn serve_macos_attach_session_with_state<H, W>(
     stream: UnixStream,
