@@ -216,9 +216,19 @@ fn persist_onboarding_home_write_plan_with_hook(
         .read(true)
         .write(true)
         .follow(FollowSymlinks::No);
-    let lock = home_dir
-        .open_with(ONBOARDING_IMPORT_LOCK_FILE, &lock_options)?
-        .into_std();
+    // macOS answers ENOENT from openat(O_CREAT | O_NOFOLLOW) while another
+    // importer creates the same lock file. The home handle stays open, so a
+    // second attempt finds the file or creates it.
+    let mut attempts = 0;
+    let lock = loop {
+        match home_dir.open_with(ONBOARDING_IMPORT_LOCK_FILE, &lock_options) {
+            Ok(lock) => break lock.into_std(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound && attempts < 16 => {
+                attempts += 1;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
     lock.lock_exclusive()?;
 
     for (relative_path, destination) in &relative_destinations {

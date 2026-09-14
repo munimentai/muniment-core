@@ -62,17 +62,29 @@ pub fn append_owner_only_record(
     let directory = directory_options.open(directory)?;
     validate_owner_only_directory(&directory.metadata()?)?;
 
-    let descriptor = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            file_name.as_ptr(),
-            libc::O_RDWR | libc::O_APPEND | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600,
-        )
+    let mut attempts = 0;
+    let descriptor = loop {
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                file_name.as_ptr(),
+                libc::O_RDWR | libc::O_APPEND | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if descriptor >= 0 {
+            break descriptor;
+        }
+        let error = io::Error::last_os_error();
+        // macOS answers ENOENT from openat(O_CREAT | O_NOFOLLOW) while another
+        // writer creates the same entry. The directory handle stays open, so a
+        // second attempt finds the file or creates it.
+        if error.kind() == io::ErrorKind::NotFound && attempts < 16 {
+            attempts += 1;
+            continue;
+        }
+        return Err(error);
     };
-    if descriptor < 0 {
-        return Err(io::Error::last_os_error());
-    }
     let mut file = unsafe { fs::File::from_raw_fd(descriptor) };
     let metadata = file.metadata()?;
     if !metadata.is_file()
