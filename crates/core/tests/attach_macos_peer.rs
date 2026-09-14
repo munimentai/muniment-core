@@ -4,6 +4,15 @@
 mod socket_path;
 use socket_path::socket_temp_path;
 
+// The listener owns the socket's parent directory and sets it to 0700, so its
+// socket sits beneath a directory the test creates rather than in the
+// per-user temporary directory itself.
+fn owned_socket_path() -> std::path::PathBuf {
+    let parent = socket_temp_path().join("muniment");
+    std::fs::create_dir_all(&parent).unwrap();
+    parent.join("attach-v1.sock")
+}
+
 use muniment_core::attach::{
     accept_macos_attach_with_reader, decode_frame, encode_frame,
     serve_next_macos_attach_with_reader, verify_macos_attach_peer_with_reader, Client, Hello, Id,
@@ -23,7 +32,7 @@ struct FakePeerReader {
 
 #[test]
 fn listener_removes_its_endpoint_and_restarts_at_the_same_path() {
-    let path = socket_temp_path();
+    let path = owned_socket_path();
     {
         let listener = MacosAttachListener::bind(&path).unwrap();
         assert!(path.exists());
@@ -38,7 +47,7 @@ fn listener_removes_its_endpoint_and_restarts_at_the_same_path() {
 
 #[test]
 fn listener_recovers_an_owned_stale_endpoint() {
-    let path = socket_temp_path();
+    let path = owned_socket_path();
     drop(UnixListener::bind(&path).unwrap());
 
     let listener = MacosAttachListener::bind(&path).unwrap();
@@ -49,7 +58,7 @@ fn listener_recovers_an_owned_stale_endpoint() {
 
 #[test]
 fn listener_preserves_a_live_endpoint() {
-    let path = socket_temp_path();
+    let path = owned_socket_path();
     let live = UnixListener::bind(&path).unwrap();
 
     assert_eq!(
@@ -64,7 +73,7 @@ fn listener_preserves_a_live_endpoint() {
 
 #[test]
 fn stop_signal_wakes_a_pending_accept() {
-    let path = socket_temp_path();
+    let path = owned_socket_path();
     let listener = MacosAttachListener::bind(&path).unwrap();
     let stop = std::sync::Arc::new(MacosAttachStopEvent::new().unwrap());
     let signal = std::sync::Arc::clone(&stop);

@@ -344,7 +344,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temporary_directory(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+        // A socket path is at most 104 bytes on macOS, and the per-user
+        // temporary directory under /var/folders spends half of that.
+        PathBuf::from("/tmp").join(format!(
             "muniment-macos-listener-{name}-{}-{}",
             std::process::id(),
             SystemTime::now()
