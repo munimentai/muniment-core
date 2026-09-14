@@ -82,7 +82,7 @@ pub fn read_exact_before<S: DeadlineStream + ?Sized>(
     deadline: Instant,
 ) -> io::Result<()> {
     while !bytes.is_empty() {
-        stream.set_read_timeout(Some(remaining(deadline)?))?;
+        unless_disconnected(stream.set_read_timeout(Some(remaining(deadline)?)))?;
         match stream.read(bytes) {
             Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
             Ok(read) => bytes = &mut bytes[read..],
@@ -99,7 +99,7 @@ pub fn write_all_before<S: DeadlineStream + ?Sized>(
     deadline: Instant,
 ) -> io::Result<()> {
     while !bytes.is_empty() {
-        stream.set_write_timeout(Some(remaining(deadline)?))?;
+        unless_disconnected(stream.set_write_timeout(Some(remaining(deadline)?)))?;
         match stream.write(bytes) {
             Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
             Ok(written) => bytes = &bytes[written..],
@@ -107,6 +107,16 @@ pub fn write_all_before<S: DeadlineStream + ?Sized>(
         }
     }
     Ok(())
+}
+
+// macOS answers EINVAL from setsockopt on a socket disconnected in both
+// directions. A read then drains the buffered reply and ends at EOF, and a
+// write answers EPIPE, so neither call blocks without the timeout.
+fn unless_disconnected(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        result => result,
+    }
 }
 
 pub(super) fn remaining(deadline: Instant) -> io::Result<Duration> {

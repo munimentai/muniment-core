@@ -27,8 +27,7 @@ pub(crate) fn read_exact_before<S: ClientStream + ?Sized>(
     deadline: Instant,
 ) -> Result<(), ClientError> {
     while !bytes.is_empty() {
-        stream
-            .set_read_timeout(Some(remaining(deadline)?))
+        unless_disconnected(stream.set_read_timeout(Some(remaining(deadline)?)))
             .map_err(|_| ClientError::DesktopUnavailable)?;
         match stream.read(bytes).map_err(map_io_error)? {
             0 => return Err(ClientError::ConnectionClosed),
@@ -44,8 +43,7 @@ pub(crate) fn write_all_before<S: ClientStream + ?Sized>(
     deadline: Instant,
 ) -> Result<(), ClientError> {
     while !bytes.is_empty() {
-        stream
-            .set_write_timeout(Some(remaining(deadline)?))
+        unless_disconnected(stream.set_write_timeout(Some(remaining(deadline)?)))
             .map_err(|_| ClientError::DesktopUnavailable)?;
         match stream.write(bytes).map_err(map_io_error)? {
             0 => return Err(ClientError::ConnectionClosed),
@@ -53,6 +51,16 @@ pub(crate) fn write_all_before<S: ClientStream + ?Sized>(
         }
     }
     Ok(())
+}
+
+// macOS answers EINVAL from setsockopt on a socket the runtime has closed in
+// both directions. A read then drains the buffered reply and ends at EOF, and
+// a write answers EPIPE, so neither call blocks without the timeout.
+fn unless_disconnected(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        result => result,
+    }
 }
 
 pub(crate) fn read_value<S: ClientStream + ?Sized>(

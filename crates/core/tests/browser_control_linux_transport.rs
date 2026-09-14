@@ -97,9 +97,12 @@ fn drops_an_unauthorized_accepted_peer() {
         listener.accept_with(&injected, &authorizer),
         Err(BrowserControlAcceptError::Unauthorized)
     ));
-    client
-        .set_read_timeout(Some(std::time::Duration::from_secs(1)))
-        .unwrap();
+    // macOS answers EINVAL once the listener has dropped its end, and a peek on
+    // that socket ends without the timeout.
+    match client.set_read_timeout(Some(std::time::Duration::from_secs(1))) {
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
+        result => result.unwrap(),
+    }
     assert_eq!(client.peek(&mut [0]).unwrap(), 0);
 }
 
@@ -139,9 +142,12 @@ fn endpoint_inspection_failure_drops_stream_before_authorization_or_handshake() 
             error.to_string(),
             "browser-control connection was not accepted"
         );
-        client
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
+        // macOS answers EINVAL once the listener has dropped the injected stream,
+        // and a read on that socket ends without the timeout.
+        match client.set_read_timeout(Some(Duration::from_secs(1))) {
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
+            result => result.unwrap(),
+        }
         let mut response = Vec::new();
         let read = client.read_to_end(&mut response);
         assert!(

@@ -2,7 +2,7 @@
 mod unix_tests {
     use std::cell::Cell;
     use std::collections::BTreeSet;
-    use std::io::{Read, Write};
+    use std::io::{self, Read, Write};
     use std::net::Shutdown;
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
@@ -145,9 +145,12 @@ mod unix_tests {
     }
 
     fn read_all(mut stream: UnixStream) -> Vec<u8> {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
+        // macOS answers EINVAL once the session thread has closed its end, and a
+        // read on that socket drains the reply and ends without the timeout.
+        match stream.set_read_timeout(Some(Duration::from_secs(2))) {
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
+            result => result.unwrap(),
+        }
         let mut bytes = Vec::new();
         stream.read_to_end(&mut bytes).unwrap();
         bytes
