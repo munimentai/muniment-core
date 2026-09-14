@@ -111,12 +111,14 @@ pub fn prepare_pi_settings(
     executable: &Path,
 ) -> Result<(), crate::pi_launch::PiLaunchError> {
     use crate::pi_launch::PiLaunchError;
-    let home = std::env::home_dir().ok_or_else(|| {
-        PiLaunchError::rejected("agent_home_resolve", "Cannot locate the Pi home directory.")
-    })?;
-    let agent_directory = std::env::var_os("PI_CODING_AGENT_DIR");
-    let directory = pi_agent_directory(&home, agent_directory.as_deref())
-        .map_err(|error| PiLaunchError::rejected("agent_directory_resolve", error))?;
+    let directory = crate::state_root::state_directory()
+        .map(|state| crate::state_root::agent_directory(&state))
+        .ok_or_else(|| {
+            PiLaunchError::rejected(
+                "agent_directory_resolve",
+                "The state directory is unavailable.",
+            )
+        })?;
     store_pi_settings(&directory.join("settings.json"), artifact)
         .map_err(|error| PiLaunchError::rejected("settings_write", error))?;
     if artifact.version != PI_CANDIDATE_ARTIFACT.version {
@@ -528,7 +530,7 @@ mod tests {
         // The production track keeps every key the candidate does not own.
         fs::write(
             &path,
-            br#"{"defaultProvider":"ollama","packages":["npm:pi-web-access@0.28.0"],"foreign":{"nested":42}}"#,
+            br#"{"defaultProvider":"ollama","packages":["npm:web-access-tools@0.28.0"],"foreign":{"nested":42}}"#,
         )
         .unwrap();
         store_pi_settings(&path, PI_ARTIFACT).unwrap();

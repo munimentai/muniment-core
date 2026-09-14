@@ -180,6 +180,7 @@ impl<'ast> Visit<'ast> for DesktopBoundary {
                     Some(
                         "install_lock"
                             | "profile_directory"
+                            | "adopt_state_directory"
                             | "WindowsDiagnosticEvent"
                             | "windows_local_app_data"
                             | "write_windows_diagnostic"

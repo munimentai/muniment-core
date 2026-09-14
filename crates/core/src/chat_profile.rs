@@ -27,11 +27,13 @@ impl ChatProfile {
     }
 
     pub fn pi_install_root(&self) -> PathBuf {
-        self.directory.join("pi")
+        self.directory
+            .join(crate::state_root::HARNESS_DIRECTORY_NAME)
     }
 
     pub fn pi_session_root(&self) -> PathBuf {
-        self.directory.join("pi-sessions")
+        self.directory
+            .join(crate::state_root::SESSIONS_DIRECTORY_NAME)
     }
 
     pub fn create_directories(&self) -> Result<(), ChatProfileError> {
@@ -105,8 +107,12 @@ mod tests {
         );
         assert_eq!(profile.cas_directory(), std::path::Path::new("profile/cas"));
         assert_eq!(
+            profile.pi_install_root(),
+            std::path::Path::new("profile/harness")
+        );
+        assert_eq!(
             profile.pi_session_root(),
-            std::path::Path::new("profile/pi-sessions")
+            std::path::Path::new("profile/sessions")
         );
     }
 

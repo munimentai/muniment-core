@@ -59,6 +59,7 @@ pub mod run_start;
 pub mod runtime_diagnostics;
 pub mod session_thread;
 pub mod sidecar;
+pub mod state_root;
 #[cfg(feature = "keyring")]
 pub mod thread_history;
 pub mod thread_ownership;

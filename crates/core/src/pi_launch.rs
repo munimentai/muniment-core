@@ -472,6 +472,15 @@ pub fn pi_launch_config_for_executable(
         .map_err(|error| PiLaunchError::rejected("session_root_check", error))?;
     boundaries.prepare_pi_settings(boundaries.pi_artifact(), &executable)?;
     config.env_remove.push("BUN_BE_BUN".into());
+    // The harness keeps its settings, routes and keys under the app's state root.
+    if let Some(agent) =
+        crate::state_root::state_directory().map(|state| crate::state_root::agent_directory(&state))
+    {
+        config.env.insert(
+            "PI_CODING_AGENT_DIR".into(),
+            agent.to_string_lossy().into_owned(),
+        );
+    }
     if boundaries.pi_artifact().version == crate::sidecar::pi_install::PI_CANDIDATE_ARTIFACT.version
     {
         // Extension loading precedes the first RPC response.

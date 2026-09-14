@@ -165,7 +165,10 @@ fn coordinate_acquires_from_the_profile_once_without_an_environment_root() {
             acquisitions: Arc::new(AtomicUsize::new(0)),
             outcome,
         };
-        assert_eq!(boundary.pi_install_root().unwrap(), directory.join("pi"));
+        assert_eq!(
+            boundary.pi_install_root().unwrap(),
+            directory.join("harness")
+        );
         let runs = if outcome == "complete" { 2 } else { 1 };
         for index in 0..runs {
             boundary.events.lock().unwrap().clear();
