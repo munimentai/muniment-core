@@ -2,6 +2,8 @@
 //! macOS Keychain, Windows Credential Manager, and the Linux kernel keyring.
 
 use keyring::Entry;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::{
     CoherentNativeCredentialStore, InstallationRecord, InstallationStore, NativeCredentialBackend,
@@ -17,25 +19,71 @@ const NATIVE_KEYS: NativeCredentialKeys = NativeCredentialKeys {
 
 struct PlatformKeychain;
 
+// One refusal at the keychain prompt holds for the rest of the process: the
+// saved session is unreadable here, so every later read answers signed out
+// from memory instead of raising the prompt again. A write that succeeds, such
+// as a new sign-in, clears it.
+#[cfg(target_os = "macos")]
+static ACCESS_REFUSED: AtomicBool = AtomicBool::new(false);
+
+// errSecUserCanceled, errSecAuthFailed and errSecInteractionNotAllowed: the user,
+// or a session with no user present, turned the prompt down.
+#[cfg(any(target_os = "macos", test))]
+fn refusal_code(code: i32) -> bool {
+    matches!(code, -128 | -25293 | -25308)
+}
+
+#[cfg(target_os = "macos")]
+fn refused(error: &keyring::Error) -> bool {
+    match error {
+        keyring::Error::PlatformFailure(inner) | keyring::Error::NoStorageAccess(inner) => inner
+            .downcast_ref::<security_framework::base::Error>()
+            .is_some_and(|error| refusal_code(error.code())),
+        _ => false,
+    }
+}
+
 impl NativeCredentialBackend for PlatformKeychain {
     fn get(&self, user: &str) -> Result<Option<String>, String> {
+        #[cfg(target_os = "macos")]
+        if ACCESS_REFUSED.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
         match Entry::new(SERVICE, user)
             .map_err(|error| error.to_string())?
             .get_password()
         {
             Ok(value) => Ok(Some(value)),
             Err(keyring::Error::NoEntry) => Ok(None),
-            Err(error) => Err(error.to_string()),
+            Err(error) => {
+                #[cfg(target_os = "macos")]
+                if refused(&error) {
+                    ACCESS_REFUSED.store(true, Ordering::SeqCst);
+                    crate::runtime_eprintln!(
+                        "muniment-runtime: keychain access refused for {user}; the session reads as signed out until a sign-in writes a new item"
+                    );
+                    return Ok(None);
+                }
+                Err(error.to_string())
+            }
         }
     }
 
     fn set(&self, user: &str, value: &str) -> Result<(), String> {
         let entry = Entry::new(SERVICE, user).map_err(|error| error.to_string())?;
         #[cfg(target_os = "macos")]
-        if entry.get_credential().is::<keyring::macos::MacCredential>() {
-            return set_macos_password(user, value).map_err(|error| error.to_string());
+        let result = if entry.get_credential().is::<keyring::macos::MacCredential>() {
+            set_macos_password(user, value)
+        } else {
+            entry.set_password(value)
+        };
+        #[cfg(not(target_os = "macos"))]
+        let result = entry.set_password(value);
+        #[cfg(target_os = "macos")]
+        if result.is_ok() {
+            ACCESS_REFUSED.store(false, Ordering::SeqCst);
         }
-        entry.set_password(value).map_err(|error| error.to_string())
+        result.map_err(|error| error.to_string())
     }
 
     fn delete(&self, user: &str) -> Result<(), String> {
@@ -152,6 +200,16 @@ impl NativeCredentialStore for KeyringNativeCredentialStore {
 mod tests {
     use super::update_or_create;
     use std::cell::Cell;
+
+    #[test]
+    fn a_refusal_code_is_the_prompt_turned_down() {
+        for code in [-128, -25293, -25308] {
+            assert!(super::refusal_code(code), "{code}");
+        }
+        for code in [0, -25300, -25291, -25299] {
+            assert!(!super::refusal_code(code), "{code}");
+        }
+    }
 
     #[test]
     fn renewal_updates_the_existing_item_without_creation() {
