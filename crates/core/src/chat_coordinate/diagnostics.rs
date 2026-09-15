@@ -47,6 +47,18 @@ impl RunDiagnostics {
         self.log_stderr();
     }
 
+    /// The first `Error:` line Pi wrote, for a failure reason the shell shows.
+    pub fn stderr_error(&self) -> Option<String> {
+        self.stderr
+            .as_ref()
+            .map(LineReader::stderr_tail)
+            .unwrap_or_default()
+            .iter()
+            .map(|line| line.trim())
+            .find(|line| line.starts_with("Error:"))
+            .map(|line| line.chars().take(320).collect())
+    }
+
     fn log_stderr(&self) {
         let tail = self
             .stderr

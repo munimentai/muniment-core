@@ -484,6 +484,10 @@ pub fn pi_launch_config_for_executable(
         .map_err(|error| PiLaunchError::rejected("session_root_check", error))?;
     boundaries.prepare_pi_settings(boundaries.pi_artifact(), &executable)?;
     config.env_remove.push("BUN_BE_BUN".into());
+    // The runtime's install above is the one writer of the agent's npm
+    // directory. Offline mode keeps Pi's own package manager from installing
+    // or updating a package beside it while a run reads the tree.
+    config.env.insert("PI_OFFLINE".into(), "1".into());
     // The harness keeps its settings, routes and keys under the app's state root.
     if let Some(agent) =
         crate::state_root::state_directory().map(|state| crate::state_root::agent_directory(&state))

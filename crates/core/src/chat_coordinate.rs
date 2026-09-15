@@ -498,7 +498,10 @@ pub fn coordinate(
     if readiness_status != SidecarStatus::Healthy {
         diagnostics.readiness_failed(readiness_status, startup_timeout);
         let reason = if grant.is_local() {
-            "Reply setup timed out. Try again.".to_owned()
+            match diagnostics.stderr_error() {
+                Some(error) => format!("Reply setup failed. {error}"),
+                None => "Reply setup timed out. Try again.".to_owned(),
+            }
         } else if readiness_status != SidecarStatus::Starting {
             "Reply setup stopped before it became ready. Try again.".to_owned()
         } else {

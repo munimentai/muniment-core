@@ -70,9 +70,15 @@ mod tests {
             { "name": "  " },
             { "model": "no-name" }
         ] });
-        assert_eq!(parse_ollama_tags(&tags), vec!["llama3.2:3b", "hf.co/munimentai/Qwen3.5-4B-GGUF:Q4_K_M"]);
+        assert_eq!(
+            parse_ollama_tags(&tags),
+            vec!["llama3.2:3b", "hf.co/munimentai/Qwen3.5-4B-GGUF:Q4_K_M"]
+        );
         let openai = json!({ "object": "list", "data": [{ "id": "qwen3", "object": "model" }, { "id": "gpt-oss:latest" }] });
-        assert_eq!(parse_openai_models(&openai), vec!["qwen3", "gpt-oss:latest"]);
+        assert_eq!(
+            parse_openai_models(&openai),
+            vec!["qwen3", "gpt-oss:latest"]
+        );
         assert!(parse_ollama_tags(&json!({})).is_empty());
         assert!(parse_openai_models(&json!({ "data": "x" })).is_empty());
     }

@@ -310,6 +310,26 @@ pub fn prepare_pi_packages(agent_directory: &Path, executable: &Path) -> io::Res
     }
     let marker = directory.join(".muniment-packages.json");
     let identity = serde_json::to_vec(&PI_PACKAGES)?;
+    // npm's lockfiles mean another package manager wrote this tree. Its files
+    // are not this install, so the tree goes and the install starts over.
+    let foreign_locks = [
+        directory.join("package-lock.json"),
+        directory.join("node_modules").join(".package-lock.json"),
+    ];
+    if foreign_locks.iter().any(|path| path.exists()) {
+        for path in [&foreign_locks[0], &foreign_locks[1], &marker] {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        match fs::remove_dir_all(directory.join("node_modules")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
     if fs::read(&marker).is_ok_and(|bytes| bytes == identity) && installed(&directory) {
         return Ok(());
     }
@@ -613,6 +633,31 @@ mod tests {
         assert!(command
             .get_envs()
             .any(|(key, value)| key == "BUN_BE_BUN" && value == Some("1".as_ref())));
+    }
+
+    #[test]
+    fn a_tree_another_package_manager_wrote_starts_over() {
+        let root = std::env::temp_dir().join(format!("muniment-packages-{}", uuid::Uuid::new_v4()));
+        let npm = root.join("npm");
+        for (name, version) in PI_PACKAGES {
+            let directory = npm.join("node_modules").join(name);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join("package.json"),
+                format!("{{\"version\":\"{version}\"}}"),
+            )
+            .unwrap();
+        }
+        let marker = npm.join(".muniment-packages.json");
+        fs::write(&marker, serde_json::to_vec(&PI_PACKAGES).unwrap()).unwrap();
+        let missing = root.join("missing-executable");
+        prepare_pi_packages(&root, &missing).unwrap();
+        fs::write(npm.join("node_modules/.package-lock.json"), "{}").unwrap();
+        assert!(prepare_pi_packages(&root, &missing).is_err());
+        assert!(!npm.join("node_modules").exists());
+        assert!(!npm.join("node_modules/.package-lock.json").exists());
+        assert!(!marker.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
