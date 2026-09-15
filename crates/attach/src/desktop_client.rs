@@ -544,6 +544,14 @@ impl DesktopClient {
         self.request_body(Operation::RecordKinds, None, body, &["kinds"])
     }
 
+    pub fn record_query(&mut self, body: Value) -> Result<Value, ClientError> {
+        self.request_body(Operation::RecordQuery, None, body, &[])
+    }
+
+    pub fn record_entity(&mut self, body: Value) -> Result<Value, ClientError> {
+        self.request_body(Operation::RecordEntity, None, body, &[])
+    }
+
     pub fn revoke_companion(&mut self, client_identity: &str) -> Result<Value, ClientError> {
         if client_identity.is_empty() || client_identity.len() > MAX_TEXT_LENGTH {
             return Err(ClientError::UnexpectedMessage);

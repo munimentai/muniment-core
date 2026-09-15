@@ -209,6 +209,22 @@ pub trait ThreadListService {
         Err(ProtocolError::unsupported_operation())
     }
 
+    fn record_query(
+        &mut self,
+        _body: serde_json::Value,
+        _provenance: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn record_entity(
+        &mut self,
+        _body: serde_json::Value,
+        _provenance: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
     fn sign_in(
         &mut self,
         _request_id: &super::Id,

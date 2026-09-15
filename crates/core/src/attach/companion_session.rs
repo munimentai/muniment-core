@@ -309,7 +309,9 @@ where
             | Operation::ArtifactWindow
             | Operation::RequestCancel
             | Operation::RecordSql
-            | Operation::RecordKinds => Some("thread.read"),
+            | Operation::RecordKinds
+            | Operation::RecordQuery
+            | Operation::RecordEntity => Some("thread.read"),
             Operation::ThreadCreate
             | Operation::RunStart
             | Operation::RunCancel

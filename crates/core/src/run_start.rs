@@ -218,6 +218,22 @@ pub trait RunAttachBoundaries {
         Err(ProtocolError::unsupported_operation())
     }
     #[cfg(any(unix, target_os = "windows"))]
+    fn record_query(
+        &self,
+        _actor: &str,
+        _body: serde_json::Value,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(any(unix, target_os = "windows"))]
+    fn record_entity(
+        &self,
+        _actor: &str,
+        _body: serde_json::Value,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(any(unix, target_os = "windows"))]
     fn list_threads(
         &self,
         workspace: &str,

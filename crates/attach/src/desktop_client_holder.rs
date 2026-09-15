@@ -128,6 +128,22 @@ impl DesktopClientHolder {
         self.with_client(|client| client.record_kinds(body.clone()))
     }
 
+    pub fn record_query(&self, body: Value) -> Result<Value, ClientError> {
+        self.with_client(|client| client.record_query(body.clone()))
+    }
+
+    pub fn record_entity(&self, body: Value) -> Result<Value, ClientError> {
+        self.with_client(|client| client.record_entity(body.clone()))
+    }
+
+    pub fn record_propose(&self, body: Value) -> Result<Value, ClientError> {
+        self.with_client(|client| client.record_propose(body.clone()))
+    }
+
+    pub fn record_commit(&self, body: Value) -> Result<Value, ClientError> {
+        self.with_client(|client| client.record_commit(body.clone()))
+    }
+
     pub fn revoke_companion(&self, client_identity: &str) -> Result<Value, ClientError> {
         self.with_client(|client| client.revoke_companion(client_identity))
     }

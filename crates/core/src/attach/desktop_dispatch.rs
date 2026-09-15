@@ -1018,6 +1018,8 @@ pub(super) fn dispatch_request<S: ThreadListService>(
             | Operation::RecordPropose
             | Operation::RecordCommit
             | Operation::RecordKinds
+            | Operation::RecordQuery
+            | Operation::RecordEntity
     ) {
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -1032,6 +1034,22 @@ pub(super) fn dispatch_request<S: ThreadListService>(
             operation: Option<serde_json::Value>,
             #[serde(default)]
             proposal: Option<String>,
+            #[serde(default)]
+            kind: Option<String>,
+            #[serde(default)]
+            entity: Option<String>,
+            #[serde(default)]
+            limit: Option<u64>,
+            #[serde(default)]
+            offset: Option<u64>,
+            #[serde(default)]
+            sort: Option<String>,
+            #[serde(default)]
+            descending: Option<bool>,
+            #[serde(default)]
+            state: Option<String>,
+            #[serde(default)]
+            search: Option<String>,
         }
         let body: Body = serde_json::from_value(request.body.clone())
             .map_err(|_| ProtocolError::invalid_request())?;
@@ -1063,6 +1081,28 @@ pub(super) fn dispatch_request<S: ThreadListService>(
             Operation::RecordKinds => {
                 body.sql.is_none() && body.operation.is_none() && body.proposal.is_none()
             }
+            Operation::RecordQuery => {
+                body.sql.is_none()
+                    && body.operation.is_none()
+                    && body.proposal.is_none()
+                    && body.entity.is_none()
+                    && body.kind.is_some()
+                    && bounded(&body.kind, 128)
+                    && bounded(&body.sort, 128)
+                    && bounded(&body.state, 128)
+                    && bounded(&body.search, 1_000)
+                    && body.limit.is_none_or(|limit| (1..=500).contains(&limit))
+                    && body.offset.is_none_or(|offset| offset <= 1_000_000)
+                    && body.descending.is_none_or(|_| true)
+            }
+            Operation::RecordEntity => {
+                body.sql.is_none()
+                    && body.operation.is_none()
+                    && body.proposal.is_none()
+                    && body.kind.is_none()
+                    && body.entity.is_some()
+                    && bounded(&body.entity, 36)
+            }
             _ => {
                 body.sql.is_none()
                     && body.operation.is_none()
@@ -1077,6 +1117,8 @@ pub(super) fn dispatch_request<S: ThreadListService>(
             Operation::RecordSql => service.record_sql(request.body, provenance)?,
             Operation::RecordPropose => service.record_propose(request.body, provenance)?,
             Operation::RecordKinds => service.record_kinds(request.body, provenance)?,
+            Operation::RecordQuery => service.record_query(request.body, provenance)?,
+            Operation::RecordEntity => service.record_entity(request.body, provenance)?,
             _ => {
                 let idempotency_key = request
                     .idempotency_key

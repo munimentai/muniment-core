@@ -7,6 +7,7 @@ mod catalogue;
 mod companies;
 mod identity;
 mod propose;
+mod query;
 mod schema;
 mod sql;
 mod validate;
@@ -18,6 +19,7 @@ pub use propose::{
     CommitResult, Diff, EntitySnapshot, IdentityInput, LinkInput, Operation, Proposal,
     ProposalIdentity, ProposalLink, Reference,
 };
+pub use query::{EdgeDetail, EntityDetail, QueryOptions, QueryPage, QUERY_LIMIT_CAP};
 pub use sql::{SqlFailure, SqlResult, SqlTool, BYTE_CAP, ROW_CAP, TIME_LIMIT};
 pub use validate::ValidationError;
 

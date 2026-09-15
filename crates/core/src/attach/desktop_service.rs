@@ -406,6 +406,26 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
     }
 
     #[cfg(any(unix, target_os = "windows"))]
+    fn record_query(
+        &mut self,
+        body: serde_json::Value,
+        provenance: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let actor = record_actor(&provenance, &body);
+        self.boundaries.record_query(&actor, body)
+    }
+
+    #[cfg(any(unix, target_os = "windows"))]
+    fn record_entity(
+        &mut self,
+        body: serde_json::Value,
+        provenance: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let actor = record_actor(&provenance, &body);
+        self.boundaries.record_entity(&actor, body)
+    }
+
+    #[cfg(any(unix, target_os = "windows"))]
     fn record_commit(
         &mut self,
         body: serde_json::Value,

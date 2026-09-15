@@ -563,6 +563,8 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         ("record-propose", Operation::RecordPropose),
         ("record-commit", Operation::RecordCommit),
         ("record-kinds", Operation::RecordKinds),
+        ("record-query", Operation::RecordQuery),
+        ("record-entity", Operation::RecordEntity),
     ];
     for (index, (name, operation)) in operations.into_iter().enumerate() {
         insert(
@@ -836,6 +838,10 @@ fn request_body(operation: Operation) -> serde_json::Value {
             "client": "claude-code"
         }),
         Operation::RecordKinds => json!({}),
+        Operation::RecordQuery => {
+            json!({"kind": "deal", "limit": 50, "offset": 0, "sort": "updated_at", "descending": true})
+        }
+        Operation::RecordEntity => json!({"entity": "019965a0-0000-7000-8000-000000000020"}),
         Operation::RunOpen => json!({"run_id": "00000000000000000000000000000191"}),
         Operation::RunStart => {
             json!({"text": "Summarize the selected file.", "context": {"selected_file": "src/main.rs"}})
@@ -1084,6 +1090,8 @@ mod tests {
             Operation::RecordPropose,
             Operation::RecordCommit,
             Operation::RecordKinds,
+            Operation::RecordQuery,
+            Operation::RecordEntity,
             Operation::RunOpen,
             Operation::RunStart,
             Operation::RunSubmit,
@@ -1154,7 +1162,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            87,
+            89,
             "every canonical fixture must be inventoried"
         );
     }
