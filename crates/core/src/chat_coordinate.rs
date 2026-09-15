@@ -200,8 +200,12 @@ impl MarkedGate {
     }
 }
 
-fn local_receipt(elapsed: Duration) -> crate::sidecar::pi_chat::Receipt {
+/// A local reply carries no cloud receipt and says so: the route reads `local`,
+/// the model is the one Pi reported for the reply, and there is no cost.
+fn local_receipt(elapsed: Duration, model: Option<String>) -> crate::sidecar::pi_chat::Receipt {
     crate::sidecar::pi_chat::Receipt {
+        route: Some("local".into()),
+        model,
         time: Some(format!("{:.1}s", elapsed.as_secs_f64())),
         ..Default::default()
     }
@@ -759,6 +763,7 @@ pub fn coordinate(
     };
     let mut buffered_events = buffered_events.into_iter();
     let mut aborting = false;
+    let mut reported_model: Option<String> = None;
     let mut open_effects = MarkedEffects::open_effects(Some(runtime_activity.clone()));
     let mut pending_permission = MarkedGate::pending_permission(Some(runtime_activity));
     'coordinate: loop {
@@ -879,7 +884,7 @@ pub fn coordinate(
             Ok(PiChatEvent::Completed) => {
                 diagnostics.outcome = "completed";
                 let receipt = if grant.is_local() {
-                    Ok(local_receipt(run_started.elapsed()))
+                    Ok(local_receipt(run_started.elapsed(), reported_model.clone()))
                 } else {
                     fetch_receipt(&grant.receipt_url, &access_token, &run_id)
                 };
@@ -1008,6 +1013,9 @@ pub fn coordinate(
                 {
                     break;
                 }
+            }
+            Ok(PiChatEvent::ModelReported { provider, model }) => {
+                reported_model = Some(format!("{provider}/{model}"));
             }
             Ok(PiChatEvent::TurnStarted) => {
                 if append_emit(
@@ -1271,7 +1279,7 @@ mod tests {
     use uuid::Uuid;
 
     fn assert_local_receipt(duration: Duration, expected_range: std::ops::Range<f64>) {
-        let receipt = local_receipt(duration);
+        let receipt = local_receipt(duration, Some("ollama/llama3.2:3b".into()));
         let time = receipt.time.as_deref().expect("local receipt records time");
         let seconds = time
             .strip_suffix('s')
@@ -1283,19 +1291,20 @@ mod tests {
         assert_eq!(tenths.len(), 1);
         assert!(tenths.chars().all(|character| character.is_ascii_digit()));
         assert!(expected_range.contains(&seconds.parse::<f64>().unwrap()));
-        assert_eq!(receipt.route, None);
-        assert_eq!(receipt.model, None);
+        assert_eq!(receipt.route.as_deref(), Some("local"));
+        assert_eq!(receipt.model.as_deref(), Some("ollama/llama3.2:3b"));
         assert_eq!(receipt.cost, None);
         assert!(receipt.capabilities.is_empty());
+        assert_eq!(local_receipt(duration, None).model, None);
     }
 
     #[test]
-    fn local_receipt_records_sub_second_time_alone() {
+    fn local_receipt_records_sub_second_time_with_the_local_route() {
         assert_local_receipt(Duration::from_millis(200), 0.0..1.0);
     }
 
     #[test]
-    fn local_receipt_records_multi_second_time_alone() {
+    fn local_receipt_records_multi_second_time_with_the_local_route() {
         assert_local_receipt(Duration::from_millis(6_200), 6.0..7.0);
     }
 

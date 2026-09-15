@@ -99,6 +99,11 @@ pub enum PiChatEvent {
     PromptAccepted,
     /// Pi's agent loop started on the accepted prompt: the model is thinking.
     TurnStarted,
+    /// An assistant message ended and named the provider and model that wrote it.
+    ModelReported {
+        provider: String,
+        model: String,
+    },
     TextDelta(String),
     ToolStarted {
         tool_call_id: String,
@@ -222,6 +227,22 @@ pub fn parse_frame(frame: &Value) -> Result<PiChatEvent, &'static str> {
             }
         }
         Some("agent_start") => Ok(PiChatEvent::TurnStarted),
+        Some("message_end")
+            if frame.pointer("/message/role").and_then(Value::as_str) == Some("assistant") =>
+        {
+            match (
+                frame.pointer("/message/provider").and_then(Value::as_str),
+                frame.pointer("/message/model").and_then(Value::as_str),
+            ) {
+                (Some(provider), Some(model)) if !provider.is_empty() && !model.is_empty() => {
+                    Ok(PiChatEvent::ModelReported {
+                        provider: provider.to_owned(),
+                        model: model.to_owned(),
+                    })
+                }
+                _ => Ok(PiChatEvent::Interleaved),
+            }
+        }
         Some("tool_execution_start") => {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase")]
@@ -789,6 +810,27 @@ mod tests {
             assert_eq!(adapter.next(Duration::ZERO).unwrap(), event);
             assert!(adapter.first_event_deadline.lock().unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn an_assistant_message_end_reports_its_provider_and_model() {
+        assert_eq!(
+            parse_frame(&json!({"type":"message_end", "message":{
+                "role":"assistant", "provider":"ollama", "model":"llama3.2:3b", "stopReason":"stop"
+            }}))
+            .unwrap(),
+            PiChatEvent::ModelReported {
+                provider: "ollama".into(),
+                model: "llama3.2:3b".into()
+            }
+        );
+        assert_eq!(
+            parse_frame(&json!({"type":"message_end", "message":{
+                "role":"user", "provider":"ollama", "model":"llama3.2:3b"
+            }}))
+            .unwrap(),
+            PiChatEvent::Interleaved
+        );
     }
 
     #[test]
