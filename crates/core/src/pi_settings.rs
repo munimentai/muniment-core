@@ -121,11 +121,76 @@ pub fn prepare_pi_settings(
         })?;
     store_pi_settings(&directory.join("settings.json"), artifact)
         .map_err(|error| PiLaunchError::rejected("settings_write", error))?;
+    if let Some(cli) = cli_executable_beside_runtime() {
+        store_mcp_server(&directory, &cli)
+            .map_err(|error| PiLaunchError::rejected("mcp_server_write", error.to_string()))?;
+    }
     if artifact.version != PI_CANDIDATE_ARTIFACT.version {
         return Ok(());
     }
     crate::pi_packages::prepare_pi_packages(&directory, executable)
         .map_err(|error| PiLaunchError::rejected("package_install", error))
+}
+
+/// The one MCP server the desktop's Pi reaches without the user adding it.
+/// The system prompt names it, and the prompt names no product, so the entry
+/// is the record and not the app.
+pub const MCP_SERVER_NAME: &str = "record";
+/// The revision the record server speaks, and the one the adapter pins.
+pub const MCP_PROTOCOL_VERSION: &str = "2026-07-28";
+
+/// The record server ships beside the runtime as `muniment-cli`. A checkout
+/// that runs the runtime from its target directory has none, and then Pi
+/// keeps the servers the user added and nothing more.
+pub fn cli_executable_beside_runtime() -> Option<PathBuf> {
+    let runtime = std::env::current_exe().ok()?;
+    let name = if cfg!(windows) {
+        "muniment-cli.exe"
+    } else {
+        "muniment-cli"
+    };
+    let cli = runtime.parent()?.join(name);
+    cli.is_file().then_some(cli)
+}
+
+/// Writes the `muniment` entry into the agent directory's `mcp.json`, the
+/// adapter's Pi-global file, and keeps every other server the user added.
+pub fn store_mcp_server(agent_directory: &Path, cli_executable: &Path) -> io::Result<()> {
+    let path = agent_directory.join("mcp.json");
+    let mut root: Map<String, Value> = match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Map::new(),
+        Err(error) => return Err(error),
+    };
+    let servers = root
+        .entry("mcpServers".to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !servers.is_object() {
+        *servers = Value::Object(Map::new());
+    }
+    if let Some(servers) = servers.as_object_mut() {
+        servers.insert(
+            MCP_SERVER_NAME.to_owned(),
+            json!({
+                "command": cli_executable.to_string_lossy(),
+                "args": ["mcp"],
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "lifecycle": "lazy",
+            }),
+        );
+    }
+    fs::create_dir_all(agent_directory)?;
+    let text = serde_json::to_string_pretty(&Value::Object(root))?;
+    let temporary = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
+    fs::write(&temporary, text)?;
+    let replaced = crate::atomic_file::replace(&temporary, &path);
+    if replaced.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    replaced
 }
 
 // proper-lockfile defaults to a 10-second stale threshold and a 5-second heartbeat.
@@ -600,6 +665,40 @@ mod tests {
     }
 
     #[test]
+    fn the_mcp_server_entry_joins_the_users_servers() {
+        let root = temporary_directory();
+        let agent = root.join("agent");
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(
+            agent.join("mcp.json"),
+            br#"{"mcpServers":{"github":{"command":"gh-mcp"}},"foreign":1}"#,
+        )
+        .unwrap();
+        let cli = root.join("muniment-cli");
+        store_mcp_server(&agent, &cli).unwrap();
+        let written: Value =
+            serde_json::from_slice(&fs::read(agent.join("mcp.json")).unwrap()).unwrap();
+        assert_eq!(written["foreign"], 1);
+        assert_eq!(written["mcpServers"]["github"]["command"], "gh-mcp");
+        let entry = &written["mcpServers"][MCP_SERVER_NAME];
+        assert_eq!(entry["command"], cli.to_string_lossy().as_ref());
+        assert_eq!(entry["args"], json!(["mcp"]));
+        assert_eq!(entry["protocolVersion"], MCP_PROTOCOL_VERSION);
+
+        store_mcp_server(&agent, &cli).unwrap();
+        let again: Value =
+            serde_json::from_slice(&fs::read(agent.join("mcp.json")).unwrap()).unwrap();
+        assert_eq!(again, written);
+
+        let fresh = root.join("fresh");
+        store_mcp_server(&fresh, &cli).unwrap();
+        let created: Value =
+            serde_json::from_slice(&fs::read(fresh.join("mcp.json")).unwrap()).unwrap();
+        assert_eq!(created["mcpServers"].as_object().unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn candidate_renders_exact_packages_and_full_registry() {
         let mut settings = Map::new();
         merge_pi_settings(&mut settings, PI_CANDIDATE_ARTIFACT);
@@ -611,7 +710,7 @@ mod tests {
                     "npm:pi-web-access@0.28.0",
                     "npm:pi-subagents@0.65.1",
                     "npm:pi-background-tasks@2.5.0",
-                    "npm:pi-mcp-adapter@2.32.1",
+                    "npm:pi-mcp-adapter@2.34.0",
                     "npm:pi-claude-bridge@0.7.0"
                 ],
                 "defaultTools": ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"]

@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"0000000000000000000000000000008a","operation":"record.propose","capability":"fixture-capability","body":{"client":"claude-code","operation":{"data":{"name":"Northwind"},"kind":"org","op":"create"}}}

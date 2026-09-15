@@ -559,6 +559,9 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         ("company-create", Operation::CompanyCreate),
         ("company-select", Operation::CompanySelect),
         ("company-rename", Operation::CompanyRename),
+        ("record-sql", Operation::RecordSql),
+        ("record-propose", Operation::RecordPropose),
+        ("record-commit", Operation::RecordCommit),
     ];
     for (index, (name, operation)) in operations.into_iter().enumerate() {
         insert(
@@ -820,6 +823,17 @@ fn request_body(operation: Operation) -> serde_json::Value {
         Operation::CompanyRename => {
             json!({"company_id": "019965a0-0000-7000-8000-000000000001", "name": "Northwind"})
         }
+        Operation::RecordSql => {
+            json!({"sql": "select name from v_org limit 5", "client": "claude-code"})
+        }
+        Operation::RecordPropose => json!({
+            "operation": {"op": "create", "kind": "org", "data": {"name": "Northwind"}},
+            "client": "claude-code"
+        }),
+        Operation::RecordCommit => json!({
+            "proposal": "019965a0-0000-7000-8000-000000000010",
+            "client": "claude-code"
+        }),
         Operation::RunOpen => json!({"run_id": "00000000000000000000000000000191"}),
         Operation::RunStart => {
             json!({"text": "Summarize the selected file.", "context": {"selected_file": "src/main.rs"}})
@@ -1064,6 +1078,9 @@ mod tests {
             Operation::CompanyCreate,
             Operation::CompanySelect,
             Operation::CompanyRename,
+            Operation::RecordSql,
+            Operation::RecordPropose,
+            Operation::RecordCommit,
             Operation::RunOpen,
             Operation::RunStart,
             Operation::RunSubmit,
@@ -1134,7 +1151,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            83,
+            86,
             "every canonical fixture must be inventoried"
         );
     }

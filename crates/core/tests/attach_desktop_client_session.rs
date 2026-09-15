@@ -920,6 +920,180 @@ impl ThreadListService for CompanyService {
     }
 }
 
+#[derive(Default)]
+struct RecordService {
+    calls: Vec<(Operation, String, serde_json::Value)>,
+}
+
+impl ThreadListService for RecordService {
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, ProtocolError> {
+        unreachable!()
+    }
+
+    fn record_sql(
+        &mut self,
+        body: serde_json::Value,
+        provenance: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        self.calls
+            .push((Operation::RecordSql, provenance.companion_kind, body));
+        Ok(
+            serde_json::json!({"result": {"columns": ["n"], "csv": "n\n1\n", "row_count": 1, "truncated": false, "elapsed_ms": 0}}),
+        )
+    }
+
+    fn record_propose(
+        &mut self,
+        body: serde_json::Value,
+        provenance: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        self.calls
+            .push((Operation::RecordPropose, provenance.companion_kind, body));
+        Ok(serde_json::json!({"proposal": {"id": "p1", "warnings": [], "diff": {"op": "create"}}}))
+    }
+
+    fn record_commit(
+        &mut self,
+        body: serde_json::Value,
+        _: &Id,
+        _: &Id,
+        provenance: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        self.calls
+            .push((Operation::RecordCommit, provenance.companion_kind, body));
+        Ok(serde_json::json!({"result": {"event_seq": 3, "entity_ids": ["e1"]}}))
+    }
+}
+
+#[test]
+fn desktop_client_reads_proposes_and_commits_on_the_record() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let session_thread = std::thread::spawn(move || {
+        let mut service = RecordService::default();
+        let result = serve_desktop_client_session(server, &session(), &mut service);
+        (result, service)
+    });
+
+    let Envelope::Response(response) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000260",
+            Operation::RecordSql,
+            "admitted",
+            serde_json::json!({"sql": "select 1 as n", "client": "claude-code"}),
+        ),
+    ) else {
+        panic!("record.sql did not return a response");
+    };
+    assert_eq!(response.body["result"]["row_count"], 1);
+
+    for body in [
+        serde_json::json!({}),
+        serde_json::json!({"sql": "   "}),
+        serde_json::json!({"sql": "select 1", "proposal": "p1"}),
+        serde_json::json!({"sql": "select 1", "other": true}),
+        serde_json::json!({"sql": "select 1", "company_id": ""}),
+    ] {
+        let Envelope::Error(error) = exchange(
+            &mut client,
+            request(
+                "018f0000-0000-7000-8000-000000000261",
+                Operation::RecordSql,
+                "admitted",
+                body,
+            ),
+        ) else {
+            panic!("the record.sql body was not validated");
+        };
+        assert_eq!(error.error.code(), ErrorCode::InvalidRequest);
+    }
+
+    let Envelope::Response(response) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000262",
+            Operation::RecordPropose,
+            "admitted",
+            serde_json::json!({"operation": {"op": "create", "kind": "org", "data": {"name": "N"}}}),
+        ),
+    ) else {
+        panic!("record.propose did not return a response");
+    };
+    assert_eq!(response.body["proposal"]["id"], "p1");
+
+    let Envelope::Error(error) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000263",
+            Operation::RecordPropose,
+            "admitted",
+            serde_json::json!({"operation": "create"}),
+        ),
+    ) else {
+        panic!("the record.propose body was not validated");
+    };
+    assert_eq!(error.error.code(), ErrorCode::InvalidRequest);
+
+    let Envelope::Error(error) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000264",
+            Operation::RecordCommit,
+            "admitted",
+            serde_json::json!({"proposal": "p1"}),
+        ),
+    ) else {
+        panic!("record.commit without a key was not refused");
+    };
+    assert_eq!(error.error.code(), ErrorCode::IdempotencyKeyRequired);
+
+    let Envelope::Response(response) = exchange(
+        &mut client,
+        idempotent_request(
+            "018f0000-0000-7000-8000-000000000265",
+            Operation::RecordCommit,
+            serde_json::json!({"proposal": "p1", "client": "claude-code"}),
+        ),
+    ) else {
+        panic!("record.commit did not return a response");
+    };
+    assert_eq!(response.body["result"]["event_seq"], 3);
+
+    let Envelope::Error(error) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000266",
+            Operation::RecordSql,
+            "other",
+            serde_json::json!({"sql": "select 1"}),
+        ),
+    ) else {
+        panic!("the unauthorized record.sql did not return an error");
+    };
+    assert_eq!(error.error.code(), ErrorCode::Unauthorized);
+
+    drop(client);
+    let (result, service) = session_thread.join().unwrap();
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        service
+            .calls
+            .iter()
+            .map(|(operation, kind, _)| (*operation, kind.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (Operation::RecordSql, "desktop-client"),
+            (Operation::RecordPropose, "desktop-client"),
+            (Operation::RecordCommit, "desktop-client"),
+        ]
+    );
+    assert_eq!(service.calls[0].2["client"], "claude-code");
+}
+
 #[test]
 fn desktop_client_manages_companies() {
     let (mut client, server) = UnixStream::pair().unwrap();

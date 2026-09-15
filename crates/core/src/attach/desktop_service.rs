@@ -199,6 +199,21 @@ fn queue_run_message<B: RunAttachBoundaries, I: RunStartIdempotency>(
     serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
 }
 
+/// The desktop's own client acts as the owner. Any other client acts as an
+/// agent named by its kind and, when it says so, the harness behind it.
+#[cfg(any(unix, target_os = "windows"))]
+pub fn record_actor(provenance: &CompanionProvenance, body: &serde_json::Value) -> String {
+    if provenance.companion_kind == crate::record::DESKTOP_ACTOR {
+        return crate::record::DESKTOP_ACTOR.to_owned();
+    }
+    match body.get("client").and_then(serde_json::Value::as_str) {
+        Some(client) if !client.trim().is_empty() => {
+            format!("{}:{}", provenance.companion_kind, client.trim())
+        }
+        _ => provenance.companion_kind.clone(),
+    }
+}
+
 impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency>
     DesktopAttachService<B, I>
 {
@@ -358,6 +373,62 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
             provenance,
             |boundaries| boundaries.rename_company(company_id, name),
         )
+    }
+
+    #[cfg(any(unix, target_os = "windows"))]
+    fn record_sql(
+        &mut self,
+        body: serde_json::Value,
+        provenance: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let actor = record_actor(&provenance, &body);
+        self.boundaries.record_sql(&actor, body)
+    }
+
+    #[cfg(any(unix, target_os = "windows"))]
+    fn record_propose(
+        &mut self,
+        body: serde_json::Value,
+        provenance: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let actor = record_actor(&provenance, &body);
+        self.boundaries.record_propose(&actor, body)
+    }
+
+    #[cfg(any(unix, target_os = "windows"))]
+    fn record_commit(
+        &mut self,
+        body: serde_json::Value,
+        request_id: &Id,
+        idempotency_key: &Id,
+        provenance: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let actor = record_actor(&provenance, &body);
+        let ledger_request = AttachRequest {
+            protocol: Protocol,
+            request_id: request_id.clone(),
+            operation: Operation::RecordCommit,
+            capability: String::new(),
+            idempotency_key: Some(idempotency_key.clone()),
+            body: body.clone(),
+        };
+        let payload = body.clone();
+        let outcome = self.idempotency.execute(
+            &provenance.profile,
+            &ledger_request,
+            &body,
+            || Ok(()),
+            || {
+                Ok(CommittedResult {
+                    body: self.boundaries.record_commit(&actor, payload)?,
+                    cursor: None,
+                })
+            },
+        )?;
+        let committed = match outcome {
+            IdempotencyOutcome::Committed(result) | IdempotencyOutcome::Replayed(result) => result,
+        };
+        Ok(committed.body)
     }
 
     fn authorize_client(

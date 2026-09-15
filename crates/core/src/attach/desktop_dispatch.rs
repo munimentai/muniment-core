@@ -1012,6 +1012,79 @@ pub(super) fn dispatch_request<S: ThreadListService>(
         };
         return Ok(response_only(serde_json::json!({"company": company})));
     }
+    if matches!(
+        request.operation,
+        Operation::RecordSql | Operation::RecordPropose | Operation::RecordCommit
+    ) {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            #[serde(default)]
+            company_id: Option<String>,
+            #[serde(default)]
+            client: Option<String>,
+            #[serde(default)]
+            sql: Option<String>,
+            #[serde(default)]
+            operation: Option<serde_json::Value>,
+            #[serde(default)]
+            proposal: Option<String>,
+        }
+        let body: Body = serde_json::from_value(request.body.clone())
+            .map_err(|_| ProtocolError::invalid_request())?;
+        let bounded = |value: &Option<String>, limit: usize| {
+            value
+                .as_deref()
+                .is_none_or(|text| !text.is_empty() && text.len() <= limit)
+        };
+        if !bounded(&body.company_id, 36) || !bounded(&body.client, 128) {
+            return Err(ProtocolError::invalid_request().into());
+        }
+        let valid = match request.operation {
+            Operation::RecordSql => {
+                body.operation.is_none()
+                    && body.proposal.is_none()
+                    && body
+                        .sql
+                        .as_deref()
+                        .is_some_and(|sql| !sql.trim().is_empty() && sql.len() <= 100_000)
+            }
+            Operation::RecordPropose => {
+                body.sql.is_none()
+                    && body.proposal.is_none()
+                    && body
+                        .operation
+                        .as_ref()
+                        .is_some_and(serde_json::Value::is_object)
+            }
+            _ => {
+                body.sql.is_none()
+                    && body.operation.is_none()
+                    && body.proposal.is_some()
+                    && bounded(&body.proposal, 36)
+            }
+        };
+        if !valid {
+            return Err(ProtocolError::invalid_request().into());
+        }
+        let answer = match request.operation {
+            Operation::RecordSql => service.record_sql(request.body, provenance)?,
+            Operation::RecordPropose => service.record_propose(request.body, provenance)?,
+            _ => {
+                let idempotency_key = request
+                    .idempotency_key
+                    .as_ref()
+                    .ok_or_else(ProtocolError::idempotency_key_required)?;
+                service.record_commit(
+                    request.body,
+                    &request.request_id,
+                    idempotency_key,
+                    provenance,
+                )?
+            }
+        };
+        return Ok(response_only(answer));
+    }
     if request.operation == Operation::ThreadDelete {
         let idempotency_key = request
             .idempotency_key

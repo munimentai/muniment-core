@@ -81,6 +81,10 @@ pub mod windows_task_service;
 pub mod windows_user_diagnostics;
 pub mod write_plan;
 
+/// The runtime crate carries no dependency of its own beyond the core and
+/// attach, so the JSON crate the record bodies use reaches it from here.
+pub use serde_json;
+
 pub use muniment_attach::{
     ensure_cross_project_home, ensure_scaffold_directory, onboard_companion_workspace,
     write_scaffold_file_if_missing,

@@ -8,6 +8,7 @@ mod companies;
 mod identity;
 mod propose;
 mod schema;
+mod sql;
 mod validate;
 
 pub use catalogue::{core_kinds, relations, KindDefinition, Relation};
@@ -17,6 +18,7 @@ pub use propose::{
     CommitResult, Diff, EntitySnapshot, IdentityInput, LinkInput, Operation, Proposal,
     ProposalIdentity, ProposalLink, Reference,
 };
+pub use sql::{SqlFailure, SqlResult, SqlTool, BYTE_CAP, ROW_CAP, TIME_LIMIT};
 pub use validate::ValidationError;
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -61,6 +63,10 @@ impl KindRow {
 
 /// Every tenant property and every tenant kind carries this prefix.
 pub const EXTENSION_PREFIX: &str = "x_";
+
+/// The actor name of the desktop's own client. It acts as the company's
+/// owner. Every other actor is an agent principal that names the owner.
+pub const DESKTOP_ACTOR: &str = "desktop-client";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EntityRow {
@@ -383,6 +389,7 @@ impl CompanyRecord {
              on conflict (kind_name) do update set version = excluded.version, schema = excluded.schema",
             params![kind, version, serde_json::to_string(&extension)?],
         )?;
+        schema::refresh_views(&self.connection)?;
         self.require_kind(kind)
     }
 
@@ -407,7 +414,44 @@ impl CompanyRecord {
             return Err(RecordError::ExtensionName(bad.to_owned()));
         }
         schema::insert_kind(&self.connection, &definition)?;
+        schema::refresh_views(&self.connection)?;
         self.require_kind(&definition.name)
+    }
+
+    /// The agent principal with this label, created on first use. It acts
+    /// for the human named, and the schema refuses one that names nobody.
+    pub fn agent_principal(
+        &mut self,
+        label: &str,
+        on_behalf_of: &str,
+    ) -> Result<PrincipalRow, RecordError> {
+        let existing: Option<String> = self
+            .connection
+            .query_row(
+                "select id from principal where type = 'agent' and label = ?1 and disabled_at is null
+                 order by id limit 1",
+                params![label],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match existing {
+            Some(id) => self
+                .principal(&id)?
+                .ok_or(RecordError::PrincipalNotFound(id)),
+            None => self.create_principal(PrincipalType::Agent, label, Some(on_behalf_of)),
+        }
+    }
+
+    /// The names the SQL tool's system prompt lists: one view per kind and
+    /// the three graph views.
+    pub fn view_names(&self) -> Result<Vec<String>, RecordError> {
+        let mut statement = self
+            .connection
+            .prepare("select name from sqlite_master where type = 'view' order by name")?;
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(names)
     }
 
     /// Creates one principal. A principal that is not a human names the human

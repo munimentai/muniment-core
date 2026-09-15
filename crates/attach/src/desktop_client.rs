@@ -523,6 +523,23 @@ impl DesktopClient {
         )
     }
 
+    pub fn record_sql(&mut self, body: Value) -> Result<Value, ClientError> {
+        self.request_body(Operation::RecordSql, None, body, &[])
+    }
+
+    pub fn record_propose(&mut self, body: Value) -> Result<Value, ClientError> {
+        self.request_body(Operation::RecordPropose, None, body, &[])
+    }
+
+    pub fn record_commit(&mut self, body: Value) -> Result<Value, ClientError> {
+        self.request_body(
+            Operation::RecordCommit,
+            Some(fresh_request_id()?),
+            body,
+            &[],
+        )
+    }
+
     pub fn revoke_companion(&mut self, client_identity: &str) -> Result<Value, ClientError> {
         if client_identity.is_empty() || client_identity.len() > MAX_TEXT_LENGTH {
             return Err(ClientError::UnexpectedMessage);

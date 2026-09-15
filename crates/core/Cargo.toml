@@ -38,7 +38,7 @@ muniment-code-diff = { path = "../code-diff" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 flate2 = "1"
 fs2 = "0.4"
-rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
+rusqlite = { version = "0.32", features = ["bundled", "hooks", "limits"] }
 same-file = "1.0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

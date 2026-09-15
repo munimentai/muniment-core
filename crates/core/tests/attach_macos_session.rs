@@ -48,6 +48,18 @@ mod unix_tests {
             })
         }
 
+        fn record_sql(
+            &mut self,
+            body: serde_json::Value,
+            provenance: CompanionProvenance,
+        ) -> Result<serde_json::Value, ProtocolError> {
+            assert_eq!(provenance.companion_kind, "desktop-client");
+            assert_eq!(body["sql"], "select 1 as n");
+            Ok(
+                serde_json::json!({"result": {"columns": ["n"], "csv": "n\n1\n", "row_count": 1, "truncated": false, "elapsed_ms": 0}}),
+            )
+        }
+
         fn list_companies(&mut self) -> Result<Vec<CompanySummary>, ProtocolError> {
             Ok(vec![CompanySummary {
                 id: COMPANY_ID.to_owned(),
@@ -200,6 +212,28 @@ mod unix_tests {
         assert_eq!(list.request_id, list_id);
         assert_eq!(list.body["current"], COMPANY_ID);
         assert_eq!(list.body["companies"][0]["name"], "Northwind");
+
+        let sql_id = Id::new("018f0000-0000-7000-8000-000000000104").unwrap();
+        client
+            .write_all(
+                &encode_frame(&Request {
+                    protocol: Protocol,
+                    request_id: sql_id.clone(),
+                    operation: Operation::RecordSql,
+                    capability: grant.capability.clone(),
+                    idempotency_key: None,
+                    body: serde_json::json!({"sql": "select 1 as n"}),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let sql_frame = read_frame(&mut client);
+        let (Envelope::Response(sql), _) = decode_frame::<Envelope>(&sql_frame).unwrap().unwrap()
+        else {
+            panic!("expected a record.sql response");
+        };
+        assert_eq!(sql.request_id, sql_id);
+        assert_eq!(sql.body["result"]["csv"], "n\n1\n");
 
         client.shutdown(Shutdown::Write).unwrap();
         let (outcome, service) = session.join().unwrap();

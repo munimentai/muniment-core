@@ -759,6 +759,57 @@ mod linux {
             Ok(())
         }
 
+        /// Runs one read-only query on the company record. The body carries
+        /// `sql` and, optionally, `company_id` and `client`.
+        pub fn record_sql(
+            &mut self,
+            body: serde_json::Value,
+        ) -> Result<serde_json::Value, ClientError> {
+            self.record_request(Operation::RecordSql, None, body)
+        }
+
+        /// Proposes one change to the company record and returns the diff.
+        pub fn record_propose(
+            &mut self,
+            body: serde_json::Value,
+        ) -> Result<serde_json::Value, ClientError> {
+            self.record_request(Operation::RecordPropose, None, body)
+        }
+
+        /// Commits one proposal. The call carries an idempotency key.
+        pub fn record_commit(
+            &mut self,
+            body: serde_json::Value,
+        ) -> Result<serde_json::Value, ClientError> {
+            let key = fresh_request_id()?;
+            self.record_request(Operation::RecordCommit, Some(key), body)
+        }
+
+        fn record_request(
+            &mut self,
+            operation: Operation,
+            idempotency_key: Option<Id>,
+            body: serde_json::Value,
+        ) -> Result<serde_json::Value, ClientError> {
+            if !body.is_object() {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            let request_id = fresh_request_id()?;
+            let request = Request {
+                protocol: Protocol,
+                request_id: request_id.clone(),
+                operation,
+                capability: self.capability.clone(),
+                idempotency_key,
+                body,
+            };
+            let response = self.send_request(request, &request_id)?;
+            if !response.body.is_object() {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            Ok(response.body)
+        }
+
         fn send_request(
             &mut self,
             request: Request,
@@ -2932,6 +2983,24 @@ impl AuthorizedClient {
         Err(ClientError::UnsupportedPlatform)
     }
     pub fn ensure_home(&mut self) -> Result<(), ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+    pub fn record_sql(
+        &mut self,
+        _body: serde_json::Value,
+    ) -> Result<serde_json::Value, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+    pub fn record_propose(
+        &mut self,
+        _body: serde_json::Value,
+    ) -> Result<serde_json::Value, ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
+    pub fn record_commit(
+        &mut self,
+        _body: serde_json::Value,
+    ) -> Result<serde_json::Value, ClientError> {
         Err(ClientError::UnsupportedPlatform)
     }
     pub fn list_threads(&mut self, _cursor: Option<&str>) -> Result<ThreadListPage, ClientError> {

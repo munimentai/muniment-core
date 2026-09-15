@@ -139,9 +139,88 @@ pub(super) fn open_connection(path: &Path) -> Result<Connection, RecordError> {
     for kind in core_kinds() {
         insert_kind(&transaction, &kind)?;
     }
+    refresh_views(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(connection)
+}
+
+/// The base columns every kind view carries before its own properties.
+const VIEW_BASE_COLUMNS: [&str; 5] = ["id", "title", "state", "created_at", "updated_at"];
+
+/// Rebuilds one view per kind, `v_<kind>`, with a column per property, plus
+/// the three graph views. A view is the SQL-native form of a skill, and the
+/// catalogue is the one source, so no view is written by hand.
+pub(super) fn refresh_views(connection: &Connection) -> Result<(), RecordError> {
+    let mut statement = connection.prepare(
+        "select k.name, k.schema, e.schema from kind k
+         left join kind_extension e on e.kind_name = k.name order by k.name",
+    )?;
+    let kinds = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (name, schema, extension) in kinds {
+        let mut columns: Vec<String> = Vec::new();
+        for text in std::iter::once(Some(schema))
+            .chain(std::iter::once(extension))
+            .flatten()
+        {
+            let value: serde_json::Value = serde_json::from_str(&text)?;
+            if let Some(properties) = value.get("properties").and_then(|p| p.as_object()) {
+                for property in properties.keys() {
+                    if !VIEW_BASE_COLUMNS.contains(&property.as_str())
+                        && !columns.contains(property)
+                        && property
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                    {
+                        columns.push(property.clone());
+                    }
+                }
+            }
+        }
+        let mut select: Vec<String> = VIEW_BASE_COLUMNS
+            .iter()
+            .map(|column| format!("\"{column}\""))
+            .collect();
+        select.extend(
+            columns
+                .iter()
+                .map(|column| format!("json_extract(data, '$.{column}') as \"{column}\"")),
+        );
+        connection.execute_batch(&format!(
+            "drop view if exists \"v_{name}\";
+             create view \"v_{name}\" as select {} from entity
+             where kind = '{name}' and deleted_at is null;",
+            select.join(", ")
+        ))?;
+    }
+    connection.execute_batch(
+        "drop view if exists edges_open;
+         create view edges_open as
+             select e.id, e.relation, e.src_id, s.kind as src_kind, s.title as src_title,
+                    e.dst_id, d.kind as dst_kind, d.title as dst_title,
+                    e.props, e.valid_from, e.source, e.confidence
+             from edge e join entity s on s.id = e.src_id join entity d on d.id = e.dst_id
+             where e.valid_to is null;
+         drop view if exists entity_identities;
+         create view entity_identities as
+             select i.kind, i.value, i.entity_id, e.kind as entity_kind, e.title, i.source,
+                    i.confidence, i.first_seen
+             from identity i join entity e on e.id = i.entity_id;
+         drop view if exists recent_events;
+         create view recent_events as
+             select v.seq, v.at, v.verb, v.actor_id, v.on_behalf_of, v.entity_id,
+                    e.kind as entity_kind, e.title, v.edge_id, v.source
+             from event v left join entity e on e.id = v.entity_id order by v.seq desc;",
+    )?;
+    Ok(())
 }
 
 /// Writes one kind row. An existing row moves to the new definition only when
@@ -212,6 +291,66 @@ mod tests {
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .unwrap();
         assert_eq!(mode, "wal");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn views_follow_the_catalogue_and_its_extensions() {
+        let path = temporary_graph("views");
+        let mut record = CompanyRecord::open(&path).unwrap();
+        let views: Vec<String> = record
+            .connection
+            .prepare("select name from sqlite_master where type = 'view' order by name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(views.len(), 23);
+        assert!(views.contains(&"v_deal".to_owned()));
+        assert!(views.contains(&"edges_open".to_owned()));
+        let deal_columns: Vec<String> = record
+            .connection
+            .prepare("select name from pragma_table_info('v_deal')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(&deal_columns[..5], VIEW_BASE_COLUMNS);
+        assert!(deal_columns.contains(&"expected_close".to_owned()));
+        let task_columns: Vec<String> = record
+            .connection
+            .prepare("select name from pragma_table_info('v_task')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            task_columns
+                .iter()
+                .filter(|c| c.as_str() == "title")
+                .count(),
+            1
+        );
+
+        record
+            .extend_kind(
+                "deal",
+                "x_renewal_risk",
+                serde_json::json!({"type": "string"}),
+            )
+            .unwrap();
+        let deal_columns: Vec<String> = record
+            .connection
+            .prepare("select name from pragma_table_info('v_deal')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(deal_columns.contains(&"x_renewal_risk".to_owned()));
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

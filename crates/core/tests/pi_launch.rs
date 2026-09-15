@@ -332,7 +332,7 @@ fn every_launch_renders_the_selected_track_before_spawn() {
                 assert_eq!(settings["defaultProvider"], "ollama");
                 assert_eq!(settings["foreign"], true);
                 if artifact == PI_CANDIDATE_ARTIFACT {
-                    assert_eq!(settings["packages"].as_array().unwrap().len(), 4);
+                    assert_eq!(settings["packages"].as_array().unwrap().len(), 5);
                     assert_eq!(settings["defaultTools"].as_array().unwrap().len(), 8);
                     assert_eq!(
                         config.startup_timeout,

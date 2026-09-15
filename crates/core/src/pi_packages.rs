@@ -16,7 +16,7 @@ pub const PI_PACKAGES: [(&str, &str); 5] = [
     ("pi-web-access", "0.28.0"),
     ("pi-subagents", "0.65.1"),
     ("pi-background-tasks", "2.5.0"),
-    ("pi-mcp-adapter", "2.32.1"),
+    ("pi-mcp-adapter", "2.34.0"),
     ("pi-claude-bridge", "0.7.0"),
 ];
 
@@ -621,7 +621,7 @@ mod tests {
                 "pi-web-access@0.28.0",
                 "pi-subagents@0.65.1",
                 "pi-background-tasks@2.5.0",
-                "pi-mcp-adapter@2.32.1",
+                "pi-mcp-adapter@2.34.0",
                 "pi-claude-bridge@0.7.0",
                 "--omit=peer",
                 "--ignore-scripts",

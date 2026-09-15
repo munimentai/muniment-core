@@ -307,11 +307,14 @@ where
             | Operation::RunCursorAck
             | Operation::ArtifactFetch
             | Operation::ArtifactWindow
-            | Operation::RequestCancel => Some("thread.read"),
+            | Operation::RequestCancel
+            | Operation::RecordSql => Some("thread.read"),
             Operation::ThreadCreate
             | Operation::RunStart
             | Operation::RunCancel
-            | Operation::PermissionAnswer => Some("run.write"),
+            | Operation::PermissionAnswer
+            | Operation::RecordPropose
+            | Operation::RecordCommit => Some("run.write"),
             _ => None,
         };
         if authorization
