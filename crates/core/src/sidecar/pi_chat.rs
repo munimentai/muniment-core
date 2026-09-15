@@ -86,6 +86,15 @@ pub struct Receipt {
     pub time: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<CapabilityReceipt>,
+    /// The tokens the reply's turns used, summed from Pi's usage on each assistant message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<TokenUsage>,
+    /// How many assistant messages the run took.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turns: Option<u32>,
+    /// One tally per tool name: calls made and calls that failed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolReceipt>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,15 +103,64 @@ pub struct CapabilityReceipt {
     pub version: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub reasoning: u64,
+    pub total: u64,
+}
+
+impl TokenUsage {
+    pub fn add(&mut self, other: &TokenUsage) {
+        self.input += other.input;
+        self.output += other.output;
+        self.cache_read += other.cache_read;
+        self.cache_write += other.cache_write;
+        self.reasoning += other.reasoning;
+        self.total += other.total;
+    }
+
+    fn from_frame(usage: &Value) -> Option<Self> {
+        let count = |field: &str| {
+            usage
+                .get(field)
+                .and_then(Value::as_f64)
+                .map(|n| n.max(0.0) as u64)
+        };
+        Some(Self {
+            input: count("input")?,
+            output: count("output")?,
+            cache_read: count("cacheRead").unwrap_or(0),
+            cache_write: count("cacheWrite").unwrap_or(0),
+            reasoning: count("reasoning").unwrap_or(0),
+            total: count("totalTokens").unwrap_or(0),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolReceipt {
+    pub name: String,
+    pub calls: u32,
+    pub failed: u32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum PiChatEvent {
     PromptAccepted,
     /// Pi's agent loop started on the accepted prompt: the model is thinking.
     TurnStarted,
-    /// An assistant message ended and named the provider and model that wrote it.
+    /// An assistant message ended: one turn, with the provider and model that
+    /// wrote it, its token usage, and the cost Pi's catalog puts on that usage.
     ModelReported {
         provider: String,
         model: String,
+        usage: Option<TokenUsage>,
+        cost: Option<f64>,
     },
     TextDelta(String),
     ToolStarted {
@@ -235,9 +293,14 @@ pub fn parse_frame(frame: &Value) -> Result<PiChatEvent, &'static str> {
                 frame.pointer("/message/model").and_then(Value::as_str),
             ) {
                 (Some(provider), Some(model)) if !provider.is_empty() && !model.is_empty() => {
+                    let usage = frame.pointer("/message/usage");
                     Ok(PiChatEvent::ModelReported {
                         provider: provider.to_owned(),
                         model: model.to_owned(),
+                        usage: usage.and_then(TokenUsage::from_frame),
+                        cost: usage
+                            .and_then(|usage| usage.pointer("/cost/total"))
+                            .and_then(Value::as_f64),
                     })
                 }
                 _ => Ok(PiChatEvent::Interleaved),
@@ -821,7 +884,30 @@ mod tests {
             .unwrap(),
             PiChatEvent::ModelReported {
                 provider: "ollama".into(),
-                model: "llama3.2:3b".into()
+                model: "llama3.2:3b".into(),
+                usage: None,
+                cost: None,
+            }
+        );
+        assert_eq!(
+            parse_frame(&json!({"type":"message_end", "message":{
+                "role":"assistant", "provider":"openai-codex", "model":"gpt-5.5",
+                "usage":{"input":11414,"output":64,"cacheRead":0,"cacheWrite":0,"reasoning":0,"totalTokens":11478,
+                         "cost":{"input":0.05707,"output":0.00192,"cacheRead":0,"cacheWrite":0,"total":0.05899}}
+            }}))
+            .unwrap(),
+            PiChatEvent::ModelReported {
+                provider: "openai-codex".into(),
+                model: "gpt-5.5".into(),
+                usage: Some(TokenUsage {
+                    input: 11414,
+                    output: 64,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                    total: 11478
+                }),
+                cost: Some(0.05899),
             }
         );
         assert_eq!(

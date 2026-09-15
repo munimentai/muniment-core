@@ -200,13 +200,78 @@ impl MarkedGate {
     }
 }
 
-/// A local reply carries no cloud receipt and says so: the route reads `local`,
-/// the model is the one Pi reported for the reply, and there is no cost.
-fn local_receipt(elapsed: Duration, model: Option<String>) -> crate::sidecar::pi_chat::Receipt {
+/// What a local run records for its receipt while it runs: the model Pi
+/// reports, the usage and catalog cost of each turn, and every tool call.
+#[derive(Default)]
+struct LocalRunLedger {
+    model: Option<String>,
+    tokens: Option<crate::sidecar::pi_chat::TokenUsage>,
+    cost: Option<f64>,
+    turns: u32,
+    tool_names: std::collections::HashMap<String, String>,
+    tools: std::collections::BTreeMap<String, (u32, u32)>,
+}
+
+impl LocalRunLedger {
+    fn record(&mut self, event: &PiChatEvent) {
+        match event {
+            PiChatEvent::ModelReported {
+                provider,
+                model,
+                usage,
+                cost,
+            } => {
+                self.model = Some(format!("{provider}/{model}"));
+                self.turns += 1;
+                if let Some(usage) = usage {
+                    self.tokens.get_or_insert_with(Default::default).add(usage);
+                }
+                if let Some(cost) = cost {
+                    *self.cost.get_or_insert(0.0) += cost;
+                }
+            }
+            PiChatEvent::ToolStarted {
+                tool_call_id,
+                tool_name,
+            } => {
+                self.tool_names
+                    .insert(tool_call_id.clone(), tool_name.clone());
+                self.tools.entry(tool_name.clone()).or_default().0 += 1;
+            }
+            PiChatEvent::ToolFinished {
+                tool_call_id,
+                failed: true,
+            } => {
+                if let Some(name) = self.tool_names.get(tool_call_id) {
+                    self.tools.entry(name.clone()).or_default().1 += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A local reply carries no cloud receipt and no route, because no routing
+/// chose the model. The model, tokens, turns and tools are what the run
+/// recorded, and the cost is Pi's catalog estimate, never a bill.
+fn local_receipt(elapsed: Duration, ledger: &LocalRunLedger) -> crate::sidecar::pi_chat::Receipt {
     crate::sidecar::pi_chat::Receipt {
-        route: Some("local".into()),
-        model,
+        model: ledger.model.clone(),
+        cost: ledger.cost.map(|cost| format!("${cost:.3} est.")),
         time: Some(format!("{:.1}s", elapsed.as_secs_f64())),
+        tokens: ledger.tokens,
+        turns: (ledger.turns > 0).then_some(ledger.turns),
+        tools: ledger
+            .tools
+            .iter()
+            .map(
+                |(name, (calls, failed))| crate::sidecar::pi_chat::ToolReceipt {
+                    name: name.clone(),
+                    calls: *calls,
+                    failed: *failed,
+                },
+            )
+            .collect(),
         ..Default::default()
     }
 }
@@ -763,7 +828,7 @@ pub fn coordinate(
     };
     let mut buffered_events = buffered_events.into_iter();
     let mut aborting = false;
-    let mut reported_model: Option<String> = None;
+    let mut ledger = LocalRunLedger::default();
     let mut open_effects = MarkedEffects::open_effects(Some(runtime_activity.clone()));
     let mut pending_permission = MarkedGate::pending_permission(Some(runtime_activity));
     'coordinate: loop {
@@ -846,6 +911,9 @@ pub fn coordinate(
             .next()
             .map(Ok)
             .unwrap_or_else(|| adapter.next(Duration::from_millis(100)));
+        if let Ok(event) = &event {
+            ledger.record(event);
+        }
         match event {
             Ok(PiChatEvent::TextDelta(text)) => {
                 for slice in split_model_stream_delta(&text) {
@@ -884,7 +952,7 @@ pub fn coordinate(
             Ok(PiChatEvent::Completed) => {
                 diagnostics.outcome = "completed";
                 let receipt = if grant.is_local() {
-                    Ok(local_receipt(run_started.elapsed(), reported_model.clone()))
+                    Ok(local_receipt(run_started.elapsed(), &ledger))
                 } else {
                     fetch_receipt(&grant.receipt_url, &access_token, &run_id)
                 };
@@ -1014,9 +1082,7 @@ pub fn coordinate(
                     break;
                 }
             }
-            Ok(PiChatEvent::ModelReported { provider, model }) => {
-                reported_model = Some(format!("{provider}/{model}"));
-            }
+            Ok(PiChatEvent::ModelReported { .. }) => {}
             Ok(PiChatEvent::TurnStarted) => {
                 if append_emit(
                     &app,
@@ -1278,8 +1344,47 @@ mod tests {
     use std::io;
     use uuid::Uuid;
 
+    fn ledger_of_one_run() -> LocalRunLedger {
+        let mut ledger = LocalRunLedger::default();
+        let usage = crate::sidecar::pi_chat::TokenUsage {
+            input: 100,
+            output: 10,
+            cache_read: 5,
+            cache_write: 0,
+            reasoning: 2,
+            total: 117,
+        };
+        let reported = |cost: f64| PiChatEvent::ModelReported {
+            provider: "ollama".into(),
+            model: "llama3.2:3b".into(),
+            usage: Some(usage),
+            cost: Some(cost),
+        };
+        let started = |id: &str, name: &str| PiChatEvent::ToolStarted {
+            tool_call_id: id.into(),
+            tool_name: name.into(),
+        };
+        let finished = |id: &str, failed: bool| PiChatEvent::ToolFinished {
+            tool_call_id: id.into(),
+            failed,
+        };
+        for event in [
+            started("c1", "read"),
+            finished("c1", false),
+            started("c2", "bash"),
+            finished("c2", true),
+            started("c3", "read"),
+            reported(0.01),
+            reported(0.0025),
+            PiChatEvent::TextDelta("hi".into()),
+        ] {
+            ledger.record(&event);
+        }
+        ledger
+    }
+
     fn assert_local_receipt(duration: Duration, expected_range: std::ops::Range<f64>) {
-        let receipt = local_receipt(duration, Some("ollama/llama3.2:3b".into()));
+        let receipt = local_receipt(duration, &ledger_of_one_run());
         let time = receipt.time.as_deref().expect("local receipt records time");
         let seconds = time
             .strip_suffix('s')
@@ -1291,20 +1396,46 @@ mod tests {
         assert_eq!(tenths.len(), 1);
         assert!(tenths.chars().all(|character| character.is_ascii_digit()));
         assert!(expected_range.contains(&seconds.parse::<f64>().unwrap()));
-        assert_eq!(receipt.route.as_deref(), Some("local"));
+        assert_eq!(receipt.route, None);
         assert_eq!(receipt.model.as_deref(), Some("ollama/llama3.2:3b"));
-        assert_eq!(receipt.cost, None);
+        assert_eq!(receipt.cost.as_deref(), Some("$0.013 est."));
+        assert_eq!(receipt.turns, Some(2));
+        let tokens = receipt.tokens.unwrap();
+        assert_eq!(
+            (
+                tokens.input,
+                tokens.output,
+                tokens.cache_read,
+                tokens.reasoning,
+                tokens.total
+            ),
+            (200, 20, 10, 4, 234)
+        );
+        assert_eq!(
+            receipt
+                .tools
+                .iter()
+                .map(|tool| (tool.name.as_str(), tool.calls, tool.failed))
+                .collect::<Vec<_>>(),
+            [("bash", 1, 1), ("read", 2, 0)]
+        );
         assert!(receipt.capabilities.is_empty());
-        assert_eq!(local_receipt(duration, None).model, None);
+        // A run Pi never reported on records the time alone.
+        let bare = local_receipt(duration, &LocalRunLedger::default());
+        assert_eq!(bare.model, None);
+        assert_eq!(bare.cost, None);
+        assert_eq!(bare.turns, None);
+        assert_eq!(bare.tokens, None);
+        assert!(bare.tools.is_empty());
     }
 
     #[test]
-    fn local_receipt_records_sub_second_time_with_the_local_route() {
+    fn local_receipt_records_sub_second_time_without_a_route() {
         assert_local_receipt(Duration::from_millis(200), 0.0..1.0);
     }
 
     #[test]
-    fn local_receipt_records_multi_second_time_with_the_local_route() {
+    fn local_receipt_records_multi_second_time_without_a_route() {
         assert_local_receipt(Duration::from_millis(6_200), 6.0..7.0);
     }
 
