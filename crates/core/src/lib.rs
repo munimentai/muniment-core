@@ -30,6 +30,7 @@ pub mod code_diff_effect;
 pub mod code_diff_journal;
 pub mod code_diff_observe;
 pub mod code_diff_staging;
+pub mod endpoint_models;
 pub mod harness_scan;
 pub mod home;
 pub mod import_preview;
