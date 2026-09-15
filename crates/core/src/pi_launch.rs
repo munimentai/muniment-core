@@ -6,12 +6,24 @@ use crate::sidecar::{pi_sidecar_config, PiSessionLocator, SidecarConfig};
 
 const CLOUD_PROVIDER_EXTENSION: &str = include_str!("muniment_cloud_provider.mjs");
 
-const BASH_TIMEOUT_INSTRUCTIONS: &str =
-    "- `bash` reads its `timeout` in SECONDS, never milliseconds, and applies
-  NO timeout at all when you omit it. Pass one on every call: 60 for a
-  quick command, up to 600 for a build or a test suite. A four- or
-  five-digit value is a millisecond habit from another harness and leaves
-  the command unbounded, so it runs until the engine kills the whole run.";
+/// The whole system prompt. It states the assistant's purpose and its tools and
+/// names no harness and no product. Pi appends the working directory, the
+/// project instruction files it finds there, and the skills list.
+pub const SYSTEM_PROMPT: &str = "You are the assistant inside a desktop app that keeps a business's records and does work on them for the user. You read and write files, run commands, search the web, hand bounded work to child agents, and run long tasks in the background.
+
+Tools:
+- read, write, edit: read a file, create or overwrite a file, replace exact text in a file.
+- bash, powershell: run a shell command in the working directory.
+- grep, find, ls: search file contents, find files by pattern, list a directory. Prefer these to shell commands for exploring files.
+- web_search, fetch_content: search the web and fetch a page.
+- subagent: hand a bounded task to a child agent and get its result.
+- bg_run, bg_status, bg_logs, bg_kill: start a long command in the background and read its progress and result.
+- mcp: discover and call the user's MCP servers.
+
+Rules:
+- `bash` reads its `timeout` in SECONDS, never milliseconds, and applies NO timeout at all when you omit it. Pass one on every call: 60 for a quick command, up to 600 for a build or a test suite. Send anything longer to `bg_run`.
+- Be concise. Show file paths clearly when you work with files.
+- When something fails, state what happened and the next step.";
 
 const LOCAL_MODE_ENV_REMOVE: &[&str] = &[
     "AI_GATEWAY_API_KEY",
@@ -486,10 +498,9 @@ pub fn pi_launch_config_for_executable(
         // Extension loading precedes the first RPC response.
         config.startup_timeout = std::time::Duration::from_secs(120);
     }
-    config.args.extend([
-        "--append-system-prompt".into(),
-        BASH_TIMEOUT_INSTRUCTIONS.into(),
-    ]);
+    config
+        .args
+        .extend(["--system-prompt".into(), SYSTEM_PROMPT.into()]);
     if grant.is_local() {
         config
             .env_remove

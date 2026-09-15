@@ -591,7 +591,7 @@ fn publish_pointers<B: PiLifecycleBoundary>(
 }
 
 pub fn resolve_current(root: &Path) -> Result<PathBuf, PiInstallError> {
-    resolve_pointer(root, "current").or_else(|_| resolve_pointer(root, "previous"))
+    resolve_current_for(root, PI_SELECTED_ARTIFACT)
 }
 
 pub fn resolve_current_for(
@@ -603,7 +603,10 @@ pub fn resolve_current_for(
     } else {
         None
     };
-    resolve_pointer_for(root, "current", descriptor, retained)
+    // The current pointer names the pin alone, so a pin move on a host that
+    // holds the predecessor acquires the pin instead of running the predecessor.
+    // The previous pointer, written by a publish or a rollback, names the retained one.
+    resolve_pointer_for(root, "current", descriptor, None)
         .or_else(|_| resolve_pointer_for(root, "previous", descriptor, retained))
 }
 
@@ -667,15 +670,6 @@ fn rollback_to_previous_for<B: PiLifecycleBoundary>(
     write_pointer(root, "current", &previous, boundary)?;
     boundary.sync_directory(root)?;
     resolve_pointer_for(root, "current", current, retained)
-}
-
-fn resolve_pointer(root: &Path, pointer: &str) -> Result<PathBuf, PiInstallError> {
-    resolve_pointer_for(
-        root,
-        pointer,
-        PI_SELECTED_ARTIFACT,
-        PI_SELECTED_TRACK.previous,
-    )
 }
 
 fn resolve_pointer_for(
@@ -831,6 +825,43 @@ mod tests {
             format!("{POINTER_HEADER}\n{}\n", PI_SELECTED_ARTIFACT.version)
         );
         assert!(!root.join(".current.tmp").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_current_pointer_at_the_predecessor_means_the_pin_is_not_installed() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "muniment-pi-pin-move-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let predecessor = PI_CANDIDATE_PREVIOUS_ARTIFACT.unwrap();
+        fs::write(
+            root.join("current"),
+            format!("{POINTER_HEADER}\n{}\n", predecessor.version),
+        )
+        .unwrap();
+        // A host that holds the predecessor alone acquires the pin instead of running it.
+        assert_eq!(
+            resolve_current_for(&root, PI_CANDIDATE_ARTIFACT),
+            Err(PiInstallError::NotInstalled)
+        );
+        assert_eq!(
+            read_pointer_for(&root, "current", PI_CANDIDATE_ARTIFACT, None),
+            Err(PiInstallError::NotInstalled)
+        );
+        // After a publish or a rollback the previous pointer names the predecessor, and that resolves.
+        fs::write(
+            root.join("previous"),
+            format!("{POINTER_HEADER}\n{}\n", predecessor.version),
+        )
+        .unwrap();
+        assert_eq!(
+            read_pointer_for(&root, "previous", PI_CANDIDATE_ARTIFACT, Some(predecessor)),
+            Ok(predecessor.version.to_owned())
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

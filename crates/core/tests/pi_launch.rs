@@ -11,6 +11,7 @@ mod acquisition_coordinate;
 mod gateway_coordinate;
 use muniment_core::pi_launch::{
     pi_launch_config, pi_launch_config_for_executable, PiLaunchBoundaries, PiLaunchError,
+    SYSTEM_PROMPT,
 };
 use muniment_core::sidecar::{validate_pi_session, PiRpcWiring, SidecarStatus, SidecarSupervisor};
 use uuid::Uuid;
@@ -505,7 +506,7 @@ fn appends_a_present_extension_file_and_environment() {
 }
 
 #[test]
-fn appends_the_exact_timeout_rule_for_every_launch() {
+fn passes_the_system_prompt_for_every_launch() {
     let root = temporary_directory();
     let extension = root.join("memory.js");
     fs::write(&extension, "").unwrap();
@@ -521,23 +522,17 @@ fn appends_the_exact_timeout_rule_for_every_launch() {
                 let config =
                     pi_launch_config_for_executable(&boundaries, "pi".into(), &grant, reopen)
                         .unwrap();
-                let appended: Vec<_> = config
+                let prompts: Vec<_> = config
                     .args
                     .windows(2)
-                    .filter(|args| args[0] == "--append-system-prompt")
+                    .filter(|args| args[0] == "--system-prompt")
                     .map(|args| args[1].as_str())
                     .collect();
-                assert_eq!(
-                    appended,
-                    [
-                        "- `bash` reads its `timeout` in SECONDS, never milliseconds, and applies
-  NO timeout at all when you omit it. Pass one on every call: 60 for a
-  quick command, up to 600 for a build or a test suite. A four- or
-  five-digit value is a millisecond habit from another harness and leaves
-  the command unbounded, so it runs until the engine kills the whole run."
-                    ]
-                );
-                assert!(!config.args.iter().any(|arg| arg == "--system-prompt"));
+                assert_eq!(prompts, [SYSTEM_PROMPT]);
+                assert!(!config
+                    .args
+                    .iter()
+                    .any(|arg| arg == "--append-system-prompt"));
                 assert!(!config.args.iter().any(|arg| arg == "--tools"));
             }
         }
@@ -546,13 +541,43 @@ fn appends_the_exact_timeout_rule_for_every_launch() {
 }
 
 #[test]
-fn workspace_agents_file_does_not_remove_the_timeout_rule() {
+fn the_system_prompt_states_purpose_and_tools_and_names_no_harness_or_product() {
+    let lower = SYSTEM_PROMPT.to_lowercase();
+    assert!(!lower.contains("muniment"));
+    assert!(!lower
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|word| word == "pi"));
+    for tool in [
+        "read",
+        "write",
+        "edit",
+        "bash",
+        "powershell",
+        "grep",
+        "find",
+        "ls",
+        "web_search",
+        "fetch_content",
+        "subagent",
+        "bg_run",
+        "bg_status",
+        "bg_logs",
+        "mcp",
+    ] {
+        assert!(SYSTEM_PROMPT.contains(tool), "{tool}");
+    }
+    assert!(SYSTEM_PROMPT.contains("`timeout` in SECONDS"));
+    assert!(SYSTEM_PROMPT.contains("Send anything longer to `bg_run`"));
+}
+
+#[test]
+fn workspace_agents_file_does_not_remove_the_system_prompt() {
     let workspace = temporary_directory();
     let instructions = "Use the workspace instructions.\n";
     fs::write(workspace.join("AGENTS.md"), instructions).unwrap();
     // A child changes the working directory without affecting parallel tests.
     let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "appends_the_exact_timeout_rule_for_every_launch"])
+        .args(["--exact", "passes_the_system_prompt_for_every_launch"])
         .current_dir(&workspace)
         .output()
         .unwrap();
