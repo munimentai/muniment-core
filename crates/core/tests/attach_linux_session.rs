@@ -7039,12 +7039,29 @@ fn companion_refuses_desktop_only_session_operations() {
         ),
         (202, Operation::RunChatEvents, json!({})),
         (204, Operation::RetentionRecheck, json!({})),
+        (205, Operation::CompanyList, json!({})),
+        (206, Operation::CompanyCreate, json!({"name": "Northwind"})),
+        (
+            207,
+            Operation::CompanySelect,
+            json!({"company_id": "019965a0-0000-7000-8000-000000000001"}),
+        ),
+        (
+            208,
+            Operation::CompanyRename,
+            json!({"company_id": "019965a0-0000-7000-8000-000000000001", "name": "N"}),
+        ),
     ] {
         let (mut client, server) = UnixStream::pair().unwrap();
         client.write_all(&hello(1, 1)).unwrap();
         let frame = if matches!(
             operation,
-            Operation::SessionSignIn | Operation::SessionSignOut | Operation::CompanionRevoke
+            Operation::SessionSignIn
+                | Operation::SessionSignOut
+                | Operation::CompanionRevoke
+                | Operation::CompanyCreate
+                | Operation::CompanySelect
+                | Operation::CompanyRename
         ) {
             request_with_idempotency(id, operation, body)
         } else {

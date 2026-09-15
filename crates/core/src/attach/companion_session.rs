@@ -278,6 +278,10 @@ where
                 | Operation::SessionSignOut
                 | Operation::CompanionList
                 | Operation::CompanionRevoke
+                | Operation::CompanyList
+                | Operation::CompanyCreate
+                | Operation::CompanySelect
+                | Operation::CompanyRename
                 | Operation::RunChatEvents
                 | Operation::RunSubmit
                 | Operation::RunResume

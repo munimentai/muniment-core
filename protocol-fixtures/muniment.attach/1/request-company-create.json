@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"00000000000000000000000000000086","operation":"company.create","capability":"fixture-capability","idempotency_key":"000000000000000000000000000000ea","body":{"name":"Northwind Traders"}}

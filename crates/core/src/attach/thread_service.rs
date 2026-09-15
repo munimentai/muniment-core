@@ -140,6 +140,41 @@ pub trait ThreadListService {
         Err(ProtocolError::unsupported_operation())
     }
 
+    fn list_companies(&mut self) -> Result<Vec<crate::record::CompanySummary>, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn create_company(
+        &mut self,
+        _name: &str,
+        _request_id: &super::Id,
+        _idempotency_key: &super::Id,
+        _provenance: CompanionProvenance,
+    ) -> Result<crate::record::CompanySummary, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn select_company(
+        &mut self,
+        _company_id: &str,
+        _request_id: &super::Id,
+        _idempotency_key: &super::Id,
+        _provenance: CompanionProvenance,
+    ) -> Result<crate::record::CompanySummary, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn rename_company(
+        &mut self,
+        _company_id: &str,
+        _name: &str,
+        _request_id: &super::Id,
+        _idempotency_key: &super::Id,
+        _provenance: CompanionProvenance,
+    ) -> Result<crate::record::CompanySummary, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
     fn sign_in(
         &mut self,
         _request_id: &super::Id,

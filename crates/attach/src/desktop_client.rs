@@ -474,6 +474,55 @@ impl DesktopClient {
         )
     }
 
+    pub fn list_companies(&mut self) -> Result<Value, ClientError> {
+        self.request_body(
+            Operation::CompanyList,
+            None,
+            serde_json::json!({}),
+            &["companies", "current"],
+        )
+    }
+
+    pub fn create_company(&mut self, name: &str) -> Result<Value, ClientError> {
+        if name.trim().is_empty() || name.len() > MAX_TEXT_LENGTH {
+            return Err(ClientError::UnexpectedMessage);
+        }
+        self.request_body(
+            Operation::CompanyCreate,
+            Some(fresh_request_id()?),
+            serde_json::json!({"name": name}),
+            &["company"],
+        )
+    }
+
+    pub fn select_company(&mut self, company_id: &str) -> Result<Value, ClientError> {
+        if company_id.is_empty() || company_id.len() > MAX_THREAD_ID_LENGTH {
+            return Err(ClientError::UnexpectedMessage);
+        }
+        self.request_body(
+            Operation::CompanySelect,
+            Some(fresh_request_id()?),
+            serde_json::json!({"company_id": company_id}),
+            &["company"],
+        )
+    }
+
+    pub fn rename_company(&mut self, company_id: &str, name: &str) -> Result<Value, ClientError> {
+        if company_id.is_empty()
+            || company_id.len() > MAX_THREAD_ID_LENGTH
+            || name.trim().is_empty()
+            || name.len() > MAX_TEXT_LENGTH
+        {
+            return Err(ClientError::UnexpectedMessage);
+        }
+        self.request_body(
+            Operation::CompanyRename,
+            Some(fresh_request_id()?),
+            serde_json::json!({"company_id": company_id, "name": name}),
+            &["company"],
+        )
+    }
+
     pub fn revoke_companion(&mut self, client_identity: &str) -> Result<Value, ClientError> {
         if client_identity.is_empty() || client_identity.len() > MAX_TEXT_LENGTH {
             return Err(ClientError::UnexpectedMessage);

@@ -23,6 +23,7 @@ use muniment_core::auth::{
 };
 use muniment_core::journal::MAX_THREAD_TITLE_CHARS;
 use muniment_core::journal::{CommitSubscription, JournalCommitHint, RunEventProjection};
+use muniment_core::record::CompanySummary;
 use muniment_core::run_events::ChatEvent;
 
 struct TestService;
@@ -844,6 +845,229 @@ fn desktop_client_rechecks_the_recorded_retention() {
     let (result, service) = session_thread.join().unwrap();
     assert_eq!(result, Ok(()));
     assert_eq!(service.checks, 1);
+}
+
+const COMPANY_ONE: &str = "019965a0-0000-7000-8000-000000000001";
+const COMPANY_TWO: &str = "019965a0-0000-7000-8000-000000000002";
+
+fn company(id: &str, name: &str, current: bool) -> CompanySummary {
+    CompanySummary {
+        id: id.into(),
+        name: name.into(),
+        created_at: "2026-01-01T00:00:00.000Z".into(),
+        owner_principal_id: "019965a0-0000-7000-8000-0000000000aa".into(),
+        current,
+    }
+}
+
+#[derive(Default)]
+struct CompanyService {
+    calls: Vec<Operation>,
+    names: Vec<String>,
+}
+
+impl ThreadListService for CompanyService {
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, ProtocolError> {
+        unreachable!()
+    }
+
+    fn list_companies(&mut self) -> Result<Vec<CompanySummary>, ProtocolError> {
+        self.calls.push(Operation::CompanyList);
+        Ok(vec![
+            company(COMPANY_ONE, "Northwind", true),
+            company(COMPANY_TWO, "Surfoff", false),
+        ])
+    }
+
+    fn create_company(
+        &mut self,
+        name: &str,
+        _: &Id,
+        _: &Id,
+        _: CompanionProvenance,
+    ) -> Result<CompanySummary, ProtocolError> {
+        self.calls.push(Operation::CompanyCreate);
+        self.names.push(name.to_owned());
+        Ok(company(COMPANY_TWO, name, false))
+    }
+
+    fn select_company(
+        &mut self,
+        company_id: &str,
+        _: &Id,
+        _: &Id,
+        _: CompanionProvenance,
+    ) -> Result<CompanySummary, ProtocolError> {
+        self.calls.push(Operation::CompanySelect);
+        Ok(company(company_id, "Surfoff", true))
+    }
+
+    fn rename_company(
+        &mut self,
+        company_id: &str,
+        name: &str,
+        _: &Id,
+        _: &Id,
+        _: CompanionProvenance,
+    ) -> Result<CompanySummary, ProtocolError> {
+        self.calls.push(Operation::CompanyRename);
+        self.names.push(name.to_owned());
+        Ok(company(company_id, name, true))
+    }
+}
+
+#[test]
+fn desktop_client_manages_companies() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let session_thread = std::thread::spawn(move || {
+        let mut service = CompanyService::default();
+        let result = serve_desktop_client_session(server, &session(), &mut service);
+        (result, service)
+    });
+
+    let Envelope::Response(response) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000250",
+            Operation::CompanyList,
+            "admitted",
+            serde_json::json!({}),
+        ),
+    ) else {
+        panic!("the company list did not return a response");
+    };
+    assert_eq!(response.body["current"], COMPANY_ONE);
+    let companies = response.body["companies"].as_array().unwrap();
+    assert_eq!(companies.len(), 2);
+    assert_eq!(companies[0]["name"], "Northwind");
+    assert_eq!(companies[0]["current"], true);
+    assert_eq!(companies[1]["id"], COMPANY_TWO);
+
+    let Envelope::Error(error) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000251",
+            Operation::CompanyList,
+            "admitted",
+            serde_json::json!({"name": "x"}),
+        ),
+    ) else {
+        panic!("the company list body was not validated");
+    };
+    assert_eq!(error.error.code(), ErrorCode::InvalidRequest);
+
+    let Envelope::Error(error) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000252",
+            Operation::CompanyCreate,
+            "admitted",
+            serde_json::json!({"name": "Surfoff"}),
+        ),
+    ) else {
+        panic!("the company create without a key was not refused");
+    };
+    assert_eq!(error.error.code(), ErrorCode::IdempotencyKeyRequired);
+
+    let Envelope::Response(response) = exchange(
+        &mut client,
+        idempotent_request(
+            "018f0000-0000-7000-8000-000000000253",
+            Operation::CompanyCreate,
+            serde_json::json!({"name": "Surfoff"}),
+        ),
+    ) else {
+        panic!("the company create did not return a response");
+    };
+    assert_eq!(response.body["company"]["name"], "Surfoff");
+    assert_eq!(response.body["company"]["id"], COMPANY_TWO);
+
+    for body in [
+        serde_json::json!({"name": "   "}),
+        serde_json::json!({}),
+        serde_json::json!({"name": "Surfoff", "company_id": COMPANY_TWO}),
+        serde_json::json!({"name": "Surfoff", "other": 1}),
+    ] {
+        let Envelope::Error(error) = exchange(
+            &mut client,
+            idempotent_request(
+                "018f0000-0000-7000-8000-000000000254",
+                Operation::CompanyCreate,
+                body,
+            ),
+        ) else {
+            panic!("the company create body was not validated");
+        };
+        assert_eq!(error.error.code(), ErrorCode::InvalidRequest);
+    }
+
+    let Envelope::Response(response) = exchange(
+        &mut client,
+        idempotent_request(
+            "018f0000-0000-7000-8000-000000000255",
+            Operation::CompanySelect,
+            serde_json::json!({"company_id": COMPANY_TWO}),
+        ),
+    ) else {
+        panic!("the company select did not return a response");
+    };
+    assert_eq!(response.body["company"]["id"], COMPANY_TWO);
+    assert_eq!(response.body["company"]["current"], true);
+
+    let Envelope::Response(response) = exchange(
+        &mut client,
+        idempotent_request(
+            "018f0000-0000-7000-8000-000000000256",
+            Operation::CompanyRename,
+            serde_json::json!({"company_id": COMPANY_TWO, "name": "Surfside"}),
+        ),
+    ) else {
+        panic!("the company rename did not return a response");
+    };
+    assert_eq!(response.body["company"]["name"], "Surfside");
+
+    let Envelope::Error(error) = exchange(
+        &mut client,
+        idempotent_request(
+            "018f0000-0000-7000-8000-000000000257",
+            Operation::CompanyRename,
+            serde_json::json!({"company_id": COMPANY_TWO}),
+        ),
+    ) else {
+        panic!("the company rename body was not validated");
+    };
+    assert_eq!(error.error.code(), ErrorCode::InvalidRequest);
+
+    let Envelope::Error(error) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000258",
+            Operation::CompanyList,
+            "other",
+            serde_json::json!({}),
+        ),
+    ) else {
+        panic!("the unauthorized company list did not return an error");
+    };
+    assert_eq!(error.error.code(), ErrorCode::Unauthorized);
+
+    drop(client);
+    let (result, service) = session_thread.join().unwrap();
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        service.calls,
+        [
+            Operation::CompanyList,
+            Operation::CompanyCreate,
+            Operation::CompanySelect,
+            Operation::CompanyRename,
+        ]
+    );
+    assert_eq!(service.names, ["Surfoff", "Surfside"]);
 }
 
 #[test]

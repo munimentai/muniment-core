@@ -161,6 +161,29 @@ pub trait RunAttachBoundaries {
         Err(ProtocolError::unsupported_operation())
     }
     #[cfg(any(unix, target_os = "windows"))]
+    fn list_companies(&self) -> Result<Vec<crate::record::CompanySummary>, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(any(unix, target_os = "windows"))]
+    fn create_company(&self, _name: &str) -> Result<crate::record::CompanySummary, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(any(unix, target_os = "windows"))]
+    fn select_company(
+        &self,
+        _company_id: &str,
+    ) -> Result<crate::record::CompanySummary, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(any(unix, target_os = "windows"))]
+    fn rename_company(
+        &self,
+        _company_id: &str,
+        _name: &str,
+    ) -> Result<crate::record::CompanySummary, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(any(unix, target_os = "windows"))]
     fn list_threads(
         &self,
         workspace: &str,

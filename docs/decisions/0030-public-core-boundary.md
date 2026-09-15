@@ -41,6 +41,7 @@ Module rows name the module below `muniment-core`.
 | module | code_diff_journal | It projects code-diff events. |
 | module | code_diff_observe | It verifies workspace state before writes. |
 | module | code_diff_staging | It stages file operations. |
+| module | endpoint_models | It lists the models an OpenAI-compatible endpoint serves. |
 | module | harness_scan | It counts durable assistant memory in user-level roots. |
 | module | home | It owns the local memory filesystem. |
 | module | import_preview | It previews bounded assistant exports. |
@@ -62,6 +63,7 @@ Module rows name the module below `muniment-core`.
 | module | pi_launch | It configures Pi launches. |
 | module | pi_packages | It installs Pi extension packages. |
 | module | pi_settings | It writes Pi runtime settings. |
+| module | record | It owns the company record: the SQLite graph, the catalogue and the write path. |
 | module | retention_record | It records retention choices. |
 | module | router_classifier | It classifies routes locally without cloud metadata. |
 | module | run_events | It appends and projects run events. |
@@ -70,6 +72,7 @@ Module rows name the module below `muniment-core`.
 | module | runtime_diagnostics | It writes bounded runtime diagnostics. |
 | module | session_thread | It binds sessions to journal threads. |
 | module | sidecar | It supervises Pi and its RPC transport. |
+| module | state_root | It resolves the one state root every local file sits under. |
 | module | thread_history | It reads journal-backed thread history. |
 | module | thread_ownership | It checks journal subject ownership. |
 | module | user_diagnostics | It diagnoses user-level runtime services. |

@@ -199,6 +199,50 @@ fn queue_run_message<B: RunAttachBoundaries, I: RunStartIdempotency>(
     serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
 }
 
+impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency>
+    DesktopAttachService<B, I>
+{
+    /// Runs one company mutation once per idempotency key and replays its
+    /// summary on a repeat.
+    #[cfg(any(unix, target_os = "windows"))]
+    fn company_mutation(
+        &mut self,
+        operation: Operation,
+        canonical_input: serde_json::Value,
+        request_id: &Id,
+        idempotency_key: &Id,
+        companion: CompanionProvenance,
+        apply: impl FnOnce(&B) -> Result<crate::record::CompanySummary, ProtocolError>,
+    ) -> Result<crate::record::CompanySummary, ProtocolError> {
+        let ledger_request = AttachRequest {
+            protocol: Protocol,
+            request_id: request_id.clone(),
+            operation,
+            capability: String::new(),
+            idempotency_key: Some(idempotency_key.clone()),
+            body: canonical_input.clone(),
+        };
+        let outcome = self.idempotency.execute(
+            &companion.profile,
+            &ledger_request,
+            &canonical_input,
+            || Ok(()),
+            || {
+                let company = apply(&self.boundaries)?;
+                Ok(CommittedResult {
+                    body: serde_json::to_value(company)
+                        .map_err(|_| ProtocolError::persistence_failed())?,
+                    cursor: None,
+                })
+            },
+        )?;
+        let committed = match outcome {
+            IdempotencyOutcome::Committed(result) | IdempotencyOutcome::Replayed(result) => result,
+        };
+        serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
+    }
+}
+
 impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> ThreadListService
     for DesktopAttachService<B, I>
 {
@@ -251,6 +295,69 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
             },
         )?;
         Ok(())
+    }
+
+    #[cfg(any(unix, target_os = "windows"))]
+    fn list_companies(&mut self) -> Result<Vec<crate::record::CompanySummary>, ProtocolError> {
+        self.boundaries.list_companies()
+    }
+
+    #[cfg(any(unix, target_os = "windows"))]
+    fn create_company(
+        &mut self,
+        name: &str,
+        request_id: &Id,
+        idempotency_key: &Id,
+        provenance: CompanionProvenance,
+    ) -> Result<crate::record::CompanySummary, ProtocolError> {
+        let canonical_input = json!({"name": name});
+        self.company_mutation(
+            Operation::CompanyCreate,
+            canonical_input,
+            request_id,
+            idempotency_key,
+            provenance,
+            |boundaries| boundaries.create_company(name),
+        )
+    }
+
+    #[cfg(any(unix, target_os = "windows"))]
+    fn select_company(
+        &mut self,
+        company_id: &str,
+        request_id: &Id,
+        idempotency_key: &Id,
+        provenance: CompanionProvenance,
+    ) -> Result<crate::record::CompanySummary, ProtocolError> {
+        let canonical_input = json!({"company_id": company_id});
+        self.company_mutation(
+            Operation::CompanySelect,
+            canonical_input,
+            request_id,
+            idempotency_key,
+            provenance,
+            |boundaries| boundaries.select_company(company_id),
+        )
+    }
+
+    #[cfg(any(unix, target_os = "windows"))]
+    fn rename_company(
+        &mut self,
+        company_id: &str,
+        name: &str,
+        request_id: &Id,
+        idempotency_key: &Id,
+        provenance: CompanionProvenance,
+    ) -> Result<crate::record::CompanySummary, ProtocolError> {
+        let canonical_input = json!({"company_id": company_id, "name": name});
+        self.company_mutation(
+            Operation::CompanyRename,
+            canonical_input,
+            request_id,
+            idempotency_key,
+            provenance,
+            |boundaries| boundaries.rename_company(company_id, name),
+        )
     }
 
     fn authorize_client(

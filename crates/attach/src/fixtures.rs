@@ -555,6 +555,10 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         ("run-permission-answer", Operation::RunPermissionAnswer),
         ("thread-select", Operation::ThreadSelect),
         ("retention-recheck", Operation::RetentionRecheck),
+        ("company-list", Operation::CompanyList),
+        ("company-create", Operation::CompanyCreate),
+        ("company-select", Operation::CompanySelect),
+        ("company-rename", Operation::CompanyRename),
     ];
     for (index, (name, operation)) in operations.into_iter().enumerate() {
         insert(
@@ -808,6 +812,14 @@ fn request_body(operation: Operation) -> serde_json::Value {
         | Operation::SessionSignIn
         | Operation::CompanionList => json!({}),
         Operation::CompanionRevoke => json!({"client_identity": "companion-1"}),
+        Operation::CompanyList => json!({}),
+        Operation::CompanyCreate => json!({"name": "Northwind Traders"}),
+        Operation::CompanySelect => {
+            json!({"company_id": "019965a0-0000-7000-8000-000000000001"})
+        }
+        Operation::CompanyRename => {
+            json!({"company_id": "019965a0-0000-7000-8000-000000000001", "name": "Northwind"})
+        }
         Operation::RunOpen => json!({"run_id": "00000000000000000000000000000191"}),
         Operation::RunStart => {
             json!({"text": "Summarize the selected file.", "context": {"selected_file": "src/main.rs"}})
@@ -1048,6 +1060,10 @@ mod tests {
             Operation::SessionSignIn,
             Operation::CompanionList,
             Operation::CompanionRevoke,
+            Operation::CompanyList,
+            Operation::CompanyCreate,
+            Operation::CompanySelect,
+            Operation::CompanyRename,
             Operation::RunOpen,
             Operation::RunStart,
             Operation::RunSubmit,
@@ -1118,7 +1134,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            79,
+            83,
             "every canonical fixture must be inventoried"
         );
     }

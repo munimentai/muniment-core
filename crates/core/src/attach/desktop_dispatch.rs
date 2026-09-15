@@ -952,6 +952,66 @@ pub(super) fn dispatch_request<S: ThreadListService>(
         )?;
         return Ok(response_only(serde_json::json!({})));
     }
+    if request.operation == Operation::CompanyList {
+        if request.body != serde_json::json!({}) {
+            return Err(ProtocolError::invalid_request().into());
+        }
+        let companies = service.list_companies()?;
+        let current = companies
+            .iter()
+            .find(|company| company.current)
+            .map(|company| company.id.clone());
+        return Ok(response_only(serde_json::json!({
+            "companies": companies,
+            "current": current,
+        })));
+    }
+    if matches!(
+        request.operation,
+        Operation::CompanyCreate | Operation::CompanySelect | Operation::CompanyRename
+    ) {
+        let idempotency_key = request
+            .idempotency_key
+            .as_ref()
+            .ok_or_else(ProtocolError::idempotency_key_required)?;
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            #[serde(default)]
+            company_id: Option<String>,
+            #[serde(default)]
+            name: Option<String>,
+        }
+        let body: Body =
+            serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
+        let name = body.name.as_deref().filter(|name| {
+            !name.trim().is_empty() && name.chars().count() <= MAX_THREAD_TITLE_CHARS
+        });
+        let company_id = body
+            .company_id
+            .as_deref()
+            .filter(|id| !id.is_empty() && id.len() <= 36);
+        let company = match (request.operation, company_id, name) {
+            (Operation::CompanyCreate, None, Some(name)) => {
+                service.create_company(name, &request.request_id, idempotency_key, provenance)?
+            }
+            (Operation::CompanySelect, Some(company_id), None) => service.select_company(
+                company_id,
+                &request.request_id,
+                idempotency_key,
+                provenance,
+            )?,
+            (Operation::CompanyRename, Some(company_id), Some(name)) => service.rename_company(
+                company_id,
+                name,
+                &request.request_id,
+                idempotency_key,
+                provenance,
+            )?,
+            _ => return Err(ProtocolError::invalid_request().into()),
+        };
+        return Ok(response_only(serde_json::json!({"company": company})));
+    }
     if request.operation == Operation::ThreadDelete {
         let idempotency_key = request
             .idempotency_key

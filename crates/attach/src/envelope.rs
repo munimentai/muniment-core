@@ -281,6 +281,14 @@ pub enum Operation {
     CompanionList,
     #[serde(rename = "companion.revoke")]
     CompanionRevoke,
+    #[serde(rename = "company.list")]
+    CompanyList,
+    #[serde(rename = "company.create")]
+    CompanyCreate,
+    #[serde(rename = "company.select")]
+    CompanySelect,
+    #[serde(rename = "company.rename")]
+    CompanyRename,
     #[serde(rename = "run.open")]
     RunOpen,
     #[serde(rename = "run.start")]
@@ -329,6 +337,9 @@ impl Operation {
                 | Self::SessionSignOut
                 | Self::SessionSignIn
                 | Self::CompanionRevoke
+                | Self::CompanyCreate
+                | Self::CompanySelect
+                | Self::CompanyRename
                 | Self::RunStart
                 | Self::RunSubmit
                 | Self::RunResume
@@ -359,6 +370,10 @@ impl Operation {
             Self::SessionSignIn => "session.sign_in",
             Self::CompanionList => "companion.list",
             Self::CompanionRevoke => "companion.revoke",
+            Self::CompanyList => "company.list",
+            Self::CompanyCreate => "company.create",
+            Self::CompanySelect => "company.select",
+            Self::CompanyRename => "company.rename",
             Self::RunOpen => "run.open",
             Self::RunStart => "run.start",
             Self::RunSubmit => "run.submit",

@@ -19,8 +19,10 @@ mod unix_tests {
         Envelope, Id, MacosAttachRouteReader, MacosAttachSessionError, MacosAttachSessionOutcome,
         MacosPeerReadError, Operation, Protocol, ProtocolError, Request, Welcome,
     };
+    use muniment_core::record::CompanySummary;
 
     const CREATED_THREAD_ID: &str = "018f0000-0000-7000-8000-000000000200";
+    const COMPANY_ID: &str = "019965a0-0000-7000-8000-000000000001";
 
     #[derive(Default)]
     struct TestService {
@@ -44,6 +46,16 @@ mod unix_tests {
             Ok(ThreadCreateAccepted {
                 thread_id: CREATED_THREAD_ID.to_owned(),
             })
+        }
+
+        fn list_companies(&mut self) -> Result<Vec<CompanySummary>, ProtocolError> {
+            Ok(vec![CompanySummary {
+                id: COMPANY_ID.to_owned(),
+                name: "Northwind".to_owned(),
+                created_at: "2026-01-01T00:00:00.000Z".to_owned(),
+                owner_principal_id: "019965a0-0000-7000-8000-0000000000aa".to_owned(),
+                current: true,
+            }])
         }
     }
 
@@ -146,7 +158,7 @@ mod unix_tests {
                     protocol: Protocol,
                     request_id: request_id.clone(),
                     operation: Operation::ThreadCreate,
-                    capability: grant.capability,
+                    capability: grant.capability.clone(),
                     idempotency_key: Some(Id::new("018f0000-0000-7000-8000-000000000102").unwrap()),
                     body: serde_json::json!({}),
                 })
@@ -165,6 +177,29 @@ mod unix_tests {
             response.body,
             serde_json::json!({"thread_id": CREATED_THREAD_ID})
         );
+
+        let list_id = Id::new("018f0000-0000-7000-8000-000000000103").unwrap();
+        client
+            .write_all(
+                &encode_frame(&Request {
+                    protocol: Protocol,
+                    request_id: list_id.clone(),
+                    operation: Operation::CompanyList,
+                    capability: grant.capability.clone(),
+                    idempotency_key: None,
+                    body: serde_json::json!({}),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let list_frame = read_frame(&mut client);
+        let (Envelope::Response(list), _) = decode_frame::<Envelope>(&list_frame).unwrap().unwrap()
+        else {
+            panic!("expected a company list response");
+        };
+        assert_eq!(list.request_id, list_id);
+        assert_eq!(list.body["current"], COMPANY_ID);
+        assert_eq!(list.body["companies"][0]["name"], "Northwind");
 
         client.shutdown(Shutdown::Write).unwrap();
         let (outcome, service) = session.join().unwrap();

@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"00000000000000000000000000000087","operation":"company.select","capability":"fixture-capability","idempotency_key":"000000000000000000000000000000eb","body":{"company_id":"019965a0-0000-7000-8000-000000000001"}}

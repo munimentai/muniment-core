@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"00000000000000000000000000000088","operation":"company.rename","capability":"fixture-capability","idempotency_key":"000000000000000000000000000000ec","body":{"company_id":"019965a0-0000-7000-8000-000000000001","name":"Northwind"}}
