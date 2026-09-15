@@ -756,12 +756,41 @@ pub fn render_template(template: &str, data: &Value) -> String {
         }
     }
     output.push_str(rest);
-    output
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .replace(" ,", ",")
-        .replace(" .", ".")
+    tidy_rendered(&output)
+}
+
+/// An absent value leaves its punctuation behind: empty parentheses, a comma
+/// with nothing before it, a doubled stop. Each pass removes one shape until
+/// the text settles.
+fn tidy_rendered(text: &str) -> String {
+    let mut current = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    loop {
+        let next = current
+            .replace("()", "")
+            .replace("( )", "")
+            .replace(" ,", ",")
+            .replace(",,", ",")
+            .replace(", ,", ",")
+            .replace(" .", ".")
+            .replace("..", ".")
+            .replace(",.", ".")
+            .replace(":,", ":")
+            .replace(": .", ".")
+            .replace(":.", ".")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    let mut trimmed = current.trim().to_owned();
+    while trimmed.starts_with([',', '.', ':']) {
+        trimmed.remove(0);
+        trimmed = trimmed.trim_start().to_owned();
+    }
+    trimmed
 }
 
 fn value_text(value: &Value) -> String {
@@ -782,9 +811,17 @@ mod tests {
         let data = serde_json::json!({"name": "Northwind", "amount": 96000, "tags": ["a", "b"]});
         assert_eq!(
             render_template("{name}: {stage}, {amount} {currency}.", &data),
-            "Northwind:, 96000."
+            "Northwind: 96000."
         );
         assert_eq!(render_template("{tags} {missing", &data), "a, b {missing");
+        assert_eq!(
+            render_template(
+                "{name} ({legal_name}), {industry}, {market_segment}, {employee_band} employees, {domain}. {city} {state} {country}. Status {status}.",
+                &serde_json::json!({"name": "Contoso", "industry": "Logistics"})
+            ),
+            "Contoso, Logistics, employees. Status."
+        );
+        assert_eq!(render_template("{a}, {b}.", &serde_json::json!({})), "");
     }
 
     #[test]
