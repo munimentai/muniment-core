@@ -28,8 +28,15 @@ fn names(list: Option<&Value>, field: &str) -> Vec<String> {
     seen
 }
 
-fn fetch(agent: &ureq::Agent, url: &str) -> Option<Value> {
-    agent.get(url).call().ok()?.into_json::<Value>().ok()
+/// The JSON body, `Ok(None)` for an HTTP error or a body that is not JSON,
+/// and `Err` when the host never answered: no route, a refused connection or
+/// a timeout.
+fn fetch(agent: &ureq::Agent, url: &str) -> Result<Option<Value>, ()> {
+    match agent.get(url).call() {
+        Ok(response) => Ok(response.into_json::<Value>().ok()),
+        Err(ureq::Error::Status(..)) => Ok(None),
+        Err(ureq::Error::Transport(_)) => Err(()),
+    }
 }
 
 /// Every model the server at `base_url` serves, or nothing when it does not answer.
@@ -44,14 +51,22 @@ pub fn discover_models(base_url: &str, timeout: Duration) -> Vec<String> {
     origin.set_path("/api/tags");
     origin.set_query(None);
     origin.set_fragment(None);
-    if let Some(tags) = fetch(&agent, origin.as_str()) {
-        let models = parse_ollama_tags(&tags);
-        if !models.is_empty() {
-            return models;
+    match fetch(&agent, origin.as_str()) {
+        Ok(Some(tags)) => {
+            let models = parse_ollama_tags(&tags);
+            if !models.is_empty() {
+                return models;
+            }
         }
+        Ok(None) => {}
+        // The host never answered its first route, so the second route on the
+        // same host would only spend the timeout again.
+        Err(()) => return Vec::new(),
     }
     let models_url = format!("{}/models", base_url.trim_end_matches('/'));
     fetch(&agent, &models_url)
+        .ok()
+        .flatten()
         .map(|value| parse_openai_models(&value))
         .unwrap_or_default()
 }
