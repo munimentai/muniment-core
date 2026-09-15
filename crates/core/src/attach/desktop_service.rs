@@ -396,6 +396,16 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
     }
 
     #[cfg(any(unix, target_os = "windows"))]
+    fn record_kinds(
+        &mut self,
+        body: serde_json::Value,
+        provenance: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let actor = record_actor(&provenance, &body);
+        self.boundaries.record_kinds(&actor, body)
+    }
+
+    #[cfg(any(unix, target_os = "windows"))]
     fn record_commit(
         &mut self,
         body: serde_json::Value,

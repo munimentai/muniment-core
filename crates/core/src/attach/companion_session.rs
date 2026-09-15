@@ -308,7 +308,8 @@ where
             | Operation::ArtifactFetch
             | Operation::ArtifactWindow
             | Operation::RequestCancel
-            | Operation::RecordSql => Some("thread.read"),
+            | Operation::RecordSql
+            | Operation::RecordKinds => Some("thread.read"),
             Operation::ThreadCreate
             | Operation::RunStart
             | Operation::RunCancel

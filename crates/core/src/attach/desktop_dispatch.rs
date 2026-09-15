@@ -1014,7 +1014,10 @@ pub(super) fn dispatch_request<S: ThreadListService>(
     }
     if matches!(
         request.operation,
-        Operation::RecordSql | Operation::RecordPropose | Operation::RecordCommit
+        Operation::RecordSql
+            | Operation::RecordPropose
+            | Operation::RecordCommit
+            | Operation::RecordKinds
     ) {
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -1057,6 +1060,9 @@ pub(super) fn dispatch_request<S: ThreadListService>(
                         .as_ref()
                         .is_some_and(serde_json::Value::is_object)
             }
+            Operation::RecordKinds => {
+                body.sql.is_none() && body.operation.is_none() && body.proposal.is_none()
+            }
             _ => {
                 body.sql.is_none()
                     && body.operation.is_none()
@@ -1070,6 +1076,7 @@ pub(super) fn dispatch_request<S: ThreadListService>(
         let answer = match request.operation {
             Operation::RecordSql => service.record_sql(request.body, provenance)?,
             Operation::RecordPropose => service.record_propose(request.body, provenance)?,
+            Operation::RecordKinds => service.record_kinds(request.body, provenance)?,
             _ => {
                 let idempotency_key = request
                     .idempotency_key

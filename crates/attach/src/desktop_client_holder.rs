@@ -108,6 +108,26 @@ impl DesktopClientHolder {
         self.with_client(DesktopClient::list_companions)
     }
 
+    pub fn list_companies(&self) -> Result<Value, ClientError> {
+        self.with_client(DesktopClient::list_companies)
+    }
+
+    pub fn create_company(&self, name: &str) -> Result<Value, ClientError> {
+        self.with_client(|client| client.create_company(name))
+    }
+
+    pub fn select_company(&self, company_id: &str) -> Result<Value, ClientError> {
+        self.with_client(|client| client.select_company(company_id))
+    }
+
+    pub fn rename_company(&self, company_id: &str, name: &str) -> Result<Value, ClientError> {
+        self.with_client(|client| client.rename_company(company_id, name))
+    }
+
+    pub fn record_kinds(&self, body: Value) -> Result<Value, ClientError> {
+        self.with_client(|client| client.record_kinds(body.clone()))
+    }
+
     pub fn revoke_companion(&self, client_identity: &str) -> Result<Value, ClientError> {
         self.with_client(|client| client.revoke_companion(client_identity))
     }

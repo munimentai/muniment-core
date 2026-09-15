@@ -295,6 +295,8 @@ pub enum Operation {
     RecordPropose,
     #[serde(rename = "record.commit")]
     RecordCommit,
+    #[serde(rename = "record.kinds")]
+    RecordKinds,
     #[serde(rename = "run.open")]
     RunOpen,
     #[serde(rename = "run.start")]
@@ -384,6 +386,7 @@ impl Operation {
             Self::RecordSql => "record.sql",
             Self::RecordPropose => "record.propose",
             Self::RecordCommit => "record.commit",
+            Self::RecordKinds => "record.kinds",
             Self::RunOpen => "run.open",
             Self::RunStart => "run.start",
             Self::RunSubmit => "run.submit",
