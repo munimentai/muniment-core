@@ -97,6 +97,8 @@ pub struct CapabilityReceipt {
 #[derive(Clone, Debug, PartialEq)]
 pub enum PiChatEvent {
     PromptAccepted,
+    /// Pi's agent loop started on the accepted prompt: the model is thinking.
+    TurnStarted,
     TextDelta(String),
     ToolStarted {
         tool_call_id: String,
@@ -219,6 +221,7 @@ pub fn parse_frame(frame: &Value) -> Result<PiChatEvent, &'static str> {
                 _ => Ok(PiChatEvent::Interleaved),
             }
         }
+        Some("agent_start") => Ok(PiChatEvent::TurnStarted),
         Some("tool_execution_start") => {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase")]
@@ -775,19 +778,30 @@ mod tests {
 
     #[test]
     fn run_lifecycle_events_disarm_the_bound_before_text_arrives() {
-        for kind in [
-            "agent_start",
-            "turn_start",
-            "message_start",
-            "message_update",
+        for (kind, event) in [
+            ("agent_start", PiChatEvent::TurnStarted),
+            ("turn_start", PiChatEvent::Interleaved),
+            ("message_start", PiChatEvent::Interleaved),
+            ("message_update", PiChatEvent::Interleaved),
         ] {
             let (sender, adapter) = bounded_adapter(Duration::from_secs(1));
             sender.send(json!({"type":kind})).unwrap();
+            assert_eq!(adapter.next(Duration::ZERO).unwrap(), event);
+            assert!(adapter.first_event_deadline.lock().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn agent_start_is_the_turn_start_and_the_other_lifecycle_frames_interleave() {
+        assert_eq!(
+            parse_frame(&json!({"type":"agent_start"})).unwrap(),
+            PiChatEvent::TurnStarted
+        );
+        for kind in ["turn_start", "turn_end", "message_start", "message_end"] {
             assert_eq!(
-                adapter.next(Duration::ZERO).unwrap(),
+                parse_frame(&json!({"type": kind})).unwrap(),
                 PiChatEvent::Interleaved
             );
-            assert!(adapter.first_event_deadline.lock().unwrap().is_none());
         }
     }
 

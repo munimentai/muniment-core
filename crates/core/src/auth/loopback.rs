@@ -164,7 +164,7 @@ fn respond_page(stream: &mut TcpStream, heading: &str, detail: &str) {
          <style>:root{{color-scheme:light dark}}\
          body{{font-family:system-ui,sans-serif;display:grid;place-content:center;min-height:100vh;margin:0;background:#F6F7F6;color:#1A1D1C}}\
          main{{text-align:center}}h1{{font-size:20px;font-weight:600;margin:0 0 8px}}p{{color:#5C6461;font-size:14px;margin:0}}\
-         @media (prefers-color-scheme:dark){{body{{background:#141716;color:#E8EBE9}}p{{color:#8A928E}}}}</style></head>\
+         @media (prefers-color-scheme:dark){{body{{background:#000000;color:#ECEFED}}p{{color:#9AA29E}}}}</style></head>\
          <body><main><h1>{heading}</h1><p>{detail}</p></main></body></html>"
     );
     let resp = format!(

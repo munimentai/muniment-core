@@ -28,6 +28,11 @@ pub struct ChatEvent {
     pub thread_id: Option<String>,
     pub phase: String,
     pub text: String,
+    /// The shell's in-flight word: `Routing` before the accepted prompt, `Thinking` from the started turn.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub prompt_accepted: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub turn_started: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_storage_notice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -110,6 +115,8 @@ pub fn chat_event(
         thread_id: None,
         phase: projection_phase(&projection.status).into(),
         text: projection.text,
+        prompt_accepted: projection.prompt_accepted,
+        turn_started: projection.turn_started,
         prompt_storage_notice: projection.prompt_storage_notice,
         failure_reason: crate::chat_view::failure_reason(&projection.status),
         receipt: projection.receipt,

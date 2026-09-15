@@ -216,7 +216,7 @@ impl Default for MemorySearchSession {
     fn default() -> Self {
         let definition = json!({
             "name": "memory-search",
-            "description": "Search the Markdown files in the Muniment Home.",
+            "description": "Search the Markdown files in the user's Home folder.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,

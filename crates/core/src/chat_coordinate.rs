@@ -1009,6 +1009,22 @@ pub fn coordinate(
                     break;
                 }
             }
+            Ok(PiChatEvent::TurnStarted) => {
+                if append_emit(
+                    &app,
+                    &journal,
+                    &mut projector,
+                    &run_id,
+                    &mut seq,
+                    "model.turn.started",
+                    json!({}),
+                    subject.as_deref(),
+                )
+                .is_err()
+                {
+                    break;
+                }
+            }
             Ok(PiChatEvent::Interleaved | PiChatEvent::PromptAccepted) => {}
             Err(error) if error == FIRST_EVENT_TIMEOUT_REASON => {
                 diagnostics.outcome = "unknown_no_first_event";

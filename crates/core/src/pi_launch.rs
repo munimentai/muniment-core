@@ -5,6 +5,12 @@ use crate::sidecar::pi_install::{resolve_current_for, PiArtifactDescriptor, PI_S
 use crate::sidecar::{pi_sidecar_config, PiSessionLocator, SidecarConfig};
 
 const CLOUD_PROVIDER_EXTENSION: &str = include_str!("muniment_cloud_provider.mjs");
+/// Rewrites the prompt and the tool descriptions so neither names the harness
+/// or the product. Written beside the session logs and loaded on every launch.
+pub const IDENTITY_EXTENSION: &str = include_str!("assistant_identity.mjs");
+pub const IDENTITY_EXTENSION_FILE: &str = "assistant-identity.mjs";
+/// An extension tool whose name carries the harness never reaches the model.
+pub const EXCLUDED_TOOLS: &str = "bg_run_pi_attested";
 
 /// The whole system prompt. It states the assistant's purpose and its tools and
 /// names no harness and no product. Pi appends the working directory, the
@@ -445,6 +451,14 @@ fn credential_field(line: &str) -> Option<(usize, &str)> {
 }
 
 fn install_cloud_provider(path: &Path) -> Result<(), PiLaunchError> {
+    install_extension(path, CLOUD_PROVIDER_EXTENSION, "cloud_extension_write")
+}
+
+fn install_identity_extension(path: &Path) -> Result<(), PiLaunchError> {
+    install_extension(path, IDENTITY_EXTENSION, "identity_extension_write")
+}
+
+fn install_extension(path: &Path, source: &str, step: &'static str) -> Result<(), PiLaunchError> {
     use std::io::Write;
     let temporary = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
     let result = (|| {
@@ -452,13 +466,13 @@ fn install_cloud_provider(path: &Path) -> Result<(), PiLaunchError> {
             .write(true)
             .create_new(true)
             .open(&temporary)?;
-        file.write_all(CLOUD_PROVIDER_EXTENSION.as_bytes())?;
+        file.write_all(source.as_bytes())?;
         file.sync_all()?;
         drop(file);
         std::fs::rename(&temporary, path)
     })();
     let _ = std::fs::remove_file(&temporary);
-    result.map_err(|error: std::io::Error| PiLaunchError::rejected("cloud_extension_write", error))
+    result.map_err(|error: std::io::Error| PiLaunchError::rejected(step, error))
 }
 
 pub fn pi_launch_config(
@@ -505,6 +519,14 @@ pub fn pi_launch_config_for_executable(
     config
         .args
         .extend(["--system-prompt".into(), SYSTEM_PROMPT.into()]);
+    let identity = session_root.join(IDENTITY_EXTENSION_FILE);
+    install_identity_extension(&identity)?;
+    config.args.extend([
+        "--extension".into(),
+        identity.to_string_lossy().into_owned(),
+        "--exclude-tools".into(),
+        EXCLUDED_TOOLS.into(),
+    ]);
     if grant.is_local() {
         config
             .env_remove

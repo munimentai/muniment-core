@@ -61,6 +61,7 @@ fn event_types_are_terminal(events: &[RunEventType]) -> bool {
             | "chat.attachment.ingested"
             | "runtime.pi_session.bound"
             | "model.prompt.accepted"
+            | "model.turn.started"
             | "model.stream.delta"
             | "permission.requested"
             | "permission.resolved"
@@ -207,6 +208,7 @@ mod tests {
                 "run.needs_attention",
                 "run.resumed",
                 "model.prompt.accepted",
+                "model.turn.started",
             ],
         ] {
             classify(types);

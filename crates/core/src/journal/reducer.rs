@@ -445,6 +445,7 @@ pub struct PiSessionBinding {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ChatProjection {
     pub prompt_accepted: bool,
+    pub turn_started: bool,
     pub prompt_storage_notice: Option<String>,
     pub text: String,
     pub receipt: Option<Value>,
@@ -596,6 +597,7 @@ impl ChatProjector {
                 });
             }
             "model.prompt.accepted" => self.chat.prompt_accepted = true,
+            "model.turn.started" => self.chat.turn_started = true,
             "model.stream.delta" => self.chat.text.push_str(&field(event, "text")?),
             "memory.recalled" => self.chat.recalls.push(projected_recall(event)?),
             "code.diff.applied" => self.chat.applied_diffs.push(projected_applied_diff(event)?),

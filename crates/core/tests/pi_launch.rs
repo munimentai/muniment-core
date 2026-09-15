@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -11,9 +11,11 @@ mod acquisition_coordinate;
 mod gateway_coordinate;
 use muniment_core::pi_launch::{
     pi_launch_config, pi_launch_config_for_executable, PiLaunchBoundaries, PiLaunchError,
-    SYSTEM_PROMPT,
+    EXCLUDED_TOOLS, IDENTITY_EXTENSION, IDENTITY_EXTENSION_FILE, SYSTEM_PROMPT,
 };
-use muniment_core::sidecar::{validate_pi_session, PiRpcWiring, SidecarStatus, SidecarSupervisor};
+use muniment_core::sidecar::{
+    validate_pi_session, PiRpcWiring, SidecarConfig, SidecarStatus, SidecarSupervisor,
+};
 use uuid::Uuid;
 
 mod stdin_deadline {
@@ -460,7 +462,8 @@ fn cloud_extension_failure_keeps_the_cause_and_local_mode_skips_the_write() {
         matches!(error, PiLaunchError::RejectedConfig { step: "cloud_extension_write", ref cause }
         if cause.contains("os error"))
     );
-    assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+    // The blocked cloud provider and the identity extension every launch writes.
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -674,19 +677,104 @@ fn omits_an_absent_extension_file() {
         extension: Some(root.join("missing.js")),
     };
     let config = pi_launch_config_for_executable(&boundaries, "pi".into(), &grant(), None).unwrap();
-    let extensions: Vec<_> = config
-        .args
-        .windows(2)
-        .filter(|args| args[0] == "--extension")
-        .map(|args| args[1].as_str())
-        .collect();
+    let extensions = |config: &SidecarConfig| -> Vec<String> {
+        config
+            .args
+            .windows(2)
+            .filter(|args| args[0] == "--extension")
+            .map(|args| args[1].clone())
+            .collect()
+    };
+    let identity = root.join(IDENTITY_EXTENSION_FILE);
     assert_eq!(
-        extensions,
-        [root.join("muniment-cloud-provider.mjs").to_str().unwrap()]
+        extensions(&config),
+        [
+            identity.to_str().unwrap(),
+            root.join("muniment-cloud-provider.mjs").to_str().unwrap()
+        ]
     );
     let local =
         pi_launch_config_for_executable(&boundaries, "pi".into(), &ChatGrant::local(), None)
             .unwrap();
-    assert!(!local.args.iter().any(|arg| arg == "--extension"));
+    assert_eq!(extensions(&local), [identity.to_str().unwrap()]);
+    assert_eq!(fs::read_to_string(&identity).unwrap(), IDENTITY_EXTENSION);
+    for config in [&config, &local] {
+        assert!(config
+            .args
+            .windows(2)
+            .any(|args| args == ["--exclude-tools", EXCLUDED_TOOLS]));
+    }
     fs::remove_dir_all(root).unwrap();
+}
+
+/// One recorded turn: the prompt Pi assembles around the runtime's system prompt
+/// and the provider payload with every extension tool. After the identity
+/// extension runs, no prose names the harness or the product. A path keeps its
+/// name, because the model reads files by it.
+#[test]
+fn the_assembled_prompt_and_the_tool_descriptions_name_neither_pi_nor_muniment() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi_turn");
+    let extension = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/assistant_identity.mjs");
+    let recorded_prompt = fs::read_to_string(fixtures.join("system-prompt.txt")).unwrap();
+    let recorded_payload = fs::read_to_string(fixtures.join("payload.json")).unwrap();
+    // The recording carries both words, so the assertion below proves the rewrite.
+    assert!(recorded_prompt.contains("pi-subagents"));
+    assert!(recorded_payload.contains("Muniment Home"));
+    assert!(recorded_payload.contains("bg_run_pi_attested"));
+
+    let output = std::process::Command::new("node")
+        .arg(fixtures.join("check.mjs"))
+        .arg(&extension)
+        .arg(fixtures.join("system-prompt.txt"))
+        .arg(fixtures.join("payload.json"))
+        .output()
+        .expect("Node.js must be available to run the identity extension");
+    assert!(
+        output.status.success(),
+        "the identity extension must run: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let turn: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    let prompt = turn["systemPrompt"].as_str().unwrap();
+    assert!(prompt.starts_with(SYSTEM_PROMPT));
+    assert!(prompt.contains("Current working directory: /Users/example/Documents/Muniment"));
+    assert!(!prompt.contains("available_skills"));
+
+    let names: Vec<&str> = turn["payload"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"subagent") && names.contains(&"bg_run") && names.contains(&"mcp"));
+    assert!(!names.contains(&"bg_run_pi_attested"));
+
+    let names_harness_or_product = |token: &str| {
+        token.to_ascii_lowercase().contains("muniment")
+            || token
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|word| word.eq_ignore_ascii_case("pi"))
+    };
+    let mut prose = Vec::new();
+    collect_strings(&turn["payload"], &mut prose);
+    prose.push(prompt.to_owned());
+    let offending: Vec<&str> = prose
+        .iter()
+        .flat_map(|text| text.split_whitespace())
+        .filter(|token| !token.contains('/') && !token.contains('\\'))
+        .filter(|token| names_harness_or_product(token))
+        .collect();
+    assert_eq!(offending, Vec::<&str>::new());
+}
+
+fn collect_strings(value: &serde_json::Value, into: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(text) => into.push(text.clone()),
+        serde_json::Value::Array(items) => {
+            items.iter().for_each(|item| collect_strings(item, into))
+        }
+        serde_json::Value::Object(map) => map.values().for_each(|item| collect_strings(item, into)),
+        _ => {}
+    }
 }
