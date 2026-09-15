@@ -12,11 +12,12 @@ use std::time::{Duration, Instant};
 use fs2::FileExt;
 use serde_json::Value;
 
-pub const PI_PACKAGES: [(&str, &str); 4] = [
+pub const PI_PACKAGES: [(&str, &str); 5] = [
     ("pi-web-access", "0.28.0"),
     ("pi-subagents", "0.65.1"),
     ("pi-background-tasks", "2.5.0"),
     ("pi-mcp-adapter", "2.32.1"),
+    ("pi-claude-bridge", "0.7.0"),
 ];
 
 fn installed(directory: &Path) -> bool {
@@ -601,6 +602,7 @@ mod tests {
                 "pi-subagents@0.65.1",
                 "pi-background-tasks@2.5.0",
                 "pi-mcp-adapter@2.32.1",
+                "pi-claude-bridge@0.7.0",
                 "--omit=peer",
                 "--ignore-scripts",
                 "--exact",

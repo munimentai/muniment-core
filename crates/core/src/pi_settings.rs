@@ -498,7 +498,7 @@ mod tests {
         assert!(!path.exists());
         store_pi_settings(&path, PI_CANDIDATE_ARTIFACT).unwrap();
         let rendered: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(rendered["packages"].as_array().unwrap().len(), 4);
+        assert_eq!(rendered["packages"].as_array().unwrap().len(), 5);
         assert_eq!(rendered["defaultTools"].as_array().unwrap().len(), 8);
         fs::write(
             &path,
@@ -611,7 +611,8 @@ mod tests {
                     "npm:pi-web-access@0.28.0",
                     "npm:pi-subagents@0.65.1",
                     "npm:pi-background-tasks@2.5.0",
-                    "npm:pi-mcp-adapter@2.32.1"
+                    "npm:pi-mcp-adapter@2.32.1",
+                    "npm:pi-claude-bridge@0.7.0"
                 ],
                 "defaultTools": ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"]
             })
@@ -655,7 +656,7 @@ mod tests {
         let merged = settings.clone();
         merge_pi_settings(&mut settings, PI_CANDIDATE_ARTIFACT);
         assert_eq!(settings, merged);
-        assert_eq!(settings["packages"].as_array().unwrap().len(), 4);
+        assert_eq!(settings["packages"].as_array().unwrap().len(), 5);
         assert_eq!(settings["defaultTools"].as_array().unwrap().len(), 8);
     }
 }
