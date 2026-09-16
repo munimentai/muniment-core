@@ -4,10 +4,11 @@ use std::fmt;
 use std::time::Duration;
 
 use super::{
-    exchange_native_code, register_installation_with_retry, run_native_browser_authorization,
-    AuthStatus, AuthorizationTransport, BrowserOpener, InstallationStore, NativeAuthorizationError,
-    NativeBrowserAuthorizationError, NativeCredentialStore, NativeRegistrationError,
-    NativeTokenError, RegistrationTransport, TokenTransport,
+    exchange_native_code, register_fresh_installation, register_installation_with_retry,
+    run_native_browser_authorization, AuthStatus, AuthorizationTransport, BrowserOpener,
+    InstallationStore, NativeAuthorizationError, NativeBrowserAuthorizationError,
+    NativeCredentialStore, NativeRegistrationError, NativeTokenError, RegistrationTransport,
+    TokenTransport,
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -53,7 +54,7 @@ pub fn run_native_sign_in(
 ) -> Result<AuthStatus, NativeSignInError> {
     register_installation_with_retry(store, registration, base_url, clock(), registration_wait)
         .map_err(map_registration)?;
-    let code = run_native_browser_authorization(
+    let code = match run_native_browser_authorization(
         store,
         authorization,
         browser,
@@ -61,8 +62,30 @@ pub fn run_native_sign_in(
         None,
         clock(),
         timeout,
-    )
-    .map_err(map_authorization)?;
+    ) {
+        Ok(code) => code,
+        // The cloud refused this installation's proof: its challenge moved on
+        // without the desktop, so register once more and authorize again.
+        Err(error) if refuses_installation_proof(&error) => {
+            failure(
+                "authorization",
+                "HttpStatus status=400 error_code=invalid_device_proof reregister=true",
+            );
+            register_fresh_installation(store, registration, base_url, clock(), registration_wait)
+                .map_err(map_registration)?;
+            run_native_browser_authorization(
+                store,
+                authorization,
+                browser,
+                base_url,
+                None,
+                clock(),
+                timeout,
+            )
+            .map_err(map_authorization)?
+        }
+        Err(error) => return Err(map_authorization(error)),
+    };
     let mut proof_jti = [0_u8; 16];
     getrandom::fill(&mut proof_jti).map_err(|_| {
         failure("proof", "Randomness");
@@ -75,6 +98,15 @@ pub fn run_native_sign_in(
         subject: credentials.tokens.subject,
         expires_at: credentials.tokens.expires_at,
     })
+}
+
+/// An authorize step the cloud refused for the device proof alone.
+fn refuses_installation_proof(error: &NativeBrowserAuthorizationError) -> bool {
+    matches!(
+        error,
+        NativeBrowserAuthorizationError::Authorization(NativeAuthorizationError::HttpFailure(400, failure))
+            if failure.code() == Some("invalid_device_proof")
+    )
 }
 
 fn failure(stage: &str, cause: &str) {
@@ -167,6 +199,33 @@ mod tests {
         );
         assert!(lines[0].ends_with(cause));
         assert!(!lines.join("\n").contains("secret"));
+    }
+
+    #[test]
+    fn only_a_refused_device_proof_asks_for_a_fresh_registration() {
+        let refused: ureq::Response = "HTTP/1.1 400 Bad Request\r\n\r\n{\"error\":{\"code\":\"invalid_device_proof\",\"message\":\"x\"}}".parse().unwrap();
+        let refused = super::super::native_http::NativeHttpFailure::from_response(refused);
+        assert!(refuses_installation_proof(
+            &NativeBrowserAuthorizationError::Authorization(NativeAuthorizationError::HttpFailure(
+                400,
+                refused.clone()
+            ))
+        ));
+        assert!(!refuses_installation_proof(
+            &NativeBrowserAuthorizationError::Authorization(NativeAuthorizationError::HttpFailure(
+                401, refused
+            ))
+        ));
+        let other: ureq::Response = "HTTP/1.1 400 Bad Request\r\n\r\n{\"error\":{\"code\":\"invalid_request\",\"message\":\"x\"}}".parse().unwrap();
+        assert!(!refuses_installation_proof(
+            &NativeBrowserAuthorizationError::Authorization(NativeAuthorizationError::HttpFailure(
+                400,
+                super::super::native_http::NativeHttpFailure::from_response(other)
+            ))
+        ));
+        assert!(!refuses_installation_proof(
+            &NativeBrowserAuthorizationError::Timeout
+        ));
     }
 
     #[test]

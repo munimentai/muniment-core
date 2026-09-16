@@ -196,6 +196,19 @@ pub fn register_installation_with_retry(
             return Ok(existing);
         }
     }
+    register_fresh_installation(store, transport, base_url, now_unix_seconds, wait)
+}
+
+/// Registers a new installation whatever the store holds. The cloud refuses a
+/// device proof once its challenge has moved on without the desktop, and only
+/// a fresh registration brings the two back in step.
+pub fn register_fresh_installation(
+    store: &dyn InstallationStore,
+    transport: &dyn RegistrationTransport,
+    base_url: &str,
+    now_unix_seconds: u64,
+    wait: &dyn Fn(Duration),
+) -> Result<InstallationRecord, NativeRegistrationError> {
     validate_base_url(base_url)?;
 
     let mut private_key = [0u8; 32];
