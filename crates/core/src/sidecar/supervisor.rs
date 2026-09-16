@@ -63,6 +63,9 @@ pub struct SidecarConfig {
     pub stderr_capacity: usize,
     /// Frequency of exit and shutdown checks. Kept configurable for bounded tests.
     pub poll_interval: Duration,
+    /// The directory the child starts in. None inherits the runtime's own,
+    /// which under a service manager is the filesystem root.
+    pub working_directory: Option<std::path::PathBuf>,
 }
 
 impl SidecarConfig {
@@ -78,6 +81,7 @@ impl SidecarConfig {
             shutdown_timeout: Duration::from_secs(2),
             stderr_capacity: DEFAULT_STDERR_CAPACITY,
             poll_interval: Duration::from_millis(20),
+            working_directory: None,
         }
     }
 }
@@ -547,6 +551,15 @@ fn spawn_child(
 ) -> Result<(Child, JoinHandle<()>), std::io::Error> {
     let mut command = Command::new(&config.program);
     command.args(&config.args).envs(&config.env);
+    // A directory that vanished must not stop the child; the prompt's facts
+    // name the one the agent was meant to work in.
+    if let Some(directory) = config
+        .working_directory
+        .as_deref()
+        .filter(|directory| directory.is_dir())
+    {
+        command.current_dir(directory);
+    }
     for name in &config.env_remove {
         command.env_remove(name);
     }

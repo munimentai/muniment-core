@@ -260,6 +260,23 @@ impl PiLaunchBoundaries for Boundaries {
     ) -> Result<(), PiLaunchError> {
         Ok(())
     }
+
+    // The facts a test launch states, fixed so no test reads this machine's
+    // agent settings or Home.
+    fn local_default_model(&self) -> Option<String> {
+        Some("ollama/llama3.2:3b".into())
+    }
+
+    fn working_directory(&self) -> Option<PathBuf> {
+        self.session_root
+            .as_ref()
+            .ok()
+            .map(|root| root.join("Documents").join("Home"))
+    }
+
+    fn earlier_models(&self) -> Vec<String> {
+        vec!["openai/gpt-5.5".into(), "ollama/llama3.2:3b".into()]
+    }
 }
 
 fn grant() -> ChatGrant {
@@ -509,7 +526,7 @@ fn appends_a_present_extension_file_and_environment() {
 }
 
 #[test]
-fn passes_the_system_prompt_for_every_launch() {
+fn passes_the_system_prompt_with_the_launch_facts_for_every_launch() {
     let root = temporary_directory();
     let extension = root.join("memory.js");
     fs::write(&extension, "").unwrap();
@@ -531,7 +548,31 @@ fn passes_the_system_prompt_for_every_launch() {
                     .filter(|args| args[0] == "--system-prompt")
                     .map(|args| args[1].as_str())
                     .collect();
-                assert_eq!(prompts, [SYSTEM_PROMPT]);
+                assert_eq!(prompts.len(), 1);
+                let prompt = prompts[0];
+                // The constant prompt first, then the facts of this launch.
+                assert!(prompt.starts_with(&format!("{SYSTEM_PROMPT}\n\nFacts:\n")));
+                let expected_model = if grant.is_local() {
+                    "ollama/llama3.2:3b"
+                } else {
+                    "model"
+                };
+                assert!(
+                    prompt.contains(&format!("- You are running as the model {expected_model}."))
+                );
+                // The answering model never lists itself among the earlier ones.
+                if grant.is_local() {
+                    assert!(
+                        prompt.contains("other models: openai/gpt-5.5. You did not write them.")
+                    );
+                } else {
+                    assert!(prompt.contains(
+                        "other models: openai/gpt-5.5, ollama/llama3.2:3b. You did not write them."
+                    ));
+                }
+                let home = root.join("Documents").join("Home");
+                assert!(prompt.contains(&format!("- The working directory is {}.", home.display())));
+                assert_eq!(config.working_directory.as_deref(), Some(home.as_path()));
                 assert!(!config
                     .args
                     .iter()
@@ -580,7 +621,10 @@ fn workspace_agents_file_does_not_remove_the_system_prompt() {
     fs::write(workspace.join("AGENTS.md"), instructions).unwrap();
     // A child changes the working directory without affecting parallel tests.
     let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "passes_the_system_prompt_for_every_launch"])
+        .args([
+            "--exact",
+            "passes_the_system_prompt_with_the_launch_facts_for_every_launch",
+        ])
         .current_dir(&workspace)
         .output()
         .unwrap();

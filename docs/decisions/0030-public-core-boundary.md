@@ -47,6 +47,7 @@ Module rows name the module below `muniment-core`.
 | module | import_preview | It previews bounded assistant exports. |
 | module | journal | It owns the run journal and reader projections. |
 | module | kokoro | It owns on-device read-aloud. |
+| module | launch_facts | It states the facts of a launch to the model: its model, earlier models, host, shell and working directory. |
 | module | local_mode | It reads the local-mode marker without an account. |
 | module | memory_failure | It defines memory-search failures. |
 | module | memory_index | It indexes local memory. |

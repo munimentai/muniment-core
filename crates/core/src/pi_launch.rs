@@ -144,6 +144,25 @@ pub trait PiLaunchBoundaries {
     fn pi_artifact(&self) -> PiArtifactDescriptor {
         PI_SELECTED_ARTIFACT
     }
+
+    /// The model a local run answers with, as the agent's settings name it.
+    fn local_default_model(&self) -> Option<String> {
+        crate::state_root::state_directory()
+            .map(|state| crate::state_root::agent_directory(&state))
+            .and_then(|agent| crate::launch_facts::read_local_default_model(&agent))
+    }
+
+    /// The directory the agent works in: the user's Home.
+    fn working_directory(&self) -> Option<PathBuf> {
+        let sessions = self.pi_session_root().ok()?;
+        let profile = sessions.parent()?;
+        crate::launch_facts::working_directory(profile)
+    }
+
+    /// Models that answered earlier runs of this thread, once each, in order.
+    fn earlier_models(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -516,9 +535,25 @@ pub fn pi_launch_config_for_executable(
         // Extension loading precedes the first RPC response.
         config.startup_timeout = std::time::Duration::from_secs(120);
     }
-    config
-        .args
-        .extend(["--system-prompt".into(), SYSTEM_PROMPT.into()]);
+    // The prompt states what the assistant does; the facts state where it runs.
+    let model = if grant.is_local() {
+        boundaries.local_default_model()
+    } else {
+        grant.model.as_deref().map(crate::launch_facts::shown_model)
+    };
+    let facts = crate::launch_facts::LaunchFacts {
+        earlier_models: crate::launch_facts::earlier_models(
+            boundaries.earlier_models(),
+            model.as_deref(),
+        ),
+        working_directory: boundaries.working_directory(),
+        model,
+    };
+    config.working_directory = facts.working_directory.clone();
+    config.args.extend([
+        "--system-prompt".into(),
+        crate::launch_facts::system_prompt_with_facts(SYSTEM_PROMPT, &facts),
+    ]);
     let identity = session_root.join(IDENTITY_EXTENSION_FILE);
     install_identity_extension(&identity)?;
     config.args.extend([

@@ -36,6 +36,7 @@ pub mod home;
 pub mod import_preview;
 pub mod journal;
 pub mod kokoro;
+pub mod launch_facts;
 pub mod local_mode;
 pub mod memory_failure;
 pub mod memory_index;

@@ -346,10 +346,12 @@ pub fn coordinate(
         }
         return;
     }
+    // The model reads the clock from the message, so each one opens with its time.
+    let stamped_prompt = crate::launch_facts::stamp_message(&prompt);
     let prepared_prompt = if resume.is_some() {
         None
     } else {
-        let prepared_prompt = match prepared_pi_prompt(&journal, &run_id, &prompt) {
+        let prepared_prompt = match prepared_pi_prompt(&journal, &run_id, &stamped_prompt) {
             Ok(prepared_prompt) => prepared_prompt,
             Err(message) => {
                 fail_start(

@@ -59,9 +59,15 @@ pub fn queue_message(
     let (transport, adapter) = transport
         .zip(adapter)
         .ok_or_else(|| "The reply is not ready for messages yet.".to_string())?;
+    // An empty message stays empty, so the adapter still refuses it.
+    let message = if request.message.trim().is_empty() {
+        request.message.clone()
+    } else {
+        crate::launch_facts::stamp_message(&request.message)
+    };
     let result = match request.delivery {
-        ChatDelivery::Steer => adapter.steer(&transport, &request.message, QUEUE_TIMEOUT),
-        ChatDelivery::FollowUp => adapter.follow_up(&transport, &request.message, QUEUE_TIMEOUT),
+        ChatDelivery::Steer => adapter.steer(&transport, &message, QUEUE_TIMEOUT),
+        ChatDelivery::FollowUp => adapter.follow_up(&transport, &message, QUEUE_TIMEOUT),
     };
     result.map_err(|error| {
         if error == "Pi queued message must not be empty" {
