@@ -142,14 +142,37 @@ pub fn fetch_grant(
     }
     // Each run requests a new key. Retry a stale issuance once, never reuse it.
     for attempt in 0..2 {
-        let grant = issue_grant(issuer_base_url, access_token, expected_device_id)
-            .map_err(|failure| failure.shell_error())?;
+        let started = std::time::Instant::now();
+        eprintln!("muniment-runtime: chat-grant start attempt={attempt} path={GRANT_PATH}");
+        let grant = issue_grant(issuer_base_url, access_token, expected_device_id).map_err(
+            |failure| {
+                let error = failure.shell_error();
+                eprintln!(
+                    "muniment-runtime: chat-grant end attempt={attempt} outcome=refused cause={error:?} elapsed_ms={}",
+                    started.elapsed().as_millis()
+                );
+                error
+            },
+        )?;
         if grant.needs_renewal() {
+            // A grant that is already inside the safe-life margin is unusable.
+            eprintln!(
+                "muniment-runtime: chat-grant end attempt={attempt} outcome=stale expires_at={} safe_life_seconds={SAFE_LIFE_SECONDS} elapsed_ms={}",
+                grant
+                    .expires_at
+                    .map(|expiry| expiry.to_rfc3339())
+                    .unwrap_or_else(|| "none".to_owned()),
+                started.elapsed().as_millis()
+            );
             if attempt == 0 {
                 continue;
             }
             return Err(FetchGrantError::Unavailable);
         }
+        eprintln!(
+            "muniment-runtime: chat-grant end attempt={attempt} outcome=issued elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
         return Ok(grant);
     }
     unreachable!()
