@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"00000000000000000000000000000093","operation":"reader.connect","capability":"fixture-capability","idempotency_key":"000000000000000000000000000000f7","body":{"secret":"sk_test_fixture","source":"stripe"}}

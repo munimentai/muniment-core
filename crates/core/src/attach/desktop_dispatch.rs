@@ -1136,7 +1136,11 @@ pub(super) fn dispatch_request<S: ThreadListService>(
     }
     if matches!(
         request.operation,
-        Operation::ReaderDescribe | Operation::ReaderRun | Operation::ReaderQueue
+        Operation::ReaderDescribe
+            | Operation::ReaderRun
+            | Operation::ReaderQueue
+            | Operation::ReaderObjects
+            | Operation::ReaderConnect
     ) {
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -1151,6 +1155,8 @@ pub(super) fn dispatch_request<S: ThreadListService>(
             mapping: Option<String>,
             #[serde(default)]
             offset: Option<u64>,
+            #[serde(default)]
+            secret: Option<String>,
         }
         let body: Body = serde_json::from_value(request.body.clone())
             .map_err(|_| ProtocolError::invalid_request())?;
@@ -1164,6 +1170,7 @@ pub(super) fn dispatch_request<S: ThreadListService>(
                 Operation::ReaderDescribe => {
                     body.mapping.is_none()
                         && body.offset.is_none()
+                        && body.secret.is_none()
                         && body.source.is_some()
                         && bounded(&body.source, 32)
                         && body.object.is_some()
@@ -1172,14 +1179,33 @@ pub(super) fn dispatch_request<S: ThreadListService>(
                 Operation::ReaderRun => {
                     body.source.is_none()
                         && body.object.is_none()
+                        && body.secret.is_none()
                         && body.mapping.is_some()
                         && bounded(&body.mapping, 36)
                         && body.offset.is_none_or(|offset| offset <= 10_000_000)
+                }
+                Operation::ReaderObjects => {
+                    body.mapping.is_none()
+                        && body.object.is_none()
+                        && body.offset.is_none()
+                        && body.secret.is_none()
+                        && body.source.is_some()
+                        && bounded(&body.source, 32)
+                }
+                Operation::ReaderConnect => {
+                    body.mapping.is_none()
+                        && body.object.is_none()
+                        && body.offset.is_none()
+                        && body.source.is_some()
+                        && bounded(&body.source, 32)
+                        && body.secret.is_some()
+                        && bounded(&body.secret, 4_096)
                 }
                 _ => {
                     body.source.is_none()
                         && body.object.is_none()
                         && body.offset.is_none()
+                        && body.secret.is_none()
                         && body.mapping.is_some()
                         && bounded(&body.mapping, 36)
                 }
@@ -1190,6 +1216,19 @@ pub(super) fn dispatch_request<S: ThreadListService>(
         let answer = match request.operation {
             Operation::ReaderDescribe => service.reader_describe(request.body, provenance)?,
             Operation::ReaderQueue => service.reader_queue(request.body, provenance)?,
+            Operation::ReaderObjects => service.reader_objects(request.body, provenance)?,
+            Operation::ReaderConnect => {
+                let idempotency_key = request
+                    .idempotency_key
+                    .as_ref()
+                    .ok_or_else(ProtocolError::idempotency_key_required)?;
+                service.reader_connect(
+                    request.body,
+                    &request.request_id,
+                    idempotency_key,
+                    provenance,
+                )?
+            }
             _ => {
                 let idempotency_key = request
                     .idempotency_key

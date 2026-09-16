@@ -564,6 +564,19 @@ impl DesktopClient {
         self.request_body(Operation::ReaderQueue, None, body, &[])
     }
 
+    pub fn reader_objects(&mut self, body: Value) -> Result<Value, ClientError> {
+        self.request_body(Operation::ReaderObjects, None, body, &[])
+    }
+
+    pub fn reader_connect(&mut self, body: Value) -> Result<Value, ClientError> {
+        self.request_body(
+            Operation::ReaderConnect,
+            Some(fresh_request_id()?),
+            body,
+            &[],
+        )
+    }
+
     pub fn revoke_companion(&mut self, client_identity: &str) -> Result<Value, ClientError> {
         if client_identity.is_empty() || client_identity.len() > MAX_TEXT_LENGTH {
             return Err(ClientError::UnexpectedMessage);

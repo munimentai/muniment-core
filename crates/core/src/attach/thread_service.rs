@@ -251,6 +251,24 @@ pub trait ThreadListService {
         Err(ProtocolError::unsupported_operation())
     }
 
+    fn reader_objects(
+        &mut self,
+        _body: serde_json::Value,
+        _provenance: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn reader_connect(
+        &mut self,
+        _body: serde_json::Value,
+        _request_id: &super::Id,
+        _idempotency_key: &super::Id,
+        _provenance: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
     fn sign_in(
         &mut self,
         _request_id: &super::Id,

@@ -285,6 +285,8 @@ where
                 | Operation::ReaderDescribe
                 | Operation::ReaderRun
                 | Operation::ReaderQueue
+                | Operation::ReaderObjects
+                | Operation::ReaderConnect
                 | Operation::RunChatEvents
                 | Operation::RunSubmit
                 | Operation::RunResume

@@ -156,6 +156,14 @@ impl DesktopClientHolder {
         self.with_client(|client| client.reader_queue(body.clone()))
     }
 
+    pub fn reader_objects(&self, body: Value) -> Result<Value, ClientError> {
+        self.with_client(|client| client.reader_objects(body.clone()))
+    }
+
+    pub fn reader_connect(&self, body: Value) -> Result<Value, ClientError> {
+        self.with_client(|client| client.reader_connect(body.clone()))
+    }
+
     pub fn revoke_companion(&self, client_identity: &str) -> Result<Value, ClientError> {
         self.with_client(|client| client.revoke_companion(client_identity))
     }

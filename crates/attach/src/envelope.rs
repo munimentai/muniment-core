@@ -307,6 +307,10 @@ pub enum Operation {
     ReaderRun,
     #[serde(rename = "reader.queue")]
     ReaderQueue,
+    #[serde(rename = "reader.objects")]
+    ReaderObjects,
+    #[serde(rename = "reader.connect")]
+    ReaderConnect,
     #[serde(rename = "run.open")]
     RunOpen,
     #[serde(rename = "run.start")]
@@ -360,6 +364,7 @@ impl Operation {
                 | Self::CompanyRename
                 | Self::RecordCommit
                 | Self::ReaderRun
+                | Self::ReaderConnect
                 | Self::RunStart
                 | Self::RunSubmit
                 | Self::RunResume
@@ -403,6 +408,8 @@ impl Operation {
             Self::ReaderDescribe => "reader.describe",
             Self::ReaderRun => "reader.run",
             Self::ReaderQueue => "reader.queue",
+            Self::ReaderObjects => "reader.objects",
+            Self::ReaderConnect => "reader.connect",
             Self::RunOpen => "run.open",
             Self::RunStart => "run.start",
             Self::RunSubmit => "run.submit",

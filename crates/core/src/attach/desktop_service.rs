@@ -445,6 +445,58 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         self.boundaries.reader_queue(&actor, body)
     }
 
+    #[cfg(any(unix, target_os = "windows"))]
+    fn reader_objects(
+        &mut self,
+        body: serde_json::Value,
+        provenance: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let actor = record_actor(&provenance, &body);
+        self.boundaries.reader_objects(&actor, body)
+    }
+
+    /// Stores a source's secret once per idempotency key. The ledger keeps
+    /// the request body, so the secret is dropped from it before the write.
+    #[cfg(any(unix, target_os = "windows"))]
+    fn reader_connect(
+        &mut self,
+        body: serde_json::Value,
+        request_id: &Id,
+        idempotency_key: &Id,
+        provenance: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let actor = record_actor(&provenance, &body);
+        let mut ledger_body = body.clone();
+        if let Some(object) = ledger_body.as_object_mut() {
+            object.remove("secret");
+        }
+        let ledger_request = AttachRequest {
+            protocol: Protocol,
+            request_id: request_id.clone(),
+            operation: Operation::ReaderConnect,
+            capability: String::new(),
+            idempotency_key: Some(idempotency_key.clone()),
+            body: ledger_body.clone(),
+        };
+        let payload = body;
+        let outcome = self.idempotency.execute(
+            &provenance.profile,
+            &ledger_request,
+            &ledger_body,
+            || Ok(()),
+            || {
+                Ok(CommittedResult {
+                    body: self.boundaries.reader_connect(&actor, payload)?,
+                    cursor: None,
+                })
+            },
+        )?;
+        let committed = match outcome {
+            IdempotencyOutcome::Committed(result) | IdempotencyOutcome::Replayed(result) => result,
+        };
+        Ok(committed.body)
+    }
+
     /// Runs one mapping once per idempotency key and replays its summary on
     /// a repeat, so a retried request never pages the source twice.
     #[cfg(any(unix, target_os = "windows"))]

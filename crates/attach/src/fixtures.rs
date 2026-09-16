@@ -568,6 +568,8 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         ("reader-describe", Operation::ReaderDescribe),
         ("reader-run", Operation::ReaderRun),
         ("reader-queue", Operation::ReaderQueue),
+        ("reader-objects", Operation::ReaderObjects),
+        ("reader-connect", Operation::ReaderConnect),
     ];
     for (index, (name, operation)) in operations.into_iter().enumerate() {
         insert(
@@ -850,6 +852,8 @@ fn request_body(operation: Operation) -> serde_json::Value {
         }
         Operation::ReaderRun => json!({"mapping": "019965a0-0000-7000-8000-000000000030"}),
         Operation::ReaderQueue => json!({"mapping": "019965a0-0000-7000-8000-000000000030"}),
+        Operation::ReaderObjects => json!({"source": "stripe"}),
+        Operation::ReaderConnect => json!({"source": "stripe", "secret": "sk_test_fixture"}),
         Operation::RunOpen => json!({"run_id": "00000000000000000000000000000191"}),
         Operation::RunStart => {
             json!({"text": "Summarize the selected file.", "context": {"selected_file": "src/main.rs"}})
@@ -1103,6 +1107,8 @@ mod tests {
             Operation::ReaderDescribe,
             Operation::ReaderRun,
             Operation::ReaderQueue,
+            Operation::ReaderObjects,
+            Operation::ReaderConnect,
             Operation::RunOpen,
             Operation::RunStart,
             Operation::RunSubmit,
@@ -1173,7 +1179,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            92,
+            94,
             "every canonical fixture must be inventoried"
         );
     }

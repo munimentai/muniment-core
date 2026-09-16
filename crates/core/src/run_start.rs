@@ -261,6 +261,24 @@ pub trait RunAttachBoundaries {
     ) -> Result<serde_json::Value, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
+    /// The objects one connected source holds.
+    #[cfg(any(unix, target_os = "windows"))]
+    fn reader_objects(
+        &self,
+        _actor: &str,
+        _body: serde_json::Value,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    /// Stores one source's secret and proves it with one read.
+    #[cfg(any(unix, target_os = "windows"))]
+    fn reader_connect(
+        &self,
+        _actor: &str,
+        _body: serde_json::Value,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
     #[cfg(any(unix, target_os = "windows"))]
     fn list_threads(
         &self,

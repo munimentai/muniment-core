@@ -1136,6 +1136,26 @@ impl ThreadListService for ReaderService {
         self.calls.push((Operation::ReaderQueue, body));
         Ok(serde_json::json!({"queue": {"rows": []}}))
     }
+
+    fn reader_objects(
+        &mut self,
+        body: serde_json::Value,
+        _: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        self.calls.push((Operation::ReaderObjects, body));
+        Ok(serde_json::json!({"objects": [{"name": "customers", "label": "Customers"}]}))
+    }
+
+    fn reader_connect(
+        &mut self,
+        body: serde_json::Value,
+        _: &Id,
+        _: &Id,
+        _: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        self.calls.push((Operation::ReaderConnect, body));
+        Ok(serde_json::json!({"connected": {"source": "stripe"}}))
+    }
 }
 
 #[test]
@@ -1246,14 +1266,75 @@ fn desktop_client_describes_runs_and_reads_the_reader_queue() {
         .unwrap()
         .is_empty());
 
+    let Envelope::Response(response) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000293",
+            Operation::ReaderObjects,
+            "admitted",
+            serde_json::json!({"source": "stripe"}),
+        ),
+    ) else {
+        panic!("reader.objects did not return a response");
+    };
+    assert_eq!(response.body["objects"][0]["name"], "customers");
+
+    let Envelope::Error(error) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000294",
+            Operation::ReaderConnect,
+            "admitted",
+            serde_json::json!({"source": "stripe", "secret": "sk_test"}),
+        ),
+    ) else {
+        panic!("reader.connect without a key was not refused");
+    };
+    assert_eq!(error.error.code(), ErrorCode::IdempotencyKeyRequired);
+    for (index, body) in [
+        serde_json::json!({"source": "stripe"}),
+        serde_json::json!({"secret": "sk_test"}),
+        serde_json::json!({"source": "stripe", "secret": ""}),
+        serde_json::json!({"source": "stripe", "secret": "sk_test", "mapping": "m"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let Envelope::Error(error) = exchange(
+            &mut client,
+            idempotent_request(
+                &format!("018f0000-0000-7000-8000-0000000002a{index}"),
+                Operation::ReaderConnect,
+                body,
+            ),
+        ) else {
+            panic!("an invalid reader.connect body was dispatched");
+        };
+        assert_eq!(error.error.code(), ErrorCode::InvalidRequest);
+    }
+    let Envelope::Response(response) = exchange(
+        &mut client,
+        idempotent_request(
+            "018f0000-0000-7000-8000-000000000295",
+            Operation::ReaderConnect,
+            serde_json::json!({"source": "stripe", "secret": "sk_test"}),
+        ),
+    ) else {
+        panic!("reader.connect did not return a response");
+    };
+    assert_eq!(response.body["connected"]["source"], "stripe");
+
     drop(client);
     let (result, service) = session_thread.join().unwrap();
     assert_eq!(result, Ok(()));
-    assert_eq!(service.calls.len(), 3);
+    assert_eq!(service.calls.len(), 5);
     assert_eq!(service.calls[0].0, Operation::ReaderDescribe);
     assert_eq!(service.calls[1].0, Operation::ReaderRun);
     assert_eq!(service.calls[1].1["offset"], 0);
     assert_eq!(service.calls[2].0, Operation::ReaderQueue);
+    assert_eq!(service.calls[3].0, Operation::ReaderObjects);
+    assert_eq!(service.calls[4].0, Operation::ReaderConnect);
+    assert_eq!(service.calls[4].1["secret"], "sk_test");
 }
 
 #[test]
