@@ -2990,6 +2990,11 @@ pub struct AuthorizedClient;
 
 #[cfg(not(unix))]
 impl AuthorizedClient {
+    // A companion off unix holds no credential to persist; the record is reached over unix sockets alone.
+    pub fn authorized_client_credential(&self) -> &str {
+        ""
+    }
+
     pub fn onboard_workspace(
         &mut self,
         _opened_directory: &str,
