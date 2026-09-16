@@ -8,7 +8,7 @@ use muniment_core::sidecar::pi_chat::{
     ExtensionUiAnswer, ExtensionUiDialog, ExtensionUiRequest, PiChatEvent,
 };
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use uuid::Uuid;
 
 fn event_envelope(run_id: &str, run_seq: u64, kind: &str, payload: Value) -> EventEnvelope {
@@ -84,6 +84,7 @@ fn extension_ui_requests_journal_the_gate_before_the_projector_accepts_it() {
         .unwrap();
     let mut gates = Vec::new();
     let mut pending = None;
+    let mut waiting = VecDeque::new();
 
     coordinate_extension_ui_request(
         PiChatEvent::ExtensionUiRequest(ExtensionUiRequest {
@@ -95,6 +96,7 @@ fn extension_ui_requests_journal_the_gate_before_the_projector_accepts_it() {
             timeout: Some(5_000),
         }),
         &mut pending,
+        &mut waiting,
         |kind, payload| {
             let envelope = event_envelope(&run_id, 2, kind, payload);
             journal.append(1, &envelope).map_err(|_| ())?;
@@ -113,8 +115,10 @@ fn extension_ui_requests_journal_the_gate_before_the_projector_accepts_it() {
     assert_eq!(gates.pop().unwrap().unwrap().gate_id, "pi-request-1");
     assert_eq!(pending.as_ref().unwrap().id, "pi-request-1");
 
+    // A request that arrives while a gate is open waits its turn: nothing is
+    // appended, the first gate stays pending, and the request sits in line.
     let mut append_attempts = 0;
-    assert!(coordinate_extension_ui_request(
+    coordinate_extension_ui_request(
         PiChatEvent::ExtensionUiRequest(ExtensionUiRequest {
             id: "pi-request-2".into(),
             dialog: ExtensionUiDialog::Input {
@@ -124,33 +128,32 @@ fn extension_ui_requests_journal_the_gate_before_the_projector_accepts_it() {
             timeout: None,
         }),
         &mut pending,
+        &mut waiting,
         |_kind, _payload| {
             append_attempts += 1;
             Err(())
         },
     )
-    .is_err());
-    assert_eq!(append_attempts, 1);
-
-    let mut appended_after_projection_failure = false;
-    assert!(coordinate_extension_ui_request(
+    .unwrap();
+    coordinate_extension_ui_request(
         PiChatEvent::ExtensionUiRequest(select_gate("pi-request-3")),
         &mut pending,
-        |kind, payload| {
-            let envelope = event_envelope(&run_id, 3, kind, payload);
-            let mut next_projector = projector.clone();
-            next_projector.apply(&envelope).map_err(|_| ())?;
-            next_projector.projection().map_err(|_| ())?;
-            journal.append(2, &envelope).map_err(|_| ())?;
-            appended_after_projection_failure = true;
-            Ok(())
+        &mut waiting,
+        |_kind, _payload| {
+            append_attempts += 1;
+            Err(())
         },
     )
-    .is_err());
-    assert!(!appended_after_projection_failure);
-    // A failed append leaves the first gate open. The coordinator has no
-    // response transport here and therefore cannot answer the new request.
+    .unwrap();
+    assert_eq!(append_attempts, 0);
     assert_eq!(pending.as_ref().unwrap().id, "pi-request-1");
+    assert_eq!(
+        waiting
+            .iter()
+            .map(|request| request.id.as_str())
+            .collect::<Vec<_>>(),
+        ["pi-request-2", "pi-request-3"]
+    );
     let events = journal.events(&run_id).unwrap();
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].event_type, "run.started");
@@ -173,6 +176,7 @@ fn other_events_leave_the_gate_untouched() {
     coordinate_extension_ui_request(
         PiChatEvent::PromptAccepted,
         &mut pending,
+        &mut VecDeque::new(),
         |kind, payload| {
             appended.push((kind.to_string(), payload));
             Ok(())
