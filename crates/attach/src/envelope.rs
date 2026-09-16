@@ -301,6 +301,12 @@ pub enum Operation {
     RecordQuery,
     #[serde(rename = "record.entity")]
     RecordEntity,
+    #[serde(rename = "reader.describe")]
+    ReaderDescribe,
+    #[serde(rename = "reader.run")]
+    ReaderRun,
+    #[serde(rename = "reader.queue")]
+    ReaderQueue,
     #[serde(rename = "run.open")]
     RunOpen,
     #[serde(rename = "run.start")]
@@ -353,6 +359,7 @@ impl Operation {
                 | Self::CompanySelect
                 | Self::CompanyRename
                 | Self::RecordCommit
+                | Self::ReaderRun
                 | Self::RunStart
                 | Self::RunSubmit
                 | Self::RunResume
@@ -393,6 +400,9 @@ impl Operation {
             Self::RecordKinds => "record.kinds",
             Self::RecordQuery => "record.query",
             Self::RecordEntity => "record.entity",
+            Self::ReaderDescribe => "reader.describe",
+            Self::ReaderRun => "reader.run",
+            Self::ReaderQueue => "reader.queue",
             Self::RunOpen => "run.open",
             Self::RunStart => "run.start",
             Self::RunSubmit => "run.submit",

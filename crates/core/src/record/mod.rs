@@ -291,7 +291,9 @@ impl From<IdentityError> for RecordError {
     }
 }
 
-pub(crate) fn now_string() -> String {
+/// The current instant as RFC 3339 with milliseconds, the record's one
+/// timestamp shape.
+pub fn now_string() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
@@ -441,6 +443,30 @@ impl CompanyRecord {
                 .principal(&id)?
                 .ok_or(RecordError::PrincipalNotFound(id)),
             None => self.create_principal(PrincipalType::Agent, label, Some(on_behalf_of)),
+        }
+    }
+
+    /// The service principal with this label, created on first use. A reader
+    /// commits as one, acting for the human named.
+    pub fn service_principal(
+        &mut self,
+        label: &str,
+        on_behalf_of: &str,
+    ) -> Result<PrincipalRow, RecordError> {
+        let existing: Option<String> = self
+            .connection
+            .query_row(
+                "select id from principal where type = 'service' and label = ?1 and disabled_at is null
+                 order by id limit 1",
+                params![label],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match existing {
+            Some(id) => self
+                .principal(&id)?
+                .ok_or(RecordError::PrincipalNotFound(id)),
+            None => self.create_principal(PrincipalType::Service, label, Some(on_behalf_of)),
         }
     }
 

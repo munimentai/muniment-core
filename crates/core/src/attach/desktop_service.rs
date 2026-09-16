@@ -426,6 +426,64 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
     }
 
     #[cfg(any(unix, target_os = "windows"))]
+    fn reader_describe(
+        &mut self,
+        body: serde_json::Value,
+        provenance: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let actor = record_actor(&provenance, &body);
+        self.boundaries.reader_describe(&actor, body)
+    }
+
+    #[cfg(any(unix, target_os = "windows"))]
+    fn reader_queue(
+        &mut self,
+        body: serde_json::Value,
+        provenance: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let actor = record_actor(&provenance, &body);
+        self.boundaries.reader_queue(&actor, body)
+    }
+
+    /// Runs one mapping once per idempotency key and replays its summary on
+    /// a repeat, so a retried request never pages the source twice.
+    #[cfg(any(unix, target_os = "windows"))]
+    fn reader_run(
+        &mut self,
+        body: serde_json::Value,
+        request_id: &Id,
+        idempotency_key: &Id,
+        provenance: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let actor = record_actor(&provenance, &body);
+        let ledger_request = AttachRequest {
+            protocol: Protocol,
+            request_id: request_id.clone(),
+            operation: Operation::ReaderRun,
+            capability: String::new(),
+            idempotency_key: Some(idempotency_key.clone()),
+            body: body.clone(),
+        };
+        let payload = body.clone();
+        let outcome = self.idempotency.execute(
+            &provenance.profile,
+            &ledger_request,
+            &body,
+            || Ok(()),
+            || {
+                Ok(CommittedResult {
+                    body: self.boundaries.reader_run(&actor, payload)?,
+                    cursor: None,
+                })
+            },
+        )?;
+        let committed = match outcome {
+            IdempotencyOutcome::Committed(result) | IdempotencyOutcome::Replayed(result) => result,
+        };
+        Ok(committed.body)
+    }
+
+    #[cfg(any(unix, target_os = "windows"))]
     fn record_commit(
         &mut self,
         body: serde_json::Value,

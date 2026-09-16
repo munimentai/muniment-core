@@ -1094,6 +1094,147 @@ fn desktop_client_reads_proposes_and_commits_on_the_record() {
     assert_eq!(service.calls[0].2["client"], "claude-code");
 }
 
+#[derive(Default)]
+struct ReaderService {
+    calls: Vec<(Operation, serde_json::Value)>,
+}
+
+impl ThreadListService for ReaderService {
+    fn list_threads(
+        &mut self,
+        _: &str,
+        _: ThreadListRequest,
+    ) -> Result<ThreadListPage, ProtocolError> {
+        unreachable!()
+    }
+
+    fn reader_describe(
+        &mut self,
+        body: serde_json::Value,
+        _: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        self.calls.push((Operation::ReaderDescribe, body));
+        Ok(serde_json::json!({"description": {"source": "csv", "rows": 2, "fields": []}}))
+    }
+
+    fn reader_run(
+        &mut self,
+        body: serde_json::Value,
+        _: &Id,
+        _: &Id,
+        _: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        self.calls.push((Operation::ReaderRun, body));
+        Ok(serde_json::json!({"run": {"created": 2, "done": true, "next_offset": 2}}))
+    }
+
+    fn reader_queue(
+        &mut self,
+        body: serde_json::Value,
+        _: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        self.calls.push((Operation::ReaderQueue, body));
+        Ok(serde_json::json!({"queue": {"rows": []}}))
+    }
+}
+
+#[test]
+fn desktop_client_describes_runs_and_reads_the_reader_queue() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let session_thread = std::thread::spawn(move || {
+        let mut service = ReaderService::default();
+        let result = serve_desktop_client_session(server, &session(), &mut service);
+        (result, service)
+    });
+
+    let Envelope::Response(response) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000280",
+            Operation::ReaderDescribe,
+            "admitted",
+            serde_json::json!({"source": "csv", "object": "/work/exports/customers.csv"}),
+        ),
+    ) else {
+        panic!("reader.describe did not return a response");
+    };
+    assert_eq!(response.body["description"]["rows"], 2);
+
+    for (index, (operation, body)) in [
+        (Operation::ReaderDescribe, serde_json::json!({})),
+        (Operation::ReaderDescribe, serde_json::json!({"source": "csv"})),
+        (Operation::ReaderDescribe, serde_json::json!({"source": "", "object": "/a.csv"})),
+        (Operation::ReaderDescribe, serde_json::json!({"source": "csv", "object": "/a.csv", "mapping": "m"})),
+        (Operation::ReaderDescribe, serde_json::json!({"source": "csv", "object": "/a.csv", "other": 1})),
+        (Operation::ReaderQueue, serde_json::json!({})),
+        (Operation::ReaderQueue, serde_json::json!({"mapping": "m", "offset": 1})),
+        (Operation::ReaderQueue, serde_json::json!({"mapping": "m", "source": "csv"})),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let Envelope::Error(error) = exchange(
+            &mut client,
+            request(
+                &format!("018f0000-0000-7000-8000-0000000002{index:02x}"),
+                operation,
+                "admitted",
+                body,
+            ),
+        ) else {
+            panic!("an invalid reader body was dispatched");
+        };
+        assert_eq!(error.error.code(), ErrorCode::InvalidRequest);
+    }
+
+    let Envelope::Error(error) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000290",
+            Operation::ReaderRun,
+            "admitted",
+            serde_json::json!({"mapping": "019965a0-0000-7000-8000-000000000030"}),
+        ),
+    ) else {
+        panic!("reader.run without a key was not refused");
+    };
+    assert_eq!(error.error.code(), ErrorCode::IdempotencyKeyRequired);
+
+    let Envelope::Response(response) = exchange(
+        &mut client,
+        idempotent_request(
+            "018f0000-0000-7000-8000-000000000291",
+            Operation::ReaderRun,
+            serde_json::json!({"mapping": "019965a0-0000-7000-8000-000000000030", "offset": 0}),
+        ),
+    ) else {
+        panic!("reader.run did not return a response");
+    };
+    assert_eq!(response.body["run"]["created"], 2);
+
+    let Envelope::Response(response) = exchange(
+        &mut client,
+        request(
+            "018f0000-0000-7000-8000-000000000292",
+            Operation::ReaderQueue,
+            "admitted",
+            serde_json::json!({"mapping": "019965a0-0000-7000-8000-000000000030"}),
+        ),
+    ) else {
+        panic!("reader.queue did not return a response");
+    };
+    assert!(response.body["queue"]["rows"].as_array().unwrap().is_empty());
+
+    drop(client);
+    let (result, service) = session_thread.join().unwrap();
+    assert_eq!(result, Ok(()));
+    assert_eq!(service.calls.len(), 3);
+    assert_eq!(service.calls[0].0, Operation::ReaderDescribe);
+    assert_eq!(service.calls[1].0, Operation::ReaderRun);
+    assert_eq!(service.calls[1].1["offset"], 0);
+    assert_eq!(service.calls[2].0, Operation::ReaderQueue);
+}
+
 #[test]
 fn desktop_client_manages_companies() {
     let (mut client, server) = UnixStream::pair().unwrap();

@@ -282,6 +282,9 @@ where
                 | Operation::CompanyCreate
                 | Operation::CompanySelect
                 | Operation::CompanyRename
+                | Operation::ReaderDescribe
+                | Operation::ReaderRun
+                | Operation::ReaderQueue
                 | Operation::RunChatEvents
                 | Operation::RunSubmit
                 | Operation::RunResume

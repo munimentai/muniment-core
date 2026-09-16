@@ -1134,6 +1134,77 @@ pub(super) fn dispatch_request<S: ThreadListService>(
         };
         return Ok(response_only(answer));
     }
+    if matches!(
+        request.operation,
+        Operation::ReaderDescribe | Operation::ReaderRun | Operation::ReaderQueue
+    ) {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            #[serde(default)]
+            company_id: Option<String>,
+            #[serde(default)]
+            source: Option<String>,
+            #[serde(default)]
+            object: Option<String>,
+            #[serde(default)]
+            mapping: Option<String>,
+            #[serde(default)]
+            offset: Option<u64>,
+        }
+        let body: Body = serde_json::from_value(request.body.clone())
+            .map_err(|_| ProtocolError::invalid_request())?;
+        let bounded = |value: &Option<String>, limit: usize| {
+            value
+                .as_deref()
+                .is_none_or(|text| !text.trim().is_empty() && text.len() <= limit)
+        };
+        let valid = bounded(&body.company_id, 36)
+            && match request.operation {
+                Operation::ReaderDescribe => {
+                    body.mapping.is_none()
+                        && body.offset.is_none()
+                        && body.source.is_some()
+                        && bounded(&body.source, 32)
+                        && body.object.is_some()
+                        && bounded(&body.object, 4_096)
+                }
+                Operation::ReaderRun => {
+                    body.source.is_none()
+                        && body.object.is_none()
+                        && body.mapping.is_some()
+                        && bounded(&body.mapping, 36)
+                        && body.offset.is_none_or(|offset| offset <= 10_000_000)
+                }
+                _ => {
+                    body.source.is_none()
+                        && body.object.is_none()
+                        && body.offset.is_none()
+                        && body.mapping.is_some()
+                        && bounded(&body.mapping, 36)
+                }
+            };
+        if !valid {
+            return Err(ProtocolError::invalid_request().into());
+        }
+        let answer = match request.operation {
+            Operation::ReaderDescribe => service.reader_describe(request.body, provenance)?,
+            Operation::ReaderQueue => service.reader_queue(request.body, provenance)?,
+            _ => {
+                let idempotency_key = request
+                    .idempotency_key
+                    .as_ref()
+                    .ok_or_else(ProtocolError::idempotency_key_required)?;
+                service.reader_run(
+                    request.body,
+                    &request.request_id,
+                    idempotency_key,
+                    provenance,
+                )?
+            }
+        };
+        return Ok(response_only(answer));
+    }
     if request.operation == Operation::ThreadDelete {
         let idempotency_key = request
             .idempotency_key

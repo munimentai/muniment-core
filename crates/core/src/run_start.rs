@@ -233,6 +233,34 @@ pub trait RunAttachBoundaries {
     ) -> Result<serde_json::Value, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
+    /// Describes one source object for the record panel's import: its fields
+    /// and samples. The body and the answer are the `reader.describe` shapes.
+    #[cfg(any(unix, target_os = "windows"))]
+    fn reader_describe(
+        &self,
+        _actor: &str,
+        _body: serde_json::Value,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    /// Runs one approved mapping over its source and writes the rows.
+    #[cfg(any(unix, target_os = "windows"))]
+    fn reader_run(
+        &self,
+        _actor: &str,
+        _body: serde_json::Value,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    /// The rows a mapping's last run could not place, with their reasons.
+    #[cfg(any(unix, target_os = "windows"))]
+    fn reader_queue(
+        &self,
+        _actor: &str,
+        _body: serde_json::Value,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
     #[cfg(any(unix, target_os = "windows"))]
     fn list_threads(
         &self,
