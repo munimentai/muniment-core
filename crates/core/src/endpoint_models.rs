@@ -80,14 +80,14 @@ mod tests {
     fn both_list_shapes_parse_in_server_order_without_repeats() {
         let tags = json!({ "models": [
             { "name": "llama3.2:3b", "size": 1 },
-            { "name": "hf.co/munimentai/Qwen3.5-4B-GGUF:Q4_K_M" },
+            { "name": "hf.co/munimentai/Example-4B-GGUF:Q4_K_M" },
             { "name": "llama3.2:3b" },
             { "name": "  " },
             { "model": "no-name" }
         ] });
         assert_eq!(
             parse_ollama_tags(&tags),
-            vec!["llama3.2:3b", "hf.co/munimentai/Qwen3.5-4B-GGUF:Q4_K_M"]
+            vec!["llama3.2:3b", "hf.co/munimentai/Example-4B-GGUF:Q4_K_M"]
         );
         let openai = json!({ "object": "list", "data": [{ "id": "qwen3", "object": "model" }, { "id": "gpt-oss:latest" }] });
         assert_eq!(
