@@ -10,11 +10,11 @@ use super::desktop_service_message::CompanionProvenance;
 use super::live_connections::LiveConnectionRegistry;
 use super::thread_service::ThreadListService;
 use super::{
-    admit_desktop_client_over_stream_with_frame, name_macos_attach_connection_route,
-    name_macos_desktop_attach_connection_route, read_exact_before, AdmittedDesktopClient, Approval,
-    ApprovalCoordinator, ApprovalWaiter, AttachSessionError, DeadlineStream,
-    DesktopClientAdmissionError, MacosAttachConnectionRoute, MacosAttachRouteReader, ProtocolError,
-    MAX_FRAME_LENGTH,
+    admit_approval_presenter_over_stream_with_frame, admit_desktop_client_over_stream_with_frame,
+    name_macos_attach_connection_route, name_macos_desktop_attach_connection_route,
+    read_exact_before, AdmittedDesktopClient, Approval, ApprovalCoordinator, ApprovalWaiter,
+    AttachSessionError, DeadlineStream, DesktopClientAdmissionError, MacosAttachConnectionRoute,
+    MacosAttachRouteReader, ProtocolError, MAX_FRAME_LENGTH,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,11 +152,10 @@ where
 
     match route {
         MacosAttachConnectionRoute::ApprovalPresenter => {
-            let admitted = admit_desktop_client_over_stream_with_frame(
+            let admitted = admit_approval_presenter_over_stream_with_frame(
                 &mut stream,
                 &frame,
                 desktop_version,
-                None,
                 deadline,
             )
             .map_err(MacosAttachSessionError::DesktopClientAdmission)?;

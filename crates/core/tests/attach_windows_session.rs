@@ -21,10 +21,10 @@ mod unix_tests {
         serve_windows_attach_session_with_reader_and_state,
         serve_windows_attach_session_with_reader_factory, Approval, ApprovalCoordinator,
         ApprovalDecision, ApprovalRequest, Authorization, DesktopClientAdmissionError,
-        DesktopClientAuthorizedGrant, Envelope, ErrorCode, ErrorEnvelope, Id, Operation, Protocol,
-        ProtocolError, Request, Welcome, WindowsAttachPeerReader, WindowsAttachRouteReader,
-        WindowsAttachSessionError, WindowsAttachSessionOutcome, WindowsPeerError,
-        WindowsPeerReadError, MAX_FRAME_LENGTH,
+        DesktopClientAuthorizedGrant, Envelope, ErrorCode, ErrorEnvelope, Id, Operation,
+        PeerAuthorizedGrant, Protocol, ProtocolError, Request, Welcome, WindowsAttachPeerReader,
+        WindowsAttachRouteReader, WindowsAttachSessionError, WindowsAttachSessionOutcome,
+        WindowsPeerError, WindowsPeerReadError, MAX_FRAME_LENGTH,
     };
 
     struct EmptyService;
@@ -525,7 +525,7 @@ mod unix_tests {
                 .unwrap()
                 .unwrap()
                 .0;
-            let _: DesktopClientAuthorizedGrant = decode_frame(&read_frame(&mut presenter_client))
+            let _: PeerAuthorizedGrant = decode_frame(&read_frame(&mut presenter_client))
                 .unwrap()
                 .unwrap()
                 .0;

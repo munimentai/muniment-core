@@ -17,7 +17,8 @@ mod unix_tests {
         serve_macos_attach_session_with_reader_and_state, Approval, ApprovalCoordinator,
         ApprovalDecision, Authorization, DesktopClientAdmissionError, DesktopClientAuthorizedGrant,
         Envelope, Id, MacosAttachRouteReader, MacosAttachSessionError, MacosAttachSessionOutcome,
-        MacosPeerReadError, Operation, Protocol, ProtocolError, Request, Welcome,
+        MacosPeerReadError, Operation, PeerAuthorizedGrant, Protocol, ProtocolError, Request,
+        Welcome,
     };
     use muniment_core::record::CompanySummary;
 
@@ -408,9 +409,54 @@ mod unix_tests {
             Err(MacosAttachSessionError::ApprovalPresenterUnavailable)
         );
         let _: Welcome = decode_frame(&read_frame(&mut client)).unwrap().unwrap().0;
-        let _: DesktopClientAuthorizedGrant =
-            decode_frame(&read_frame(&mut client)).unwrap().unwrap().0;
+        let _: PeerAuthorizedGrant = decode_frame(&read_frame(&mut client)).unwrap().unwrap().0;
         assert_eq!(client.read(&mut [0_u8]).unwrap(), 0);
+    }
+
+    // The desktop's presenter handshake parses the grant as a peer grant and
+    // refuses one that names a profile, so the presenter route must write the
+    // peer shape or the presenter never connects.
+    #[test]
+    fn presenter_route_grants_a_peer_grant_without_workspace_authority() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&hello_frame("desktop")).unwrap();
+        let coordinator = ApprovalCoordinator::default();
+        let session_coordinator = coordinator.clone();
+        let session = std::thread::spawn(move || {
+            serve_macos_attach_session_with_reader_and_state(
+                server,
+                &route_reader("/Applications/Muniment.app/Contents/MacOS/muniment"),
+                501,
+                expected_desktop_executable(),
+                "1.2.3",
+                Duration::from_secs(2),
+                &mut TestService::default(),
+                None,
+                session_coordinator,
+                approval_waiter_with_claims(
+                    |_: &muniment_core::attach::PairingChallenge, _: &str, _: &str, _: Duration| {
+                        None::<ApprovalDecision>
+                    },
+                ),
+                &LiveConnectionRegistry::default(),
+                |_| {},
+            )
+        });
+
+        let welcome: Welcome = decode_frame(&read_frame(&mut client)).unwrap().unwrap().0;
+        assert_eq!(welcome.authorization, Authorization::Authorized);
+        let grant: PeerAuthorizedGrant = decode_frame(&read_frame(&mut client)).unwrap().unwrap().0;
+        assert_eq!(grant.capability.len(), 64);
+        assert!(grant.expires_at > 0 && grant.expires_at <= 8 * 60 * 60);
+        assert!(grant.idle_timeout_seconds > 0 && grant.idle_timeout_seconds <= 15 * 60);
+        assert!(coordinator.claim_presenter(|_| true).is_none());
+
+        drop(client);
+        assert_eq!(
+            session.join().unwrap(),
+            Ok(MacosAttachSessionOutcome::ApprovalPresenter)
+        );
+        assert!(coordinator.claim_presenter(|_| true).is_some());
     }
 
     #[test]

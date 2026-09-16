@@ -289,11 +289,10 @@ where
 
     match route {
         WindowsAttachConnectionRoute::ApprovalPresenter => {
-            let admitted = admit_desktop_client_over_stream_with_frame(
+            let admitted = super::admit_approval_presenter_over_stream_with_frame(
                 stream,
                 &frame,
                 desktop_version,
-                None,
                 deadline,
             )
             .map_err(WindowsAttachSessionError::DesktopClientAdmission)?;

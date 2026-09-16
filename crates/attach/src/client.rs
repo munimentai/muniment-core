@@ -2319,6 +2319,8 @@ mod linux {
         let connect_stop = stop.clone();
         #[cfg(target_os = "linux")]
         let mut diagnostic = crate::LinuxConnectDiagnostic::default();
+        #[cfg(not(target_os = "linux"))]
+        let mut last_failure: Option<ClientError> = None;
         serve_approval_presenter_with(
             || {
                 #[cfg(target_os = "linux")]
@@ -2328,7 +2330,20 @@ mod linux {
                 #[cfg(not(target_os = "linux"))]
                 {
                     let stream = interruptible_connect(endpoint, &connect_stop)?;
-                    handshake_approval_presenter_stream(stream, client_version, io_timeout).ok()
+                    match handshake_approval_presenter_stream(stream, client_version, io_timeout) {
+                        Ok(presenter) => {
+                            last_failure = None;
+                            Some(presenter)
+                        }
+                        Err(error) => {
+                            // The loop retries every interval, so a reason prints once until it changes.
+                            if last_failure != Some(error) {
+                                eprintln!("muniment-desktop: approval presenter handshake failed endpoint={endpoint:?} reason={error:?}");
+                                last_failure = Some(error);
+                            }
+                            None
+                        }
+                    }
                 }
             },
             stop,

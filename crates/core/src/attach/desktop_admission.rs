@@ -6,8 +6,8 @@ use std::time::Instant;
 
 use muniment_attach::{
     decode_frame, encode_frame, reconnect_welcome, DesktopClientAuthorizedGrant, ErrorEnvelope,
-    Failure, FirstMessage, NegotiationError, Protocol, ProtocolError, VersionRange,
-    MAX_FRAME_LENGTH,
+    Failure, FirstMessage, NegotiationError, PeerAuthorizedGrant, Protocol, ProtocolError,
+    VersionRange, MAX_FRAME_LENGTH,
 };
 
 use super::deadline_io::{is_timeout, read_exact_before, write_all_before, DeadlineStream};
@@ -82,6 +82,88 @@ pub fn admit_desktop_client_over_stream_with_frame<S: DeadlineStream + ?Sized>(
     approval: Option<&Approval>,
     deadline: Instant,
 ) -> Result<AdmittedDesktopClient, DesktopClientAdmissionError> {
+    let negotiated = negotiate_first_frame(stream, frame, runtime_version, deadline)?;
+    let mut workspace_scopes = BTreeMap::new();
+    if let Some(approval) = approval.as_ref() {
+        workspace_scopes.insert(approval.workspace.clone(), approval.scopes.clone());
+    }
+    let grant = DesktopClientAuthorizedGrant {
+        profile_id: approval.as_ref().map_or_else(
+            || "desktop-owner".into(),
+            |approval| approval.profile.clone(),
+        ),
+        capability: negotiated.capability.clone(),
+        expires_at: approval
+            .as_ref()
+            .map_or(MAX_CAPABILITY_LIFETIME, |approval| approval.lifetime)
+            .min(MAX_CAPABILITY_LIFETIME)
+            .as_secs(),
+        idle_timeout_seconds: CAPABILITY_IDLE_LIFETIME.as_secs(),
+        workspace_scopes,
+    };
+    write_all_before(
+        stream,
+        &encode_frame(&grant).map_err(|_| DesktopClientAdmissionError::MalformedFrame)?,
+        deadline,
+    )
+    .map_err(map_io_error)?;
+
+    Ok(AdmittedDesktopClient {
+        capability: negotiated.capability,
+        workspace: approval.map_or_else(String::new, |approval| approval.workspace.clone()),
+        client_identity: negotiated.client_identity,
+        companion_kind: negotiated.companion_kind,
+        companion_version: negotiated.companion_version,
+    })
+}
+
+/// Admits the desktop's approval presenter after the caller has read the
+/// first frame. A presenter holds no workspace authority, so its grant is a
+/// peer grant with an empty profile and no scopes, the shape the desktop's
+/// presenter handshake accepts.
+pub fn admit_approval_presenter_over_stream_with_frame<S: DeadlineStream + ?Sized>(
+    stream: &mut S,
+    frame: &[u8],
+    runtime_version: &str,
+    deadline: Instant,
+) -> Result<AdmittedDesktopClient, DesktopClientAdmissionError> {
+    let negotiated = negotiate_first_frame(stream, frame, runtime_version, deadline)?;
+    let grant = PeerAuthorizedGrant {
+        capability: negotiated.capability.clone(),
+        expires_at: MAX_CAPABILITY_LIFETIME.as_secs(),
+        idle_timeout_seconds: CAPABILITY_IDLE_LIFETIME.as_secs(),
+    };
+    write_all_before(
+        stream,
+        &encode_frame(&grant).map_err(|_| DesktopClientAdmissionError::MalformedFrame)?,
+        deadline,
+    )
+    .map_err(map_io_error)?;
+
+    Ok(AdmittedDesktopClient {
+        capability: negotiated.capability,
+        workspace: String::new(),
+        client_identity: negotiated.client_identity,
+        companion_kind: negotiated.companion_kind,
+        companion_version: negotiated.companion_version,
+    })
+}
+
+struct NegotiatedAdmission {
+    capability: String,
+    client_identity: String,
+    companion_kind: String,
+    companion_version: String,
+}
+
+/// Reads the hello, negotiates the version, writes the welcome and mints the
+/// capability. The caller writes the grant that fits the route.
+fn negotiate_first_frame<S: DeadlineStream + ?Sized>(
+    stream: &mut S,
+    frame: &[u8],
+    runtime_version: &str,
+    deadline: Instant,
+) -> Result<NegotiatedAdmission, DesktopClientAdmissionError> {
     if frame.len() >= 4
         && u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize > MAX_FRAME_LENGTH
     {
@@ -127,35 +209,8 @@ pub fn admit_desktop_client_over_stream_with_frame<S: DeadlineStream + ?Sized>(
 
     let mut capability_bytes = [0_u8; 32];
     getrandom::fill(&mut capability_bytes).map_err(|_| DesktopClientAdmissionError::Randomness)?;
-    let capability = hex(&capability_bytes);
-    let mut workspace_scopes = BTreeMap::new();
-    if let Some(approval) = approval.as_ref() {
-        workspace_scopes.insert(approval.workspace.clone(), approval.scopes.clone());
-    }
-    let grant = DesktopClientAuthorizedGrant {
-        profile_id: approval.as_ref().map_or_else(
-            || "desktop-owner".into(),
-            |approval| approval.profile.clone(),
-        ),
-        capability: capability.clone(),
-        expires_at: approval
-            .as_ref()
-            .map_or(MAX_CAPABILITY_LIFETIME, |approval| approval.lifetime)
-            .min(MAX_CAPABILITY_LIFETIME)
-            .as_secs(),
-        idle_timeout_seconds: CAPABILITY_IDLE_LIFETIME.as_secs(),
-        workspace_scopes,
-    };
-    write_all_before(
-        stream,
-        &encode_frame(&grant).map_err(|_| DesktopClientAdmissionError::MalformedFrame)?,
-        deadline,
-    )
-    .map_err(map_io_error)?;
-
-    Ok(AdmittedDesktopClient {
-        capability,
-        workspace: approval.map_or_else(String::new, |approval| approval.workspace.clone()),
+    Ok(NegotiatedAdmission {
+        capability: hex(&capability_bytes),
         client_identity,
         companion_kind,
         companion_version,
