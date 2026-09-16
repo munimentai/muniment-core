@@ -477,11 +477,18 @@ fn validate_base_url(value: &str) -> Result<(), NativeAuthorizationError> {
     }
 }
 
+// The continuation is https, or http on a loopback host, the same rule the
+// base URL follows, so a cloud on this machine can sign the desktop in.
 fn validate_continuation(value: &str) -> Result<(), NativeAuthorizationError> {
     let parsed = url::Url::parse(value).map_err(|_| {
         NativeAuthorizationError::MalformedResponse("authorization URL is invalid".into())
     })?;
-    if parsed.scheme() != "https"
+    let loopback = parsed.scheme() == "http"
+        && matches!(
+            parsed.host_str(),
+            Some("127.0.0.1" | "localhost" | "::1" | "[::1]")
+        );
+    if (parsed.scheme() != "https" && !loopback)
         || !parsed.username().is_empty()
         || parsed.password().is_some()
         || parsed.fragment().is_some()
@@ -505,6 +512,25 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_continuation_is_https_or_loopback_http() {
+        for accepted in [
+            "https://api.muniment.ai/v1/auth/native/authorize/opaque",
+            "http://localhost:8787/v1/auth/native/authorize/opaque",
+            "http://127.0.0.1:8787/v1/auth/native/authorize/opaque",
+        ] {
+            assert!(super::validate_continuation(accepted).is_ok(), "{accepted}");
+        }
+        for refused in [
+            "http://api.muniment.ai/v1/auth/native/authorize/opaque",
+            "https://user@api.muniment.ai/v1/auth/native/authorize/opaque",
+            "https://api.muniment.ai/v1/auth/native/authorize/opaque#frag",
+            "http://localhost.evil.test/v1/auth/native/authorize/opaque",
+        ] {
+            assert!(super::validate_continuation(refused).is_err(), "{refused}");
+        }
+    }
+
     #[test]
     fn json_shape_names_keys_and_types_without_values() {
         let value = serde_json::json!({
