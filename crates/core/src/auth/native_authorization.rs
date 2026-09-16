@@ -298,11 +298,45 @@ impl AuthorizationTransport for UreqAuthorizationTransport {
         if response.status() != 200 {
             return Err(NativeAuthorizationError::HttpStatus(response.status()));
         }
-        response.into_json().map_err(|_| {
+        let body: serde_json::Value = response.into_json().map_err(|_| {
+            NativeAuthorizationError::MalformedResponse("response was not valid JSON".into())
+        })?;
+        serde_json::from_value(body.clone()).map_err(|_| {
+            // The shape names keys and value types, never a value, so a drift
+            // from the contract reads in the log without exposing a secret.
+            super::native_http::log(&format!(
+                "muniment-runtime: native-auth failure method=POST path={AUTHORIZATION_PATH} stage=authorization_body shape={}",
+                json_shape(&body)
+            ));
             NativeAuthorizationError::MalformedResponse(
                 "response was not valid contract JSON".into(),
             )
         })
+    }
+}
+
+/// The keys and value types of a JSON document, without any value: an object
+/// reads as `{a:string,b:{c:number}}` and an array as `[string]` by its first
+/// element.
+pub fn json_shape(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "null".into(),
+        serde_json::Value::Bool(_) => "boolean".into(),
+        serde_json::Value::Number(_) => "number".into(),
+        serde_json::Value::String(_) => "string".into(),
+        serde_json::Value::Array(items) => match items.first() {
+            Some(first) => format!("[{}]", json_shape(first)),
+            None => "[]".into(),
+        },
+        serde_json::Value::Object(fields) => {
+            let mut keys: Vec<_> = fields.iter().collect();
+            keys.sort_by(|a, b| a.0.cmp(b.0));
+            let inner: Vec<String> = keys
+                .into_iter()
+                .map(|(key, value)| format!("{key}:{}", json_shape(value)))
+                .collect();
+            format!("{{{}}}", inner.join(","))
+        }
     }
 }
 
@@ -471,6 +505,20 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn json_shape_names_keys_and_types_without_values() {
+        let value = serde_json::json!({
+            "authorization_url": "https://secret.example/x",
+            "device_challenge": "secret",
+            "extra": {"nested": 1, "list": ["a"], "none": null, "flag": true},
+            "empty": []
+        });
+        assert_eq!(
+            super::json_shape(&value),
+            "{authorization_url:string,device_challenge:string,empty:[],extra:{flag:boolean,list:[string],nested:number,none:null}}"
+        );
+    }
+
     use std::sync::{Arc, Mutex};
 
     use ed25519_dalek::{Signature, Verifier};

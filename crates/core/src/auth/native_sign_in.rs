@@ -109,7 +109,9 @@ fn map_authorization(error: NativeBrowserAuthorizationError) -> NativeSignInErro
             NativeAuthorizationError::HttpFailure(status, failure) => {
                 format!("HttpStatus status={status} {}", failure.diagnostic())
             }
-            NativeAuthorizationError::MalformedResponse(_) => "MalformedResponse".into(),
+            NativeAuthorizationError::MalformedResponse(message) => {
+                malformed_authorization_cause(&message)
+            }
             NativeAuthorizationError::Persistence(_) => "Persistence".into(),
         },
         NativeBrowserAuthorizationError::BrowserOpen => "BrowserOpen".into(),
@@ -120,6 +122,21 @@ fn map_authorization(error: NativeBrowserAuthorizationError) -> NativeSignInErro
     };
     failure("authorization", &cause);
     NativeSignInError::Authorization(cause)
+}
+
+// The authorize step raises a fixed message for each check it makes. The label
+// carries the check and never the message itself, so a message that held
+// response data stays out of the log and the card.
+fn malformed_authorization_cause(message: &str) -> String {
+    let check = match message {
+        "response was not valid JSON" => "json",
+        "response was not valid contract JSON" => "contract",
+        "device challenge was not canonical contract data" => "device_challenge",
+        "authorization URL is invalid" => "url_invalid",
+        "authorization URL is unsafe" => "url_unsafe",
+        _ => return "MalformedResponse".into(),
+    };
+    format!("MalformedResponse check={check}")
 }
 
 fn map_token(error: NativeTokenError) -> NativeSignInError {
@@ -150,6 +167,22 @@ mod tests {
         );
         assert!(lines[0].ends_with(cause));
         assert!(!lines.join("\n").contains("secret"));
+    }
+
+    #[test]
+    fn malformed_authorization_names_the_check_and_never_the_message() {
+        assert_eq!(
+            malformed_authorization_cause("authorization URL is unsafe"),
+            "MalformedResponse check=url_unsafe"
+        );
+        assert_eq!(
+            malformed_authorization_cause("response was not valid contract JSON"),
+            "MalformedResponse check=contract"
+        );
+        assert_eq!(
+            malformed_authorization_cause("secret body text"),
+            "MalformedResponse"
+        );
     }
 
     #[test]
