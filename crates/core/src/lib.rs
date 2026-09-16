@@ -84,7 +84,14 @@ pub mod write_plan;
 
 /// The runtime crate carries no dependency of its own beyond the core and
 /// attach, so the JSON crate the record bodies use reaches it from here.
+/// The runtime depends on this crate and the attach crate alone, so the
+/// crates it derives and hashes with travel through here.
+pub use chrono;
+#[cfg(feature = "keyring")]
+pub use keyring;
+pub use serde;
 pub use serde_json;
+pub use sha2;
 
 pub use muniment_attach::{
     ensure_cross_project_home, ensure_scaffold_directory, onboard_companion_workspace,
