@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 
 use crate::journal::pi_translation::permission_journal_payload;
 use crate::sidecar::pi_chat::{
@@ -65,19 +66,47 @@ pub struct PendingPermissionAnswer {
 pub struct JournalAppendFailed;
 
 /// Opens a gate for a Pi extension-UI request. The caller journals the request
-/// through `append` before the gate becomes the pending one.
+/// through `append` before the gate becomes the pending one. The journal holds
+/// one open gate per run, so a request that arrives while another waits, as
+/// two parallel tool calls each asking a question do, joins `waiting` and
+/// opens when the pending one resolves.
 pub fn coordinate_extension_ui_request(
     event: PiChatEvent,
     pending: &mut Option<ExtensionUiRequest>,
+    waiting: &mut VecDeque<ExtensionUiRequest>,
     append: impl FnOnce(&str, Value) -> Result<(), ()>,
 ) -> Result<(), JournalAppendFailed> {
     let PiChatEvent::ExtensionUiRequest(request) = event else {
         return Ok(());
     };
+    if pending.is_some() {
+        waiting.push_back(request);
+        return Ok(());
+    }
     append("permission.requested", permission_journal_payload(&request))
         .map_err(|()| JournalAppendFailed)?;
     *pending = Some(request);
     Ok(())
+}
+
+/// Opens the next waiting request once no gate is pending.
+pub fn open_waiting_request(
+    pending: &mut Option<ExtensionUiRequest>,
+    waiting: &mut VecDeque<ExtensionUiRequest>,
+    append: impl FnOnce(&str, Value) -> Result<(), ()>,
+) -> Result<(), JournalAppendFailed> {
+    if pending.is_some() {
+        return Ok(());
+    }
+    let Some(next) = waiting.pop_front() else {
+        return Ok(());
+    };
+    coordinate_extension_ui_request(
+        PiChatEvent::ExtensionUiRequest(next),
+        pending,
+        waiting,
+        append,
+    )
 }
 
 /// Closes the open gate when the queued answer names it and fits its dialog.
@@ -128,4 +157,89 @@ pub fn coordinate_permission_answer(
     }
     *pending = None;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sidecar::pi_chat::ExtensionUiDialog;
+
+    fn select(id: &str) -> ExtensionUiRequest {
+        ExtensionUiRequest {
+            id: id.into(),
+            dialog: ExtensionUiDialog::Select {
+                title: "MCP Input Request".into(),
+                options: vec!["Continue".into(), "Decline".into()],
+            },
+            timeout: None,
+        }
+    }
+
+    #[test]
+    fn a_second_request_waits_for_the_first_gate_and_opens_after_its_answer() {
+        let mut pending = None;
+        let mut waiting = VecDeque::new();
+        let mut journaled = Vec::new();
+        for id in ["gate-1", "gate-2"] {
+            coordinate_extension_ui_request(
+                PiChatEvent::ExtensionUiRequest(select(id)),
+                &mut pending,
+                &mut waiting,
+                |kind, payload| {
+                    journaled.push((kind.to_owned(), payload["gate_id"].clone()));
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            pending.as_ref().map(|request| request.id.as_str()),
+            Some("gate-1")
+        );
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(
+            journaled,
+            [("permission.requested".to_owned(), json!("gate-1"))]
+        );
+
+        // The card names gate-1, so its answer lands, and gate-2 opens next.
+        let mut sent = Vec::new();
+        coordinate_permission_answer(
+            &mut pending,
+            PendingPermissionAnswer {
+                gate_id: "gate-1".into(),
+                answer: ChatPermissionAnswer::Select("Continue".into()),
+                resolved: None,
+            },
+            |request, _| {
+                sent.push(request.id.clone());
+                Ok(())
+            },
+            |_, _| Ok(9),
+        )
+        .unwrap();
+        assert!(pending.is_none());
+        assert_eq!(sent, ["gate-1"]);
+        open_waiting_request(&mut pending, &mut waiting, |kind, payload| {
+            journaled.push((kind.to_owned(), payload["gate_id"].clone()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            pending.as_ref().map(|request| request.id.as_str()),
+            Some("gate-2")
+        );
+        assert!(waiting.is_empty());
+        assert_eq!(
+            journaled[1],
+            ("permission.requested".to_owned(), json!("gate-2"))
+        );
+
+        // With a gate open, the next opener does nothing.
+        open_waiting_request(&mut pending, &mut waiting, |_, _| panic!("no append")).unwrap();
+        assert_eq!(
+            pending.as_ref().map(|request| request.id.as_str()),
+            Some("gate-2")
+        );
+    }
 }

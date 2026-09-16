@@ -18,8 +18,8 @@ use crate::journal::split_model_stream_delta;
 use crate::memory_failure::{MemoryFailure, MemoryFailureAnswer};
 use crate::memory_runtime::ApplicationMemoryRuntime;
 use crate::permission_gate::{
-    coordinate_extension_ui_request, coordinate_permission_answer, ChatPermissionAnswer,
-    PendingPermissionAnswer,
+    coordinate_extension_ui_request, coordinate_permission_answer, open_waiting_request,
+    ChatPermissionAnswer, PendingPermissionAnswer,
 };
 use crate::pi_execution::{
     coordinate_prepared_prompt, prepared_pi_prompt, PiRuntime, PreparedPromptError, ResumeAttempt,
@@ -833,6 +833,9 @@ pub fn coordinate(
     let mut ledger = LocalRunLedger::default();
     let mut open_effects = MarkedEffects::open_effects(Some(runtime_activity.clone()));
     let mut pending_permission = MarkedGate::pending_permission(Some(runtime_activity));
+    // Requests that arrived while a gate was open, each waiting its turn.
+    let mut waiting_permissions: VecDeque<crate::sidecar::pi_chat::ExtensionUiRequest> =
+        VecDeque::new();
     'coordinate: loop {
         diagnostics.log_lifecycle();
         if let Some(error) = gateway_failure
@@ -908,6 +911,25 @@ pub fn coordinate(
             {
                 break 'coordinate;
             }
+        }
+        if pending_permission
+            .with(|pending| {
+                open_waiting_request(pending, &mut waiting_permissions, |kind, payload| {
+                    append_emit(
+                        &app,
+                        &journal,
+                        &mut projector,
+                        &run_id,
+                        &mut seq,
+                        kind,
+                        payload,
+                        subject.as_deref(),
+                    )
+                })
+            })
+            .is_err()
+        {
+            break 'coordinate;
         }
         let event = buffered_events
             .next()
@@ -1066,18 +1088,23 @@ pub fn coordinate(
                 }
                 if pending_permission
                     .with(|pending| {
-                        coordinate_extension_ui_request(event, pending, |kind, payload| {
-                            append_emit(
-                                &app,
-                                &journal,
-                                &mut projector,
-                                &run_id,
-                                &mut seq,
-                                kind,
-                                payload,
-                                subject.as_deref(),
-                            )
-                        })
+                        coordinate_extension_ui_request(
+                            event,
+                            pending,
+                            &mut waiting_permissions,
+                            |kind, payload| {
+                                append_emit(
+                                    &app,
+                                    &journal,
+                                    &mut projector,
+                                    &run_id,
+                                    &mut seq,
+                                    kind,
+                                    payload,
+                                    subject.as_deref(),
+                                )
+                            },
+                        )
                     })
                     .is_err()
                 {
@@ -1880,6 +1907,7 @@ mod tests {
             coordinate_extension_ui_request(
                 PiChatEvent::ExtensionUiRequest(confirm_request(gate_id)),
                 pending,
+                &mut VecDeque::new(),
                 |_, _| Ok(()),
             )
         })

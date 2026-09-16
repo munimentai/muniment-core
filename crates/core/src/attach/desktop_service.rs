@@ -1349,7 +1349,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
                         &request.gate_id,
                         request.answer.clone(),
                     )
-                    .map_err(|error| error.protocol_error())?;
+                    .map_err(|error| error.desktop_protocol_error())?;
                 let deadline = std::time::Instant::now() + PERMISSION_COMMIT_TIMEOUT;
                 let remaining = deadline
                     .checked_duration_since(std::time::Instant::now())
