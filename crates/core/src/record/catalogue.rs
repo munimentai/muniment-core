@@ -16,7 +16,7 @@ pub struct KindDefinition {
     pub states: Option<Vec<String>>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct Relation {
     pub name: &'static str,
     /// Source kinds, or `any`.

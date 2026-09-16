@@ -710,11 +710,7 @@ impl CompanyRecord {
 
     /// Full-text search over titles and prose, live entities only.
     pub fn search(&self, text: &str, limit: usize) -> Result<Vec<EntityRow>, RecordError> {
-        let query = text
-            .split_whitespace()
-            .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let query = query::search_query(text);
         if query.is_empty() {
             return Ok(Vec::new());
         }

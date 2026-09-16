@@ -108,6 +108,9 @@ pub enum Operation {
         loser: Reference,
         survivor: Reference,
     },
+    Delete {
+        entity: Reference,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -162,6 +165,9 @@ pub enum Diff {
         link: ProposalLink,
         identities_moved: usize,
     },
+    /// A soft delete: the row keeps its data and history and leaves every
+    /// live read, and a later merge or link cannot name it.
+    Delete { before: EntitySnapshot },
 }
 
 impl Diff {
@@ -171,6 +177,7 @@ impl Diff {
             Self::Update { .. } => "updated",
             Self::Link { .. } => "linked",
             Self::Merge { .. } => "merged",
+            Self::Delete { .. } => "deleted",
         }
     }
 
@@ -180,6 +187,7 @@ impl Diff {
             Self::Create { after, .. } | Self::Update { after, .. } => &after.id,
             Self::Link { link, .. } => &link.src_id,
             Self::Merge { survivor, .. } => &survivor.id,
+            Self::Delete { before } => &before.id,
         }
     }
 
@@ -251,6 +259,12 @@ impl CompanyRecord {
             } => self.propose_link(src, relation, dst, props, &mut resolved)?,
             Operation::Merge { loser, survivor } => {
                 self.propose_merge(loser, survivor, &mut resolved)?
+            }
+            Operation::Delete { entity } => {
+                let id = self.resolve_required(&entity, &mut resolved)?;
+                Diff::Delete {
+                    before: existing_snapshot(self.require_entity(&id)?),
+                }
             }
         };
         let expires = chrono::Utc::now() + chrono::Duration::seconds(PROPOSAL_TTL_SECONDS);
@@ -778,6 +792,23 @@ fn apply(
                 vec![survivor.id.clone(), loser.id.clone()],
             ))
         }
+        Diff::Delete { before } => {
+            let current: Option<String> = transaction
+                .query_row(
+                    "select updated_at from entity where id = ?1 and deleted_at is null",
+                    params![before.id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if current.as_deref() != Some(before.updated_at.as_str()) {
+                return Err(RecordError::Stale(before.id.clone()));
+            }
+            transaction.execute(
+                "update entity set deleted_at = ?2, updated_at = ?2 where id = ?1",
+                params![before.id, now],
+            )?;
+            Ok((Some(serde_json::to_value(before)?), vec![before.id.clone()]))
+        }
     }
 }
 
@@ -957,6 +988,44 @@ mod tests {
         assert_eq!(entity.data["city"], "Lisbon");
         assert_eq!(fixture.record.edges(&person_id).unwrap().len(), 2);
         assert_eq!(fixture.record.search("Elena", 10).unwrap()[0].id, person_id);
+        assert_eq!(fixture.record.search("Ele", 10).unwrap()[0].id, person_id);
+    }
+
+    #[test]
+    fn a_delete_leaves_the_live_reads_and_keeps_the_history() {
+        let mut fixture = Fixture::new("delete");
+        let org = fixture.org("Northwind Traders", "northwind.example");
+        let (proposal, result) = fixture.create(Operation::Delete {
+            entity: Reference::Entity(org.clone()),
+        });
+        assert!(matches!(proposal.diff, Diff::Delete { ref before } if before.id == org));
+        assert_eq!(result.entity_ids, std::slice::from_ref(&org));
+        let entity = fixture.record.entity(&org).unwrap().unwrap();
+        assert!(entity.deleted_at.is_some());
+        assert!(fixture.record.entities("org", 10).unwrap().is_empty());
+        assert!(fixture.record.search("Northwind", 10).unwrap().is_empty());
+        let verbs: Vec<String> = fixture
+            .record
+            .events(&org)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.verb)
+            .collect();
+        assert_eq!(verbs, ["created", "deleted"]);
+        assert!(matches!(
+            fixture.record.propose(Operation::Delete {
+                entity: Reference::Entity(org.clone()),
+            }),
+            Err(RecordError::EntityDeleted(_))
+        ));
+        assert!(matches!(
+            fixture.record.propose(Operation::Update {
+                entity: Reference::parse("domain:northwind.example").unwrap(),
+                data: Map::new(),
+                identities: vec![],
+            }),
+            Err(RecordError::EntityDeleted(_))
+        ));
     }
 
     #[test]

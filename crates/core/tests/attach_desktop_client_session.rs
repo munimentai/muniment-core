@@ -1162,13 +1162,31 @@ fn desktop_client_describes_runs_and_reads_the_reader_queue() {
 
     for (index, (operation, body)) in [
         (Operation::ReaderDescribe, serde_json::json!({})),
-        (Operation::ReaderDescribe, serde_json::json!({"source": "csv"})),
-        (Operation::ReaderDescribe, serde_json::json!({"source": "", "object": "/a.csv"})),
-        (Operation::ReaderDescribe, serde_json::json!({"source": "csv", "object": "/a.csv", "mapping": "m"})),
-        (Operation::ReaderDescribe, serde_json::json!({"source": "csv", "object": "/a.csv", "other": 1})),
+        (
+            Operation::ReaderDescribe,
+            serde_json::json!({"source": "csv"}),
+        ),
+        (
+            Operation::ReaderDescribe,
+            serde_json::json!({"source": "", "object": "/a.csv"}),
+        ),
+        (
+            Operation::ReaderDescribe,
+            serde_json::json!({"source": "csv", "object": "/a.csv", "mapping": "m"}),
+        ),
+        (
+            Operation::ReaderDescribe,
+            serde_json::json!({"source": "csv", "object": "/a.csv", "other": 1}),
+        ),
         (Operation::ReaderQueue, serde_json::json!({})),
-        (Operation::ReaderQueue, serde_json::json!({"mapping": "m", "offset": 1})),
-        (Operation::ReaderQueue, serde_json::json!({"mapping": "m", "source": "csv"})),
+        (
+            Operation::ReaderQueue,
+            serde_json::json!({"mapping": "m", "offset": 1}),
+        ),
+        (
+            Operation::ReaderQueue,
+            serde_json::json!({"mapping": "m", "source": "csv"}),
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -1223,7 +1241,10 @@ fn desktop_client_describes_runs_and_reads_the_reader_queue() {
     ) else {
         panic!("reader.queue did not return a response");
     };
-    assert!(response.body["queue"]["rows"].as_array().unwrap().is_empty());
+    assert!(response.body["queue"]["rows"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 
     drop(client);
     let (result, service) = session_thread.join().unwrap();

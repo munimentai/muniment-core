@@ -67,9 +67,10 @@ fn identifier(text: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
-fn search_query(text: &str) -> String {
+/// Each word as a quoted prefix token, so the start of a title finds it.
+pub(super) fn search_query(text: &str) -> String {
     text.split_whitespace()
-        .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
+        .map(|word| format!("\"{}\"*", word.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -314,6 +315,17 @@ mod tests {
             .unwrap();
         assert_eq!(searched.rows.len(), 1);
         assert_eq!(searched.rows[0].title, "Contoso pilot");
+        let prefixed = record
+            .query(
+                "deal",
+                &QueryOptions {
+                    search: Some("cont pil".into()),
+                    ..QueryOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(prefixed.rows.len(), 1);
+        assert_eq!(prefixed.rows[0].title, "Contoso pilot");
 
         assert!(matches!(
             record.query(
