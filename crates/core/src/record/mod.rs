@@ -49,6 +49,10 @@ pub struct KindRow {
     pub text_template: String,
     pub states: Option<Vec<String>>,
     pub extension: Option<Value>,
+    /// The live records of the kind, so the panel shows what the company
+    /// holds and opens on the connect screen when it holds nothing.
+    #[serde(default)]
+    pub count: i64,
 }
 
 impl KindRow {
@@ -331,10 +335,22 @@ impl CompanyRecord {
                 row.get::<_, Option<String>>(6)?,
             ))
         })?;
+        let mut counts = std::collections::HashMap::new();
+        let mut counting = self
+            .connection
+            .prepare("select kind, count(*) from entity where deleted_at is null group by kind")?;
+        for counted in counting.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })? {
+            let (kind, count) = counted?;
+            counts.insert(kind, count);
+        }
         let mut kinds = Vec::new();
         for row in rows {
             let (name, version, schema, title_template, text_template, states, extension) = row?;
+            let count = counts.get(&name).copied().unwrap_or(0);
             kinds.push(KindRow {
+                count,
                 name,
                 version,
                 schema: serde_json::from_str(&schema)?,
