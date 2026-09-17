@@ -282,6 +282,7 @@ where
                 | Operation::CompanyCreate
                 | Operation::CompanySelect
                 | Operation::CompanyRename
+                | Operation::CompanyDelete
                 | Operation::ReaderDescribe
                 | Operation::ReaderRun
                 | Operation::ReaderQueue

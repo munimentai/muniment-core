@@ -289,6 +289,8 @@ pub enum Operation {
     CompanySelect,
     #[serde(rename = "company.rename")]
     CompanyRename,
+    #[serde(rename = "company.delete")]
+    CompanyDelete,
     #[serde(rename = "record.sql")]
     RecordSql,
     #[serde(rename = "record.propose")]
@@ -362,6 +364,7 @@ impl Operation {
                 | Self::CompanyCreate
                 | Self::CompanySelect
                 | Self::CompanyRename
+                | Self::CompanyDelete
                 | Self::RecordCommit
                 | Self::ReaderRun
                 | Self::ReaderConnect
@@ -399,6 +402,7 @@ impl Operation {
             Self::CompanyCreate => "company.create",
             Self::CompanySelect => "company.select",
             Self::CompanyRename => "company.rename",
+            Self::CompanyDelete => "company.delete",
             Self::RecordSql => "record.sql",
             Self::RecordPropose => "record.propose",
             Self::RecordCommit => "record.commit",

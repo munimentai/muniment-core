@@ -124,6 +124,10 @@ impl DesktopClientHolder {
         self.with_client(|client| client.rename_company(company_id, name))
     }
 
+    pub fn delete_company(&self, company_id: &str) -> Result<Value, ClientError> {
+        self.with_client(|client| client.delete_company(company_id))
+    }
+
     pub fn record_kinds(&self, body: Value) -> Result<Value, ClientError> {
         self.with_client(|client| client.record_kinds(body.clone()))
     }

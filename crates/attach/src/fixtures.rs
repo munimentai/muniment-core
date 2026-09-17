@@ -559,6 +559,7 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         ("company-create", Operation::CompanyCreate),
         ("company-select", Operation::CompanySelect),
         ("company-rename", Operation::CompanyRename),
+        ("company-delete", Operation::CompanyDelete),
         ("record-sql", Operation::RecordSql),
         ("record-propose", Operation::RecordPropose),
         ("record-commit", Operation::RecordCommit),
@@ -831,6 +832,9 @@ fn request_body(operation: Operation) -> serde_json::Value {
         Operation::CompanyRename => {
             json!({"company_id": "019965a0-0000-7000-8000-000000000001", "name": "Northwind"})
         }
+        Operation::CompanyDelete => {
+            json!({"company_id": "019965a0-0000-7000-8000-000000000001"})
+        }
         Operation::RecordSql => {
             json!({"sql": "select name from v_org limit 5", "client": "claude-code"})
         }
@@ -1098,6 +1102,7 @@ mod tests {
             Operation::CompanyCreate,
             Operation::CompanySelect,
             Operation::CompanyRename,
+            Operation::CompanyDelete,
             Operation::RecordSql,
             Operation::RecordPropose,
             Operation::RecordCommit,
@@ -1179,7 +1184,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            94,
+            95,
             "every canonical fixture must be inventoried"
         );
     }

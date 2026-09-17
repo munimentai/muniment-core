@@ -220,6 +220,31 @@ impl CompaniesRoot {
         })
     }
 
+    /// Removes one company with its graph and audit file. When it was the
+    /// current company, the oldest remaining one becomes current, or none.
+    pub fn delete(&self, id: &str) -> Result<CompanySummary, CompanyError> {
+        let file = self.require_company(id)?;
+        let was_current = self.current()?.as_deref() == Some(id);
+        fs::remove_dir_all(self.company_directory(id))?;
+        if was_current {
+            match self.list()?.first() {
+                Some(next) => self.write_current(&next.id)?,
+                None => match fs::remove_file(self.directory.join(CURRENT_FILE_NAME)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                },
+            }
+        }
+        Ok(CompanySummary {
+            id: file.id,
+            name: file.name,
+            created_at: file.created_at,
+            owner_principal_id: file.owner_principal_id,
+            current: false,
+        })
+    }
+
     /// Opens one company's graph.
     pub fn open(&self, id: &str) -> Result<CompanyRecord, CompanyError> {
         self.require_company(id)?;
@@ -343,6 +368,20 @@ mod tests {
             .unwrap();
         assert_eq!(owner.principal_type, PrincipalType::Human);
         assert_eq!(owner.label, OWNER_LABEL);
+
+        let deleted = root.delete(&second.id).unwrap();
+        assert_eq!(deleted.name, "Surfoff");
+        assert!(!deleted.current);
+        assert!(!root.company_directory(&second.id).exists());
+        assert_eq!(root.current().unwrap().as_deref(), Some(first.id.as_str()));
+        assert!(root.list().unwrap()[0].current);
+        assert!(matches!(
+            root.delete(&second.id),
+            Err(CompanyError::UnknownCompany(_))
+        ));
+        root.delete(&first.id).unwrap();
+        assert!(root.list().unwrap().is_empty());
+        assert_eq!(root.current().unwrap(), None);
         assert_eq!(record.kinds().unwrap().len(), 20);
         fs::remove_dir_all(state).unwrap();
     }

@@ -175,6 +175,16 @@ pub trait ThreadListService {
         Err(ProtocolError::unsupported_operation())
     }
 
+    fn delete_company(
+        &mut self,
+        _company_id: &str,
+        _request_id: &super::Id,
+        _idempotency_key: &super::Id,
+        _provenance: CompanionProvenance,
+    ) -> Result<crate::record::CompanySummary, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
     fn record_sql(
         &mut self,
         _body: serde_json::Value,

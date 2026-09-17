@@ -376,6 +376,25 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
     }
 
     #[cfg(any(unix, target_os = "windows"))]
+    fn delete_company(
+        &mut self,
+        company_id: &str,
+        request_id: &Id,
+        idempotency_key: &Id,
+        provenance: CompanionProvenance,
+    ) -> Result<crate::record::CompanySummary, ProtocolError> {
+        let canonical_input = json!({"company_id": company_id});
+        self.company_mutation(
+            Operation::CompanyDelete,
+            canonical_input,
+            request_id,
+            idempotency_key,
+            provenance,
+            |boundaries| boundaries.delete_company(company_id),
+        )
+    }
+
+    #[cfg(any(unix, target_os = "windows"))]
     fn record_sql(
         &mut self,
         body: serde_json::Value,

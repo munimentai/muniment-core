@@ -968,7 +968,10 @@ pub(super) fn dispatch_request<S: ThreadListService>(
     }
     if matches!(
         request.operation,
-        Operation::CompanyCreate | Operation::CompanySelect | Operation::CompanyRename
+        Operation::CompanyCreate
+            | Operation::CompanySelect
+            | Operation::CompanyRename
+            | Operation::CompanyDelete
     ) {
         let idempotency_key = request
             .idempotency_key
@@ -1004,6 +1007,12 @@ pub(super) fn dispatch_request<S: ThreadListService>(
             (Operation::CompanyRename, Some(company_id), Some(name)) => service.rename_company(
                 company_id,
                 name,
+                &request.request_id,
+                idempotency_key,
+                provenance,
+            )?,
+            (Operation::CompanyDelete, Some(company_id), None) => service.delete_company(
+                company_id,
                 &request.request_id,
                 idempotency_key,
                 provenance,

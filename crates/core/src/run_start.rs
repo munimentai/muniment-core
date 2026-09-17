@@ -183,6 +183,13 @@ pub trait RunAttachBoundaries {
     ) -> Result<crate::record::CompanySummary, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
+    #[cfg(any(unix, target_os = "windows"))]
+    fn delete_company(
+        &self,
+        _company_id: &str,
+    ) -> Result<crate::record::CompanySummary, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
     /// Runs one read-only query for the actor named. The body and the answer
     /// are the `record.sql` wire shapes.
     #[cfg(any(unix, target_os = "windows"))]
