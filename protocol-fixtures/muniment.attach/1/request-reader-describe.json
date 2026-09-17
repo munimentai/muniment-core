@@ -1,1 +1,1 @@
-{"protocol":"muniment.attach/1","request_id":"0000000000000000000000000000008f","operation":"reader.describe","capability":"fixture-capability","body":{"object":"/work/exports/customers.csv","source":"csv"}}
+{"protocol":"muniment.attach/1","request_id":"00000000000000000000000000000090","operation":"reader.describe","capability":"fixture-capability","body":{"object":"/work/exports/customers.csv","source":"csv"}}

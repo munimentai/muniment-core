@@ -1,1 +1,1 @@
-{"protocol":"muniment.attach/1","request_id":"0000000000000000000000000000008b","operation":"record.commit","capability":"fixture-capability","idempotency_key":"000000000000000000000000000000ef","body":{"client":"claude-code","proposal":"019965a0-0000-7000-8000-000000000010"}}
+{"protocol":"muniment.attach/1","request_id":"0000000000000000000000000000008c","operation":"record.commit","capability":"fixture-capability","idempotency_key":"000000000000000000000000000000f0","body":{"client":"claude-code","proposal":"019965a0-0000-7000-8000-000000000010"}}

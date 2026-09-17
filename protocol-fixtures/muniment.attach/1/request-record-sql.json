@@ -1,1 +1,1 @@
-{"protocol":"muniment.attach/1","request_id":"00000000000000000000000000000089","operation":"record.sql","capability":"fixture-capability","body":{"client":"claude-code","sql":"select name from v_org limit 5"}}
+{"protocol":"muniment.attach/1","request_id":"0000000000000000000000000000008a","operation":"record.sql","capability":"fixture-capability","body":{"client":"claude-code","sql":"select name from v_org limit 5"}}
