@@ -288,13 +288,17 @@ impl DesktopClientHolder {
         let (client, wake) = &*self.inner;
         let mut client = Self::lock_client(client)?;
         let result = call(client.as_mut().ok_or(ClientError::DesktopUnavailable)?);
-        // An authorization refusal does not break the transport. Keep the client so the shell can
-        // report the refusal without a reconnect that repeats the same request.
+        // A refusal the runtime answered does not break the transport. Keep the client so the
+        // shell can report the refusal without a reconnect that repeats the same request, and
+        // so the next request, such as a sign-out, still has a connection.
         if !matches!(
             &result,
             Err(ClientError::RuntimeUpgradePending
                 | ClientError::AuthorizationExpired
-                | ClientError::AuthorizationFailed)
+                | ClientError::AuthorizationFailed
+                | ClientError::DesktopFailed
+                | ClientError::RequestRejected
+                | ClientError::ThreadNotFound)
         ) && result.is_err()
         {
             *client = None;
@@ -406,12 +410,32 @@ mod tests {
             "1.0.0".into(),
             IO_TIMEOUT,
         ));
-        let reasons = [
-            "chat_not_entitled: No chat model is currently available for this account.",
-            "chat_not_entitled: The account has no allowed model.",
-        ];
+        // Each refusal the runtime answers keeps the connection, an entitlement
+        // refusal and a grant the cloud could not issue alike.
+        fn refusals() -> [(crate::ProtocolError, ClientError); 3] {
+            [
+                (
+                    crate::ProtocolError::unauthorized_with_reason(
+                        "chat_not_entitled: No chat model is currently available for this account.",
+                    ),
+                    ClientError::AuthorizationExpired,
+                ),
+                (
+                    crate::ProtocolError::unauthorized_with_reason(
+                        "chat_not_entitled: The account has no allowed model.",
+                    ),
+                    ClientError::AuthorizationExpired,
+                ),
+                (
+                    crate::ProtocolError::persistence_failed_with_reason(
+                        "Chat configuration is temporarily unavailable.",
+                    ),
+                    ClientError::DesktopFailed,
+                ),
+            ]
+        }
         let worker = std::thread::spawn(move || {
-            for reason in reasons {
+            for (error, _) in refusals() {
                 let mut prefix = [0; 4];
                 server.read_exact(&mut prefix).unwrap();
                 let mut body = vec![0; u32::from_be_bytes(prefix) as usize];
@@ -420,21 +444,18 @@ mod tests {
                 assert_eq!(request.operation, Operation::RunSubmit);
                 let response = serde_json::json!({
                     "protocol": "muniment.attach/1", "request_id": request.request_id,
-                    "ok": false, "error": crate::ProtocolError::unauthorized_with_reason(reason),
+                    "ok": false, "error": error,
                 });
                 server
                     .write_all(&crate::encode_frame(&response).unwrap())
                     .unwrap();
             }
         });
-        for reason in reasons {
+        for (error, expected) in refusals() {
             let started = Instant::now();
             assert_eq!(
                 holder.run_submit_with_reason("prompt", &[], None, |_| true),
-                Err((
-                    ClientError::AuthorizationExpired,
-                    Some(crate::ProtocolError::unauthorized_with_reason(reason))
-                ))
+                Err((expected, Some(error)))
             );
             assert!(started.elapsed() < Duration::from_secs(30));
             assert!(holder.inner.0.lock().unwrap().is_some());

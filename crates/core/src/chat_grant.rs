@@ -201,8 +201,20 @@ pub(crate) fn issue_grant(
         .set("Authorization", &format!("Bearer {access_token}"))
         .send_json(serde_json::json!({"protocol": PROTOCOL}))
         .map_err(|error| match error {
-            ureq::Error::Status(status, response) => grant_status_error(status, response),
-            ureq::Error::Transport(_) => GrantFailure::Other(FetchGrantError::Unavailable),
+            ureq::Error::Status(status, response) => {
+                let failure = grant_status_error(status, response);
+                eprintln!(
+                    "muniment-runtime: chat-grant issue outcome=refused status={status} cause={failure:?}"
+                );
+                failure
+            }
+            ureq::Error::Transport(transport) => {
+                eprintln!(
+                    "muniment-runtime: chat-grant issue outcome=unreachable cause={:?}",
+                    transport.kind()
+                );
+                GrantFailure::Other(FetchGrantError::Unavailable)
+            }
         })?;
     if response.status() != 201 {
         return Err(GrantFailure::Other(FetchGrantError::InvalidResponse));

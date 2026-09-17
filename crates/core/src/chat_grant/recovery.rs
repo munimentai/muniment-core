@@ -113,6 +113,7 @@ pub(crate) fn recover_grant(
     loop {
         if recovery.session_needs_renewal() {
             if budget.refreshed {
+                eprintln!("muniment-runtime: chat-grant recover outcome=session_refreshed_twice");
                 return Err(FetchGrantError::Unavailable);
             }
             budget.recover(recovery, GrantFailure::SessionInvalid)?;
@@ -121,8 +122,14 @@ pub(crate) fn recover_grant(
         match recovery.issue() {
             Ok(grant) if !grant.needs_renewal() => return Ok(grant),
             Ok(_) if !budget.stale => budget.stale = true,
-            Ok(_) => return Err(FetchGrantError::Unavailable),
-            Err(failure) => budget.recover(recovery, failure)?,
+            Ok(_) => {
+                eprintln!("muniment-runtime: chat-grant recover outcome=stale_twice");
+                return Err(FetchGrantError::Unavailable);
+            }
+            Err(failure) => {
+                eprintln!("muniment-runtime: chat-grant recover failure={failure:?}");
+                budget.recover(recovery, failure)?
+            }
         }
     }
 }
@@ -303,11 +310,16 @@ mod native {
         }
         fn issue(&mut self) -> Result<ChatGrant, GrantFailure> {
             self.current().map_err(GrantFailure::Other)?;
-            if self
+            if let Some(remaining) = self
                 .retries
                 .get(&self.retry_key())
-                .is_some_and(|deadline| !deadline.remaining(Instant::now()).is_zero())
+                .map(|deadline| deadline.remaining(Instant::now()))
+                .filter(|remaining| !remaining.is_zero())
             {
+                eprintln!(
+                    "muniment-runtime: chat-grant issue outcome=waiting remaining_ms={}",
+                    remaining.as_millis()
+                );
                 return Err(GrantFailure::Other(FetchGrantError::Unavailable));
             }
             let result = crate::chat_grant::issue_grant(
@@ -390,7 +402,19 @@ mod native {
     }
 
     pub fn fetch_native(base: &str, token: &str) -> Result<ChatGrant, FetchGrantError> {
-        with_native(base, token, |recovery| recover_grant(recovery))
+        let started = Instant::now();
+        let result = with_native(base, token, |recovery| recover_grant(recovery));
+        match &result {
+            Ok(_) => eprintln!(
+                "muniment-runtime: chat-grant end outcome=issued elapsed_ms={}",
+                started.elapsed().as_millis()
+            ),
+            Err(error) => eprintln!(
+                "muniment-runtime: chat-grant end outcome=refused cause={error:?} elapsed_ms={}",
+                started.elapsed().as_millis()
+            ),
+        }
+        result
     }
 
     pub fn inspect_native_chat_session(token: &str) -> Result<String, FetchGrantError> {
