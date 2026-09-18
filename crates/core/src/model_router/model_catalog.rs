@@ -203,8 +203,12 @@ mod tests {
             assert!(matches!(entry.tier, "deep" | "balanced" | "fast"));
             assert!(entry.price > 0.0 && entry.output > 0.0);
         }
-        // Every pooled family offers at least one model to route to.
+        // Every pooled family offers at least one model to route to. Devin is
+        // a subscription the pool shows and probes, and no turn lands on it.
         for family in FAMILIES {
+            if family.id == "devin" {
+                continue;
+            }
             assert!(
                 !family_models(family.id).is_empty(),
                 "{} offers no model",

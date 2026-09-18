@@ -30,9 +30,18 @@ pub const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 pub const CODEX_USER_AGENT: &str =
     "codex-tui/0.149.1 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.149.1)";
 pub const CLAUDE_OAUTH_BETA: &str = "oauth-2025-04-20";
+/// Kimi meters its coding plan by window and answers here with a bearer.
+pub const KIMI_USAGE_URL: &str = "https://api.kimi.com/coding/v1/usages";
+/// Antigravity answers its buckets here, a fraction left per model family.
+pub const ANTIGRAVITY_QUOTA_URL: &str =
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+/// Devin's seat service answers a protobuf with a daily and a weekly percent left.
+pub const DEVIN_SERVER_URL: &str = "https://server.codeium.com";
+pub const DEVIN_STATUS_PATH: &str = "/exa.seat_management_pb.SeatManagementService/GetUserStatus";
 pub const TIMEOUT: Duration = Duration::from_secs(12);
 
 const FIVE_HOURS: i64 = 5 * 60 * 60;
+const ONE_DAY: i64 = 24 * 60 * 60;
 const ONE_WEEK: i64 = 7 * 24 * 60 * 60;
 const MONTH_LOW: i64 = 28 * 24 * 60 * 60;
 const MONTH_HIGH: i64 = 31 * 24 * 60 * 60;
@@ -43,6 +52,7 @@ const MONTH_HIGH: i64 = 31 * 24 * 60 * 60;
 #[serde(rename_all = "snake_case")]
 pub enum WindowKind {
     FiveHour,
+    Daily,
     Weekly,
     Monthly,
     Other,
@@ -53,6 +63,8 @@ impl WindowKind {
     pub fn from_seconds(seconds: i64) -> Self {
         if seconds == FIVE_HOURS {
             Self::FiveHour
+        } else if seconds == ONE_DAY {
+            Self::Daily
         } else if seconds == ONE_WEEK {
             Self::Weekly
         } else if (MONTH_LOW..=MONTH_HIGH).contains(&seconds) {
@@ -66,6 +78,7 @@ impl WindowKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::FiveHour => "5-hour window",
+            Self::Daily => "Daily window",
             Self::Weekly => "Weekly window",
             Self::Monthly => "Monthly window",
             Self::Other => "Window",
@@ -326,6 +339,432 @@ pub fn probe_claude(access: &str, now_ms: i64, timeout: Duration) -> Option<Quot
     parse_claude(&fetch(CLAUDE_USAGE_URL, &headers, timeout)?, now_ms)
 }
 
+fn post_json(url: &str, headers: &[(&str, &str)], body: Value, timeout: Duration) -> Option<Value> {
+    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    let mut request = agent.post(url);
+    for (name, value) in headers {
+        request = request.set(name, value);
+    }
+    request.send_json(body).ok()?.into_json::<Value>().ok()
+}
+
+fn post_bytes(
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    let mut request = agent.post(url);
+    for (name, value) in headers {
+        request = request.set(name, value);
+    }
+    use std::io::Read;
+    let response = request.send_bytes(body).ok()?;
+    let mut bytes = Vec::new();
+    let mut limited = response.into_reader().take(4 << 20);
+    limited.read_to_end(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+/// A reset instant from an RFC 3339 field, or from seconds left.
+fn reset_ms(record: &Value, now_ms: i64) -> Option<i64> {
+    for key in ["reset_at", "resetAt", "reset_time", "resetTime"] {
+        if let Some(moment) = rfc3339_ms(record.get(key)) {
+            return Some(moment);
+        }
+    }
+    for key in ["reset_in", "resetIn", "ttl"] {
+        if let Some(seconds) = number(record.get(key)).filter(|seconds| *seconds > 0.0) {
+            return Some(now_ms + (seconds * 1000.0) as i64);
+        }
+    }
+    None
+}
+
+/// Kimi names a window by a duration and a unit such as `TIME_UNIT_MINUTE`.
+fn kimi_window_seconds(window: &Value) -> Option<i64> {
+    let duration = number(window.get("duration")).filter(|value| *value > 0.0)?;
+    let unit = text(window.get("timeUnit"))
+        .or_else(|| text(window.get("time_unit")))
+        .unwrap_or_default()
+        .to_uppercase();
+    let unit = unit.trim_start_matches("TIME_UNIT_").trim_end_matches('S');
+    let seconds = match unit {
+        "SECOND" => 1.0,
+        "" | "MINUTE" => 60.0,
+        "HOUR" => 3600.0,
+        "DAY" => 86_400.0,
+        "WEEK" => 604_800.0,
+        _ => return None,
+    };
+    Some((duration * seconds) as i64)
+}
+
+/// One Kimi limit as a window: what is used of what is allowed.
+fn kimi_window(item: &Value, now_ms: i64) -> Option<Window> {
+    let detail = item
+        .get("detail")
+        .filter(|value| value.is_object())
+        .unwrap_or(item);
+    let limit = number(detail.get("limit")).filter(|limit| *limit > 0.0)?;
+    let used = number(detail.get("used"))
+        .or_else(|| number(detail.get("remaining")).map(|remaining| limit - remaining))?;
+    // A limit's name says which window it is. Only a scope names a model.
+    let scope = text(item.get("scope"))
+        .or_else(|| text(detail.get("scope")))
+        .unwrap_or_default();
+    let seconds = item
+        .get("window")
+        .and_then(kimi_window_seconds)
+        .or_else(|| kimi_window_seconds(item))
+        .or_else(|| kimi_window_seconds(detail))
+        .unwrap_or(0);
+    Some(Window {
+        kind: WindowKind::from_seconds(seconds),
+        scope,
+        used_percent: (used / limit * 100.0).clamp(0.0, 100.0),
+        resets_at_ms: reset_ms(detail, now_ms).or_else(|| reset_ms(item, now_ms)),
+        limit_reached: used >= limit,
+    })
+}
+
+/// The quota in a Kimi `usages` answer: each limit is one window, and the
+/// plain `usage` stands in when the list is absent.
+pub fn parse_kimi(payload: &Value, now_ms: i64) -> Option<Quota> {
+    let mut windows: Vec<Window> = payload
+        .get("limits")
+        .and_then(Value::as_array)
+        .map(|limits| {
+            limits
+                .iter()
+                .filter_map(|item| kimi_window(item, now_ms))
+                .collect()
+        })
+        .unwrap_or_default();
+    if windows.is_empty() {
+        if let Some(window) = payload
+            .get("usage")
+            .and_then(|usage| kimi_window(usage, now_ms))
+        {
+            windows.push(window);
+        }
+    }
+    if windows.is_empty() {
+        return None;
+    }
+    Some(Quota {
+        plan: text(payload.get("plan")).or_else(|| text(payload.get("plan_name"))),
+        email: text(payload.get("email")),
+        windows,
+        banked_resets: None,
+        observed_at_ms: now_ms,
+    })
+}
+
+/// Antigravity names a window in words. The rest reads as one of its own.
+fn antigravity_window_kind(window: &str) -> WindowKind {
+    match window.trim().to_lowercase().as_str() {
+        "5h" | "five-hour" | "five_hour" | "five hour" => WindowKind::FiveHour,
+        "daily" | "day" | "24h" => WindowKind::Daily,
+        "weekly" | "week" => WindowKind::Weekly,
+        "monthly" | "month" => WindowKind::Monthly,
+        _ => WindowKind::Other,
+    }
+}
+
+/// The quota in an Antigravity `retrieveUserQuotaSummary` answer: every
+/// bucket of every group is one window scoped to the model family it names,
+/// and the fraction left becomes the percent used the screen shows.
+pub fn parse_antigravity(payload: &Value, now_ms: i64) -> Option<Quota> {
+    let mut windows = Vec::new();
+    for group in payload.get("groups").and_then(Value::as_array)? {
+        for bucket in group
+            .get("buckets")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(remaining) = number(bucket.get("remainingFraction"))
+                .or_else(|| number(bucket.get("remaining_fraction")))
+            else {
+                continue;
+            };
+            let remaining = remaining.clamp(0.0, 1.0);
+            windows.push(Window {
+                kind: antigravity_window_kind(&text(bucket.get("window")).unwrap_or_default()),
+                scope: text(bucket.get("displayName"))
+                    .or_else(|| text(bucket.get("display_name")))
+                    .or_else(|| text(bucket.get("bucketId")))
+                    .unwrap_or_default(),
+                used_percent: ((1.0 - remaining) * 100.0).clamp(0.0, 100.0),
+                resets_at_ms: rfc3339_ms(bucket.get("resetTime"))
+                    .or_else(|| rfc3339_ms(bucket.get("reset_time"))),
+                limit_reached: remaining <= 0.0,
+            });
+        }
+    }
+    if windows.is_empty() {
+        return None;
+    }
+    Some(Quota {
+        plan: payload
+            .get("currentTier")
+            .and_then(|tier| text(tier.get("name")).or_else(|| text(tier.get("id")))),
+        email: None,
+        windows,
+        banked_resets: None,
+        observed_at_ms: now_ms,
+    })
+}
+
+/// Protobuf wire helpers, enough for Devin's one request and one answer.
+mod proto {
+    pub fn varint(mut value: u64, out: &mut Vec<u8>) {
+        while value >= 0x80 {
+            out.push((value as u8) | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+    }
+
+    pub fn bytes_field(field: u32, data: &[u8], out: &mut Vec<u8>) {
+        varint(u64::from(field) << 3 | 2, out);
+        varint(data.len() as u64, out);
+        out.extend_from_slice(data);
+    }
+
+    pub fn string_field(field: u32, text: &str, out: &mut Vec<u8>) {
+        bytes_field(field, text.as_bytes(), out);
+    }
+
+    fn read_varint(data: &[u8], at: &mut usize) -> Option<u64> {
+        let mut value = 0u64;
+        let mut shift = 0u32;
+        loop {
+            let byte = *data.get(*at)?;
+            *at += 1;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Some(value);
+            }
+            shift += 7;
+            if shift > 63 {
+                return None;
+            }
+        }
+    }
+
+    /// One field as the wire carries it.
+    pub enum Field<'a> {
+        Varint(u64),
+        Bytes(&'a [u8]),
+        Other,
+    }
+
+    /// Every top-level field of a message, in order.
+    pub fn fields(data: &[u8]) -> Vec<(u32, Field<'_>)> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at < data.len() {
+            let Some(key) = read_varint(data, &mut at) else {
+                break;
+            };
+            let number = (key >> 3) as u32;
+            match key & 7 {
+                0 => match read_varint(data, &mut at) {
+                    Some(value) => out.push((number, Field::Varint(value))),
+                    None => break,
+                },
+                1 => {
+                    at += 8;
+                    out.push((number, Field::Other));
+                }
+                2 => {
+                    let Some(length) = read_varint(data, &mut at) else {
+                        break;
+                    };
+                    let end = at.saturating_add(length as usize);
+                    if end > data.len() {
+                        break;
+                    }
+                    out.push((number, Field::Bytes(&data[at..end])));
+                    at = end;
+                }
+                5 => {
+                    at += 4;
+                    out.push((number, Field::Other));
+                }
+                _ => break,
+            }
+        }
+        out
+    }
+}
+
+/// A 732-character hex fingerprint Devin's seat service wants, derived from a
+/// seed so one account presents one device.
+pub fn devin_fingerprint(seed: &str) -> String {
+    use sha2::Digest;
+    let mut out = String::new();
+    let mut counter = 0;
+    while out.len() < 732 {
+        let digest = sha2::Sha256::digest(format!("{seed}-{counter}").as_bytes());
+        out.push_str(
+            &digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        );
+        counter += 1;
+    }
+    out.truncate(732);
+    out
+}
+
+/// The `GetUserStatus` request as Devin's CLI sends it.
+pub fn devin_status_request(session_token: &str, fingerprint: &str) -> Vec<u8> {
+    let mut metadata = Vec::new();
+    proto::string_field(1, "chisel", &mut metadata);
+    proto::string_field(2, "3000.10.21", &mut metadata);
+    proto::string_field(3, session_token, &mut metadata);
+    proto::string_field(4, "en", &mut metadata);
+    proto::string_field(5, std::env::consts::OS, &mut metadata);
+    proto::string_field(7, "3000.10.21", &mut metadata);
+    proto::string_field(12, "chisel", &mut metadata);
+    proto::string_field(31, fingerprint, &mut metadata);
+    let mut request = Vec::new();
+    proto::bytes_field(1, &metadata, &mut request);
+    request
+}
+
+/// The quota in a `GetUserStatus` answer: the daily and weekly percent left,
+/// their resets, the plan and the email.
+pub fn parse_devin_status(bytes: &[u8], now_ms: i64) -> Option<Quota> {
+    use proto::Field;
+    let mut email = None;
+    let mut plan = None;
+    let mut daily: Option<(f64, Option<i64>)> = None;
+    let mut weekly: Option<(f64, Option<i64>)> = None;
+    let status = proto::fields(bytes)
+        .into_iter()
+        .find_map(|(number, field)| match field {
+            Field::Bytes(data) if number == 1 => Some(data),
+            _ => None,
+        })?;
+    for (number, field) in proto::fields(status) {
+        match (number, field) {
+            (7, Field::Bytes(data)) => email = String::from_utf8(data.to_vec()).ok(),
+            (13, Field::Bytes(plan_status)) => {
+                let mut daily_left = None;
+                let mut weekly_left = None;
+                let mut daily_reset = None;
+                let mut weekly_reset = None;
+                for (inner, value) in proto::fields(plan_status) {
+                    match (inner, value) {
+                        (1, Field::Bytes(info)) => {
+                            for (key, item) in proto::fields(info) {
+                                if let (2, Field::Bytes(name)) = (key, item) {
+                                    plan = String::from_utf8(name.to_vec()).ok();
+                                }
+                            }
+                        }
+                        (14, Field::Varint(value)) => daily_left = Some(value as f64),
+                        (15, Field::Varint(value)) => weekly_left = Some(value as f64),
+                        (17, Field::Varint(value)) if value > 0 => {
+                            daily_reset = Some(value as i64 * 1000)
+                        }
+                        (18, Field::Varint(value)) if value > 0 => {
+                            weekly_reset = Some(value as i64 * 1000)
+                        }
+                        _ => {}
+                    }
+                }
+                daily = daily_left.map(|left| (left, daily_reset));
+                weekly = weekly_left.map(|left| (left, weekly_reset));
+            }
+            _ => {}
+        }
+    }
+    let mut windows = Vec::new();
+    for (kind, value) in [(WindowKind::Daily, daily), (WindowKind::Weekly, weekly)] {
+        if let Some((left, resets_at_ms)) = value {
+            windows.push(Window {
+                kind,
+                scope: String::new(),
+                used_percent: (100.0 - left).clamp(0.0, 100.0),
+                resets_at_ms,
+                limit_reached: left <= 0.0,
+            });
+        }
+    }
+    if windows.is_empty() {
+        return None;
+    }
+    Some(Quota {
+        plan,
+        email,
+        windows,
+        banked_resets: None,
+        observed_at_ms: now_ms,
+    })
+}
+
+/// Asks Kimi what this account has left.
+pub fn probe_kimi(access: &str, device_id: &str, now_ms: i64, timeout: Duration) -> Option<Quota> {
+    let bearer = format!("Bearer {access}");
+    let mut headers = vec![("Authorization", bearer.as_str())];
+    let device = super::native_auth::kimi_headers(device_id);
+    let device: Vec<(&str, &str)> = device
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect();
+    headers.extend(device);
+    parse_kimi(&fetch(KIMI_USAGE_URL, &headers, timeout)?, now_ms)
+}
+
+/// Asks Antigravity what this account has left in each of its buckets.
+pub fn probe_antigravity(
+    access: &str,
+    project: Option<&str>,
+    now_ms: i64,
+    timeout: Duration,
+) -> Option<Quota> {
+    let bearer = format!("Bearer {access}");
+    let headers = [
+        ("Authorization", bearer.as_str()),
+        ("Content-Type", "application/json"),
+        ("User-Agent", super::native_auth::ANTIGRAVITY_USER_AGENT),
+    ];
+    let body = match project {
+        Some(project) => serde_json::json!({"project": project}),
+        None => serde_json::json!({}),
+    };
+    parse_antigravity(
+        &post_json(ANTIGRAVITY_QUOTA_URL, &headers, body, timeout)?,
+        now_ms,
+    )
+}
+
+/// Asks Devin's seat service what this account has left today and this week.
+pub fn probe_devin(session_token: &str, now_ms: i64, timeout: Duration) -> Option<Quota> {
+    let authorization = format!("Basic {session_token}-{session_token}");
+    let headers = [
+        ("Authorization", authorization.as_str()),
+        ("Connect-Protocol-Version", "1"),
+        ("Content-Type", "application/proto"),
+        ("Accept", "*/*"),
+    ];
+    let body = devin_status_request(session_token, &devin_fingerprint(session_token));
+    let answer = post_bytes(
+        &format!("{DEVIN_SERVER_URL}{DEVIN_STATUS_PATH}"),
+        &headers,
+        &body,
+        timeout,
+    )?;
+    parse_devin_status(&answer, now_ms)
+}
+
 /// Asks the account's upstream what it has left. A key has no window to ask
 /// about, and a provider with no usage route answers nothing.
 pub fn probe(account: &Account, now_ms: i64, timeout: Duration) -> Option<Quota> {
@@ -339,6 +778,14 @@ pub fn probe(account: &Account, now_ms: i64, timeout: Duration) -> Option<Quota>
         } => match provider.as_str() {
             "openai-codex" => probe_codex(access, account_id.as_deref(), now_ms, timeout),
             "anthropic" => probe_claude(access, now_ms, timeout),
+            "kimi" => probe_kimi(
+                access,
+                account_id.as_deref().unwrap_or_default(),
+                now_ms,
+                timeout,
+            ),
+            "antigravity" => probe_antigravity(access, account_id.as_deref(), now_ms, timeout),
+            "devin" => probe_devin(access, now_ms, timeout),
             _ => None,
         },
     }
@@ -402,6 +849,8 @@ mod tests {
         assert_eq!(WindowKind::from_seconds(604_800), WindowKind::Weekly);
         assert_eq!(WindowKind::from_seconds(30 * 86_400), WindowKind::Monthly);
         assert_eq!(WindowKind::from_seconds(60), WindowKind::Other);
+        assert_eq!(WindowKind::from_seconds(86_400), WindowKind::Daily);
+        assert_eq!(WindowKind::Daily.label(), "Daily window");
         // A Pro plan's primary window is the weekly one.
         let quota = parse_codex(&codex_pro(), 1_789_700_000_000).unwrap();
         assert_eq!(quota.windows.len(), 1);
@@ -519,6 +968,102 @@ mod tests {
             ..account
         };
         assert_eq!(probe(&xai, 0, Duration::from_millis(50)), None);
+    }
+
+    #[test]
+    fn a_kimi_answer_reads_each_limit_as_a_window_by_its_duration() {
+        let payload = json!({
+            "limits": [
+                { "name": "Weekly", "window": { "duration": 10080, "timeUnit": "TIME_UNIT_MINUTE" },
+                  "detail": { "used": 30, "limit": 100, "reset_at": "2026-09-20T00:00:00Z" } },
+                { "window": { "duration": 5, "timeUnit": "TIME_UNIT_HOUR" },
+                  "detail": { "remaining": 15, "limit": 60, "reset_in": 900 } }
+            ]
+        });
+        let quota = parse_kimi(&payload, 1_000_000).unwrap();
+        assert_eq!(quota.windows.len(), 2);
+        assert_eq!(quota.windows[0].kind, WindowKind::Weekly);
+        assert_eq!(quota.windows[0].scope, "");
+        assert_eq!(quota.windows[0].used_percent, 30.0);
+        assert!(quota.windows[0].resets_at_ms.unwrap() > 1_700_000_000_000);
+        assert_eq!(quota.windows[1].kind, WindowKind::FiveHour);
+        assert_eq!(quota.windows[1].used_percent, 75.0);
+        assert_eq!(quota.windows[1].resets_at_ms, Some(1_000_000 + 900_000));
+        assert_eq!(quota.headline().unwrap().kind, WindowKind::Weekly);
+        // The plain usage stands in when the list is absent.
+        let plain = parse_kimi(&json!({ "usage": { "used": 5, "limit": 10 } }), 0).unwrap();
+        assert_eq!(plain.windows[0].used_percent, 50.0);
+        assert!(parse_kimi(&json!({}), 0).is_none());
+    }
+
+    #[test]
+    fn an_antigravity_answer_reads_each_bucket_as_a_scoped_window() {
+        let payload = json!({
+            "groups": [{ "displayName": "Gemini", "buckets": [
+                { "displayName": "Gemini 3 Pro", "window": "5h", "remainingFraction": 0.25, "resetTime": "2026-09-18T12:00:00Z" },
+                { "displayName": "Gemini 3 Pro", "window": "weekly", "remainingFraction": "0", "resetTime": "2026-09-21T00:00:00Z" }
+            ] }],
+            "currentTier": { "id": "g1-pro-tier", "name": "Google AI Pro" }
+        });
+        let quota = parse_antigravity(&payload, 5).unwrap();
+        assert_eq!(quota.windows.len(), 2);
+        assert_eq!(quota.windows[0].kind, WindowKind::FiveHour);
+        assert_eq!(quota.windows[0].scope, "Gemini 3 Pro");
+        assert_eq!(quota.windows[0].used_percent, 75.0);
+        assert_eq!(quota.windows[1].kind, WindowKind::Weekly);
+        assert!(quota.windows[1].limit_reached);
+        assert_eq!(quota.plan.as_deref(), Some("Google AI Pro"));
+        assert!(parse_antigravity(&json!({ "groups": [] }), 0).is_none());
+    }
+
+    #[test]
+    fn a_devin_status_round_trips_through_the_wire() {
+        // The request names the token and a device of 732 hex characters.
+        let fingerprint = devin_fingerprint("token-1");
+        assert_eq!(fingerprint.len(), 732);
+        assert!(fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(fingerprint, devin_fingerprint("token-1"));
+        let request = devin_status_request("devin-session-token$eyJ", &fingerprint);
+        let outer = proto::fields(&request);
+        assert_eq!(outer.len(), 1);
+        let metadata = match &outer[0] {
+            (1, proto::Field::Bytes(data)) => *data,
+            _ => panic!("the request wraps its metadata in field 1"),
+        };
+        let names: Vec<u32> = proto::fields(metadata)
+            .iter()
+            .map(|(number, _)| *number)
+            .collect();
+        assert_eq!(names, [1, 2, 3, 4, 5, 7, 12, 31]);
+
+        // An answer built the way the service builds it reads back.
+        let mut plan_info = Vec::new();
+        proto::string_field(2, "Devin Core", &mut plan_info);
+        let mut plan_status = Vec::new();
+        proto::bytes_field(1, &plan_info, &mut plan_status);
+        proto::varint(14 << 3, &mut plan_status);
+        proto::varint(40, &mut plan_status);
+        proto::varint(15 << 3, &mut plan_status);
+        proto::varint(90, &mut plan_status);
+        proto::varint(17 << 3, &mut plan_status);
+        proto::varint(1_789_800_000, &mut plan_status);
+        let mut status = Vec::new();
+        proto::string_field(3, "mikey", &mut status);
+        proto::string_field(7, "mikey@example.com", &mut status);
+        proto::bytes_field(13, &plan_status, &mut status);
+        let mut answer = Vec::new();
+        proto::bytes_field(1, &status, &mut answer);
+        let quota = parse_devin_status(&answer, 7).unwrap();
+        assert_eq!(quota.email.as_deref(), Some("mikey@example.com"));
+        assert_eq!(quota.plan.as_deref(), Some("Devin Core"));
+        assert_eq!(quota.windows.len(), 2);
+        assert_eq!(quota.windows[0].kind, WindowKind::Daily);
+        assert_eq!(quota.windows[0].used_percent, 60.0);
+        assert_eq!(quota.windows[0].resets_at_ms, Some(1_789_800_000_000));
+        assert_eq!(quota.windows[1].kind, WindowKind::Weekly);
+        assert_eq!(quota.windows[1].remaining_percent(), 90.0);
+        assert_eq!(quota.headline().unwrap().kind, WindowKind::Weekly);
+        assert!(parse_devin_status(&[], 0).is_none());
     }
 
     #[test]

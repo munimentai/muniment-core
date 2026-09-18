@@ -22,7 +22,7 @@ pub struct Family {
 }
 
 /// Every family the router balances. Each one takes many accounts.
-pub const FAMILIES: [Family; 5] = [
+pub const FAMILIES: [Family; 6] = [
     Family {
         id: "openai",
         name: "OpenAI",
@@ -56,16 +56,40 @@ pub const FAMILIES: [Family; 5] = [
         base_url: "https://api.moonshot.ai/v1",
         wire: Wire::OpenAiCompatible,
     },
+    // Devin is a subscription alone. The pool holds it and shows what it has
+    // left, and no turn lands on it until the router speaks its wire.
+    Family {
+        id: "devin",
+        name: "Devin",
+        base_url: "https://api.devin.ai/v1",
+        wire: Wire::OpenAiCompatible,
+    },
 ];
 
-/// Pi's sign-in providers and the family each one pools into. Pi signs into an
-/// account under its own provider id, and the router holds the result as one
-/// more account of the family.
-pub const SUBSCRIPTION_PROVIDERS: [(&str, &str, &str); 3] = [
+/// The subscription sign-ins and the family each one pools into. The first
+/// three are Pi's own sign-ins, under Pi's provider ids. Kimi, Antigravity
+/// and Devin have no Pi sign-in, so the router runs its own: Kimi by device
+/// code, Antigravity and Devin through the browser.
+pub const SUBSCRIPTION_PROVIDERS: [(&str, &str, &str); 6] = [
     ("openai-codex", "openai", "ChatGPT Plus or Pro"),
     ("xai", "xai", "SuperGrok or X Premium"),
     ("anthropic", "anthropic", "Claude Pro or Max"),
+    ("kimi", "kimi", "Kimi Code"),
+    (
+        "antigravity",
+        "google",
+        "Antigravity, with a Google account",
+    ),
+    ("devin", "devin", "Devin"),
 ];
+
+/// The sign-ins the router runs itself rather than through Pi.
+pub const NATIVE_SIGN_INS: [&str; 3] = ["kimi", "antigravity", "devin"];
+
+/// Whether a subscription provider signs in through the router's own flow.
+pub fn native_sign_in(provider: &str) -> bool {
+    NATIVE_SIGN_INS.contains(&provider)
+}
 
 /// The family a Pi sign-in provider pools into.
 pub fn family_for_pi_provider(provider: &str) -> Option<Family> {
@@ -94,6 +118,10 @@ mod tests {
         assert_eq!(family_for_pi_provider("openai-codex").unwrap().id, "openai");
         assert_eq!(family_for_pi_provider("xai").unwrap().id, "xai");
         assert_eq!(family_for_pi_provider("github-copilot"), None);
+        assert_eq!(family_for_pi_provider("kimi").unwrap().id, "kimi");
+        assert_eq!(family_for_pi_provider("antigravity").unwrap().id, "google");
+        assert_eq!(family_for_pi_provider("devin").unwrap().id, "devin");
+        assert!(native_sign_in("kimi") && !native_sign_in("openai-codex"));
         assert_eq!(family("anthropic").unwrap().wire, Wire::OpenAiCompatible);
         assert_eq!(family("kimi").unwrap().wire, Wire::OpenAiCompatible);
     }
