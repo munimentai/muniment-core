@@ -240,6 +240,16 @@ pub trait RunAttachBoundaries {
     ) -> Result<serde_json::Value, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
+    /// The local report over one company's graph: every finding with its
+    /// magnitude and evidence. The body and the answer are the `record.report` shapes.
+    #[cfg(any(unix, target_os = "windows"))]
+    fn record_report(
+        &self,
+        _actor: &str,
+        _body: serde_json::Value,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
     /// Describes one source object for the record panel's import: its fields
     /// and samples. The body and the answer are the `reader.describe` shapes.
     #[cfg(any(unix, target_os = "windows"))]

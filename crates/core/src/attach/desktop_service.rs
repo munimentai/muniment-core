@@ -445,6 +445,16 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
     }
 
     #[cfg(any(unix, target_os = "windows"))]
+    fn record_report(
+        &mut self,
+        body: serde_json::Value,
+        provenance: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let actor = record_actor(&provenance, &body);
+        self.boundaries.record_report(&actor, body)
+    }
+
+    #[cfg(any(unix, target_os = "windows"))]
     fn reader_describe(
         &mut self,
         body: serde_json::Value,

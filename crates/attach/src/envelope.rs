@@ -303,6 +303,8 @@ pub enum Operation {
     RecordQuery,
     #[serde(rename = "record.entity")]
     RecordEntity,
+    #[serde(rename = "record.report")]
+    RecordReport,
     #[serde(rename = "reader.describe")]
     ReaderDescribe,
     #[serde(rename = "reader.run")]
@@ -409,6 +411,7 @@ impl Operation {
             Self::RecordKinds => "record.kinds",
             Self::RecordQuery => "record.query",
             Self::RecordEntity => "record.entity",
+            Self::RecordReport => "record.report",
             Self::ReaderDescribe => "reader.describe",
             Self::ReaderRun => "reader.run",
             Self::ReaderQueue => "reader.queue",

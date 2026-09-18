@@ -140,6 +140,10 @@ impl DesktopClientHolder {
         self.with_client(|client| client.record_entity(body.clone()))
     }
 
+    pub fn record_report(&self, body: Value) -> Result<Value, ClientError> {
+        self.with_client(|client| client.record_report(body.clone()))
+    }
+
     pub fn record_propose(&self, body: Value) -> Result<Value, ClientError> {
         self.with_client(|client| client.record_propose(body.clone()))
     }

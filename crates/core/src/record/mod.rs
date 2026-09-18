@@ -8,6 +8,7 @@ mod companies;
 mod identity;
 mod propose;
 mod query;
+pub mod report;
 mod schema;
 mod sql;
 mod validate;

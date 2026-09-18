@@ -317,7 +317,8 @@ where
             | Operation::RecordSql
             | Operation::RecordKinds
             | Operation::RecordQuery
-            | Operation::RecordEntity => Some("thread.read"),
+            | Operation::RecordEntity
+            | Operation::RecordReport => Some("thread.read"),
             Operation::ThreadCreate
             | Operation::RunStart
             | Operation::RunCancel

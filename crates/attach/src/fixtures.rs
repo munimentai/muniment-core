@@ -571,6 +571,7 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         ("reader-queue", Operation::ReaderQueue),
         ("reader-objects", Operation::ReaderObjects),
         ("reader-connect", Operation::ReaderConnect),
+        ("record-report", Operation::RecordReport),
     ];
     for (index, (name, operation)) in operations.into_iter().enumerate() {
         insert(
@@ -851,6 +852,7 @@ fn request_body(operation: Operation) -> serde_json::Value {
             json!({"kind": "deal", "limit": 50, "offset": 0, "sort": "updated_at", "descending": true})
         }
         Operation::RecordEntity => json!({"entity": "019965a0-0000-7000-8000-000000000020"}),
+        Operation::RecordReport => json!({}),
         Operation::ReaderDescribe => {
             json!({"source": "csv", "object": "/work/exports/customers.csv"})
         }
@@ -1109,6 +1111,7 @@ mod tests {
             Operation::RecordKinds,
             Operation::RecordQuery,
             Operation::RecordEntity,
+            Operation::RecordReport,
             Operation::ReaderDescribe,
             Operation::ReaderRun,
             Operation::ReaderQueue,
@@ -1184,7 +1187,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            95,
+            96,
             "every canonical fixture must be inventoried"
         );
     }

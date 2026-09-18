@@ -1029,6 +1029,7 @@ pub(super) fn dispatch_request<S: ThreadListService>(
             | Operation::RecordKinds
             | Operation::RecordQuery
             | Operation::RecordEntity
+            | Operation::RecordReport
     ) {
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -1087,8 +1088,12 @@ pub(super) fn dispatch_request<S: ThreadListService>(
                         .as_ref()
                         .is_some_and(serde_json::Value::is_object)
             }
-            Operation::RecordKinds => {
-                body.sql.is_none() && body.operation.is_none() && body.proposal.is_none()
+            Operation::RecordKinds | Operation::RecordReport => {
+                body.sql.is_none()
+                    && body.operation.is_none()
+                    && body.proposal.is_none()
+                    && body.kind.is_none()
+                    && body.entity.is_none()
             }
             Operation::RecordQuery => {
                 body.sql.is_none()
@@ -1128,6 +1133,7 @@ pub(super) fn dispatch_request<S: ThreadListService>(
             Operation::RecordKinds => service.record_kinds(request.body, provenance)?,
             Operation::RecordQuery => service.record_query(request.body, provenance)?,
             Operation::RecordEntity => service.record_entity(request.body, provenance)?,
+            Operation::RecordReport => service.record_report(request.body, provenance)?,
             _ => {
                 let idempotency_key = request
                     .idempotency_key

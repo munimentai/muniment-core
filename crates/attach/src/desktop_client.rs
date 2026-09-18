@@ -564,6 +564,10 @@ impl DesktopClient {
         self.request_body(Operation::RecordEntity, None, body, &[])
     }
 
+    pub fn record_report(&mut self, body: Value) -> Result<Value, ClientError> {
+        self.request_body(Operation::RecordReport, None, body, &[])
+    }
+
     pub fn reader_describe(&mut self, body: Value) -> Result<Value, ClientError> {
         self.request_body(Operation::ReaderDescribe, None, body, &[])
     }
