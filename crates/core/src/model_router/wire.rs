@@ -55,19 +55,34 @@ fn message_text(message: &Value) -> String {
     }
 }
 
+/// Whether the client asked for the usage chunk of a streamed answer itself.
+/// Pi does by default, and that chunk is then the client's to keep.
+pub fn wants_usage(request: &Value) -> bool {
+    request
+        .get("stream_options")
+        .and_then(|options| options.get("include_usage"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// The request the upstream receives: the same request with the model the
 /// router resolved, and, on a streamed turn, the usage chunk asked for so the
 /// ledger can count a stream. The router drops that chunk before the client
-/// sees it.
+/// sees it unless the client asked for it too.
 pub fn upstream_request(request: &Value, model: &str) -> Value {
     let mut upstream = request.clone();
     if let Some(object) = upstream.as_object_mut() {
         object.insert("model".into(), Value::String(model.to_owned()));
         if streams(request) {
-            object.insert(
-                "stream_options".into(),
-                serde_json::json!({ "include_usage": true }),
-            );
+            let options = object
+                .entry("stream_options")
+                .or_insert_with(|| serde_json::json!({}));
+            if !options.is_object() {
+                *options = serde_json::json!({});
+            }
+            if let Some(options) = options.as_object_mut() {
+                options.insert("include_usage".into(), Value::Bool(true));
+            }
         }
     }
     upstream
@@ -174,6 +189,16 @@ mod tests {
         assert!(upstream.get("stream_options").is_none());
         assert!(!streams(&once));
         assert!(streams(&request()));
+        assert!(!wants_usage(&request()));
+
+        // A client that asked for usage itself keeps its other options, and
+        // the router knows to leave the usage chunk on the wire.
+        let mut asking = request();
+        asking["stream_options"] = json!({ "include_usage": true, "other": 1 });
+        let upstream = upstream_request(&asking, "gpt-5.6-mini");
+        assert_eq!(upstream["stream_options"]["include_usage"], true);
+        assert_eq!(upstream["stream_options"]["other"], 1);
+        assert!(wants_usage(&asking));
         assert_eq!(requested_model(&once), Some("auto"));
         assert_eq!(requested_model(&json!({})), None);
     }

@@ -225,26 +225,6 @@ impl RouterConfig {
             .collect()
     }
 
-    /// The route with this key.
-    pub fn route(&self, key: &str) -> Option<&Route> {
-        self.routes.iter().find(|route| route.key == key)
-    }
-
-    /// The route a turn takes with no classification: the named fallback, else
-    /// the first route.
-    pub fn fallback_route(&self) -> Option<&Route> {
-        self.fallback
-            .as_deref()
-            .and_then(|key| self.route(key))
-            .or_else(|| self.routes.first())
-    }
-
-    /// Whether a turn is classified at all: routing is optional, and it takes
-    /// a ready classifier and two routes to choose between.
-    pub fn classifies(&self) -> bool {
-        self.classifier.ready() && self.routes.len() > 1
-    }
-
     /// The account with this id.
     pub fn account(&self, id: &str) -> Option<&Account> {
         self.accounts.iter().find(|account| account.id == id)
@@ -325,7 +305,7 @@ mod tests {
         assert!(!config.enabled);
         assert!(config.accounts.is_empty());
         assert_eq!(config.classifier, Classifier::None);
-        assert!(!config.classifies());
+        assert!(!config.classifier.ready());
     }
 
     #[test]
@@ -358,8 +338,7 @@ mod tests {
         };
         save(&agent, &config).unwrap();
         assert_eq!(load(&agent).unwrap(), config);
-        assert!(config.classifies());
-        assert_eq!(config.fallback_route().unwrap().key, "fast");
+        assert!(config.classifier.ready());
         assert_eq!(config.pool("openai").len(), 2);
         assert_eq!(config.pool("kimi").len(), 0);
         #[cfg(unix)]
@@ -396,39 +375,30 @@ mod tests {
     }
 
     #[test]
-    fn a_classifier_with_no_key_never_classifies() {
-        let mut config = RouterConfig {
-            classifier: Classifier::Typesafe {
-                api_key: "  ".into(),
-                model: "jev-latest".into(),
-                base_url: None,
-            },
-            routes: vec![
-                Route {
-                    key: "a".into(),
-                    description: "one".into(),
-                    family: "openai".into(),
-                    model: "m".into(),
-                },
-                Route {
-                    key: "b".into(),
-                    description: "two".into(),
-                    family: "openai".into(),
-                    model: "m".into(),
-                },
-            ],
-            ..RouterConfig::default()
+    fn a_classifier_with_no_key_is_never_ready() {
+        let blank = Classifier::Typesafe {
+            api_key: "  ".into(),
+            model: "jev-latest".into(),
+            base_url: None,
         };
-        assert!(!config.classifies());
-        config.classifier = Classifier::Typesafe {
+        assert!(!blank.ready());
+        let keyed = Classifier::Typesafe {
             api_key: "apikey_1".into(),
             model: "jev-latest".into(),
             base_url: None,
         };
-        assert!(config.classifies());
-        // One route is no choice, so a lone route never spends a classifier call.
-        config.routes.pop();
-        assert!(!config.classifies());
+        assert!(keyed.ready());
+        assert!(!Classifier::Endpoint {
+            base_url: " ".into(),
+            api_key: None,
+            model: "m".into(),
+        }
+        .ready());
+        assert!(!Classifier::Pooled {
+            family: "nobody".into(),
+            model: "m".into(),
+        }
+        .ready());
     }
 
     fn tempdir() -> PathBuf {

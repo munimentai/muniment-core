@@ -490,7 +490,13 @@ fn complete(stream: &mut TcpStream, state: &State, request: &Value) {
         match call {
             Ok(response) => {
                 if wire::streams(request) {
-                    relay_stream(stream, state, &account.id, response);
+                    relay_stream(
+                        stream,
+                        state,
+                        &account.id,
+                        response,
+                        wire::wants_usage(request),
+                    );
                 } else {
                     relay_once(stream, state, &account.id, response);
                 }
@@ -556,8 +562,15 @@ fn relay_once(stream: &mut TcpStream, state: &State, account: &str, response: ur
 }
 
 /// A streamed answer: forward every frame as it arrives, and keep the usage
-/// frame the router asked for off the client's wire.
-fn relay_stream(stream: &mut TcpStream, state: &State, account: &str, response: ureq::Response) {
+/// frame the router asked for off the client's wire unless `keep_usage` says
+/// the client asked for it too.
+fn relay_stream(
+    stream: &mut TcpStream,
+    state: &State,
+    account: &str,
+    response: ureq::Response,
+    keep_usage: bool,
+) {
     let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n";
     if stream.write_all(head.as_bytes()).is_err() {
         return;
@@ -579,7 +592,7 @@ fn relay_stream(stream: &mut TcpStream, state: &State, account: &str, response: 
                     if let Some(counted) = wire::tokens(&chunk) {
                         tokens = counted;
                     }
-                    if wire::usage_only_chunk(&chunk) {
+                    if !keep_usage && wire::usage_only_chunk(&chunk) {
                         // The router asked for this frame. The client did not.
                         continue;
                     }
@@ -865,6 +878,31 @@ mod tests {
         assert_eq!(counted.requests, 1);
         assert_eq!(counted.input_tokens, 100);
         assert_eq!(counted.output_tokens, 7);
+    }
+
+    #[test]
+    fn a_client_that_asked_for_usage_keeps_the_usage_frame() {
+        let agent = agent_dir();
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"be\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":7}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (url, _seen) = upstream(vec![(200, body.to_owned(), true)]);
+        config::save(&agent, &config(vec![account("a1", &url)])).unwrap();
+        let handle = start_with_clock(agent.clone(), fixed_clock).unwrap();
+        let mut request = turn("auto", true);
+        request["stream_options"] = json!({ "include_usage": true });
+        let (status, answered) = call(
+            handle.endpoint(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&request),
+            &handle.endpoint().token,
+        );
+        assert_eq!(status, 200);
+        assert!(answered.contains("prompt_tokens"));
+        assert_eq!(usage::load(&agent).account("a1").unwrap().input_tokens, 100);
     }
 
     #[test]

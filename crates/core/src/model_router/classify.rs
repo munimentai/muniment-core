@@ -263,12 +263,11 @@ fn ask_pool(call: PoolCall<'_>, state: &str, now_ms: i64, timeout: Duration) -> 
         .send_json(&body)
         .ok()
         .and_then(|response| response.into_json::<Value>().ok());
+    // A call the upstream refused or never answered spent nothing the ledger
+    // can count, and naming the account here would record a served turn on
+    // an account that just refused one.
     let Some(answered) = answered else {
-        return Asked {
-            answer: None,
-            spent_on: Some(account.id.clone()),
-            spent: Tokens::default(),
-        };
+        return empty;
     };
     Asked {
         answer: answered
