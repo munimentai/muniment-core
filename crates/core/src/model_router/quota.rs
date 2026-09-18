@@ -765,6 +765,15 @@ pub fn probe_devin(session_token: &str, now_ms: i64, timeout: Duration) -> Optio
     parse_devin_status(&answer, now_ms)
 }
 
+/// Whether the router has a usage route for this sign-in provider. xAI has
+/// none, so its card says what the router cannot read.
+pub fn has_reader(provider: &str) -> bool {
+    matches!(
+        provider,
+        "openai-codex" | "anthropic" | "kimi" | "antigravity" | "devin"
+    )
+}
+
 /// Asks the account's upstream what it has left. A key has no window to ask
 /// about, and a provider with no usage route answers nothing.
 pub fn probe(account: &Account, now_ms: i64, timeout: Duration) -> Option<Quota> {
@@ -968,6 +977,8 @@ mod tests {
             ..account
         };
         assert_eq!(probe(&xai, 0, Duration::from_millis(50)), None);
+        assert!(!has_reader("xai"));
+        assert!(has_reader("anthropic") && has_reader("openai-codex"));
     }
 
     #[test]

@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::config::{self, RouterConfig};
+use super::native_auth;
 use super::usage::{self, Ledger};
 use super::{balance, plan, served_models, wire, ResolveError};
 
@@ -35,6 +36,8 @@ const BODY_LIMIT: usize = 32 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const READ_TIMEOUT: Duration = Duration::from_secs(600);
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
+/// How long a token refresh may take before the turn moves on.
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// The port and token Pi reaches the router on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -412,7 +415,7 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 /// One chat turn: plan it once, send it, and fail over to the next account
 /// when the upstream refuses the account rather than the request.
 fn complete(stream: &mut TcpStream, state: &State, request: &Value) {
-    let config = state.config();
+    let mut config = state.config();
     let requested = wire::requested_model(request).unwrap_or(config::AUTO_MODEL);
     let text = wire::classifier_state(request);
     // The turn classifies once. A failover picks another account against the
@@ -460,6 +463,32 @@ fn complete(stream: &mut TcpStream, state: &State, request: &Value) {
                     &wire::error_body(&message, "router_error"),
                 );
                 return;
+            }
+        };
+        // A token inside a minute of dying is traded for a fresh one first, and
+        // the pool keeps the fresh one, so this turn and the ones behind it go
+        // out on a live token. A refused refresh is the account refused.
+        let account = match native_auth::refresh_if_expiring(
+            &account.credential,
+            (state.now_ms)(),
+            REFRESH_TIMEOUT,
+        ) {
+            None => account.clone(),
+            Some(Ok(credential)) => {
+                let mut fresh = account.clone();
+                fresh.credential = credential;
+                let mut saved = config.clone();
+                if let Some(entry) = saved.accounts.iter_mut().find(|entry| entry.id == fresh.id) {
+                    entry.credential = fresh.credential.clone();
+                }
+                let _ = config::save(&state.agent, &saved);
+                config = saved;
+                fresh
+            }
+            Some(Err(message)) => {
+                state.record_error(&account.id, &message, true);
+                refusals.push(message);
+                continue;
             }
         };
         let Some(upstream) = account.upstream() else {
