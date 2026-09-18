@@ -46,6 +46,7 @@ pub mod model_acquisition_transport;
 pub mod model_artifact;
 pub mod model_install;
 pub mod model_install_native;
+pub mod model_router;
 pub mod onnx_runtime;
 pub mod owned_threads;
 pub mod permission_gate;

@@ -1,0 +1,224 @@
+//! Reading and writing the OpenAI chat wire the router speaks on both sides.
+//!
+//! Pi sends the router an OpenAI chat completion request. The router sends the
+//! picked account's upstream the same request with the model swapped, and
+//! relays the answer back. Everything the router needs to read out of that
+//! traffic lives here: the turn's text for the classifier, the model the
+//! request names, and the token counts the ledger records.
+
+use serde_json::Value;
+
+/// The token counts one turn spent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Tokens {
+    pub input: u64,
+    pub output: u64,
+}
+
+/// The model an OpenAI chat request names.
+pub fn requested_model(request: &Value) -> Option<&str> {
+    request.get("model")?.as_str()
+}
+
+/// Whether the request asks for a streamed answer.
+pub fn streams(request: &Value) -> bool {
+    request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// The turn's text for the classifier: the last user message, flattened out of
+/// whichever content shape the client sent.
+pub fn classifier_state(request: &Value) -> String {
+    let Some(messages) = request.get("messages").and_then(Value::as_array) else {
+        return String::new();
+    };
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .map(message_text)
+        .unwrap_or_default()
+}
+
+/// One message's text, from a string body or from the text parts of a list.
+fn message_text(message: &Value) -> String {
+    match message.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// The request the upstream receives: the same request with the model the
+/// router resolved, and, on a streamed turn, the usage chunk asked for so the
+/// ledger can count a stream. The router drops that chunk before the client
+/// sees it.
+pub fn upstream_request(request: &Value, model: &str) -> Value {
+    let mut upstream = request.clone();
+    if let Some(object) = upstream.as_object_mut() {
+        object.insert("model".into(), Value::String(model.to_owned()));
+        if streams(request) {
+            object.insert(
+                "stream_options".into(),
+                serde_json::json!({ "include_usage": true }),
+            );
+        }
+    }
+    upstream
+}
+
+/// The token counts in an answer, from the `usage` object either side sends.
+pub fn tokens(value: &Value) -> Option<Tokens> {
+    let usage = value.get("usage")?;
+    if usage.is_null() {
+        return None;
+    }
+    let count = |names: [&str; 2]| -> u64 {
+        names
+            .iter()
+            .find_map(|name| usage.get(*name).and_then(Value::as_u64))
+            .unwrap_or(0)
+    };
+    Some(Tokens {
+        input: count(["prompt_tokens", "input_tokens"]),
+        output: count(["completion_tokens", "output_tokens"]),
+    })
+}
+
+/// Whether a streamed chunk carries only usage, which is the chunk the router
+/// asked for itself and keeps off the client's wire.
+pub fn usage_only_chunk(chunk: &Value) -> bool {
+    let empty_choices = chunk
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| choices.is_empty());
+    empty_choices && tokens(chunk).is_some()
+}
+
+/// The OpenAI model list the router answers `/v1/models` with.
+pub fn model_list(models: &[String]) -> Value {
+    serde_json::json!({
+        "object": "list",
+        "data": models
+            .iter()
+            .map(|id| serde_json::json!({
+                "id": id,
+                "object": "model",
+                "owned_by": super::config::ROUTER_PROVIDER,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// The error body the router answers a failed turn with, in the shape an
+/// OpenAI client already reads.
+pub fn error_body(message: &str, kind: &str) -> Value {
+    serde_json::json!({ "error": { "message": message, "type": kind } })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn request() -> Value {
+        json!({
+            "model": "auto",
+            "stream": true,
+            "messages": [
+                { "role": "system", "content": "You are muniment." },
+                { "role": "user", "content": "First question" },
+                { "role": "assistant", "content": "First answer" },
+                { "role": "user", "content": [
+                    { "type": "text", "text": "Why did the build fail?" },
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,AA" } },
+                    { "type": "text", "text": "Read the log." }
+                ]}
+            ]
+        })
+    }
+
+    #[test]
+    fn the_classifier_sees_the_last_user_turn_whatever_shape_it_came_in() {
+        assert_eq!(
+            classifier_state(&request()),
+            "Why did the build fail?\nRead the log."
+        );
+        assert_eq!(
+            classifier_state(&json!({ "messages": [{ "role": "user", "content": "plain" }] })),
+            "plain"
+        );
+        assert_eq!(classifier_state(&json!({})), "");
+        assert_eq!(
+            classifier_state(&json!({ "messages": [{ "role": "system", "content": "s" }] })),
+            ""
+        );
+    }
+
+    #[test]
+    fn the_upstream_request_carries_the_resolved_model_and_asks_a_stream_to_count() {
+        let upstream = upstream_request(&request(), "gpt-5.6-mini");
+        assert_eq!(upstream["model"], "gpt-5.6-mini");
+        assert_eq!(upstream["stream_options"]["include_usage"], true);
+        assert_eq!(upstream["messages"], request()["messages"]);
+
+        let once = json!({ "model": "auto", "messages": [] });
+        let upstream = upstream_request(&once, "claude-opus-5");
+        assert_eq!(upstream["model"], "claude-opus-5");
+        assert!(upstream.get("stream_options").is_none());
+        assert!(!streams(&once));
+        assert!(streams(&request()));
+        assert_eq!(requested_model(&once), Some("auto"));
+        assert_eq!(requested_model(&json!({})), None);
+    }
+
+    #[test]
+    fn both_token_spellings_read_as_the_same_counts() {
+        assert_eq!(
+            tokens(&json!({ "usage": { "prompt_tokens": 312, "completion_tokens": 48 } })),
+            Some(Tokens {
+                input: 312,
+                output: 48
+            })
+        );
+        assert_eq!(
+            tokens(&json!({ "usage": { "input_tokens": 7, "output_tokens": 2 } })),
+            Some(Tokens {
+                input: 7,
+                output: 2
+            })
+        );
+        assert_eq!(tokens(&json!({ "usage": null })), None);
+        assert_eq!(tokens(&json!({})), None);
+        assert_eq!(tokens(&json!({ "usage": {} })), Some(Tokens::default()));
+    }
+
+    #[test]
+    fn the_usage_chunk_is_the_one_with_no_choices() {
+        assert!(usage_only_chunk(&json!({
+            "choices": [],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 3 }
+        })));
+        assert!(!usage_only_chunk(&json!({
+            "choices": [{ "delta": { "content": "hi" } }],
+            "usage": null
+        })));
+        assert!(!usage_only_chunk(&json!({ "choices": [] })));
+    }
+
+    #[test]
+    fn the_model_list_reads_as_an_openai_list() {
+        let list = model_list(&["auto".to_owned(), "deep".to_owned()]);
+        assert_eq!(list["object"], "list");
+        assert_eq!(list["data"][0]["id"], "auto");
+        assert_eq!(list["data"][1]["id"], "deep");
+        assert_eq!(list["data"][0]["owned_by"], "muniment-router");
+        assert_eq!(error_body("no", "router_error")["error"]["message"], "no");
+    }
+}
