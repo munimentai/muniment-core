@@ -53,6 +53,45 @@ pub enum Credential {
 }
 
 impl Credential {
+    /// The same subscription has the same provider and upstream account id.
+    /// Email is the fallback only when neither sign-in names an account id.
+    pub fn same_subscription(&self, other: &Self) -> bool {
+        let (
+            Self::Subscription {
+                provider,
+                account_id,
+                email,
+                ..
+            },
+            Self::Subscription {
+                provider: other_provider,
+                account_id: other_id,
+                email: other_email,
+                ..
+            },
+        ) = (self, other)
+        else {
+            return false;
+        };
+        if provider != other_provider {
+            return false;
+        }
+        fn nonempty(value: &Option<String>) -> Option<&str> {
+            value
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+        }
+        match (nonempty(account_id), nonempty(other_id)) {
+            (Some(id), Some(other)) => id == other,
+            (None, None) => match (nonempty(email), nonempty(other_email)) {
+                (Some(email), Some(other)) => email.eq_ignore_ascii_case(other),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     /// The bearer value an upstream request carries, when one is ready.
     pub fn bearer(&self) -> &str {
         match self {
@@ -305,6 +344,22 @@ fn default_confidence() -> f64 {
 }
 
 impl RouterConfig {
+    /// Refreshes a matching subscription without changing its local id or
+    /// settings. Usage and quota stay attached to that id.
+    pub fn import_account(&mut self, account: Account) -> String {
+        if let Some(existing) = self
+            .accounts
+            .iter_mut()
+            .find(|existing| existing.credential.same_subscription(&account.credential))
+        {
+            existing.credential = account.credential;
+            return existing.id.clone();
+        }
+        let id = account.id.clone();
+        self.accounts.push(account);
+        id
+    }
+
     /// Every account of one family, in configured order.
     pub fn pool(&self, family: &str) -> Vec<&Account> {
         self.accounts
@@ -327,8 +382,19 @@ pub fn config_path(agent: &Path) -> PathBuf {
 /// Reads the record, or the default when no record exists yet.
 pub fn load(agent: &Path) -> io::Result<RouterConfig> {
     match fs::read(config_path(agent)) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+        Ok(bytes) => {
+            let mut config: RouterConfig = serde_json::from_slice(&bytes)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            let accounts = std::mem::take(&mut config.accounts);
+            let count = accounts.len();
+            for account in accounts {
+                config.import_account(account);
+            }
+            if config.accounts.len() != count {
+                save(agent, &config)?;
+            }
+            Ok(config)
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(RouterConfig::default()),
         Err(error) => Err(error),
     }
@@ -384,6 +450,179 @@ mod tests {
             enabled: true,
             weight: 1,
         }
+    }
+
+    fn subscription(
+        id: &str,
+        provider: &str,
+        upstream_id: Option<&str>,
+        email: Option<&str>,
+    ) -> Account {
+        let mut account = key_account(id, "openai");
+        account.credential = Credential::Subscription {
+            provider: provider.into(),
+            access: format!("access-{id}"),
+            refresh: Some(format!("refresh-{id}")),
+            expires_ms: Some(1_900_000_000_000),
+            account_id: upstream_id.map(str::to_owned),
+            email: email.map(str::to_owned),
+            plan: None,
+            renews_at_ms: None,
+        };
+        account
+    }
+
+    #[test]
+    fn a_repeat_sign_in_refreshes_the_credential_and_keeps_the_account() {
+        let mut original = subscription(
+            "first",
+            "openai-codex",
+            Some("acct-1"),
+            Some("old@example.com"),
+        );
+        original.label = "Work account".into();
+        original.enabled = false;
+        original.weight = 7;
+        original.models = vec!["gpt-5.6".into()];
+        original.base_url = Some("http://127.0.0.1:8317/v1".into());
+        let mut config = RouterConfig::default();
+        assert_eq!(config.import_account(original.clone()), "first");
+        let fresh = subscription(
+            "second",
+            "openai-codex",
+            Some("acct-1"),
+            Some("new@example.com"),
+        );
+        assert_eq!(config.import_account(fresh.clone()), "first");
+        original.credential = fresh.credential;
+        assert_eq!(config.accounts, vec![original]);
+    }
+
+    #[test]
+    fn subscription_identity_uses_the_provider_and_id_before_email() {
+        let credential =
+            |provider, id, email| subscription("local", provider, id, email).credential;
+        let first = credential("openai-codex", Some("acct-1"), Some("work@example.com"));
+        assert!(first.same_subscription(&credential("openai-codex", Some("acct-1"), None)));
+        assert!(!first.same_subscription(&credential(
+            "openai-codex",
+            Some("acct-2"),
+            Some("work@example.com")
+        )));
+        assert!(!first.same_subscription(&credential(
+            "other",
+            Some("acct-1"),
+            Some("work@example.com")
+        )));
+        assert!(!first.same_subscription(&credential(
+            "openai-codex",
+            None,
+            Some("work@example.com")
+        )));
+        let email_only = credential("xai", None, Some(" Work@Example.com "));
+        assert!(email_only.same_subscription(&credential(
+            "xai",
+            Some(" "),
+            Some("work@example.com")
+        )));
+        assert!(!email_only.same_subscription(&credential(
+            "anthropic",
+            None,
+            Some("work@example.com")
+        )));
+        assert!(!email_only.same_subscription(&credential("xai", None, Some("other@example.com"))));
+        for email in [None, Some(""), Some(" ")] {
+            let anonymous = credential("anthropic", None, email);
+            assert!(!anonymous.same_subscription(&anonymous));
+        }
+        let key = key_account("key", "openai").credential;
+        assert!(!key.same_subscription(&key));
+        assert!(!first.same_subscription(&key));
+    }
+
+    #[test]
+    fn loading_collapses_old_duplicates_and_preserves_usage_and_quota() {
+        use super::super::{quota, usage};
+
+        let agent = tempdir();
+        let first = subscription(
+            "first",
+            "openai-codex",
+            Some("acct-1"),
+            Some("work@example.com"),
+        );
+        let second = subscription(
+            "second",
+            "openai-codex",
+            Some("acct-1"),
+            Some("work@example.com"),
+        );
+        let latest = subscription(
+            "latest",
+            "openai-codex",
+            Some("acct-1"),
+            Some("work@example.com"),
+        );
+        let email_first = subscription("email-first", "xai", None, Some("work@example.com"));
+        let email_latest = subscription("email-latest", "xai", None, Some("WORK@example.com"));
+        let other = subscription(
+            "other",
+            "openai-codex",
+            Some("acct-2"),
+            Some("work@example.com"),
+        );
+        let key = key_account("key", "openai");
+        let config = RouterConfig {
+            enabled: true,
+            accounts: vec![
+                first.clone(),
+                second,
+                latest.clone(),
+                email_first.clone(),
+                email_latest.clone(),
+                other.clone(),
+                key.clone(),
+            ],
+            ..RouterConfig::default()
+        };
+        save(&agent, &config).unwrap();
+        let mut ledger = usage::Ledger::default();
+        ledger.record_success("first", "2026-09-18", 1234, 100, 25);
+        ledger.record_error("first", "2026-09-18", 1235, "rate limit", true);
+        usage::save(&agent, &ledger).unwrap();
+        let mut quotas = quota::QuotaStore::default();
+        quotas.accounts.insert(
+            "first".into(),
+            quota::Quota {
+                plan: Some("pro".into()),
+                observed_at_ms: 1234,
+                banked_resets: Some(2),
+                ..quota::Quota::default()
+            },
+        );
+        quota::save(&agent, &quotas).unwrap();
+        let usage_before = fs::read(usage::usage_path(&agent)).unwrap();
+        let quota_before = fs::read(quota::quota_path(&agent)).unwrap();
+
+        let loaded = load(&agent).unwrap();
+        let mut expected_first = first;
+        expected_first.credential = latest.credential;
+        let mut expected_email = email_first;
+        expected_email.credential = email_latest.credential;
+        assert_eq!(
+            loaded.accounts,
+            vec![expected_first, expected_email, other, key]
+        );
+        assert!(loaded.enabled);
+        let persisted: RouterConfig =
+            serde_json::from_slice(&fs::read(config_path(&agent)).unwrap()).unwrap();
+        assert_eq!(persisted, loaded);
+        assert_eq!(load(&agent).unwrap(), loaded);
+        assert_eq!(usage::load(&agent), ledger);
+        assert_eq!(quota::load(&agent), quotas);
+        assert_eq!(fs::read(usage::usage_path(&agent)).unwrap(), usage_before);
+        assert_eq!(fs::read(quota::quota_path(&agent)).unwrap(), quota_before);
+        fs::remove_dir_all(agent).unwrap();
     }
 
     #[test]
