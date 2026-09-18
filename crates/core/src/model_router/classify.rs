@@ -1,11 +1,11 @@
 //! The optional query classifier that picks a route.
 //!
-//! Routing is optional. With no classifier every turn takes the fallback
-//! route and the balancer still spreads it across the pool. With one, the
-//! turn's last user message goes to the classifier as one `choice` question
-//! whose options are the user's own routes, and the answer names the route.
-//! A confidence under the configured floor takes the fallback instead, so a
-//! guess never silently picks the expensive model.
+//! Routing is optional. With no classifier every turn takes the fallback and
+//! the balancer still spreads it across the pool. With one, the turn's last
+//! user message goes to the classifier as one `choice` question whose options
+//! are every model the pools serve, each carrying the statement that says what
+//! work it wins. A confidence under the configured floor takes the fallback
+//! instead, so a guess never silently picks the expensive model.
 //!
 //! The classifier is a network call to a service the user names, so it sends
 //! the turn's text off the machine. Settings says so, and the default is off.
@@ -33,7 +33,7 @@ pub const STATE_LIMIT: usize = 8_000;
 /// Why a turn took the route it took.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
-    /// No classifier is configured, or there is only one route.
+    /// No classifier is configured, or only one model is in the running.
     NotClassified,
     /// The classifier answered above the confidence floor.
     Classified,
@@ -81,11 +81,14 @@ impl Decision {
 /// What a pooled classifier is told, so a small model answers in one shape.
 pub const POOLED_SYSTEM: &str = "You are a router. Read the request and pick exactly one option. Answer with one JSON object and nothing else: {\"choice\": \"<option name>\", \"confidence\": <0 to 1>}. The confidence is your own probability that the option is right.";
 
-/// The `choice` question for this configuration's routes.
-pub fn question(config: &RouterConfig, state: &str) -> Value {
+/// The `choice` question over every model in the running.
+pub fn question(config: &RouterConfig, options: &[Route], state: &str) -> Value {
     let mut criteria = serde_json::Map::new();
-    for route in &config.routes {
-        criteria.insert(route.key.clone(), Value::String(route.description.clone()));
+    for option in options {
+        criteria.insert(
+            option.key.clone(),
+            Value::String(option.description.clone()),
+        );
     }
     let model = config.classifier.model().to_owned();
     json!({
@@ -139,27 +142,42 @@ fn endpoint(classifier: &Classifier) -> Option<(String, Option<String>)> {
 /// failure lands on the fallback.
 pub fn decide(
     config: &RouterConfig,
+    options: &[Route],
     ledger: &Ledger,
     state: &str,
     now_ms: i64,
     timeout: Duration,
 ) -> Option<Decision> {
-    let fallback = config.fallback_route()?.clone();
-    if !config.classifies() {
+    let fallback = super::fallback(config, options)?.clone();
+    if !super::classifies(config, options) {
         return Some(Decision::plain(fallback, 0.0, Reason::NotClassified));
     }
     let asked = match &config.classifier {
-        Classifier::Pooled { family, model } => {
-            ask_pool(config, ledger, family, model, state, now_ms, timeout)
-        }
+        Classifier::Pooled { family, model } => ask_pool(
+            PoolCall {
+                config,
+                options,
+                ledger,
+                family,
+                model,
+            },
+            state,
+            now_ms,
+            timeout,
+        ),
         _ => {
             let Some((url, bearer)) = endpoint(&config.classifier) else {
                 return Some(Decision::plain(fallback, 0.0, Reason::NotClassified));
             };
             Asked {
-                answer: ask(&url, bearer.as_deref(), &question(config, state), timeout)
-                    .as_ref()
-                    .and_then(parse),
+                answer: ask(
+                    &url,
+                    bearer.as_deref(),
+                    &question(config, options, state),
+                    timeout,
+                )
+                .as_ref()
+                .and_then(parse),
                 spent_on: None,
                 spent: Tokens::default(),
             }
@@ -175,7 +193,7 @@ pub fn decide(
     let Some((key, confidence)) = asked.answer.clone() else {
         return Some(settle(fallback, 0.0, Reason::Failed));
     };
-    let Some(route) = config.route(&key) else {
+    let Some(route) = options.iter().find(|option| option.key == key) else {
         return Some(settle(fallback, confidence, Reason::Failed));
     };
     if confidence < config.min_confidence {
@@ -191,17 +209,25 @@ struct Asked {
     spent: Tokens,
 }
 
+/// The pool one classifier call reaches, and the choice it is given.
+struct PoolCall<'a> {
+    config: &'a RouterConfig,
+    options: &'a [Route],
+    ledger: &'a Ledger,
+    family: &'a str,
+    model: &'a str,
+}
+
 /// A pooled classifier: the balancer picks an account of the classifier's
 /// family and a small model on it answers the same choice as JSON.
-fn ask_pool(
-    config: &RouterConfig,
-    ledger: &Ledger,
-    family: &str,
-    model: &str,
-    state: &str,
-    now_ms: i64,
-    timeout: Duration,
-) -> Asked {
+fn ask_pool(call: PoolCall<'_>, state: &str, now_ms: i64, timeout: Duration) -> Asked {
+    let PoolCall {
+        config,
+        options,
+        ledger,
+        family,
+        model,
+    } = call;
     let empty = Asked {
         answer: None,
         spent_on: None,
@@ -213,17 +239,16 @@ fn ask_pool(
     let Some(upstream) = account.upstream() else {
         return empty;
     };
-    let options = config
-        .routes
+    let listed = options
         .iter()
-        .map(|route| format!("- {}: {}", route.key, route.description))
+        .map(|option| format!("- {}: {}", option.key, option.description))
         .collect::<Vec<_>>()
         .join("\n");
     let body = json!({
         "model": model,
         "temperature": 0,
         "messages": [
-            { "role": "system", "content": format!("{POOLED_SYSTEM}\n\nThe options:\n{options}") },
+            { "role": "system", "content": format!("{POOLED_SYSTEM}\n\nThe options:\n{listed}") },
             { "role": "user", "content": clip(state) },
         ],
     });
@@ -379,10 +404,23 @@ mod tests {
         }
     }
 
+    /// One decision over a configuration's own routes as the option set, which
+    /// is what `options` builds from a pool that serves exactly those models.
+    fn decided(config: &RouterConfig, state: &str, timeout: Duration) -> Option<Decision> {
+        decide(
+            config,
+            &config.routes,
+            &Ledger::default(),
+            state,
+            1_000,
+            timeout,
+        )
+    }
+
     #[test]
     fn the_question_carries_every_route_as_an_option() {
         let config = routed(typesafe(None));
-        let question = question(&config, "Why did the build fail?");
+        let question = question(&config, &config.routes, "Why did the build fail?");
         assert_eq!(question["state"], "Why did the build fail?");
         assert_eq!(question["model"], "jev-latest");
         let choice = &question["questions"][QUESTION];
@@ -415,15 +453,12 @@ mod tests {
     #[test]
     fn with_no_classifier_every_turn_takes_the_fallback() {
         let config = routed(Classifier::None);
-        let decision = decide(&config, &Ledger::default(), "anything", 1_000, TIMEOUT).unwrap();
+        let decision = decided(&config, "anything", TIMEOUT).unwrap();
         assert_eq!(decision.route.key, "fast");
         assert_eq!(decision.reason, Reason::NotClassified);
         // No route at all means the router has nothing to route to.
         let empty = RouterConfig::default();
-        assert_eq!(
-            decide(&empty, &Ledger::default(), "anything", 1_000, TIMEOUT),
-            None
-        );
+        assert_eq!(decided(&empty, "anything", TIMEOUT), None);
     }
 
     #[test]
@@ -431,14 +466,8 @@ mod tests {
         let server = mock(json!({ "answers": { "route": {
             "choice": "deep", "confidence": 0.82
         }}}));
-        let decision = decide(
-            &routed(typesafe(Some(server.url.clone()))),
-            &Ledger::default(),
-            "prove it",
-            1_000,
-            TIMEOUT,
-        )
-        .unwrap();
+        let config = routed(typesafe(Some(server.url.clone())));
+        let decision = decided(&config, "prove it", TIMEOUT).unwrap();
         assert_eq!(decision.route.key, "deep");
         assert_eq!(decision.route.model, "claude-opus-5");
         assert_eq!(decision.reason, Reason::Classified);
@@ -447,14 +476,8 @@ mod tests {
         let weak = mock(json!({ "answers": { "route": {
             "choice": "deep", "confidence": 0.2
         }}}));
-        let decision = decide(
-            &routed(typesafe(Some(weak.url))),
-            &Ledger::default(),
-            "prove it",
-            1_000,
-            TIMEOUT,
-        )
-        .unwrap();
+        let weak_config = routed(typesafe(Some(weak.url)));
+        let decision = decided(&weak_config, "prove it", TIMEOUT).unwrap();
         assert_eq!(decision.route.key, "fast");
         assert_eq!(decision.reason, Reason::LowConfidence);
         assert_eq!(decision.confidence, 0.2);
@@ -465,27 +488,14 @@ mod tests {
     fn a_classifier_that_does_not_answer_never_fails_the_turn() {
         // Nothing listens on port 9, so the call fails at the transport.
         let config = routed(typesafe(Some("http://127.0.0.1:9/v1/systemone".into())));
-        let decision = decide(
-            &config,
-            &Ledger::default(),
-            "prove it",
-            1_000,
-            Duration::from_millis(300),
-        )
-        .unwrap();
+        let decision = decided(&config, "prove it", Duration::from_millis(300)).unwrap();
         assert_eq!(decision.route.key, "fast");
         assert_eq!(decision.reason, Reason::Failed);
 
         // An answer naming a route the configuration lost also falls back.
         let stray = mock(json!({ "answers": { "route": { "choice": "gone", "confidence": 0.99 }}}));
-        let decision = decide(
-            &routed(typesafe(Some(stray.url))),
-            &Ledger::default(),
-            "prove it",
-            1_000,
-            TIMEOUT,
-        )
-        .unwrap();
+        let stray_config = routed(typesafe(Some(stray.url)));
+        let decision = decided(&stray_config, "prove it", TIMEOUT).unwrap();
         assert_eq!(decision.route.key, "fast");
         assert_eq!(decision.reason, Reason::Failed);
     }
@@ -525,7 +535,7 @@ mod tests {
             Some(("fast".to_owned(), 0.9))
         );
         assert_eq!(
-            parse_pooled_answer("Here you go: {\"choice\":\"fast\"} — hope that helps."),
+            parse_pooled_answer("Here you go: {\"choice\":\"fast\"} and I hope that helps."),
             Some(("fast".to_owned(), 1.0))
         );
         // A confidence outside the range is pulled back into it.
@@ -562,7 +572,7 @@ mod tests {
             enabled: true,
             weight: 1,
         });
-        let decision = decide(&config, &Ledger::default(), "prove it", 1_000, TIMEOUT).unwrap();
+        let decision = decided(&config, "prove it", TIMEOUT).unwrap();
         assert_eq!(decision.route.key, "deep");
         assert_eq!(decision.reason, Reason::Classified);
         assert_eq!(decision.confidence, 0.91);
@@ -578,7 +588,7 @@ mod tests {
             family: "openai".into(),
             model: "gpt-5.6-nano".into(),
         });
-        let decision = decide(&config, &Ledger::default(), "prove it", 1_000, TIMEOUT).unwrap();
+        let decision = decided(&config, "prove it", TIMEOUT).unwrap();
         assert_eq!(decision.route.key, "fast");
         assert_eq!(decision.reason, Reason::Failed);
         assert_eq!(decision.spent_on, None);

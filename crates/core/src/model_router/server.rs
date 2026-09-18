@@ -621,7 +621,8 @@ mod tests {
                 key: format!("sk-{id}"),
             },
             base_url: Some(base_url.to_owned()),
-            models: Vec::new(),
+            // The one model this pool serves, so the option set is exactly it.
+            models: vec!["gpt-5.6-mini".to_owned()],
             enabled: true,
             weight: 1,
         }
@@ -910,7 +911,7 @@ mod tests {
             &endpoint.token,
         );
         assert_eq!(status, 503);
-        assert!(body.contains("No account is connected"));
+        assert!(body.contains("No model is in the running"));
         let (status, _) = call(
             endpoint,
             "POST",

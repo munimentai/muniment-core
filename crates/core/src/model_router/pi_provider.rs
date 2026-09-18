@@ -73,6 +73,16 @@ mod tests {
     fn routed() -> RouterConfig {
         RouterConfig {
             enabled: true,
+            accounts: vec![crate::model_router::config::Account {
+                id: "a1".into(),
+                family: "openai".into(),
+                label: "work".into(),
+                credential: crate::model_router::config::Credential::ApiKey { key: "sk".into() },
+                base_url: None,
+                models: vec!["gpt-5.6-mini".into()],
+                enabled: true,
+                weight: 1,
+            }],
             routes: vec![Route {
                 key: "fast".into(),
                 description: "A short question".into(),
@@ -92,7 +102,7 @@ mod tests {
         assert_eq!(entry["apiKey"], "t0ken");
         assert_eq!(entry["models"][0]["id"], "auto");
         assert_eq!(entry["models"][1]["id"], "fast");
-        assert_eq!(entry["models"][2]["id"], "openai/gpt-5.6-mini");
+        assert_eq!(entry["models"].as_array().unwrap().len(), 2);
     }
 
     #[test]

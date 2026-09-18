@@ -15,13 +15,14 @@ pub mod balance;
 pub mod classify;
 pub mod config;
 pub mod family;
+pub mod model_catalog;
 pub mod pi_provider;
 pub mod server;
 pub mod usage;
 pub mod wire;
 
 use classify::Reason;
-use config::{RouterConfig, AUTO_MODEL};
+use config::{Route, RouterConfig, AUTO_MODEL};
 use usage::Ledger;
 
 /// Which account serves this turn, on which model, and how it was picked.
@@ -59,29 +60,114 @@ impl ResolveError {
             Self::UnknownModel(model) => {
                 format!("The router does not serve the model {model}.")
             }
-            Self::NoRoute => "The router has no route. Add one in Settings → Models.".into(),
+            Self::NoRoute => {
+                "No model is in the running. Add an account in Settings → Models.".into()
+            }
             Self::Pool(error) => error.message(),
         }
     }
 }
 
-/// The models the router serves, as an OpenAI-compatible list: `auto` when
-/// there is a route to take, then each route by name, then every
-/// `family/model` pair a route names.
-pub fn served_models(config: &RouterConfig) -> Vec<String> {
-    let mut models = Vec::new();
-    if config.fallback_route().is_some() {
-        models.push(AUTO_MODEL.to_owned());
-    }
-    for route in &config.routes {
-        if !models.iter().any(|known| known == &route.key) {
-            models.push(route.key.clone());
+/// Every model in the running: each model an enabled account can serve, keyed
+/// `family/model` and described by the catalog statement the classifier reads.
+///
+/// The set is the pool, not a list anyone maintains: connect an account and
+/// its models are in the running at once. A user route replaces the entry for
+/// its model, taking that entry's place under its own name and words, so one
+/// model is never two options.
+pub fn options(config: &RouterConfig) -> Vec<Route> {
+    let mut options: Vec<Route> = Vec::new();
+    for account in config
+        .accounts
+        .iter()
+        .filter(|account| account.enabled && account.weight > 0)
+    {
+        // An account that names no model serves every model of its family.
+        let models: Vec<String> = if account.models.is_empty() {
+            model_catalog::family_models(&account.family)
+                .iter()
+                .map(|entry| entry.model.to_owned())
+                .collect()
+        } else {
+            account.models.clone()
+        };
+        for model in models {
+            let key = format!("{}/{}", account.family, model);
+            if options.iter().any(|known| known.key == key) {
+                continue;
+            }
+            // A model the catalog does not describe still runs. Its id is all
+            // the classifier gets, so a user route is the way to describe it.
+            let description = model_catalog::entry(&account.family, &model)
+                .map(|entry| entry.statement())
+                .unwrap_or_else(|| format!("The model {model}, which carries no description."));
+            options.push(Route {
+                key,
+                description,
+                family: account.family.clone(),
+                model,
+            });
         }
     }
     for route in &config.routes {
-        let pair = format!("{}/{}", route.family, route.model);
-        if !models.iter().any(|known| known == &pair) {
-            models.push(pair);
+        let Some(existing) = options
+            .iter_mut()
+            .find(|known| known.family == route.family && known.model == route.model)
+        else {
+            continue;
+        };
+        if !route.key.trim().is_empty() {
+            existing.key = route.key.clone();
+        }
+        if !route.description.trim().is_empty() {
+            existing.description = route.description.clone();
+        }
+    }
+    options
+}
+
+/// The option a turn takes with no classification: the one the configuration
+/// names, else the cheapest model in the running, else the first option.
+pub fn fallback<'a>(config: &RouterConfig, options: &'a [Route]) -> Option<&'a Route> {
+    if let Some(named) = config
+        .fallback
+        .as_deref()
+        .and_then(|key| options.iter().find(|option| option.key == key))
+    {
+        return Some(named);
+    }
+    options
+        .iter()
+        .min_by(|left, right| {
+            let price = |route: &Route| {
+                model_catalog::entry(&route.family, &route.model)
+                    .map(|entry| entry.price)
+                    // A model with no catalog price sorts last, never first:
+                    // an unknown cost is not a cheap one.
+                    .unwrap_or(f64::MAX)
+            };
+            price(left).total_cmp(&price(right))
+        })
+        .or_else(|| options.first())
+}
+
+/// Whether a turn is classified: it takes a ready classifier and two models in
+/// the running to choose between.
+pub fn classifies(config: &RouterConfig, options: &[Route]) -> bool {
+    config.classifier.ready() && options.len() > 1
+}
+
+/// The models the router serves, as an OpenAI-compatible list: `auto` while
+/// anything is in the running, then every option by name.
+pub fn served_models(config: &RouterConfig) -> Vec<String> {
+    let options = options(config);
+    let mut models = Vec::new();
+    if !options.is_empty() {
+        models.push(AUTO_MODEL.to_owned());
+    }
+    for option in &options {
+        if !models.iter().any(|known| known == &option.key) {
+            models.push(option.key.clone());
         }
     }
     models
@@ -123,8 +209,9 @@ pub fn plan(
         }
     }
 
+    let options = options(config);
     if requested == AUTO_MODEL {
-        let decision = classify::decide(config, ledger, state, now_ms, classify::TIMEOUT)
+        let decision = classify::decide(config, &options, ledger, state, now_ms, classify::TIMEOUT)
             .ok_or(ResolveError::NoRoute)?;
         return Ok(Plan {
             family: decision.route.family.clone(),
@@ -136,18 +223,15 @@ pub fn plan(
             classifier_spent: decision.spent,
         });
     }
-    if let Some(route) = config.route(requested) {
+    if let Some(option) = options.iter().find(|option| option.key == requested) {
         return Ok(named(
-            route.family.clone(),
-            route.model.clone(),
-            route.key.clone(),
+            option.family.clone(),
+            option.model.clone(),
+            option.key.clone(),
         ));
     }
-    if let Some((family, model)) = requested.split_once('/') {
-        if family::family(family).is_some() && !model.is_empty() {
-            return Ok(named(family.to_owned(), model.to_owned(), String::new()));
-        }
-    }
+    // The router serves what it lists and nothing else, so a pair no account
+    // serves is not found rather than found and then unservable.
     Err(ResolveError::UnknownModel(requested.to_owned()))
 }
 
@@ -193,6 +277,8 @@ mod tests {
         }
     }
 
+    /// Two OpenAI accounts and one Anthropic, with two options renamed by the
+    /// user. Every catalog model of both families is in the running.
     fn pooled() -> RouterConfig {
         RouterConfig {
             enabled: true,
@@ -207,7 +293,7 @@ mod tests {
                     key: "fast".into(),
                     description: "A short question".into(),
                     family: "openai".into(),
-                    model: "gpt-5.6-mini".into(),
+                    model: "gpt-5.6-luna".into(),
                 },
                 Route {
                     key: "deep".into(),
@@ -217,23 +303,113 @@ mod tests {
                 },
             ],
             fallback: Some("fast".into()),
-            min_confidence: 0.55,
+            min_confidence: 0.6,
         }
     }
 
     #[test]
-    fn the_router_serves_auto_every_route_and_every_pair() {
+    fn every_model_an_enabled_account_serves_is_in_the_running() {
+        let mut config = pooled();
+        let running = options(&config);
+        // Four OpenAI models and three Anthropic, from the catalog.
+        assert_eq!(running.len(), 7);
+        assert!(running.iter().all(|option| !option.description.is_empty()));
+        // The user's two routes took their models' places under their names.
         assert_eq!(
-            served_models(&pooled()),
-            [
-                "auto",
-                "fast",
-                "deep",
-                "openai/gpt-5.6-mini",
-                "anthropic/claude-opus-5"
-            ]
+            running.iter().filter(|option| option.key == "fast").count(),
+            1
         );
+        let fast = running.iter().find(|option| option.key == "fast").unwrap();
+        assert_eq!(fast.model, "gpt-5.6-luna");
+        assert_eq!(fast.description, "A short question");
+        // An option the user did not name keeps its pair and its statement.
+        let sol = running
+            .iter()
+            .find(|option| option.model == "gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(sol.key, "openai/gpt-5.6-sol");
+        assert!(sol.description.contains("Agentic coding"));
+        // No model appears twice, whatever the account count.
+        let mut keys: Vec<&str> = running.iter().map(|option| option.key.as_str()).collect();
+        keys.sort_unstable();
+        let before = keys.len();
+        keys.dedup();
+        assert_eq!(keys.len(), before);
+
+        // An account that names models serves those and no others.
+        config.accounts[2].models = vec!["claude-opus-5".into()];
+        let running = options(&config);
+        assert_eq!(running.len(), 5);
+        assert!(running
+            .iter()
+            .all(|option| option.model != "claude-haiku-4-5"));
+    }
+
+    #[test]
+    fn a_turned_off_account_puts_nothing_in_the_running() {
+        let mut config = pooled();
+        config.accounts[2].enabled = false;
+        assert!(options(&config)
+            .iter()
+            .all(|option| option.family != "anthropic"));
+        config.accounts[0].weight = 0;
+        config.accounts[1].weight = 0;
+        assert!(options(&config).is_empty());
+        assert!(served_models(&config).is_empty());
+    }
+
+    #[test]
+    fn a_model_the_catalog_does_not_describe_still_runs() {
+        let mut config = pooled();
+        config.accounts[0].models = vec!["gpt-7-unreleased".into()];
+        config.accounts[1].models = vec!["gpt-7-unreleased".into()];
+        config.accounts[2].models = vec!["claude-opus-5".into()];
+        let running = options(&config);
+        let stray = running
+            .iter()
+            .find(|option| option.model == "gpt-7-unreleased")
+            .unwrap();
+        assert_eq!(stray.key, "openai/gpt-7-unreleased");
+        assert!(stray.description.contains("no description"));
+    }
+
+    #[test]
+    fn the_router_serves_auto_and_every_model_in_the_running() {
+        let served = served_models(&pooled());
+        assert_eq!(served[0], "auto");
+        assert_eq!(served.len(), 8);
+        assert!(served.iter().any(|model| model == "fast"));
+        assert!(served.iter().any(|model| model == "deep"));
+        assert!(served.iter().any(|model| model == "openai/gpt-6-astra"));
         assert!(served_models(&RouterConfig::default()).is_empty());
+    }
+
+    #[test]
+    fn the_fallback_is_the_named_one_and_otherwise_the_cheapest_in_the_running() {
+        let mut config = pooled();
+        let running = options(&config);
+        assert_eq!(fallback(&config, &running).unwrap().key, "fast");
+        // With none named, the cheapest model in the running takes the turn.
+        config.fallback = None;
+        assert_eq!(fallback(&config, &running).unwrap().model, "gpt-5.6-luna");
+        // A name that no longer matches an option falls back the same way.
+        config.fallback = Some("gone".into());
+        assert_eq!(fallback(&config, &running).unwrap().model, "gpt-5.6-luna");
+        assert_eq!(fallback(&config, &[]), None);
+    }
+
+    #[test]
+    fn classifying_takes_a_ready_classifier_and_two_models_to_choose_between() {
+        let mut config = pooled();
+        let running = options(&config);
+        assert!(!classifies(&config, &running));
+        config.classifier = Classifier::Typesafe {
+            api_key: "apikey_1".into(),
+            model: "jev-latest".into(),
+            base_url: None,
+        };
+        assert!(classifies(&config, &running));
+        assert!(!classifies(&config, &running[..1]));
     }
 
     #[test]
@@ -242,7 +418,7 @@ mod tests {
         let mut ledger = Ledger::default();
         let first = resolve(&config, &ledger, "auto", "hello", 1_000).unwrap();
         assert_eq!(first.family, "openai");
-        assert_eq!(first.model, "gpt-5.6-mini");
+        assert_eq!(first.model, "gpt-5.6-luna");
         assert_eq!(first.route, "fast");
         assert_eq!(first.reason, Reason::NotClassified);
         assert_eq!(first.account_id, "o1");
@@ -252,52 +428,37 @@ mod tests {
     }
 
     #[test]
-    fn a_route_name_pins_the_turn_to_that_route() {
+    fn a_model_in_the_running_pins_the_turn_to_itself() {
         let config = pooled();
         let ledger = Ledger::default();
-        let picked = resolve(&config, &ledger, "deep", "hello", 1_000).unwrap();
-        assert_eq!(picked.family, "anthropic");
-        assert_eq!(picked.model, "claude-opus-5");
-        assert_eq!(picked.account_id, "c1");
-        assert_eq!(picked.route, "deep");
+        // By the name the user gave it.
+        let named = resolve(&config, &ledger, "deep", "hello", 1_000).unwrap();
+        assert_eq!(named.family, "anthropic");
+        assert_eq!(named.model, "claude-opus-5");
+        assert_eq!(named.account_id, "c1");
+        // And by its pair.
+        let pair = resolve(&config, &ledger, "openai/gpt-5.6-sol", "hello", 1_000).unwrap();
+        assert_eq!(pair.model, "gpt-5.6-sol");
+        assert_eq!(pair.route, "openai/gpt-5.6-sol");
     }
 
     #[test]
-    fn a_family_and_model_pair_pins_the_turn_to_that_model() {
-        let config = pooled();
-        let ledger = Ledger::default();
-        let picked = resolve(&config, &ledger, "openai/gpt-5.6", "hello", 1_000).unwrap();
-        assert_eq!(picked.family, "openai");
-        assert_eq!(picked.model, "gpt-5.6");
-        assert!(picked.route.is_empty());
-    }
-
-    #[test]
-    fn an_unserved_model_and_an_empty_pool_each_name_their_failure() {
+    fn a_model_not_in_the_running_is_not_served() {
         let config = pooled();
         let ledger = Ledger::default();
         assert_eq!(
-            resolve(&config, &ledger, "gpt-5.6", "hello", 1_000),
-            Err(ResolveError::UnknownModel("gpt-5.6".into()))
+            resolve(&config, &ledger, "gpt-5.6-sol", "hello", 1_000),
+            Err(ResolveError::UnknownModel("gpt-5.6-sol".into()))
         );
+        // A pair whose family holds no account is not in the running either.
         assert_eq!(
-            resolve(&config, &ledger, "nobody/m", "hello", 1_000),
-            Err(ResolveError::UnknownModel("nobody/m".into()))
+            resolve(&config, &ledger, "kimi/kimi-k3", "hello", 1_000),
+            Err(ResolveError::UnknownModel("kimi/kimi-k3".into()))
         );
         assert_eq!(
             resolve(&RouterConfig::default(), &ledger, "auto", "hello", 1_000),
             Err(ResolveError::NoRoute)
         );
-        let mut thin = pooled();
-        thin.accounts
-            .retain(|account| account.family != "anthropic");
-        assert_eq!(
-            resolve(&thin, &ledger, "deep", "hello", 1_000),
-            Err(ResolveError::Pool(balance::PickError::EmptyPool))
-        );
-        assert!(!ResolveError::NoRoute.message().is_empty());
-        assert!(ResolveError::UnknownModel("m".into())
-            .message()
-            .contains('m'));
+        assert!(ResolveError::NoRoute.message().contains("Add an account"));
     }
 }
