@@ -17,6 +17,7 @@ pub mod config;
 pub mod family;
 pub mod model_catalog;
 pub mod pi_provider;
+pub mod quota;
 pub mod server;
 pub mod usage;
 pub mod wire;
@@ -80,7 +81,7 @@ pub fn options(config: &RouterConfig) -> Vec<Route> {
     for account in config
         .accounts
         .iter()
-        .filter(|account| account.enabled && account.weight > 0)
+        .filter(|account| account.enabled && account.weight > 0 && account.credential.servable())
     {
         // An account that names no model serves every model of its family.
         let models: Vec<String> = if account.models.is_empty() {

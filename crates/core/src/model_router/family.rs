@@ -58,6 +58,23 @@ pub const FAMILIES: [Family; 5] = [
     },
 ];
 
+/// Pi's sign-in providers and the family each one pools into. Pi signs into an
+/// account under its own provider id, and the router holds the result as one
+/// more account of the family.
+pub const SUBSCRIPTION_PROVIDERS: [(&str, &str, &str); 3] = [
+    ("openai-codex", "openai", "ChatGPT Plus or Pro"),
+    ("xai", "xai", "SuperGrok or X Premium"),
+    ("anthropic", "anthropic", "Claude Pro or Max"),
+];
+
+/// The family a Pi sign-in provider pools into.
+pub fn family_for_pi_provider(provider: &str) -> Option<Family> {
+    SUBSCRIPTION_PROVIDERS
+        .iter()
+        .find(|(pi, _, _)| *pi == provider)
+        .and_then(|(_, id, _)| family(id))
+}
+
 /// The family with this id.
 pub fn family(id: &str) -> Option<Family> {
     FAMILIES.iter().copied().find(|entry| entry.id == id)
@@ -74,6 +91,9 @@ mod tests {
             assert!(entry.base_url.starts_with("https://"));
         }
         assert_eq!(family("nobody"), None);
+        assert_eq!(family_for_pi_provider("openai-codex").unwrap().id, "openai");
+        assert_eq!(family_for_pi_provider("xai").unwrap().id, "xai");
+        assert_eq!(family_for_pi_provider("github-copilot"), None);
         assert_eq!(family("anthropic").unwrap().wire, Wire::OpenAiCompatible);
         assert_eq!(family("kimi").unwrap().wire, Wire::OpenAiCompatible);
     }

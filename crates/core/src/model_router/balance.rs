@@ -49,7 +49,7 @@ pub fn pick<'a>(
     let live: Vec<&Account> = pool
         .iter()
         .copied()
-        .filter(|account| account.enabled && account.weight > 0)
+        .filter(|account| account.enabled && account.weight > 0 && account.credential.servable())
         .collect();
     if live.is_empty() {
         return Err(PickError::AllDisabled);
@@ -214,6 +214,33 @@ mod tests {
             })
         );
         assert!(!PickError::EmptyPool.message().is_empty());
+    }
+
+    #[test]
+    fn a_subscription_is_never_picked_until_the_router_speaks_its_wire() {
+        let mut config = config(vec![account("a1", "openai", 1), account("s1", "openai", 1)]);
+        config.accounts[1].credential = Credential::Subscription {
+            provider: "openai-codex".into(),
+            access: "at".into(),
+            refresh: None,
+            expires_ms: None,
+            account_id: None,
+            email: None,
+            plan: None,
+            renews_at_ms: None,
+        };
+        let mut ledger = Ledger::default();
+        // Four turns, and every one lands on the key.
+        assert_eq!(
+            run(&config, &mut ledger, "gpt", 4),
+            ["a1", "a1", "a1", "a1"]
+        );
+        // A pool of subscriptions alone reads as all disabled, not as empty.
+        config.accounts.remove(0);
+        assert_eq!(
+            pick(&config, &ledger, "openai", "gpt", 1_000),
+            Err(PickError::AllDisabled)
+        );
     }
 
     #[test]

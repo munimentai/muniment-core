@@ -27,14 +27,28 @@ pub const DEFAULT_MIN_CONFIDENCE: f64 = 0.6;
 pub enum Credential {
     /// An API key the user pasted.
     ApiKey { key: String },
-    /// An account sign-in: the token the harness's own flow returned.
-    OAuth {
+    /// A subscription: the token Pi's own sign-in returned, held here per
+    /// account instead of in Pi's one slot per provider.
+    Subscription {
+        /// Pi's provider id for the sign-in: `openai-codex`, `xai`, `anthropic`.
+        provider: String,
         access: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         refresh: Option<String>,
         /// Unix milliseconds. `None` is a token that never expires.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expires_ms: Option<i64>,
+        /// The upstream's account id, which Codex wants in a header.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        email: Option<String>,
+        /// The plan the upstream reports, `pro` or `max`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan: Option<String>,
+        /// Unix milliseconds the subscription renews, when the upstream says.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        renews_at_ms: Option<i64>,
     },
 }
 
@@ -43,7 +57,7 @@ impl Credential {
     pub fn bearer(&self) -> &str {
         match self {
             Self::ApiKey { key } => key,
-            Self::OAuth { access, .. } => access,
+            Self::Subscription { access, .. } => access,
         }
     }
 
@@ -51,8 +65,74 @@ impl Credential {
     pub fn source(&self) -> &'static str {
         match self {
             Self::ApiKey { .. } => "key",
-            Self::OAuth { .. } => "account",
+            Self::Subscription { .. } => "account",
         }
+    }
+
+    /// The email a subscription signed in with, when the sign-in said.
+    pub fn into_email(self) -> Option<String> {
+        match self {
+            Self::Subscription { email, .. } => email,
+            Self::ApiKey { .. } => None,
+        }
+    }
+
+    /// Whether the router can send a turn on this credential. A key goes out
+    /// on the family's OpenAI-compatible route. A subscription speaks its own
+    /// wire, which the router does not yet, so it is shown and probed but no
+    /// turn lands on it.
+    pub fn servable(&self) -> bool {
+        matches!(self, Self::ApiKey { .. })
+    }
+
+    /// Pi's provider id behind a subscription, none for a key.
+    pub fn pi_provider(&self) -> Option<&str> {
+        match self {
+            Self::ApiKey { .. } => None,
+            Self::Subscription { provider, .. } => Some(provider),
+        }
+    }
+
+    /// Whether the access token has passed its expiry, with a minute of slack
+    /// so a turn never starts on a token that dies mid-stream.
+    pub fn expired(&self, now_ms: i64) -> bool {
+        match self {
+            Self::ApiKey { .. } => false,
+            Self::Subscription { expires_ms, .. } => {
+                expires_ms.is_some_and(|expires| now_ms + 60_000 >= expires)
+            }
+        }
+    }
+
+    /// A subscription from the entry Pi's sign-in wrote to its `auth.json`:
+    /// `{"type":"oauth","access":…,"refresh":…,"expires":…,"accountId":…}`.
+    /// Pi keeps `expires` in Unix milliseconds.
+    pub fn from_pi_auth(provider: &str, entry: &serde_json::Value) -> Option<Self> {
+        if entry.get("type").and_then(serde_json::Value::as_str) != Some("oauth") {
+            return None;
+        }
+        let access = entry.get("access")?.as_str()?.trim().to_owned();
+        if access.is_empty() {
+            return None;
+        }
+        let text = |name: &str| {
+            entry
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        };
+        Some(Self::Subscription {
+            provider: provider.to_owned(),
+            access,
+            refresh: text("refresh"),
+            expires_ms: entry.get("expires").and_then(serde_json::Value::as_i64),
+            account_id: text("accountId").or_else(|| text("account_id")),
+            email: text("email"),
+            plan: None,
+            renews_at_ms: None,
+        })
     }
 }
 
@@ -105,6 +185,14 @@ impl Account {
     /// The family record, when the id names one the router knows.
     pub fn family(&self) -> Option<Family> {
         family(&self.family)
+    }
+
+    /// The email a subscription signed in with, when the upstream said.
+    pub fn email(&self) -> Option<&str> {
+        match &self.credential {
+            Credential::Subscription { email, .. } => email.as_deref(),
+            Credential::ApiKey { .. } => None,
+        }
     }
 
     /// Whether this account may answer for `model`.
@@ -399,6 +487,46 @@ mod tests {
             model: "m".into(),
         }
         .ready());
+    }
+
+    #[test]
+    fn a_pi_sign_in_entry_becomes_a_subscription_and_a_key_entry_does_not() {
+        let entry = serde_json::json!({
+            "type": "oauth",
+            "access": "at",
+            "refresh": "rt",
+            "expires": 1_790_000_000_000_i64,
+            "accountId": "acct-1"
+        });
+        let credential = Credential::from_pi_auth("openai-codex", &entry).unwrap();
+        assert_eq!(credential.bearer(), "at");
+        assert_eq!(credential.source(), "account");
+        assert_eq!(credential.pi_provider(), Some("openai-codex"));
+        assert!(!credential.expired(1_789_000_000_000));
+        // A minute before expiry counts as expired, so no turn starts on it.
+        assert!(credential.expired(1_790_000_000_000 - 30_000));
+        match &credential {
+            Credential::Subscription {
+                account_id,
+                refresh,
+                email,
+                ..
+            } => {
+                assert_eq!(account_id.as_deref(), Some("acct-1"));
+                assert_eq!(refresh.as_deref(), Some("rt"));
+                assert_eq!(email, &None);
+            }
+            Credential::ApiKey { .. } => panic!("a sign-in is not a key"),
+        }
+        assert!(Credential::from_pi_auth(
+            "openai",
+            &serde_json::json!({ "type": "api_key", "key": "sk" })
+        )
+        .is_none());
+        assert!(Credential::from_pi_auth("xai", &serde_json::json!({ "type": "oauth" })).is_none());
+        assert!(!Credential::ApiKey { key: "sk".into() }.expired(i64::MAX));
+        assert!(Credential::ApiKey { key: "sk".into() }.servable());
+        assert!(!credential.servable());
     }
 
     fn tempdir() -> PathBuf {
