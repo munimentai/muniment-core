@@ -6,6 +6,7 @@
 
 use crate::runtime_eprintln as eprintln;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
@@ -166,10 +167,12 @@ pub enum PiChatEvent {
     ToolStarted {
         tool_call_id: String,
         tool_name: String,
+        input: Option<String>,
     },
     ToolFinished {
         tool_call_id: String,
         failed: bool,
+        output: Option<String>,
     },
     ExtensionUiRequest(ExtensionUiRequest),
     Completed,
@@ -323,6 +326,7 @@ pub fn parse_frame(frame: &Value) -> Result<PiChatEvent, &'static str> {
             Ok(PiChatEvent::ToolStarted {
                 tool_call_id: event.tool_call_id,
                 tool_name: event.tool_name,
+                input: activity_detail(frame.get("args")),
             })
         }
         Some("tool_execution_end") => {
@@ -342,6 +346,7 @@ pub fn parse_frame(frame: &Value) -> Result<PiChatEvent, &'static str> {
             Ok(PiChatEvent::ToolFinished {
                 tool_call_id: event.tool_call_id,
                 failed: event.is_error,
+                output: activity_detail(frame.get("result")),
             })
         }
         Some("extension_ui_request") => parse_extension_ui_request(frame),
@@ -511,6 +516,7 @@ pub const FIRST_EVENT_TIMEOUT_REASON: &str = "No reply arrived within 30 seconds
 pub struct PiRunAdapter {
     run_id: String,
     frames: Mutex<mpsc::Receiver<Value>>,
+    buffered: Mutex<VecDeque<Value>>,
     first_event_deadline: Mutex<Option<Instant>>,
 }
 
@@ -531,21 +537,78 @@ impl PiRunAdapter {
         images: Vec<PiImageContent>,
         timeout: Duration,
     ) -> Result<(Self, PiChatEvent), String> {
+        Self::start_with_images_and_handler(run_id, transport, prompt, images, timeout, |_, _| {
+            false
+        })
+    }
+
+    /// Services extension requests while Pi prepares a prompt, before its acknowledgement.
+    pub fn start_with_images_and_handler(
+        run_id: impl Into<String>,
+        transport: &PiRpcTransport,
+        prompt: &str,
+        images: Vec<PiImageContent>,
+        timeout: Duration,
+        mut consume: impl FnMut(&Self, &PiChatEvent) -> bool,
+    ) -> Result<(Self, PiChatEvent), String> {
         let run_id = run_id.into();
-        let frames = transport.subscribe();
         let deadline = Instant::now() + FIRST_EVENT_TIMEOUT;
-        let response = transport
-            .call(
-                PromptCommand::with_images(prompt, images).into_value(),
-                timeout.min(deadline.saturating_duration_since(Instant::now())),
-            )
-            .map_err(|error| {
-                if Instant::now() >= deadline {
-                    format!("Pi did not acknowledge the prompt within 30 seconds. {error}")
-                } else {
-                    error
+        let adapter = Self {
+            run_id: run_id.clone(),
+            frames: Mutex::new(transport.subscribe()),
+            buffered: Mutex::new(VecDeque::new()),
+            first_event_deadline: Mutex::new(Some(deadline)),
+        };
+        let response = std::thread::scope(|scope| {
+            let (sender, response) = mpsc::channel();
+            scope.spawn(move || {
+                let result = transport.call(
+                    PromptCommand::with_images(prompt, images).into_value(),
+                    timeout.min(deadline.saturating_duration_since(Instant::now())),
+                );
+                let _ = sender.send(result);
+            });
+            loop {
+                match response.try_recv() {
+                    Ok(result) => return result,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        return Err("The prompt dispatcher stopped.".into())
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
                 }
-            })?;
+                let frame = adapter
+                    .frames
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .recv_timeout(Duration::from_millis(5));
+                match frame {
+                    Ok(frame) => {
+                        let handled =
+                            parse_frame(&frame).is_ok_and(|event| consume(&adapter, &event));
+                        if !handled {
+                            adapter
+                                .buffered
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push_back(frame);
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return response
+                            .recv()
+                            .unwrap_or_else(|_| Err("The prompt dispatcher stopped.".into()))
+                    }
+                }
+            }
+        })
+        .map_err(|error| {
+            if Instant::now() >= deadline {
+                format!("Pi did not acknowledge the prompt within 30 seconds. {error}")
+            } else {
+                error
+            }
+        })?;
         let accepted = parse_frame(&response).map_err(str::to_owned)?;
         if accepted != PiChatEvent::PromptAccepted {
             let detail: String = response
@@ -558,14 +621,7 @@ impl PiRunAdapter {
             eprintln!("muniment-runtime: run_id={run_id} provider_request outcome=not_started prompt_error={detail:?}");
             return Err("Pi rejected the prompt".into());
         }
-        Ok((
-            Self {
-                run_id,
-                frames: Mutex::new(frames),
-                first_event_deadline: Mutex::new(Some(deadline)),
-            },
-            accepted,
-        ))
+        Ok((adapter, accepted))
     }
 
     pub fn run_id(&self) -> &str {
@@ -703,20 +759,28 @@ impl PiRunAdapter {
         } else {
             timeout
         };
-        let frame = self
-            .frames
+        let buffered = self
+            .buffered
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .recv_timeout(timeout)
-            .map_err(|error| match error {
-                mpsc::RecvTimeoutError::Timeout
-                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) =>
-                {
-                    FIRST_EVENT_TIMEOUT_REASON.to_string()
-                }
-                mpsc::RecvTimeoutError::Timeout => "timed out waiting for Pi stream".to_string(),
-                mpsc::RecvTimeoutError::Disconnected => "Pi process stream ended".to_string(),
-            })?;
+            .pop_front();
+        let frame = match buffered {
+            Some(frame) => Ok(frame),
+            None => self
+                .frames
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv_timeout(timeout),
+        }
+        .map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) =>
+            {
+                FIRST_EVENT_TIMEOUT_REASON.to_string()
+            }
+            mpsc::RecvTimeoutError::Timeout => "timed out waiting for Pi stream".to_string(),
+            mpsc::RecvTimeoutError::Disconnected => "Pi process stream ended".to_string(),
+        })?;
         let event = parse_frame(&frame).map_err(str::to_owned)?;
         if frame.get("type").and_then(Value::as_str) == Some("message_end")
             && frame.pointer("/message/role").and_then(Value::as_str) == Some("assistant")
@@ -771,6 +835,29 @@ impl Drop for PiRunAdapter {
     }
 }
 
+// Activity details are bounded plain text. The same secret gate as memory
+// prevents credentials from entering the journal or the webview.
+fn activity_detail(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    let text = if let Some(content) = value.get("content").and_then(Value::as_array) {
+        content
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        serde_json::to_string_pretty(value).ok()?
+    };
+    if crate::memory_secret::reject_memory_secret(&text).is_err() {
+        return Some("Details withheld because they may contain a secret.".into());
+    }
+    let mut clipped: String = text.chars().take(8000).collect();
+    if text.chars().count() > 8000 {
+        clipped.push_str("\n[Output shortened]");
+    }
+    Some(clipped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,6 +868,7 @@ mod tests {
         let adapter = PiRunAdapter {
             run_id: "0190a100-0000-7000-8000-000000000001".into(),
             frames: Mutex::new(frames),
+            buffered: Mutex::new(VecDeque::new()),
             first_event_deadline: Mutex::new(Some(Instant::now() + Duration::from_secs(1))),
         };
         drop(sender);
@@ -798,6 +886,7 @@ mod tests {
             PiRunAdapter {
                 run_id: "run-bound".into(),
                 frames: Mutex::new(frames),
+                buffered: Mutex::new(VecDeque::new()),
                 first_event_deadline: Mutex::new(Some(Instant::now() + timeout)),
             },
         )

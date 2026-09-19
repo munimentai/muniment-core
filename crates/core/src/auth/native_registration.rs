@@ -188,6 +188,20 @@ pub fn register_installation_with_retry(
     now_unix_seconds: u64,
     wait: &dyn Fn(Duration),
 ) -> Result<InstallationRecord, NativeRegistrationError> {
+    register_installation_while(store, transport, base_url, now_unix_seconds, wait, &|| true)
+}
+
+pub fn register_installation_while(
+    store: &dyn InstallationStore,
+    transport: &dyn RegistrationTransport,
+    base_url: &str,
+    now_unix_seconds: u64,
+    wait: &dyn Fn(Duration),
+    active: &dyn Fn() -> bool,
+) -> Result<InstallationRecord, NativeRegistrationError> {
+    if !active() {
+        return Err(NativeRegistrationError::Transport("Cancelled".into()));
+    }
     if let Some(existing) = store.load()? {
         if !existing.registration_token.is_empty()
             && !existing.device_challenge.is_empty()
@@ -196,7 +210,7 @@ pub fn register_installation_with_retry(
             return Ok(existing);
         }
     }
-    register_fresh_installation(store, transport, base_url, now_unix_seconds, wait)
+    register_fresh_installation_while(store, transport, base_url, now_unix_seconds, wait, active)
 }
 
 /// Registers a new installation whatever the store holds. The cloud refuses a
@@ -208,6 +222,17 @@ pub fn register_fresh_installation(
     base_url: &str,
     now_unix_seconds: u64,
     wait: &dyn Fn(Duration),
+) -> Result<InstallationRecord, NativeRegistrationError> {
+    register_fresh_installation_while(store, transport, base_url, now_unix_seconds, wait, &|| true)
+}
+
+pub fn register_fresh_installation_while(
+    store: &dyn InstallationStore,
+    transport: &dyn RegistrationTransport,
+    base_url: &str,
+    now_unix_seconds: u64,
+    wait: &dyn Fn(Duration),
+    active: &dyn Fn() -> bool,
 ) -> Result<InstallationRecord, NativeRegistrationError> {
     validate_base_url(base_url)?;
 
@@ -223,6 +248,9 @@ pub fn register_fresh_installation(
     let url = format!("{}{}", base_url.trim_end_matches('/'), REGISTRATION_PATH);
     let mut total_wait = Duration::ZERO;
     let response = loop {
+        if !active() {
+            return Err(NativeRegistrationError::Transport("Cancelled".into()));
+        }
         match transport.register(&url, &request) {
             Ok(response) => break response,
             Err(NativeRegistrationError::RateLimited(delay)) => {

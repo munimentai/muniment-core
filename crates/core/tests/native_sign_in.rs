@@ -327,3 +327,31 @@ fn cancellation_exchange_and_persistence_failures_are_safe() {
         assert!(store.credentials.lock().unwrap().is_none());
     }
 }
+
+#[test]
+fn returning_to_local_mode_cancels_the_browser_wait_without_saving_credentials() {
+    use std::sync::atomic::AtomicBool;
+    let store = Store::default();
+    let active = AtomicBool::new(true);
+    let browser_opened = AtomicBool::new(false);
+    let browser = |_: &str| {
+        browser_opened.store(true, Ordering::SeqCst);
+        active.store(false, Ordering::SeqCst);
+        Ok(())
+    };
+    let result = muniment_core::auth::run_native_sign_in_while(
+        &store,
+        &Registration(Arc::new(AtomicUsize::new(0))),
+        &Authorization(Arc::new(Mutex::new(None))),
+        &UreqTokenTransport::new(Duration::from_secs(1)),
+        &browser,
+        "http://127.0.0.1:1",
+        &|| 1_000,
+        Duration::from_secs(300),
+        &std::thread::sleep,
+        &|| active.load(Ordering::SeqCst),
+    );
+    assert!(result.is_err());
+    assert!(browser_opened.load(Ordering::SeqCst));
+    assert!(store.credentials.lock().unwrap().is_none());
+}

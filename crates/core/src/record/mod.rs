@@ -117,6 +117,10 @@ pub struct EventRow {
     pub seq: i64,
     pub at: String,
     pub actor_id: String,
+    #[serde(default)]
+    pub actor_label: Option<String>,
+    #[serde(default)]
+    pub on_behalf_of_label: Option<String>,
     pub on_behalf_of: Option<String>,
     pub verb: String,
     pub entity_id: Option<String>,
@@ -702,7 +706,16 @@ impl CompanyRecord {
                 after,
                 source,
             ) = row?;
+            let actor_label = self.principal(&actor_id)?.map(|actor| actor.label);
+            let on_behalf_of_label = on_behalf_of
+                .as_deref()
+                .map(|id| self.principal(id))
+                .transpose()?
+                .flatten()
+                .map(|actor| actor.label);
             events.push(EventRow {
+                actor_label,
+                on_behalf_of_label,
                 id,
                 seq,
                 at,

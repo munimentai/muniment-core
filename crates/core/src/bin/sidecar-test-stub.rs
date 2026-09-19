@@ -456,6 +456,7 @@ fn pi_chat_capture(output: String) {
 }
 
 fn pi_chat_extension_ui(output: String) {
+    let mut pending_prompt = None;
     for line in io::stdin().lock().lines() {
         let line = line.unwrap();
         let request: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -470,6 +471,14 @@ fn pi_chat_extension_ui(output: String) {
                 fs::write(format!("{output}.waiting"), "").unwrap();
                 continue;
             }
+            "prompt" if request["message"] == "name-first" => {
+                pending_prompt = Some(request["id"].clone());
+                println!("{}", serde_json::json!({"type":"agent_start"}));
+                println!(
+                    "{}",
+                    serde_json::json!({"type":"extension_ui_request", "id":"name-1", "method":"editor", "title":"muniment:thread-title", "prefill":"{\"action\":\"request\"}"})
+                );
+            }
             "prompt" => println!(
                 "{}",
                 serde_json::json!({
@@ -483,6 +492,13 @@ fn pi_chat_extension_ui(output: String) {
                     .open(&output)
                     .unwrap();
                 writeln!(capture, "{line}").unwrap();
+                if let Some(id) = pending_prompt.take() {
+                    println!(
+                        "{}",
+                        serde_json::json!({"type":"response", "command":"prompt", "success":true, "id":id})
+                    );
+                    println!("{}", serde_json::json!({"type":"agent_end"}));
+                }
             }
             command => panic!("unexpected command: {command}"),
         }

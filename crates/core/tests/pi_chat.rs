@@ -296,19 +296,20 @@ fn multi_image_adapter_prompt_matches_pi_contract_and_is_acknowledged() {
 }
 
 #[test]
-fn tool_execution_frames_are_typed_without_sensitive_contents() {
+fn tool_execution_frames_include_bounded_details_and_filter_credentials() {
     let started = parse_frame(&json!({
         "type":"tool_execution_start",
         "toolCallId":"call-1",
         "toolName":"bash",
-        "args":{"command":"secret argument"}
+        "args":{"command":"API_KEY=sk-test1234567890secret"}
     }))
     .unwrap();
     assert_eq!(
         started,
         PiChatEvent::ToolStarted {
             tool_call_id: "call-1".into(),
-            tool_name: "bash".into()
+            tool_name: "bash".into(),
+            input: Some("Details withheld because they may contain a secret.".into()),
         }
     );
 
@@ -316,7 +317,7 @@ fn tool_execution_frames_are_typed_without_sensitive_contents() {
         "type":"tool_execution_end",
         "toolCallId":"call-1",
         "toolName":"bash",
-        "result":{"content":[{"type":"text","text":"secret result"}]},
+        "result":{"content":[{"type":"text","text":"API_KEY=sk-test1234567890secret"}]},
         "isError":true,
         "error":"secret upstream error"
     }))
@@ -325,12 +326,17 @@ fn tool_execution_frames_are_typed_without_sensitive_contents() {
         finished,
         PiChatEvent::ToolFinished {
             tool_call_id: "call-1".into(),
-            failed: true
+            failed: true,
+            output: Some("Details withheld because they may contain a secret.".into()),
         }
     );
 
     let projected = format!("{started:?} {finished:?}");
-    for secret in ["secret argument", "secret result", "secret upstream error"] {
+    for secret in [
+        "API_KEY=sk-test1234567890secret",
+        "API_KEY=sk-test1234567890secret",
+        "secret upstream error",
+    ] {
         assert!(!projected.contains(secret));
     }
 }
@@ -793,5 +799,63 @@ fn transport_send_completes_while_call_waits() {
         json!({"type":"extension_ui_response", "id":"gate-1", "confirmed":true})
     );
     assert!(call.join().unwrap().is_err());
+    supervisor.shutdown().unwrap();
+}
+
+#[test]
+fn action_output_keeps_text_bounds_unicode_and_omits_images() {
+    let output = "é".repeat(9000);
+    let event = parse_frame(&json!({"type":"tool_execution_end", "toolCallId":"read-1", "isError":false,
+        "result":{"content":[{"type":"text","text":output},{"type":"image","data":"not-for-history"}]}})).unwrap();
+    let PiChatEvent::ToolFinished {
+        output: Some(text), ..
+    } = event
+    else {
+        panic!("missing action detail")
+    };
+    assert!(text.starts_with(&"é".repeat(8000)));
+    assert!(text.ends_with("[Output shortened]"));
+    assert!(!text.contains("not-for-history"));
+}
+
+#[test]
+fn startup_answers_name_requests_before_acknowledgement_and_keeps_other_frames() {
+    let temp = TempDir::new();
+    let capture = temp.path().join("name-answer.jsonl");
+    let (mut supervisor, wiring) = extension_ui_supervisor(&capture);
+    let transport = wiring.transport().unwrap();
+    let mut answered = 0;
+    let (adapter, accepted) = PiRunAdapter::start_with_images_and_handler(
+        "run-name",
+        &transport,
+        "name-first",
+        vec![],
+        Duration::from_secs(2),
+        |adapter, event| {
+            let PiChatEvent::ExtensionUiRequest(request) = event else {
+                return false;
+            };
+            answered += 1;
+            adapter
+                .answer_extension_ui(
+                    &transport,
+                    request,
+                    ExtensionUiAnswer::Editor("{\"prompt\":\"Compare leases\"}".into()),
+                )
+                .unwrap();
+            true
+        },
+    )
+    .unwrap();
+    assert_eq!(accepted, PiChatEvent::PromptAccepted);
+    assert_eq!(answered, 1);
+    assert_eq!(
+        adapter.next(Duration::from_secs(1)).unwrap(),
+        PiChatEvent::TurnStarted
+    );
+    assert_eq!(
+        adapter.next(Duration::from_secs(1)).unwrap(),
+        PiChatEvent::Completed
+    );
     supervisor.shutdown().unwrap();
 }

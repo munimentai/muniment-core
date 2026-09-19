@@ -233,6 +233,7 @@ impl LocalRunLedger {
             PiChatEvent::ToolStarted {
                 tool_call_id,
                 tool_name,
+                ..
             } => {
                 self.tool_names
                     .insert(tool_call_id.clone(), tool_name.clone());
@@ -241,6 +242,7 @@ impl LocalRunLedger {
             PiChatEvent::ToolFinished {
                 tool_call_id,
                 failed: true,
+                ..
             } => {
                 if let Some(name) = self.tool_names.get(tool_call_id) {
                     self.tools.entry(name.clone()).or_default().1 += 1;
@@ -345,6 +347,22 @@ pub fn coordinate(
             );
         }
         return;
+    }
+    if resume.is_none() {
+        let fallback = prompt
+            .split_whitespace()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let fallback: String = fallback.chars().take(80).collect();
+        if let Ok(mut storage) = journal.lock() {
+            let _ = crate::journal::thread_mutation::save_first_thread_name(
+                &mut storage.journal,
+                &run_id,
+                &fallback,
+                false,
+            );
+        }
     }
     // The model reads the clock from the message, so each one opens with its time.
     let stamped_prompt = crate::launch_facts::stamp_message(&prompt);
@@ -708,12 +726,24 @@ pub fn coordinate(
             subject.as_deref(),
             || {
                 let prepared_prompt = prepared_prompt.expect("new runs prepare a Pi prompt");
-                let (adapter, _) = PiRunAdapter::start_with_images(
+                let (adapter, _) = PiRunAdapter::start_with_images_and_handler(
                     run_id.clone(),
                     &transport,
                     prepared_prompt.message,
                     prepared_prompt.images,
                     RPC_TIMEOUT,
+                    |adapter, event| {
+                        answer_thread_title(&journal, adapter, &transport, &run_id, &prompt, event)
+                            || answer_gateway_boundary(
+                                &app,
+                                adapter,
+                                &transport,
+                                &mut grant,
+                                &mut access_token,
+                                &mut gateway_failure,
+                                event,
+                            )
+                    },
                 )
                 .map_err(|error| {
                     diagnostics.prompt_failed(&error);
@@ -733,6 +763,11 @@ pub fn coordinate(
                         &session_root,
                         RPC_TIMEOUT,
                         |event| {
+                            if answer_thread_title(
+                                &journal, &adapter, &transport, &run_id, &prompt, event,
+                            ) {
+                                return true;
+                            }
                             answer_gateway_boundary(
                                 &app,
                                 &adapter,
@@ -1061,6 +1096,9 @@ pub fn coordinate(
                 }
             }
             Ok(event @ PiChatEvent::ExtensionUiRequest(_)) => {
+                if answer_thread_title(&journal, &adapter, &transport, &run_id, &prompt, &event) {
+                    continue;
+                }
                 if answer_gateway_boundary(
                     &app,
                     &adapter,
@@ -1177,6 +1215,56 @@ pub fn coordinate(
             }
         }
     }
+}
+
+fn answer_thread_title(
+    storage: &SharedStorage,
+    adapter: &PiRunAdapter,
+    transport: &PiRpcTransport,
+    run_id: &str,
+    prompt: &str,
+    event: &PiChatEvent,
+) -> bool {
+    let PiChatEvent::ExtensionUiRequest(request) = event else {
+        return false;
+    };
+    let ExtensionUiDialog::Editor { title, prefill } = &request.dialog else {
+        return false;
+    };
+    if title != "muniment:thread-title" {
+        return false;
+    }
+    let response = (|| {
+        let args: Value = serde_json::from_str(prefill.as_deref()?).ok()?;
+        let mut storage = storage.lock().ok()?;
+        match args["action"].as_str()? {
+            "request" => {
+                crate::journal::thread_mutation::first_thread_needs_name(
+                    &mut storage.journal,
+                    run_id,
+                )?;
+                Some(json!({"prompt": prompt.chars().take(8000).collect::<String>()}))
+            }
+            "save" => {
+                let saved = crate::journal::thread_mutation::save_first_thread_name(
+                    &mut storage.journal,
+                    run_id,
+                    args["title"].as_str()?,
+                    true,
+                )
+                .ok()?;
+                Some(json!({"saved": saved}))
+            }
+            _ => None,
+        }
+    })()
+    .unwrap_or_else(|| json!({}));
+    let _ = adapter.answer_extension_ui(
+        transport,
+        request,
+        ExtensionUiAnswer::Editor(response.to_string()),
+    );
+    true
 }
 
 fn answer_gateway_boundary(
@@ -1392,10 +1480,12 @@ mod tests {
         let started = |id: &str, name: &str| PiChatEvent::ToolStarted {
             tool_call_id: id.into(),
             tool_name: name.into(),
+            input: None,
         };
         let finished = |id: &str, failed: bool| PiChatEvent::ToolFinished {
             tool_call_id: id.into(),
             failed,
+            output: None,
         };
         for event in [
             started("c1", "read"),
@@ -1934,6 +2024,7 @@ mod tests {
         let started = PiChatEvent::ToolStarted {
             tool_call_id: effect_id.into(),
             tool_name: "Read file".into(),
+            input: None,
         };
         assert!(effects
             .with(|open_effects| tool_journal_entry(&started, open_effects))
@@ -1978,6 +2069,7 @@ mod tests {
         let finished = PiChatEvent::ToolFinished {
             tool_call_id: "effect-1".into(),
             failed: false,
+            output: None,
         };
         assert!(effects
             .with(|open_effects| tool_journal_entry(&finished, open_effects))
@@ -1987,6 +2079,7 @@ mod tests {
         let finished = PiChatEvent::ToolFinished {
             tool_call_id: "effect-2".into(),
             failed: false,
+            output: None,
         };
         assert!(effects
             .with(|open_effects| tool_journal_entry(&finished, open_effects))

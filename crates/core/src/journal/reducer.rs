@@ -488,6 +488,10 @@ pub struct ToolActivity {
     pub effect_id: String,
     pub display_name: Option<String>,
     pub status: ToolActivityStatus,
+    pub input: Option<String>,
+    pub output: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -542,6 +546,10 @@ pub fn project_chat_fragment(events: &[EventEnvelope]) -> Result<ChatProjection,
                 effect_id: field(event, "effect_id")?,
                 display_name: optional_field(event, "display_name")?,
                 status: ToolActivityStatus::Running,
+                input: optional_field(event, "input")?,
+                output: None,
+                started_at: Some(event.recorded_at.clone()),
+                finished_at: None,
             }),
             "tool.effect.completed" | "tool.effect.failed" => {
                 let effect_id = field(event, "effect_id")?;
@@ -551,6 +559,8 @@ pub fn project_chat_fragment(events: &[EventEnvelope]) -> Result<ChatProjection,
                     .rev()
                     .find(|activity| activity.effect_id == effect_id)
                 {
+                    activity.output = optional_field(event, "output")?;
+                    activity.finished_at = Some(event.recorded_at.clone());
                     activity.status = if event.event_type == "tool.effect.completed" {
                         ToolActivityStatus::Completed
                     } else {
@@ -605,6 +615,10 @@ impl ChatProjector {
                 effect_id: field(event, "effect_id")?,
                 display_name: optional_field(event, "display_name")?,
                 status: ToolActivityStatus::Running,
+                input: optional_field(event, "input")?,
+                output: None,
+                started_at: Some(event.recorded_at.clone()),
+                finished_at: None,
             }),
             "tool.effect.completed" | "tool.effect.failed" => {
                 let effect_id = field(event, "effect_id")?;
@@ -615,6 +629,8 @@ impl ChatProjector {
                     .rev()
                     .find(|activity| activity.effect_id == effect_id)
                 {
+                    activity.output = optional_field(event, "output")?;
+                    activity.finished_at = Some(event.recorded_at.clone());
                     activity.status = if event.event_type == "tool.effect.completed" {
                         ToolActivityStatus::Completed
                     } else {

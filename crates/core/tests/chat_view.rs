@@ -102,16 +102,28 @@ fn tool_activity_uses_the_webview_contract() {
             effect_id: "effect-1".into(),
             display_name: Some("Search".into()),
             status: ToolActivityStatus::Running,
+            input: None,
+            output: None,
+            started_at: None,
+            finished_at: None,
         },
         ToolActivity {
             effect_id: "effect-2".into(),
             display_name: None,
             status: ToolActivityStatus::Completed,
+            input: None,
+            output: None,
+            started_at: None,
+            finished_at: None,
         },
         ToolActivity {
             effect_id: "effect-3".into(),
             display_name: None,
             status: ToolActivityStatus::Failed,
+            input: None,
+            output: None,
+            started_at: None,
+            finished_at: None,
         },
     ]);
 

@@ -22,6 +22,14 @@ pub struct ChatToolActivity {
     pub effect_id: String,
     pub display_name: Option<String>,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -98,6 +106,10 @@ pub fn chat_tool_activity(activity: &[ToolActivity]) -> Vec<ChatToolActivity> {
         .iter()
         .map(|activity| ChatToolActivity {
             effect_id: activity.effect_id.clone(),
+            input: activity.input.clone(),
+            output: activity.output.clone(),
+            started_at: activity.started_at.clone(),
+            finished_at: activity.finished_at.clone(),
             display_name: activity.display_name.clone(),
             status: match activity.status {
                 ToolActivityStatus::Running => "running",
