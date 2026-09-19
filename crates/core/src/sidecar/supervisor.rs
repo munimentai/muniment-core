@@ -551,13 +551,8 @@ fn spawn_child(
 ) -> Result<(Child, JoinHandle<()>), std::io::Error> {
     let mut command = Command::new(&config.program);
     command.args(&config.args).envs(&config.env);
-    // A directory that vanished must not stop the child; the prompt's facts
-    // name the one the agent was meant to work in.
-    if let Some(directory) = config
-        .working_directory
-        .as_deref()
-        .filter(|directory| directory.is_dir())
-    {
+    // A missing working folder must fail the spawn rather than redirect writes.
+    if let Some(directory) = config.working_directory.as_deref() {
         command.current_dir(directory);
     }
     for name in &config.env_remove {

@@ -264,9 +264,6 @@ fn ask_pool(call: PoolCall<'_>, state: &str, now_ms: i64, timeout: Duration) -> 
     let Ok(account) = balance::pick(config, ledger, family, model, now_ms) else {
         return empty;
     };
-    let Some(upstream) = account.upstream() else {
-        return empty;
-    };
     let listed = options
         .iter()
         .map(|option| format!("- {}: {}", option.key, option.description))
@@ -281,16 +278,19 @@ fn ask_pool(call: PoolCall<'_>, state: &str, now_ms: i64, timeout: Duration) -> 
         ],
     });
     let agent = ureq::AgentBuilder::new().timeout(timeout).build();
-    let answered = agent
-        .post(&format!("{upstream}/chat/completions"))
-        .set("content-type", "application/json")
-        .set(
-            "authorization",
-            &format!("Bearer {}", account.credential.bearer()),
-        )
-        .send_json(&body)
+    let Ok(prepared) = super::transport::prepare(account, &body, model) else {
+        return empty;
+    };
+    let mut call = agent
+        .post(&prepared.url)
+        .set("content-type", "application/json");
+    for (name, value) in &prepared.headers {
+        call = call.set(name, value);
+    }
+    let answered = call
+        .send_json(&prepared.body)
         .ok()
-        .and_then(|response| response.into_json::<Value>().ok());
+        .and_then(|response| super::transport::collect(response, prepared.protocol, model).ok());
     // A call the upstream refused or never answered spent nothing the ledger
     // can count, and naming the account here would record a served turn on
     // an account that just refused one.

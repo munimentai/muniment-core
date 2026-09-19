@@ -753,7 +753,7 @@ pub fn coordinate(
             &run_id,
             &mut seq,
             subject.as_deref(),
-            || {
+            |emit| {
                 let prepared_prompt = prepared_prompt.expect("new runs prepare a Pi prompt");
                 let (adapter, _) = PiRunAdapter::start_with_images_and_handler(
                     run_id.clone(),
@@ -783,6 +783,8 @@ pub fn coordinate(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
                     Some(Arc::clone(&adapter));
+                emit(&PiChatEvent::PromptAccepted)?;
+                let mut journal_failed = false;
                 let session_root = app
                     .pi_session_root()
                     .map_err(|_| PreparedPromptError::SessionRoot)?;
@@ -792,12 +794,18 @@ pub fn coordinate(
                         &session_root,
                         RPC_TIMEOUT,
                         |event| {
+                            if emit(event).map_err(|_| {
+                                journal_failed = true;
+                                "The reply could not be saved.".to_owned()
+                            })? {
+                                return Ok(true);
+                            }
                             if answer_thread_title(
                                 &journal, &adapter, &transport, &run_id, &prompt, event,
                             ) {
-                                return true;
+                                return Ok(true);
                             }
-                            answer_gateway_boundary(
+                            Ok(answer_gateway_boundary(
                                 &app,
                                 &adapter,
                                 &transport,
@@ -805,11 +813,13 @@ pub fn coordinate(
                                 &mut access_token,
                                 &mut gateway_failure,
                                 event,
-                            )
+                            ))
                         },
                     )
                     .map_err(|error| {
-                        if error == FIRST_EVENT_TIMEOUT_REASON {
+                        if journal_failed {
+                            PreparedPromptError::Journal
+                        } else if error == FIRST_EVENT_TIMEOUT_REASON {
                             PreparedPromptError::FirstEventTimeout
                         } else {
                             PreparedPromptError::Binding
@@ -1342,6 +1352,61 @@ fn coordinate_memory_search(
     subject: Option<&str>,
     event: &PiChatEvent,
 ) -> bool {
+    if let PiChatEvent::ExtensionUiRequest(request) = event {
+        if let ExtensionUiDialog::Editor { title, prefill } = &request.dialog {
+            if let Some(tool) = title.strip_prefix("muniment:").filter(|tool| {
+                [
+                    "memory-delete",
+                    "memory-profile-read",
+                    "memory-profile-save",
+                ]
+                .contains(tool)
+            }) {
+                let result = prefill
+                    .as_deref()
+                    .ok_or_else(|| "The memory arguments are missing.".to_owned())
+                    .and_then(|arguments| memory_runtime.maintain_memory(run_id, tool, arguments));
+                let value = result.unwrap_or_else(|error| json!({"error": error}));
+                let _ = adapter.answer_extension_ui(
+                    transport,
+                    request,
+                    ExtensionUiAnswer::Editor(value.to_string()),
+                );
+                return true;
+            }
+            if let Some(tool) = title.strip_prefix("muniment:").filter(|tool| {
+                ["agent-list", "agent-read", "agent-save", "agent-run"].contains(tool)
+            }) {
+                let result = prefill
+                    .as_deref()
+                    .ok_or_else(|| "The agent arguments are missing.".to_owned())
+                    .and_then(|arguments| memory_runtime.agent_tool(run_id, tool, arguments));
+                let value = result.unwrap_or_else(|error| json!({"error": error}));
+                let _ = adapter.answer_extension_ui(
+                    transport,
+                    request,
+                    ExtensionUiAnswer::Editor(value.to_string()),
+                );
+                return true;
+            }
+            if title == "muniment:memory-save" {
+                let result = prefill
+                    .as_deref()
+                    .ok_or_else(|| "The memory arguments are missing.".to_owned())
+                    .and_then(|arguments| memory_runtime.capture_fact(run_id, arguments));
+                let value = match result {
+                    Ok(fact) => json!({"saved": true, "fact": fact}),
+                    Err(error) => json!({"error": error}),
+                };
+                let _ = adapter.answer_extension_ui(
+                    transport,
+                    request,
+                    ExtensionUiAnswer::Editor(value.to_string()),
+                );
+                return true;
+            }
+        }
+    }
     coordinate_memory_search_with(
         sink,
         journal,

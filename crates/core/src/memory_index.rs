@@ -598,6 +598,16 @@ fn scan_home_with_hook(
             deadline,
         )?;
     }
+    // General recall never reads another agent's learned memory.
+    files.retain(|path| {
+        let parts: Vec<_> = path.components().collect();
+        !(parts
+            .first()
+            .is_some_and(|part| part.as_os_str() == "agents")
+            && parts
+                .get(2)
+                .is_some_and(|part| part.as_os_str() == "memory"))
+    });
     files.sort();
     files.truncate(MAX_FILES);
     after_collection();

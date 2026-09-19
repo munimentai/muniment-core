@@ -66,7 +66,7 @@ impl LaunchFacts {
         ));
         match &self.working_directory {
             Some(directory) => lines.push(format!(
-                "- The working directory is {}. It holds the user's memory, agents, projects and sessions. Work inside it, and read or write elsewhere only at a path the user names.",
+                "- The working directory is {}. Create generated files inside this working directory. Read or write elsewhere only at a path the user names.",
                 directory.display()
             )),
             None => lines.push(

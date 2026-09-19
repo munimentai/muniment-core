@@ -29,7 +29,7 @@ impl PickError {
             Self::EmptyPool => "No account is connected for this provider. Add one in Settings → Models.".into(),
             Self::AllDisabled => "Every account for this provider is turned off. Turn one on in Settings → Models.".into(),
             Self::NoneServesModel => "No connected account serves this model. Add the model to an account in Settings → Models.".into(),
-            Self::AllCooling { .. } => "Every account for this provider is rate limited. Wait, or add another account.".into(),
+            Self::AllCooling { .. } => "Every account for this provider is temporarily unavailable.".into(),
         }
     }
 }
@@ -41,6 +41,25 @@ pub fn pick<'a>(
     family: &str,
     model: &str,
     now_ms: i64,
+) -> Result<&'a Account, PickError> {
+    pick_with_active(
+        config,
+        ledger,
+        family,
+        model,
+        now_ms,
+        &std::collections::BTreeMap::new(),
+    )
+}
+
+/// Includes reserved turns so concurrent calls share the pool too.
+pub fn pick_with_active<'a>(
+    config: &'a RouterConfig,
+    ledger: &Ledger,
+    family: &str,
+    model: &str,
+    now_ms: i64,
+    active: &std::collections::BTreeMap<String, u32>,
 ) -> Result<&'a Account, PickError> {
     let pool = config.pool(family);
     if pool.is_empty() {
@@ -89,6 +108,7 @@ pub fn pick<'a>(
                 .account(&account.id)
                 .map(|usage| usage.requests)
                 .unwrap_or(0)
+                .saturating_add(u64::from(*active.get(&account.id).unwrap_or(&0)))
         })
         .collect();
     let mut best = 0;
@@ -217,10 +237,10 @@ mod tests {
     }
 
     #[test]
-    fn a_subscription_is_never_picked_until_the_router_speaks_its_wire() {
+    fn an_unsupported_subscription_is_never_picked() {
         let mut config = config(vec![account("a1", "openai", 1), account("s1", "openai", 1)]);
         config.accounts[1].credential = Credential::Subscription {
-            provider: "openai-codex".into(),
+            provider: "devin".into(),
             access: "at".into(),
             refresh: None,
             expires_ms: None,

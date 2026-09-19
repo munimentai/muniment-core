@@ -20,6 +20,7 @@ pub mod native_auth;
 pub mod pi_provider;
 pub mod quota;
 pub mod server;
+pub mod transport;
 pub mod usage;
 pub mod wire;
 

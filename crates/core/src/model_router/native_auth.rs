@@ -572,6 +572,109 @@ pub fn devin_profile(
     Some((text(body.get("user_name")), text(body.get("org_id"))))
 }
 
+/// Refreshes the OAuth credentials used by the native Codex and Claude wires.
+fn inference_refresh(
+    provider: &str,
+    refresh: &str,
+    now_ms: i64,
+    timeout: Duration,
+) -> Result<Credential, String> {
+    let client = agent(timeout);
+    let call = if provider == "openai-codex" {
+        client
+            .post("https://auth.openai.com/oauth/token")
+            .send_form(&[
+                ("client_id", "app_EMoamEEZ73f0CkXaXp7hrann"),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh),
+            ])
+    } else {
+        client
+            .post("https://platform.claude.com/v1/oauth/token")
+            .send_json(serde_json::json!({
+                "client_id":"9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+                "grant_type":"refresh_token", "refresh_token":refresh,
+            }))
+    };
+    let (status, body) = read(call)?;
+    if status != 200 {
+        return Err(format!(
+            "The account refused token refresh ({status}). Reconnect the account."
+        ));
+    }
+    let access =
+        text(body.get("access_token")).ok_or("The refresh response has no access token.")?;
+    Ok(Credential::Subscription {
+        provider: provider.into(),
+        access,
+        refresh: Some(text(body.get("refresh_token")).unwrap_or_else(|| refresh.into())),
+        expires_ms: expires_ms(number(body.get("expires_in")), now_ms),
+        account_id: None,
+        email: None,
+        plan: None,
+        renews_at_ms: None,
+    })
+}
+
+struct RefreshWriteLock(std::path::PathBuf);
+impl Drop for RefreshWriteLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+fn refresh_write_lock(agent: &std::path::Path) -> Result<RefreshWriteLock, String> {
+    let path = agent.join(format!("{}.lock", super::config::CONFIG_FILE));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(RefreshWriteLock(path)),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            Err(_) => return Err("Cannot lock account settings for token refresh.".into()),
+        }
+    }
+}
+
+/// Serializes token rotation across concurrent turns and merges only that credential.
+/// Always reload after the network call so unrelated settings survive a refresh.
+pub fn refresh_account(
+    agent: &std::path::Path,
+    id: &str,
+    now_ms: i64,
+    timeout: Duration,
+) -> Result<super::config::Account, String> {
+    static REFRESH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _held = REFRESH.lock().unwrap_or_else(|error| error.into_inner());
+    let mut config = super::config::load(agent).map_err(|_| "Cannot read account settings.")?;
+    let mut account = config
+        .accounts
+        .iter()
+        .find(|account| account.id == id)
+        .cloned()
+        .ok_or("The account was removed.")?;
+    if let Some(result) = refresh_if_expiring(&account.credential, now_ms, timeout) {
+        let original = account.credential.clone();
+        account.credential = result?;
+        let _file_lock = refresh_write_lock(agent)?;
+        config = super::config::load(agent).map_err(|_| "Cannot read account settings.")?;
+        let entry = config
+            .accounts
+            .iter_mut()
+            .find(|entry| entry.id == id)
+            .ok_or("The account was removed.")?;
+        if entry.credential != original {
+            return Ok(entry.clone());
+        }
+        entry.credential = account.credential.clone();
+        super::config::save(agent, &config).map_err(|_| "Cannot save the refreshed account.")?;
+    }
+    Ok(account)
+}
+
 /// Refreshes a subscription whose upstream hands out refresh tokens, when
 /// its access token is inside a minute of dying. Answers the new credential,
 /// or none when nothing needed doing or the upstream refused.
@@ -605,6 +708,7 @@ pub fn refresh_if_expiring(
         ),
         "antigravity" => antigravity_refresh(GOOGLE_TOKEN_URL, refresh, now_ms, timeout),
         "xai" => xai_refresh(XAI_TOKEN_URL, refresh, now_ms, timeout),
+        "openai-codex" | "anthropic" => inference_refresh(provider, refresh, now_ms, timeout),
         _ => return None,
     };
     Some(refreshed.map(|mut fresh| {

@@ -490,6 +490,40 @@ fn deferred_session_supervisor(
 }
 
 #[test]
+fn text_reaches_the_consumer_before_the_session_file_exists() {
+    let temp = TempDir::new();
+    let session_file = temp.path().join("session.jsonl");
+    let (mut supervisor, wiring) = deferred_session_supervisor(&session_file, None);
+    let transport = wiring.transport().unwrap();
+    let (adapter, _) =
+        PiRunAdapter::start("run-stream", &transport, "prompt", Duration::from_secs(1)).unwrap();
+    let mut text = String::new();
+    let (locator, buffered) = adapter
+        .await_session_binding_with_handler(
+            &transport,
+            temp.path(),
+            Duration::from_secs(3),
+            |event| {
+                if let PiChatEvent::TextDelta(delta) = event {
+                    assert!(
+                        !session_file.exists(),
+                        "text must arrive before durable binding"
+                    );
+                    text.push_str(delta);
+                    return Ok(true);
+                }
+                Ok(false)
+            },
+        )
+        .unwrap();
+    assert_eq!(text, "buffered");
+    assert!(buffered.is_empty(), "delivered text must not replay");
+    assert_eq!(locator.as_str(), "session.jsonl");
+    assert!(session_file.is_file());
+    supervisor.shutdown().unwrap();
+}
+
+#[test]
 fn accepted_prompt_waits_for_session_file_and_preserves_stream_frames() {
     let temp = TempDir::new();
     let session_file = temp.path().join("session.jsonl");

@@ -5,6 +5,7 @@ use serde_json::json;
 
 use crate::attachment::{prepare_pi_images, AttachmentDeliveryError};
 use crate::journal::reducer::ChatProjector;
+use crate::journal::{pi_translation::model_stream_delta_payload, split_model_stream_delta};
 use crate::run_events::{append_emit, ChatEventSink, SharedStorage};
 use crate::sidecar::pi_chat::{PiChatEvent, PiImageContent, PromptCommand};
 use crate::sidecar::{PiRpcWiring, PiSessionLocator, SidecarSupervisor};
@@ -108,9 +109,30 @@ pub fn coordinate_prepared_prompt<T>(
     run_id: &str,
     seq: &mut u64,
     subject: Option<&str>,
-    submit: impl FnOnce() -> Result<(T, PiSessionLocator, Vec<PiChatEvent>), PreparedPromptError>,
+    submit: impl FnOnce(
+        &mut dyn FnMut(&PiChatEvent) -> Result<bool, PreparedPromptError>,
+    ) -> Result<(T, PiSessionLocator, Vec<PiChatEvent>), PreparedPromptError>,
 ) -> Result<(T, Vec<PiChatEvent>), PreparedPromptError> {
-    let (handle, locator, buffered_events) = submit()?;
+    let (handle, locator, buffered_events) = submit(&mut |event| {
+        let (kind, payloads) = match event {
+            PiChatEvent::PromptAccepted => ("model.prompt.accepted", vec![json!({})]),
+            PiChatEvent::TurnStarted => ("model.turn.started", vec![json!({})]),
+            PiChatEvent::TextDelta(text) => (
+                "model.stream.delta",
+                split_model_stream_delta(text)
+                    .map(model_stream_delta_payload)
+                    .collect(),
+            ),
+            _ => return Ok(false),
+        };
+        for payload in payloads {
+            append_emit(
+                sink, journal, projector, run_id, seq, kind, payload, subject,
+            )
+            .map_err(|_| PreparedPromptError::Journal)?;
+        }
+        Ok(true)
+    })?;
     append_emit(
         sink,
         journal,
@@ -119,17 +141,6 @@ pub fn coordinate_prepared_prompt<T>(
         seq,
         "runtime.pi_session.bound",
         json!({"run_id": run_id, "locator": locator.as_str()}),
-        subject,
-    )
-    .map_err(|_| PreparedPromptError::Journal)?;
-    append_emit(
-        sink,
-        journal,
-        projector,
-        run_id,
-        seq,
-        "model.prompt.accepted",
-        json!({}),
         subject,
     )
     .map_err(|_| PreparedPromptError::Journal)?;
@@ -270,7 +281,7 @@ mod tests {
             &run_id,
             &mut seq,
             Some("owner"),
-            || {
+            |emit| {
                 let mut storage = storage.lock().unwrap();
                 let events = storage.journal.events(&run_id).unwrap();
                 assert_eq!(events.len(), 3);
@@ -280,6 +291,11 @@ mod tests {
                     };
                     storage.cas.verify(attachment.sha256()).unwrap();
                 }
+                drop(storage);
+                assert!(emit(&PiChatEvent::PromptAccepted)?);
+                assert!(emit(&PiChatEvent::TurnStarted)?);
+                assert!(emit(&PiChatEvent::TextDelta("early text".into()))?);
+
                 Ok(("handle", locator, vec![PiChatEvent::Completed]))
             },
         )
@@ -297,8 +313,10 @@ mod tests {
                 "run.started",
                 "chat.attachment.ingested",
                 "chat.attachment.ingested",
-                "runtime.pi_session.bound",
-                "model.prompt.accepted"
+                "model.prompt.accepted",
+                "model.turn.started",
+                "model.stream.delta",
+                "runtime.pi_session.bound"
             ]
         );
         drop(events);

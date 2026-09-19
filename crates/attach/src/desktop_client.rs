@@ -114,6 +114,23 @@ impl DesktopClient {
         }
     }
 
+    pub fn create_thread(&mut self) -> Result<String, ClientError> {
+        let response = self.request(
+            Operation::ThreadCreate,
+            Some(fresh_request_id()?),
+            serde_json::json!({}),
+        )?;
+        let thread = response
+            .body
+            .get("thread_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(ClientError::UnexpectedMessage)?;
+        if thread.is_empty() || thread.len() > MAX_THREAD_ID_LENGTH {
+            return Err(ClientError::UnexpectedMessage);
+        }
+        Ok(thread.to_owned())
+    }
+
     pub fn rename_thread(&mut self, thread_id: &str, title: &str) -> Result<(), ClientError> {
         if thread_id.is_empty() || thread_id.len() > MAX_THREAD_ID_LENGTH || title.is_empty() {
             return Err(ClientError::UnexpectedMessage);

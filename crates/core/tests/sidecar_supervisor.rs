@@ -1286,3 +1286,24 @@ fn json_rpc_call_interrupted_by_restart_returns_bounded_error() {
     supervisor.shutdown().unwrap();
     let _ = std::fs::remove_dir(marker);
 }
+
+#[test]
+fn missing_project_directory_does_not_fall_back_to_the_parent_directory() {
+    let mut cfg = config(&["echo"]);
+    cfg.working_directory =
+        Some(std::env::temp_dir().join(format!("missing-project-{}", uuid::Uuid::new_v4())));
+    cfg.restart.max_restarts = 0;
+    let supervisor = SidecarSupervisor::spawn(cfg, |_| Ok(ProbeOutcome::Ready)).unwrap();
+    let events = supervisor.subscribe();
+    loop {
+        let event = next_event(&events);
+        assert_ne!(event.status, SidecarStatus::Healthy);
+        if event.status == SidecarStatus::Failed {
+            assert!(matches!(
+                event.cause,
+                Some(SidecarEventCause::SpawnError(_))
+            ));
+            break;
+        }
+    }
+}

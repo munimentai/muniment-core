@@ -40,6 +40,10 @@ impl DesktopClientHolder {
         self.with_client(|client| client.request(operation, idempotency_key, body))
     }
 
+    pub fn create_thread(&self) -> Result<String, ClientError> {
+        self.with_client(|client| client.create_thread())
+    }
+
     pub fn rename_thread(&self, thread_id: &str, title: &str) -> Result<(), ClientError> {
         self.with_client(|client| client.rename_thread(thread_id, title))
     }

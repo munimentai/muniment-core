@@ -31,7 +31,7 @@ pub fn choose_default_home(
     home: Option<PathBuf>,
 ) -> Result<PathBuf, String> {
     if let Some(documents) = documents.filter(|path| path.is_dir()) {
-        return Ok(documents.join("Muniment"));
+        return Ok(documents.join("muniment"));
     }
 
     let home = home
@@ -39,9 +39,9 @@ pub fn choose_default_home(
         .ok_or_else(|| "The Documents folder is unavailable.".to_string())?;
     let documents = home.join("Documents");
     Ok(if documents.is_dir() {
-        documents.join("Muniment")
+        documents.join("muniment")
     } else {
-        home.join("Muniment")
+        home.join("muniment")
     })
 }
 
@@ -1292,7 +1292,7 @@ fn persist_home_locked(config_dir: &Path, home: &Path) -> Result<(), HomeError> 
 }
 
 #[cfg(not(target_os = "windows"))]
-fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
     fs::rename(source, destination)
 }
 
@@ -1302,7 +1302,7 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
     if destination.exists() {
         // Windows rename does not replace an existing file atomically.
         use std::os::windows::ffi::OsStrExt;
@@ -1399,7 +1399,7 @@ mod tests {
 
         assert_eq!(
             choose_default_home(Some(documents.clone()), None).unwrap(),
-            documents.join("Muniment")
+            documents.join("muniment")
         );
     }
 
@@ -1411,7 +1411,7 @@ mod tests {
 
         assert_eq!(
             choose_default_home(None, Some(root.0.clone())).unwrap(),
-            documents.join("Muniment")
+            documents.join("muniment")
         );
     }
 
@@ -1421,7 +1421,7 @@ mod tests {
 
         assert_eq!(
             choose_default_home(None, Some(root.0.clone())).unwrap(),
-            root.0.join("Muniment")
+            root.0.join("muniment")
         );
     }
 
@@ -1433,7 +1433,7 @@ mod tests {
 
         let home = choose_default_home(Some(documents.clone()), Some(root.0.clone())).unwrap();
 
-        assert_eq!(home, root.0.join("Muniment"));
+        assert_eq!(home, root.0.join("muniment"));
         assert!(!home.exists());
         assert!(!documents.exists());
         super::confirm_home(&config, &home).unwrap();
@@ -1452,7 +1452,7 @@ mod tests {
 
         assert_eq!(
             choose_default_home(Some(documents.clone()), Some(root.0.clone())).unwrap(),
-            root.0.join("Muniment")
+            root.0.join("muniment")
         );
         assert_eq!(fs::read(documents).unwrap(), b"keep");
     }
@@ -1465,7 +1465,7 @@ mod tests {
 
         assert_eq!(
             choose_default_home(Some(root.0.join("missing")), Some(root.0.clone())).unwrap(),
-            documents.join("Muniment")
+            documents.join("muniment")
         );
     }
 
@@ -1484,7 +1484,7 @@ mod tests {
     fn failed_home_creation_names_the_path_and_io_error() {
         let root = TempRoot::new("creation-error");
         let config = root.0.join("config");
-        let home = root.0.join("missing").join("Muniment");
+        let home = root.0.join("missing").join("muniment");
         let expected = fs::create_dir(&home).unwrap_err();
 
         let error = super::confirm_home(&config, &home).unwrap_err();
@@ -1503,7 +1503,7 @@ mod tests {
     fn refused_scaffold_names_the_path_without_changing_the_file() {
         let root = TempRoot::new("refused-scaffold");
         let config = root.0.join("config");
-        let home = root.0.join("Muniment");
+        let home = root.0.join("muniment");
         fs::create_dir(&home).unwrap();
         let refused = home.join("agents");
         fs::write(&refused, b"keep").unwrap();

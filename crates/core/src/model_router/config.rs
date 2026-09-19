@@ -116,12 +116,10 @@ impl Credential {
         }
     }
 
-    /// Whether the router can send a turn on this credential. A key goes out
-    /// on the family's OpenAI-compatible route. A subscription speaks its own
-    /// wire, which the router does not yet, so it is shown and probed but no
-    /// turn lands on it.
+    /// Whether a native transport is available for this credential.
     pub fn servable(&self) -> bool {
         matches!(self, Self::ApiKey { .. })
+            || matches!(self, Self::Subscription { provider, .. } if matches!(provider.as_str(), "openai-codex" | "xai" | "anthropic" | "kimi"))
     }
 
     /// Pi's provider id behind a subscription, none for a key.
@@ -799,7 +797,7 @@ mod tests {
         assert!(Credential::from_pi_auth("xai", &serde_json::json!({ "type": "oauth" })).is_none());
         assert!(!Credential::ApiKey { key: "sk".into() }.expired(i64::MAX));
         assert!(Credential::ApiKey { key: "sk".into() }.servable());
-        assert!(!credential.servable());
+        assert!(credential.servable());
     }
 
     fn tempdir() -> PathBuf {
