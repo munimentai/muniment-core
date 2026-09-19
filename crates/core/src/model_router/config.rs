@@ -168,7 +168,26 @@ impl Credential {
             refresh: text("refresh"),
             expires_ms: entry.get("expires").and_then(serde_json::Value::as_i64),
             account_id: text("accountId").or_else(|| text("account_id")),
-            email: text("email"),
+            email: text("email").or_else(|| {
+                // Display metadata only. Claims never authorize an account or a request.
+                use base64::Engine;
+                let token = entry
+                    .get("id_token")
+                    .or_else(|| entry.get("idToken"))
+                    .or_else(|| entry.get("access"))?
+                    .as_str()?;
+                let payload = token.split('.').nth(1)?;
+                let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(payload)
+                    .ok()?;
+                let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+                claims
+                    .get("email")?
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|email| !email.is_empty())
+                    .map(str::to_owned)
+            }),
             plan: None,
             renews_at_ms: None,
         })
@@ -470,6 +489,21 @@ mod tests {
             renews_at_ms: None,
         };
         account
+    }
+
+    #[test]
+    fn sign_in_email_can_come_from_display_claims() {
+        use base64::Engine;
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"email":"user@example.test"}"#);
+        let entry = serde_json::json!({"type":"oauth", "access":"opaque", "id_token":format!("header.{claims}.signature")});
+        assert_eq!(
+            Credential::from_pi_auth("xai", &entry)
+                .unwrap()
+                .into_email()
+                .as_deref(),
+            Some("user@example.test")
+        );
     }
 
     #[test]
