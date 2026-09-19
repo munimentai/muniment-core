@@ -117,6 +117,7 @@ impl Drop for Handle {
 /// What the router keeps between turns: where its files are, and the counters
 /// it has not yet written down.
 struct State {
+    progress: super::progress::Progress,
     agent: PathBuf,
     ledger: Mutex<Ledger>,
     /// The turns in flight, counted up while an upstream call is open.
@@ -151,6 +152,49 @@ pub struct RouteTest {
     pub reason: &'static str,
     pub confidence: Option<f64>,
     pub elapsed_ms: u128,
+    pub eligible_models: Vec<String>,
+    pub exclusions: Vec<RouteExclusion>,
+    pub fallback_reason: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RouteExclusion {
+    pub model: String,
+    pub reason: String,
+}
+
+fn route_availability(
+    config: &RouterConfig,
+    ledger: &Ledger,
+    now_ms: i64,
+) -> (Vec<String>, Vec<RouteExclusion>) {
+    let mut models = std::collections::BTreeSet::new();
+    for account in &config.accounts {
+        let names = if account.models.is_empty() {
+            super::model_catalog::family_models(&account.family)
+                .iter()
+                .map(|entry| entry.model.to_owned())
+                .collect()
+        } else {
+            account.models.clone()
+        };
+        for model in names {
+            models.insert((account.family.clone(), model));
+        }
+    }
+    let mut eligible = Vec::new();
+    let mut excluded = Vec::new();
+    for (family, model) in models {
+        let name = format!("{family}/{model}");
+        match balance::pick(config, ledger, &family, &model, now_ms) {
+            Ok(_) => eligible.push(name),
+            Err(error) => excluded.push(RouteExclusion {
+                model: name,
+                reason: error.message(),
+            }),
+        }
+    }
+    (eligible, excluded)
 }
 
 impl State {
@@ -191,7 +235,23 @@ impl State {
         if let Some(account) = &decision.spent_on {
             self.record_success(account, decision.spent);
         }
+        let (eligible_models, exclusions) =
+            route_availability(&config, &self.ledger(), (self.now_ms)());
         Ok(RouteTest {
+            eligible_models,
+            exclusions,
+            fallback_reason: match decision.reason {
+                super::classify::Reason::Classified => None,
+                super::classify::Reason::NotClassified => {
+                    Some("Classification is not active for this request.")
+                }
+                super::classify::Reason::LowConfidence => {
+                    Some("Classifier confidence is below the configured minimum.")
+                }
+                super::classify::Reason::Failed => {
+                    Some("The classifier did not return a valid choice.")
+                }
+            },
             model: format!("{}/{}", decision.route.family, decision.route.model),
             reason: match decision.reason {
                 super::classify::Reason::Classified => "Classifier selected the model",
@@ -310,6 +370,7 @@ fn start_with_clock(agent: PathBuf, clock: fn() -> i64) -> io::Result<Handle> {
     write_endpoint(&agent, &endpoint)?;
     let active: Active = Arc::new(Mutex::new(BTreeMap::new()));
     let state = Arc::new(State {
+        progress: Default::default(),
         ledger: Mutex::new(usage::load(&agent)),
         agent,
         active: Arc::clone(&active),
@@ -460,6 +521,19 @@ fn serve(stream: TcpStream, state: &State, token: &str) {
         return;
     }
     match (head.method.as_str(), head.path()) {
+        ("GET", path) if path.starts_with("/v1/routing-progress/") => {
+            let id = path.trim_start_matches("/v1/routing-progress/");
+            if let Some(snapshot) = state.progress.get(id, (state.now_ms)()) {
+                respond(
+                    &mut stream,
+                    200,
+                    "OK",
+                    &serde_json::to_value(snapshot).unwrap(),
+                );
+            } else {
+                respond(&mut stream, 404, "Not Found", &serde_json::json!({}));
+            }
+        }
         ("GET", "/v1/models") | ("GET", "/models") => {
             let models = served_models(&state.config());
             respond(&mut stream, 200, "OK", &wire::model_list(&models));
@@ -486,7 +560,11 @@ fn serve(stream: TcpStream, state: &State, token: &str) {
                 );
                 return;
             };
-            complete(&mut stream, state, &request);
+            let progress = state
+                .progress
+                .start(head.header("x-muniment-routing-id"), (state.now_ms)());
+            complete(&mut stream, state, &request, progress.as_deref());
+            state.progress.finish(progress.as_deref());
         }
         _ => respond(
             &mut stream,
@@ -510,11 +588,15 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 
 /// Classify once, try the selected pool, then eligible fallback models.
 /// Once response output starts, never replay the request on another model.
-fn complete(stream: &mut TcpStream, state: &State, request: &Value) {
+fn complete(stream: &mut TcpStream, state: &State, request: &Value, progress: Option<&str>) {
+    state
+        .progress
+        .stage(progress, "choosing-model", (state.now_ms)());
     let config = state.classifier_config();
     let requested = wire::requested_model(request).unwrap_or(config::AUTO_MODEL);
     let text = wire::classifier_state(request);
     // Reuse the decision across attempts so failure never spends the classifier twice.
+    let classification_started = std::time::Instant::now();
     let plan = match plan(&config, &state.ledger(), requested, &text, (state.now_ms)()) {
         Ok(plan) => plan,
         Err(error) => {
@@ -534,6 +616,11 @@ fn complete(stream: &mut TcpStream, state: &State, request: &Value) {
     if let Some(spent_on) = &plan.classifier_spent_on {
         state.record_success(spent_on, plan.classifier_spent);
     }
+    let classification_ms = classification_started
+        .elapsed()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    let (_, exclusions) = route_availability(&config, &state.ledger(), (state.now_ms)());
     let mut refusals: Vec<String> = Vec::new();
     let mut routes = super::options(&config);
     // Prefer the configured fallback, then another provider, then remaining models.
@@ -554,14 +641,36 @@ fn complete(stream: &mut TcpStream, state: &State, request: &Value) {
         },
     );
     let mut last_failure = (503, "No eligible model served this turn.".to_owned());
+    let mut attempted = false;
     for route in routes {
         let mut candidates = config.clone();
         loop {
             let (account, _in_flight) =
                 match state.reserve(&candidates, &route.family, &route.model) {
                     Ok(account) => account,
-                    Err(_) => break,
+                    Err(error) => {
+                        refusals.push(format!(
+                            "{}/{}: {}",
+                            route.family,
+                            route.model,
+                            error.message()
+                        ));
+                        break;
+                    }
                 };
+            if attempted
+                || matches!(
+                    plan.reason,
+                    super::classify::Reason::Failed | super::classify::Reason::LowConfidence
+                )
+            {
+                state.progress.stage(progress, "fallback", (state.now_ms)());
+            } else {
+                state
+                    .progress
+                    .stage(progress, "waiting-for-account", (state.now_ms)());
+            }
+            attempted = true;
             // Try each account at most once for this model, even if cooldown expires.
             if let Some(candidate) = candidates.accounts.iter_mut().find(|a| a.id == account.id) {
                 candidate.enabled = false;
@@ -602,10 +711,47 @@ fn complete(stream: &mut TcpStream, state: &State, request: &Value) {
             let call = call.send_json(&prepared.body);
             match call {
                 Ok(response) => {
-                    let response_id = wire::classified_response_id(
+                    state.progress.stage(progress, "thinking", (state.now_ms)());
+                    let response_id = wire::evidenced_response_id(
                         &route.family,
                         &route.model,
                         plan.classifier.as_ref(),
+                        wire::RoutingEvidence {
+                            account: account.label.clone(),
+                            selected_model: format!("{}/{}", plan.family, plan.model),
+                            decision: match plan.reason {
+                                super::classify::Reason::Classified => {
+                                    "Classifier selected the model"
+                                }
+                                super::classify::Reason::NotClassified
+                                    if requested != config::AUTO_MODEL =>
+                                {
+                                    "User selected the model"
+                                }
+                                super::classify::Reason::NotClassified => {
+                                    "Fallback used without classification"
+                                }
+                                super::classify::Reason::LowConfidence => {
+                                    "Fallback used because classifier confidence was low"
+                                }
+                                super::classify::Reason::Failed => {
+                                    "Fallback used because the classifier failed"
+                                }
+                            }
+                            .into(),
+                            confidence: matches!(
+                                plan.reason,
+                                super::classify::Reason::Classified
+                                    | super::classify::Reason::LowConfidence
+                            )
+                            .then_some(plan.confidence),
+                            classification_ms,
+                            exclusions: exclusions
+                                .iter()
+                                .map(|item| format!("{}: {}", item.model, item.reason))
+                                .collect(),
+                            fallback_causes: refusals.clone(),
+                        },
                     );
                     if prepared.protocol != transport::Protocol::Chat {
                         let result = relay_native(
@@ -686,12 +832,12 @@ fn complete(stream: &mut TcpStream, state: &State, request: &Value) {
                         let _ = usage::save(&state.agent, &ledger);
                     }
                     last_failure = (status, detail);
+                    refusals.push(format!("{} answered {status}.", account.label));
                     if !cools {
                         // Another model may accept the request, but repeating it on
                         // the same model's other accounts does not help.
                         break;
                     }
-                    refusals.push(format!("{} answered {status}.", account.label));
                 }
                 Err(ureq::Error::Transport(error)) => {
                     state.record_error(&account.id, &error.to_string(), true);
@@ -966,6 +1112,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn route_test_availability_uses_runtime_pool_readiness() {
+        let ready = account("ready", "http://localhost");
+        let mut disabled = account("disabled", "http://localhost");
+        disabled.models = vec!["disabled-model".into()];
+        disabled.enabled = false;
+        let mut cooling = account("cooling", "http://localhost");
+        cooling.models = vec!["cooling-model".into()];
+        let config = config(vec![ready, disabled, cooling]);
+        let mut ledger = Ledger::default();
+        ledger
+            .accounts
+            .entry("cooling".into())
+            .or_default()
+            .cooldown_until_ms = Some(fixed_clock() + 1000);
+        let (eligible, excluded) = route_availability(&config, &ledger, fixed_clock());
+        assert_eq!(eligible, vec!["openai/gpt-5.6-mini"]);
+        assert_eq!(excluded.len(), 2);
+        assert_eq!(excluded[0].model, "openai/cooling-model");
+        assert!(excluded[0].reason.contains("temporarily unavailable"));
+        assert_eq!(excluded[1].model, "openai/disabled-model");
+        assert!(excluded[1].reason.contains("serves this model"));
+        let (eligible, _) = route_availability(&config, &ledger, fixed_clock() + 1000);
+        assert!(eligible.contains(&"openai/cooling-model".to_owned()));
+    }
+
     /// One request to the running router, answered whole.
     fn call(
         endpoint: &Endpoint,
@@ -1066,6 +1238,56 @@ mod tests {
     }
 
     #[test]
+    fn progress_endpoint_reports_real_fallback_and_requires_authentication() {
+        let agent = agent_dir();
+        let (url, _) = upstream(vec![
+            (429, "limited".into(), false),
+            (200, answer("hello", 1, 1), false),
+        ]);
+        config::save(
+            &agent,
+            &config(vec![account("a", &url), account("b", &url)]),
+        )
+        .unwrap();
+        let handle = start_with_clock(agent, fixed_clock).unwrap();
+        let endpoint = handle.endpoint();
+        let id = uuid::Uuid::new_v4().to_string();
+        ureq::post(&format!("{}/chat/completions", endpoint.base_url()))
+            .set("authorization", &format!("Bearer {}", endpoint.token))
+            .set("x-muniment-routing-id", &id)
+            .send_json(turn("auto", false))
+            .unwrap()
+            .into_string()
+            .unwrap();
+        let path = format!("/v1/routing-progress/{id}");
+        assert_eq!(call(endpoint, "GET", &path, None, "wrong").0, 401);
+        let (status, body) = call(endpoint, "GET", &path, None, &endpoint.token);
+        assert_eq!(status, 200);
+        let snapshot: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            snapshot["stages"],
+            json!([
+                "choosing-model",
+                "waiting-for-account",
+                "fallback",
+                "thinking"
+            ])
+        );
+        assert_eq!(snapshot["done"], true);
+        assert_eq!(
+            call(
+                endpoint,
+                "GET",
+                &format!("/v1/routing-progress/{}", uuid::Uuid::new_v4()),
+                None,
+                &endpoint.token
+            )
+            .0,
+            404
+        );
+    }
+
+    #[test]
     fn native_subscription_streams_fail_over_and_count_only_complete_answers() {
         let agent = agent_dir();
         let payload = [
@@ -1159,6 +1381,7 @@ mod tests {
     fn reservations_distribute_concurrent_turns_and_release_on_drop() {
         let agent = agent_dir();
         let state = State {
+            progress: Default::default(),
             agent,
             ledger: Mutex::new(Ledger::default()),
             active: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1300,6 +1523,11 @@ mod tests {
             &handle.endpoint().token,
         );
         assert_eq!(status, 200, "{body}");
+        let response: Value = serde_json::from_str(&body).unwrap();
+        let routing = wire::response_routing(response["id"].as_str().unwrap()).unwrap();
+        assert_eq!(routing.fallback_causes, ["a answered 404."]);
+        assert_eq!(routing.account, "a");
+        assert_eq!(routing.selected_model, "openai/gpt-5.6-mini");
         let models: Vec<_> = seen
             .try_iter()
             .map(|r| r["model"].as_str().unwrap().to_owned())

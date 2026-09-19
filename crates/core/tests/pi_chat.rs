@@ -893,3 +893,28 @@ fn startup_answers_name_requests_before_acknowledgement_and_keeps_other_frames()
     );
     supervisor.shutdown().unwrap();
 }
+
+#[test]
+fn router_progress_notifications_are_typed_and_ignore_other_messages() {
+    for stage in [
+        "choosing-model",
+        "waiting-for-account",
+        "fallback",
+        "thinking",
+    ] {
+        assert_eq!(parse_frame(&json!({"type":"extension_ui_request", "method":"notify", "message":format!("muniment:routing:{stage}")})).unwrap(), PiChatEvent::RoutingStage(stage.into()));
+    }
+    for message in [
+        "Other notification",
+        "muniment:routing:unknown",
+        "muniment:routing:",
+    ] {
+        assert_eq!(
+            parse_frame(
+                &json!({"type":"extension_ui_request", "method":"notify", "message":message})
+            )
+            .unwrap(),
+            PiChatEvent::Interleaved
+        );
+    }
+}

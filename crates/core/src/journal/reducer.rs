@@ -446,6 +446,7 @@ pub struct PiSessionBinding {
 pub struct ChatProjection {
     pub prompt_accepted: bool,
     pub turn_started: bool,
+    pub routing_stage: Option<String>,
     pub prompt_storage_notice: Option<String>,
     pub text: String,
     pub receipt: Option<Value>,
@@ -610,7 +611,19 @@ impl ChatProjector {
             }
             "model.prompt.accepted" => self.chat.prompt_accepted = true,
             "model.turn.started" => self.chat.turn_started = true,
-            "model.stream.delta" => self.chat.text.push_str(&field(event, "text")?),
+            "model.routing.stage" => {
+                let stage = field(event, "stage")?;
+                if matches!(
+                    stage.as_str(),
+                    "choosing-model" | "waiting-for-account" | "fallback" | "thinking"
+                ) {
+                    self.chat.routing_stage = Some(stage);
+                }
+            }
+            "model.stream.delta" => {
+                self.chat.routing_stage = None;
+                self.chat.text.push_str(&field(event, "text")?);
+            }
             "memory.recalled" => self.chat.recalls.push(projected_recall(event)?),
             "code.diff.applied" => self.chat.applied_diffs.push(projected_applied_diff(event)?),
             "tool.effect.started" => self.chat.tool_activity.push(ToolActivity {

@@ -116,6 +116,9 @@ pub fn coordinate_prepared_prompt<T>(
     let (handle, locator, buffered_events) = submit(&mut |event| {
         let (kind, payloads) = match event {
             PiChatEvent::PromptAccepted => ("model.prompt.accepted", vec![json!({})]),
+            PiChatEvent::RoutingStage(stage) => {
+                ("model.routing.stage", vec![json!({"stage": stage})])
+            }
             PiChatEvent::TurnStarted => ("model.turn.started", vec![json!({})]),
             PiChatEvent::TextDelta(text) => (
                 "model.stream.delta",

@@ -18,6 +18,7 @@ pub mod family;
 pub mod model_catalog;
 pub mod native_auth;
 pub mod pi_provider;
+mod progress;
 pub mod quota;
 pub mod server;
 pub mod transport;

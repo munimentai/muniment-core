@@ -22,7 +22,77 @@ pub fn routed_response_id(family: &str, model: &str) -> String {
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoutingEvidence {
+    pub account: String,
+    pub selected_model: String,
+    pub decision: String,
+    pub confidence: Option<f64>,
+    pub classification_ms: u64,
+    pub exclusions: Vec<String>,
+    pub fallback_causes: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RoutedResponse {
+    family: String,
+    model: String,
+    classifier: Option<ClassifierUsage>,
+    routing: RoutingEvidence,
+}
+
+pub fn evidenced_response_id(
+    family: &str,
+    model: &str,
+    classifier: Option<&ClassifierUsage>,
+    routing: RoutingEvidence,
+) -> String {
+    let value = RoutedResponse {
+        family: family.into(),
+        model: model.into(),
+        classifier: classifier.cloned(),
+        routing,
+    };
+    let bytes = serde_json::to_vec(&value).expect("routing evidence serializes");
+    format!(
+        "muniment-route-v3.{}.{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes),
+        uuid::Uuid::new_v4()
+    )
+}
+
+fn evidenced_response(id: &str) -> Option<RoutedResponse> {
+    if id.len() > 65536 {
+        return None;
+    }
+    let (encoded, nonce) = id.strip_prefix("muniment-route-v3.")?.split_once('.')?;
+    uuid::Uuid::parse_str(nonce).ok()?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .ok()?;
+    let value: RoutedResponse = serde_json::from_slice(&bytes).ok()?;
+    if super::family::family(&value.family).is_none()
+        || value.model.is_empty()
+        || value.model.len() > 512
+        || value.model.chars().any(char::is_control)
+        || value
+            .routing
+            .confidence
+            .is_some_and(|v| !v.is_finite() || !(0.0..=1.0).contains(&v))
+    {
+        return None;
+    }
+    Some(value)
+}
+
+pub fn response_routing(id: &str) -> Option<RoutingEvidence> {
+    evidenced_response(id).map(|value| value.routing)
+}
+
 pub fn response_model(id: &str) -> Option<(String, String)> {
+    if id.starts_with("muniment-route-v3.") {
+        return evidenced_response(id).map(|value| (value.family, value.model));
+    }
     if id.starts_with("muniment-route-v2.") {
         return classified_response(id).map(|(family, model, _)| (family, model));
     }
@@ -98,6 +168,9 @@ fn classified_response(id: &str) -> Option<(String, String, ClassifierUsage)> {
 }
 
 pub fn response_classifier(id: &str) -> Option<ClassifierUsage> {
+    if id.starts_with("muniment-route-v3.") {
+        return evidenced_response(id).and_then(|value| value.classifier);
+    }
     classified_response(id).map(|(_, _, usage)| usage)
 }
 

@@ -1006,3 +1006,31 @@ fn action_details_survive_full_and_fragment_replay() {
         Some("fn main() {}")
     );
 }
+
+#[test]
+fn routing_stages_replay_and_reply_output_clears_the_wait() {
+    let mut events = stream(&[
+        ("run.started", json!({})),
+        ("model.turn.started", json!({})),
+        ("model.routing.stage", json!({"stage":"choosing-model"})),
+        (
+            "model.routing.stage",
+            json!({"stage":"waiting-for-account"}),
+        ),
+        ("model.routing.stage", json!({"stage":"fallback"})),
+    ]);
+    let mut projector = ChatProjector::default();
+    for event in &events {
+        projector.apply(event).unwrap();
+    }
+    let projection = projector.projection().unwrap();
+    assert_eq!(projection.routing_stage.as_deref(), Some("fallback"));
+    assert_eq!(projection, project_chat(&events).unwrap());
+    events.push(event(6, "model.stream.delta", json!({"text":"hello"})));
+    projector.apply(events.last().unwrap()).unwrap();
+    assert_eq!(projector.projection().unwrap().routing_stage, None);
+    assert_eq!(
+        projector.projection().unwrap(),
+        project_chat(&events).unwrap()
+    );
+}

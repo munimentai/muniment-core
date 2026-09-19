@@ -62,6 +62,7 @@ fn event_types_are_terminal(events: &[RunEventType]) -> bool {
             | "runtime.pi_session.bound"
             | "model.prompt.accepted"
             | "model.turn.started"
+            | "model.routing.stage"
             | "model.stream.delta"
             | "permission.requested"
             | "permission.resolved"

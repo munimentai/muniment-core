@@ -209,6 +209,7 @@ struct LocalRunLedger {
     cost: Option<f64>,
     cost_incomplete: bool,
     classifiers: Vec<crate::model_router::wire::ClassifierUsage>,
+    routing: Vec<crate::model_router::wire::RoutingEvidence>,
     turns: u32,
     tool_names: std::collections::HashMap<String, String>,
     tools: std::collections::BTreeMap<String, (u32, u32)>,
@@ -218,12 +219,16 @@ impl LocalRunLedger {
     fn record(&mut self, event: &PiChatEvent) {
         match event {
             PiChatEvent::ModelReported {
+                routing,
                 classifier,
                 provider,
                 model,
                 usage,
                 cost,
             } => {
+                if let Some(routing) = routing {
+                    self.routing.push((**routing).clone());
+                }
                 if let Some(classifier) = classifier {
                     if let Some(held) = self
                         .classifiers
@@ -278,13 +283,13 @@ impl LocalRunLedger {
     }
 }
 
-/// A local reply carries no cloud receipt and no route, because no routing
-/// chose the model. The model, tokens, turns and tools are what the run
-/// recorded, and the cost is Pi's catalog estimate, never a bill.
+/// A local receipt preserves the model, routing evidence, usage and tools
+/// recorded by the run. The cost is a catalog estimate, never a bill.
 fn local_receipt(elapsed: Duration, ledger: &LocalRunLedger) -> crate::sidecar::pi_chat::Receipt {
     crate::sidecar::pi_chat::Receipt {
         model: ledger.model.clone(),
         classifiers: ledger.classifiers.clone(),
+        routing: ledger.routing.clone(),
         cost: ledger
             .cost
             .filter(|_| !ledger.cost_incomplete)
@@ -1189,6 +1194,22 @@ pub fn coordinate(
                 }
             }
             Ok(PiChatEvent::ModelReported { .. }) => {}
+            Ok(PiChatEvent::RoutingStage(stage)) => {
+                if append_emit(
+                    &app,
+                    &journal,
+                    &mut projector,
+                    &run_id,
+                    &mut seq,
+                    "model.routing.stage",
+                    json!({"stage": stage}),
+                    subject.as_deref(),
+                )
+                .is_err()
+                {
+                    break;
+                }
+            }
             Ok(PiChatEvent::TurnStarted) => {
                 if append_emit(
                     &app,
@@ -1566,6 +1587,7 @@ mod tests {
             total: 117,
         };
         let reported = |cost: f64| PiChatEvent::ModelReported {
+            routing: None,
             classifier: None,
             provider: "ollama".into(),
             model: "llama3.2:3b".into(),
@@ -1598,9 +1620,39 @@ mod tests {
     }
 
     #[test]
+    fn routed_receipt_preserves_account_decision_and_exclusions() {
+        let evidence = crate::model_router::wire::RoutingEvidence {
+            account: "Work".into(),
+            selected_model: "openai/gpt-5.6-mini".into(),
+            decision: "Classifier selected the model".into(),
+            confidence: Some(0.8),
+            classification_ms: 42,
+            exclusions: vec!["anthropic/claude: Account is turned off.".into()],
+            fallback_causes: vec!["Personal answered 429.".into()],
+        };
+        let id = crate::model_router::wire::evidenced_response_id(
+            "openai",
+            "gpt-5.6-mini",
+            None,
+            evidence.clone(),
+        );
+        let event = crate::sidecar::pi_chat::parse_frame(&serde_json::json!({
+            "type": "message_end", "message": {"role": "assistant", "provider": "muniment-router", "model": "auto", "responseId": id}
+        })).unwrap();
+        let mut ledger = LocalRunLedger::default();
+        ledger.record(&event);
+        let receipt = local_receipt(Duration::from_secs(1), &ledger);
+        let restored: crate::sidecar::pi_chat::Receipt =
+            serde_json::from_slice(&serde_json::to_vec(&receipt).unwrap()).unwrap();
+        assert_eq!(restored.routing, vec![evidence]);
+        assert_eq!(restored.model.as_deref(), Some("openai/gpt-5.6-mini"));
+    }
+
+    #[test]
     fn classifier_usage_sums_without_changing_model_usage() {
         let mut ledger = LocalRunLedger::default();
         let event = PiChatEvent::ModelReported {
+            routing: None,
             classifier: Some(crate::model_router::wire::ClassifierUsage {
                 model: "typesafe/jev-latest".into(),
                 tokens: Some(crate::model_router::wire::Tokens {
@@ -1635,6 +1687,7 @@ mod tests {
     fn a_run_with_an_unpriced_turn_does_not_show_a_partial_cost() {
         let mut ledger = ledger_of_one_run();
         ledger.record(&PiChatEvent::ModelReported {
+            routing: None,
             classifier: None,
             provider: "muniment-router".into(),
             model: "private-model".into(),

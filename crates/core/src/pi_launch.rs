@@ -588,6 +588,16 @@ pub fn pi_launch_config_for_executable(
         "--exclude-tools".into(),
         EXCLUDED_TOOLS.into(),
     ]);
+    let progress = session_root.join("muniment-routing-progress.mjs");
+    install_extension(
+        &progress,
+        include_str!("routing_progress.mjs"),
+        "routing_progress_write",
+    )?;
+    config.args.extend([
+        "--extension".into(),
+        progress.to_string_lossy().into_owned(),
+    ]);
     if grant.is_local() {
         config
             .env_remove

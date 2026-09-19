@@ -98,6 +98,8 @@ pub struct Receipt {
     pub tools: Vec<ToolReceipt>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub classifiers: Vec<crate::model_router::wire::ClassifierUsage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routing: Vec<crate::model_router::wire::RoutingEvidence>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,9 +159,11 @@ pub enum PiChatEvent {
     PromptAccepted,
     /// Pi's agent loop started on the accepted prompt: the model is thinking.
     TurnStarted,
+    RoutingStage(String),
     /// An assistant message ended: one turn, with the provider and model that
     /// wrote it, its token usage, and the cost Pi's catalog puts on that usage.
     ModelReported {
+        routing: Option<Box<crate::model_router::wire::RoutingEvidence>>,
         classifier: Option<crate::model_router::wire::ClassifierUsage>,
         provider: String,
         model: String,
@@ -353,7 +357,10 @@ pub fn parse_frame(frame: &Value) -> Result<PiChatEvent, &'static str> {
                         == Some(crate::model_router::config::ROUTER_PROVIDER))
                         .then(|| frame.pointer("/message/responseId").and_then(Value::as_str)
                             .and_then(crate::model_router::wire::response_classifier)).flatten();
+                    let routing = (frame.pointer("/message/provider").and_then(Value::as_str) == Some(crate::model_router::config::ROUTER_PROVIDER))
+                        .then(|| frame.pointer("/message/responseId").and_then(Value::as_str).and_then(crate::model_router::wire::response_routing)).flatten().map(Box::new);
                     Ok(PiChatEvent::ModelReported {
+                        routing,
                         classifier,
                         provider,
                         model,
@@ -435,6 +442,20 @@ fn parse_extension_ui_request(frame: &Value) -> Result<PiChatEvent, &'static str
     let Some(method) = frame.get("method").and_then(Value::as_str) else {
         return Ok(PiChatEvent::Interleaved);
     };
+    if method == "notify" {
+        if let Some(stage) = frame
+            .get("message")
+            .and_then(Value::as_str)
+            .and_then(|text| text.strip_prefix("muniment:routing:"))
+        {
+            if matches!(
+                stage,
+                "choosing-model" | "waiting-for-account" | "fallback" | "thinking"
+            ) {
+                return Ok(PiChatEvent::RoutingStage(stage.into()));
+            }
+        }
+    }
     if !matches!(method, "select" | "confirm" | "input" | "editor") {
         return Ok(PiChatEvent::Interleaved);
     }
@@ -1224,6 +1245,7 @@ mod tests {
             assert_eq!(
                 parse_frame(&frame).unwrap(),
                 PiChatEvent::ModelReported {
+                    routing: None,
                     classifier: None,
                     provider: provider.into(),
                     model: model.into(),
@@ -1237,6 +1259,7 @@ mod tests {
             assert_eq!(
                 parse_frame(&direct).unwrap(),
                 PiChatEvent::ModelReported {
+                    routing: None,
                     classifier: None,
                     provider: "ollama".into(),
                     model: "auto".into(),
@@ -1249,6 +1272,7 @@ mod tests {
         assert_eq!(
             parse_frame(&frame).unwrap(),
             PiChatEvent::ModelReported {
+                routing: None,
                 classifier: None,
                 provider: "muniment-router".into(),
                 model: "auto".into(),
@@ -1278,6 +1302,7 @@ mod tests {
             "usage":{"input":1000,"output":1000,"cost":{"total":0}}
         }});
         let PiChatEvent::ModelReported {
+            routing: None,
             classifier: recorded,
             model,
             cost,
@@ -1314,6 +1339,7 @@ mod tests {
             }}))
             .unwrap(),
             PiChatEvent::ModelReported {
+                routing: None,
                 classifier: None,
                 provider: "ollama".into(),
                 model: "llama3.2:3b".into(),
@@ -1329,6 +1355,7 @@ mod tests {
             }}))
             .unwrap(),
             PiChatEvent::ModelReported {
+                    routing: None,
                     classifier: None,
                 provider: "openai-codex".into(),
                 model: "gpt-5.5".into(),

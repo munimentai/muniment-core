@@ -479,8 +479,8 @@ fn cloud_extension_failure_keeps_the_cause_and_local_mode_skips_the_write() {
         matches!(error, PiLaunchError::RejectedConfig { step: "cloud_extension_write", ref cause }
         if cause.contains("os error"))
     );
-    // The blocked cloud provider and the identity extension every launch writes.
-    assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+    // The blocked cloud provider and the two extensions every launch writes.
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 3);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -736,13 +736,20 @@ fn omits_an_absent_extension_file() {
         extensions(&config),
         [
             identity.to_str().unwrap(),
+            root.join("muniment-routing-progress.mjs").to_str().unwrap(),
             root.join("muniment-cloud-provider.mjs").to_str().unwrap()
         ]
     );
     let local =
         pi_launch_config_for_executable(&boundaries, "pi".into(), &ChatGrant::local(), None)
             .unwrap();
-    assert_eq!(extensions(&local), [identity.to_str().unwrap()]);
+    assert_eq!(
+        extensions(&local),
+        [
+            identity.to_str().unwrap(),
+            root.join("muniment-routing-progress.mjs").to_str().unwrap()
+        ]
+    );
     assert_eq!(fs::read_to_string(&identity).unwrap(), IDENTITY_EXTENSION);
     for config in [&config, &local] {
         assert!(config
