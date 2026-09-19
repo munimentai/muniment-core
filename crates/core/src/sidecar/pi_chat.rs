@@ -320,13 +320,37 @@ pub fn parse_frame(frame: &Value) -> Result<PiChatEvent, &'static str> {
             ) {
                 (Some(provider), Some(model)) if !provider.is_empty() && !model.is_empty() => {
                     let usage = frame.pointer("/message/usage");
+                    let routed = (provider == crate::model_router::config::ROUTER_PROVIDER)
+                        .then(|| {
+                            frame
+                                .pointer("/message/responseId")
+                                .and_then(Value::as_str)
+                                .and_then(crate::model_router::wire::response_model)
+                        })
+                        .flatten();
+                    let tokens = usage.and_then(TokenUsage::from_frame);
+                    // The router alias has no Pi catalog price. Estimate each turn
+                    // against its selected model, never the alias or the final model
+                    // of a multi-model run. Cached input uses the standard input rate.
+                    let cost = if provider == crate::model_router::config::ROUTER_PROVIDER {
+                        routed.as_ref().and_then(|(family, model)| {
+                            let price = crate::model_router::model_catalog::entry(family, model)?;
+                            let tokens = tokens.as_ref()?;
+                            Some(((tokens.input as f64 + tokens.cache_read as f64
+                                + tokens.cache_write as f64) * price.price
+                                + tokens.output as f64 * price.output) / 1_000_000.0)
+                        })
+                    } else {
+                        usage.and_then(|usage| usage.pointer("/cost/total"))
+                            .and_then(Value::as_f64)
+                    };
+                    let (provider, model) =
+                        routed.unwrap_or_else(|| (provider.to_owned(), model.to_owned()));
                     Ok(PiChatEvent::ModelReported {
-                        provider: provider.to_owned(),
-                        model: model.to_owned(),
-                        usage: usage.and_then(TokenUsage::from_frame),
-                        cost: usage
-                            .and_then(|usage| usage.pointer("/cost/total"))
-                            .and_then(Value::as_f64),
+                        provider,
+                        model,
+                        usage: tokens,
+                        cost,
                     })
                 }
                 _ => Ok(PiChatEvent::Interleaved),
@@ -1177,6 +1201,64 @@ mod tests {
             sender.send(json!({"type":kind})).unwrap();
             assert_eq!(adapter.next(Duration::ZERO).unwrap(), event);
             assert!(adapter.first_event_deadline.lock().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn routed_messages_report_their_own_selected_model() {
+        let fast = crate::model_router::wire::routed_response_id("openai", "gpt-5.6-luna");
+        let deep = crate::model_router::wire::routed_response_id("anthropic", "claude-opus-5");
+        for (id, provider, model) in [
+            (deep, "anthropic", "claude-opus-5"),
+            (fast, "openai", "gpt-5.6-luna"),
+        ] {
+            let frame = json!({"type":"message_end","message":{"role":"assistant","provider":"muniment-router","model":"auto","responseId":id}});
+            assert_eq!(
+                parse_frame(&frame).unwrap(),
+                PiChatEvent::ModelReported {
+                    provider: provider.into(),
+                    model: model.into(),
+                    usage: None,
+                    cost: None
+                }
+            );
+            // Another provider cannot accidentally consume router metadata.
+            let mut direct = frame;
+            direct["message"]["provider"] = json!("ollama");
+            assert_eq!(
+                parse_frame(&direct).unwrap(),
+                PiChatEvent::ModelReported {
+                    provider: "ollama".into(),
+                    model: "auto".into(),
+                    usage: None,
+                    cost: None
+                }
+            );
+        }
+        let frame = json!({"type":"message_end","message":{"role":"assistant","provider":"muniment-router","model":"auto","responseId":"muniment-route-v1.invalid"}});
+        assert_eq!(
+            parse_frame(&frame).unwrap(),
+            PiChatEvent::ModelReported {
+                provider: "muniment-router".into(),
+                model: "auto".into(),
+                usage: None,
+                cost: None
+            }
+        );
+    }
+
+    #[test]
+    fn routed_cost_uses_the_selected_model_and_unknown_prices_are_unavailable() {
+        for (model, expected) in [("claude-sonnet-5", Some(0.018)), ("private-model", None)] {
+            let id = crate::model_router::wire::routed_response_id("anthropic", model);
+            let frame = json!({"type":"message_end","message":{
+                "role":"assistant","provider":"muniment-router","model":"auto","responseId":id,
+                "usage":{"input":1000,"output":1000,"cost":{"total":0}}
+            }});
+            let PiChatEvent::ModelReported { cost, .. } = parse_frame(&frame).unwrap() else {
+                panic!("expected model usage");
+            };
+            assert_eq!(cost, expected);
         }
     }
 

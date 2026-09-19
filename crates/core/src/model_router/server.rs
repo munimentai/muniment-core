@@ -518,6 +518,7 @@ fn complete(stream: &mut TcpStream, state: &State, request: &Value) {
             .send_json(&body);
         match call {
             Ok(response) => {
+                let response_id = wire::routed_response_id(&plan.family, &plan.model);
                 if wire::streams(request) {
                     relay_stream(
                         stream,
@@ -525,9 +526,10 @@ fn complete(stream: &mut TcpStream, state: &State, request: &Value) {
                         &account.id,
                         response,
                         wire::wants_usage(request),
+                        &response_id,
                     );
                 } else {
-                    relay_once(stream, state, &account.id, response);
+                    relay_once(stream, state, &account.id, response, &response_id);
                 }
                 return;
             }
@@ -568,8 +570,14 @@ fn complete(stream: &mut TcpStream, state: &State, request: &Value) {
 }
 
 /// One whole answer: forward the body and count what it says it spent.
-fn relay_once(stream: &mut TcpStream, state: &State, account: &str, response: ureq::Response) {
-    let Ok(value) = response.into_json::<Value>() else {
+fn relay_once(
+    stream: &mut TcpStream,
+    state: &State,
+    account: &str,
+    response: ureq::Response,
+    response_id: &str,
+) {
+    let Ok(mut value) = response.into_json::<Value>() else {
         state.record_error(
             account,
             "The provider answered with something that is not JSON.",
@@ -586,6 +594,9 @@ fn relay_once(stream: &mut TcpStream, state: &State, account: &str, response: ur
         );
         return;
     };
+    if let Some(object) = value.as_object_mut() {
+        object.insert("id".into(), Value::String(response_id.into()));
+    }
     state.record_success(account, wire::tokens(&value).unwrap_or_default());
     respond(stream, 200, "OK", &value);
 }
@@ -599,6 +610,7 @@ fn relay_stream(
     account: &str,
     response: ureq::Response,
     keep_usage: bool,
+    response_id: &str,
 ) {
     let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n";
     if stream.write_all(head.as_bytes()).is_err() {
@@ -617,7 +629,7 @@ fn relay_stream(
         }
         if let Some(payload) = line.trim_end().strip_prefix("data: ") {
             if payload != "[DONE]" {
-                if let Ok(chunk) = serde_json::from_str::<Value>(payload) {
+                if let Ok(mut chunk) = serde_json::from_str::<Value>(payload) {
                     if let Some(counted) = wire::tokens(&chunk) {
                         tokens = counted;
                     }
@@ -625,6 +637,10 @@ fn relay_stream(
                         // The router asked for this frame. The client did not.
                         continue;
                     }
+                    if let Some(object) = chunk.as_object_mut() {
+                        object.insert("id".into(), Value::String(response_id.into()));
+                    }
+                    line = format!("data: {chunk}\n");
                 }
             }
         }

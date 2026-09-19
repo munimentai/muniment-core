@@ -6,7 +6,41 @@
 //! traffic lives here: the turn's text for the classifier, the model the
 //! request names, and the token counts the ledger records.
 
+use base64::Engine;
 use serde_json::Value;
+
+/// Pi preserves response IDs but keeps the requested model name (`auto`).
+/// Carry the selected route in a unique response ID so concurrent turns and
+/// restored receipts use their own evidence, never a global last-model value.
+pub fn routed_response_id(family: &str, model: &str) -> String {
+    let route = serde_json::to_vec(&(family, model)).expect("strings serialize");
+    format!(
+        "muniment-route-v1.{}.{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(route),
+        uuid::Uuid::new_v4()
+    )
+}
+
+pub fn response_model(id: &str) -> Option<(String, String)> {
+    if id.len() > 2048 {
+        return None;
+    }
+    let rest = id.strip_prefix("muniment-route-v1.")?;
+    let (route, nonce) = rest.split_once('.')?;
+    uuid::Uuid::parse_str(nonce).ok()?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(route)
+        .ok()?;
+    let (family, model): (String, String) = serde_json::from_slice(&bytes).ok()?;
+    if super::family::family(&family).is_none()
+        || model.is_empty()
+        || model.len() > 512
+        || model.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some((family, model))
+}
 
 /// The token counts one turn spent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

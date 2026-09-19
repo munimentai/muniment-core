@@ -207,6 +207,7 @@ struct LocalRunLedger {
     model: Option<String>,
     tokens: Option<crate::sidecar::pi_chat::TokenUsage>,
     cost: Option<f64>,
+    cost_incomplete: bool,
     turns: u32,
     tool_names: std::collections::HashMap<String, String>,
     tools: std::collections::BTreeMap<String, (u32, u32)>,
@@ -228,6 +229,8 @@ impl LocalRunLedger {
                 }
                 if let Some(cost) = cost {
                     *self.cost.get_or_insert(0.0) += cost;
+                } else {
+                    self.cost_incomplete = true;
                 }
             }
             PiChatEvent::ToolStarted {
@@ -259,7 +262,10 @@ impl LocalRunLedger {
 fn local_receipt(elapsed: Duration, ledger: &LocalRunLedger) -> crate::sidecar::pi_chat::Receipt {
     crate::sidecar::pi_chat::Receipt {
         model: ledger.model.clone(),
-        cost: ledger.cost.map(|cost| format!("${cost:.3} est.")),
+        cost: ledger
+            .cost
+            .filter(|_| !ledger.cost_incomplete)
+            .map(|cost| format!("${cost:.3} est.")),
         time: Some(format!("{:.1}s", elapsed.as_secs_f64())),
         tokens: ledger.tokens,
         turns: (ledger.turns > 0).then_some(ledger.turns),
@@ -1500,6 +1506,18 @@ mod tests {
             ledger.record(&event);
         }
         ledger
+    }
+
+    #[test]
+    fn a_run_with_an_unpriced_turn_does_not_show_a_partial_cost() {
+        let mut ledger = ledger_of_one_run();
+        ledger.record(&PiChatEvent::ModelReported {
+            provider: "muniment-router".into(),
+            model: "private-model".into(),
+            usage: None,
+            cost: None,
+        });
+        assert_eq!(local_receipt(Duration::ZERO, &ledger).cost, None);
     }
 
     fn assert_local_receipt(duration: Duration, expected_range: std::ops::Range<f64>) {
