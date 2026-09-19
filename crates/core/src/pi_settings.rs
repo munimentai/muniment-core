@@ -121,6 +121,8 @@ pub fn prepare_pi_settings(
         })?;
     store_pi_settings(&directory.join("settings.json"), artifact)
         .map_err(|error| PiLaunchError::rejected("settings_write", error))?;
+    store_web_search_defaults(&directory)
+        .map_err(|error| PiLaunchError::rejected("web_search_settings", error.to_string()))?;
     if let Some(cli) = cli_executable_beside_runtime() {
         store_mcp_server(&directory, &cli)
             .map_err(|error| PiLaunchError::rejected("mcp_server_write", error.to_string()))?;
@@ -130,6 +132,28 @@ pub fn prepare_pi_settings(
     }
     crate::pi_packages::prepare_pi_packages(&directory, executable)
         .map_err(|error| PiLaunchError::rejected("package_install", error))
+}
+
+/// Embedded searches return their sources to the conversation without a browser
+/// approval workflow. Explicit user configuration remains authoritative.
+pub fn store_web_search_defaults(agent: &Path) -> io::Result<()> {
+    let path = agent.join("web-search.json");
+    fs::create_dir_all(agent)?;
+    let lock = lock_settings(&path)?;
+    let mut value: Value = match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::other)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(error) => return Err(error),
+    };
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| io::Error::other("Invalid web search settings"))?;
+    if object.contains_key("workflow") {
+        return Ok(());
+    }
+    object.insert("workflow".into(), Value::String("none".into()));
+    lock.check()?;
+    crate::model_router::config::write_private(&path, &serde_json::to_vec_pretty(&value)?)
 }
 
 /// The one MCP server the desktop's Pi reaches without the user adding it.
@@ -402,6 +426,25 @@ mod tests {
         let path = std::env::temp_dir().join(format!("muniment-pi-settings-{}", Uuid::new_v4()));
         fs::create_dir(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn web_search_defaults_skip_the_browser_and_preserve_user_choices() {
+        let directory = temporary_directory();
+        store_web_search_defaults(&directory).unwrap();
+        let path = directory.join("web-search.json");
+        let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["workflow"], "none");
+        fs::write(
+            &path,
+            br#"{"workflow":"summary-review","provider":"brave"}"#,
+        )
+        .unwrap();
+        store_web_search_defaults(&directory).unwrap();
+        let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["workflow"], "summary-review");
+        assert_eq!(value["provider"], "brave");
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

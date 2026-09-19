@@ -969,7 +969,7 @@ pub fn coordinate(
         let event = buffered_events
             .next()
             .map(Ok)
-            .unwrap_or_else(|| adapter.next(Duration::from_millis(100)));
+            .unwrap_or_else(|| adapter.next_settled(&transport, Duration::from_millis(100)));
         if let Ok(event) = &event {
             ledger.record(event);
         }
