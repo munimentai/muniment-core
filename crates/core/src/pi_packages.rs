@@ -285,6 +285,32 @@ fn run_install(command: &mut Command, timeout: Duration) -> io::Result<String> {
         .map_err(|error| install_failure(error, &tail))
 }
 
+// The pinned extension stores background-task output beside the user's files.
+// Keep that local metadata under the product's directory name.
+fn brand_background_task_paths(directory: &Path) -> io::Result<()> {
+    let package = directory.join("node_modules/pi-background-tasks");
+    for (relative, old, new) in [
+        ("src/core/registry.ts", "'.pi'", "'.muniment'"),
+        ("src/extension.ts", ".pi/tasks", ".muniment/tasks"),
+        (
+            "src/core/attested-pi-run.ts",
+            "parts[0] === '.pi'",
+            "['.pi', '.muniment'].includes(parts[0])",
+        ),
+    ] {
+        let path = package.join(relative);
+        let source = fs::read_to_string(&path)?;
+        if source.contains(old) {
+            fs::write(path, source.replace(old, new))?;
+        } else if !source.contains(new) {
+            return Err(io::Error::other(
+                "The background task storage path is unavailable.",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Acquire packages before RPC starts. The caller supplies the verified candidate executable.
 pub fn prepare_pi_packages(agent_directory: &Path, executable: &Path) -> io::Result<()> {
     let directory = agent_directory.join("npm");
@@ -331,7 +357,7 @@ pub fn prepare_pi_packages(agent_directory: &Path, executable: &Path) -> io::Res
         }
     }
     if fs::read(&marker).is_ok_and(|bytes| bytes == identity) && installed(&directory) {
-        return Ok(());
+        return brand_background_task_paths(&directory);
     }
     // A failed or interrupted install must retry, even if it wrote the top-level manifests.
     match fs::remove_file(&marker) {
@@ -360,6 +386,7 @@ pub fn prepare_pi_packages(agent_directory: &Path, executable: &Path) -> io::Res
             &stderr_tail,
         ));
     }
+    brand_background_task_paths(&directory)?;
     let mut file = fs::File::create(marker)?;
     file.write_all(&identity)?;
     file.sync_all()
@@ -368,6 +395,40 @@ pub fn prepare_pi_packages(agent_directory: &Path, executable: &Path) -> io::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn background_fixture(npm: &Path) {
+        let package = npm.join("node_modules/pi-background-tasks/src");
+        fs::create_dir_all(package.join("core")).unwrap();
+        fs::write(
+            package.join("core/attested-pi-run.ts"),
+            "parts[0] === '.pi'",
+        )
+        .unwrap();
+        fs::write(
+            package.join("core/registry.ts"),
+            "join(ctx.cwd, '.pi', 'tasks', runId); join('.pi', 'tasks', runId);",
+        )
+        .unwrap();
+        fs::write(
+            package.join("extension.ts"),
+            "Output is written to .pi/tasks",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn background_output_paths_are_branded_on_existing_installs_and_idempotent() {
+        let npm = std::env::temp_dir().join(format!("muniment-bg-{}", uuid::Uuid::new_v4()));
+        background_fixture(&npm);
+        brand_background_task_paths(&npm).unwrap();
+        brand_background_task_paths(&npm).unwrap();
+        let registry =
+            fs::read_to_string(npm.join("node_modules/pi-background-tasks/src/core/registry.ts"))
+                .unwrap();
+        assert!(!registry.contains("'.pi'"));
+        assert_eq!(registry.matches("'.muniment'").count(), 2);
+        fs::remove_dir_all(npm).unwrap();
+    }
 
     #[test]
     fn stderr_capture_bounds_output_and_redacts_before_retaining_the_tail() {
@@ -533,6 +594,7 @@ mod tests {
         let config = crate::sidecar::pi_sidecar_config("pi.exe", &sessions, None).unwrap();
         assert_eq!(config.args[3], sessions.to_string_lossy());
         let npm = agent.join("npm");
+        background_fixture(&npm);
         for (name, version) in PI_PACKAGES {
             let package = npm.join("node_modules").join(name);
             fs::create_dir_all(&package).unwrap();
@@ -639,6 +701,7 @@ mod tests {
     fn a_tree_another_package_manager_wrote_starts_over() {
         let root = std::env::temp_dir().join(format!("muniment-packages-{}", uuid::Uuid::new_v4()));
         let npm = root.join("npm");
+        background_fixture(&npm);
         for (name, version) in PI_PACKAGES {
             let directory = npm.join("node_modules").join(name);
             fs::create_dir_all(&directory).unwrap();
@@ -664,6 +727,7 @@ mod tests {
     fn partial_acquisition_retries_and_releases_the_lock() {
         let root = std::env::temp_dir().join(format!("muniment-packages-{}", uuid::Uuid::new_v4()));
         let npm = root.join("npm");
+        background_fixture(&npm);
         for (name, version) in PI_PACKAGES {
             let directory = npm.join("node_modules").join(name);
             fs::create_dir_all(&directory).unwrap();

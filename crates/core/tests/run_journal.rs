@@ -77,6 +77,24 @@ fn event_for(run_id: &str, event_id: &str, seq: u64, event_type: &str) -> EventE
     event
 }
 
+#[test]
+fn reopens_receipt_with_fractional_classifier_cost() {
+    let db = TestDb::new();
+    let mut completed = event(1);
+    completed.event_type = "run.completed".into();
+    completed.payload = EventPayload::Inline {
+        payload_json: json!({"receipt": {"classifiers": [{"cost": 0.00012096000000000001_f64}]}}),
+    };
+    {
+        let mut journal = RunJournal::open(&db).unwrap();
+        journal.append(0, &completed).unwrap();
+    }
+    let mut reopened = RunJournal::open(&db).unwrap();
+    let events = reopened.events(RUN).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].payload, completed.payload);
+}
+
 fn cas_payload(hash: &str) -> EventPayload {
     EventPayload::Cas {
         payload_cas: CasReference {

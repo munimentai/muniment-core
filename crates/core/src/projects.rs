@@ -211,7 +211,9 @@ pub fn workspace_with_config(
     thread: &str,
 ) -> Result<PathBuf, String> {
     if let Some(project) = read(profile)?.threads.get(thread) {
-        return folder_with_config(profile, config, project);
+        let folder = folder_with_config(profile, config, project)?;
+        migrate_workspace_metadata(&folder)?;
+        return Ok(folder);
     }
     if thread.is_empty()
         || thread.len() > 128
@@ -230,7 +232,23 @@ pub fn workspace_with_config(
         return Err("The session folder must not be a symbolic link.".into());
     }
     fs::create_dir_all(&folder).map_err(|_| "The session folder cannot be opened.")?;
+    migrate_workspace_metadata(&folder)?;
     Ok(folder)
+}
+
+fn migrate_workspace_metadata(folder: &Path) -> Result<(), String> {
+    let old = folder.join(".pi");
+    let new = folder.join(".muniment");
+    if !old.exists() && !old.is_symlink() {
+        return Ok(());
+    }
+    if old.is_symlink() || !old.is_dir() || new.exists() || new.is_symlink() {
+        return Err(
+            "The session metadata folder cannot be renamed without overwriting existing files."
+                .into(),
+        );
+    }
+    fs::rename(old, new).map_err(|_| "The session metadata folder could not be renamed.".into())
 }
 
 #[cfg(test)]
@@ -261,8 +279,15 @@ mod tests {
         let first = workspace(&profile, "thread-one").unwrap();
         assert!(first.ends_with("sessions/thread-one"));
         fs::write(first.join("result.txt"), "kept").unwrap();
+        fs::create_dir_all(first.join(".pi/tasks")).unwrap();
+        fs::write(first.join(".pi/tasks/result.txt"), "task output").unwrap();
         assert_ne!(first, workspace(&profile, "thread-two").unwrap());
         assert_eq!(first, workspace(&profile, "thread-one").unwrap());
+        assert!(!first.join(".pi").exists());
+        assert_eq!(
+            fs::read_to_string(first.join(".muniment/tasks/result.txt")).unwrap(),
+            "task output"
+        );
         assert!(workspace(&profile, "../outside").is_err());
         let project = create(&profile, "Research").unwrap();
         assign(&profile, "thread-two", &project).unwrap();
@@ -275,6 +300,25 @@ mod tests {
             "kept"
         );
     }
+    #[test]
+    fn metadata_migration_preserves_conflicting_directories() {
+        let fixture = Fixture::new();
+        let folder = workspace(&fixture.profile(), "thread-one").unwrap();
+        fs::create_dir(folder.join(".pi")).unwrap();
+        fs::create_dir(folder.join(".muniment")).unwrap();
+        fs::write(folder.join(".pi/old.txt"), "old").unwrap();
+        fs::write(folder.join(".muniment/new.txt"), "new").unwrap();
+        assert!(workspace(&fixture.profile(), "thread-one").is_err());
+        assert_eq!(
+            fs::read_to_string(folder.join(".pi/old.txt")).unwrap(),
+            "old"
+        );
+        assert_eq!(
+            fs::read_to_string(folder.join(".muniment/new.txt")).unwrap(),
+            "new"
+        );
+    }
+
     #[test]
     fn rename_preserves_files_and_thread_membership() {
         let fixture = Fixture::new();
