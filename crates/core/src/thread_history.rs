@@ -17,6 +17,8 @@ use crate::thread_ownership::{subject_owns_first_run, ThreadOwnershipError};
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<String>,
     pub run_id: String,
     pub prompt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -86,6 +88,7 @@ pub fn project_history_entry(
             .collect(),
     };
     Ok(HistoryEntry {
+        sent_at: events.first().map(|event| event.recorded_at.clone()),
         // A refused write leaves no prompt history to read from the keyring.
         prompt: if projection.prompt_storage_notice.is_some() {
             None
