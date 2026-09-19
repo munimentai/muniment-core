@@ -192,7 +192,8 @@ mod tests {
 
     #[test]
     fn default_working_directory_requires_an_existing_folder() {
-        let root = std::env::temp_dir().join(format!("muniment-default-home-{}", uuid::Uuid::now_v7()));
+        let root =
+            std::env::temp_dir().join(format!("muniment-default-home-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(root.join("Documents")).unwrap();
         assert_eq!(existing_default_home(root.clone()), None);
         let home = root.join("Documents/muniment");
