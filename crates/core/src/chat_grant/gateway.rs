@@ -63,6 +63,7 @@ fn prepare(
                 return Err(FetchGrantError::Unauthorized);
             }
             (403, "model_not_allowed") => return Err(FetchGrantError::Unauthorized),
+            (503, "temporarily_unavailable") => return Err(FetchGrantError::Unavailable),
             _ => return Err(FetchGrantError::InvalidResponse),
         }
         if denial.terminal {
@@ -237,6 +238,21 @@ mod tests {
                 assert!(grant.virtual_key.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn a_temporary_gateway_failure_is_not_an_invalid_configuration() {
+        let boundary = boundary();
+        let mut grant = current();
+        let result = prepare(
+            &boundary,
+            &mut grant,
+            &mut "bearer".into(),
+            &denial(503, "temporarily_unavailable", false),
+        );
+        assert_eq!(result, Err(FetchGrantError::Unavailable));
+        assert!(grant.virtual_key.is_empty());
+        assert!(boundary.actions.borrow().is_empty());
     }
 
     #[test]
