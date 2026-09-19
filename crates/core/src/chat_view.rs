@@ -19,6 +19,7 @@ pub struct SelectedFile {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatToolActivity {
+    pub text_offset: usize,
     pub effect_id: String,
     pub display_name: Option<String>,
     pub status: String,
@@ -105,6 +106,7 @@ pub fn chat_tool_activity(activity: &[ToolActivity]) -> Vec<ChatToolActivity> {
     activity
         .iter()
         .map(|activity| ChatToolActivity {
+            text_offset: activity.text_offset,
             effect_id: activity.effect_id.clone(),
             input: activity.input.clone(),
             output: activity.output.clone(),

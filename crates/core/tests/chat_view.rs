@@ -99,6 +99,7 @@ fn pending_permission_uses_the_webview_contract() {
 fn tool_activity_uses_the_webview_contract() {
     let activity = chat_tool_activity(&[
         ToolActivity {
+            text_offset: 0,
             effect_id: "effect-1".into(),
             display_name: Some("Search".into()),
             status: ToolActivityStatus::Running,
@@ -108,6 +109,7 @@ fn tool_activity_uses_the_webview_contract() {
             finished_at: None,
         },
         ToolActivity {
+            text_offset: 0,
             effect_id: "effect-2".into(),
             display_name: None,
             status: ToolActivityStatus::Completed,
@@ -117,6 +119,7 @@ fn tool_activity_uses_the_webview_contract() {
             finished_at: None,
         },
         ToolActivity {
+            text_offset: 0,
             effect_id: "effect-3".into(),
             display_name: None,
             status: ToolActivityStatus::Failed,
@@ -130,9 +133,9 @@ fn tool_activity_uses_the_webview_contract() {
     assert_eq!(
         serde_json::to_value(activity).unwrap(),
         json!([
-            {"effectId": "effect-1", "displayName": "Search", "status": "running"},
-            {"effectId": "effect-2", "displayName": null, "status": "completed"},
-            {"effectId": "effect-3", "displayName": null, "status": "failed"}
+            {"textOffset":0,"effectId": "effect-1", "displayName": "Search", "status": "running"},
+            {"textOffset":0,"effectId": "effect-2", "displayName": null, "status": "completed"},
+            {"textOffset":0,"effectId": "effect-3", "displayName": null, "status": "failed"}
         ])
     );
     assert!(chat_tool_activity(&[]).is_empty());

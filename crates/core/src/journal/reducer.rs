@@ -485,6 +485,7 @@ pub struct ProjectedAttachment {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolActivity {
+    pub text_offset: usize,
     pub effect_id: String,
     pub display_name: Option<String>,
     pub status: ToolActivityStatus,
@@ -543,6 +544,7 @@ pub fn project_chat_fragment(events: &[EventEnvelope]) -> Result<ChatProjection,
             "memory.recalled" => chat.recalls.push(projected_recall(event)?),
             "code.diff.applied" => chat.applied_diffs.push(projected_applied_diff(event)?),
             "tool.effect.started" => chat.tool_activity.push(ToolActivity {
+                text_offset: chat.text.encode_utf16().count(),
                 effect_id: field(event, "effect_id")?,
                 display_name: optional_field(event, "display_name")?,
                 status: ToolActivityStatus::Running,
@@ -612,6 +614,7 @@ impl ChatProjector {
             "memory.recalled" => self.chat.recalls.push(projected_recall(event)?),
             "code.diff.applied" => self.chat.applied_diffs.push(projected_applied_diff(event)?),
             "tool.effect.started" => self.chat.tool_activity.push(ToolActivity {
+                text_offset: self.chat.text.encode_utf16().count(),
                 effect_id: field(event, "effect_id")?,
                 display_name: optional_field(event, "display_name")?,
                 status: ToolActivityStatus::Running,

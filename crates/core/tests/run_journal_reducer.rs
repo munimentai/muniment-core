@@ -912,6 +912,7 @@ fn chat_projection_tracks_tool_activity_in_start_order() {
         projection.tool_activity,
         vec![
             ToolActivity {
+                text_offset: 0,
                 effect_id: "first".into(),
                 display_name: Some("Search".into()),
                 status: ToolActivityStatus::Completed,
@@ -921,6 +922,7 @@ fn chat_projection_tracks_tool_activity_in_start_order() {
                 finished_at: Some(interleaved[3].recorded_at.clone()),
             },
             ToolActivity {
+                text_offset: 7,
                 effect_id: "second".into(),
                 display_name: None,
                 status: ToolActivityStatus::Failed,
