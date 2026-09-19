@@ -518,7 +518,11 @@ fn complete(stream: &mut TcpStream, state: &State, request: &Value) {
             .send_json(&body);
         match call {
             Ok(response) => {
-                let response_id = wire::routed_response_id(&plan.family, &plan.model);
+                let response_id = wire::classified_response_id(
+                    &plan.family,
+                    &plan.model,
+                    plan.classifier.as_ref(),
+                );
                 if wire::streams(request) {
                     relay_stream(
                         stream,

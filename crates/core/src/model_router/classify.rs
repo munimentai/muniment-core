@@ -64,6 +64,7 @@ pub struct Decision {
     /// on the user's own account costs them, so the ledger counts it.
     pub spent_on: Option<String>,
     pub spent: Tokens,
+    pub classifier: Option<super::wire::ClassifierUsage>,
 }
 
 impl Decision {
@@ -74,6 +75,7 @@ impl Decision {
             reason,
             spent_on: None,
             spent: Tokens::default(),
+            classifier: None,
         }
     }
 }
@@ -169,17 +171,16 @@ pub fn decide(
             let Some((url, bearer)) = endpoint(&config.classifier) else {
                 return Some(Decision::plain(fallback, 0.0, Reason::NotClassified));
             };
+            let response = ask(
+                &url,
+                bearer.as_deref(),
+                &question(config, options, state),
+                timeout,
+            );
             Asked {
-                answer: ask(
-                    &url,
-                    bearer.as_deref(),
-                    &question(config, options, state),
-                    timeout,
-                )
-                .as_ref()
-                .and_then(parse),
+                answer: response.as_ref().and_then(parse),
                 spent_on: None,
-                spent: Tokens::default(),
+                spent: response.as_ref().and_then(super::wire::tokens),
             }
         }
     };
@@ -188,7 +189,8 @@ pub fn decide(
         confidence,
         reason,
         spent_on: asked.spent_on.clone(),
-        spent: asked.spent,
+        spent: asked.spent.unwrap_or_default(),
+        classifier: Some(classifier_usage(&config.classifier, asked.spent)),
     };
     let Some((key, confidence)) = asked.answer.clone() else {
         return Some(settle(fallback, 0.0, Reason::Failed));
@@ -202,11 +204,37 @@ pub fn decide(
     Some(settle(route.clone(), confidence, Reason::Classified))
 }
 
+fn classifier_usage(
+    classifier: &Classifier,
+    tokens: Option<Tokens>,
+) -> super::wire::ClassifierUsage {
+    let (model, price) = match classifier {
+        Classifier::Pooled { family, model } => (
+            format!("{family}/{model}"),
+            super::model_catalog::entry(family, model).map(|entry| (entry.price, entry.output)),
+        ),
+        Classifier::Typesafe { model, .. } => (
+            format!("typesafe/{model}"),
+            matches!(model.as_str(), "jev-latest" | "jev-preview" | "jev-1.13.0")
+                .then_some((0.042, 0.0)),
+        ),
+        _ => (classifier.model().to_owned(), None),
+    };
+    let cost = tokens.zip(price).map(|(tokens, (input, output))| {
+        (tokens.input as f64 * input + tokens.output as f64 * output) / 1_000_000.0
+    });
+    super::wire::ClassifierUsage {
+        model,
+        tokens,
+        cost,
+    }
+}
+
 /// What one classifier call came back with.
 struct Asked {
     answer: Option<(String, f64)>,
     spent_on: Option<String>,
-    spent: Tokens,
+    spent: Option<Tokens>,
 }
 
 /// The pool one classifier call reaches, and the choice it is given.
@@ -231,7 +259,7 @@ fn ask_pool(call: PoolCall<'_>, state: &str, now_ms: i64, timeout: Duration) -> 
     let empty = Asked {
         answer: None,
         spent_on: None,
-        spent: Tokens::default(),
+        spent: None,
     };
     let Ok(account) = balance::pick(config, ledger, family, model, now_ms) else {
         return empty;
@@ -277,7 +305,7 @@ fn ask_pool(call: PoolCall<'_>, state: &str, now_ms: i64, timeout: Duration) -> 
             .and_then(|choice| choice.get("message")?.get("content")?.as_str())
             .and_then(parse_pooled_answer),
         spent_on: Some(account.id.clone()),
-        spent: super::wire::tokens(&answered).unwrap_or_default(),
+        spent: super::wire::tokens(&answered),
     }
 }
 
@@ -458,6 +486,27 @@ mod tests {
         // No route at all means the router has nothing to route to.
         let empty = RouterConfig::default();
         assert_eq!(decided(&empty, "anything", TIMEOUT), None);
+    }
+
+    #[test]
+    fn typesafe_usage_survives_fallback_and_uses_input_only_pricing() {
+        let server = mock(
+            json!({"answers":{"route":{"choice":"deep","confidence":0.2}},
+            "usage":{"input_tokens":1000,"output_tokens":12}}),
+        );
+        let config = routed(typesafe(Some(server.url)));
+        let decision = decided(&config, "test", TIMEOUT).unwrap();
+        assert_eq!(decision.reason, Reason::LowConfidence);
+        let usage = decision.classifier.unwrap();
+        assert_eq!(
+            usage.tokens,
+            Some(Tokens {
+                input: 1000,
+                output: 12
+            })
+        );
+        assert_eq!(usage.cost, Some(0.000042));
+        assert!(classifier_usage(&config.classifier, None).cost.is_none());
     }
 
     #[test]

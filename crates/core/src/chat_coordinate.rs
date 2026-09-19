@@ -208,6 +208,7 @@ struct LocalRunLedger {
     tokens: Option<crate::sidecar::pi_chat::TokenUsage>,
     cost: Option<f64>,
     cost_incomplete: bool,
+    classifiers: Vec<crate::model_router::wire::ClassifierUsage>,
     turns: u32,
     tool_names: std::collections::HashMap<String, String>,
     tools: std::collections::BTreeMap<String, (u32, u32)>,
@@ -217,11 +218,32 @@ impl LocalRunLedger {
     fn record(&mut self, event: &PiChatEvent) {
         match event {
             PiChatEvent::ModelReported {
+                classifier,
                 provider,
                 model,
                 usage,
                 cost,
             } => {
+                if let Some(classifier) = classifier {
+                    if let Some(held) = self
+                        .classifiers
+                        .iter_mut()
+                        .find(|held| held.model == classifier.model)
+                    {
+                        held.tokens = held.tokens.zip(classifier.tokens).map(|(left, right)| {
+                            crate::model_router::wire::Tokens {
+                                input: left.input.saturating_add(right.input),
+                                output: left.output.saturating_add(right.output),
+                            }
+                        });
+                        held.cost = held
+                            .cost
+                            .zip(classifier.cost)
+                            .map(|(left, right)| left + right);
+                    } else {
+                        self.classifiers.push(classifier.clone());
+                    }
+                }
                 self.model = Some(format!("{provider}/{model}"));
                 self.turns += 1;
                 if let Some(usage) = usage {
@@ -262,6 +284,7 @@ impl LocalRunLedger {
 fn local_receipt(elapsed: Duration, ledger: &LocalRunLedger) -> crate::sidecar::pi_chat::Receipt {
     crate::sidecar::pi_chat::Receipt {
         model: ledger.model.clone(),
+        classifiers: ledger.classifiers.clone(),
         cost: ledger
             .cost
             .filter(|_| !ledger.cost_incomplete)
@@ -1478,6 +1501,7 @@ mod tests {
             total: 117,
         };
         let reported = |cost: f64| PiChatEvent::ModelReported {
+            classifier: None,
             provider: "ollama".into(),
             model: "llama3.2:3b".into(),
             usage: Some(usage),
@@ -1509,9 +1533,44 @@ mod tests {
     }
 
     #[test]
+    fn classifier_usage_sums_without_changing_model_usage() {
+        let mut ledger = LocalRunLedger::default();
+        let event = PiChatEvent::ModelReported {
+            classifier: Some(crate::model_router::wire::ClassifierUsage {
+                model: "typesafe/jev-latest".into(),
+                tokens: Some(crate::model_router::wire::Tokens {
+                    input: 1000,
+                    output: 0,
+                }),
+                cost: Some(0.000042),
+            }),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-5".into(),
+            usage: Some(crate::sidecar::pi_chat::TokenUsage {
+                input: 10,
+                output: 2,
+                ..Default::default()
+            }),
+            cost: Some(0.01),
+        };
+        ledger.record(&event);
+        ledger.record(&event);
+        let receipt = local_receipt(Duration::ZERO, &ledger);
+        assert_eq!(receipt.cost.as_deref(), Some("$0.020 est."));
+        assert_eq!(receipt.tokens.unwrap().input, 20);
+        assert_eq!(receipt.classifiers.len(), 1);
+        assert_eq!(receipt.classifiers[0].tokens.unwrap().input, 2000);
+        assert_eq!(receipt.classifiers[0].cost, Some(0.000084));
+        let restored: crate::sidecar::pi_chat::Receipt =
+            serde_json::from_value(serde_json::to_value(&receipt).unwrap()).unwrap();
+        assert_eq!(restored, receipt);
+    }
+
+    #[test]
     fn a_run_with_an_unpriced_turn_does_not_show_a_partial_cost() {
         let mut ledger = ledger_of_one_run();
         ledger.record(&PiChatEvent::ModelReported {
+            classifier: None,
             provider: "muniment-router".into(),
             model: "private-model".into(),
             usage: None,

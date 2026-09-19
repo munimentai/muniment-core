@@ -43,6 +43,7 @@ pub struct Resolution {
     /// The account a pooled classifier spent to pick this route, and its cost.
     pub classifier_spent_on: Option<String>,
     pub classifier_spent: wire::Tokens,
+    pub classifier: Option<wire::ClassifierUsage>,
 }
 
 /// Why a turn could not be served.
@@ -187,6 +188,7 @@ pub struct Plan {
     /// The account a pooled classifier spent to make this plan, and its cost.
     pub classifier_spent_on: Option<String>,
     pub classifier_spent: wire::Tokens,
+    pub classifier: Option<wire::ClassifierUsage>,
 }
 
 /// The plan for one turn: `auto` classifies, a route key takes that route, and
@@ -208,6 +210,7 @@ pub fn plan(
             confidence: 0.0,
             classifier_spent_on: None,
             classifier_spent: wire::Tokens::default(),
+            classifier: None,
         }
     }
 
@@ -223,6 +226,7 @@ pub fn plan(
             confidence: decision.confidence,
             classifier_spent_on: decision.spent_on,
             classifier_spent: decision.spent,
+            classifier: decision.classifier,
         });
     }
     if let Some(option) = options.iter().find(|option| option.key == requested) {
@@ -258,6 +262,7 @@ pub fn resolve(
         confidence: plan.confidence,
         classifier_spent_on: plan.classifier_spent_on,
         classifier_spent: plan.classifier_spent,
+        classifier: plan.classifier,
     })
 }
 

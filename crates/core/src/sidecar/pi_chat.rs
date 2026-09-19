@@ -96,6 +96,8 @@ pub struct Receipt {
     /// One tally per tool name: calls made and calls that failed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolReceipt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub classifiers: Vec<crate::model_router::wire::ClassifierUsage>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +160,7 @@ pub enum PiChatEvent {
     /// An assistant message ended: one turn, with the provider and model that
     /// wrote it, its token usage, and the cost Pi's catalog puts on that usage.
     ModelReported {
+        classifier: Option<crate::model_router::wire::ClassifierUsage>,
         provider: String,
         model: String,
         usage: Option<TokenUsage>,
@@ -346,7 +349,12 @@ pub fn parse_frame(frame: &Value) -> Result<PiChatEvent, &'static str> {
                     };
                     let (provider, model) =
                         routed.unwrap_or_else(|| (provider.to_owned(), model.to_owned()));
+                    let classifier = (frame.pointer("/message/provider").and_then(Value::as_str)
+                        == Some(crate::model_router::config::ROUTER_PROVIDER))
+                        .then(|| frame.pointer("/message/responseId").and_then(Value::as_str)
+                            .and_then(crate::model_router::wire::response_classifier)).flatten();
                     Ok(PiChatEvent::ModelReported {
+                        classifier,
                         provider,
                         model,
                         usage: tokens,
@@ -1216,6 +1224,7 @@ mod tests {
             assert_eq!(
                 parse_frame(&frame).unwrap(),
                 PiChatEvent::ModelReported {
+                    classifier: None,
                     provider: provider.into(),
                     model: model.into(),
                     usage: None,
@@ -1228,6 +1237,7 @@ mod tests {
             assert_eq!(
                 parse_frame(&direct).unwrap(),
                 PiChatEvent::ModelReported {
+                    classifier: None,
                     provider: "ollama".into(),
                     model: "auto".into(),
                     usage: None,
@@ -1239,12 +1249,46 @@ mod tests {
         assert_eq!(
             parse_frame(&frame).unwrap(),
             PiChatEvent::ModelReported {
+                classifier: None,
                 provider: "muniment-router".into(),
                 model: "auto".into(),
                 usage: None,
                 cost: None
             }
         );
+    }
+
+    #[test]
+    fn classifier_usage_follows_its_own_routed_response() {
+        let classifier = crate::model_router::wire::ClassifierUsage {
+            model: "typesafe/jev-latest".into(),
+            tokens: Some(crate::model_router::wire::Tokens {
+                input: 1000,
+                output: 0,
+            }),
+            cost: Some(0.000042),
+        };
+        let id = crate::model_router::wire::classified_response_id(
+            "anthropic",
+            "claude-sonnet-5",
+            Some(&classifier),
+        );
+        let frame = json!({"type":"message_end","message":{
+            "role":"assistant","provider":"muniment-router","model":"auto","responseId":id,
+            "usage":{"input":1000,"output":1000,"cost":{"total":0}}
+        }});
+        let PiChatEvent::ModelReported {
+            classifier: recorded,
+            model,
+            cost,
+            ..
+        } = parse_frame(&frame).unwrap()
+        else {
+            panic!("model usage expected");
+        };
+        assert_eq!(recorded, Some(classifier));
+        assert_eq!(model, "claude-sonnet-5");
+        assert_eq!(cost, Some(0.018));
     }
 
     #[test]
@@ -1270,6 +1314,7 @@ mod tests {
             }}))
             .unwrap(),
             PiChatEvent::ModelReported {
+                classifier: None,
                 provider: "ollama".into(),
                 model: "llama3.2:3b".into(),
                 usage: None,
@@ -1284,6 +1329,7 @@ mod tests {
             }}))
             .unwrap(),
             PiChatEvent::ModelReported {
+                    classifier: None,
                 provider: "openai-codex".into(),
                 model: "gpt-5.5".into(),
                 usage: Some(TokenUsage {
