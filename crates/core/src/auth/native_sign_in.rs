@@ -4,11 +4,9 @@ use std::fmt;
 use std::time::Duration;
 
 use super::{
-    exchange_native_code, register_fresh_installation, register_installation_with_retry,
-    run_native_browser_authorization, AuthStatus, AuthorizationTransport, BrowserOpener,
-    InstallationStore, NativeAuthorizationError, NativeBrowserAuthorizationError,
-    NativeCredentialStore, NativeRegistrationError, NativeTokenError, RegistrationTransport,
-    TokenTransport,
+    exchange_native_code, AuthStatus, AuthorizationTransport, BrowserOpener, InstallationStore,
+    NativeAuthorizationError, NativeBrowserAuthorizationError, NativeCredentialStore,
+    NativeRegistrationError, NativeTokenError, RegistrationTransport, TokenTransport,
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -52,9 +50,47 @@ pub fn run_native_sign_in(
     timeout: Duration,
     registration_wait: &dyn Fn(Duration),
 ) -> Result<AuthStatus, NativeSignInError> {
-    register_installation_with_retry(store, registration, base_url, clock(), registration_wait)
-        .map_err(map_registration)?;
-    let code = match run_native_browser_authorization(
+    run_native_sign_in_while(
+        store,
+        registration,
+        authorization,
+        tokens,
+        browser,
+        base_url,
+        clock,
+        timeout,
+        registration_wait,
+        &|| true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_native_sign_in_while(
+    store: &(impl InstallationStore + NativeCredentialStore),
+    registration: &dyn RegistrationTransport,
+    authorization: &dyn AuthorizationTransport,
+    tokens: &dyn TokenTransport,
+    browser: &dyn BrowserOpener,
+    base_url: &str,
+    clock: &dyn Fn() -> u64,
+    timeout: Duration,
+    registration_wait: &dyn Fn(Duration),
+    active: &dyn Fn() -> bool,
+) -> Result<AuthStatus, NativeSignInError> {
+    let cancelled = || NativeSignInError::Authorization("Cancelled".into());
+    if !active() {
+        return Err(cancelled());
+    }
+    super::native_registration::register_installation_while(
+        store,
+        registration,
+        base_url,
+        clock(),
+        registration_wait,
+        active,
+    )
+    .map_err(map_registration)?;
+    let code = match super::native_authorization::run_native_browser_authorization_while(
         store,
         authorization,
         browser,
@@ -62,6 +98,7 @@ pub fn run_native_sign_in(
         None,
         clock(),
         timeout,
+        active,
     ) {
         Ok(code) => code,
         // The cloud refused this installation's proof: its challenge moved on
@@ -71,9 +108,16 @@ pub fn run_native_sign_in(
                 "authorization",
                 "HttpStatus status=400 error_code=invalid_device_proof reregister=true",
             );
-            register_fresh_installation(store, registration, base_url, clock(), registration_wait)
-                .map_err(map_registration)?;
-            run_native_browser_authorization(
+            super::native_registration::register_fresh_installation_while(
+                store,
+                registration,
+                base_url,
+                clock(),
+                registration_wait,
+                active,
+            )
+            .map_err(map_registration)?;
+            super::native_authorization::run_native_browser_authorization_while(
                 store,
                 authorization,
                 browser,
@@ -81,11 +125,15 @@ pub fn run_native_sign_in(
                 None,
                 clock(),
                 timeout,
+                active,
             )
             .map_err(map_authorization)?
         }
         Err(error) => return Err(map_authorization(error)),
     };
+    if !active() {
+        return Err(cancelled());
+    }
     let mut proof_jti = [0_u8; 16];
     getrandom::fill(&mut proof_jti).map_err(|_| {
         failure("proof", "Randomness");
@@ -93,6 +141,10 @@ pub fn run_native_sign_in(
     })?;
     let credentials = exchange_native_code(store, tokens, base_url, code, clock(), proof_jti)
         .map_err(map_token)?;
+    if !active() {
+        store.clear_session().map_err(map_token)?;
+        return Err(cancelled());
+    }
     Ok(AuthStatus {
         signed_in: true,
         subject: credentials.tokens.subject,

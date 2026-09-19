@@ -15,20 +15,26 @@ pub fn tool_journal_entry(
         PiChatEvent::ToolStarted {
             tool_call_id,
             tool_name,
+            input,
         } if open_effects.insert(tool_call_id.clone()) => Some((
             "tool.effect.started",
-            json!({"effect_id": tool_call_id, "display_name": tool_name}),
+            with_detail(
+                json!({"effect_id": tool_call_id, "display_name": tool_name}),
+                "input",
+                input,
+            ),
         )),
         PiChatEvent::ToolFinished {
             tool_call_id,
             failed,
+            output,
         } if open_effects.remove(tool_call_id) => Some((
             if *failed {
                 "tool.effect.failed"
             } else {
                 "tool.effect.completed"
             },
-            json!({"effect_id": tool_call_id}),
+            with_detail(json!({"effect_id": tool_call_id}), "output", output),
         )),
         _ => None,
     }
@@ -74,6 +80,13 @@ pub fn close_open_effects<E>(
     Ok(())
 }
 
+fn with_detail(mut value: Value, key: &str, detail: &Option<String>) -> Value {
+    if let Some(detail) = detail {
+        value[key] = json!(detail);
+    }
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,10 +105,12 @@ mod tests {
         let started = PiChatEvent::ToolStarted {
             tool_call_id: "tool-1".into(),
             tool_name: "Read file".into(),
+            input: None,
         };
         let unmatched = PiChatEvent::ToolFinished {
             tool_call_id: "missing".into(),
             failed: false,
+            output: None,
         };
 
         assert_eq!(
@@ -111,6 +126,7 @@ mod tests {
         let finished = PiChatEvent::ToolFinished {
             tool_call_id: "tool-1".into(),
             failed: false,
+            output: None,
         };
         assert_eq!(
             tool_journal_entry(&finished, &mut open_effects),
@@ -121,6 +137,7 @@ mod tests {
         let failed = PiChatEvent::ToolFinished {
             tool_call_id: "tool-2".into(),
             failed: true,
+            output: None,
         };
         assert!(open_effects.insert("tool-2".into()));
         assert_eq!(

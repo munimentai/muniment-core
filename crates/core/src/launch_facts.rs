@@ -66,7 +66,7 @@ impl LaunchFacts {
         ));
         match &self.working_directory {
             Some(directory) => lines.push(format!(
-                "- The working directory is {}. It holds the user's memory, agents, projects and sessions. Work inside it, and read or write elsewhere only at a path the user names.",
+                "- The working directory is {}. Create generated files inside this working directory. Read or write elsewhere only at a path the user names.",
                 directory.display()
             )),
             None => lines.push(
@@ -134,8 +134,13 @@ pub fn working_directory(config_directory: &Path) -> Option<PathBuf> {
     if let Ok(Some(home)) = crate::home::configured_home(config_directory) {
         return Some(home);
     }
-    let home = PathBuf::from(crate::state_root::home_directory_value()?);
-    crate::home::choose_default_home(Some(home.join("Documents")), Some(home)).ok()
+    existing_default_home(PathBuf::from(crate::state_root::home_directory_value()?))
+}
+
+fn existing_default_home(home: PathBuf) -> Option<PathBuf> {
+    crate::home::choose_default_home(Some(home.join("Documents")), Some(home))
+        .ok()
+        .filter(|directory| directory.is_dir())
 }
 
 /// The zone name behind a `zoneinfo` link such as
@@ -184,6 +189,22 @@ pub fn stamp_message(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_working_directory_requires_an_existing_folder() {
+        let root =
+            std::env::temp_dir().join(format!("muniment-default-home-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(root.join("Documents")).unwrap();
+        assert_eq!(existing_default_home(root.clone()), None);
+        let home = root.join("Documents/muniment");
+        std::fs::create_dir(&home).unwrap();
+        assert_eq!(existing_default_home(root.clone()), Some(home.clone()));
+        let config = root.join("config");
+        crate::home::confirm_home(&config, &home).unwrap();
+        std::fs::remove_dir_all(&home).unwrap();
+        assert_eq!(working_directory(&config), Some(home));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn renders_every_fact_and_names_the_model_once() {

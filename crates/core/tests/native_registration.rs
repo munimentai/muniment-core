@@ -291,3 +291,35 @@ fn secret_bearing_debug_output_is_redacted() {
     assert!(!debug.contains(&URL_SAFE_NO_PAD.encode(record.private_key)));
     assert!(debug.contains("<redacted>"));
 }
+
+#[test]
+fn cancellation_during_a_registration_wait_prevents_the_next_request() {
+    use std::sync::atomic::AtomicBool;
+    struct Limited(AtomicUsize);
+    impl muniment_core::auth::RegistrationTransport for Limited {
+        fn register(
+            &self,
+            _: &str,
+            _: &muniment_core::auth::NativeDeviceRegistrationRequest,
+        ) -> Result<NativeDeviceRegistrationResponse, NativeRegistrationError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(NativeRegistrationError::RateLimited(Duration::from_secs(
+                30,
+            )))
+        }
+    }
+    let active = AtomicBool::new(true);
+    let transport = Limited(AtomicUsize::new(0));
+    let store = MemoryStore::default();
+    let result = muniment_core::auth::native_registration::register_installation_while(
+        &store,
+        &transport,
+        "http://127.0.0.1:1",
+        1_000,
+        &|_| active.store(false, Ordering::SeqCst),
+        &|| active.load(Ordering::SeqCst),
+    );
+    assert!(result.is_err());
+    assert_eq!(transport.0.load(Ordering::SeqCst), 1);
+    assert!(store.value.lock().unwrap().is_none());
+}

@@ -681,6 +681,8 @@ fn local_launch_clears_inherited_cloud_environment_in_the_child() {
     let mut config =
         pi_launch_config_for_executable(&boundaries, executable, &ChatGrant::local(), None)
             .unwrap();
+    // This environment test supplies an existing workspace explicitly.
+    config.working_directory = Some(root.clone());
     config.env.insert(
         "PI_RESUME_STUB_ENV_CAPTURE".into(),
         capture.to_string_lossy().into_owned(),
@@ -821,4 +823,61 @@ fn collect_strings(value: &serde_json::Value, into: &mut Vec<String>) {
         serde_json::Value::Object(map) => map.values().for_each(|item| collect_strings(item, into)),
         _ => {}
     }
+}
+
+#[test]
+fn project_launch_uses_the_folder_after_rename_and_rejects_a_missing_folder() {
+    struct ProjectBoundary {
+        profile: PathBuf,
+    }
+    impl PiLaunchBoundaries for ProjectBoundary {
+        fn pi_session_root(&self) -> Result<PathBuf, PiLaunchError> {
+            Ok(self.profile.join("sessions"))
+        }
+        fn memory_agent_extension_path(&self) -> Option<PathBuf> {
+            None
+        }
+        fn local_default_model(&self) -> Option<String> {
+            Some("test/model".into())
+        }
+        fn prepare_pi_settings(
+            &self,
+            _: muniment_core::sidecar::pi_install::PiArtifactDescriptor,
+            _: &Path,
+        ) -> Result<(), PiLaunchError> {
+            Ok(())
+        }
+        fn project_directory(&self) -> Result<Option<PathBuf>, PiLaunchError> {
+            muniment_core::projects::thread_folder(&self.profile, "thread")
+                .map_err(|error| PiLaunchError::rejected("project_folder", error))
+        }
+    }
+    let root = temporary_directory();
+    let profile = root.join("profile");
+    muniment_core::home::confirm_home(&profile, &root.join("muniment")).unwrap();
+    let project = muniment_core::projects::create(&profile, "Drafts").unwrap();
+    muniment_core::projects::assign(&profile, "thread", &project).unwrap();
+    fs::create_dir_all(profile.join("sessions")).unwrap();
+    let boundary = ProjectBoundary {
+        profile: profile.clone(),
+    };
+    for name in ["Drafts", "Reports"] {
+        muniment_core::projects::rename(&profile, &project, name).unwrap();
+        let config =
+            pi_launch_config_for_executable(&boundary, "pi".into(), &ChatGrant::local(), None)
+                .unwrap();
+        assert_eq!(
+            config.working_directory,
+            Some(root.join("muniment/projects").join(name))
+        );
+        assert!(config
+            .args
+            .iter()
+            .any(|arg| arg.contains("Create generated files inside this working directory.")));
+    }
+    fs::remove_dir(root.join("muniment/projects/Reports")).unwrap();
+    assert!(
+        pi_launch_config_for_executable(&boundary, "pi".into(), &ChatGrant::local(), None).is_err()
+    );
+    fs::remove_dir_all(root).unwrap();
 }

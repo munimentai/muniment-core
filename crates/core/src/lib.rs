@@ -39,6 +39,7 @@ pub mod kokoro;
 pub mod launch_facts;
 pub mod local_mode;
 pub mod memory_failure;
+pub mod memory_files;
 pub mod memory_index;
 pub mod memory_runtime;
 pub mod memory_secret;
@@ -98,3 +99,7 @@ pub use muniment_attach::{
     ensure_cross_project_home, ensure_scaffold_directory, onboard_companion_workspace,
     write_scaffold_file_if_missing,
 };
+
+pub mod agent_templates;
+pub mod agents;
+pub mod projects;

@@ -207,6 +207,8 @@ struct LocalRunLedger {
     model: Option<String>,
     tokens: Option<crate::sidecar::pi_chat::TokenUsage>,
     cost: Option<f64>,
+    cost_incomplete: bool,
+    classifiers: Vec<crate::model_router::wire::ClassifierUsage>,
     turns: u32,
     tool_names: std::collections::HashMap<String, String>,
     tools: std::collections::BTreeMap<String, (u32, u32)>,
@@ -216,11 +218,32 @@ impl LocalRunLedger {
     fn record(&mut self, event: &PiChatEvent) {
         match event {
             PiChatEvent::ModelReported {
+                classifier,
                 provider,
                 model,
                 usage,
                 cost,
             } => {
+                if let Some(classifier) = classifier {
+                    if let Some(held) = self
+                        .classifiers
+                        .iter_mut()
+                        .find(|held| held.model == classifier.model)
+                    {
+                        held.tokens = held.tokens.zip(classifier.tokens).map(|(left, right)| {
+                            crate::model_router::wire::Tokens {
+                                input: left.input.saturating_add(right.input),
+                                output: left.output.saturating_add(right.output),
+                            }
+                        });
+                        held.cost = held
+                            .cost
+                            .zip(classifier.cost)
+                            .map(|(left, right)| left + right);
+                    } else {
+                        self.classifiers.push(classifier.clone());
+                    }
+                }
                 self.model = Some(format!("{provider}/{model}"));
                 self.turns += 1;
                 if let Some(usage) = usage {
@@ -228,11 +251,14 @@ impl LocalRunLedger {
                 }
                 if let Some(cost) = cost {
                     *self.cost.get_or_insert(0.0) += cost;
+                } else {
+                    self.cost_incomplete = true;
                 }
             }
             PiChatEvent::ToolStarted {
                 tool_call_id,
                 tool_name,
+                ..
             } => {
                 self.tool_names
                     .insert(tool_call_id.clone(), tool_name.clone());
@@ -241,6 +267,7 @@ impl LocalRunLedger {
             PiChatEvent::ToolFinished {
                 tool_call_id,
                 failed: true,
+                ..
             } => {
                 if let Some(name) = self.tool_names.get(tool_call_id) {
                     self.tools.entry(name.clone()).or_default().1 += 1;
@@ -257,7 +284,11 @@ impl LocalRunLedger {
 fn local_receipt(elapsed: Duration, ledger: &LocalRunLedger) -> crate::sidecar::pi_chat::Receipt {
     crate::sidecar::pi_chat::Receipt {
         model: ledger.model.clone(),
-        cost: ledger.cost.map(|cost| format!("${cost:.3} est.")),
+        classifiers: ledger.classifiers.clone(),
+        cost: ledger
+            .cost
+            .filter(|_| !ledger.cost_incomplete)
+            .map(|cost| format!("${cost:.3} est.")),
         time: Some(format!("{:.1}s", elapsed.as_secs_f64())),
         tokens: ledger.tokens,
         turns: (ledger.turns > 0).then_some(ledger.turns),
@@ -345,6 +376,22 @@ pub fn coordinate(
             );
         }
         return;
+    }
+    if resume.is_none() {
+        let fallback = prompt
+            .split_whitespace()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let fallback: String = fallback.chars().take(80).collect();
+        if let Ok(mut storage) = journal.lock() {
+            let _ = crate::journal::thread_mutation::save_first_thread_name(
+                &mut storage.journal,
+                &run_id,
+                &fallback,
+                false,
+            );
+        }
     }
     // The model reads the clock from the message, so each one opens with its time.
     let stamped_prompt = crate::launch_facts::stamp_message(&prompt);
@@ -706,14 +753,26 @@ pub fn coordinate(
             &run_id,
             &mut seq,
             subject.as_deref(),
-            || {
+            |emit| {
                 let prepared_prompt = prepared_prompt.expect("new runs prepare a Pi prompt");
-                let (adapter, _) = PiRunAdapter::start_with_images(
+                let (adapter, _) = PiRunAdapter::start_with_images_and_handler(
                     run_id.clone(),
                     &transport,
                     prepared_prompt.message,
                     prepared_prompt.images,
                     RPC_TIMEOUT,
+                    |adapter, event| {
+                        answer_thread_title(&journal, adapter, &transport, &run_id, &prompt, event)
+                            || answer_gateway_boundary(
+                                &app,
+                                adapter,
+                                &transport,
+                                &mut grant,
+                                &mut access_token,
+                                &mut gateway_failure,
+                                event,
+                            )
+                    },
                 )
                 .map_err(|error| {
                     diagnostics.prompt_failed(&error);
@@ -724,6 +783,8 @@ pub fn coordinate(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
                     Some(Arc::clone(&adapter));
+                emit(&PiChatEvent::PromptAccepted)?;
+                let mut journal_failed = false;
                 let session_root = app
                     .pi_session_root()
                     .map_err(|_| PreparedPromptError::SessionRoot)?;
@@ -733,7 +794,18 @@ pub fn coordinate(
                         &session_root,
                         RPC_TIMEOUT,
                         |event| {
-                            answer_gateway_boundary(
+                            if emit(event).map_err(|_| {
+                                journal_failed = true;
+                                "The reply could not be saved.".to_owned()
+                            })? {
+                                return Ok(true);
+                            }
+                            if answer_thread_title(
+                                &journal, &adapter, &transport, &run_id, &prompt, event,
+                            ) {
+                                return Ok(true);
+                            }
+                            Ok(answer_gateway_boundary(
                                 &app,
                                 &adapter,
                                 &transport,
@@ -741,11 +813,13 @@ pub fn coordinate(
                                 &mut access_token,
                                 &mut gateway_failure,
                                 event,
-                            )
+                            ))
                         },
                     )
                     .map_err(|error| {
-                        if error == FIRST_EVENT_TIMEOUT_REASON {
+                        if journal_failed {
+                            PreparedPromptError::Journal
+                        } else if error == FIRST_EVENT_TIMEOUT_REASON {
                             PreparedPromptError::FirstEventTimeout
                         } else {
                             PreparedPromptError::Binding
@@ -934,7 +1008,7 @@ pub fn coordinate(
         let event = buffered_events
             .next()
             .map(Ok)
-            .unwrap_or_else(|| adapter.next(Duration::from_millis(100)));
+            .unwrap_or_else(|| adapter.next_settled(&transport, Duration::from_millis(100)));
         if let Ok(event) = &event {
             ledger.record(event);
         }
@@ -1061,6 +1135,9 @@ pub fn coordinate(
                 }
             }
             Ok(event @ PiChatEvent::ExtensionUiRequest(_)) => {
+                if answer_thread_title(&journal, &adapter, &transport, &run_id, &prompt, &event) {
+                    continue;
+                }
                 if answer_gateway_boundary(
                     &app,
                     &adapter,
@@ -1179,6 +1256,56 @@ pub fn coordinate(
     }
 }
 
+fn answer_thread_title(
+    storage: &SharedStorage,
+    adapter: &PiRunAdapter,
+    transport: &PiRpcTransport,
+    run_id: &str,
+    prompt: &str,
+    event: &PiChatEvent,
+) -> bool {
+    let PiChatEvent::ExtensionUiRequest(request) = event else {
+        return false;
+    };
+    let ExtensionUiDialog::Editor { title, prefill } = &request.dialog else {
+        return false;
+    };
+    if title != "muniment:thread-title" {
+        return false;
+    }
+    let response = (|| {
+        let args: Value = serde_json::from_str(prefill.as_deref()?).ok()?;
+        let mut storage = storage.lock().ok()?;
+        match args["action"].as_str()? {
+            "request" => {
+                crate::journal::thread_mutation::first_thread_needs_name(
+                    &mut storage.journal,
+                    run_id,
+                )?;
+                Some(json!({"prompt": prompt.chars().take(8000).collect::<String>()}))
+            }
+            "save" => {
+                let saved = crate::journal::thread_mutation::save_first_thread_name(
+                    &mut storage.journal,
+                    run_id,
+                    args["title"].as_str()?,
+                    true,
+                )
+                .ok()?;
+                Some(json!({"saved": saved}))
+            }
+            _ => None,
+        }
+    })()
+    .unwrap_or_else(|| json!({}));
+    let _ = adapter.answer_extension_ui(
+        transport,
+        request,
+        ExtensionUiAnswer::Editor(response.to_string()),
+    );
+    true
+}
+
 fn answer_gateway_boundary(
     boundaries: &impl PiLaunchBoundaries,
     adapter: &PiRunAdapter,
@@ -1225,6 +1352,61 @@ fn coordinate_memory_search(
     subject: Option<&str>,
     event: &PiChatEvent,
 ) -> bool {
+    if let PiChatEvent::ExtensionUiRequest(request) = event {
+        if let ExtensionUiDialog::Editor { title, prefill } = &request.dialog {
+            if let Some(tool) = title.strip_prefix("muniment:").filter(|tool| {
+                [
+                    "memory-delete",
+                    "memory-profile-read",
+                    "memory-profile-save",
+                ]
+                .contains(tool)
+            }) {
+                let result = prefill
+                    .as_deref()
+                    .ok_or_else(|| "The memory arguments are missing.".to_owned())
+                    .and_then(|arguments| memory_runtime.maintain_memory(run_id, tool, arguments));
+                let value = result.unwrap_or_else(|error| json!({"error": error}));
+                let _ = adapter.answer_extension_ui(
+                    transport,
+                    request,
+                    ExtensionUiAnswer::Editor(value.to_string()),
+                );
+                return true;
+            }
+            if let Some(tool) = title.strip_prefix("muniment:").filter(|tool| {
+                ["agent-list", "agent-read", "agent-save", "agent-run"].contains(tool)
+            }) {
+                let result = prefill
+                    .as_deref()
+                    .ok_or_else(|| "The agent arguments are missing.".to_owned())
+                    .and_then(|arguments| memory_runtime.agent_tool(run_id, tool, arguments));
+                let value = result.unwrap_or_else(|error| json!({"error": error}));
+                let _ = adapter.answer_extension_ui(
+                    transport,
+                    request,
+                    ExtensionUiAnswer::Editor(value.to_string()),
+                );
+                return true;
+            }
+            if title == "muniment:memory-save" {
+                let result = prefill
+                    .as_deref()
+                    .ok_or_else(|| "The memory arguments are missing.".to_owned())
+                    .and_then(|arguments| memory_runtime.capture_fact(run_id, arguments));
+                let value = match result {
+                    Ok(fact) => json!({"saved": true, "fact": fact}),
+                    Err(error) => json!({"error": error}),
+                };
+                let _ = adapter.answer_extension_ui(
+                    transport,
+                    request,
+                    ExtensionUiAnswer::Editor(value.to_string()),
+                );
+                return true;
+            }
+        }
+    }
     coordinate_memory_search_with(
         sink,
         journal,
@@ -1384,6 +1566,7 @@ mod tests {
             total: 117,
         };
         let reported = |cost: f64| PiChatEvent::ModelReported {
+            classifier: None,
             provider: "ollama".into(),
             model: "llama3.2:3b".into(),
             usage: Some(usage),
@@ -1392,10 +1575,12 @@ mod tests {
         let started = |id: &str, name: &str| PiChatEvent::ToolStarted {
             tool_call_id: id.into(),
             tool_name: name.into(),
+            input: None,
         };
         let finished = |id: &str, failed: bool| PiChatEvent::ToolFinished {
             tool_call_id: id.into(),
             failed,
+            output: None,
         };
         for event in [
             started("c1", "read"),
@@ -1410,6 +1595,53 @@ mod tests {
             ledger.record(&event);
         }
         ledger
+    }
+
+    #[test]
+    fn classifier_usage_sums_without_changing_model_usage() {
+        let mut ledger = LocalRunLedger::default();
+        let event = PiChatEvent::ModelReported {
+            classifier: Some(crate::model_router::wire::ClassifierUsage {
+                model: "typesafe/jev-latest".into(),
+                tokens: Some(crate::model_router::wire::Tokens {
+                    input: 1000,
+                    output: 0,
+                }),
+                cost: Some(0.000042),
+            }),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-5".into(),
+            usage: Some(crate::sidecar::pi_chat::TokenUsage {
+                input: 10,
+                output: 2,
+                ..Default::default()
+            }),
+            cost: Some(0.01),
+        };
+        ledger.record(&event);
+        ledger.record(&event);
+        let receipt = local_receipt(Duration::ZERO, &ledger);
+        assert_eq!(receipt.cost.as_deref(), Some("$0.020 est."));
+        assert_eq!(receipt.tokens.unwrap().input, 20);
+        assert_eq!(receipt.classifiers.len(), 1);
+        assert_eq!(receipt.classifiers[0].tokens.unwrap().input, 2000);
+        assert_eq!(receipt.classifiers[0].cost, Some(0.000084));
+        let restored: crate::sidecar::pi_chat::Receipt =
+            serde_json::from_value(serde_json::to_value(&receipt).unwrap()).unwrap();
+        assert_eq!(restored, receipt);
+    }
+
+    #[test]
+    fn a_run_with_an_unpriced_turn_does_not_show_a_partial_cost() {
+        let mut ledger = ledger_of_one_run();
+        ledger.record(&PiChatEvent::ModelReported {
+            classifier: None,
+            provider: "muniment-router".into(),
+            model: "private-model".into(),
+            usage: None,
+            cost: None,
+        });
+        assert_eq!(local_receipt(Duration::ZERO, &ledger).cost, None);
     }
 
     fn assert_local_receipt(duration: Duration, expected_range: std::ops::Range<f64>) {
@@ -1934,6 +2166,7 @@ mod tests {
         let started = PiChatEvent::ToolStarted {
             tool_call_id: effect_id.into(),
             tool_name: "Read file".into(),
+            input: None,
         };
         assert!(effects
             .with(|open_effects| tool_journal_entry(&started, open_effects))
@@ -1978,6 +2211,7 @@ mod tests {
         let finished = PiChatEvent::ToolFinished {
             tool_call_id: "effect-1".into(),
             failed: false,
+            output: None,
         };
         assert!(effects
             .with(|open_effects| tool_journal_entry(&finished, open_effects))
@@ -1987,6 +2221,7 @@ mod tests {
         let finished = PiChatEvent::ToolFinished {
             tool_call_id: "effect-2".into(),
             failed: false,
+            output: None,
         };
         assert!(effects
             .with(|open_effects| tool_journal_entry(&finished, open_effects))

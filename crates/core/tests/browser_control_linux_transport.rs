@@ -165,6 +165,9 @@ fn identity_rejection_drops_stream_before_pairing_or_handshake_response() {
     let listener = BrowserControlListener::bind("127.0.0.1:0", "/secret/browser").unwrap();
     let injected = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let mut client = TcpStream::connect(injected.local_addr().unwrap()).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
     client.write_all(valid_request().as_bytes()).unwrap();
     let process = RecordingAuthorizer {
         calls: RefCell::new(Vec::new()),
@@ -190,9 +193,6 @@ fn identity_rejection_drops_stream_before_pairing_or_handshake_response() {
     );
     assert_eq!(process.calls.borrow().len(), 1);
     assert!(pairing.calls.borrow().is_empty());
-    client
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .unwrap();
     let mut response = Vec::new();
     let read = client.read_to_end(&mut response);
     assert!(
@@ -277,6 +277,9 @@ fn websocket_exchange(
     let listener = BrowserControlListener::bind("127.0.0.1:0", "/browser-bin").unwrap();
     let injected = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let mut client = TcpStream::connect(injected.local_addr().unwrap()).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
     for part in request_parts {
         client.write_all(part).unwrap();
     }
@@ -289,9 +292,6 @@ fn websocket_exchange(
         result: Ok(()),
     };
     let result = listener.accept_websocket_with(&injected, &authorizer, &pairing, config);
-    client
-        .set_read_timeout(Some(Duration::from_millis(100)))
-        .unwrap();
     let mut response = Vec::new();
     let _ = client.read_to_end(&mut response);
     (result, response)
@@ -303,6 +303,9 @@ fn rejected_pairing_exchange(
     let listener = BrowserControlListener::bind("127.0.0.1:0", "/browser-bin").unwrap();
     let injected = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let mut client = TcpStream::connect(injected.local_addr().unwrap()).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
     client.write_all(request.as_bytes()).unwrap();
     let process = RecordingAuthorizer {
         calls: RefCell::new(Vec::new()),
@@ -320,9 +323,6 @@ fn rejected_pairing_exchange(
             &handshake_config(1024, 16, Duration::from_secs(1)),
         )
         .unwrap_err();
-    client
-        .set_read_timeout(Some(Duration::from_millis(100)))
-        .unwrap();
     let mut response = Vec::new();
     let _ = client.read_to_end(&mut response);
     (error, pairing.calls.into_inner(), response)

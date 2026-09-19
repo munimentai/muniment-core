@@ -8,7 +8,7 @@
 //! machine from spending the user's accounts.
 //!
 //! A refused turn fails over: the account that refused goes into cooldown and
-//! the next account of the pool takes the turn, up to [`ATTEMPTS`] times.
+//! the next account takes the turn, then another enabled model if the pool fails.
 
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -24,17 +24,18 @@ use serde_json::Value;
 use super::config::{self, RouterConfig};
 use super::usage::{self, Ledger};
 use super::{balance, plan, served_models, wire, ResolveError};
+use super::{native_auth, transport};
 
 /// Where the router writes the port and token Pi needs.
 pub const ENDPOINT_FILE: &str = "muniment-router-endpoint.json";
-/// How many accounts one turn may try before it gives up.
-pub const ATTEMPTS: usize = 3;
 /// The longest a request head may be, and the longest a request body may be.
 const HEAD_LIMIT: usize = 64 * 1024;
 const BODY_LIMIT: usize = 32 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const READ_TIMEOUT: Duration = Duration::from_secs(600);
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
+/// How long a token refresh may take before the turn moves on.
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// The port and token Pi reaches the router on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +81,7 @@ pub struct Handle {
     endpoint: Endpoint,
     stop: Arc<AtomicBool>,
     active: Active,
+    state: Arc<State>,
 }
 
 impl Handle {
@@ -93,6 +95,11 @@ impl Handle {
             .lock()
             .map(|active| active.clone())
             .unwrap_or_default()
+    }
+
+    /// Uses the running router's ledger without generating an assistant reply.
+    pub fn test_route(&self, sample: &str) -> Result<RouteTest, String> {
+        self.state.test_route(sample)
     }
 
     /// Stops the accept loop. Turns already in flight finish.
@@ -125,18 +132,6 @@ struct InFlight {
     account: String,
 }
 
-impl InFlight {
-    fn start(active: &Active, account: &str) -> Self {
-        if let Ok(mut held) = active.lock() {
-            *held.entry(account.to_owned()).or_insert(0) += 1;
-        }
-        Self {
-            active: Arc::clone(active),
-            account: account.to_owned(),
-        }
-    }
-}
-
 impl Drop for InFlight {
     fn drop(&mut self) {
         if let Ok(mut held) = self.active.lock() {
@@ -150,9 +145,111 @@ impl Drop for InFlight {
     }
 }
 
+#[derive(Serialize)]
+pub struct RouteTest {
+    pub model: String,
+    pub reason: &'static str,
+    pub confidence: Option<f64>,
+    pub elapsed_ms: u128,
+}
+
 impl State {
+    fn classifier_config(&self) -> RouterConfig {
+        let config = self.config();
+        if let config::Classifier::Pooled { family, model } = &config.classifier {
+            if let Ok(account) =
+                balance::pick(&config, &self.ledger(), family, model, (self.now_ms)())
+            {
+                if let Err(error) = native_auth::refresh_account(
+                    &self.agent,
+                    &account.id,
+                    (self.now_ms)(),
+                    REFRESH_TIMEOUT,
+                ) {
+                    self.record_error(&account.id, &error, true);
+                }
+            }
+        }
+        self.config()
+    }
+
+    fn test_route(&self, sample: &str) -> Result<RouteTest, String> {
+        if sample.trim().is_empty() || sample.len() > 32_000 {
+            return Err("Enter a sample of 1 to 32,000 bytes.".into());
+        }
+        let started = std::time::Instant::now();
+        let config = self.classifier_config();
+        let decision = super::classify::decide(
+            &config,
+            &super::options(&config),
+            &self.ledger(),
+            sample,
+            (self.now_ms)(),
+            super::classify::TIMEOUT,
+        )
+        .ok_or("Connect an eligible account before testing.")?;
+        if let Some(account) = &decision.spent_on {
+            self.record_success(account, decision.spent);
+        }
+        Ok(RouteTest {
+            model: format!("{}/{}", decision.route.family, decision.route.model),
+            reason: match decision.reason {
+                super::classify::Reason::Classified => "Classifier selected the model",
+                super::classify::Reason::NotClassified => "Fallback used without classification",
+                super::classify::Reason::LowConfidence => {
+                    "Fallback used because confidence was low"
+                }
+                super::classify::Reason::Failed => "Fallback used because the classifier failed",
+            },
+            confidence: (decision.reason == super::classify::Reason::Classified
+                || decision.reason == super::classify::Reason::LowConfidence)
+                .then_some(decision.confidence),
+            elapsed_ms: started.elapsed().as_millis(),
+        })
+    }
+
     /// The configuration as it stands right now. It is read per turn, so a
     /// change in Settings takes the next turn with no restart.
+    fn reserve(
+        &self,
+        config: &RouterConfig,
+        family: &str,
+        model: &str,
+    ) -> Result<(config::Account, InFlight), balance::PickError> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut ledger = self.ledger();
+        let now = (self.now_ms)();
+        // Respect known account-wide exhaustion until its reset. Unknown or
+        // stale windows do not disable an account indefinitely.
+        for (id, quota) in super::quota::load(&self.agent).accounts {
+            let reset = quota
+                .windows
+                .iter()
+                .filter(|window| {
+                    window.scope.is_empty()
+                        && (window.limit_reached || window.used_percent >= 100.0)
+                })
+                .filter_map(|window| window.resets_at_ms.filter(|reset| *reset > now))
+                .max();
+            if let Some(reset) = reset {
+                let usage = ledger.accounts.entry(id).or_default();
+                usage.cooldown_until_ms = Some(usage.cooldown_until_ms.unwrap_or(0).max(reset));
+            }
+        }
+        let account =
+            balance::pick_with_active(config, &ledger, family, model, (self.now_ms)(), &active)?
+                .clone();
+        *active.entry(account.id.clone()).or_insert(0) += 1;
+        let guard = InFlight {
+            active: Arc::clone(&self.active),
+            account: account.id.clone(),
+        };
+        Ok((account, guard))
+    }
+
     fn config(&self) -> RouterConfig {
         config::load(&self.agent).unwrap_or_default()
     }
@@ -221,6 +318,7 @@ fn start_with_clock(agent: PathBuf, clock: fn() -> i64) -> io::Result<Handle> {
     let stop = Arc::new(AtomicBool::new(false));
     let accept_stop = Arc::clone(&stop);
     let accept_token = endpoint.token.clone();
+    let handle_state = Arc::clone(&state);
     std::thread::spawn(move || {
         while !accept_stop.load(Ordering::SeqCst) {
             match listener.accept() {
@@ -243,6 +341,7 @@ fn start_with_clock(agent: PathBuf, clock: fn() -> i64) -> io::Result<Handle> {
         endpoint,
         stop,
         active,
+        state: handle_state,
     })
 }
 
@@ -409,14 +508,13 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
-/// One chat turn: plan it once, send it, and fail over to the next account
-/// when the upstream refuses the account rather than the request.
+/// Classify once, try the selected pool, then eligible fallback models.
+/// Once response output starts, never replay the request on another model.
 fn complete(stream: &mut TcpStream, state: &State, request: &Value) {
-    let config = state.config();
+    let config = state.classifier_config();
     let requested = wire::requested_model(request).unwrap_or(config::AUTO_MODEL);
     let text = wire::classifier_state(request);
-    // The turn classifies once. A failover picks another account against the
-    // same plan, so one turn never spends the classifier twice.
+    // Reuse the decision across attempts so failure never spends the classifier twice.
     let plan = match plan(&config, &state.ledger(), requested, &text, (state.now_ms)()) {
         Ok(plan) => plan,
         Err(error) => {
@@ -437,128 +535,320 @@ fn complete(stream: &mut TcpStream, state: &State, request: &Value) {
         state.record_success(spent_on, plan.classifier_spent);
     }
     let mut refusals: Vec<String> = Vec::new();
-    for _ in 0..ATTEMPTS {
-        let picked = balance::pick(
-            &config,
-            &state.ledger(),
-            &plan.family,
-            &plan.model,
-            (state.now_ms)(),
-        );
-        let account = match picked {
-            Ok(account) => account,
-            Err(error) => {
-                let message = if refusals.is_empty() {
-                    error.message()
-                } else {
-                    format!("{} {}", error.message(), refusals.join(" "))
+    let mut routes = super::options(&config);
+    // Prefer the configured fallback, then another provider, then remaining models.
+    routes.sort_by_key(|route| {
+        (
+            config.fallback.as_deref() != Some(route.key.as_str()),
+            route.family == plan.family,
+        )
+    });
+    routes.retain(|route| route.family != plan.family || route.model != plan.model);
+    routes.insert(
+        0,
+        config::Route {
+            key: plan.route.clone(),
+            description: String::new(),
+            family: plan.family.clone(),
+            model: plan.model.clone(),
+        },
+    );
+    let mut last_failure = (503, "No eligible model served this turn.".to_owned());
+    for route in routes {
+        let mut candidates = config.clone();
+        loop {
+            let (account, _in_flight) =
+                match state.reserve(&candidates, &route.family, &route.model) {
+                    Ok(account) => account,
+                    Err(_) => break,
                 };
-                respond(
-                    stream,
-                    503,
-                    "Router",
-                    &wire::error_body(&message, "router_error"),
-                );
-                return;
+            // Try each account at most once for this model, even if cooldown expires.
+            if let Some(candidate) = candidates.accounts.iter_mut().find(|a| a.id == account.id) {
+                candidate.enabled = false;
             }
-        };
-        let Some(upstream) = account.upstream() else {
-            state.record_error(&account.id, "The account names no provider.", false);
-            respond(
-                stream,
-                503,
-                "Router",
-                &wire::error_body("The picked account names no provider.", "router_error"),
-            );
-            return;
-        };
-        let url = format!("{upstream}/chat/completions");
-        let body = wire::upstream_request(request, &plan.model);
-        let _in_flight = InFlight::start(&state.active, &account.id);
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(CONNECT_TIMEOUT)
-            .timeout_read(READ_TIMEOUT)
-            .build();
-        let call = agent
-            .post(&url)
-            .set("content-type", "application/json")
-            .set(
-                "authorization",
-                &format!("Bearer {}", account.credential.bearer()),
-            )
-            .send_json(&body);
-        match call {
-            Ok(response) => {
-                if wire::streams(request) {
-                    relay_stream(
-                        stream,
-                        state,
+            // A token inside a minute of dying is traded for a fresh one first, and
+            // the pool keeps the fresh one, so this turn and the ones behind it go
+            // out on a live token. A refused refresh is the account refused.
+            let account = match native_auth::refresh_account(
+                &state.agent,
+                &account.id,
+                (state.now_ms)(),
+                REFRESH_TIMEOUT,
+            ) {
+                Ok(account) => account,
+                Err(message) => {
+                    state.record_error(&account.id, &message, true);
+                    refusals.push(message);
+                    continue;
+                }
+            };
+            let prepared = match transport::prepare(&account, request, &route.model) {
+                Ok(prepared) => prepared,
+                Err(message) => {
+                    last_failure = (400, message);
+                    break;
+                }
+            };
+            let agent = ureq::AgentBuilder::new()
+                .timeout_connect(CONNECT_TIMEOUT)
+                .timeout_read(READ_TIMEOUT)
+                .build();
+            let mut call = agent
+                .post(&prepared.url)
+                .set("content-type", "application/json");
+            for (name, value) in &prepared.headers {
+                call = call.set(name, value);
+            }
+            let call = call.send_json(&prepared.body);
+            match call {
+                Ok(response) => {
+                    let response_id = wire::classified_response_id(
+                        &route.family,
+                        &route.model,
+                        plan.classifier.as_ref(),
+                    );
+                    if prepared.protocol != transport::Protocol::Chat {
+                        let result = relay_native(
+                            stream,
+                            state,
+                            &account.id,
+                            response,
+                            request,
+                            &route.model,
+                            &response_id,
+                        );
+                        match result {
+                            Ok(()) => return,
+                            Err(message) => {
+                                last_failure = (502, message);
+                                continue;
+                            }
+                        }
+                    }
+                    let result = if wire::streams(request) {
+                        relay_stream(
+                            stream,
+                            state,
+                            &account.id,
+                            response,
+                            wire::wants_usage(request),
+                            &response_id,
+                        )
+                    } else {
+                        relay_once(stream, state, &account.id, response, &response_id)
+                    };
+                    match result {
+                        Ok(()) => return,
+                        Err(message) => last_failure = (502, message),
+                    }
+                }
+                Err(ureq::Error::Status(status, response)) => {
+                    let retry_after = response
+                        .header("retry-after")
+                        .and_then(|s| s.parse::<u64>().ok());
+                    let limit_headers = [
+                        "retry-after",
+                        "anthropic-ratelimit-unified-status",
+                        "anthropic-ratelimit-unified-reset",
+                        "anthropic-ratelimit-unified-representative-claim",
+                    ]
+                    .iter()
+                    .filter_map(|name| {
+                        response.header(name).map(|value| {
+                            format!("{name}={}", value.chars().take(200).collect::<String>())
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                    let detail = response
+                        .into_string()
+                        .unwrap_or_else(|_| format!("The provider answered {status}."));
+                    let cools = usage::status_cools(status);
+                    state.record_error(
                         &account.id,
-                        response,
-                        wire::wants_usage(request),
+                        &format!(
+                            "HTTP {status} model={} {limit_headers} {detail}",
+                            route.model
+                        ),
+                        cools,
                     );
-                } else {
-                    relay_once(stream, state, &account.id, response);
+                    if let Some(seconds) = retry_after {
+                        let mut ledger = state
+                            .ledger
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if let Some(entry) = ledger.accounts.get_mut(&account.id) {
+                            let until =
+                                (state.now_ms)().saturating_add(seconds.min(86400) as i64 * 1000);
+                            entry.cooldown_until_ms =
+                                Some(entry.cooldown_until_ms.unwrap_or(0).max(until));
+                        }
+                        let _ = usage::save(&state.agent, &ledger);
+                    }
+                    last_failure = (status, detail);
+                    if !cools {
+                        // Another model may accept the request, but repeating it on
+                        // the same model's other accounts does not help.
+                        break;
+                    }
+                    refusals.push(format!("{} answered {status}.", account.label));
                 }
-                return;
-            }
-            Err(ureq::Error::Status(status, response)) => {
-                let detail = response
-                    .into_string()
-                    .unwrap_or_else(|_| format!("The provider answered {status}."));
-                let cools = usage::status_cools(status);
-                state.record_error(&account.id, &detail, cools);
-                if !cools {
-                    // The request is wrong, not the account. Another account
-                    // would refuse it the same way.
-                    respond(
-                        stream,
-                        status,
-                        "Provider",
-                        &wire::error_body(&detail, "provider_error"),
-                    );
-                    return;
+                Err(ureq::Error::Transport(error)) => {
+                    state.record_error(&account.id, &error.to_string(), true);
+                    refusals.push(format!("{} did not answer.", account.label));
                 }
-                refusals.push(format!("{} answered {status}.", account.label));
-            }
-            Err(ureq::Error::Transport(error)) => {
-                state.record_error(&account.id, &error.to_string(), true);
-                refusals.push(format!("{} did not answer.", account.label));
             }
         }
     }
     respond(
         stream,
-        503,
+        last_failure.0,
         "Router",
         &wire::error_body(
-            &format!("No account served this turn. {}", refusals.join(" ")),
+            &format!(
+                "No eligible model served this turn. {} {}",
+                last_failure.1,
+                refusals.join(" ")
+            ),
             "router_error",
         ),
     );
 }
 
+/// Native providers stream even when the caller wants one complete answer.
+/// Once a delta is delivered, errors end this turn and never replay it.
+fn relay_native(
+    stream: &mut TcpStream,
+    state: &State,
+    account: &str,
+    response: ureq::Response,
+    request: &Value,
+    model: &str,
+    response_id: &str,
+) -> Result<(), String> {
+    let streaming = wire::streams(request);
+    let mut started = false;
+    let mut decoder = transport::Decoder::new(model);
+    decoder.response_id = response_id.to_owned();
+    let mut reader = BufReader::new(response.into_reader().take(BODY_LIMIT as u64));
+    let mut line = String::new();
+    let mut data = String::new();
+    let mut failure = None;
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => {
+                failure = Some("The provider stream ended unexpectedly.".to_owned());
+                break;
+            }
+        }
+        if data.len() + line.len() > BODY_LIMIT {
+            failure = Some("The provider event exceeds the size limit.".to_owned());
+            break;
+        }
+        if let Some(part) = line.trim_end().strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(part.trim_start());
+        }
+        if !line.trim().is_empty() || data.is_empty() {
+            continue;
+        }
+        if data == "[DONE]" {
+            break;
+        }
+        let event: Value = match serde_json::from_str(&data) {
+            Ok(event) => event,
+            Err(_) => {
+                failure = Some("The provider sent an invalid event.".to_owned());
+                break;
+            }
+        };
+        data.clear();
+        match decoder.event(&event) {
+            Ok(Some(chunk)) if streaming => {
+                if !started {
+                    if stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n").is_err() { return Ok(()); }
+                    started = true;
+                }
+                if write_event(stream, &chunk).is_err() {
+                    state.record_error(account, "The client closed the stream.", false);
+                    return Ok(());
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+        }
+        if decoder.finished {
+            break;
+        }
+    }
+    if !decoder.finished || failure.is_some() {
+        let message =
+            failure.unwrap_or_else(|| "The provider stream ended before completion.".into());
+        state.record_error(account, &message, false);
+        if started {
+            let _ = write_event(stream, &wire::error_body(&message, "provider_error"));
+        } else {
+            return Err(message);
+        }
+        return Ok(());
+    }
+    state.record_success(account, decoder.tokens);
+    if streaming {
+        if !started && stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n").is_err() { return Ok(()); }
+        if write_event(stream, &decoder.final_chunk()).is_err() {
+            return Ok(());
+        }
+        if wire::wants_usage(request) && write_event(stream, &decoder.usage_chunk()).is_err() {
+            return Ok(());
+        }
+        let _ = stream.write_all(b"data: [DONE]\n\n");
+        let _ = stream.flush();
+    } else {
+        respond(stream, 200, "OK", &decoder.completion());
+    }
+    Ok(())
+}
+
+fn write_event(stream: &mut TcpStream, value: &Value) -> io::Result<()> {
+    write!(stream, "data: {value}\n\n")?;
+    stream.flush()
+}
+
 /// One whole answer: forward the body and count what it says it spent.
-fn relay_once(stream: &mut TcpStream, state: &State, account: &str, response: ureq::Response) {
-    let Ok(value) = response.into_json::<Value>() else {
+fn relay_once(
+    stream: &mut TcpStream,
+    state: &State,
+    account: &str,
+    response: ureq::Response,
+    response_id: &str,
+) -> Result<(), String> {
+    let Ok(mut value) = response.into_json::<Value>() else {
         state.record_error(
             account,
             "The provider answered with something that is not JSON.",
             false,
         );
-        respond(
-            stream,
-            502,
-            "Router",
-            &wire::error_body(
-                "The provider answered with something that is not JSON.",
-                "provider_error",
-            ),
-        );
-        return;
+        return Err("The provider answered with something that is not JSON.".into());
     };
+    if value.get("error").is_some() || !value["choices"].is_array() {
+        let message = "The provider returned no completion.";
+        state.record_error(account, message, false);
+        return Err(message.into());
+    }
+    if let Some(object) = value.as_object_mut() {
+        object.insert("id".into(), Value::String(response_id.into()));
+    }
     state.record_success(account, wire::tokens(&value).unwrap_or_default());
     respond(stream, 200, "OK", &value);
+    Ok(())
 }
 
 /// A streamed answer: forward every frame as it arrives, and keep the usage
@@ -570,41 +860,61 @@ fn relay_stream(
     account: &str,
     response: ureq::Response,
     keep_usage: bool,
-) {
-    let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n";
-    if stream.write_all(head.as_bytes()).is_err() {
-        return;
-    }
-    let _ = stream.flush();
-    let mut reader = BufReader::new(response.into_reader());
+    response_id: &str,
+) -> Result<(), String> {
+    let mut reader = BufReader::new(response.into_reader().take(BODY_LIMIT as u64));
     let mut tokens = wire::Tokens::default();
     let mut line = String::new();
+    let mut started = false;
+    let mut finished = false;
     loop {
         line.clear();
         match reader.read_line(&mut line) {
-            Ok(0) => break,
+            Ok(0) | Err(_) => break,
             Ok(_) => {}
-            Err(_) => break,
         }
-        if let Some(payload) = line.trim_end().strip_prefix("data: ") {
-            if payload != "[DONE]" {
-                if let Ok(chunk) = serde_json::from_str::<Value>(payload) {
-                    if let Some(counted) = wire::tokens(&chunk) {
-                        tokens = counted;
-                    }
-                    if !keep_usage && wire::usage_only_chunk(&chunk) {
-                        // The router asked for this frame. The client did not.
-                        continue;
-                    }
-                }
+        let Some(payload) = line.trim_end().strip_prefix("data:").map(str::trim_start) else {
+            continue;
+        };
+        if payload == "[DONE]" {
+            finished = started;
+            if started {
+                let _ = stream.write_all(b"data: [DONE]\n\n");
             }
-        }
-        if stream.write_all(line.as_bytes()).is_err() {
             break;
         }
-        let _ = stream.flush();
+        let Ok(mut chunk) = serde_json::from_str::<Value>(payload) else {
+            break;
+        };
+        if chunk.get("error").is_some() || !chunk["choices"].is_array() {
+            break;
+        }
+        if let Some(counted) = wire::tokens(&chunk) {
+            tokens = counted;
+        }
+        if !keep_usage && wire::usage_only_chunk(&chunk) {
+            continue;
+        }
+        if !started {
+            if stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n").is_err() { return Ok(()); }
+            started = true;
+        }
+        chunk["id"] = Value::String(response_id.into());
+        if write_event(stream, &chunk).is_err() {
+            break;
+        }
     }
-    state.record_success(account, tokens);
+    if finished {
+        state.record_success(account, tokens);
+    } else {
+        let message = "The provider stream ended before completion.";
+        state.record_error(account, message, false);
+        if !started {
+            return Err(message.into());
+        }
+        let _ = write_event(stream, &wire::error_body(message, "provider_error"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -756,6 +1066,117 @@ mod tests {
     }
 
     #[test]
+    fn native_subscription_streams_fail_over_and_count_only_complete_answers() {
+        let agent = agent_dir();
+        let payload = [
+            json!({"type":"response.output_text.delta","delta":"hello"}),
+            json!({"type":"response.completed","response":{"usage":{"input_tokens":11,"output_tokens":2}}}),
+        ].iter().map(|event| format!("data: {event}\n\n")).collect::<String>();
+        let (url, seen) = upstream(vec![(429, "limited".into(), false), (200, payload, true)]);
+        let mut accounts = vec![account("s1", &url), account("s2", &url)];
+        for account in &mut accounts {
+            account.credential = Credential::Subscription {
+                provider: "openai-codex".into(),
+                access: format!("token-{}", account.id),
+                refresh: None,
+                expires_ms: None,
+                account_id: Some(account.id.clone()),
+                email: None,
+                plan: None,
+                renews_at_ms: None,
+            };
+        }
+        config::save(&agent, &config(accounts)).unwrap();
+        let handle = start_with_clock(agent.clone(), fixed_clock).unwrap();
+        let (status, body) = call(
+            handle.endpoint(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&turn("auto", true)),
+            &handle.endpoint().token,
+        );
+        assert_eq!(status, 200);
+        let chunks: Vec<Value> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let id = chunks[0]["id"].as_str().unwrap();
+        assert_eq!(
+            wire::response_model(id),
+            Some(("openai".into(), "gpt-5.6-mini".into()))
+        );
+        assert!(chunks.iter().all(|chunk| chunk["id"] == id));
+        assert!(body.contains("hello"));
+        assert!(body.contains("[DONE]"));
+        assert_eq!(seen.try_iter().count(), 2);
+        let ledger = usage::load(&agent);
+        assert_eq!(ledger.account("s1").unwrap().errors, 1);
+        assert_eq!(ledger.account("s2").unwrap().input_tokens, 11);
+        assert_eq!(ledger.account("s2").unwrap().requests, 1);
+    }
+
+    #[test]
+    fn a_truncated_native_stream_is_not_counted_as_success_or_replayed() {
+        let agent = agent_dir();
+        let (url, seen) = upstream(vec![(200, "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n".into(), true)]);
+        let mut native = account("s1", &url);
+        native.family = "anthropic".into();
+        native.credential = Credential::Subscription {
+            provider: "anthropic".into(),
+            access: "token".into(),
+            refresh: None,
+            expires_ms: None,
+            account_id: None,
+            email: None,
+            plan: None,
+            renews_at_ms: None,
+        };
+        let mut saved = config(vec![native]);
+        saved.routes.clear();
+        saved.fallback = None;
+        config::save(&agent, &saved).unwrap();
+        let handle = start_with_clock(agent.clone(), fixed_clock).unwrap();
+        let (status, body) = call(
+            handle.endpoint(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&turn("auto", true)),
+            &handle.endpoint().token,
+        );
+        assert_eq!(status, 200);
+        assert!(body.contains("partial"));
+        assert!(body.contains("provider_error"));
+        assert!(!body.contains("[DONE]"));
+        assert_eq!(seen.try_iter().count(), 1);
+        let ledger = usage::load(&agent);
+        let usage = ledger.account("s1").unwrap();
+        assert_eq!(usage.requests, 0);
+        assert_eq!(usage.errors, 1);
+    }
+
+    #[test]
+    fn reservations_distribute_concurrent_turns_and_release_on_drop() {
+        let agent = agent_dir();
+        let state = State {
+            agent,
+            ledger: Mutex::new(Ledger::default()),
+            active: Arc::new(Mutex::new(BTreeMap::new())),
+            now_ms: fixed_clock,
+        };
+        let saved = config(vec![
+            account("a", "http://unused"),
+            account("b", "http://unused"),
+        ]);
+        let (first, first_guard) = state.reserve(&saved, "openai", "gpt-5.6-mini").unwrap();
+        let (second, second_guard) = state.reserve(&saved, "openai", "gpt-5.6-mini").unwrap();
+        assert_ne!(first.id, second.id);
+        drop(first_guard);
+        drop(second_guard);
+        assert!(state.active.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn a_turn_reaches_the_pool_and_lands_in_the_ledger() {
         let agent = agent_dir();
         let (url, seen) = upstream(vec![(200, answer("because", 312, 48), false)]);
@@ -814,6 +1235,101 @@ mod tests {
         assert!(refused.cooldown_until_ms.is_some());
         assert!(refused.last_error.as_ref().unwrap().contains("slow down"));
         assert_eq!(ledger.account("a2").unwrap().requests, 1);
+    }
+
+    #[test]
+    fn exhausted_provider_falls_back_and_reports_the_successful_model() {
+        let agent = agent_dir();
+        let (limited, seen_limited) = upstream(vec![
+            (429, "limited".into(), false),
+            (429, "limited".into(), false),
+        ]);
+        let (serving, seen_serving) = upstream(vec![(200, answer("fallback reply", 12, 3), false)]);
+        let mut spare = account("spare", &serving);
+        spare.family = "xai".into();
+        spare.models = vec!["grok-test".into()];
+        let mut disabled = spare.clone();
+        disabled.id = "disabled".into();
+        disabled.enabled = false;
+        let mut configuration = config(vec![
+            account("a1", &limited),
+            account("a2", &limited),
+            disabled,
+            spare,
+        ]);
+        configuration.fallback = Some("xai/grok-test".into());
+        config::save(&agent, &configuration).unwrap();
+        let handle = start_with_clock(agent.clone(), fixed_clock).unwrap();
+        let (status, body) = call(
+            handle.endpoint(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&turn("fast", false)),
+            &handle.endpoint().token,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("fallback reply"));
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            wire::response_model(body["id"].as_str().unwrap()),
+            Some(("xai".into(), "grok-test".into()))
+        );
+        assert_eq!(seen_limited.try_iter().count(), 2);
+        assert_eq!(seen_serving.try_iter().count(), 1);
+        let ledger = usage::load(&agent);
+        assert_eq!(ledger.account("spare").unwrap().requests, 1);
+        assert!(ledger.account("disabled").is_none());
+    }
+
+    #[test]
+    fn model_rejection_tries_another_model_without_repeating_the_rejected_one() {
+        let agent = agent_dir();
+        let (url, seen) = upstream(vec![
+            (404, "model unavailable".into(), false),
+            (200, answer("alternate", 1, 1), false),
+        ]);
+        let mut a = account("a", &url);
+        a.models.push("alternate-model".into());
+        config::save(&agent, &config(vec![a])).unwrap();
+        let handle = start_with_clock(agent, fixed_clock).unwrap();
+        let (status, body) = call(
+            handle.endpoint(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&turn("fast", false)),
+            &handle.endpoint().token,
+        );
+        assert_eq!(status, 200, "{body}");
+        let models: Vec<_> = seen
+            .try_iter()
+            .map(|r| r["model"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(models, vec!["gpt-5.6-mini", "alternate-model"]);
+    }
+
+    #[test]
+    fn native_error_before_output_can_use_another_provider() {
+        let agent = agent_dir();
+        let (broken, _) = upstream(vec![(
+            200,
+            "data: {\"type\":\"error\",\"error\":{\"message\":\"overloaded\"}}\n\n".into(),
+            true,
+        )]);
+        let mut native = account("native", &broken);
+        native.family = "anthropic".into();
+        native.models = vec!["claude-test".into()];
+        let (serving, _) = upstream(vec![(200, answer("recovered", 1, 1), false)]);
+        config::save(&agent, &config(vec![native, account("spare", &serving)])).unwrap();
+        let handle = start_with_clock(agent, fixed_clock).unwrap();
+        let (status, body) = call(
+            handle.endpoint(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&turn("anthropic/claude-test", false)),
+            &handle.endpoint().token,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("recovered"));
     }
 
     #[test]

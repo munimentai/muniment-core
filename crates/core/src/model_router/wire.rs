@@ -6,10 +6,103 @@
 //! traffic lives here: the turn's text for the classifier, the model the
 //! request names, and the token counts the ledger records.
 
+use base64::Engine;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Pi preserves response IDs but keeps the requested model name (`auto`).
+/// Carry the selected route in a unique response ID so concurrent turns and
+/// restored receipts use their own evidence, never a global last-model value.
+pub fn routed_response_id(family: &str, model: &str) -> String {
+    let route = serde_json::to_vec(&(family, model)).expect("strings serialize");
+    format!(
+        "muniment-route-v1.{}.{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(route),
+        uuid::Uuid::new_v4()
+    )
+}
+
+pub fn response_model(id: &str) -> Option<(String, String)> {
+    if id.starts_with("muniment-route-v2.") {
+        return classified_response(id).map(|(family, model, _)| (family, model));
+    }
+    if id.len() > 2048 {
+        return None;
+    }
+    let rest = id.strip_prefix("muniment-route-v1.")?;
+    let (route, nonce) = rest.split_once('.')?;
+    uuid::Uuid::parse_str(nonce).ok()?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(route)
+        .ok()?;
+    let (family, model): (String, String) = serde_json::from_slice(&bytes).ok()?;
+    if super::family::family(&family).is_none()
+        || model.is_empty()
+        || model.len() > 512
+        || model.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some((family, model))
+}
+
+/// Usage recorded by one classifier call. Missing values mean unreported, not free.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClassifierUsage {
+    pub model: String,
+    pub tokens: Option<Tokens>,
+    pub cost: Option<f64>,
+}
+
+pub fn classified_response_id(
+    family: &str,
+    model: &str,
+    classifier: Option<&ClassifierUsage>,
+) -> String {
+    let Some(classifier) = classifier else {
+        return routed_response_id(family, model);
+    };
+    let route = serde_json::to_vec(&(family, model, classifier)).expect("route serializes");
+    format!(
+        "muniment-route-v2.{}.{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(route),
+        uuid::Uuid::new_v4()
+    )
+}
+
+fn classified_response(id: &str) -> Option<(String, String, ClassifierUsage)> {
+    if id.len() > 4096 {
+        return None;
+    }
+    let (route, nonce) = id.strip_prefix("muniment-route-v2.")?.split_once('.')?;
+    uuid::Uuid::parse_str(nonce).ok()?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(route)
+        .ok()?;
+    let value: (String, String, ClassifierUsage) = serde_json::from_slice(&bytes).ok()?;
+    if super::family::family(&value.0).is_none()
+        || value.1.is_empty()
+        || value.1.len() > 512
+        || value.1.chars().any(char::is_control)
+        || value.2.model.is_empty()
+        || value.2.model.len() > 512
+        || value.2.model.chars().any(char::is_control)
+        || value
+            .2
+            .cost
+            .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
+    {
+        return None;
+    }
+    Some(value)
+}
+
+pub fn response_classifier(id: &str) -> Option<ClassifierUsage> {
+    classified_response(id).map(|(_, _, usage)| usage)
+}
+
 /// The token counts one turn spent.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tokens {
     pub input: u64,
     pub output: u64,

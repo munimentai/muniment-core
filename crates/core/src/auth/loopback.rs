@@ -47,8 +47,20 @@ impl RedirectCatcher {
         expected_state: &str,
         timeout: Duration,
     ) -> Result<String, AuthError> {
+        self.wait_for_callback_while(expected_state, timeout, &|| true)
+    }
+
+    pub fn wait_for_callback_while(
+        self,
+        expected_state: &str,
+        timeout: Duration,
+        active: &dyn Fn() -> bool,
+    ) -> Result<String, AuthError> {
         let deadline = Instant::now() + timeout;
         loop {
+            if !active() {
+                return Err(AuthError::Timeout);
+            }
             let mut stream = match self.listener.accept() {
                 Ok((s, _)) => s,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -104,6 +116,9 @@ impl RedirectCatcher {
                     "This sign-in attempt could not be verified. Close this tab and try again from the app.",
                 );
                 return Err(AuthError::StateMismatch);
+            }
+            if !active() {
+                return Err(AuthError::Timeout);
             }
             return match param("code") {
                 Some(code) => {
@@ -220,5 +235,21 @@ mod tests {
             .wait_for_callback("xyz", Duration::from_millis(80))
             .unwrap_err();
         assert_eq!(err, AuthError::Timeout);
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    #[test]
+    fn returning_to_local_mode_closes_the_listener_before_a_callback() {
+        let catcher = RedirectCatcher::bind().unwrap();
+        let port = catcher.port();
+        let start = Instant::now();
+        assert!(catcher
+            .wait_for_callback_while("state", Duration::from_secs(120), &|| false)
+            .is_err());
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
     }
 }

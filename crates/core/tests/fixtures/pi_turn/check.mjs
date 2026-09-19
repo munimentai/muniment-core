@@ -3,7 +3,9 @@
 import fs from 'node:fs'
 
 const [extensionPath, promptPath, payloadPath] = process.argv.slice(2)
-const { default: register } = await import(extensionPath)
+// This fixture checks prompt rewriting. Harness wire tests cover the bundled model import.
+const source = fs.readFileSync(extensionPath, 'utf8').replace(/^import \{ completeSimple \}[^\n]*\n/m, '')
+const { default: register } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`)
 const handlers = {}
 register({ on: (name, handler) => { handlers[name] = handler } })
 const prompt = fs.readFileSync(promptPath, 'utf8')

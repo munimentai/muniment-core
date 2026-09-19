@@ -6,6 +6,7 @@
 
 use crate::runtime_eprintln as eprintln;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
@@ -95,6 +96,8 @@ pub struct Receipt {
     /// One tally per tool name: calls made and calls that failed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolReceipt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub classifiers: Vec<crate::model_router::wire::ClassifierUsage>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +160,7 @@ pub enum PiChatEvent {
     /// An assistant message ended: one turn, with the provider and model that
     /// wrote it, its token usage, and the cost Pi's catalog puts on that usage.
     ModelReported {
+        classifier: Option<crate::model_router::wire::ClassifierUsage>,
         provider: String,
         model: String,
         usage: Option<TokenUsage>,
@@ -166,10 +170,12 @@ pub enum PiChatEvent {
     ToolStarted {
         tool_call_id: String,
         tool_name: String,
+        input: Option<String>,
     },
     ToolFinished {
         tool_call_id: String,
         failed: bool,
+        output: Option<String>,
     },
     ExtensionUiRequest(ExtensionUiRequest),
     Completed,
@@ -284,6 +290,29 @@ pub fn parse_frame(frame: &Value) -> Result<PiChatEvent, &'static str> {
                 _ => Ok(PiChatEvent::Interleaved),
             }
         }
+        Some("compaction_start" | "auto_compaction_start") => Ok(PiChatEvent::ToolStarted {
+            tool_call_id: "muniment:context-compaction".into(),
+            tool_name: "compact_context".into(),
+            input: Some(serde_json::json!({"reason": frame.get("reason").and_then(Value::as_str).unwrap_or("threshold")}).to_string()),
+        }),
+        Some("compaction_end" | "auto_compaction_end") => {
+            let failed = frame.get("aborted").and_then(Value::as_bool) == Some(true)
+                || frame.get("errorMessage").and_then(Value::as_str).is_some()
+                || !frame.get("result").is_some_and(Value::is_object);
+            let detail = if frame.get("aborted").and_then(Value::as_bool) == Some(true) {
+                "Context compaction was cancelled. The conversation remains available.".to_owned()
+            } else if failed {
+                frame.get("errorMessage").and_then(Value::as_str).unwrap_or("Context compaction did not finish.").to_owned()
+            } else {
+                let tokens = frame.pointer("/result/tokensBefore").and_then(Value::as_u64);
+                let summary = frame.pointer("/result/summary").and_then(Value::as_str).unwrap_or("");
+                format!("Context compacted. Earlier messages remain in the conversation.\n{}\n{summary}", tokens.map(|n| format!("Context before compaction: {n} tokens.")).unwrap_or_default())
+            };
+            Ok(PiChatEvent::ToolFinished {
+                tool_call_id: "muniment:context-compaction".into(), failed,
+                output: activity_detail(Some(&Value::String(detail))),
+            })
+        }
         Some("agent_start") => Ok(PiChatEvent::TurnStarted),
         Some("message_end")
             if frame.pointer("/message/role").and_then(Value::as_str) == Some("assistant") =>
@@ -294,13 +323,42 @@ pub fn parse_frame(frame: &Value) -> Result<PiChatEvent, &'static str> {
             ) {
                 (Some(provider), Some(model)) if !provider.is_empty() && !model.is_empty() => {
                     let usage = frame.pointer("/message/usage");
+                    let routed = (provider == crate::model_router::config::ROUTER_PROVIDER)
+                        .then(|| {
+                            frame
+                                .pointer("/message/responseId")
+                                .and_then(Value::as_str)
+                                .and_then(crate::model_router::wire::response_model)
+                        })
+                        .flatten();
+                    let tokens = usage.and_then(TokenUsage::from_frame);
+                    // The router alias has no Pi catalog price. Estimate each turn
+                    // against its selected model, never the alias or the final model
+                    // of a multi-model run. Cached input uses the standard input rate.
+                    let cost = if provider == crate::model_router::config::ROUTER_PROVIDER {
+                        routed.as_ref().and_then(|(family, model)| {
+                            let price = crate::model_router::model_catalog::entry(family, model)?;
+                            let tokens = tokens.as_ref()?;
+                            Some(((tokens.input as f64 + tokens.cache_read as f64
+                                + tokens.cache_write as f64) * price.price
+                                + tokens.output as f64 * price.output) / 1_000_000.0)
+                        })
+                    } else {
+                        usage.and_then(|usage| usage.pointer("/cost/total"))
+                            .and_then(Value::as_f64)
+                    };
+                    let (provider, model) =
+                        routed.unwrap_or_else(|| (provider.to_owned(), model.to_owned()));
+                    let classifier = (frame.pointer("/message/provider").and_then(Value::as_str)
+                        == Some(crate::model_router::config::ROUTER_PROVIDER))
+                        .then(|| frame.pointer("/message/responseId").and_then(Value::as_str)
+                            .and_then(crate::model_router::wire::response_classifier)).flatten();
                     Ok(PiChatEvent::ModelReported {
-                        provider: provider.to_owned(),
-                        model: model.to_owned(),
-                        usage: usage.and_then(TokenUsage::from_frame),
-                        cost: usage
-                            .and_then(|usage| usage.pointer("/cost/total"))
-                            .and_then(Value::as_f64),
+                        classifier,
+                        provider,
+                        model,
+                        usage: tokens,
+                        cost,
                     })
                 }
                 _ => Ok(PiChatEvent::Interleaved),
@@ -323,6 +381,7 @@ pub fn parse_frame(frame: &Value) -> Result<PiChatEvent, &'static str> {
             Ok(PiChatEvent::ToolStarted {
                 tool_call_id: event.tool_call_id,
                 tool_name: event.tool_name,
+                input: activity_detail(frame.get("args")),
             })
         }
         Some("tool_execution_end") => {
@@ -342,6 +401,7 @@ pub fn parse_frame(frame: &Value) -> Result<PiChatEvent, &'static str> {
             Ok(PiChatEvent::ToolFinished {
                 tool_call_id: event.tool_call_id,
                 failed: event.is_error,
+                output: activity_detail(frame.get("result")),
             })
         }
         Some("extension_ui_request") => parse_extension_ui_request(frame),
@@ -511,7 +571,10 @@ pub const FIRST_EVENT_TIMEOUT_REASON: &str = "No reply arrived within 30 seconds
 pub struct PiRunAdapter {
     run_id: String,
     frames: Mutex<mpsc::Receiver<Value>>,
+    buffered: Mutex<VecDeque<Value>>,
     first_event_deadline: Mutex<Option<Instant>>,
+    compaction_id: Mutex<Option<String>>,
+    pending_terminal: Mutex<Option<PiChatEvent>>,
 }
 
 impl PiRunAdapter {
@@ -531,21 +594,80 @@ impl PiRunAdapter {
         images: Vec<PiImageContent>,
         timeout: Duration,
     ) -> Result<(Self, PiChatEvent), String> {
+        Self::start_with_images_and_handler(run_id, transport, prompt, images, timeout, |_, _| {
+            false
+        })
+    }
+
+    /// Services extension requests while Pi prepares a prompt, before its acknowledgement.
+    pub fn start_with_images_and_handler(
+        run_id: impl Into<String>,
+        transport: &PiRpcTransport,
+        prompt: &str,
+        images: Vec<PiImageContent>,
+        timeout: Duration,
+        mut consume: impl FnMut(&Self, &PiChatEvent) -> bool,
+    ) -> Result<(Self, PiChatEvent), String> {
         let run_id = run_id.into();
-        let frames = transport.subscribe();
         let deadline = Instant::now() + FIRST_EVENT_TIMEOUT;
-        let response = transport
-            .call(
-                PromptCommand::with_images(prompt, images).into_value(),
-                timeout.min(deadline.saturating_duration_since(Instant::now())),
-            )
-            .map_err(|error| {
-                if Instant::now() >= deadline {
-                    format!("Pi did not acknowledge the prompt within 30 seconds. {error}")
-                } else {
-                    error
+        let adapter = Self {
+            run_id: run_id.clone(),
+            frames: Mutex::new(transport.subscribe()),
+            buffered: Mutex::new(VecDeque::new()),
+            compaction_id: Mutex::new(None),
+            pending_terminal: Mutex::new(None),
+            first_event_deadline: Mutex::new(Some(deadline)),
+        };
+        let response = std::thread::scope(|scope| {
+            let (sender, response) = mpsc::channel();
+            scope.spawn(move || {
+                let result = transport.call(
+                    PromptCommand::with_images(prompt, images).into_value(),
+                    timeout.min(deadline.saturating_duration_since(Instant::now())),
+                );
+                let _ = sender.send(result);
+            });
+            loop {
+                match response.try_recv() {
+                    Ok(result) => return result,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        return Err("The prompt dispatcher stopped.".into())
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
                 }
-            })?;
+                let frame = adapter
+                    .frames
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .recv_timeout(Duration::from_millis(5));
+                match frame {
+                    Ok(frame) => {
+                        let handled =
+                            parse_frame(&frame).is_ok_and(|event| consume(&adapter, &event));
+                        if !handled {
+                            adapter
+                                .buffered
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push_back(frame);
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return response
+                            .recv()
+                            .unwrap_or_else(|_| Err("The prompt dispatcher stopped.".into()))
+                    }
+                }
+            }
+        })
+        .map_err(|error| {
+            if Instant::now() >= deadline {
+                format!("Pi did not acknowledge the prompt within 30 seconds. {error}")
+            } else {
+                error
+            }
+        })?;
         let accepted = parse_frame(&response).map_err(str::to_owned)?;
         if accepted != PiChatEvent::PromptAccepted {
             let detail: String = response
@@ -558,14 +680,7 @@ impl PiRunAdapter {
             eprintln!("muniment-runtime: run_id={run_id} provider_request outcome=not_started prompt_error={detail:?}");
             return Err("Pi rejected the prompt".into());
         }
-        Ok((
-            Self {
-                run_id,
-                frames: Mutex::new(frames),
-                first_event_deadline: Mutex::new(Some(deadline)),
-            },
-            accepted,
-        ))
+        Ok((adapter, accepted))
     }
 
     pub fn run_id(&self) -> &str {
@@ -593,7 +708,7 @@ impl PiRunAdapter {
         session_root: &Path,
         timeout: Duration,
     ) -> Result<(super::PiSessionLocator, Vec<PiChatEvent>), String> {
-        self.await_session_binding_with_handler(transport, session_root, timeout, |_| false)
+        self.await_session_binding_with_handler(transport, session_root, timeout, |_| Ok(false))
     }
 
     pub fn await_session_binding_with_handler(
@@ -601,7 +716,7 @@ impl PiRunAdapter {
         transport: &PiRpcTransport,
         session_root: &Path,
         timeout: Duration,
-        mut consume: impl FnMut(&PiChatEvent) -> bool,
+        mut consume: impl FnMut(&PiChatEvent) -> Result<bool, String>,
     ) -> Result<(super::PiSessionLocator, Vec<PiChatEvent>), String> {
         let mut deadline = std::time::Instant::now() + timeout;
         let mut buffered = Vec::new();
@@ -614,7 +729,7 @@ impl PiRunAdapter {
             match self.next(Duration::from_millis(10).min(remaining)) {
                 Ok(event) => {
                     let started = std::time::Instant::now();
-                    if consume(&event) {
+                    if consume(&event)? {
                         // Native recovery has its own timeout. Keep Pi's binding wait separate.
                         deadline += started.elapsed();
                     } else {
@@ -689,6 +804,73 @@ impl PiRunAdapter {
         require_queue_ack(&response, "follow_up")
     }
 
+    /// Pi emits agent_end before automatic compaction. A state RPC is a
+    /// protocol barrier: drain the following lifecycle events before settling.
+    pub fn next_settled(
+        &self,
+        transport: &PiRpcTransport,
+        timeout: Duration,
+    ) -> Result<PiChatEvent, String> {
+        self.next_with_settlement(timeout, || {
+            transport.call(json!({"type": "get_state"}), Duration::from_secs(5))
+        })
+    }
+
+    fn next_with_settlement(
+        &self,
+        timeout: Duration,
+        state: impl FnOnce() -> Result<Value, String>,
+    ) -> Result<PiChatEvent, String> {
+        let result = self.next(timeout);
+        let mut pending = self
+            .pending_terminal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match result {
+            Ok(event @ (PiChatEvent::Completed | PiChatEvent::Failed | PiChatEvent::Cancelled)) => {
+                *pending = Some(event);
+                Ok(PiChatEvent::Interleaved)
+            }
+            Err(ref error) if error == "timed out waiting for Pi stream" && pending.is_some() => {
+                let snapshot = state()?;
+                if snapshot
+                    .pointer("/data/isCompacting")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                    || snapshot
+                        .pointer("/data/isStreaming")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                {
+                    return Ok(PiChatEvent::Interleaved);
+                }
+                // The barrier may have delivered compaction events to the subscriber.
+                if let Ok(frame) = self
+                    .frames
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .try_recv()
+                {
+                    self.buffered
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push_back(frame);
+                    return Ok(PiChatEvent::Interleaved);
+                }
+                if self
+                    .compaction_id
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_some()
+                {
+                    return Ok(PiChatEvent::Interleaved);
+                }
+                Ok(pending.take().unwrap())
+            }
+            other => other,
+        }
+    }
+
     pub fn next(&self, timeout: Duration) -> Result<PiChatEvent, String> {
         let mut deadline = self
             .first_event_deadline
@@ -703,21 +885,65 @@ impl PiRunAdapter {
         } else {
             timeout
         };
-        let frame = self
-            .frames
+        let buffered = self
+            .buffered
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .recv_timeout(timeout)
-            .map_err(|error| match error {
-                mpsc::RecvTimeoutError::Timeout
-                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) =>
+            .pop_front();
+        let frame = match buffered {
+            Some(frame) => Ok(frame),
+            None => self
+                .frames
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv_timeout(timeout),
+        }
+        .map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) =>
+            {
+                FIRST_EVENT_TIMEOUT_REASON.to_string()
+            }
+            mpsc::RecvTimeoutError::Timeout => "timed out waiting for Pi stream".to_string(),
+            mpsc::RecvTimeoutError::Disconnected => "Pi process stream ended".to_string(),
+        })?;
+        let mut event = parse_frame(&frame).map_err(str::to_owned)?;
+        if frame.get("type").and_then(Value::as_str) == Some("agent_start")
+            || (matches!(
+                frame.get("type").and_then(Value::as_str),
+                Some("compaction_end" | "auto_compaction_end")
+            ) && frame.get("willRetry").and_then(Value::as_bool) == Some(true))
+        {
+            self.pending_terminal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+        }
+        match &mut event {
+            PiChatEvent::ToolStarted { tool_call_id, .. }
+                if tool_call_id == "muniment:context-compaction" =>
+            {
+                *tool_call_id = format!("muniment:context-compaction:{}", uuid::Uuid::now_v7());
+                *self
+                    .compaction_id
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(tool_call_id.clone());
+            }
+            PiChatEvent::ToolFinished { tool_call_id, .. }
+                if tool_call_id == "muniment:context-compaction" =>
+            {
+                if let Some(id) = self
+                    .compaction_id
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
                 {
-                    FIRST_EVENT_TIMEOUT_REASON.to_string()
+                    *tool_call_id = id;
                 }
-                mpsc::RecvTimeoutError::Timeout => "timed out waiting for Pi stream".to_string(),
-                mpsc::RecvTimeoutError::Disconnected => "Pi process stream ended".to_string(),
-            })?;
-        let event = parse_frame(&frame).map_err(str::to_owned)?;
+            }
+            _ => {}
+        }
         if frame.get("type").and_then(Value::as_str) == Some("message_end")
             && frame.pointer("/message/role").and_then(Value::as_str) == Some("assistant")
         {
@@ -771,6 +997,31 @@ impl Drop for PiRunAdapter {
     }
 }
 
+// Activity details are bounded plain text. The same secret gate as memory
+// prevents credentials from entering the journal or the webview.
+fn activity_detail(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    let text = if let Some(text) = value.as_str() {
+        text.to_owned()
+    } else if let Some(content) = value.get("content").and_then(Value::as_array) {
+        content
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        serde_json::to_string_pretty(value).ok()?
+    };
+    if crate::memory_secret::reject_memory_secret(&text).is_err() {
+        return Some("Details withheld because they may contain a secret.".into());
+    }
+    let mut clipped: String = text.chars().take(8000).collect();
+    if text.chars().count() > 8000 {
+        clipped.push_str("\n[Output shortened]");
+    }
+    Some(clipped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,6 +1032,9 @@ mod tests {
         let adapter = PiRunAdapter {
             run_id: "0190a100-0000-7000-8000-000000000001".into(),
             frames: Mutex::new(frames),
+            buffered: Mutex::new(VecDeque::new()),
+            compaction_id: Mutex::new(None),
+            pending_terminal: Mutex::new(None),
             first_event_deadline: Mutex::new(Some(Instant::now() + Duration::from_secs(1))),
         };
         drop(sender);
@@ -798,9 +1052,92 @@ mod tests {
             PiRunAdapter {
                 run_id: "run-bound".into(),
                 frames: Mutex::new(frames),
+                buffered: Mutex::new(VecDeque::new()),
+                compaction_id: Mutex::new(None),
+                pending_terminal: Mutex::new(None),
                 first_event_deadline: Mutex::new(Some(Instant::now() + timeout)),
             },
         )
+    }
+
+    #[test]
+    fn completion_waits_for_post_reply_compaction_and_overflow_retry() {
+        let (sender, adapter) = bounded_adapter(Duration::from_secs(1));
+        let next = || {
+            adapter
+                .next_with_settlement(Duration::from_millis(1), || {
+                    Ok(json!({"success":true,"data":{"isStreaming":false,"isCompacting":false}}))
+                })
+                .unwrap()
+        };
+        sender.send(json!({"type":"agent_end"})).unwrap();
+        assert_eq!(next(), PiChatEvent::Interleaved);
+        sender
+            .send(json!({"type":"compaction_start","reason":"threshold"}))
+            .unwrap();
+        assert!(matches!(next(), PiChatEvent::ToolStarted { .. }));
+        assert_eq!(next(), PiChatEvent::Interleaved);
+        sender.send(json!({"type":"compaction_end","result":{"summary":"Keep the goal"},"willRetry":false})).unwrap();
+        assert!(matches!(
+            next(),
+            PiChatEvent::ToolFinished { failed: false, .. }
+        ));
+        assert_eq!(next(), PiChatEvent::Completed);
+
+        sender
+            .send(
+                json!({"type":"agent_end","messages":[{"role":"assistant","stopReason":"error"}]}),
+            )
+            .unwrap();
+        assert_eq!(next(), PiChatEvent::Interleaved);
+        sender
+            .send(json!({"type":"compaction_start","reason":"overflow"}))
+            .unwrap();
+        assert!(matches!(next(), PiChatEvent::ToolStarted { .. }));
+        sender.send(json!({"type":"compaction_end","result":{"summary":"Keep the goal"},"willRetry":true})).unwrap();
+        assert!(matches!(next(), PiChatEvent::ToolFinished { .. }));
+        assert!(adapter.pending_terminal.lock().unwrap().is_none());
+        sender.send(json!({"type":"agent_end"})).unwrap();
+        assert_eq!(next(), PiChatEvent::Interleaved);
+        assert_eq!(next(), PiChatEvent::Completed);
+    }
+
+    #[test]
+    fn compaction_cycles_have_distinct_ids_and_failed_endings_are_visible() {
+        let (sender, adapter) = bounded_adapter(Duration::from_secs(1));
+        let mut ids = Vec::new();
+        for prefix in ["compaction", "auto_compaction"] {
+            sender
+                .send(json!({"type": format!("{prefix}_start"), "reason": "threshold"}))
+                .unwrap();
+            let PiChatEvent::ToolStarted {
+                tool_call_id,
+                tool_name,
+                ..
+            } = adapter.next(Duration::from_secs(1)).unwrap()
+            else {
+                panic!("missing start")
+            };
+            assert_eq!(tool_name, "compact_context");
+            sender.send(json!({"type": format!("{prefix}_end"), "result": {"summary":"Keep the user goal", "tokensBefore":50000}})).unwrap();
+            let PiChatEvent::ToolFinished {
+                tool_call_id: ended,
+                failed,
+                output,
+            } = adapter.next(Duration::from_secs(1)).unwrap()
+            else {
+                panic!("missing end")
+            };
+            assert_eq!(tool_call_id, ended);
+            assert!(!failed);
+            assert!(output.unwrap().contains("50000"));
+            ids.push(tool_call_id);
+        }
+        assert_ne!(ids[0], ids[1]);
+        assert!(matches!(
+            parse_frame(&json!({"type":"compaction_end","aborted":true,"result":null})).unwrap(),
+            PiChatEvent::ToolFinished { failed: true, .. }
+        ));
     }
 
     #[test]
@@ -876,6 +1213,100 @@ mod tests {
     }
 
     #[test]
+    fn routed_messages_report_their_own_selected_model() {
+        let fast = crate::model_router::wire::routed_response_id("openai", "gpt-5.6-luna");
+        let deep = crate::model_router::wire::routed_response_id("anthropic", "claude-opus-5");
+        for (id, provider, model) in [
+            (deep, "anthropic", "claude-opus-5"),
+            (fast, "openai", "gpt-5.6-luna"),
+        ] {
+            let frame = json!({"type":"message_end","message":{"role":"assistant","provider":"muniment-router","model":"auto","responseId":id}});
+            assert_eq!(
+                parse_frame(&frame).unwrap(),
+                PiChatEvent::ModelReported {
+                    classifier: None,
+                    provider: provider.into(),
+                    model: model.into(),
+                    usage: None,
+                    cost: None
+                }
+            );
+            // Another provider cannot accidentally consume router metadata.
+            let mut direct = frame;
+            direct["message"]["provider"] = json!("ollama");
+            assert_eq!(
+                parse_frame(&direct).unwrap(),
+                PiChatEvent::ModelReported {
+                    classifier: None,
+                    provider: "ollama".into(),
+                    model: "auto".into(),
+                    usage: None,
+                    cost: None
+                }
+            );
+        }
+        let frame = json!({"type":"message_end","message":{"role":"assistant","provider":"muniment-router","model":"auto","responseId":"muniment-route-v1.invalid"}});
+        assert_eq!(
+            parse_frame(&frame).unwrap(),
+            PiChatEvent::ModelReported {
+                classifier: None,
+                provider: "muniment-router".into(),
+                model: "auto".into(),
+                usage: None,
+                cost: None
+            }
+        );
+    }
+
+    #[test]
+    fn classifier_usage_follows_its_own_routed_response() {
+        let classifier = crate::model_router::wire::ClassifierUsage {
+            model: "typesafe/jev-latest".into(),
+            tokens: Some(crate::model_router::wire::Tokens {
+                input: 1000,
+                output: 0,
+            }),
+            cost: Some(0.000042),
+        };
+        let id = crate::model_router::wire::classified_response_id(
+            "anthropic",
+            "claude-sonnet-5",
+            Some(&classifier),
+        );
+        let frame = json!({"type":"message_end","message":{
+            "role":"assistant","provider":"muniment-router","model":"auto","responseId":id,
+            "usage":{"input":1000,"output":1000,"cost":{"total":0}}
+        }});
+        let PiChatEvent::ModelReported {
+            classifier: recorded,
+            model,
+            cost,
+            ..
+        } = parse_frame(&frame).unwrap()
+        else {
+            panic!("model usage expected");
+        };
+        assert_eq!(recorded, Some(classifier));
+        assert_eq!(model, "claude-sonnet-5");
+        assert_eq!(cost, Some(0.018));
+    }
+
+    #[test]
+    fn routed_cost_uses_the_selected_model_and_unknown_prices_are_unavailable() {
+        for (model, expected) in [("claude-sonnet-5", Some(0.018)), ("private-model", None)] {
+            let id = crate::model_router::wire::routed_response_id("anthropic", model);
+            let frame = json!({"type":"message_end","message":{
+                "role":"assistant","provider":"muniment-router","model":"auto","responseId":id,
+                "usage":{"input":1000,"output":1000,"cost":{"total":0}}
+            }});
+            let PiChatEvent::ModelReported { cost, .. } = parse_frame(&frame).unwrap() else {
+                panic!("expected model usage");
+            };
+            assert_eq!(cost, expected);
+        }
+    }
+
+    #[test]
     fn an_assistant_message_end_reports_its_provider_and_model() {
         assert_eq!(
             parse_frame(&json!({"type":"message_end", "message":{
@@ -883,6 +1314,7 @@ mod tests {
             }}))
             .unwrap(),
             PiChatEvent::ModelReported {
+                classifier: None,
                 provider: "ollama".into(),
                 model: "llama3.2:3b".into(),
                 usage: None,
@@ -897,6 +1329,7 @@ mod tests {
             }}))
             .unwrap(),
             PiChatEvent::ModelReported {
+                    classifier: None,
                 provider: "openai-codex".into(),
                 model: "gpt-5.5".into(),
                 usage: Some(TokenUsage {

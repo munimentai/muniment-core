@@ -328,6 +328,62 @@ pub fn probe_codex(
     parse_codex(&fetch(CODEX_USAGE_URL, &headers, timeout)?, now_ms)
 }
 
+/// Grok Build's credits endpoint, as used by its billing extension.
+pub const XAI_USAGE_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
+
+pub fn parse_xai(payload: &Value, now_ms: i64) -> Option<Quota> {
+    let config = payload.get("config")?;
+    let used = number(config.get("creditUsagePercent")).or_else(|| {
+        let limit = number(config.pointer("/monthlyLimit/val"))?;
+        (limit > 0.0).then(|| number(config.pointer("/used/val")).unwrap_or(0.0) / limit * 100.0)
+    })?;
+    if !used.is_finite() {
+        return None;
+    }
+    let period = config.get("currentPeriod");
+    let kind = match period.and_then(|p| p.get("type")).and_then(Value::as_str) {
+        Some("USAGE_PERIOD_TYPE_WEEKLY") => WindowKind::Weekly,
+        Some("USAGE_PERIOD_TYPE_MONTHLY") => WindowKind::Monthly,
+        _ if config.get("monthlyLimit").is_some() => WindowKind::Monthly,
+        _ => WindowKind::Other,
+    };
+    Some(Quota {
+        plan: text(payload.get("subscription_tier")),
+        email: None,
+        windows: vec![Window {
+            kind,
+            scope: String::new(),
+            used_percent: used.clamp(0.0, 100.0),
+            resets_at_ms: rfc3339_ms(period.and_then(|p| p.get("end")))
+                .or_else(|| rfc3339_ms(config.get("billingPeriodEnd"))),
+            limit_reached: used >= 100.0,
+        }],
+        banked_resets: None,
+        observed_at_ms: now_ms,
+    })
+}
+
+pub fn probe_xai(
+    access: &str,
+    account_id: Option<&str>,
+    now_ms: i64,
+    timeout: Duration,
+) -> Option<Quota> {
+    let bearer = format!("Bearer {access}");
+    let mut headers = vec![
+        ("Authorization", bearer.as_str()),
+        ("X-XAI-Token-Auth", "xai-grok-cli"),
+    ];
+    if let Some(id) = account_id {
+        headers.push(("x-userid", id));
+    }
+    let mut quota = parse_xai(&fetch(XAI_USAGE_URL, &headers, timeout)?, now_ms)?;
+    if let Some(user) = fetch("https://cli-chat-proxy.grok.com/v1/user", &headers, timeout) {
+        quota.email = text(user.get("email"));
+    }
+    Some(quota)
+}
+
 /// Asks Anthropic what this account has left.
 pub fn probe_claude(access: &str, now_ms: i64, timeout: Duration) -> Option<Quota> {
     let bearer = format!("Bearer {access}");
@@ -765,6 +821,15 @@ pub fn probe_devin(session_token: &str, now_ms: i64, timeout: Duration) -> Optio
     parse_devin_status(&answer, now_ms)
 }
 
+/// Whether the router has a usage route for this sign-in provider. xAI has
+/// none, so its card says what the router cannot read.
+pub fn has_reader(provider: &str) -> bool {
+    matches!(
+        provider,
+        "openai-codex" | "anthropic" | "kimi" | "antigravity" | "devin" | "xai"
+    )
+}
+
 /// Asks the account's upstream what it has left. A key has no window to ask
 /// about, and a provider with no usage route answers nothing.
 pub fn probe(account: &Account, now_ms: i64, timeout: Duration) -> Option<Quota> {
@@ -778,6 +843,7 @@ pub fn probe(account: &Account, now_ms: i64, timeout: Duration) -> Option<Quota>
         } => match provider.as_str() {
             "openai-codex" => probe_codex(access, account_id.as_deref(), now_ms, timeout),
             "anthropic" => probe_claude(access, now_ms, timeout),
+            "xai" => probe_xai(access, account_id.as_deref(), now_ms, timeout),
             "kimi" => probe_kimi(
                 access,
                 account_id.as_deref().unwrap_or_default(),
@@ -819,6 +885,26 @@ pub fn save(agent: &Path, store: &QuotaStore) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grok_credits_parse_weekly_monthly_empty_and_exhausted() {
+        let value = serde_json::json!({"config": {"creditUsagePercent": 42.5, "currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY", "end": "2026-10-01T00:00:00Z"}}, "subscription_tier": "SuperGrok"});
+        let quota = parse_xai(&value, 123).unwrap();
+        assert_eq!(quota.windows[0].kind, WindowKind::Weekly);
+        assert_eq!(quota.windows[0].remaining_percent(), 57.5);
+        assert!(quota.windows[0].resets_at_ms.is_some());
+        assert_eq!(quota.plan.as_deref(), Some("SuperGrok"));
+        assert!(parse_xai(&serde_json::json!({"config": {}}), 0).is_none());
+        let quota = parse_xai(
+            &serde_json::json!({"config": {"monthlyLimit": {"val": 100}, "used": {"val": 150}}}),
+            0,
+        )
+        .unwrap();
+        assert_eq!(quota.windows[0].kind, WindowKind::Monthly);
+        assert_eq!(quota.windows[0].remaining_percent(), 0.0);
+        assert!(quota.windows[0].limit_reached);
+    }
+
     use serde_json::json;
 
     /// A Pro account's answer, as `wham/usage` gave it.
@@ -967,7 +1053,9 @@ mod tests {
             },
             ..account
         };
-        assert_eq!(probe(&xai, 0, Duration::from_millis(50)), None);
+        assert!(xai.credential.pi_provider().is_some());
+        assert!(has_reader("xai"));
+        assert!(has_reader("anthropic") && has_reader("openai-codex"));
     }
 
     #[test]

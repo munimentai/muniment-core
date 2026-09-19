@@ -392,6 +392,7 @@ mod tests {
         assert_eq!(detail.edges[0].dst_title, "Northwind");
         assert_eq!(detail.events.len(), 1);
         assert_eq!(detail.events[0].verb, "created");
+        assert_eq!(detail.events[0].actor_label.as_deref(), Some("owner"));
         assert!(record.entity_detail("missing").unwrap().is_none());
         let person_detail = record.entity_detail(&person_id).unwrap().unwrap();
         assert_eq!(person_detail.edges[0].dst_title, "Northwind");

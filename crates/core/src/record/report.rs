@@ -35,6 +35,8 @@ pub struct Finding {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     pub evidence: Vec<String>,
+    #[serde(default)]
+    pub record_groups: Vec<Vec<String>>,
 }
 
 /// One kind and the live records it holds.
@@ -224,7 +226,7 @@ impl CompanyRecord {
         }
         let mut evidence = vec![
             format!(
-                "person {} rows, {} resolve onto another person",
+                "person {} rows, {} possible duplicate records",
                 count(rows),
                 count(extras)
             ),
@@ -243,11 +245,15 @@ impl CompanyRecord {
             id: "duplicate-person".into(),
             category: "identity".into(),
             magnitude: extras,
-            short: "duplicate people".into(),
-            claim: "people appear more than once under one name".into(),
-            consequence: "every owner report and every campaign count reads them twice".into(),
+            short: "possible duplicate people".into(),
+            claim: "person records share a name and may describe the same person".into(),
+            consequence: "compare their fields and sources before merging".into(),
             kind: Some("person".into()),
             evidence,
+            record_groups: groups
+                .iter()
+                .map(|(_, members)| members.iter().map(|(id, _)| id.clone()).collect())
+                .collect(),
         }))
     }
 
@@ -285,11 +291,15 @@ impl CompanyRecord {
             id: "duplicate-organization".into(),
             category: "identity".into(),
             magnitude: extras,
-            short: "duplicate organizations".into(),
+            short: "possible duplicate organizations".into(),
             claim: "organizations carry a name another organization already carries".into(),
-            consequence: "pipeline rolls up to two rows for one account".into(),
+            consequence: "compare their fields and sources before merging".into(),
             kind: Some("org".into()),
             evidence,
+            record_groups: groups
+                .iter()
+                .map(|(_, members)| members.iter().map(|(id, _)| id.clone()).collect())
+                .collect(),
         }))
     }
 
@@ -353,6 +363,10 @@ impl CompanyRecord {
             consequence: "routing sends one account to two owners".into(),
             kind: Some("org".into()),
             evidence,
+            record_groups: groups
+                .iter()
+                .map(|(_, members)| members.iter().map(|(id, _)| id.clone()).collect())
+                .collect(),
         }))
     }
 
@@ -436,6 +450,7 @@ impl CompanyRecord {
             consequence: "a form asks for what no report reads".into(),
             kind: None,
             evidence,
+            record_groups: Vec::new(),
         }))
     }
 
@@ -505,6 +520,7 @@ impl CompanyRecord {
             consequence: "a list is doing its work as a paragraph".into(),
             kind: None,
             evidence,
+            record_groups: Vec::new(),
         }))
     }
 
@@ -570,6 +586,7 @@ impl CompanyRecord {
             consequence: "the older copy answers first".into(),
             kind: None,
             evidence,
+            record_groups: Vec::new(),
         }))
     }
 
@@ -744,8 +761,10 @@ mod tests {
         );
         let people = &report.findings[1];
         assert_eq!(people.magnitude, 2);
+        assert_eq!(people.record_groups.len(), 1);
+        assert!(people.record_groups.iter().all(|group| group.len() == 3));
         assert_eq!(people.kind.as_deref(), Some("person"));
-        assert!(people.evidence[0].starts_with("person 4 rows, 2 resolve"));
+        assert!(people.evidence[0].starts_with("person 4 rows, 2 possible duplicate"));
         let orgs = &report.findings[2];
         assert_eq!(orgs.magnitude, 1);
         let stale = &report.findings[3];

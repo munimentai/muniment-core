@@ -912,14 +912,24 @@ fn chat_projection_tracks_tool_activity_in_start_order() {
         projection.tool_activity,
         vec![
             ToolActivity {
+                text_offset: 0,
                 effect_id: "first".into(),
                 display_name: Some("Search".into()),
                 status: ToolActivityStatus::Completed,
+                input: None,
+                output: None,
+                started_at: Some(interleaved[1].recorded_at.clone()),
+                finished_at: Some(interleaved[3].recorded_at.clone()),
             },
             ToolActivity {
+                text_offset: 7,
                 effect_id: "second".into(),
                 display_name: None,
                 status: ToolActivityStatus::Failed,
+                input: None,
+                output: None,
+                started_at: Some(interleaved[4].recorded_at.clone()),
+                finished_at: Some(interleaved[6].recorded_at.clone()),
             },
         ]
     );
@@ -968,4 +978,31 @@ fn receipt_projection_preserves_absent_fields_as_unknown() {
     assert!(receipt.get("model").is_none());
     assert!(receipt.get("cost").is_none());
     assert!(receipt.get("time").is_none());
+}
+
+#[test]
+fn action_details_survive_full_and_fragment_replay() {
+    let events = stream(&[
+        ("run.started", json!({})),
+        (
+            "tool.effect.started",
+            json!({"effect_id":"read-1","display_name":"read","input":"{\"path\":\"main.rs\"}"}),
+        ),
+        (
+            "tool.effect.completed",
+            json!({"effect_id":"read-1","output":"fn main() {}"}),
+        ),
+        ("run.completed", json!({})),
+    ]);
+    let full = project_chat(&events).unwrap();
+    let fragment = muniment_core::journal::reducer::project_chat_fragment(&events).unwrap();
+    assert_eq!(full.tool_activity, fragment.tool_activity);
+    assert_eq!(
+        full.tool_activity[0].input.as_deref(),
+        Some("{\"path\":\"main.rs\"}")
+    );
+    assert_eq!(
+        full.tool_activity[0].output.as_deref(),
+        Some("fn main() {}")
+    );
 }

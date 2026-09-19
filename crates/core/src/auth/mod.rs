@@ -84,7 +84,7 @@ pub use native_session::{
     NativeSessionOrganization, NativeSessionRequest, NativeSessionRole, NativeSessionUser,
     SessionTransport, UreqSessionTransport,
 };
-pub use native_sign_in::{run_native_sign_in, NativeSignInError};
+pub use native_sign_in::{run_native_sign_in, run_native_sign_in_while, NativeSignInError};
 pub use native_token::{
     exchange_native_code, refresh_native_credentials, NativeAuthorizationCodeTokenRequest,
     NativeCredentialStore, NativeCredentials, NativeRefreshTokenRequest, NativeTokenError,

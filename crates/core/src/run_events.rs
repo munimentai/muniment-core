@@ -230,6 +230,18 @@ pub fn fail(
     reason: &str,
     subject: Option<&str>,
 ) {
+    let partial = projector
+        .projection()
+        .is_ok_and(|projection| !projection.text.trim().is_empty());
+    let reason = if partial
+        && matches!(
+            reason,
+            "The reply could not be started." | "The reply did not start. Try again."
+        ) {
+        "The reply stopped before it finished."
+    } else {
+        reason
+    };
     let _ = append_emit(
         sink,
         storage,

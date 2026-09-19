@@ -17,8 +17,30 @@ pub fn subject_owns_first_run(
         .map_err(|error| ThreadOwnershipError::ThreadRunsUnavailable(format!("{error:?}")))?
         .run_ids
         .into_iter()
-        .next()
-        .ok_or(ThreadOwnershipError::MissingFirstRun)?;
+        .next();
+    let Some(first_run) = first_run else {
+        // Explicitly created chats can have no first reply yet. Use their
+        // creation owner without treating broken run-backed threads as empty.
+        let events = journal
+            .thread_events(thread_id)
+            .map_err(|error| ThreadOwnershipError::FirstEnvelopeUnavailable(error.to_string()))?;
+        let created = events
+            .first()
+            .filter(|event| {
+                event.event_type == "thread.created"
+                    && event
+                        .provenance
+                        .extra
+                        .get("attach_profile")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|profile| !profile.is_empty())
+            })
+            .ok_or(ThreadOwnershipError::MissingFirstRun)?;
+        return Ok(!events
+            .iter()
+            .any(|event| event.event_type == "thread.deleted")
+            && created.provenance.actor_id.as_deref() == subject);
+    };
     let first = journal
         .first_envelope(&first_run)
         .map_err(|error| ThreadOwnershipError::FirstEnvelopeUnavailable(error.to_string()))?;
@@ -116,6 +138,48 @@ mod tests {
             subject_owns_first_run(&mut journal, &thread_id, Some("subject")),
             Ok(true)
         );
+    }
+
+    #[test]
+    fn empty_explicit_threads_use_the_creation_owner_and_remain_readable() {
+        for owner in [None, Some("owner")] {
+            let path = journal_file();
+            let mut journal =
+                RunJournal::open_with_busy_timeout(&path, Duration::from_secs(60)).unwrap();
+            let mut provenance = event(owner).provenance;
+            provenance
+                .extra
+                .insert("attach_profile".into(), "desktop-owner".into());
+            let thread_id = journal
+                .create_thread("local", "2026-08-05T00:00:00Z", provenance)
+                .unwrap();
+            assert_eq!(
+                subject_owns_first_run(&mut journal, &thread_id, owner),
+                Ok(true)
+            );
+            assert_eq!(
+                subject_owns_first_run(&mut journal, &thread_id, Some("other")),
+                Ok(false)
+            );
+            let page =
+                crate::owned_threads::chat_thread_summaries_page(&mut journal, owner, 20, None)
+                    .unwrap();
+            assert_eq!(page.summaries.len(), 1);
+            #[cfg(feature = "keyring")]
+            {
+                let history = crate::thread_history::chat_thread_open_page(
+                    &mut journal,
+                    None,
+                    owner,
+                    path.parent().unwrap(),
+                    &thread_id,
+                    20,
+                    None,
+                )
+                .unwrap();
+                assert!(history.entries.is_empty());
+            }
+        }
     }
 
     #[test]

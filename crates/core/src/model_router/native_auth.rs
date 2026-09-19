@@ -18,6 +18,13 @@ pub const KIMI_AUTH_URL: &str = "https://auth.kimi.com";
 pub const KIMI_DEVICE_CODE_PATH: &str = "/api/oauth/device_authorization";
 pub const KIMI_TOKEN_PATH: &str = "/api/oauth/token";
 
+/// xAI signs in through the client its Grok CLI presents. Pi runs that
+/// sign-in, and the router refreshes the token it leaves.
+pub const XAI_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
+pub const XAI_TOKEN_URL: &str = "https://auth.x.ai/oauth2/token";
+/// How long an xAI token lives when the answer does not say.
+const XAI_TOKEN_LIFETIME_SECONDS: f64 = 3600.0;
+
 /// Antigravity signs in with a Google account through the client its IDE
 /// presents, and its redirect lands on this fixed loopback port.
 pub const ANTIGRAVITY_CLIENT_ID: &str =
@@ -396,6 +403,53 @@ pub fn antigravity_refresh(
     Ok(credential)
 }
 
+// xAI.
+
+/// The credential an xAI token answer describes. An answer that names no new
+/// refresh token keeps the one it was asked with.
+pub fn xai_credential(body: &Value, previous_refresh: &str, now_ms: i64) -> Option<Credential> {
+    let access = text(body.get("access_token"))?;
+    let refresh = text(body.get("refresh_token")).unwrap_or_else(|| previous_refresh.to_owned());
+    let expires_in = number(body.get("expires_in")).unwrap_or(XAI_TOKEN_LIFETIME_SECONDS);
+    Some(Credential::Subscription {
+        provider: "xai".into(),
+        access,
+        refresh: Some(refresh),
+        expires_ms: expires_ms(Some(expires_in), now_ms),
+        account_id: None,
+        email: None,
+        plan: None,
+        renews_at_ms: None,
+    })
+}
+
+/// Trades the refresh token for a fresh access token at xAI.
+pub fn xai_refresh(
+    token_url: &str,
+    refresh: &str,
+    now_ms: i64,
+    timeout: Duration,
+) -> Result<Credential, String> {
+    let (status, body) = read(
+        agent(timeout)
+            .post(token_url)
+            .set("accept", "application/json")
+            .send_form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", XAI_CLIENT_ID),
+                ("refresh_token", refresh),
+            ]),
+    )?;
+    if status == 400 || status == 401 {
+        return Err("xAI refused the refresh token. Sign in again.".into());
+    }
+    if status != 200 {
+        return Err(format!("xAI answered {status} to the refresh."));
+    }
+    xai_credential(&body, refresh, now_ms)
+        .ok_or_else(|| "xAI answered without an access token.".to_string())
+}
+
 /// The email of the Google account behind a token.
 pub fn google_email(userinfo_url: &str, access: &str, timeout: Duration) -> Option<String> {
     let (status, body) = read(
@@ -518,6 +572,109 @@ pub fn devin_profile(
     Some((text(body.get("user_name")), text(body.get("org_id"))))
 }
 
+/// Refreshes the OAuth credentials used by the native Codex and Claude wires.
+fn inference_refresh(
+    provider: &str,
+    refresh: &str,
+    now_ms: i64,
+    timeout: Duration,
+) -> Result<Credential, String> {
+    let client = agent(timeout);
+    let call = if provider == "openai-codex" {
+        client
+            .post("https://auth.openai.com/oauth/token")
+            .send_form(&[
+                ("client_id", "app_EMoamEEZ73f0CkXaXp7hrann"),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh),
+            ])
+    } else {
+        client
+            .post("https://platform.claude.com/v1/oauth/token")
+            .send_json(serde_json::json!({
+                "client_id":"9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+                "grant_type":"refresh_token", "refresh_token":refresh,
+            }))
+    };
+    let (status, body) = read(call)?;
+    if status != 200 {
+        return Err(format!(
+            "The account refused token refresh ({status}). Reconnect the account."
+        ));
+    }
+    let access =
+        text(body.get("access_token")).ok_or("The refresh response has no access token.")?;
+    Ok(Credential::Subscription {
+        provider: provider.into(),
+        access,
+        refresh: Some(text(body.get("refresh_token")).unwrap_or_else(|| refresh.into())),
+        expires_ms: expires_ms(number(body.get("expires_in")), now_ms),
+        account_id: None,
+        email: None,
+        plan: None,
+        renews_at_ms: None,
+    })
+}
+
+struct RefreshWriteLock(std::path::PathBuf);
+impl Drop for RefreshWriteLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+fn refresh_write_lock(agent: &std::path::Path) -> Result<RefreshWriteLock, String> {
+    let path = agent.join(format!("{}.lock", super::config::CONFIG_FILE));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(RefreshWriteLock(path)),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            Err(_) => return Err("Cannot lock account settings for token refresh.".into()),
+        }
+    }
+}
+
+/// Serializes token rotation across concurrent turns and merges only that credential.
+/// Always reload after the network call so unrelated settings survive a refresh.
+pub fn refresh_account(
+    agent: &std::path::Path,
+    id: &str,
+    now_ms: i64,
+    timeout: Duration,
+) -> Result<super::config::Account, String> {
+    static REFRESH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _held = REFRESH.lock().unwrap_or_else(|error| error.into_inner());
+    let mut config = super::config::load(agent).map_err(|_| "Cannot read account settings.")?;
+    let mut account = config
+        .accounts
+        .iter()
+        .find(|account| account.id == id)
+        .cloned()
+        .ok_or("The account was removed.")?;
+    if let Some(result) = refresh_if_expiring(&account.credential, now_ms, timeout) {
+        let original = account.credential.clone();
+        account.credential = result?;
+        let _file_lock = refresh_write_lock(agent)?;
+        config = super::config::load(agent).map_err(|_| "Cannot read account settings.")?;
+        let entry = config
+            .accounts
+            .iter_mut()
+            .find(|entry| entry.id == id)
+            .ok_or("The account was removed.")?;
+        if entry.credential != original {
+            return Ok(entry.clone());
+        }
+        entry.credential = account.credential.clone();
+        super::config::save(agent, &config).map_err(|_| "Cannot save the refreshed account.")?;
+    }
+    Ok(account)
+}
+
 /// Refreshes a subscription whose upstream hands out refresh tokens, when
 /// its access token is inside a minute of dying. Answers the new credential,
 /// or none when nothing needed doing or the upstream refused.
@@ -550,6 +707,8 @@ pub fn refresh_if_expiring(
             timeout,
         ),
         "antigravity" => antigravity_refresh(GOOGLE_TOKEN_URL, refresh, now_ms, timeout),
+        "xai" => xai_refresh(XAI_TOKEN_URL, refresh, now_ms, timeout),
+        "openai-codex" | "anthropic" => inference_refresh(provider, refresh, now_ms, timeout),
         _ => return None,
     };
     Some(refreshed.map(|mut fresh| {
@@ -701,6 +860,37 @@ mod tests {
             "devin-session-token$eyJabc"
         );
         assert_eq!(devin_session_token("plain"), "plain");
+    }
+
+    #[test]
+    fn an_xai_answer_reads_its_tokens_and_keeps_the_refresh_it_was_asked_with() {
+        let body = serde_json::json!({ "access_token": "at2", "refresh_token": "rt2", "expires_in": 3600 });
+        let Some(Credential::Subscription {
+            provider,
+            access,
+            refresh,
+            expires_ms,
+            ..
+        }) = xai_credential(&body, "rt1", 1_000)
+        else {
+            panic!("no credential");
+        };
+        assert_eq!(provider, "xai");
+        assert_eq!(access, "at2");
+        assert_eq!(refresh.as_deref(), Some("rt2"));
+        assert_eq!(expires_ms, Some(3_601_000));
+        let kept = serde_json::json!({ "access_token": "at3" });
+        let Some(Credential::Subscription {
+            refresh,
+            expires_ms,
+            ..
+        }) = xai_credential(&kept, "rt1", 0)
+        else {
+            panic!("no credential");
+        };
+        assert_eq!(refresh.as_deref(), Some("rt1"));
+        assert_eq!(expires_ms, Some(3_600_000));
+        assert!(xai_credential(&serde_json::json!({}), "rt1", 0).is_none());
     }
 
     #[test]

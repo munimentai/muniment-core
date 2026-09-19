@@ -16,12 +16,14 @@ SOURCE = pathlib.Path(__file__).resolve().parents[1] / 'src/muniment_cloud_provi
 
 
 class CloudWire(unittest.TestCase):
-    def exchange(self, failures=(), tool=False, terminal=False, expect_reply=True, oauth=False):
+    def exchange(self, failures=(), tool=False, terminal=False, expect_reply=True, oauth=False, naming=False):
         with tempfile.TemporaryDirectory(prefix='muniment-pi-wire-') as directory:
             root = pathlib.Path(directory)
             (root / 'agent').mkdir()
             (root / 'sessions').mkdir()
             (root / 'provider.mjs').write_text(SOURCE.read_text())
+            (root / 'identity.mjs').write_text(SOURCE.with_name('assistant_identity.mjs').read_text())
+            titles = []
             credential = ({'type': 'oauth', 'access': 'stored-access', 'refresh': 'stored-refresh', 'expires': 0}
                           if oauth else {'type': 'api_key', 'key': 'conflicting-stored-key'})
             stored_credentials = json.dumps({'muniment': credential})
@@ -55,7 +57,8 @@ class CloudWire(unittest.TestCase):
                                  'arguments': json.dumps({'path': str(root / 'tool-result'), 'content': 'once'})}}]}
                         finish = 'tool_calls'
                     else:
-                        delta = {'role': 'assistant', 'content': 'The gateway replied.'}
+                        is_name = any('Name this thread in one to three words.' in str(message.get('content')) for message in body['messages'])
+                        delta = {'role': 'assistant', 'content': 'Lease comparison' if is_name else 'The gateway replied.'}
                         finish = 'stop'
                     for part, reason in [(delta, None), ({}, finish)]:
                         chunk = {'id': 'wire', 'object': 'chat.completion.chunk', 'created': 1,
@@ -76,6 +79,8 @@ class CloudWire(unittest.TestCase):
             command = [EXECUTABLE, '--mode', 'rpc', '--session-dir', str(root / 'sessions'),
                        '--extension', str(root / 'provider.mjs'), '--provider', 'muniment', '--model', 'allowed-model',
                        '--api-key', 'muniment-runtime-boundary']
+            if naming:
+                command.extend(['--extension', str(root / 'identity.mjs')])
             process = subprocess.Popen(command, cwd=root, env=env, stdin=subprocess.PIPE,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             lines = queue.Queue()
@@ -88,7 +93,16 @@ class CloudWire(unittest.TestCase):
                 process.stdin.flush()
                 while True:
                     event = json.loads(lines.get(timeout=45))
-                    if event.get('type') == 'extension_ui_request' and event.get('title') == 'muniment:chat-grant':
+                    if event.get('type') == 'extension_ui_request' and event.get('title') == 'muniment:thread-title':
+                        request = json.loads(event['prefill'])
+                        if request['action'] == 'request':
+                            answer = {'prompt': 'Compare lease terms'}
+                        else:
+                            titles.append(request['title'])
+                            answer = {'saved': True}
+                        process.stdin.write(json.dumps({'type': 'extension_ui_response', 'id': event['id'], 'value': json.dumps(answer)}) + '\n')
+                        process.stdin.flush()
+                    elif event.get('type') == 'extension_ui_request' and event.get('title') == 'muniment:chat-grant':
                         denial = json.loads(event['prefill'])
                         boundaries.append(denial)
                         if denial:
@@ -129,6 +143,10 @@ class CloudWire(unittest.TestCase):
                 for path in root.rglob('*'):
                     if path.is_file():
                         self.assertNotIn(b'ephemeral-wire-key-', path.read_bytes(), str(path))
+                if naming:
+                    self.assertEqual(titles, ['Lease comparison'])
+                    self.assertEqual(len(requests), 2)
+                    self.assertNotIn('Lease comparison', json.dumps(events))
                 return requests, boundaries
             finally:
                 process.terminate()
@@ -140,6 +158,9 @@ class CloudWire(unittest.TestCase):
                 error = process.stderr.read()
                 process.stderr.close()
                 self.assertNotIn('ephemeral-wire-key-', error)
+
+    def test_first_message_names_the_thread_before_the_reply(self):
+        self.exchange(naming=True)
 
     def test_stored_credentials_cannot_override_the_grant(self):
         requests, boundaries = self.exchange()

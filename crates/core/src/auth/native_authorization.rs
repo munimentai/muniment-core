@@ -168,6 +168,29 @@ pub fn run_native_browser_authorization(
     now_unix_seconds: u64,
     timeout: Duration,
 ) -> Result<NativeAuthorizationCode, NativeBrowserAuthorizationError> {
+    run_native_browser_authorization_while(
+        store,
+        transport,
+        browser,
+        base_url,
+        org_id,
+        now_unix_seconds,
+        timeout,
+        &|| true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_native_browser_authorization_while(
+    store: &dyn InstallationStore,
+    transport: &dyn AuthorizationTransport,
+    browser: &dyn BrowserOpener,
+    base_url: &str,
+    org_id: Option<Uuid>,
+    now_unix_seconds: u64,
+    timeout: Duration,
+    active: &dyn Fn() -> bool,
+) -> Result<NativeAuthorizationCode, NativeBrowserAuthorizationError> {
     // Bind first so the exact live redirect URI is sent to the server and no
     // callback can race listener setup.
     let catcher = RedirectCatcher::bind().map_err(map_callback_error)?;
@@ -191,12 +214,15 @@ pub fn run_native_browser_authorization(
     )
     .map_err(NativeBrowserAuthorizationError::Authorization)?;
 
+    if !active() {
+        return Err(NativeBrowserAuthorizationError::Timeout);
+    }
     browser
         .open(&authorization.authorization_url)
         .map_err(|_| NativeBrowserAuthorizationError::BrowserOpen)?;
     let redirect_uri = catcher.redirect_uri();
     let authorization_code = catcher
-        .wait_for_callback(&state, timeout)
+        .wait_for_callback_while(&state, timeout, active)
         .map_err(map_callback_error)?;
     Ok(NativeAuthorizationCode {
         authorization_code,

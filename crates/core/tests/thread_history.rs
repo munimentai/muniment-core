@@ -90,12 +90,14 @@ fn open_page_uses_the_webview_contract() {
             "recalls",
             "resumable",
             "runId",
+            "sentAt",
             "text",
             "toolActivity"
         ]
     );
     assert_eq!(value["nextCursor"], Value::Null);
     assert_eq!(entry["runId"], run_id);
+    assert_eq!(entry["sentAt"], "2026-08-08T00:00:00Z");
     assert!(entry.get("pendingPermission").is_none());
 
     drop(journal);

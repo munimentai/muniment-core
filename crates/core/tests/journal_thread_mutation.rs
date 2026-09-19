@@ -265,3 +265,57 @@ fn permits_mutations_when_the_first_run_has_no_recorded_subject() {
 
     assert_eq!(journal.last_thread_seq(&thread_id).unwrap(), 3);
 }
+
+#[test]
+fn first_message_name_persists_and_never_overwrites_a_manual_name() {
+    use muniment_core::journal::thread_mutation::{
+        first_thread_needs_name, save_first_thread_name,
+    };
+    let (path, mut journal, thread) = journal_with_thread(Some("owner"));
+    let run = journal.thread_run_ids(&thread, 1, None).unwrap().run_ids[0].clone();
+    assert!(save_first_thread_name(&mut journal, &run, "Help with report", false).unwrap());
+    assert_eq!(
+        first_thread_needs_name(&mut journal, &run),
+        Some(thread.clone())
+    );
+    assert!(!save_first_thread_name(&mut journal, &run, "This title is too long", true).unwrap());
+    assert!(save_first_thread_name(&mut journal, &run, "Report repair", true).unwrap());
+    assert!(first_thread_needs_name(&mut journal, &run).is_none());
+    drop(journal);
+    let mut journal = RunJournal::open(&path).unwrap();
+    let events = journal.thread_events(&thread).unwrap();
+    assert!(serde_json::to_string(events.last().unwrap())
+        .unwrap()
+        .contains("Report repair"));
+    append_thread_rename_now(
+        &mut journal,
+        Some("owner"),
+        &thread,
+        "My title",
+        &provenance(Some("owner")),
+    )
+    .unwrap();
+    assert!(!save_first_thread_name(&mut journal, &run, "Late name", true).unwrap());
+}
+
+#[test]
+fn a_manual_name_during_generation_and_later_messages_block_automatic_names() {
+    use muniment_core::journal::thread_mutation::save_first_thread_name;
+    let (_, mut journal, thread) = journal_with_thread(Some("owner"));
+    let first = journal.thread_run_ids(&thread, 1, None).unwrap().run_ids[0].clone();
+    assert!(save_first_thread_name(&mut journal, &first, "Temporary title", false).unwrap());
+    let later = run_started(Some("owner"));
+    journal
+        .append_new_run_in_thread("workspace-a", &thread, &later)
+        .unwrap();
+    assert!(!save_first_thread_name(&mut journal, &later.run_id, "Wrong topic", true).unwrap());
+    append_thread_rename_now(
+        &mut journal,
+        Some("owner"),
+        &thread,
+        "Chosen name",
+        &provenance(Some("owner")),
+    )
+    .unwrap();
+    assert!(!save_first_thread_name(&mut journal, &first, "Late title", true).unwrap());
+}

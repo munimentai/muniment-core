@@ -23,6 +23,11 @@ Module rows name the module below `muniment-core`.
 | crate | muniment-cli | It gives the local runtime a shell-free client. |
 | crate | muniment-acp | It adapts ACP agents to the runtime. |
 | crate | muniment-runtime | It owns the user-level runtime service. |
+| module | agent_templates | It imports bounded public agent templates. |
+| module | agents | It stores persistent agents and their conversations. |
+| module | memory_files | It manages user profiles and recoverable memory files. |
+| module | model_router | It selects local provider accounts and routes model requests. |
+| module | projects | It scopes threads and generated files to project folders. |
 | module | active_run | It controls active runs and permission answers. |
 | module | asr | It owns on-device speech recognition. |
 | module | assistant_text | It scans and projects assistant replies. |
