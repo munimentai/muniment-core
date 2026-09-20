@@ -202,7 +202,14 @@ fn desktop_has_no_credential_store_call_path() {
         files: 0,
         launch_boundaries: 0,
     };
-    boundary.file(&root.join("main.rs"), root);
+    boundary.file(&root.join("main.rs"), root.clone());
+    // The Windows sandbox host loads the desktop as a library. Keep its one
+    // reviewed include explicit, then scan every module in the shared entry.
+    assert_eq!(
+        std::fs::read_to_string(root.join("lib.rs")).unwrap().trim(),
+        "include!(\"desktop.rs\");"
+    );
+    boundary.file(&root.join("desktop.rs"), root);
     assert!(boundary.files > 20);
     assert_eq!(boundary.launch_boundaries, 1);
 }
