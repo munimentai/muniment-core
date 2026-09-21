@@ -57,6 +57,10 @@ pub fn command(root: &Path, action: &str, mut data: Value) -> Result<Value, Stri
     let _lock = MUTATION
         .lock()
         .map_err(|_| "Extension settings are busy.")?;
+    if matches!(action, "auth" | "test") {
+        crate::pi_packages::brand_mcp_adapter(&root.join("agent/npm"))
+            .map_err(|_| "The MCP adapter display name could not be configured.")?;
+    }
     let executable = crate::sidecar::pi_install::resolve_current(&root.join("harness"))
         .map_err(|_| "The local runtime must be installed first.")?;
     let directory = root.join("extensions");
