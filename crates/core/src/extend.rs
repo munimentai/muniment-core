@@ -287,6 +287,9 @@ fn route(root: &Path, data: &Value) -> Result<Value, String> {
     let state = inventory(root)?;
     let thread = data["threadId"].as_str().ok_or("Choose a thread.")?;
     let rules = &state["threads"][thread];
+    if rules["automatic"] != true {
+        return Ok(json!({"selected": []}));
+    }
     let mut selected = rules["selected"].as_array().cloned().unwrap_or_default();
     let disabled = rules["disabled"].as_array().cloned().unwrap_or_default();
     let agent = root.join("agent");

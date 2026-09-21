@@ -72,7 +72,9 @@ async function scan(base) {
   const extensions = pkg?.pi?.extensions || []
   for (const file of extensions) { safeRelative(file); if (!(await fs.stat(path.join(base, file))).isFile()) throw new Error('A plugin entry file is missing.') }
   const dependencies = pkg?.dependencies || {}
-  if (manifest?.hooks || await json('hooks/hooks.json')) throw new Error('This plugin contains hooks that Muniment does not support.')
+  const unsupported = ['hooks', 'agents', 'lspServers', 'outputStyles', 'apps'].filter(key => manifest?.[key])
+  if (await json('hooks/hooks.json')) unsupported.push('hooks')
+  if (unsupported.length) throw new Error(`This plugin contains unsupported components: ${[...new Set(unsupported)].join(', ')}.`)
   return { name: manifest?.name || pkg?.name || skills[0]?.name || path.basename(base), description: manifest?.description || pkg?.description || '', skills, extensions, dependencies, digest: digest.digest('hex'), servers: mcp?.mcpServers || {} }
 }
 async function sourceSnapshot(source) {
@@ -133,6 +135,7 @@ try {
     try {
       const found = await scan(snapshot.base)
       for (const definition of Object.values(found.servers)) validateServer(definition)
+      if (!/^https:\/\/github.com\//.test(data.source)) snapshot.version = found.digest
       const preview = { ...found, ...snapshot, source: data.sourceLabel || data.source, kind: data.kind, id: path.basename(snapshot.target) }
       await fs.writeFile(path.join(snapshot.target, '.muniment-preview.json'), JSON.stringify(preview), { mode: 0o600 })
       result = preview
