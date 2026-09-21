@@ -246,13 +246,14 @@ pub fn prepare(
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or(json!({}));
+    let settings = crate::pi_settings::mcp_settings(&ambient["settings"]);
     let snapshot = snapshot(&state, thread, ambient);
     let directory = root.join("extensions/runs");
     fs::create_dir_all(&directory).map_err(|_| "Cannot create extension snapshot.")?;
     let file = directory.join(format!("{}.json", uuid::Uuid::new_v4()));
     crate::model_router::config::write_private(
         &file,
-        &serde_json::to_vec(&json!({"mcpServers": snapshot["mcpServers"]}))
+        &serde_json::to_vec(&json!({"mcpServers": snapshot["mcpServers"], "settings": settings}))
             .map_err(|_| "Invalid extensions.")?,
     )
     .map_err(|_| "Cannot write extension snapshot.")?;
@@ -279,126 +280,6 @@ pub fn prepare(
         config.args.extend(["--extension".into(), entry.into()]);
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn disabled_servers_and_plugin_members_never_reach_snapshot() {
-        let state = json!({"items": [
-            {"id":"one","kind":"mcp","enabled":true,"definition":{"url":"https://example.com/mcp"}},
-            {"id":"two","kind":"plugin","base":"/package","servers":{"docs":{"url":"https://example.com"}},"skills":[{"name":"review","path":"SKILL.md"}],"extensions":["index.ts"]}
-        ],"turns":{"chat":{"disabled":["one","two:docs"],"selected":["two"]}}});
-        let result = snapshot(
-            &state,
-            "chat",
-            json!({"mcpServers":{"record":{"command":"cli"}}}),
-        );
-        assert_eq!(result["mcpServers"].as_object().unwrap().len(), 1);
-        assert_eq!(result["skills"].as_array().unwrap().len(), 1);
-        assert_eq!(result["extensions"].as_array().unwrap().len(), 1);
-        let mut disabled = state;
-        disabled["turns"]["chat"]["disabled"] = json!(["one", "two"]);
-        let result = snapshot(&disabled, "chat", json!({}));
-        assert_eq!(result["mcpServers"], json!({}));
-        assert_eq!(result["skills"], json!([]));
-        assert_eq!(result["extensions"], json!([]));
-    }
-    #[test]
-    fn next_turn_does_not_reuse_mcp_skill_or_plugin_selection() {
-        let root =
-            Extracted(std::env::temp_dir().join(format!("extend-turn-{}", uuid::Uuid::new_v4())));
-        fs::create_dir_all(root.0.join("extensions")).unwrap();
-        let state = json!({"items":[
-          {"id":"m","kind":"mcp","definition":{"command":"test"}},
-          {"id":"p","kind":"plugin","base":"/p","skills":[{"name":"review","path":"SKILL.md"}],"extensions":["index.ts"]}
-        ],"turns":{"chat":{"selected":["m","p"]}},"threads":{"chat":{"selected":["m","p"]}}});
-        fs::write(
-            root.0.join("extensions/inventory.json"),
-            serde_json::to_vec(&state).unwrap(),
-        )
-        .unwrap();
-        let first = snapshot(&take_turn(&root.0, "chat").unwrap(), "chat", json!({}));
-        assert_eq!(first["mcpServers"].as_object().unwrap().len(), 1);
-        assert_eq!(first["skills"].as_array().unwrap().len(), 1);
-        assert_eq!(first["extensions"].as_array().unwrap().len(), 1);
-        let next = snapshot(&take_turn(&root.0, "chat").unwrap(), "chat", json!({}));
-        assert_eq!(next["mcpServers"], json!({}));
-        assert_eq!(next["skills"], json!([]));
-        assert_eq!(next["extensions"], json!([]));
-    }
-
-    #[test]
-    fn opens_only_managed_package_folders() {
-        let root = Extracted(
-            std::env::temp_dir().join(format!("extend-folders-{}", uuid::Uuid::new_v4())),
-        );
-        let packages = package_folder(&root.0, None).unwrap();
-        let folder = packages.join("review");
-        fs::create_dir_all(&folder).unwrap();
-        fs::write(
-            root.0.join("extensions/inventory.json"),
-            serde_json::to_vec(&json!({"items":[
-                {"id":"review","kind":"skill","base":folder},
-                {"id":"outside","kind":"plugin","base":root.0}
-            ]}))
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(package_folder(&root.0, Some("review")).unwrap(), folder);
-        assert!(package_folder(&root.0, Some("outside")).is_err());
-        assert!(package_folder(&root.0, Some("missing")).is_err());
-    }
-
-    #[test]
-    fn custom_servers_are_not_restricted_by_catalog_policy() {
-        let state = json!({"items":[
-          {"id":"relay","kind":"mcp","definition":{"url":"https://microsoft365.mcp.claude.com/mcp"}},
-          {"id":"provider","kind":"mcp","definition":{"url":"https://mcp.notion.com/mcp"}},
-          {"id":"plugin","kind":"plugin","servers":{"relay":{"url":"https://hcls.mcp.claude.com/mcp"}}}
-        ],"turns":{"chat":{"selected":["relay","provider","plugin"]}}});
-        let result = snapshot(&state, "chat", json!({}));
-        let servers = result["mcpServers"].as_object().unwrap();
-        assert_eq!(servers.len(), 3);
-        assert!(servers.contains_key("extend-provider"));
-        assert!(servers.contains_key("extend-relay"));
-        assert!(servers.contains_key("extend-plugin-relay"));
-    }
-
-    #[test]
-    fn archives_extract_regular_files_and_reject_traversal() {
-        let temp =
-            Extracted(std::env::temp_dir().join(format!("extend-test-{}", uuid::Uuid::new_v4())));
-        fs::create_dir_all(&temp.0).unwrap();
-        let zip_path = &temp.0.join("skills.zip");
-        let file = fs::File::create(&zip_path).unwrap();
-        let mut zip = zip::ZipWriter::new(file);
-        zip.start_file("review/SKILL.md", zip::write::SimpleFileOptions::default())
-            .unwrap();
-        zip.write_all(b"name: review").unwrap();
-        zip.finish().unwrap();
-        let extracted = extract_archive(&zip_path, &temp.0).unwrap();
-        assert_eq!(
-            fs::read(extracted.0.join("review/SKILL.md")).unwrap(),
-            b"name: review"
-        );
-        let file = fs::File::create(&zip_path).unwrap();
-        let mut zip = zip::ZipWriter::new(file);
-        zip.start_file("../outside", zip::write::SimpleFileOptions::default())
-            .unwrap();
-        zip.write_all(b"no").unwrap();
-        zip.finish().unwrap();
-        assert!(extract_archive(&zip_path, &temp.0).is_err());
-        assert!(!&temp.0.join("outside").exists());
-    }
-
-    #[test]
-    fn selection_does_not_leak_across_threads() {
-        let state = json!({"items":[{"id":"p","kind":"plugin","base":"/p","skills":[{"name":"a","path":"SKILL.md"}],"extensions":["index.ts"]}],"turns":{"a":{"selected":["p"]}}});
-        assert_eq!(snapshot(&state, "b", json!({}))["extensions"], json!([]));
-        assert_eq!(snapshot(&state, "b", json!({}))["skills"], json!([]));
-    }
 }
 
 fn route(root: &Path, data: &Value) -> Result<Value, String> {
@@ -625,4 +506,157 @@ fn extract_archive(source: &Path, directory: &Path) -> Result<Extracted, String>
         }
     }
     Ok(target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn turn_config_keeps_metadata_sharing_explicit() {
+        let root = Extracted(
+            std::env::temp_dir().join(format!("extend-settings-{}", uuid::Uuid::new_v4())),
+        );
+        fs::create_dir_all(root.0.join("extensions")).unwrap();
+        fs::create_dir_all(root.0.join("agent")).unwrap();
+        fs::write(
+            root.0.join("extensions/inventory.json"),
+            br#"{"items":[{"id":"m","kind":"mcp","definition":{"command":"test"}}]}"#,
+        )
+        .unwrap();
+        for settings in [
+            json!({}),
+            json!({"jev":{"semanticSearch":true,"allowedServers":["m"]},"scriptMode":false}),
+        ] {
+            fs::write(
+                root.0.join("agent/mcp.json"),
+                serde_json::to_vec(&json!({"settings":settings})).unwrap(),
+            )
+            .unwrap();
+            let mut config = crate::sidecar::SidecarConfig::new("unused");
+            prepare(&root.0, "chat", &mut config, &mut String::new()).unwrap();
+            let generated: Value =
+                serde_json::from_slice(&fs::read(&config.args[1]).unwrap()).unwrap();
+            if settings.as_object().unwrap().is_empty() {
+                assert_eq!(generated["settings"]["jev"], false);
+            } else {
+                assert_eq!(generated["settings"], settings);
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_servers_and_plugin_members_never_reach_snapshot() {
+        let state = json!({"items": [
+            {"id":"one","kind":"mcp","enabled":true,"definition":{"url":"https://example.com/mcp"}},
+            {"id":"two","kind":"plugin","base":"/package","servers":{"docs":{"url":"https://example.com"}},"skills":[{"name":"review","path":"SKILL.md"}],"extensions":["index.ts"]}
+        ],"turns":{"chat":{"disabled":["one","two:docs"],"selected":["two"]}}});
+        let result = snapshot(
+            &state,
+            "chat",
+            json!({"mcpServers":{"record":{"command":"cli"}}}),
+        );
+        assert_eq!(result["mcpServers"].as_object().unwrap().len(), 1);
+        assert_eq!(result["skills"].as_array().unwrap().len(), 1);
+        assert_eq!(result["extensions"].as_array().unwrap().len(), 1);
+        let mut disabled = state;
+        disabled["turns"]["chat"]["disabled"] = json!(["one", "two"]);
+        let result = snapshot(&disabled, "chat", json!({}));
+        assert_eq!(result["mcpServers"], json!({}));
+        assert_eq!(result["skills"], json!([]));
+        assert_eq!(result["extensions"], json!([]));
+    }
+    #[test]
+    fn next_turn_does_not_reuse_mcp_skill_or_plugin_selection() {
+        let root =
+            Extracted(std::env::temp_dir().join(format!("extend-turn-{}", uuid::Uuid::new_v4())));
+        fs::create_dir_all(root.0.join("extensions")).unwrap();
+        let state = json!({"items":[
+          {"id":"m","kind":"mcp","definition":{"command":"test"}},
+          {"id":"p","kind":"plugin","base":"/p","skills":[{"name":"review","path":"SKILL.md"}],"extensions":["index.ts"]}
+        ],"turns":{"chat":{"selected":["m","p"]}},"threads":{"chat":{"selected":["m","p"]}}});
+        fs::write(
+            root.0.join("extensions/inventory.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        let first = snapshot(&take_turn(&root.0, "chat").unwrap(), "chat", json!({}));
+        assert_eq!(first["mcpServers"].as_object().unwrap().len(), 1);
+        assert_eq!(first["skills"].as_array().unwrap().len(), 1);
+        assert_eq!(first["extensions"].as_array().unwrap().len(), 1);
+        let next = snapshot(&take_turn(&root.0, "chat").unwrap(), "chat", json!({}));
+        assert_eq!(next["mcpServers"], json!({}));
+        assert_eq!(next["skills"], json!([]));
+        assert_eq!(next["extensions"], json!([]));
+    }
+
+    #[test]
+    fn opens_only_managed_package_folders() {
+        let root = Extracted(
+            std::env::temp_dir().join(format!("extend-folders-{}", uuid::Uuid::new_v4())),
+        );
+        let packages = package_folder(&root.0, None).unwrap();
+        let folder = packages.join("review");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(
+            root.0.join("extensions/inventory.json"),
+            serde_json::to_vec(&json!({"items":[
+                {"id":"review","kind":"skill","base":folder},
+                {"id":"outside","kind":"plugin","base":root.0}
+            ]}))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(package_folder(&root.0, Some("review")).unwrap(), folder);
+        assert!(package_folder(&root.0, Some("outside")).is_err());
+        assert!(package_folder(&root.0, Some("missing")).is_err());
+    }
+
+    #[test]
+    fn custom_servers_are_not_restricted_by_catalog_policy() {
+        let state = json!({"items":[
+          {"id":"relay","kind":"mcp","definition":{"url":"https://microsoft365.mcp.claude.com/mcp"}},
+          {"id":"provider","kind":"mcp","definition":{"url":"https://mcp.notion.com/mcp"}},
+          {"id":"plugin","kind":"plugin","servers":{"relay":{"url":"https://hcls.mcp.claude.com/mcp"}}}
+        ],"turns":{"chat":{"selected":["relay","provider","plugin"]}}});
+        let result = snapshot(&state, "chat", json!({}));
+        let servers = result["mcpServers"].as_object().unwrap();
+        assert_eq!(servers.len(), 3);
+        assert!(servers.contains_key("extend-provider"));
+        assert!(servers.contains_key("extend-relay"));
+        assert!(servers.contains_key("extend-plugin-relay"));
+    }
+
+    #[test]
+    fn archives_extract_regular_files_and_reject_traversal() {
+        let temp =
+            Extracted(std::env::temp_dir().join(format!("extend-test-{}", uuid::Uuid::new_v4())));
+        fs::create_dir_all(&temp.0).unwrap();
+        let zip_path = &temp.0.join("skills.zip");
+        let file = fs::File::create(zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("review/SKILL.md", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"name: review").unwrap();
+        zip.finish().unwrap();
+        let extracted = extract_archive(zip_path, &temp.0).unwrap();
+        assert_eq!(
+            fs::read(extracted.0.join("review/SKILL.md")).unwrap(),
+            b"name: review"
+        );
+        let file = fs::File::create(zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("../outside", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"no").unwrap();
+        zip.finish().unwrap();
+        assert!(extract_archive(zip_path, &temp.0).is_err());
+        assert!(!&temp.0.join("outside").exists());
+    }
+
+    #[test]
+    fn selection_does_not_leak_across_threads() {
+        let state = json!({"items":[{"id":"p","kind":"plugin","base":"/p","skills":[{"name":"a","path":"SKILL.md"}],"extensions":["index.ts"]}],"turns":{"a":{"selected":["p"]}}});
+        assert_eq!(snapshot(&state, "b", json!({}))["extensions"], json!([]));
+        assert_eq!(snapshot(&state, "b", json!({}))["skills"], json!([]));
+    }
 }

@@ -177,6 +177,15 @@ pub fn cli_executable_beside_runtime() -> Option<PathBuf> {
     cli.is_file().then_some(cli)
 }
 
+// Adapter upgrades must not enable an external metadata service without a user setting.
+pub(crate) fn mcp_settings(value: &Value) -> Value {
+    let mut settings = value.as_object().cloned().unwrap_or_default();
+    settings
+        .entry("jev".to_owned())
+        .or_insert(Value::Bool(false));
+    Value::Object(settings)
+}
+
 /// Writes the `muniment` entry into the agent directory's `mcp.json`, the
 /// adapter's Pi-global file, and keeps every other server the user added.
 pub fn store_mcp_server(agent_directory: &Path, cli_executable: &Path) -> io::Result<()> {
@@ -189,6 +198,8 @@ pub fn store_mcp_server(agent_directory: &Path, cli_executable: &Path) -> io::Re
         Err(error) if error.kind() == io::ErrorKind::NotFound => Map::new(),
         Err(error) => return Err(error),
     };
+    let settings = mcp_settings(root.get("settings").unwrap_or(&Value::Null));
+    root.insert("settings".to_owned(), settings);
     let servers = root
         .entry("mcpServers".to_owned())
         .or_insert_with(|| Value::Object(Map::new()));
@@ -722,6 +733,7 @@ mod tests {
         let written: Value =
             serde_json::from_slice(&fs::read(agent.join("mcp.json")).unwrap()).unwrap();
         assert_eq!(written["foreign"], 1);
+        assert_eq!(written["settings"]["jev"], false);
         assert_eq!(written["mcpServers"]["github"]["command"], "gh-mcp");
         let entry = &written["mcpServers"][MCP_SERVER_NAME];
         assert_eq!(entry["command"], cli.to_string_lossy().as_ref());
@@ -742,6 +754,16 @@ mod tests {
     }
 
     #[test]
+    fn mcp_settings_preserve_explicit_metadata_sharing_and_other_settings() {
+        let configured = json!({"jev": {"semanticSearch": true, "allowedServers": ["github"]}, "scriptMode": false});
+        assert_eq!(mcp_settings(&configured), configured);
+        assert_eq!(
+            mcp_settings(&json!({"scriptMode": false})),
+            json!({"scriptMode": false, "jev": false})
+        );
+    }
+
+    #[test]
     fn candidate_renders_exact_packages_and_full_registry() {
         let mut settings = Map::new();
         merge_pi_settings(&mut settings, PI_CANDIDATE_ARTIFACT);
@@ -750,11 +772,11 @@ mod tests {
             serde_json::from_str::<Value>(&rendered).unwrap(),
             json!({
                 "packages": [
-                    "npm:pi-web-access@0.28.0",
-                    "npm:pi-subagents@0.65.1",
+                    "npm:pi-web-access@0.30.0",
+                    "npm:pi-subagents@0.70.1",
                     "npm:pi-background-tasks@2.5.0",
-                    "npm:pi-mcp-adapter@2.34.0",
-                    "npm:pi-claude-bridge@0.7.0"
+                    "npm:pi-mcp-adapter@2.36.0",
+                    "npm:pi-claude-bridge@0.8.0"
                 ],
                 "defaultTools": ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"]
             })

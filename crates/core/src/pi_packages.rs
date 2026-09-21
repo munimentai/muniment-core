@@ -13,11 +13,11 @@ use fs2::FileExt;
 use serde_json::Value;
 
 pub const PI_PACKAGES: [(&str, &str); 5] = [
-    ("pi-web-access", "0.28.0"),
-    ("pi-subagents", "0.65.1"),
+    ("pi-web-access", "0.30.0"),
+    ("pi-subagents", "0.70.1"),
     ("pi-background-tasks", "2.5.0"),
-    ("pi-mcp-adapter", "2.34.0"),
-    ("pi-claude-bridge", "0.7.0"),
+    ("pi-mcp-adapter", "2.36.0"),
+    ("pi-claude-bridge", "0.8.0"),
 ];
 
 fn installed(directory: &Path) -> bool {
@@ -680,11 +680,11 @@ mod tests {
             args,
             [
                 "install",
-                "pi-web-access@0.28.0",
-                "pi-subagents@0.65.1",
+                "pi-web-access@0.30.0",
+                "pi-subagents@0.70.1",
                 "pi-background-tasks@2.5.0",
-                "pi-mcp-adapter@2.34.0",
-                "pi-claude-bridge@0.7.0",
+                "pi-mcp-adapter@2.36.0",
+                "pi-claude-bridge@0.8.0",
                 "--omit=peer",
                 "--ignore-scripts",
                 "--exact",

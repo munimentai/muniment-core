@@ -256,26 +256,54 @@ pub fn workspace_with_config(
 
 /// Converts legacy session directories using the journal's visible thread titles.
 pub fn migrate_session_names(profile: &Path) -> Result<(), String> {
-    let Some(home) = crate::home::configured_home(profile).map_err(|e| e.to_string())? else { return Ok(()) };
+    let Some(home) = crate::home::configured_home(profile).map_err(|e| e.to_string())? else {
+        return Ok(());
+    };
     let root = home.join("sessions");
-    if !root.is_dir() || root.is_symlink() { return Ok(()) }
-    let ids = fs::read_dir(&root).map_err(|e| e.to_string())?.filter_map(Result::ok).filter_map(|entry| {
-        let id = entry.file_name().to_string_lossy().into_owned();
-        (uuid::Uuid::parse_str(&id).is_ok() && entry.path().is_dir() && !entry.path().is_symlink()).then_some(id)
-    }).collect::<Vec<_>>();
-    if ids.is_empty() { return Ok(()) }
+    if !root.is_dir() || root.is_symlink() {
+        return Ok(());
+    }
+    let ids = fs::read_dir(&root)
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let id = entry.file_name().to_string_lossy().into_owned();
+            (uuid::Uuid::parse_str(&id).is_ok()
+                && entry.path().is_dir()
+                && !entry.path().is_symlink())
+            .then_some(id)
+        })
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Ok(());
+    }
     let mut titles = BTreeMap::new();
     if profile.join("runs.sqlite3").exists() {
-        let mut journal = crate::journal::RunJournal::open(profile.join("runs.sqlite3")).map_err(|e| e.to_string())?;
+        let mut journal = crate::journal::RunJournal::open(profile.join("runs.sqlite3"))
+            .map_err(|e| e.to_string())?;
         let mut cursor = None;
         loop {
-            let page = journal.thread_summaries(100, cursor.as_deref()).map_err(|e| e.to_string())?;
-            for summary in page.summaries { titles.insert(summary.thread_id, summary.title); }
+            let page = journal
+                .thread_summaries(100, cursor.as_deref())
+                .map_err(|e| e.to_string())?;
+            for summary in page.summaries {
+                titles.insert(summary.thread_id, summary.title);
+            }
             cursor = page.next_cursor;
-            if cursor.is_none() { break }
+            if cursor.is_none() {
+                break;
+            }
         }
     }
-    for id in ids { crate::workspace_names::resolve(profile, &root, &id, Some(titles.get(&id).map(String::as_str).unwrap_or("Thread")), None)?; }
+    for id in ids {
+        crate::workspace_names::resolve(
+            profile,
+            &root,
+            &id,
+            Some(titles.get(&id).map(String::as_str).unwrap_or("Thread")),
+            None,
+        )?;
+    }
     Ok(())
 }
 

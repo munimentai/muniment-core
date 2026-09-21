@@ -9,9 +9,17 @@ use std::{
 pub fn basename(name: &str, id: &str) -> String {
     let mut clean = String::new();
     for c in name.chars() {
-        let c = if c.is_alphanumeric() || c == '-' { c } else { '_' };
-        if c == '_' && (clean.is_empty() || clean.ends_with('_')) { continue }
-        if clean.len() + c.len_utf8() > 72 { break }
+        let c = if c.is_alphanumeric() || c == '-' {
+            c
+        } else {
+            '_'
+        };
+        if c == '_' && (clean.is_empty() || clean.ends_with('_')) {
+            continue;
+        }
+        if clean.len() + c.len_utf8() > 72 {
+            break;
+        }
         clean.push(c);
     }
     let clean = clean.trim_matches('_');
@@ -35,7 +43,8 @@ pub fn resolve(
     name: Option<&str>,
     legacy: Option<&Path>,
 ) -> Result<PathBuf, String> {
-    if id.is_empty() || id.len() > 128
+    if id.is_empty()
+        || id.len() > 128
         || !id
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
@@ -62,7 +71,15 @@ pub fn resolve(
         Err(e) => return Err(e.to_string()),
     };
     let key = format!("{}:{id}", root.display());
-    if names.get(&key).is_some_and(|n| Path::new(n).components().count() != 1 || !matches!(Path::new(n).components().next(), Some(std::path::Component::Normal(_)))) { return Err("Invalid workspace folder name.".into()); }
+    if names.get(&key).is_some_and(|n| {
+        Path::new(n).components().count() != 1
+            || !matches!(
+                Path::new(n).components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+    }) {
+        return Err("Invalid workspace folder name.".into());
+    }
     let previous = names.get(&key).map(|n| root.join(n));
     let source = previous
         .clone()
@@ -76,9 +93,19 @@ pub fn resolve(
         .or_else(|| names.get(&key).cloned())
         .unwrap_or_else(|| basename("Untitled", id));
     let mut target = root.join(&desired);
-    let same_source = |path: &Path| source.exists() && path.exists() && source.canonicalize().ok() == path.canonicalize().ok();
-    let collision = fs::read_dir(root).map_err(|e| e.to_string())?.filter_map(Result::ok).any(|entry| entry.file_name().to_string_lossy().to_lowercase() == desired.to_lowercase() && !same_source(&entry.path()));
-    if target != source && collision { target = root.join(format!("{desired}-{id}")); }
+    let same_source = |path: &Path| {
+        source.exists() && path.exists() && source.canonicalize().ok() == path.canonicalize().ok()
+    };
+    let collision = fs::read_dir(root)
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .any(|entry| {
+            entry.file_name().to_string_lossy().to_lowercase() == desired.to_lowercase()
+                && !same_source(&entry.path())
+        });
+    if target != source && collision {
+        target = root.join(format!("{desired}-{id}"));
+    }
     if source.is_symlink() || target.is_symlink() {
         return Err("The workspace folder must not be a symbolic link.".into());
     }
@@ -108,13 +135,28 @@ mod tests {
     use super::*;
     #[test]
     fn names_are_portable_and_bounded() {
-        for name in ["CON", "NUL.txt", "COM1", "LPT9", "Plan Builder", "a/b\\c:*?\"<>|", "...", "name. ", "a\n b"] {
+        for name in [
+            "CON",
+            "NUL.txt",
+            "COM1",
+            "LPT9",
+            "Plan Builder",
+            "a/b\\c:*?\"<>|",
+            "...",
+            "name. ",
+            "a\n b",
+        ] {
             let leaf = basename(name, "12345678");
-            assert!(!leaf.chars().any(|c| c.is_whitespace() || "/\\<>:\"|?*.".contains(c)));
+            assert!(!leaf
+                .chars()
+                .any(|c| c.is_whitespace() || "/\\<>:\"|?*.".contains(c)));
             assert!(leaf.ends_with("-12345678"));
         }
         assert!(basename(&"界".repeat(100), "12345678").len() <= 81);
-        assert_eq!(basename("Plan Builder", "12345678"), "Plan_Builder-12345678");
+        assert_eq!(
+            basename("Plan Builder", "12345678"),
+            "Plan_Builder-12345678"
+        );
     }
     #[test]
     fn names_migrate_and_rename_without_merging_colliding_ids() {
