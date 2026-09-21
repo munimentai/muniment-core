@@ -28,6 +28,10 @@ Module rows name the module below `muniment-core`.
 | module | memory_files | It manages user profiles and recoverable memory files. |
 | module | model_router | It selects local provider accounts and routes model requests. |
 | module | projects | It scopes threads and generated files to project folders. |
+| module | extend | It manages local extensions and per-chat capability snapshots. |
+| module | creations | It stores local agent and artifact creation contracts. |
+| module | project_context | It provides project context to the local harness. |
+| module | workspace_names | It resolves stable names for local workspace folders. |
 | module | active_run | It controls active runs and permission answers. |
 | module | asr | It owns on-device speech recognition. |
 | module | assistant_text | It scans and projects assistant replies. |

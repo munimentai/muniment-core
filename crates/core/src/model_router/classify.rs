@@ -150,6 +150,28 @@ pub fn decide(
     now_ms: i64,
     timeout: Duration,
 ) -> Option<Decision> {
+    decide_for(
+        config,
+        options,
+        ledger,
+        state,
+        now_ms,
+        timeout,
+        INSTRUCTIONS,
+    )
+}
+
+/// Reuses the classifier connection for capability selection without changing model routes.
+#[allow(clippy::too_many_arguments)]
+pub fn decide_for(
+    config: &RouterConfig,
+    options: &[Route],
+    ledger: &Ledger,
+    state: &str,
+    now_ms: i64,
+    timeout: Duration,
+    instructions: &str,
+) -> Option<Decision> {
     let fallback = super::fallback(config, options)?.clone();
     if !super::classifies(config, options) {
         return Some(Decision::plain(fallback, 0.0, Reason::NotClassified));
@@ -163,7 +185,7 @@ pub fn decide(
                 family,
                 model,
             },
-            state,
+            &format!("{instructions}\n\n{state}"),
             now_ms,
             timeout,
         ),
@@ -174,7 +196,11 @@ pub fn decide(
             let response = ask(
                 &url,
                 bearer.as_deref(),
-                &question(config, options, state),
+                &{
+                    let mut request = question(config, options, state);
+                    request["questions"][QUESTION]["instructions"] = json!(instructions);
+                    request
+                },
                 timeout,
             );
             Asked {

@@ -142,6 +142,9 @@ pub trait PiLaunchBoundaries {
     fn agent_instructions(&self) -> Result<Option<String>, PiLaunchError> {
         Ok(None)
     }
+    fn extension_thread_id(&self) -> Option<String> {
+        None
+    }
     fn memory_agent_extension_path(&self) -> Option<PathBuf>;
     fn prepare_pi_settings(
         &self,
@@ -585,6 +588,13 @@ pub fn pi_launch_config_for_executable(
     prompt.push_str("\n\nCreation workflow: Agents and artifacts each have one dedicated chat thread with a goal and a specified output. Use ask_user_question for focused questions about missing requirements. The tool opens a popup and waits for the user. Do not print a questionnaire in chat or assume an unanswered choice. Use creation-plan to save the agreed goal and output before building. For agents, describe their task, sources, rules and expected output, then use agent-save. Never create a schedule unless requested. For artifacts, write and verify a self-contained HTML file in the thread workspace, then call artifact-publish. Fix and republish that same file for revisions. Publishing is local to Muniment, not public web hosting. Do not claim an artifact is published until the tool confirms it. Keep code and build details out of the user's flow unless needed.");
     if let Some(context) = boundaries.project_context() {
         prompt.push_str(context);
+    }
+    if let (Some(root), Some(thread)) = (
+        crate::state_root::state_directory(),
+        boundaries.extension_thread_id(),
+    ) {
+        crate::extend::prepare(&root, &thread, &mut config, &mut prompt)
+            .map_err(|e| PiLaunchError::rejected("extensions", e))?;
     }
     config.args.extend(["--system-prompt".into(), prompt]);
     let identity = session_root.join(IDENTITY_EXTENSION_FILE);
