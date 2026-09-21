@@ -13,9 +13,7 @@ pub fn inventory(root: &Path) -> Result<Value, String> {
         Ok(bytes) => {
             serde_json::from_slice(&bytes).map_err(|_| "Extension settings are invalid.".into())
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Ok(json!({"items": [], "threads": {}}))
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(json!({"items": [], "turns": {}})),
         Err(_) => Err("Extension settings could not be read.".into()),
     }
 }
@@ -105,7 +103,7 @@ pub fn command(root: &Path, action: &str, mut data: Value) -> Result<Value, Stri
 
 /// A disabled item cannot enter the MCP snapshot or the skill/extension arguments.
 pub fn snapshot(state: &Value, thread: &str, ambient: Value) -> Value {
-    let rules = &state["threads"][thread];
+    let rules = &state["turns"][thread];
     let disabled = rules["disabled"].as_array().cloned().unwrap_or_default();
     let mut selected = rules["selected"].as_array().cloned().unwrap_or_default();
     selected.extend(
@@ -129,13 +127,18 @@ pub fn snapshot(state: &Value, thread: &str, ambient: Value) -> Value {
             continue;
         }
         if item["kind"] == "mcp" {
+            if !selected.contains(&json!(id)) {
+                continue;
+            }
             servers.insert(format!("extend-{id}"), item["definition"].clone());
             names.push(item["name"].clone());
         } else {
             let base = item["base"].as_str().unwrap_or("");
             for (name, definition) in item["servers"].as_object().into_iter().flatten() {
                 let server_id = format!("{id}:{name}");
-                if disabled.contains(&json!(server_id)) {
+                if disabled.contains(&json!(server_id))
+                    || (!selected.contains(&json!(server_id)) && !selected.contains(&json!(id)))
+                {
                     continue;
                 }
                 let mut definition = definition.clone();
@@ -174,13 +177,33 @@ pub fn snapshot(state: &Value, thread: &str, ambient: Value) -> Value {
     json!({"mcpServers": servers, "skills": skills, "extensions": extensions, "names": names})
 }
 
+// Consume the pending selection once. A later run on this thread starts empty.
+fn take_turn(root: &Path, thread: &str) -> Result<Value, String> {
+    let _lock = MUTATION
+        .lock()
+        .map_err(|_| "Extension settings are busy.")?;
+    let state = inventory(root)?;
+    let mut remaining = state.clone();
+    if let Some(turns) = remaining["turns"].as_object_mut() {
+        if turns.remove(thread).is_some() {
+            crate::model_router::config::write_private(
+                &root.join("extensions/inventory.json"),
+                &serde_json::to_vec_pretty(&remaining)
+                    .map_err(|_| "Invalid extension settings.")?,
+            )
+            .map_err(|_| "Cannot consume extension selection.")?;
+        }
+    }
+    Ok(state)
+}
+
 pub fn prepare(
     root: &Path,
     thread: &str,
     config: &mut crate::sidecar::SidecarConfig,
     prompt: &mut String,
 ) -> Result<(), String> {
-    let state = inventory(root)?;
+    let state = take_turn(root, thread)?;
     if state["items"].as_array().is_none_or(Vec::is_empty) {
         return Ok(());
     }
@@ -231,7 +254,7 @@ mod tests {
         let state = json!({"items": [
             {"id":"one","kind":"mcp","enabled":true,"definition":{"url":"https://example.com/mcp"}},
             {"id":"two","kind":"plugin","base":"/package","servers":{"docs":{"url":"https://example.com"}},"skills":[{"name":"review","path":"SKILL.md"}],"extensions":["index.ts"]}
-        ],"threads":{"chat":{"disabled":["one","two:docs"],"selected":["two"]}}});
+        ],"turns":{"chat":{"disabled":["one","two:docs"],"selected":["two"]}}});
         let result = snapshot(
             &state,
             "chat",
@@ -241,12 +264,36 @@ mod tests {
         assert_eq!(result["skills"].as_array().unwrap().len(), 1);
         assert_eq!(result["extensions"].as_array().unwrap().len(), 1);
         let mut disabled = state;
-        disabled["threads"]["chat"]["disabled"] = json!(["one", "two"]);
+        disabled["turns"]["chat"]["disabled"] = json!(["one", "two"]);
         let result = snapshot(&disabled, "chat", json!({}));
         assert_eq!(result["mcpServers"], json!({}));
         assert_eq!(result["skills"], json!([]));
         assert_eq!(result["extensions"], json!([]));
     }
+    #[test]
+    fn next_turn_does_not_reuse_mcp_skill_or_plugin_selection() {
+        let root =
+            Extracted(std::env::temp_dir().join(format!("extend-turn-{}", uuid::Uuid::new_v4())));
+        fs::create_dir_all(root.0.join("extensions")).unwrap();
+        let state = json!({"items":[
+          {"id":"m","kind":"mcp","definition":{"command":"test"}},
+          {"id":"p","kind":"plugin","base":"/p","skills":[{"name":"review","path":"SKILL.md"}],"extensions":["index.ts"]}
+        ],"turns":{"chat":{"selected":["m","p"]}},"threads":{"chat":{"selected":["m","p"]}}});
+        fs::write(
+            root.0.join("extensions/inventory.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        let first = snapshot(&take_turn(&root.0, "chat").unwrap(), "chat", json!({}));
+        assert_eq!(first["mcpServers"].as_object().unwrap().len(), 1);
+        assert_eq!(first["skills"].as_array().unwrap().len(), 1);
+        assert_eq!(first["extensions"].as_array().unwrap().len(), 1);
+        let next = snapshot(&take_turn(&root.0, "chat").unwrap(), "chat", json!({}));
+        assert_eq!(next["mcpServers"], json!({}));
+        assert_eq!(next["skills"], json!([]));
+        assert_eq!(next["extensions"], json!([]));
+    }
+
     #[test]
     fn archives_extract_regular_files_and_reject_traversal() {
         let temp =
@@ -276,7 +323,7 @@ mod tests {
 
     #[test]
     fn selection_does_not_leak_across_threads() {
-        let state = json!({"items":[{"id":"p","kind":"plugin","base":"/p","skills":[{"name":"a","path":"SKILL.md"}],"extensions":["index.ts"]}],"threads":{"a":{"selected":["p"]}}});
+        let state = json!({"items":[{"id":"p","kind":"plugin","base":"/p","skills":[{"name":"a","path":"SKILL.md"}],"extensions":["index.ts"]}],"turns":{"a":{"selected":["p"]}}});
         assert_eq!(snapshot(&state, "b", json!({}))["extensions"], json!([]));
         assert_eq!(snapshot(&state, "b", json!({}))["skills"], json!([]));
     }
@@ -286,7 +333,7 @@ fn route(root: &Path, data: &Value) -> Result<Value, String> {
     use crate::model_router::{classify, config, usage};
     let state = inventory(root)?;
     let thread = data["threadId"].as_str().ok_or("Choose a thread.")?;
-    let rules = &state["threads"][thread];
+    let rules = &state["turns"][thread];
     if rules["automatic"] != true {
         return Ok(json!({"selected": []}));
     }
@@ -390,12 +437,12 @@ fn route(root: &Path, data: &Value) -> Result<Value, String> {
         .lock()
         .map_err(|_| "Extension settings are busy.")?;
     let mut latest = inventory(root)?;
-    if latest["threads"][thread] != *rules {
+    if latest["turns"][thread] != *rules {
         return Ok(json!({"selected": []}));
     }
     let explicit = rules["selected"].as_array().cloned().unwrap_or_default();
     selected.retain(|id| !explicit.contains(id));
-    latest["threads"][thread]["automaticSelected"] = json!(selected);
+    latest["turns"][thread]["automaticSelected"] = json!(selected);
     crate::model_router::config::write_private(
         &root.join("extensions/inventory.json"),
         &serde_json::to_vec_pretty(&latest).map_err(|_| "Invalid extension settings.")?,

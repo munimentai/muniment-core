@@ -21,7 +21,7 @@ fn fixture(automatic: bool) -> Fixture {
     fs::write(root.0.join("extensions/inventory.json"), serde_json::to_vec(&json!({"items":[
   {"id":"review","kind":"skill","skills":[{"name":"review","description":"Review code","path":"SKILL.md"}]},
   {"id":"disabled","kind":"mcp","name":"Unavailable","definition":{"url":"https://example.com"}}
- ],"threads":{"chat":{"automatic":automatic,"selected":[],"disabled":["disabled"]}}})).unwrap()).unwrap();
+ ],"turns":{"chat":{"automatic":automatic,"selected":[],"disabled":["disabled"]}}})).unwrap()).unwrap();
     root
 }
 #[test]
@@ -111,6 +111,6 @@ fn classifier_only_sees_eligible_metadata_and_keeps_manual_selection_separate() 
     handle.join().unwrap();
     assert_eq!(result["selected"], json!(["review:SKILL.md"]));
     let state = extend::inventory(&root.0).unwrap();
-    assert_eq!(state["threads"]["chat"]["selected"], json!([]));
-    assert_eq!(state["threads"]["chat"]["disabled"], json!(["disabled"]));
+    assert_eq!(state["turns"]["chat"]["selected"], json!([]));
+    assert_eq!(state["turns"]["chat"]["disabled"], json!(["disabled"]));
 }
