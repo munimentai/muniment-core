@@ -1,5 +1,6 @@
 // Runs with the verified harness's embedded Bun. Package code is loaded only by install/auth/test actions.
 import fs from 'node:fs/promises'
+import { serviceFavicon } from './extend_favicon.mjs'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
@@ -123,6 +124,9 @@ try {
     const definition = validateServer(data.definition)
     const entry = { id, kind: 'mcp', name: data.name.trim(), description: data.description || '', source: data.source || '', definition, enabled: data.enabled !== false }
     if (!entry.name) throw new Error('Enter a name.')
+    const old = state.items.find(item => item.id === id)
+    entry.icon = old?.definition?.url === definition.url ? old.icon : null
+    if (data.fetchIcon && definition.url) entry.icon = await serviceFavicon(definition.url) || entry.icon
     if (data.token) {
       if (!definition.url) throw new Error('Tokens require a remote server URL.')
       const { saveBearerTokenForUrl } = await loadAdapter('mcp-bearer-store.ts')

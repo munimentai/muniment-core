@@ -17,6 +17,36 @@ pub fn inventory(root: &Path) -> Result<Value, String> {
         Err(_) => Err("Extension settings could not be read.".into()),
     }
 }
+/// Open only managed package folders, never an arbitrary path from the UI.
+pub fn package_folder(root: &Path, id: Option<&str>) -> Result<std::path::PathBuf, String> {
+    let packages = root.join("extensions/packages");
+    fs::create_dir_all(&packages).map_err(|_| "The extension folder could not be created.")?;
+    let packages = packages
+        .canonicalize()
+        .map_err(|_| "The extension folder is unavailable.")?;
+    let Some(id) = id else {
+        return Ok(packages);
+    };
+    let state = inventory(root)?;
+    let item = state["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|item| item["id"] == id && (item["kind"] == "skill" || item["kind"] == "plugin"))
+        .ok_or("Extension not found.")?;
+    let folder = Path::new(
+        item["base"]
+            .as_str()
+            .ok_or("The extension folder is unavailable.")?,
+    )
+    .canonicalize()
+    .map_err(|_| "The extension folder is unavailable.")?;
+    if !folder.starts_with(packages) || !folder.is_dir() {
+        return Err("The extension folder is outside managed storage.".into());
+    }
+    Ok(folder)
+}
+
 pub fn command(root: &Path, action: &str, mut data: Value) -> Result<Value, String> {
     if action == "route" {
         return route(root, &data);
@@ -53,6 +83,11 @@ pub fn command(root: &Path, action: &str, mut data: Value) -> Result<Value, Stri
         };
         data["source"] = json!(base);
     }
+    crate::model_router::config::write_private(
+        &directory.join("extend_favicon.mjs"),
+        include_bytes!("extend_favicon.mjs"),
+    )
+    .map_err(|_| "The extension helper could not be written.")?;
     let script = directory.join("bridge.mjs");
     crate::model_router::config::write_private(&script, include_bytes!("extend_bridge.mjs"))
         .map_err(|_| "The extension helper could not be written.")?;
@@ -292,6 +327,28 @@ mod tests {
         assert_eq!(next["mcpServers"], json!({}));
         assert_eq!(next["skills"], json!([]));
         assert_eq!(next["extensions"], json!([]));
+    }
+
+    #[test]
+    fn opens_only_managed_package_folders() {
+        let root = Extracted(
+            std::env::temp_dir().join(format!("extend-folders-{}", uuid::Uuid::new_v4())),
+        );
+        let packages = package_folder(&root.0, None).unwrap();
+        let folder = packages.join("review");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(
+            root.0.join("extensions/inventory.json"),
+            serde_json::to_vec(&json!({"items":[
+                {"id":"review","kind":"skill","base":folder},
+                {"id":"outside","kind":"plugin","base":root.0}
+            ]}))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(package_folder(&root.0, Some("review")).unwrap(), folder);
+        assert!(package_folder(&root.0, Some("outside")).is_err());
+        assert!(package_folder(&root.0, Some("missing")).is_err());
     }
 
     #[test]
