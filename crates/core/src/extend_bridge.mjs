@@ -3,7 +3,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { randomUUID, createHash } from 'node:crypto'
 const root = process.env.MUNIMENT_EXTEND_ROOT
 const agent = path.join(root, 'agent')
 const directory = path.join(root, 'extensions')
@@ -42,10 +42,11 @@ function safeRelative(value) {
 async function scan(base) {
   const skills = []
   let count = 0, bytes = 0
+  const digest = createHash('sha256')
   async function walk(dir, depth) {
     if (depth > 10) throw new Error('The package has too many folder levels.')
-    for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
-      if (['.git', 'node_modules'].includes(entry.name)) continue
+    for (const entry of (await fs.readdir(dir, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
+      if (['.git', 'node_modules', '.muniment-preview.json'].includes(entry.name)) continue
       if (++count > 12000) throw new Error('The package has too many files.')
       const file = path.join(dir, entry.name)
       if (entry.isSymbolicLink()) throw new Error('Package links are not supported. Use regular files.')
@@ -53,9 +54,10 @@ async function scan(base) {
       else if (entry.isFile()) {
         const stat = await fs.stat(file); bytes += stat.size
         if (bytes > 100 * 1024 * 1024) throw new Error('The package exceeds 100 MB.')
-        if (entry.name === 'SKILL.md') {
+        digest.update(path.relative(base, file)); digest.update(await fs.readFile(file))
+        if (entry.name === 'SKILL.md' || (entry.name.endsWith('.md') && path.relative(base, file).startsWith(`commands${path.sep}`))) {
           const text = await fs.readFile(file, 'utf8')
-          const name = text.match(/^name:\s*["']?([^\n"']+)/m)?.[1]?.trim() || path.basename(dir)
+          const name = text.match(/^name:\s*["']?([^\n"']+)/m)?.[1]?.trim() || (entry.name === 'SKILL.md' ? path.basename(dir) : entry.name.slice(0, -3))
           const description = text.match(/^description:\s*["']?([^\n"']+)/m)?.[1]?.trim() || `Instructions for ${name}`
           skills.push({ name, description, path: path.relative(base, file) })
         }
@@ -69,9 +71,9 @@ async function scan(base) {
   const mcp = await json('.mcp.json')
   const extensions = pkg?.pi?.extensions || []
   for (const file of extensions) { safeRelative(file); if (!(await fs.stat(path.join(base, file))).isFile()) throw new Error('A plugin entry file is missing.') }
-  if (pkg?.dependencies && Object.keys(pkg.dependencies).length && extensions.length) throw new Error('This plugin needs package dependencies. Use a self-contained plugin package.')
+  const dependencies = pkg?.dependencies || {}
   if (manifest?.hooks || await json('hooks/hooks.json')) throw new Error('This plugin contains hooks that Muniment does not support.')
-  return { name: manifest?.name || pkg?.name || skills[0]?.name || path.basename(base), description: manifest?.description || pkg?.description || '', skills, extensions, servers: mcp?.mcpServers || {} }
+  return { name: manifest?.name || pkg?.name || skills[0]?.name || path.basename(base), description: manifest?.description || pkg?.description || '', skills, extensions, dependencies, digest: digest.digest('hex'), servers: mcp?.mcpServers || {} }
 }
 async function sourceSnapshot(source) {
   const target = path.join(directory, 'packages', randomUUID())
@@ -140,9 +142,12 @@ try {
     const target = path.join(directory, 'packages', data.previewId)
     const preview = JSON.parse(await fs.readFile(path.join(target, '.muniment-preview.json'), 'utf8'))
     const scanned = await scan(preview.base)
+    if (scanned.digest !== preview.digest) throw new Error('The package changed after review. Review it again.')
+    for (const definition of Object.values(scanned.servers)) validateServer(definition)
     const chosen = scanned.skills.filter(s => data.skills?.includes(s.path))
     if (preview.kind === 'skill' && !chosen.length) throw new Error('Select at least one skill.')
     if (preview.kind === 'plugin' && !chosen.length && !scanned.extensions.length && !Object.keys(scanned.servers).length) throw new Error('This package has no supported skills, tools, or extensions.')
+    if (preview.kind === 'plugin' && Object.keys(scanned.dependencies).length) await run(process.execPath, ['install', '--ignore-scripts', '--no-progress', ...(await fs.access(path.join(preview.base, 'bun.lock')).then(() => true, () => false) ? ['--frozen-lockfile'] : [])], preview.base)
     const old = state.items.find(i => i.id === data.replaceId)
     const entry = { ...preview, ...scanned, skills: chosen, id: old?.id || preview.id, enabled: true, previous: old ? { ...old, previous: undefined } : undefined }
     state.items = [...state.items.filter(i => i.id !== entry.id), entry]; await write(state); result = state
@@ -164,20 +169,22 @@ try {
     state.threads[data.threadId] = { disabled: data.disabled || [], selected: data.selected || [], automatic: !!data.automatic, automaticSelected: [] }
     await write(state); result = state
   } else if (action === 'auth' || action === 'test') {
-    const item = state.items.find(i => i.id === data.id)
-    if (!item?.definition) throw new Error('Server not found.')
-    const name = `extend-${item.id}`
-    const definition = item.definition
+    const item = state.items.find(i => i.id === data.id || data.id.startsWith(`${i.id}:`))
+    const member = item && data.id !== item.id ? data.id.slice(item.id.length + 1) : null
+    const definition = member ? item?.servers?.[member] : item?.definition
+    if (!definition) throw new Error('Server not found.')
+    const name = member ? `extend-${item.id}-${member}` : `extend-${item.id}`
     if (action === 'auth') {
       const { authenticate } = await loadAdapter('mcp-auth-flow.ts')
       await authenticate(name, definition.url, { ...definition, auth: 'oauth' }, { signal: AbortSignal.timeout(120000) })
-      item.definition.auth = 'oauth'; await write(state)
+      definition.auth = 'oauth'; await write(state)
     }
     const { McpServerManager } = await loadAdapter('server-manager.ts')
     const manager = new McpServerManager(directory)
     try {
       const connection = await manager.connect(name, definition, AbortSignal.timeout(20000))
       result = { status: connection.status, tools: connection.tools.map(t => ({ name: t.name, description: t.description })), resources: connection.resources.length }
+      item.lastCheck = { status: result.status, tools: result.tools.length }; await write(state)
     } finally { await manager.close(name) }
   } else throw new Error('Unknown extension action.')
   process.stdout.write(`\nMUNIMENT_EXTEND_RESULT=${JSON.stringify({ ok: true, result })}\n`)

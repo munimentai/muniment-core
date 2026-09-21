@@ -19,7 +19,7 @@ pub fn inventory(root: &Path) -> Result<Value, String> {
         Err(_) => Err("Extension settings could not be read.".into()),
     }
 }
-pub fn command(root: &Path, action: &str, data: Value) -> Result<Value, String> {
+pub fn command(root: &Path, action: &str, mut data: Value) -> Result<Value, String> {
     if action == "route" {
         return route(root, &data);
     }
@@ -33,6 +33,28 @@ pub fn command(root: &Path, action: &str, data: Value) -> Result<Value, String> 
         .map_err(|_| "The local runtime must be installed first.")?;
     let directory = root.join("extensions");
     fs::create_dir_all(&directory).map_err(|_| "The extension folder could not be created.")?;
+    let archive = if action == "preview" {
+        data["source"]
+            .as_str()
+            .filter(|source| Path::new(source).is_file())
+            .map(|source| extract_archive(Path::new(source), &directory))
+            .transpose()?
+    } else {
+        None
+    };
+    if let Some(archive) = &archive {
+        data["sourceLabel"] = data["source"].clone();
+        let entries: Vec<_> = fs::read_dir(&archive.0)
+            .map_err(|_| "Cannot read extracted package.")?
+            .filter_map(Result::ok)
+            .collect();
+        let base = if entries.len() == 1 && entries[0].path().is_dir() {
+            entries[0].path()
+        } else {
+            archive.0.clone()
+        };
+        data["source"] = json!(base);
+    }
     let script = directory.join("bridge.mjs");
     crate::model_router::config::write_private(&script, include_bytes!("extend_bridge.mjs"))
         .map_err(|_| "The extension helper could not be written.")?;
@@ -226,6 +248,33 @@ mod tests {
         assert_eq!(result["extensions"], json!([]));
     }
     #[test]
+    fn archives_extract_regular_files_and_reject_traversal() {
+        let temp =
+            Extracted(std::env::temp_dir().join(format!("extend-test-{}", uuid::Uuid::new_v4())));
+        fs::create_dir_all(&temp.0).unwrap();
+        let zip_path = &temp.0.join("skills.zip");
+        let file = fs::File::create(&zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("review/SKILL.md", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"name: review").unwrap();
+        zip.finish().unwrap();
+        let extracted = extract_archive(&zip_path, &temp.0).unwrap();
+        assert_eq!(
+            fs::read(extracted.0.join("review/SKILL.md")).unwrap(),
+            b"name: review"
+        );
+        let file = fs::File::create(&zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("../outside", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"no").unwrap();
+        zip.finish().unwrap();
+        assert!(extract_archive(&zip_path, &temp.0).is_err());
+        assert!(!&temp.0.join("outside").exists());
+    }
+
+    #[test]
     fn selection_does_not_leak_across_threads() {
         let state = json!({"items":[{"id":"p","kind":"plugin","base":"/p","skills":[{"name":"a","path":"SKILL.md"}],"extensions":["index.ts"]}],"threads":{"a":{"selected":["p"]}}});
         assert_eq!(snapshot(&state, "b", json!({}))["extensions"], json!([]));
@@ -308,7 +357,7 @@ fn route(root: &Path, data: &Value) -> Result<Value, String> {
             ));
         }
     }
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
     options.extend(candidates.into_iter().take(20).map(|(_, option)| option));
     router.fallback = Some("none".into());
     let mut ledger = usage::load(&agent);
@@ -350,4 +399,108 @@ fn route(root: &Path, data: &Value) -> Result<Value, String> {
     )
     .map_err(|_| "Cannot save extension routing.")?;
     Ok(json!({"selected": selected}))
+}
+
+struct Extracted(std::path::PathBuf);
+impl Drop for Extracted {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+fn extract_archive(source: &Path, directory: &Path) -> Result<Extracted, String> {
+    use std::io::Read;
+    let target = Extracted(directory.join(format!("archive-{}", uuid::Uuid::new_v4())));
+    fs::create_dir_all(&target.0).map_err(|_| "Cannot create archive folder.")?;
+    let file = fs::File::open(source).map_err(|_| "Cannot read archive.")?;
+    if file
+        .metadata()
+        .map_err(|_| "Cannot inspect archive.")?
+        .len()
+        > 100 * 1024 * 1024
+    {
+        return Err("The archive exceeds 100 MB.".into());
+    }
+    let mut total = 0_u64;
+    let mut count = 0_usize;
+    let mut store =
+        |relative: &Path, size: u64, is_dir: bool, input: &mut dyn Read| -> Result<(), String> {
+            if relative.components().any(|part| {
+                !matches!(
+                    part,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            }) || relative.to_string_lossy().contains('\\')
+            {
+                return Err("The archive contains an unsafe path.".into());
+            }
+            total = total.checked_add(size).ok_or("The archive is too large.")?;
+            count += 1;
+            if total > 100 * 1024 * 1024 || count > 12000 {
+                return Err("The archive is too large.".into());
+            }
+            let output = target.0.join(relative);
+            if is_dir {
+                fs::create_dir_all(output).map_err(|_| "Cannot create archive folder.")?;
+            } else {
+                fs::create_dir_all(output.parent().ok_or("Invalid archive path.")?)
+                    .map_err(|_| "Cannot create archive folder.")?;
+                let mut output = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(output)
+                    .map_err(|_| "Archive contains duplicate paths.")?;
+                let copied = std::io::copy(&mut input.take(size + 1), &mut output)
+                    .map_err(|_| "Cannot extract archive.")?;
+                if copied != size {
+                    return Err("Archive size does not match its entry.".into());
+                }
+            }
+            Ok(())
+        };
+    if source
+        .extension()
+        .is_some_and(|extension| extension == "zip")
+    {
+        let mut archive = zip::ZipArchive::new(file).map_err(|_| "Invalid ZIP archive.")?;
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).map_err(|_| "Cannot read ZIP entry.")?;
+            if entry.unix_mode().is_some_and(|mode| {
+                let kind = mode & 0o170000;
+                kind != 0 && kind != 0o100000 && kind != 0o040000
+            }) {
+                return Err("Archive links and special files are not supported.".into());
+            }
+            let relative = entry
+                .enclosed_name()
+                .ok_or("The archive contains an unsafe path.")?
+                .to_path_buf();
+            let size = entry.size();
+            let is_dir = entry.is_dir();
+            store(&relative, size, is_dir, &mut entry)?;
+        }
+    } else {
+        let reader: Box<dyn Read> = if source
+            .extension()
+            .is_some_and(|extension| extension == "gz" || extension == "tgz")
+        {
+            Box::new(flate2::read::GzDecoder::new(file))
+        } else {
+            Box::new(file)
+        };
+        let mut archive = tar::Archive::new(reader);
+        for entry in archive.entries().map_err(|_| "Invalid TAR archive.")? {
+            let mut entry = entry.map_err(|_| "Cannot read TAR entry.")?;
+            let kind = entry.header().entry_type();
+            if !kind.is_file() && !kind.is_dir() {
+                return Err("Archive links and special files are not supported.".into());
+            }
+            let relative = entry
+                .path()
+                .map_err(|_| "Invalid archive path.")?
+                .into_owned();
+            let size = entry.size();
+            store(&relative, size, kind.is_dir(), &mut entry)?;
+        }
+    }
+    Ok(target)
 }
