@@ -105,8 +105,6 @@ function validateServer(definition) {
   if (!definition || typeof definition !== 'object' || Array.isArray(definition)) throw new Error('Enter a server configuration.')
   if (definition.url) {
     const url = new URL(definition.url)
-    const host = url.hostname.toLowerCase().replace(/\.$/, '')
-    if (['anthropic.com', 'claude.com', 'claude.ai', 'example-server.modelcontextprotocol.io'].some(domain => host === domain || host.endsWith(`.${domain}`))) throw new Error('Use the provider’s direct MCP server URL.')
     if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password) throw new Error('Use an HTTP or HTTPS server URL without credentials.')
   } else if (typeof definition.command !== 'string' || !definition.command.trim()) throw new Error('Enter a server URL or command.')
   if (definition.args && (!Array.isArray(definition.args) || definition.args.some(a => typeof a !== 'string'))) throw new Error('Server arguments must be a list of text values.')

@@ -101,28 +101,6 @@ pub fn command(root: &Path, action: &str, mut data: Value) -> Result<Value, Stri
     }
 }
 
-fn provider_destination(definition: &Value) -> bool {
-    let Some(value) = definition["url"].as_str() else {
-        return true;
-    };
-    let Ok(url) = url::Url::parse(value) else {
-        return false;
-    };
-    let host = url
-        .host_str()
-        .unwrap_or("")
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
-    ![
-        "anthropic.com",
-        "claude.com",
-        "claude.ai",
-        "example-server.modelcontextprotocol.io",
-    ]
-    .iter()
-    .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
-}
-
 /// A disabled item cannot enter the MCP snapshot or the skill/extension arguments.
 pub fn snapshot(state: &Value, thread: &str, ambient: Value) -> Value {
     let rules = &state["turns"][thread];
@@ -149,7 +127,7 @@ pub fn snapshot(state: &Value, thread: &str, ambient: Value) -> Value {
             continue;
         }
         if item["kind"] == "mcp" {
-            if !selected.contains(&json!(id)) || !provider_destination(&item["definition"]) {
+            if !selected.contains(&json!(id)) {
                 continue;
             }
             servers.insert(format!("extend-{id}"), item["definition"].clone());
@@ -158,8 +136,7 @@ pub fn snapshot(state: &Value, thread: &str, ambient: Value) -> Value {
             let base = item["base"].as_str().unwrap_or("");
             for (name, definition) in item["servers"].as_object().into_iter().flatten() {
                 let server_id = format!("{id}:{name}");
-                if !provider_destination(definition)
-                    || disabled.contains(&json!(server_id))
+                if disabled.contains(&json!(server_id))
                     || (!selected.contains(&json!(server_id)) && !selected.contains(&json!(id)))
                 {
                     continue;
@@ -318,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn saved_relays_cannot_enter_a_run() {
+    fn custom_servers_are_not_restricted_by_catalog_policy() {
         let state = json!({"items":[
           {"id":"relay","kind":"mcp","definition":{"url":"https://microsoft365.mcp.claude.com/mcp"}},
           {"id":"provider","kind":"mcp","definition":{"url":"https://mcp.notion.com/mcp"}},
@@ -326,11 +303,10 @@ mod tests {
         ],"turns":{"chat":{"selected":["relay","provider","plugin"]}}});
         let result = snapshot(&state, "chat", json!({}));
         let servers = result["mcpServers"].as_object().unwrap();
-        assert_eq!(servers.len(), 1);
+        assert_eq!(servers.len(), 3);
         assert!(servers.contains_key("extend-provider"));
-        assert!(!provider_destination(
-            &json!({"url":"https://HCLS.MCP.CLAUDE.COM./mcp"})
-        ));
+        assert!(servers.contains_key("extend-relay"));
+        assert!(servers.contains_key("extend-plugin-relay"));
     }
 
     #[test]
