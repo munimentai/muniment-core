@@ -94,7 +94,7 @@ fn root(profile: &Path) -> Result<PathBuf, String> {
 }
 pub fn folder(profile: &Path, id: &str) -> Result<PathBuf, String> {
     uuid::Uuid::parse_str(id).map_err(|_| "The agent identifier is invalid.")?;
-    let folder = root(profile)?.join(id);
+    let folder = crate::workspace_names::resolve(profile, &root(profile)?, id, None, None)?;
     if folder.is_symlink() {
         return Err("The agent folder must not be a symbolic link.".into());
     }
@@ -166,9 +166,23 @@ pub fn list(profile: &Path) -> Result<AgentList, String> {
     let mut agents = Vec::new();
     for entry in fs::read_dir(root(profile)?).map_err(|_| "The agents could not be read.")? {
         let entry = entry.map_err(|_| "An agent could not be read.")?;
-        let id = entry.file_name().to_string_lossy().into_owned();
-        if uuid::Uuid::parse_str(&id).is_ok() && entry.path().join("agent.md").exists() {
-            agents.push(get(profile, &id)?);
+        let path = entry.path().join("agent.md");
+        if !entry.path().is_symlink() && path.is_file() {
+            let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+            if let Some(metadata) = text
+                .strip_prefix("```json\n")
+                .and_then(|s| s.split_once("\n```\n\n").map(|(m, _)| m))
+            {
+                let agent: Agent = serde_json::from_str(metadata).map_err(|e| e.to_string())?;
+                crate::workspace_names::resolve(
+                    profile,
+                    &root(profile)?,
+                    &agent.id,
+                    Some(&agent.name),
+                    Some(&entry.path()),
+                )?;
+                agents.push(get(profile, &agent.id)?);
+            }
         }
     }
     agents.sort_by(|a, b| a.name.cmp(&b.name));
@@ -283,7 +297,13 @@ pub fn save(profile: &Path, mut agent: Agent) -> Result<Agent, String> {
             ),
         });
     }
-    let directory = folder(profile, &agent.id)?;
+    let directory = crate::workspace_names::resolve(
+        profile,
+        &root(profile)?,
+        &agent.id,
+        Some(&agent.name),
+        None,
+    )?;
     fs::create_dir_all(&directory).map_err(|_| "The agent folder could not be created.")?;
     let mut metadata = agent.clone();
     metadata.instructions.clear();

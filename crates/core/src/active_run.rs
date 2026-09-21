@@ -1,13 +1,12 @@
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::Deserialize;
 
 use crate::permission_gate::{ChatPermissionAnswer, PendingPermissionAnswer};
 use crate::run_start::ActiveRun;
-use crate::sidecar::pi_chat::cancel_command;
 
 const QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -90,19 +89,9 @@ pub fn cancel_active_run(
         .as_ref()
         .filter(|run| run.id == run_id && workspace.is_none_or(|value| value == run.workspace))
         .ok_or_else(|| "That reply is no longer active.".to_string())?;
-    let cancelled = Arc::clone(&run.cancelled);
-    let transport = run
-        .transport
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    drop(active);
-    cancelled.store(true, Ordering::SeqCst);
-    if let Some(transport) = transport {
-        transport
-            .call(cancel_command(), Duration::from_secs(2))
-            .map_err(|_| "The reply could not be stopped yet. Try again.".to_string())?;
-    }
+    // The coordinator owns Pi cancellation and its bounded shutdown fallback.
+    // A queued stop is accepted even when Pi is blocked on an extension UI.
+    run.cancelled.store(true, Ordering::SeqCst);
     Ok(())
 }
 
@@ -165,6 +154,7 @@ mod tests {
 
     use super::*;
     use crate::attach::RuntimeActivityRegistry;
+    use std::sync::Arc;
 
     fn inactive_transport_run(
         id: &str,

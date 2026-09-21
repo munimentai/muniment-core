@@ -190,6 +190,20 @@ pub fn append_terminal(
     payload: Value,
     subject: Option<&str>,
 ) -> Result<(), ()> {
+    if kind == "run.cancelled" {
+        if let Some(gate) = projector.projection().map_err(|_| ())?.pending_permission {
+            append_emit(
+                sink,
+                storage,
+                projector,
+                run_id,
+                seq,
+                "permission.resolved",
+                json!({"gate_id": gate.gate_id, "decision": {"type": "cancelled"}}),
+                subject,
+            )?;
+        }
+    }
     close_open_effects(open_effects, |kind, payload| {
         append_emit(
             sink, storage, projector, run_id, seq, kind, payload, subject,
@@ -475,6 +489,63 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_resolves_an_unanswered_question_before_closing_its_tool() {
+        let sink = RecordingSink::default();
+        let storage = storage();
+        let mut projector = ChatProjector::new();
+        let mut seq = 0;
+        let run_id = Uuid::now_v7().to_string();
+        let mut effects = BTreeSet::from(["question-tool".to_owned()]);
+        let question = crate::sidecar::pi_chat::ExtensionUiRequest {
+            id: "question-1".into(),
+            dialog: crate::sidecar::pi_chat::ExtensionUiDialog::Editor {
+                title: "muniment:ask_user_question".into(),
+                prefill: Some("{}".into()),
+            },
+            timeout: None,
+        };
+        for (kind, payload) in [
+            ("run.started", json!({})),
+            ("tool.effect.started", json!({"effect_id": "question-tool"})),
+            (
+                "permission.requested",
+                crate::journal::pi_translation::permission_journal_payload(&question),
+            ),
+        ] {
+            append_emit(
+                &sink,
+                &storage,
+                &mut projector,
+                &run_id,
+                &mut seq,
+                kind,
+                payload,
+                None,
+            )
+            .unwrap();
+        }
+        append_terminal(
+            &sink,
+            &storage,
+            &mut projector,
+            &run_id,
+            &mut seq,
+            &mut effects,
+            "run.cancelled",
+            json!({}),
+            None,
+        )
+        .unwrap();
+        let stored = storage.lock().unwrap().journal.events(&run_id).unwrap();
+        assert_eq!(stored[3].event_type, "permission.resolved");
+        assert_eq!(stored[4].event_type, "tool.effect.failed");
+        assert_eq!(stored[5].event_type, "run.cancelled");
+        let projection = projector.projection().unwrap();
+        assert!(projection.pending_permission.is_none());
+        assert_eq!(projection_phase(&projection.status), "cancelled");
+    }
+
+    #[test]
     fn fail_appends_and_delivers_the_failed_event() {
         let sink = RecordingSink::default();
         let storage = storage();
@@ -651,7 +722,7 @@ mod tests {
         );
         let events = sink.events.lock().unwrap();
         let phases: Vec<_> = events.iter().map(|event| event.phase.as_str()).collect();
-        assert_eq!(phases, ["thinking", "interrupted", "thinking", "failed"]);
+        assert_eq!(phases, ["thinking", "thinking", "thinking", "failed"]);
         assert_eq!(events[2].tool_activity[0].status, "failed");
     }
 
