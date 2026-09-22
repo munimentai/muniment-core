@@ -73,6 +73,7 @@ Module rows name the module below `muniment-core`.
 | module | pi_launch | It configures Pi launches. |
 | module | pi_packages | It installs Pi extension packages. |
 | module | pi_settings | It writes Pi runtime settings. |
+| module | provider_models | It discovers and caches models from configured providers. |
 | module | record | It owns the company record: the SQLite graph, the catalogue and the write path. |
 | module | retention_record | It records retention choices. |
 | module | router_classifier | It classifies routes locally without cloud metadata. |
