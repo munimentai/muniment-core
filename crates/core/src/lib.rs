@@ -107,3 +107,5 @@ pub mod agents;
 pub mod project_context;
 pub mod projects;
 pub mod workspace_names;
+
+pub mod provider_models;

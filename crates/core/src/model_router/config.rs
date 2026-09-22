@@ -340,6 +340,9 @@ pub struct Route {
 /// The whole router record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct RouterConfig {
+    /// Runtime-only provider catalogs. Saving settings never pins discoveries.
+    #[serde(skip)]
+    pub discovered_models: std::collections::BTreeMap<String, Vec<String>>,
     /// Off keeps every turn on Pi's own provider and starts no listener.
     #[serde(default)]
     pub enabled: bool,
@@ -410,6 +413,21 @@ pub fn load(agent: &Path) -> io::Result<RouterConfig> {
             if config.accounts.len() != count {
                 save(agent, &config)?;
             }
+            config.discovered_models = crate::provider_models::load(agent)
+                .into_iter()
+                .filter_map(|(key, catalog)| {
+                    key.strip_prefix("account:").map(|id| {
+                        (
+                            id.to_owned(),
+                            catalog
+                                .models
+                                .iter()
+                                .filter_map(|m| m["id"].as_str().map(str::to_owned))
+                                .collect(),
+                        )
+                    })
+                })
+                .collect();
             Ok(config)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(RouterConfig::default()),
@@ -671,6 +689,7 @@ mod tests {
     fn a_saved_record_reads_back_whole_and_stays_private() {
         let agent = tempdir();
         let config = RouterConfig {
+            discovered_models: Default::default(),
             enabled: true,
             accounts: vec![key_account("a1", "openai"), key_account("a2", "openai")],
             classifier: Classifier::Typesafe {
