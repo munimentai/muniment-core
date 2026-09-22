@@ -1,0 +1,313 @@
+//! Provider-owned model discovery. The cache contains metadata, never credentials.
+use std::{collections::BTreeMap, fs, io::Read, path::Path, time::Duration};
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+const CACHE_FILE: &str = "provider-models.json";
+pub const TTL_MS: i64 = 10 * 60 * 1000;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Catalog {
+    pub checked_ms: i64,
+    pub models: Vec<Value>,
+}
+pub type Cache = BTreeMap<String, Catalog>;
+
+pub fn load(agent: &Path) -> Cache {
+    fs::read(agent.join(CACHE_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+pub fn save(agent: &Path, cache: &Cache) -> std::io::Result<()> {
+    fs::create_dir_all(agent)?;
+    let temporary = agent.join(format!("provider-models-{}.tmp", uuid::Uuid::new_v4()));
+    fs::write(&temporary, serde_json::to_vec(cache)?)?;
+    crate::atomic_file::replace(&temporary, &agent.join(CACHE_FILE))
+}
+
+/// Only providers with a documented model-list route. Subscription tokens are
+/// not API keys: xAI is the supported subscription discovery endpoint.
+pub fn endpoint(provider: &str, oauth: bool) -> Option<(&'static str, &'static str)> {
+    if oauth && provider != "xai" {
+        return None;
+    }
+    Some(match provider {
+        "xai" => ("https://api.x.ai/v1/language-models", "openai-responses"),
+        "openai" => ("https://api.openai.com/v1/models", "openai-responses"),
+        "anthropic" => (
+            "https://api.anthropic.com/v1/models?limit=1000",
+            "anthropic-messages",
+        ),
+        "google" => (
+            "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000",
+            "google-generative-ai",
+        ),
+        _ => return None,
+    })
+}
+
+fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 256
+        && !id.contains(char::is_whitespace)
+        && !id.contains(char::is_control)
+}
+
+/// Keep conversational models only. Unknown OpenAI families stay out until the
+/// provider exposes capabilities, rather than offering embeddings as chat.
+pub fn parse(provider: &str, value: &Value) -> Vec<Value> {
+    let entries = value
+        .get(if matches!(provider, "google" | "xai") {
+            "models"
+        } else {
+            "data"
+        })
+        .and_then(Value::as_array);
+    let mut models = Vec::new();
+    for entry in entries.into_iter().flatten() {
+        let id = entry
+            .get(if provider == "google" { "name" } else { "id" })
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let id = if provider == "google" {
+            id.strip_prefix("models/").unwrap_or(id)
+        } else {
+            id
+        };
+        if !valid_id(id) || models.iter().any(|model: &Value| model["id"] == id) {
+            continue;
+        }
+        if provider == "google"
+            && !entry["supportedGenerationMethods"]
+                .as_array()
+                .is_some_and(|methods| methods.iter().any(|m| m == "generateContent"))
+        {
+            continue;
+        }
+        if provider == "openai"
+            && (!(id.starts_with("gpt-")
+                || id.starts_with("chatgpt-")
+                || id.starts_with("o1")
+                || id.starts_with("o3")
+                || id.starts_with("o4"))
+                || [
+                    "audio",
+                    "realtime",
+                    "transcrib",
+                    "tts",
+                    "image",
+                    "search",
+                    "instruct",
+                ]
+                .iter()
+                .any(|part| id.contains(part)))
+        {
+            continue;
+        }
+        if entry
+            .get("output_modalities")
+            .and_then(Value::as_array)
+            .is_some_and(|m| !m.iter().any(|v| v == "text"))
+        {
+            continue;
+        }
+        let mut model = json!({"id": id, "name": entry.get("displayName").or_else(|| entry.get("display_name")).and_then(Value::as_str).unwrap_or(id)});
+        for (source, target) in [
+            ("inputTokenLimit", "contextWindow"),
+            ("max_input_tokens", "contextWindow"),
+            ("context_window", "contextWindow"),
+            ("outputTokenLimit", "maxTokens"),
+            ("max_tokens", "maxTokens"),
+        ] {
+            if let Some(n) = entry[source].as_u64().filter(|n| *n > 0) {
+                model[target] = n.into();
+            }
+        }
+        if let Some(thinking) = entry["thinking"].as_bool() {
+            model["reasoning"] = thinking.into();
+        }
+        if let Some(input) = entry["input_modalities"].as_array() {
+            model["input"] = input
+                .iter()
+                .filter(|v| **v == "text" || **v == "image")
+                .cloned()
+                .collect::<Vec<_>>()
+                .into();
+        }
+        if provider == "xai" {
+            let mut cost = json!({});
+            for (field, target) in [
+                ("prompt_text_token_price", "input"),
+                ("completion_text_token_price", "output"),
+                ("cached_prompt_text_token_price", "cacheRead"),
+            ] {
+                if let Some(price) = entry[field].as_f64().filter(|v| v.is_finite() && *v >= 0.0) {
+                    cost[target] = (price / 10000.0).into();
+                }
+            }
+            if cost.get("input").is_some() && cost.get("output").is_some() {
+                model["cost"] = cost;
+            }
+        }
+        models.push(model);
+    }
+    models
+}
+
+/// No redirects with credentials, bounded response size and request time.
+/// Any incomplete or invalid response leaves the saved catalog intact.
+pub fn discover(provider: &str, oauth: bool, token: &str, timeout: Duration) -> Option<Vec<Value>> {
+    let (url, _) = endpoint(provider, oauth)?;
+    discover_at(provider, url, token, timeout)
+}
+
+fn discover_at(provider: &str, url: &str, token: &str, timeout: Duration) -> Option<Vec<Value>> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(timeout)
+        .redirects(0)
+        .build();
+    let mut request = agent.get(url);
+    request = match provider {
+        "anthropic" => request
+            .set("x-api-key", token)
+            .set("anthropic-version", "2023-06-01"),
+        "google" => request.set("x-goog-api-key", token),
+        _ => request.set("Authorization", &format!("Bearer {token}")),
+    };
+    let response = request.call().ok()?;
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(4 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > 4 * 1024 * 1024 {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    // Never replace a complete cache with a truncated page.
+    if value["has_more"] == true
+        || value
+            .get("nextPageToken")
+            .and_then(Value::as_str)
+            .is_some_and(|v| !v.is_empty())
+    {
+        return None;
+    }
+    let models = parse(provider, &value);
+    (!models.is_empty()).then_some(models)
+}
+
+/// Add discoveries without overwriting user model settings or bundled metadata.
+pub fn merge_models(
+    root: &mut serde_json::Map<String, Value>,
+    provider: &str,
+    models: &[Value],
+) -> bool {
+    let Some(providers) = root
+        .entry("providers")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+    else {
+        return false;
+    };
+    let Some(entry) = providers
+        .entry(provider.to_owned())
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+    else {
+        return false;
+    };
+    let Some(existing) = entry
+        .entry("models")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+    else {
+        return false;
+    };
+    let mut changed = false;
+    for model in models {
+        if !existing.iter().any(|old| old["id"] == model["id"]) {
+            existing.push(model.clone());
+            changed = true;
+        }
+    }
+    changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn discovery_filters_non_chat_models_and_keeps_metadata() {
+        let google = parse(
+            "google",
+            &json!({"models":[{"name":"models/gemini-new","supportedGenerationMethods":["generateContent"],"inputTokenLimit":1000000,"thinking":true},{"name":"models/embed","supportedGenerationMethods":["embedContent"]}]}),
+        );
+        assert_eq!(google.len(), 1);
+        assert_eq!(google[0]["contextWindow"], 1000000);
+        assert_eq!(parse("openai", &json!({"data":[{"id":"gpt-new"},{"id":"gpt-new"},{"id":"gpt-audio"},{"id":"text-embedding-3"},{"id":"bad\nmodel"}]})).len(), 1);
+        assert_eq!(
+            parse(
+                "xai",
+                &json!({"models":[{"id":"grok-4.7","input_modalities":["text","image"],"output_modalities":["text"]}]})
+            )[0]["id"],
+            "grok-4.7"
+        );
+        assert!(endpoint("openai-codex", true).is_none());
+    }
+    #[test]
+    fn discoveries_preserve_custom_settings_and_are_idempotent() {
+        let mut root = json!({"providers":{"xai":{"headers":{"custom":"keep"},"models":[{"id":"grok-old","contextWindow":42}]}}}).as_object().unwrap().clone();
+        let new = vec![
+            json!({"id":"grok-old","contextWindow":100}),
+            json!({"id":"grok-new"}),
+        ];
+        assert!(merge_models(&mut root, "xai", &new));
+        assert!(!merge_models(&mut root, "xai", &new));
+        assert_eq!(root["providers"]["xai"]["models"][0]["contextWindow"], 42);
+        assert_eq!(root["providers"]["xai"]["headers"]["custom"], "keep");
+    }
+    #[test]
+    fn authenticated_request_and_failed_refresh_keep_the_cache_usable() {
+        use std::{
+            io::{BufRead, BufReader, Write},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/models", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                headers.push_str(&line);
+            }
+            assert!(headers
+                .to_lowercase()
+                .contains("authorization: bearer test-token"));
+            let body = r#"{"models":[{"id":"grok-new"}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        assert_eq!(
+            discover_at("xai", &url, "test-token", Duration::from_secs(2)).unwrap()[0]["id"],
+            "grok-new"
+        );
+        server.join().unwrap();
+        assert!(discover_at("xai", &url, "test-token", Duration::from_millis(50)).is_none());
+    }
+}

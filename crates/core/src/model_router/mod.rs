@@ -89,10 +89,16 @@ pub fn options(config: &RouterConfig) -> Vec<Route> {
     {
         // An account that names no model serves every model of its family.
         let models: Vec<String> = if account.models.is_empty() {
-            model_catalog::family_models(&account.family)
-                .iter()
-                .map(|entry| entry.model.to_owned())
-                .collect()
+            config
+                .discovered_models
+                .get(&account.id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    model_catalog::family_models(&account.family)
+                        .iter()
+                        .map(|entry| entry.model.to_owned())
+                        .collect()
+                })
         } else {
             account.models.clone()
         };
@@ -286,10 +292,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn live_models_extend_routing_without_pinning_manual_settings() {
+        let mut config = pooled();
+        config
+            .discovered_models
+            .insert("o1".into(), vec!["gpt-new".into()]);
+        assert!(options(&config)
+            .iter()
+            .any(|route| route.model == "gpt-new"));
+        config.accounts[0].models = vec!["gpt-fixed".into()];
+        assert!(!options(&config)
+            .iter()
+            .any(|route| route.model == "gpt-new"));
+        assert!(options(&config)
+            .iter()
+            .any(|route| route.model == "gpt-fixed"));
+        assert!(!serde_json::to_string(&config)
+            .unwrap()
+            .contains("discovered_models"));
+    }
+
     /// Two OpenAI accounts and one Anthropic, with two options renamed by the
     /// user. Every catalog model of both families is in the running.
     fn pooled() -> RouterConfig {
         RouterConfig {
+            discovered_models: Default::default(),
             enabled: true,
             accounts: vec![
                 account("o1", "openai"),

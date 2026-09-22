@@ -664,7 +664,18 @@ impl ChatProjector {
 
     pub fn projection(&self) -> Result<ChatProjection, ReduceError> {
         let mut chat = self.chat.clone();
-        let status = self.reducer.clone().finish()?.status;
+        // A live tool call has an open effect until its result arrives. Only
+        // finish() may classify an unfinished replay as an unknown outcome.
+        let status = self
+            .reducer
+            .state
+            .as_ref()
+            .ok_or_else(|| ReduceError::InvalidTransition {
+                event_type: "live-projection".into(),
+                detail: "empty journal".into(),
+            })?
+            .status
+            .clone();
         chat.pending_permission = match &status {
             RunStatus::PendingPermission(gate) => Some(gate.clone()),
             _ => None,

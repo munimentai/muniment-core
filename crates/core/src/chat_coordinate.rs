@@ -31,8 +31,8 @@ use crate::run_events::{
     fail_with_open_effects as core_fail_with_open_effects, ChatEventSink, SharedStorage,
 };
 use crate::sidecar::pi_chat::{
-    cancel_command, ExtensionUiAnswer, ExtensionUiDialog, ExtensionUiRequest, PiChatEvent,
-    PiRunAdapter, FIRST_EVENT_TIMEOUT_REASON,
+    ExtensionUiAnswer, ExtensionUiDialog, ExtensionUiRequest, PiChatEvent, PiRunAdapter,
+    FIRST_EVENT_TIMEOUT_REASON,
 };
 use crate::sidecar::{PiRpcTransport, PiRpcWiring, SidecarStatus, SidecarSupervisor};
 use serde_json::{json, Value};
@@ -908,7 +908,6 @@ pub fn coordinate(
         }
     };
     let mut buffered_events = buffered_events.into_iter();
-    let mut aborting = false;
     let mut ledger = LocalRunLedger::default();
     let mut open_effects = MarkedEffects::open_effects(Some(runtime_activity.clone()));
     let mut pending_permission = MarkedGate::pending_permission(Some(runtime_activity));
@@ -940,8 +939,25 @@ pub fn coordinate(
             break;
         }
         if cancelled.swap(false, Ordering::SeqCst) {
-            aborting = true;
-            let _ = transport.call(cancel_command(), Duration::from_secs(2));
+            if adapter
+                .cancel_and_drain(&transport, Duration::from_secs(2))
+                .is_err()
+            {
+                let _ = runtime.supervisor.shutdown();
+            }
+            diagnostics.outcome = "cancelled";
+            let _ = append_terminal(
+                &app,
+                &journal,
+                &mut projector,
+                &run_id,
+                &mut seq,
+                &mut open_effects,
+                "run.cancelled",
+                json!({}),
+                subject.as_deref(),
+            );
+            break;
         }
         let answers: Vec<_> = permission_answers
             .lock()
@@ -1037,21 +1053,6 @@ pub fn coordinate(
                 }
             }
             Ok(PiChatEvent::Completed | PiChatEvent::Failed) if gateway_failure.is_some() => {}
-            Ok(PiChatEvent::Completed) if aborting => {
-                diagnostics.outcome = "cancelled";
-                let _ = append_terminal(
-                    &app,
-                    &journal,
-                    &mut projector,
-                    &run_id,
-                    &mut seq,
-                    &mut open_effects,
-                    "run.cancelled",
-                    json!({}),
-                    subject.as_deref(),
-                );
-                break;
-            }
             Ok(PiChatEvent::Completed) => {
                 diagnostics.outcome = "completed";
                 let receipt = if grant.is_local() {
@@ -1396,7 +1397,15 @@ fn coordinate_memory_search(
                 return true;
             }
             if let Some(tool) = title.strip_prefix("muniment:").filter(|tool| {
-                ["agent-list", "agent-read", "agent-save", "agent-run"].contains(tool)
+                [
+                    "agent-list",
+                    "agent-read",
+                    "agent-save",
+                    "agent-run",
+                    "creation-plan",
+                    "artifact-publish",
+                ]
+                .contains(tool)
             }) {
                 let result = prefill
                     .as_deref()

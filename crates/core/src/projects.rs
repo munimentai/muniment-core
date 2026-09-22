@@ -74,8 +74,21 @@ pub fn list(profile: &Path) -> Result<Catalog, String> {
     let _guard = WRITE.lock().map_err(|_| "The project catalog is busy.")?;
     let mut catalog = read(profile)?;
     let root = root(profile)?;
+    let known = catalog
+        .projects
+        .iter()
+        .map(|(id, title)| {
+            crate::workspace_names::resolve(
+                profile,
+                &root,
+                id,
+                Some(title),
+                Some(&root.join(title)),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut changed = false;
-    for entry in fs::read_dir(root).map_err(|_| "The projects folder cannot be read.")? {
+    for entry in fs::read_dir(&root).map_err(|_| "The projects folder cannot be read.")? {
         let entry = entry.map_err(|_| "A project folder cannot be read.")?;
         if !entry
             .file_type()
@@ -85,7 +98,10 @@ pub fn list(profile: &Path) -> Result<Catalog, String> {
             continue;
         }
         let folder = entry.file_name().to_string_lossy().into_owned();
-        if name(&folder).is_ok() && !catalog.projects.values().any(|n| n == &folder) {
+        if name(&folder).is_ok()
+            && !known.contains(&entry.path())
+            && !catalog.projects.values().any(|n| n == &folder)
+        {
             catalog
                 .projects
                 .insert(uuid::Uuid::new_v4().to_string(), folder);
@@ -129,7 +145,14 @@ fn folder_with_config(profile: &Path, config: &Path, id: &str) -> Result<PathBuf
         .projects
         .get(id)
         .ok_or("The project does not exist.")?;
-    let folder = root(config)?.join(name(value)?);
+    let root = root(config)?;
+    let folder = crate::workspace_names::resolve(
+        config,
+        &root,
+        id,
+        Some(name(value)?),
+        Some(&root.join(value)),
+    )?;
     if folder.is_symlink() || !folder.is_dir() {
         return Err("The project folder is unavailable.".into());
     }
@@ -155,26 +178,14 @@ pub fn rename(profile: &Path, id: &str, value: &str) -> Result<(), String> {
         return Err("A project with that name already exists.".into());
     }
     let source = folder(profile, id)?;
-    let target = root(profile)?.join(value);
+    let target = root(profile)?.join(crate::workspace_names::basename(value, id));
     if target.exists() && !old.eq_ignore_ascii_case(value) {
         return Err("A folder with that name already exists.".into());
     }
-    let temporary = root(profile)?.join(format!(".rename-{}", uuid::Uuid::new_v4()));
-    fs::rename(&source, &temporary).map_err(|_| "The project folder could not be renamed.")?;
-    if target.exists() {
-        fs::rename(&temporary, &source)
-            .map_err(|_| "The original project folder could not be restored.")?;
-        return Err("A folder with that name already exists.".into());
-    }
-    if fs::rename(&temporary, &target).is_err() {
-        fs::rename(&temporary, &source)
-            .map_err(|_| "The original project folder could not be restored.")?;
-        return Err("The project folder could not be renamed.".into());
-    }
+    crate::workspace_names::resolve(profile, &root(profile)?, id, Some(value), Some(&source))?;
     catalog.projects.insert(id.into(), value.into());
     if let Err(error) = save(profile, &catalog) {
-        fs::rename(&target, &source)
-            .map_err(|_| "The folder changed but its project could not be saved.")?;
+        crate::workspace_names::resolve(profile, &root(profile)?, id, Some(&old), Some(&target))?;
         return Err(error);
     }
     Ok(())
@@ -210,6 +221,13 @@ pub fn workspace_with_config(
     config: &Path,
     thread: &str,
 ) -> Result<PathBuf, String> {
+    if let Some(id) = crate::agents::state(profile)?.threads.get(thread) {
+        let agent = crate::agents::get(config, id)?;
+        if let Some(project) = agent.project_id {
+            return folder_with_config(profile, config, &project);
+        }
+        return crate::agents::folder(config, id);
+    }
     if let Some(project) = read(profile)?.threads.get(thread) {
         let folder = folder_with_config(profile, config, project)?;
         migrate_workspace_metadata(&folder)?;
@@ -227,13 +245,66 @@ pub fn workspace_with_config(
         .map_err(|e| e.to_string())?
         .ok_or("The Home folder is unavailable.")?;
     let sessions = home.join("sessions");
-    let folder = sessions.join(thread);
+    let folder = crate::workspace_names::resolve(config, &sessions, thread, None, None)?;
     if sessions.is_symlink() || folder.is_symlink() {
         return Err("The session folder must not be a symbolic link.".into());
     }
     fs::create_dir_all(&folder).map_err(|_| "The session folder cannot be opened.")?;
     migrate_workspace_metadata(&folder)?;
     Ok(folder)
+}
+
+/// Converts legacy session directories using the journal's visible thread titles.
+pub fn migrate_session_names(profile: &Path) -> Result<(), String> {
+    let Some(home) = crate::home::configured_home(profile).map_err(|e| e.to_string())? else {
+        return Ok(());
+    };
+    let root = home.join("sessions");
+    if !root.is_dir() || root.is_symlink() {
+        return Ok(());
+    }
+    let ids = fs::read_dir(&root)
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let id = entry.file_name().to_string_lossy().into_owned();
+            (uuid::Uuid::parse_str(&id).is_ok()
+                && entry.path().is_dir()
+                && !entry.path().is_symlink())
+            .then_some(id)
+        })
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let mut titles = BTreeMap::new();
+    if profile.join("runs.sqlite3").exists() {
+        let mut journal = crate::journal::RunJournal::open(profile.join("runs.sqlite3"))
+            .map_err(|e| e.to_string())?;
+        let mut cursor = None;
+        loop {
+            let page = journal
+                .thread_summaries(100, cursor.as_deref())
+                .map_err(|e| e.to_string())?;
+            for summary in page.summaries {
+                titles.insert(summary.thread_id, summary.title);
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+    }
+    for id in ids {
+        crate::workspace_names::resolve(
+            profile,
+            &root,
+            &id,
+            Some(titles.get(&id).map(String::as_str).unwrap_or("Thread")),
+            None,
+        )?;
+    }
+    Ok(())
 }
 
 fn migrate_workspace_metadata(folder: &Path) -> Result<(), String> {
@@ -277,7 +348,11 @@ mod tests {
         let fixture = Fixture::new();
         let profile = fixture.profile();
         let first = workspace(&profile, "thread-one").unwrap();
-        assert!(first.ends_with("sessions/thread-one"));
+        assert!(first
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("Untitled-"));
         fs::write(first.join("result.txt"), "kept").unwrap();
         fs::create_dir_all(first.join(".pi/tasks")).unwrap();
         fs::write(first.join(".pi/tasks/result.txt"), "task output").unwrap();
@@ -328,7 +403,11 @@ mod tests {
         fs::write(folder(&profile, &id).unwrap().join("draft.txt"), "draft").unwrap();
         rename(&profile, &id, "Agreements").unwrap();
         let renamed = thread_folder(&profile, "thread-one").unwrap().unwrap();
-        assert!(renamed.ends_with("projects/Agreements"));
+        assert!(renamed
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("Agreements-"));
         assert_eq!(
             fs::read_to_string(renamed.join("draft.txt")).unwrap(),
             "draft"
@@ -339,7 +418,10 @@ mod tests {
         assert!(thread_folder(&profile, "thread-one")
             .unwrap()
             .unwrap()
-            .ends_with("projects/agreements"));
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("agreements-"));
     }
     #[test]
     fn discovers_existing_folders_and_rejects_collisions_and_escapes() {

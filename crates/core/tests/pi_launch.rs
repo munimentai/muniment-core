@@ -875,14 +875,17 @@ fn project_launch_uses_the_folder_after_rename_and_rejects_a_missing_folder() {
                 .unwrap();
         assert_eq!(
             config.working_directory,
-            Some(root.join("muniment/projects").join(name))
+            Some(
+                root.join("muniment/projects")
+                    .join(muniment_core::workspace_names::basename(name, &project))
+            )
         );
         assert!(config
             .args
             .iter()
             .any(|arg| arg.contains("Create generated files inside this working directory.")));
     }
-    fs::remove_dir(root.join("muniment/projects/Reports")).unwrap();
+    fs::remove_dir(muniment_core::projects::folder(&profile, &project).unwrap()).unwrap();
     assert!(
         pi_launch_config_for_executable(&boundary, "pi".into(), &ChatGrant::local(), None).is_err()
     );

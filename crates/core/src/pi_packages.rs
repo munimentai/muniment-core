@@ -13,11 +13,11 @@ use fs2::FileExt;
 use serde_json::Value;
 
 pub const PI_PACKAGES: [(&str, &str); 5] = [
-    ("pi-web-access", "0.28.0"),
-    ("pi-subagents", "0.65.1"),
+    ("pi-web-access", "0.30.0"),
+    ("pi-subagents", "0.70.1"),
     ("pi-background-tasks", "2.5.0"),
-    ("pi-mcp-adapter", "2.34.0"),
-    ("pi-claude-bridge", "0.7.0"),
+    ("pi-mcp-adapter", "2.36.0"),
+    ("pi-claude-bridge", "0.8.0"),
 ];
 
 fn installed(directory: &Path) -> bool {
@@ -311,6 +311,32 @@ fn brand_background_task_paths(directory: &Path) -> io::Result<()> {
     Ok(())
 }
 
+// Apply product copy to the pinned adapter without changing its storage identity.
+pub(crate) fn brand_mcp_adapter(directory: &Path) -> io::Result<()> {
+    let package = directory.join("node_modules/pi-mcp-adapter");
+    for (relative, old, new) in [
+        (
+            "agent-dir.ts",
+            "export function getAppName(): string {\n  const name = readPiConfig()?.name\n  return typeof name === \"string\" && name.trim() ? name.trim() : \"pi\"\n}",
+            "export function getAppName(): string {\n  const name = readPiConfig()?.name\n  return typeof name === \"string\" && name.trim() ? name.trim() : \"Muniment\"\n}",
+        ),
+        (
+            "host-html-template.ts",
+            "You can close this page and return to Pi.",
+            "You can close this page and return to Muniment.",
+        ),
+    ] {
+        let path = package.join(relative);
+        let source = fs::read_to_string(&path)?;
+        if source.contains(old) {
+            crate::model_router::config::write_private(&path, source.replace(old, new).as_bytes())?;
+        } else if !source.contains(new) {
+            return Err(io::Error::other("The MCP adapter display name is unavailable."));
+        }
+    }
+    Ok(())
+}
+
 /// Acquire packages before RPC starts. The caller supplies the verified candidate executable.
 pub fn prepare_pi_packages(agent_directory: &Path, executable: &Path) -> io::Result<()> {
     let directory = agent_directory.join("npm");
@@ -357,7 +383,8 @@ pub fn prepare_pi_packages(agent_directory: &Path, executable: &Path) -> io::Res
         }
     }
     if fs::read(&marker).is_ok_and(|bytes| bytes == identity) && installed(&directory) {
-        return brand_background_task_paths(&directory);
+        brand_background_task_paths(&directory)?;
+        return brand_mcp_adapter(&directory);
     }
     // A failed or interrupted install must retry, even if it wrote the top-level manifests.
     match fs::remove_file(&marker) {
@@ -387,6 +414,7 @@ pub fn prepare_pi_packages(agent_directory: &Path, executable: &Path) -> io::Res
         ));
     }
     brand_background_task_paths(&directory)?;
+    brand_mcp_adapter(&directory)?;
     let mut file = fs::File::create(marker)?;
     file.write_all(&identity)?;
     file.sync_all()
@@ -396,7 +424,37 @@ pub fn prepare_pi_packages(agent_directory: &Path, executable: &Path) -> io::Res
 mod tests {
     use super::*;
 
+    #[test]
+    fn adapter_branding_is_idempotent_and_preserves_storage_identity() {
+        let root = std::env::temp_dir().join(format!("muniment-brand-{}", uuid::Uuid::new_v4()));
+        background_fixture(&root);
+        let path = root.join("node_modules/pi-mcp-adapter/agent-dir.ts");
+        let mut original = fs::read_to_string(&path).unwrap();
+        original.push_str("\nconst storage = process.env.PI_CODING_AGENT_DIR;\n");
+        fs::write(&path, &original).unwrap();
+        brand_mcp_adapter(&root).unwrap();
+        let branded = fs::read_to_string(&path).unwrap();
+        assert!(branded.contains("\"Muniment\""));
+        assert!(branded.contains("process.env.PI_CODING_AGENT_DIR"));
+        brand_mcp_adapter(&root).unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), branded);
+        assert!(
+            fs::read_to_string(root.join("node_modules/pi-mcp-adapter/host-html-template.ts"))
+                .unwrap()
+                .contains("return to Muniment.")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn background_fixture(npm: &Path) {
+        let adapter = npm.join("node_modules/pi-mcp-adapter");
+        fs::create_dir_all(&adapter).unwrap();
+        fs::write(adapter.join("agent-dir.ts"), "export function getAppName(): string {\n  const name = readPiConfig()?.name\n  return typeof name === \"string\" && name.trim() ? name.trim() : \"pi\"\n}").unwrap();
+        fs::write(
+            adapter.join("host-html-template.ts"),
+            "You can close this page and return to Pi.",
+        )
+        .unwrap();
         let package = npm.join("node_modules/pi-background-tasks/src");
         fs::create_dir_all(package.join("core")).unwrap();
         fs::write(
@@ -680,11 +738,11 @@ mod tests {
             args,
             [
                 "install",
-                "pi-web-access@0.28.0",
-                "pi-subagents@0.65.1",
+                "pi-web-access@0.30.0",
+                "pi-subagents@0.70.1",
                 "pi-background-tasks@2.5.0",
-                "pi-mcp-adapter@2.34.0",
-                "pi-claude-bridge@0.7.0",
+                "pi-mcp-adapter@2.36.0",
+                "pi-claude-bridge@0.8.0",
                 "--omit=peer",
                 "--ignore-scripts",
                 "--exact",

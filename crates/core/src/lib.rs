@@ -30,7 +30,9 @@ pub mod code_diff_effect;
 pub mod code_diff_journal;
 pub mod code_diff_observe;
 pub mod code_diff_staging;
+pub mod creations;
 pub mod endpoint_models;
+pub mod extend;
 pub mod harness_scan;
 pub mod home;
 pub mod import_preview;
@@ -102,4 +104,8 @@ pub use muniment_attach::{
 
 pub mod agent_templates;
 pub mod agents;
+pub mod project_context;
 pub mod projects;
+pub mod workspace_names;
+
+pub mod provider_models;
