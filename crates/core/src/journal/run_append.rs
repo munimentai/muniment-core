@@ -13,18 +13,42 @@ pub fn append_run_event(
     projector: &mut ChatProjector,
     envelope: &EventEnvelope,
 ) -> Result<ChatProjection, RunAppendError> {
-    let mut next_projector = projector.clone();
-    next_projector
-        .apply(envelope)
-        .map_err(RunAppendError::Apply)?;
-    let projection = next_projector
-        .projection()
-        .map_err(RunAppendError::Projection)?;
-    journal
-        .append(envelope.run_seq.saturating_sub(1), envelope)
-        .map_err(RunAppendError::Append)?;
-    *projector = next_projector;
+    let checkpoint = projector.checkpoint(envelope);
+    if let Err(error) = projector.apply(envelope) {
+        projector.restore(checkpoint);
+        return Err(RunAppendError::Apply(error));
+    }
+    let projection = match projector.projection() {
+        Ok(projection) => projection,
+        Err(error) => {
+            projector.restore(checkpoint);
+            return Err(RunAppendError::Projection(error));
+        }
+    };
+    if let Err(error) = journal.append(envelope.run_seq.saturating_sub(1), envelope) {
+        projector.restore(checkpoint);
+        return Err(RunAppendError::Append(error));
+    }
     Ok(projection)
+}
+
+/// Appends one event and advances the projector without copying its
+/// projection. A failed apply or append leaves the projector unchanged.
+pub fn append_run_event_in_place(
+    journal: &mut RunJournal,
+    projector: &mut ChatProjector,
+    envelope: &EventEnvelope,
+) -> Result<(), RunAppendError> {
+    let checkpoint = projector.checkpoint(envelope);
+    if let Err(error) = projector.apply(envelope) {
+        projector.restore(checkpoint);
+        return Err(RunAppendError::Apply(error));
+    }
+    if let Err(error) = journal.append(envelope.run_seq.saturating_sub(1), envelope) {
+        projector.restore(checkpoint);
+        return Err(RunAppendError::Append(error));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -103,6 +127,90 @@ mod tests {
             Err(RunAppendError::Apply(_))
         ));
         assert!(journal.events(&event.run_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_text_append_restores_the_text_and_its_length() {
+        let mut journal =
+            RunJournal::open_with_busy_timeout(":memory:", Duration::from_secs(60)).unwrap();
+        let run_id = Uuid::now_v7().to_string();
+        let mut projector = ChatProjector::new();
+        for (seq, kind, payload) in [
+            (1, "run.started", json!({})),
+            (2, "model.routing.stage", json!({"stage": "thinking"})),
+            (3, "model.stream.delta", json!({"text": "héllo "})),
+        ] {
+            append_run_event_in_place(
+                &mut journal,
+                &mut projector,
+                &envelope(&run_id, seq, kind, payload),
+            )
+            .unwrap();
+        }
+        let before = projector.projection().unwrap();
+        let before_len = projector.text_utf16_len();
+        assert_eq!(before_len, 6);
+
+        // A second writer takes run_seq 4, so this append conflicts.
+        journal
+            .append(
+                3,
+                &envelope(&run_id, 4, "model.stream.delta", json!({"text": "x"})),
+            )
+            .unwrap();
+        let conflicting = envelope(&run_id, 4, "model.stream.delta", json!({"text": "wörld"}));
+        assert!(matches!(
+            append_run_event_in_place(&mut journal, &mut projector, &conflicting),
+            Err(RunAppendError::Append(_))
+        ));
+        assert_eq!(projector.projection().unwrap(), before);
+        assert_eq!(projector.text_utf16_len(), before_len);
+    }
+
+    #[test]
+    fn failed_tool_outcome_append_restores_the_running_activity() {
+        let mut journal =
+            RunJournal::open_with_busy_timeout(":memory:", Duration::from_secs(60)).unwrap();
+        let run_id = Uuid::now_v7().to_string();
+        let mut projector = ChatProjector::new();
+        for (seq, kind, payload) in [
+            (1, "run.started", json!({})),
+            (
+                2,
+                "tool.effect.started",
+                json!({"effect_id": "effect-1", "input": "ls"}),
+            ),
+        ] {
+            append_run_event_in_place(
+                &mut journal,
+                &mut projector,
+                &envelope(&run_id, seq, kind, payload),
+            )
+            .unwrap();
+        }
+        let before = projector.projection().unwrap();
+        journal
+            .append(
+                2,
+                &envelope(
+                    &run_id,
+                    3,
+                    "model.routing.stage",
+                    json!({"stage": "thinking"}),
+                ),
+            )
+            .unwrap();
+        let finished = envelope(
+            &run_id,
+            3,
+            "tool.effect.completed",
+            json!({"effect_id": "effect-1", "output": "done"}),
+        );
+        assert!(matches!(
+            append_run_event(&mut journal, &mut projector, &finished),
+            Err(RunAppendError::Append(_))
+        ));
+        assert_eq!(projector.projection().unwrap(), before);
     }
 
     #[test]

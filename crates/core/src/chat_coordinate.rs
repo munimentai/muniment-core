@@ -1,6 +1,8 @@
+mod delta_batch;
 mod diagnostics;
 
 use crate::runtime_eprintln as eprintln;
+use delta_batch::HeldDeltas;
 use diagnostics::RunDiagnostics;
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -914,6 +916,9 @@ pub fn coordinate(
     // Requests that arrived while a gate was open, each waiting its turn.
     let mut waiting_permissions: VecDeque<crate::sidecar::pi_chat::ExtensionUiRequest> =
         VecDeque::new();
+    // Text deltas wait here for one batched commit. Every other append below
+    // flushes them first, so the journal keeps stream order.
+    let mut held_deltas = HeldDeltas::default();
     'coordinate: loop {
         diagnostics.log_lifecycle();
         if let Some(error) = gateway_failure
@@ -926,6 +931,14 @@ pub fn coordinate(
             {
                 let _ = runtime.supervisor.shutdown();
             }
+            let _ = held_deltas.flush(
+                &app,
+                &journal,
+                &mut projector,
+                &run_id,
+                &mut seq,
+                subject.as_deref(),
+            );
             fail_with_open_effects(
                 &app,
                 &journal,
@@ -946,6 +959,14 @@ pub fn coordinate(
                 let _ = runtime.supervisor.shutdown();
             }
             diagnostics.outcome = "cancelled";
+            let _ = held_deltas.flush(
+                &app,
+                &journal,
+                &mut projector,
+                &run_id,
+                &mut seq,
+                subject.as_deref(),
+            );
             let _ = append_terminal(
                 &app,
                 &journal,
@@ -964,6 +985,20 @@ pub fn coordinate(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .drain(..)
             .collect();
+        if (!answers.is_empty() || !waiting_permissions.is_empty())
+            && held_deltas
+                .flush(
+                    &app,
+                    &journal,
+                    &mut projector,
+                    &run_id,
+                    &mut seq,
+                    subject.as_deref(),
+                )
+                .is_err()
+        {
+            break 'coordinate;
+        }
         for answer in answers {
             if matches!(&answer.answer, ChatPermissionAnswer::CodeDiff { .. }) {
                 if coordinate_code_diff_answer(
@@ -1026,30 +1061,49 @@ pub fn coordinate(
         {
             break 'coordinate;
         }
-        let event = buffered_events
-            .next()
-            .map(Ok)
-            .unwrap_or_else(|| adapter.next_settled(&transport, Duration::from_millis(100)));
+        let event = buffered_events.next().map(Ok).unwrap_or_else(|| {
+            adapter.next_settled(
+                &transport,
+                held_deltas.wait_bound(Duration::from_millis(100)),
+            )
+        });
         if let Ok(event) = &event {
             ledger.record(event);
+        }
+        // Any event but text, and the idle poll that ends a window, commits
+        // the held text before the event's own append.
+        if !matches!(event, Ok(PiChatEvent::TextDelta(_)))
+            && held_deltas
+                .flush(
+                    &app,
+                    &journal,
+                    &mut projector,
+                    &run_id,
+                    &mut seq,
+                    subject.as_deref(),
+                )
+                .is_err()
+        {
+            break 'coordinate;
         }
         match event {
             Ok(PiChatEvent::TextDelta(text)) => {
                 for slice in split_model_stream_delta(&text) {
-                    if append_emit(
-                        &app,
-                        &journal,
-                        &mut projector,
-                        &run_id,
-                        &mut seq,
-                        "model.stream.delta",
-                        model_stream_delta_payload(slice),
-                        subject.as_deref(),
-                    )
-                    .is_err()
-                    {
-                        break 'coordinate;
-                    }
+                    held_deltas.push(model_stream_delta_payload(slice));
+                }
+                if held_deltas.due()
+                    && held_deltas
+                        .flush(
+                            &app,
+                            &journal,
+                            &mut projector,
+                            &run_id,
+                            &mut seq,
+                            subject.as_deref(),
+                        )
+                        .is_err()
+                {
+                    break 'coordinate;
                 }
             }
             Ok(PiChatEvent::Completed | PiChatEvent::Failed) if gateway_failure.is_some() => {}

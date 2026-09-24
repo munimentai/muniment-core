@@ -76,6 +76,7 @@ mod tests {
                 claimed_kind: "cli".into(),
                 claimed_version: "1.2.3".into(),
                 approved_at: Some("2026-08-04T12:00:00Z".into()),
+                subject: None,
             },
         )
     }

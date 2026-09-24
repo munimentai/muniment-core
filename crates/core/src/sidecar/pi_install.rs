@@ -11,9 +11,10 @@ use crate::model_install::{
     install_model, AvailableSpace, InstallCancellation, InstallLock, ModelInstallError,
 };
 
-pub const PI_RELEASE_BASE: &str = "https://github.com/earendil-works/pi/releases/download/v0.73.1";
-pub const PI_CANDIDATE_RELEASE_BASE: &str =
-    "https://github.com/earendil-works/pi/releases/download/v0.85.1";
+pub const PI_RELEASE_BASE: &str = "https://github.com/earendil-works/pi/releases/download/v0.87.1";
+/// The candidate track equals the production pin until the nightly exercises a
+/// newer release. A candidate move gives it its own descriptors again.
+pub const PI_CANDIDATE_RELEASE_BASE: &str = PI_RELEASE_BASE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PiArtifactDescriptor {
@@ -24,54 +25,56 @@ pub struct PiArtifactDescriptor {
     pub executable: &'static str,
 }
 
-/// The one older pin admitted for rollback. A pin update moves the former
-/// `PI_ARTIFACT` descriptor here; arbitrary installed revision names are never
-/// trusted. There is no predecessor for the first supported pin.
-pub const PI_PREVIOUS_ARTIFACT: Option<PiArtifactDescriptor> = None;
+/// The one older pin admitted for rollback; arbitrary installed revision names
+/// are never trusted. The predecessor must accept the launch contract of the
+/// current pin, because a launch after a rollback still builds the arguments
+/// and settings of `PI_SELECTED_ARTIFACT`. 0.85.1 is the verified revision the
+/// nightly ran before 0.87.1 and reads the same flags and settings keys.
+pub const PI_PREVIOUS_ARTIFACT: Option<PiArtifactDescriptor> = Some(PI_PREDECESSOR_ARTIFACT);
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub const PI_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
-    version: "0.73.1",
+    version: "0.87.1",
     archive: "pi-linux-x64.tar.gz",
-    byte_size: 45_540_364,
-    sha256: "00f0db9e93f6ba33deb1bb4d75b4eafede9fa5379b635a908cf967d5b37e366d",
+    byte_size: 42_120_827,
+    sha256: "80d78dd62d50049a006b981d994c61255bcc10e730b0c278d4ea0a755909764c",
     executable: "pi/pi",
 };
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 pub const PI_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
-    version: "0.73.1",
+    version: "0.87.1",
     archive: "pi-linux-arm64.tar.gz",
-    byte_size: 44_095_594,
-    sha256: "f47455b6a7ff6e43752a37c7c0a08b8054efd82cae1efc06d007c94f06a56318",
+    byte_size: 42_217_308,
+    sha256: "364b4a9f8491450b27a4857d4e3c780dbaf696790821c176a873e860cbbc3b89",
     executable: "pi/pi",
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub const PI_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
-    version: "0.73.1",
+    version: "0.87.1",
     archive: "pi-darwin-arm64.tar.gz",
-    byte_size: 28_567_469,
-    sha256: "c64f501cad8fa0a581257dc9e878e1b2f351f295d0d85d573fe8d7967bfb1bee",
+    byte_size: 30_563_988,
+    sha256: "4f8d288b78c9768d3a4ac6f61f06cd34394b82ac17d5b42d1e44a437add401b7",
     executable: "pi/pi",
 };
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 pub const PI_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
-    version: "0.73.1",
+    version: "0.87.1",
     archive: "pi-darwin-x64.tar.gz",
-    byte_size: 31_000_715,
-    sha256: "e59fded1f79fbc7b12e263bf43d1e358af598f6fb3c4d4f58e16d1c5ebe6b2b5",
+    byte_size: 33_033_993,
+    sha256: "01d8ee28d7114fec4f4eeedbb7561f790853040e9bfbdeebe79437ab66ea51f5",
     executable: "pi/pi",
 };
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub const PI_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
-    version: "0.73.1",
+    version: "0.87.1",
     archive: "pi-windows-x64.zip",
-    byte_size: 48_225_045,
-    sha256: "8bdb8e612a4b820f939a524652709b167ac5f1d4d1bba25988a631bff0bbe80b",
+    byte_size: 44_615_504,
+    sha256: "aab2ba67baf8ff97a52d05b62d88e9e65a840c6ea8fa1029a28d62d210d4e5fc",
     executable: "pi/pi.exe",
 };
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub const PI_CANDIDATE_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
+const PI_PREDECESSOR_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
     version: "0.85.1",
     archive: "pi-linux-x64.tar.gz",
     byte_size: 42_560_927,
@@ -79,7 +82,7 @@ pub const PI_CANDIDATE_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
     executable: "pi/pi",
 };
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-pub const PI_CANDIDATE_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
+const PI_PREDECESSOR_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
     version: "0.85.1",
     archive: "pi-linux-arm64.tar.gz",
     byte_size: 42_628_180,
@@ -87,7 +90,7 @@ pub const PI_CANDIDATE_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
     executable: "pi/pi",
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub const PI_CANDIDATE_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
+const PI_PREDECESSOR_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
     version: "0.85.1",
     archive: "pi-darwin-arm64.tar.gz",
     byte_size: 31_035_676,
@@ -95,7 +98,7 @@ pub const PI_CANDIDATE_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
     executable: "pi/pi",
 };
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-pub const PI_CANDIDATE_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
+const PI_PREDECESSOR_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
     version: "0.85.1",
     archive: "pi-darwin-x64.tar.gz",
     byte_size: 33_544_584,
@@ -103,7 +106,7 @@ pub const PI_CANDIDATE_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
     executable: "pi/pi",
 };
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-pub const PI_CANDIDATE_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
+const PI_PREDECESSOR_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
     version: "0.85.1",
     archive: "pi-windows-x64.zip",
     byte_size: 45_009_021,
@@ -111,7 +114,8 @@ pub const PI_CANDIDATE_ARTIFACT: PiArtifactDescriptor = PiArtifactDescriptor {
     executable: "pi/pi.exe",
 };
 
-pub const PI_CANDIDATE_PREVIOUS_ARTIFACT: Option<PiArtifactDescriptor> = Some(PI_ARTIFACT);
+pub const PI_CANDIDATE_ARTIFACT: PiArtifactDescriptor = PI_ARTIFACT;
+pub const PI_CANDIDATE_PREVIOUS_ARTIFACT: Option<PiArtifactDescriptor> = PI_PREVIOUS_ARTIFACT;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PiTrack {
@@ -866,6 +870,26 @@ mod tests {
     }
 
     #[test]
+    fn an_untrusted_older_revision_is_never_retained_for_rollback() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "muniment-pi-untrusted-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        // A host on a pin older than the predecessor publishes the new pin with no rollback target.
+        fs::write(root.join("current"), format!("{POINTER_HEADER}\n0.73.1\n")).unwrap();
+        publish_pointers(&root, &FsPiLifecycleBoundary, PI_SELECTED_TRACK).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("current")).unwrap(),
+            format!("{POINTER_HEADER}\n{}\n", PI_SELECTED_ARTIFACT.version)
+        );
+        assert!(!root.join("previous").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn interrupted_activation_preserves_the_existing_pointer() {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
@@ -925,14 +949,17 @@ mod tests {
             let track = pi_track(switch);
             assert_eq!(track.artifact, PI_ARTIFACT);
             assert_eq!(track.release_base, PI_RELEASE_BASE);
-            assert_eq!(track.previous, None);
+            assert_eq!(track.previous, PI_PREVIOUS_ARTIFACT);
         }
         let candidate = pi_track(Some("1"));
         assert_eq!(candidate.artifact, PI_CANDIDATE_ARTIFACT);
         assert_eq!(candidate.release_base, PI_CANDIDATE_RELEASE_BASE);
-        assert_eq!(candidate.previous, Some(PI_ARTIFACT));
-        assert_eq!(PI_ARTIFACT.version, "0.73.1");
-        assert_eq!(PI_CANDIDATE_ARTIFACT.version, "0.85.1");
+        assert_eq!(candidate.previous, PI_CANDIDATE_PREVIOUS_ARTIFACT);
+        assert_eq!(PI_ARTIFACT.version, "0.87.1");
+        assert_eq!(PI_CANDIDATE_ARTIFACT.version, "0.87.1");
+        assert_eq!(PI_PREVIOUS_ARTIFACT.map(|a| a.version), Some("0.85.1"));
+        assert_eq!(PI_PREDECESSOR_ARTIFACT.archive, PI_ARTIFACT.archive);
+        assert_eq!(PI_PREDECESSOR_ARTIFACT.executable, PI_ARTIFACT.executable);
     }
 
     #[test]
@@ -966,7 +993,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("muniment-pi-descriptors-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
-        for artifact in [PI_ARTIFACT, PI_CANDIDATE_ARTIFACT] {
+        for artifact in [PI_ARTIFACT, PI_PREDECESSOR_ARTIFACT] {
             assert!(artifact.byte_size > 0);
             assert_eq!(artifact.sha256.len(), 64);
             assert!(artifact.sha256.bytes().all(|b| b.is_ascii_hexdigit()));
@@ -995,7 +1022,7 @@ mod tests {
     }
 
     #[test]
-    fn candidate_activation_rolls_back_only_to_the_verified_production_pin() {
+    fn activation_rolls_back_only_to_the_verified_predecessor() {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
             "muniment-pi-upgrade-{}-{}",
@@ -1028,7 +1055,7 @@ mod tests {
             ..candidate
         };
         publish_pointers(&root, &FsPiLifecycleBoundary, track).unwrap();
-        // A repeated candidate install must retain the production predecessor.
+        // A repeated install must retain the verified predecessor.
         publish_pointers(&root, &FsPiLifecycleBoundary, track).unwrap();
         assert_eq!(
             read_pointer_for(&root, "previous", new, Some(old)).unwrap(),
@@ -1050,7 +1077,12 @@ mod tests {
                 false
             })
             .unwrap();
-        assert_eq!(restored, root.join("revisions/0.73.1").join(old.executable));
+        assert_eq!(
+            restored,
+            root.join("revisions")
+                .join(old.version)
+                .join(old.executable)
+        );
         assert_eq!(
             read_pointer_for(&root, "current", new, Some(old)).unwrap(),
             old.version
@@ -1086,7 +1118,7 @@ mod tests {
             read_pointer_for(&root, "current", new, Some(old)).unwrap(),
             new.version
         );
-        for version in [new.version, "other", "../0.73.1", ""] {
+        for version in [new.version, "other", "../0.85.1", "0.73.1", ""] {
             fs::write(
                 root.join("previous"),
                 format!("{POINTER_HEADER}\n{version}\n"),

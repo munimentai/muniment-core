@@ -1,4 +1,4 @@
-//! The candidate acquires packages through the verified Pi executable's embedded Bun runtime.
+//! The runtime acquires packages through the verified Pi executable's embedded Bun runtime.
 
 use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
@@ -10,15 +10,46 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
-use serde_json::Value;
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 
 pub const PI_PACKAGES: [(&str, &str); 5] = [
     ("pi-web-access", "0.30.0"),
-    ("pi-subagents", "0.70.1"),
+    ("pi-subagents", "0.71.0"),
     ("pi-background-tasks", "2.5.0"),
-    ("pi-mcp-adapter", "2.36.0"),
+    ("pi-mcp-adapter", "2.37.0"),
     ("pi-claude-bridge", "0.8.0"),
 ];
+
+/// The Bun lockfile for exactly `PI_PACKAGES`. It records every transitive
+/// version and its integrity hash, and the install is frozen to it, so no
+/// dependency resolves at install time. Regenerate it with the pinned Pi
+/// executable's Bun from the manifest `package_manifest` writes:
+/// `BUN_BE_BUN=1 pi install --lockfile-only --omit=peer --ignore-scripts`.
+pub const PI_PACKAGES_LOCK: &str = include_str!("pi_packages.bun.lock");
+
+/// The manifest the lockfile was resolved from. A frozen install fails when
+/// its dependencies differ from the lockfile's.
+fn package_manifest() -> Vec<u8> {
+    let dependencies: Map<String, Value> = PI_PACKAGES
+        .iter()
+        .map(|(name, version)| ((*name).to_owned(), Value::String((*version).to_owned())))
+        .collect();
+    let manifest = json!({
+        "name": "muniment-pi-packages",
+        "private": true,
+        "dependencies": dependencies,
+    });
+    serde_json::to_vec_pretty(&manifest).expect("the package manifest serializes")
+}
+
+/// The marker names the packages and the lockfile, so a new lockfile reinstalls.
+fn install_identity() -> io::Result<Vec<u8>> {
+    let lock = format!("{:x}", Sha256::digest(PI_PACKAGES_LOCK.as_bytes()));
+    Ok(serde_json::to_vec(
+        &json!({"packages": PI_PACKAGES, "lock": lock}),
+    )?)
+}
 
 fn installed(directory: &Path) -> bool {
     PI_PACKAGES.iter().all(|(name, version)| {
@@ -70,12 +101,14 @@ fn install_command(executable: &Path, directory: &Path) -> Command {
         // Scope it to acquisition. The RPC process must run Pi's entrypoint.
         .env("BUN_BE_BUN", "1")
         .arg("install")
-        .args(
-            PI_PACKAGES
-                .iter()
-                .map(|(name, version)| format!("{name}@{version}")),
-        )
-        .args(["--omit=peer", "--ignore-scripts", "--exact", "--cwd"])
+        // The lockfile pins every package and its integrity hash. Bun refuses
+        // to resolve or write anything the lockfile does not hold.
+        .args([
+            "--frozen-lockfile",
+            "--omit=peer",
+            "--ignore-scripts",
+            "--cwd",
+        ])
         .arg(directory)
         .current_dir(directory)
         .stdin(Stdio::null())
@@ -337,7 +370,7 @@ pub(crate) fn brand_mcp_adapter(directory: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Acquire packages before RPC starts. The caller supplies the verified candidate executable.
+/// Acquire packages before RPC starts. The caller supplies the verified executable.
 pub fn prepare_pi_packages(agent_directory: &Path, executable: &Path) -> io::Result<()> {
     let directory = agent_directory.join("npm");
     fs::create_dir_all(&directory)?;
@@ -361,7 +394,7 @@ pub fn prepare_pi_packages(agent_directory: &Path, executable: &Path) -> io::Res
         }
     }
     let marker = directory.join(".muniment-packages.json");
-    let identity = serde_json::to_vec(&PI_PACKAGES)?;
+    let identity = install_identity()?;
     // npm's lockfiles mean another package manager wrote this tree. Its files
     // are not this install, so the tree goes and the install starts over.
     let foreign_locks = [
@@ -392,15 +425,9 @@ pub fn prepare_pi_packages(agent_directory: &Path, executable: &Path) -> io::Res
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    match OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(directory.join("package.json"))
-    {
-        Ok(mut file) => file.write_all(b"{\"private\":true}")?,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error),
-    }
+    // The manifest and the lockfile are the runtime's. Each install replaces both.
+    fs::write(directory.join("package.json"), package_manifest())?;
+    fs::write(directory.join("bun.lock"), PI_PACKAGES_LOCK)?;
     // Resolve relative overrides before --cwd changes Bun's working directory.
     let directory = fs::canonicalize(directory)?;
     let stderr_tail = run_install(
@@ -637,7 +664,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn config_accepts_verbatim_session_root_and_agent_directory() {
-        use crate::sidecar::pi_install::PI_CANDIDATE_ARTIFACT;
+        use crate::sidecar::pi_install::PI_ARTIFACT;
         let root = std::env::temp_dir().join(format!("muniment-verbatim-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(root.join("sessions")).unwrap();
         let root = root.canonicalize().unwrap();
@@ -647,10 +674,9 @@ mod tests {
         let directory =
             crate::pi_settings::pi_agent_directory(&root, Some(agent.as_os_str())).unwrap();
         assert_eq!(directory, agent);
-        crate::pi_settings::store_pi_settings(&agent.join("settings.json"), PI_CANDIDATE_ARTIFACT)
-            .unwrap();
+        crate::pi_settings::store_pi_settings(&agent.join("settings.json"), PI_ARTIFACT).unwrap();
         let config = crate::sidecar::pi_sidecar_config("pi.exe", &sessions, None).unwrap();
-        assert_eq!(config.args[3], sessions.to_string_lossy());
+        assert_eq!(config.args[4], sessions.to_string_lossy());
         let npm = agent.join("npm");
         background_fixture(&npm);
         for (name, version) in PI_PACKAGES {
@@ -664,7 +690,7 @@ mod tests {
         }
         fs::write(
             npm.join(".muniment-packages.json"),
-            serde_json::to_vec(&PI_PACKAGES).unwrap(),
+            install_identity().unwrap(),
         )
         .unwrap();
         prepare_pi_packages(&agent, Path::new("pi.exe")).unwrap();
@@ -738,14 +764,9 @@ mod tests {
             args,
             [
                 "install",
-                "pi-web-access@0.30.0",
-                "pi-subagents@0.70.1",
-                "pi-background-tasks@2.5.0",
-                "pi-mcp-adapter@2.36.0",
-                "pi-claude-bridge@0.8.0",
+                "--frozen-lockfile",
                 "--omit=peer",
                 "--ignore-scripts",
-                "--exact",
                 "--cwd",
                 "/agent/npm"
             ]
@@ -753,6 +774,53 @@ mod tests {
         assert!(command
             .get_envs()
             .any(|(key, value)| key == "BUN_BE_BUN" && value == Some("1".as_ref())));
+    }
+
+    #[test]
+    fn the_lockfile_pins_exactly_the_manifest_with_integrity_hashes() {
+        let manifest: Value = serde_json::from_slice(&package_manifest()).unwrap();
+        let dependencies = manifest["dependencies"].as_object().unwrap();
+        assert_eq!(dependencies.len(), PI_PACKAGES.len());
+        let workspace = PI_PACKAGES_LOCK.split("\"packages\":").next().unwrap();
+        for (name, version) in PI_PACKAGES {
+            assert_eq!(dependencies[name], version);
+            // The root workspace names each pin, and the tree holds that exact release.
+            assert!(workspace.contains(&format!("\"{name}\": \"{version}\",")));
+            assert!(PI_PACKAGES_LOCK.contains(&format!("[\"{name}@{version}\", \"\"")));
+        }
+        let entries = PI_PACKAGES_LOCK
+            .lines()
+            .filter(|line| line.trim_start().starts_with('"') && line.contains(": [\""))
+            .collect::<Vec<_>>();
+        assert!(!entries.is_empty());
+        for entry in entries {
+            assert!(entry.contains("\"sha512-"), "{entry}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn each_install_writes_the_manifest_and_the_lockfile() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("muniment-package-lock-{}", uuid::Uuid::new_v4()));
+        let npm = root.join("npm");
+        fs::create_dir_all(&npm).unwrap();
+        fs::write(npm.join("package.json"), "{\"private\":true}").unwrap();
+        fs::write(npm.join("bun.lock"), "{}").unwrap();
+        let executable = root.join("pi-stub");
+        fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(prepare_pi_packages(&root, &executable).is_err());
+        assert_eq!(
+            fs::read(npm.join("package.json")).unwrap(),
+            package_manifest()
+        );
+        assert_eq!(
+            fs::read_to_string(npm.join("bun.lock")).unwrap(),
+            PI_PACKAGES_LOCK
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -770,7 +838,7 @@ mod tests {
             .unwrap();
         }
         let marker = npm.join(".muniment-packages.json");
-        fs::write(&marker, serde_json::to_vec(&PI_PACKAGES).unwrap()).unwrap();
+        fs::write(&marker, install_identity().unwrap()).unwrap();
         let missing = root.join("missing-executable");
         prepare_pi_packages(&root, &missing).unwrap();
         fs::write(npm.join("node_modules/.package-lock.json"), "{}").unwrap();
@@ -800,7 +868,7 @@ mod tests {
         assert!(prepare_pi_packages(&root, &missing).is_err());
         let marker = npm.join(".muniment-packages.json");
         assert!(!marker.exists());
-        fs::write(&marker, serde_json::to_vec(&PI_PACKAGES).unwrap()).unwrap();
+        fs::write(&marker, install_identity().unwrap()).unwrap();
         prepare_pi_packages(&root, &missing).unwrap();
         fs::write(npm.join("node_modules/pi-web-access/package.json"), "{}").unwrap();
         assert!(prepare_pi_packages(&root, &missing).is_err());

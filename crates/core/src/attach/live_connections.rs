@@ -64,6 +64,23 @@ impl LiveConnectionRegistry {
         self.set_state(credential, |state| *state = LiveConnectionState::Revoked)
     }
 
+    /// Revokes every live connection under every credential, as a sign-out does. The
+    /// credentials stay usable, so a companion that a later visible approval admits
+    /// connects again.
+    pub fn revoke_all(&self) -> usize {
+        let connections = self.connections.lock().expect("live connection registry");
+        let mut revoked = 0;
+        for entries in connections.values() {
+            let _gate = entries.gate.lock().expect("credential admission gate");
+            for connection in entries.connections.values() {
+                *connection.state.lock().expect("live connection state") =
+                    LiveConnectionState::Revoked;
+                revoked += 1;
+            }
+        }
+        revoked
+    }
+
     fn set_state(&self, credential: &str, update: impl Fn(&mut LiveConnectionState)) -> usize {
         let mut connections = self.connections.lock().expect("live connection registry");
         let entries = connections.entry(credential.to_owned()).or_default();
@@ -124,5 +141,34 @@ impl Drop for RegisteredConnection {
         if let Some(entries) = connections.get_mut(&self.credential) {
             entries.connections.remove(&self.connection_event_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(value: u128) -> super::super::Id {
+        super::super::Id::new(format!("{value:032x}")).unwrap()
+    }
+
+    #[test]
+    fn revoke_all_revokes_live_connections_and_admits_later_ones() {
+        let registry = LiveConnectionRegistry::default();
+        let first = registry.register("credential-a".into(), "cap-a".into(), id(1));
+        let second = registry.register("credential-b".into(), "cap-b".into(), id(2));
+        assert_eq!(registry.revoke_all(), 2);
+        for connection in [&first, &second] {
+            assert_eq!(
+                *connection.connection.state.lock().unwrap(),
+                LiveConnectionState::Revoked
+            );
+        }
+        drop(first);
+        let later = registry.register("credential-a".into(), "cap-c".into(), id(3));
+        assert_eq!(
+            *later.connection.state.lock().unwrap(),
+            LiveConnectionState::Active
+        );
     }
 }

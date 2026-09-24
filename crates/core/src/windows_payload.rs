@@ -91,7 +91,7 @@ pub fn plan_windows_payload_removals(
     let per_user_scope = payload_scopes.per_user_removal_scope(user_sid)?;
     Ok(per_user_scope
         .into_iter()
-        .chain(payload_scopes.machine_removal_scope())
+        .chain(payload_scopes.machine_removal_scope(user_sid))
         .map(|scope| plan_scope_task_removals(scope, registrations))
         .collect())
 }
@@ -112,11 +112,12 @@ impl WindowsPayloadScopes {
             }))
     }
 
-    /// Builds the removal scope for an installed machine payload.
-    pub fn machine_removal_scope(&self) -> Option<RemovalScope> {
+    /// Builds the removal scope for an installed machine payload run by `user_sid`.
+    pub fn machine_removal_scope(&self, user_sid: &str) -> Option<RemovalScope> {
         self.machine_payload_path
             .as_ref()
             .map(|payload_path| RemovalScope::Machine {
+                invoking_user_sid: user_sid.to_owned(),
                 payload_path: payload_path.clone(),
                 per_user_payload_path: self.per_user_payload_path.clone(),
             })

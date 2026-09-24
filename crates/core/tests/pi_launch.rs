@@ -328,8 +328,12 @@ impl PiLaunchBoundaries for TrackBoundaries {
 
 #[test]
 fn every_launch_renders_the_selected_track_before_spawn() {
-    use muniment_core::sidecar::pi_install::{PI_ARTIFACT, PI_CANDIDATE_ARTIFACT};
-    for artifact in [PI_ARTIFACT, PI_CANDIDATE_ARTIFACT] {
+    use muniment_core::sidecar::pi_install::{PI_ARTIFACT, PI_PREVIOUS_ARTIFACT};
+    // The pin and its retained predecessor share one launch contract.
+    for artifact in [Some(PI_ARTIFACT), PI_PREVIOUS_ARTIFACT]
+        .into_iter()
+        .flatten()
+    {
         for grant in [ChatGrant::local(), grant()] {
             let root = temporary_directory();
             fs::write(root.join("session.jsonl"), "").unwrap();
@@ -348,18 +352,13 @@ fn every_launch_renders_the_selected_track_before_spawn() {
                     serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
                 assert_eq!(settings["defaultProvider"], "ollama");
                 assert_eq!(settings["foreign"], true);
-                if artifact == PI_CANDIDATE_ARTIFACT {
-                    assert_eq!(settings["packages"].as_array().unwrap().len(), 5);
-                    assert_eq!(settings["defaultTools"].as_array().unwrap().len(), 8);
-                    assert_eq!(
-                        config.startup_timeout,
-                        Duration::from_secs(if grant.is_local() { 120 } else { 30 })
-                    );
-                } else {
-                    assert!(settings.get("packages").is_none());
-                    assert!(settings.get("defaultTools").is_none());
-                    assert_eq!(config.startup_timeout, Duration::from_secs(30));
-                }
+                assert_eq!(settings["packages"].as_array().unwrap().len(), 5);
+                assert_eq!(settings["defaultTools"].as_array().unwrap().len(), 8);
+                assert_eq!(
+                    config.startup_timeout,
+                    Duration::from_secs(if grant.is_local() { 120 } else { 30 })
+                );
+                assert_eq!(config.args[..3], ["--mode", "rpc", "--approve"]);
                 assert_eq!(
                     config
                         .args
@@ -377,12 +376,12 @@ fn every_launch_renders_the_selected_track_before_spawn() {
 }
 
 #[test]
-fn rejects_a_candidate_launch_when_settings_cannot_be_saved() {
+fn rejects_a_launch_when_settings_cannot_be_saved() {
     let root = temporary_directory();
     fs::write(root.join("settings.json"), "null").unwrap();
     let boundaries = TrackBoundaries {
         root: root.clone(),
-        artifact: muniment_core::sidecar::pi_install::PI_CANDIDATE_ARTIFACT,
+        artifact: muniment_core::sidecar::pi_install::PI_ARTIFACT,
     };
     for grant in [ChatGrant::local(), grant()] {
         let error =
@@ -403,7 +402,7 @@ fn rejects_a_candidate_launch_when_settings_cannot_be_saved() {
 #[cfg(unix)]
 fn pinned_pi_cloud_wire_contract() {
     let Ok(executable) = std::env::var("MUNIMENT_PI_WIRE_EXECUTABLE") else {
-        eprintln!("The wire test requires MUNIMENT_PI_WIRE_EXECUTABLE for Pi 0.73.1 or 0.85.1.");
+        eprintln!("The wire test requires MUNIMENT_PI_WIRE_EXECUTABLE for Pi 0.85.1 or 0.87.1.");
         return;
     };
     let output = std::process::Command::new("python3")

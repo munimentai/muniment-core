@@ -12,7 +12,7 @@ use muniment_attach::{
 
 use super::deadline_io::{is_timeout, read_exact_before, write_all_before};
 use super::linux::PeerCredentials;
-use super::verify_approval_presenter_peer_with_reader;
+use super::verify_accepted_desktop_peer;
 use crate::browser_control::LinuxProcReader;
 
 const DESKTOP_PROTOCOL: VersionRange = VersionRange { min: 1, max: 1 };
@@ -41,14 +41,12 @@ pub fn admit_approval_presenter(
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or(ApprovalPresenterAdmissionError::Timeout)?;
-    let peer_authorized = u32::try_from(peer_credentials.pid).is_ok_and(|peer_pid| {
-        verify_approval_presenter_peer_with_reader(
-            peer_pid,
-            expected_desktop_executable,
-            process_reader,
-        )
-        .is_ok()
-    });
+    let peer_authorized = verify_accepted_desktop_peer(
+        &peer_credentials,
+        expected_desktop_executable,
+        process_reader,
+    )
+    .is_ok();
     if !peer_authorized {
         write_protocol_error(&mut stream, ProtocolError::unauthorized(), deadline);
         return Err(ApprovalPresenterAdmissionError::PeerUnauthorized);

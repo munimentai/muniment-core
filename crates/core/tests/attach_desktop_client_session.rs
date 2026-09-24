@@ -1757,6 +1757,7 @@ fn desktop_chat_subscription_delivers_events_and_owns_the_session() {
                 recalls: Vec::new(),
                 applied_diffs: Vec::new(),
                 pending_permission: None,
+                delta: None,
             })
             .unwrap();
         let Envelope::Event(event) = read_envelope(&mut client) else {
@@ -1843,6 +1844,7 @@ fn desktop_chat_subscription_stays_responsive_under_sustained_events() {
                     recalls: Vec::new(),
                     applied_diffs: Vec::new(),
                     pending_permission: None,
+                    delta: None,
                 })
                 .is_err()
             {

@@ -155,3 +155,22 @@ pub struct EntitlementSnapshotResult {
     pub snapshot: crate::auth::EntitlementSnapshotView,
     pub changed_snapshot_version: Option<u64>,
 }
+
+/// Compares a presented secret with the expected one in time that does not depend on
+/// where the two first differ. A length mismatch returns early, because lengths are
+/// fixed by the issuer and carry no secret.
+pub(crate) fn secret_eq(presented: &str, expected: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    presented.as_bytes().ct_eq(expected.as_bytes()).into()
+}
+
+#[cfg(test)]
+mod secret_eq_tests {
+    #[test]
+    fn compares_whole_secrets() {
+        assert!(super::secret_eq("capability", "capability"));
+        assert!(!super::secret_eq("capability", "capabilitx"));
+        assert!(!super::secret_eq("capability", "capabilit"));
+        assert!(!super::secret_eq("", "capability"));
+    }
+}

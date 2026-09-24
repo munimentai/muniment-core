@@ -41,6 +41,7 @@ fn entry(
         claimed_kind: kind.to_owned(),
         claimed_version: version.to_owned(),
         approved_at: approved_at.map(str::to_owned),
+        subject: None,
     }
 }
 
@@ -129,6 +130,7 @@ fn start_session(
                 pid: std::process::id() as libc::pid_t,
                 uid: unsafe { libc::geteuid() },
                 gid: unsafe { libc::getegid() },
+                accept_image: None,
             },
             "0.1.0",
             Duration::from_secs(2),

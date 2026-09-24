@@ -191,6 +191,7 @@ fn writes_registration_and_applies_each_removal_plan() {
     fixture.register_machine_task();
 
     let machine_scope = RemovalScope::Machine {
+        invoking_user_sid: sid.as_str().to_owned(),
         payload_path: PathBuf::from(MACHINE_PAYLOAD),
         per_user_payload_path: None,
     };

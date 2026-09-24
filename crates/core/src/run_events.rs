@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvError, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{SecondsFormat, Utc};
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -13,45 +14,168 @@ use crate::chat_view::{
     chat_attachments, chat_pending_permission, chat_tool_activity, projection_phase,
     ChatAppliedDiff, ChatAttachment, ChatPendingPermission, ChatToolActivity,
 };
-use crate::code_diff_journal::{load_applied_code_diffs, load_pending_code_diff};
+use crate::code_diff_journal::{load_applied_code_diffs_cached, load_pending_code_diff_cached};
 use crate::journal::pi_translation::close_open_effects;
 use crate::journal::reducer::{ChatProjection, ChatProjector, ProjectedRecall};
-use crate::journal::run_append::append_run_event;
+use crate::journal::run_append::append_run_event_in_place;
 use crate::journal::{EventEnvelope, EventPayload, Provenance, RunJournal};
 use muniment_code_diff::CodeDiff;
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// How long a run streams text deltas before it sends its whole state again.
+/// A shell that missed the start of the run, such as a reloaded window, joins
+/// the stream at the next whole state.
+pub const CHAT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Counts chat-event subscriptions. A run sends its whole state again after a
+/// subscription starts, so every subscriber reads a whole state before a delta.
+static SUBSCRIPTION_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn subscription_generation() -> u64 {
+    SUBSCRIPTION_GENERATION.load(Ordering::Acquire)
+}
+
+/// A chat event is either a whole projection of the run or, with `delta`
+/// set, a text delta. A text delta carries the run id, the thread id, the
+/// phase and in `text` only the text appended since the run's previous event.
+/// Every other field keeps the value of the previous event, except the
+/// routing stage, which a text delta clears.
+#[derive(Clone)]
 pub struct ChatEvent {
     pub run_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     pub phase: String,
     pub text: String,
     /// The shell's in-flight word: `Routing` before the accepted prompt, `Thinking` from the started turn.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub prompt_accepted: bool,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub turn_started: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub routing_stage: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_storage_notice: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub receipt: Option<Value>,
     pub tool_activity: Vec<ChatToolActivity>,
     pub attachments: Vec<ChatAttachment>,
     pub recalls: Vec<ProjectedRecall>,
     pub applied_diffs: Vec<ChatAppliedDiff>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_permission: Option<ChatPendingPermission>,
+    pub delta: Option<ChatTextDelta>,
 }
 
-/// A chat-event receiver that unregisters itself when dropped.
+/// Marks a chat event that carries only appended text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatTextDelta {
+    /// Where the appended text starts in the run's text, in UTF-16 code units.
+    pub text_start: usize,
+    generation: u64,
+}
+
+impl ChatTextDelta {
+    pub fn new(text_start: usize) -> Self {
+        Self {
+            text_start,
+            generation: subscription_generation(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatEventWire<'a> {
+    run_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thread_id: Option<&'a str>,
+    phase: &'a str,
+    text: &'a str,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    prompt_accepted: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    turn_started: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    routing_stage: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_storage_notice: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_reason: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt: Option<&'a Value>,
+    tool_activity: &'a [ChatToolActivity],
+    attachments: &'a [ChatAttachment],
+    recalls: &'a [ProjectedRecall],
+    applied_diffs: &'a [ChatAppliedDiff],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending_permission: Option<&'a ChatPendingPermission>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatTextDeltaWire<'a> {
+    run_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thread_id: Option<&'a str>,
+    phase: &'a str,
+    text: &'a str,
+    text_start: usize,
+}
+
+impl Serialize for ChatEvent {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if let Some(delta) = &self.delta {
+            return ChatTextDeltaWire {
+                run_id: &self.run_id,
+                thread_id: self.thread_id.as_deref(),
+                phase: &self.phase,
+                text: &self.text,
+                text_start: delta.text_start,
+            }
+            .serialize(serializer);
+        }
+        ChatEventWire {
+            run_id: &self.run_id,
+            thread_id: self.thread_id.as_deref(),
+            phase: &self.phase,
+            text: &self.text,
+            prompt_accepted: self.prompt_accepted,
+            turn_started: self.turn_started,
+            routing_stage: self.routing_stage.as_deref(),
+            prompt_storage_notice: self.prompt_storage_notice.as_deref(),
+            failure_reason: self.failure_reason.as_deref(),
+            receipt: self.receipt.as_ref(),
+            tool_activity: &self.tool_activity,
+            attachments: &self.attachments,
+            recalls: &self.recalls,
+            applied_diffs: &self.applied_diffs,
+            pending_permission: self.pending_permission.as_ref(),
+        }
+        .serialize(serializer)
+    }
+}
+
+/// What one run's live stream last delivered in full.
+#[derive(Clone, Debug, Default)]
+pub struct ChatDelivery {
+    snapshot: Option<(u64, Instant)>,
+}
+
+impl ChatDelivery {
+    /// Reports whether a text event may go out as a delta: a whole state went
+    /// out since the newest subscription started, and less than the snapshot
+    /// interval ago.
+    fn allows_delta(&self, generation: u64) -> bool {
+        self.snapshot.is_some_and(|(delivered, at)| {
+            delivered == generation && at.elapsed() < CHAT_SNAPSHOT_INTERVAL
+        })
+    }
+
+    pub(crate) fn delivered_snapshot(&mut self, generation: u64) {
+        self.snapshot = Some((generation, Instant::now()));
+    }
+}
+
+/// A chat-event receiver that unregisters itself when dropped. It skips a
+/// text delta built before the subscription started, because this receiver
+/// has no whole state for that delta to extend. The run's next event is whole.
 pub struct ChatEventSubscription {
     receiver: Receiver<ChatEvent>,
+    generation: u64,
     on_drop: Option<Box<dyn FnOnce() + Send>>,
 }
 
@@ -59,6 +183,7 @@ impl ChatEventSubscription {
     pub fn new(receiver: Receiver<ChatEvent>, on_drop: impl FnOnce() + Send + 'static) -> Self {
         Self {
             receiver,
+            generation: start_subscription(),
             on_drop: Some(Box::new(on_drop)),
         }
     }
@@ -67,21 +192,50 @@ impl ChatEventSubscription {
     pub fn detached(receiver: Receiver<ChatEvent>) -> Self {
         Self {
             receiver,
+            generation: start_subscription(),
             on_drop: None,
         }
     }
 
+    fn current(&self, event: &ChatEvent) -> bool {
+        event
+            .delta
+            .as_ref()
+            .is_none_or(|delta| delta.generation >= self.generation)
+    }
+
     pub fn recv(&self) -> Result<ChatEvent, RecvError> {
-        self.receiver.recv()
+        loop {
+            let event = self.receiver.recv()?;
+            if self.current(&event) {
+                return Ok(event);
+            }
+        }
     }
 
     pub fn recv_timeout(&self, timeout: Duration) -> Result<ChatEvent, RecvTimeoutError> {
-        self.receiver.recv_timeout(timeout)
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let event = self.receiver.recv_timeout(remaining)?;
+            if self.current(&event) {
+                return Ok(event);
+            }
+        }
     }
 
     pub fn try_recv(&self) -> Result<ChatEvent, TryRecvError> {
-        self.receiver.try_recv()
+        loop {
+            let event = self.receiver.try_recv()?;
+            if self.current(&event) {
+                return Ok(event);
+            }
+        }
     }
+}
+
+fn start_subscription() -> u64 {
+    SUBSCRIPTION_GENERATION.fetch_add(1, Ordering::AcqRel) + 1
 }
 
 impl Drop for ChatEventSubscription {
@@ -128,6 +282,7 @@ pub fn chat_event(
         recalls: projection.recalls,
         applied_diffs,
         pending_permission: chat_pending_permission(projection.pending_permission, code_diff),
+        delta: None,
     }
 }
 
@@ -161,21 +316,84 @@ pub(crate) fn append_emit_detailed(
 ) -> Result<(), String> {
     *seq += 1;
     let envelope = event_envelope(sink, run_id, *seq, kind, payload, subject);
-    let (projection, code_diff, applied_diffs) = {
+    let event = {
         let mut storage = storage
             .lock()
             .map_err(|error| format!("Journal lock failed: {error}"))?;
-        let projection = append_run_event(&mut storage.journal, projector, &envelope)
+        let text_start = projector.text_utf16_len();
+        append_run_event_in_place(&mut storage.journal, projector, &envelope)
             .map_err(|error| format!("Journal append failed: {error:?}"))?;
-        let gate = projection.pending_permission.clone();
-        let ChatStorage { journal, cas } = &mut *storage;
-        let code_diff = load_pending_code_diff(journal, cas, run_id, &gate);
-        let applied_diffs =
-            load_applied_code_diffs(journal, cas, run_id, projection.applied_diffs.clone());
-        (projection, code_diff, applied_diffs)
+        let generation = subscription_generation();
+        match text_delta(projector, &envelope, text_start, generation) {
+            Some(event) => event,
+            None => {
+                let projection = projector.projection().map_err(|error| {
+                    format!(
+                        "Journal append failed: {:?}",
+                        crate::journal::run_append::RunAppendError::Projection(error)
+                    )
+                })?;
+                let gate = projection.pending_permission.clone();
+                let ChatStorage { journal, cas } = &mut *storage;
+                let code_diff = load_pending_code_diff_cached(
+                    journal,
+                    cas,
+                    run_id,
+                    &gate,
+                    &mut projector.code_diffs,
+                );
+                let applied_diffs = load_applied_code_diffs_cached(
+                    journal,
+                    cas,
+                    run_id,
+                    projection.applied_diffs.clone(),
+                    &mut projector.code_diffs,
+                );
+                projector.delivery.delivered_snapshot(generation);
+                chat_event(run_id, projection, code_diff, applied_diffs)
+            }
+        }
     };
-    sink.deliver(chat_event(run_id, projection, code_diff, applied_diffs))
+    sink.deliver(event)
         .map_err(|()| "The shell event sink rejected the projection.".into())
+}
+
+/// Builds the text delta for an appended `model.stream.delta` event when
+/// every subscriber already holds the run's whole state.
+pub(crate) fn text_delta(
+    projector: &ChatProjector,
+    envelope: &EventEnvelope,
+    text_start: usize,
+    generation: u64,
+) -> Option<ChatEvent> {
+    if envelope.event_type != "model.stream.delta" || !projector.delivery.allows_delta(generation) {
+        return None;
+    }
+    let EventPayload::Inline { payload_json } = &envelope.payload else {
+        return None;
+    };
+    let text = payload_json.get("text").and_then(Value::as_str)?;
+    Some(ChatEvent {
+        run_id: envelope.run_id.clone(),
+        thread_id: None,
+        phase: projection_phase(&projector.status().cloned()).into(),
+        text: text.to_owned(),
+        prompt_accepted: false,
+        turn_started: false,
+        routing_stage: None,
+        prompt_storage_notice: None,
+        failure_reason: None,
+        receipt: None,
+        tool_activity: Vec::new(),
+        attachments: Vec::new(),
+        recalls: Vec::new(),
+        applied_diffs: Vec::new(),
+        pending_permission: None,
+        delta: Some(ChatTextDelta {
+            text_start,
+            generation,
+        }),
+    })
 }
 
 #[allow(clippy::result_unit_err, clippy::too_many_arguments)]
@@ -796,6 +1014,159 @@ mod tests {
             .events(&run_id)
             .unwrap()
             .is_empty());
+    }
+
+    fn stream(
+        sink: &RecordingSink,
+        storage: &SharedStorage,
+        projector: &mut ChatProjector,
+        run_id: &str,
+        seq: &mut u64,
+        kind: &str,
+        payload: Value,
+    ) {
+        append_emit(sink, storage, projector, run_id, seq, kind, payload, None).unwrap();
+    }
+
+    /// Runs `scenario` until no other test starts a subscription during it,
+    /// because a new subscription turns the next delta into a whole state.
+    fn without_new_subscriptions<T>(mut scenario: impl FnMut() -> T) -> T {
+        loop {
+            let before = subscription_generation();
+            let result = scenario();
+            if subscription_generation() == before {
+                return result;
+            }
+        }
+    }
+
+    #[test]
+    fn a_text_event_after_a_whole_state_carries_only_the_appended_text() {
+        let (sink, projector, run_id) = without_new_subscriptions(|| {
+            let sink = RecordingSink::default();
+            let storage = storage();
+            let mut projector = ChatProjector::new();
+            let mut seq = 0;
+            let run_id = Uuid::now_v7().to_string();
+            for (kind, payload) in [
+                ("run.started", json!({})),
+                (
+                    "tool.effect.started",
+                    json!({"effect_id": "tool-1", "input": "ls"}),
+                ),
+                ("model.stream.delta", json!({"text": "héllo"})),
+                ("model.stream.delta", json!({"text": " wörld"})),
+            ] {
+                stream(
+                    &sink,
+                    &storage,
+                    &mut projector,
+                    &run_id,
+                    &mut seq,
+                    kind,
+                    payload,
+                );
+            }
+            (sink, projector, run_id)
+        });
+
+        let events = sink.events.lock().unwrap();
+        assert!(events[..2].iter().all(|event| event.delta.is_none()));
+        let first = &events[2];
+        assert_eq!(first.text, "héllo");
+        assert_eq!(first.delta.as_ref().unwrap().text_start, 0);
+        let second = serde_json::to_value(&events[3]).unwrap();
+        assert_eq!(
+            second,
+            json!({"runId": run_id, "phase": "streaming", "text": " wörld", "textStart": 5})
+        );
+        assert_eq!(projector.projection().unwrap().text, "héllo wörld");
+    }
+
+    #[test]
+    fn a_new_subscription_gets_a_whole_state_before_any_delta() {
+        let (sink, storage, mut projector, mut seq, run_id) = without_new_subscriptions(|| {
+            let sink = RecordingSink::default();
+            let storage = storage();
+            let mut projector = ChatProjector::new();
+            let mut seq = 0;
+            let run_id = Uuid::now_v7().to_string();
+            stream(
+                &sink,
+                &storage,
+                &mut projector,
+                &run_id,
+                &mut seq,
+                "run.started",
+                json!({}),
+            );
+            stream(
+                &sink,
+                &storage,
+                &mut projector,
+                &run_id,
+                &mut seq,
+                "model.stream.delta",
+                json!({"text": "one"}),
+            );
+            (sink, storage, projector, seq, run_id)
+        });
+        let stale = sink.events.lock().unwrap().last().cloned().unwrap();
+        assert!(stale.delta.is_some());
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let subscription = ChatEventSubscription::detached(receiver);
+        stream(
+            &sink,
+            &storage,
+            &mut projector,
+            &run_id,
+            &mut seq,
+            "model.stream.delta",
+            json!({"text": " two"}),
+        );
+        let whole = sink.events.lock().unwrap().last().cloned().unwrap();
+        assert!(whole.delta.is_none());
+        assert_eq!(whole.text, "one two");
+
+        // A delta built before the subscription started never reaches it.
+        sender.send(stale).unwrap();
+        sender.send(whole).unwrap();
+        assert_eq!(subscription.try_recv().unwrap().text, "one two");
+        assert!(subscription.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_text_stream_sends_its_whole_state_again_after_the_snapshot_interval() {
+        let sink = RecordingSink::default();
+        let storage = storage();
+        let mut projector = ChatProjector::new();
+        let mut seq = 0;
+        let run_id = Uuid::now_v7().to_string();
+        stream(
+            &sink,
+            &storage,
+            &mut projector,
+            &run_id,
+            &mut seq,
+            "run.started",
+            json!({}),
+        );
+        let generation = projector.delivery.snapshot.unwrap().0;
+        projector.delivery.snapshot = Some((
+            generation,
+            Instant::now().checked_sub(CHAT_SNAPSHOT_INTERVAL).unwrap(),
+        ));
+        stream(
+            &sink,
+            &storage,
+            &mut projector,
+            &run_id,
+            &mut seq,
+            "model.stream.delta",
+            json!({"text": "late"}),
+        );
+        assert!(sink.events.lock().unwrap().last().unwrap().delta.is_none());
     }
 
     #[test]

@@ -59,6 +59,9 @@ use uuid::{Uuid, Version};
 
 const SCHEMA_VERSION: i64 = 4;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+// One append runs about a dozen distinct statements, and the thread projection
+// adds more for tools and gates. The cache holds all of them at once.
+const STATEMENT_CACHE_CAPACITY: usize = 48;
 const COMMIT_HINT_CAPACITY: usize = 64;
 
 /// A loss-tolerant wake-up hint. SQLite remains the authoritative event source.
@@ -191,6 +194,7 @@ pub struct RunJournal {
     pub(crate) coordination: Option<Arc<JournalCoordination>>,
     pub(crate) generation: u64,
     pub(crate) assistant_projection_cache: Option<AssistantProjectionCache>,
+    pub(crate) run_stream_cache: reducer::RunStreamCache,
 }
 
 pub(crate) struct AssistantProjectionCache {
@@ -355,6 +359,10 @@ pub struct ThreadProjectionBoundary {
 pub(crate) struct JournalCoordination {
     pub(crate) operation: Mutex<()>,
     pub(crate) generation: std::sync::atomic::AtomicU64,
+    /// True once an open in this process has run the full database validation
+    /// while this coordination is live. Every later write in the process
+    /// validates its own envelopes, so a reopen skips the full scan.
+    validated: std::sync::atomic::AtomicBool,
     subscribers: Mutex<Vec<CommitSubscriber>>,
 }
 
@@ -430,6 +438,7 @@ fn coordination_for(path: &Path) -> Arc<JournalCoordination> {
     let coordination = Arc::new(JournalCoordination {
         operation: Mutex::new(()),
         generation: std::sync::atomic::AtomicU64::new(0),
+        validated: std::sync::atomic::AtomicBool::new(false),
         subscribers: Mutex::new(Vec::new()),
     });
     journals.insert(key, Arc::downgrade(&coordination));
@@ -770,6 +779,15 @@ impl RunJournal {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.busy_timeout(busy_timeout)?;
+        connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
+        // The full validation runs once per process for each journal path: the
+        // first open validates, and a reopen while that handle's coordination
+        // is live skips the scan. When every handle closes, the next open
+        // validates again, so a file changed while closed never opens unchecked.
+        let validated = version == SCHEMA_VERSION
+            && coordination
+                .as_ref()
+                .is_some_and(|state| state.validated.load(std::sync::atomic::Ordering::Acquire));
         if version < SCHEMA_VERSION {
             // Commit the upgrade once so startup does not sync each intermediate schema.
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -790,7 +808,14 @@ impl RunJournal {
             }
             tx.commit()?;
         }
-        validate_database(&connection)?;
+        if !validated {
+            validate_database(&connection)?;
+            if let Some(state) = &coordination {
+                state
+                    .validated
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
         let cursor_key = load_or_create_cursor_key(&connection)?;
         let generation = coordination.as_ref().map_or(0, |state| {
             state.generation.load(std::sync::atomic::Ordering::Acquire)
@@ -803,6 +828,7 @@ impl RunJournal {
             generation,
             coordination,
             assistant_projection_cache: None,
+            run_stream_cache: reducer::RunStreamCache::default(),
         })
     }
 
@@ -1355,6 +1381,106 @@ impl RunJournal {
             .map_err(Into::into)
     }
 
+    /// The receipt models of a thread's first `limit` runs other than
+    /// `excluded_run_id`, in run order, from the receipt projection. A run
+    /// without a valid receipt or without a model adds nothing, and a deleted
+    /// thread has none.
+    pub fn thread_receipt_models(
+        &mut self,
+        thread_id: &str,
+        excluded_run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, JournalError> {
+        let coordination = self.coordination.clone();
+        let _operation = coordination
+            .as_ref()
+            .map(|state| state.operation.lock().unwrap());
+        self.refresh_after_compaction()?;
+        let connection = self
+            .connection
+            .as_ref()
+            .expect("journal connection is always present outside compaction");
+        let mut statement = connection.prepare_cached(
+            "WITH runs AS (SELECT run_id,thread_run_ordinal FROM run_threads \
+             WHERE thread_id=?1 AND NOT EXISTS(SELECT 1 FROM thread_events deleted \
+                WHERE deleted.thread_id=?1 AND deleted.event_type='thread.deleted') \
+             ORDER BY thread_run_ordinal LIMIT ?3) \
+             SELECT r.receipt_json FROM runs JOIN receipt_projection r ON r.run_id=runs.run_id \
+             WHERE runs.run_id<>?2 AND r.valid=1 AND r.receipt_json IS NOT NULL \
+             ORDER BY runs.thread_run_ordinal, r.run_seq",
+        )?;
+        let rows = statement
+            .query_map(params![thread_id, excluded_run_id, limit as u64], |row| {
+                row.get::<_, String>(0)
+            })?;
+        let mut models = Vec::new();
+        for encoded in rows {
+            let Ok(receipt) = serde_json::from_str::<ReceiptProjection>(&encoded?) else {
+                continue;
+            };
+            if let Some(model) = receipt.model {
+                models.push(model);
+            }
+        }
+        Ok(models)
+    }
+
+    /// The projected user and assistant text of a thread's newest `limit` runs
+    /// owned by `workspace`, oldest first. Each run yields its user message
+    /// text and its assistant text, each joined across projection chunks.
+    pub fn thread_recall_texts(
+        &mut self,
+        thread_id: &str,
+        workspace: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, JournalError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let coordination = self.coordination.clone();
+        let _operation = coordination
+            .as_ref()
+            .map(|state| state.operation.lock().unwrap());
+        self.refresh_after_compaction()?;
+        let connection = self
+            .connection
+            .as_ref()
+            .expect("journal connection is always present outside compaction");
+        let mut runs = connection
+            .prepare_cached(
+                "SELECT rt.run_id FROM run_threads rt \
+                 JOIN run_workspaces rw ON rw.run_id=rt.run_id AND rw.workspace=?2 \
+                 WHERE rt.thread_id=?1 ORDER BY rt.thread_run_ordinal DESC LIMIT ?3",
+            )?
+            .query_map(params![thread_id, workspace, limit as u64], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        runs.reverse();
+        let mut entries = connection.prepare_cached(
+            "SELECT kind, COALESCE(text,'') FROM thread_projection_entries \
+             WHERE run_id=?1 AND kind IN ('user_message','assistant_message') ORDER BY ordinal",
+        )?;
+        let mut texts = Vec::with_capacity(runs.len());
+        for run_id in runs {
+            let mut user = String::new();
+            let mut assistant = String::new();
+            let rows = entries.query_map([&run_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (kind, text) = row?;
+                if kind == "user_message" {
+                    user.push_str(&text);
+                } else {
+                    assistant.push_str(&text);
+                }
+            }
+            texts.push((user, assistant));
+        }
+        Ok(texts)
+    }
+
     pub fn append_batch(
         &mut self,
         expected_last_seq: u64,
@@ -1390,11 +1516,8 @@ impl RunJournal {
         let mut all_existing = true;
         for (event, bytes) in events.iter().zip(&canonical) {
             match tx
-                .query_row(
-                    "SELECT envelope_json FROM events WHERE event_id=?1",
-                    [&event.event_id],
-                    |r| r.get::<_, String>(0),
-                )
+                .prepare_cached("SELECT envelope_json FROM events WHERE event_id=?1")?
+                .query_row([&event.event_id], |r| r.get::<_, String>(0))
                 .optional()?
             {
                 Some(stored) if stored == *bytes => {}
@@ -1410,11 +1533,9 @@ impl RunJournal {
             return Ok(());
         }
 
-        let actual: u64 = tx.query_row(
-            "SELECT COALESCE(MAX(run_seq), 0) FROM events WHERE run_id=?1",
-            [run_id],
-            |r| r.get(0),
-        )?;
+        let actual: u64 = tx
+            .prepare_cached("SELECT COALESCE(MAX(run_seq), 0) FROM events WHERE run_id=?1")?
+            .query_row([run_id], |r| r.get(0))?;
         if actual != expected_last_seq {
             return Err(JournalError::Conflict(Conflict::StaleSequence {
                 expected: expected_last_seq,
@@ -1426,15 +1547,13 @@ impl RunJournal {
             // creation uses append_new_run, which records the real scope.
             let thread_id = Uuid::now_v7().to_string();
             append_thread_created(&tx, &thread_id, Some(""), &events[0].recorded_at, false)?;
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO run_threads(run_id,thread_id,thread_run_ordinal) VALUES(?1,?2,1)",
-                params![run_id, thread_id],
-            )?;
+            )?
+            .execute(params![run_id, thread_id])?;
         }
         for (event, bytes) in events.iter().zip(canonical) {
-            let result = tx.execute(
-                "INSERT INTO events(event_id,run_id,run_seq,event_type,event_version,envelope_version,recorded_at,envelope_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![event.event_id,event.run_id,event.run_seq,event.event_type,event.event_version,event.envelope_version,event.recorded_at,bytes]);
+            let result = tx.prepare_cached("INSERT INTO events(event_id,run_id,run_seq,event_type,event_version,envelope_version,recorded_at,envelope_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)")?.execute(params![event.event_id,event.run_id,event.run_seq,event.event_type,event.event_version,event.envelope_version,event.recorded_at,bytes]);
             if let Err(rusqlite::Error::SqliteFailure(e, _)) = &result {
                 if e.code == rusqlite::ErrorCode::ConstraintViolation {
                     return Err(JournalError::Conflict(Conflict::Sequence {
@@ -2231,6 +2350,7 @@ pub(crate) fn open_journal_connection_with_busy_timeout(
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "FULL")?;
     connection.busy_timeout(busy_timeout)?;
+    connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
     Ok(connection)
 }
 
@@ -3156,16 +3276,14 @@ fn update_permission_pending_projection(
         _ => None,
     };
     if let Some((gate_id, kind, title, message)) = fields {
-        tx.execute(
-            "INSERT INTO permission_pending_projection(run_id,run_seq,gate_id,kind,title,message,valid) \
-             VALUES(?1,?2,?3,?4,?5,?6,1)",
-            params![event.run_id, event.run_seq, gate_id, kind, title, message],
+        tx.prepare_cached("INSERT INTO permission_pending_projection(run_id,run_seq,gate_id,kind,title,message,valid) \
+             VALUES(?1,?2,?3,?4,?5,?6,1)")?.execute(params![event.run_id, event.run_seq, gate_id, kind, title, message],
         )?;
     } else {
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO permission_pending_projection(run_id,run_seq,valid) VALUES(?1,?2,0)",
-            params![event.run_id, event.run_seq],
-        )?;
+        )?
+        .execute(params![event.run_id, event.run_seq])?;
     }
     Ok(())
 }
@@ -3188,15 +3306,13 @@ fn update_receipt_projection(
     if let Some(receipt) = receipt {
         let encoded = serde_json::to_string(&receipt)
             .map_err(|error| JournalError::InvalidEnvelope(error.to_string()))?;
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO receipt_projection(run_id,run_seq,receipt_json,valid) VALUES(?1,?2,?3,1)",
-            params![event.run_id, event.run_seq, encoded],
-        )?;
+        )?
+        .execute(params![event.run_id, event.run_seq, encoded])?;
     } else {
-        tx.execute(
-            "INSERT INTO receipt_projection(run_id,run_seq,valid) VALUES(?1,?2,0)",
-            params![event.run_id, event.run_seq],
-        )?;
+        tx.prepare_cached("INSERT INTO receipt_projection(run_id,run_seq,valid) VALUES(?1,?2,0)")?
+            .execute(params![event.run_id, event.run_seq])?;
     }
     Ok(())
 }
@@ -3329,33 +3445,28 @@ fn update_thread_projection(
         result
     }
     let next_ordinal = || -> Result<i64, rusqlite::Error> {
-        tx.query_row(
+        tx.prepare_cached(
             "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM thread_projection_entries WHERE run_id=?1",
-            [&event.run_id],
-            |row| row.get(0),
-        )
+        )?
+        .query_row([&event.run_id], |row| row.get(0))
     };
     let insert_chunks = |kind: &str, text: &str| -> Result<(), JournalError> {
         let first_ordinal = next_ordinal()?;
         for (offset, chunk) in chunks(text).into_iter().enumerate() {
             let ordinal = first_ordinal + offset as i64;
-            tx.execute(
-                "INSERT INTO thread_projection_entries(run_id,ordinal,run_seq,kind,text) VALUES(?1,?2,?3,?4,?5)",
-                params![event.run_id, ordinal, event.run_seq, kind, chunk],
+            tx.prepare_cached("INSERT INTO thread_projection_entries(run_id,ordinal,run_seq,kind,text) VALUES(?1,?2,?3,?4,?5)")?.execute(params![event.run_id, ordinal, event.run_seq, kind, chunk],
             )?;
-            tx.execute(
-                "INSERT INTO thread_projection_versions(run_id,ordinal,valid_from_seq,run_seq,kind,text) VALUES(?1,?2,?3,?3,?4,?5)",
-                params![event.run_id, ordinal, event.run_seq, kind, chunk],
+            tx.prepare_cached("INSERT INTO thread_projection_versions(run_id,ordinal,valid_from_seq,run_seq,kind,text) VALUES(?1,?2,?3,?3,?4,?5)")?.execute(params![event.run_id, ordinal, event.run_seq, kind, chunk],
             )?;
         }
         Ok(())
     };
     let archive = |kind: &str| -> Result<(), JournalError> {
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE thread_projection_versions SET valid_until_seq=?1 \
              WHERE run_id=?2 AND kind=?3 AND valid_until_seq IS NULL",
-            params![event.run_seq, event.run_id, kind],
-        )?;
+        )?
+        .execute(params![event.run_seq, event.run_id, kind])?;
         Ok(())
     };
     match event.event_type.as_str() {
@@ -3368,10 +3479,7 @@ fn update_thread_projection(
             let Some(mut text) = inline_text(event, "text") else {
                 return Ok(());
             };
-            let last: Option<(i64, String)> = tx
-                .query_row(
-                    "SELECT ordinal, COALESCE(text,'') FROM thread_projection_entries WHERE run_id=?1 AND kind='assistant_message' ORDER BY ordinal DESC LIMIT 1",
-                    [&event.run_id],
+            let last: Option<(i64, String)> = tx.prepare_cached("SELECT ordinal, COALESCE(text,'') FROM thread_projection_entries WHERE run_id=?1 AND kind='assistant_message' ORDER BY ordinal DESC LIMIT 1")?.query_row([&event.run_id],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
@@ -3383,19 +3491,17 @@ fn update_thread_projection(
                     take -= 1;
                 }
                 tail.push_str(&text[..take]);
-                tx.execute(
+                tx.prepare_cached(
                     "UPDATE thread_projection_versions SET valid_until_seq=?1 \
                      WHERE run_id=?2 AND ordinal=?3 AND valid_until_seq IS NULL",
-                    params![event.run_seq, event.run_id, ordinal],
-                )?;
-                tx.execute(
+                )?
+                .execute(params![event.run_seq, event.run_id, ordinal])?;
+                tx.prepare_cached(
                     "UPDATE thread_projection_entries SET text=?1 WHERE run_id=?2 AND ordinal=?3",
-                    params![tail, event.run_id, ordinal],
-                )?;
-                tx.execute(
-                    "INSERT INTO thread_projection_versions(run_id,ordinal,valid_from_seq,run_seq,kind,text) \
-                     VALUES(?1,?2,?3,?3,'assistant_message',?4)",
-                    params![event.run_id, ordinal, event.run_seq, tail],
+                )?
+                .execute(params![tail, event.run_id, ordinal])?;
+                tx.prepare_cached("INSERT INTO thread_projection_versions(run_id,ordinal,valid_from_seq,run_seq,kind,text) \
+                     VALUES(?1,?2,?3,?3,'assistant_message',?4)")?.execute(params![event.run_id, ordinal, event.run_seq, tail],
                 )?;
                 text.drain(..take);
             }
@@ -3413,14 +3519,10 @@ fn update_thread_projection(
             let display = inline_text(event, "display_name");
             let ordinal = next_ordinal()?;
             let kind = format!("tool_running:{effect_id}");
-            tx.execute(
-                "INSERT INTO thread_projection_entries(run_id,ordinal,run_seq,kind,text) VALUES(?1,?2,?3,?4,?5)",
-                params![event.run_id, ordinal, event.run_seq, kind, display],
+            tx.prepare_cached("INSERT INTO thread_projection_entries(run_id,ordinal,run_seq,kind,text) VALUES(?1,?2,?3,?4,?5)")?.execute(params![event.run_id, ordinal, event.run_seq, kind, display],
             )?;
-            tx.execute(
-                "INSERT INTO thread_projection_versions(run_id,ordinal,valid_from_seq,run_seq,kind,text) \
-                 VALUES(?1,?2,?3,?3,?4,?5)",
-                params![event.run_id, ordinal, event.run_seq, kind, display],
+            tx.prepare_cached("INSERT INTO thread_projection_versions(run_id,ordinal,valid_from_seq,run_seq,kind,text) \
+                 VALUES(?1,?2,?3,?3,?4,?5)")?.execute(params![event.run_id, ordinal, event.run_seq, kind, display],
             )?;
         }
         "tool.effect.completed" | "tool.effect.failed" => {
@@ -3432,27 +3534,25 @@ fn update_thread_projection(
                     "tool_failed"
                 };
                 archive(&old)?;
-                tx.execute(
+                tx.prepare_cached(
                     "UPDATE thread_projection_entries SET kind=?1 WHERE run_id=?2 AND kind=?3",
-                    params![new, event.run_id, old],
-                )?;
-                tx.execute(
-                    "INSERT INTO thread_projection_versions(run_id,ordinal,valid_from_seq,run_seq,kind,text) \
+                )?
+                .execute(params![new, event.run_id, old])?;
+                tx.prepare_cached("INSERT INTO thread_projection_versions(run_id,ordinal,valid_from_seq,run_seq,kind,text) \
                      SELECT run_id,ordinal,?1,?1,?2,text FROM thread_projection_entries \
-                     WHERE run_id=?3 AND kind=?2",
-                    params![event.run_seq, new, event.run_id],
+                     WHERE run_id=?3 AND kind=?2")?.execute(params![event.run_seq, new, event.run_id],
                 )?;
             }
         }
         "permission.requested" => {
             let title = inline_text(event, "title").unwrap_or_default();
             archive("permission_pending")?;
-            tx.execute("DELETE FROM thread_projection_entries WHERE run_id=?1 AND kind='permission_pending'", [&event.run_id])?;
+            tx.prepare_cached("DELETE FROM thread_projection_entries WHERE run_id=?1 AND kind='permission_pending'")?.execute([&event.run_id])?;
             insert_chunks("permission_pending", &title)?;
         }
         "permission.resolved" => {
             archive("permission_pending")?;
-            tx.execute("DELETE FROM thread_projection_entries WHERE run_id=?1 AND kind='permission_pending'", [&event.run_id])?;
+            tx.prepare_cached("DELETE FROM thread_projection_entries WHERE run_id=?1 AND kind='permission_pending'")?.execute([&event.run_id])?;
         }
         _ => {}
     }
@@ -3497,6 +3597,160 @@ mod tests {
         );
         drop(live);
         assert_eq!(coordination.subscribers.lock().unwrap().len(), earlier_len);
+        drop(journal);
+        let _ = fs::remove_file(path);
+    }
+
+    fn test_event(run_id: &str, run_seq: u64, event_type: &str, payload: Value) -> EventEnvelope {
+        EventEnvelope {
+            event_id: Uuid::now_v7().to_string(),
+            run_id: run_id.into(),
+            run_seq,
+            event_type: event_type.into(),
+            event_version: 1,
+            envelope_version: 1,
+            recorded_at: "2026-08-05T00:00:00Z".into(),
+            occurred_at: None,
+            correlation_id: None,
+            causation_id: None,
+            payload: EventPayload::Inline {
+                payload_json: payload,
+            },
+            provenance: Provenance {
+                source: "test".into(),
+                source_version: "1".into(),
+                actor_id: None,
+                device_id: None,
+                rpc_request_id: None,
+                capability_versions: None,
+                extra: BTreeMap::new(),
+            },
+            extra: BTreeMap::new(),
+        }
+    }
+
+    fn test_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("muniment-{name}-{}.sqlite3", Uuid::new_v4()))
+    }
+
+    #[test]
+    fn reopen_while_a_validated_handle_is_live_skips_validation_and_a_closed_journal_revalidates() {
+        let path = test_path("validated-once");
+        let run_id = Uuid::now_v7().to_string();
+        let mut live = RunJournal::open(&path).unwrap();
+        live.append_new_run(
+            "workspace",
+            &test_event(&run_id, 1, "run.started", serde_json::json!({})),
+        )
+        .unwrap();
+        let coordination = live.coordination.clone().unwrap();
+        assert!(coordination
+            .validated
+            .load(std::sync::atomic::Ordering::Acquire));
+        drop(RunJournal::open(&path).unwrap());
+        drop(coordination);
+        drop(live);
+
+        // A change made while every handle is closed fails the next open.
+        Connection::open(&path)
+            .unwrap()
+            .execute("UPDATE events SET envelope_json='{}'", [])
+            .unwrap();
+        assert!(matches!(
+            RunJournal::open(&path),
+            Err(JournalError::Corrupt(_))
+        ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn thread_readers_use_the_receipt_and_text_projections() {
+        let path = test_path("thread-projection-readers");
+        let mut journal = RunJournal::open(&path).unwrap();
+        let first = Uuid::now_v7().to_string();
+        let second = Uuid::now_v7().to_string();
+        let current = Uuid::now_v7().to_string();
+        let thread = journal
+            .append_new_run(
+                "workspace",
+                &test_event(&first, 1, "run.started", serde_json::json!({})),
+            )
+            .unwrap();
+        journal
+            .append_batch(
+                1,
+                &[
+                    test_event(
+                        &first,
+                        2,
+                        "user.prompt.submitted",
+                        serde_json::json!({"prompt": "Name a color"}),
+                    ),
+                    test_event(
+                        &first,
+                        3,
+                        "model.stream.delta",
+                        serde_json::json!({"text": "Blue "}),
+                    ),
+                    test_event(
+                        &first,
+                        4,
+                        "model.stream.delta",
+                        serde_json::json!({"text": "x".repeat(100)}),
+                    ),
+                    test_event(
+                        &first,
+                        5,
+                        "run.completed",
+                        serde_json::json!({"receipt": {"model": "model-a"}}),
+                    ),
+                ],
+            )
+            .unwrap();
+        for (run, model) in [(&second, None), (&current, Some("model-c"))] {
+            journal
+                .append_new_run_in_thread(
+                    "workspace",
+                    &thread,
+                    &test_event(run, 1, "run.started", serde_json::json!({})),
+                )
+                .unwrap();
+            let receipt = model.map_or(
+                serde_json::json!({}),
+                |model| serde_json::json!({"receipt": {"model": model}}),
+            );
+            journal
+                .append(1, &test_event(run, 2, "run.completed", receipt))
+                .unwrap();
+        }
+
+        assert_eq!(
+            journal
+                .thread_receipt_models(&thread, &current, 100)
+                .unwrap(),
+            ["model-a"]
+        );
+        assert!(journal
+            .thread_receipt_models(&thread, &current, 0)
+            .unwrap()
+            .is_empty());
+        let texts = journal
+            .thread_recall_texts(&thread, "workspace", 3)
+            .unwrap();
+        assert_eq!(texts.len(), 3);
+        assert_eq!(texts[0].0, "Name a color");
+        assert_eq!(texts[0].1, format!("Blue {}", "x".repeat(100)));
+        assert_eq!(
+            journal
+                .thread_recall_texts(&thread, "workspace", 1)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(journal
+            .thread_recall_texts(&thread, "other", 3)
+            .unwrap()
+            .is_empty());
         drop(journal);
         let _ = fs::remove_file(path);
     }

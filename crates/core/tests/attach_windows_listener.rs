@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use muniment_core::attach::thread_service::ThreadListService;
 use muniment_core::attach::{
-    decode_frame, fail_next_windows_attach_pipe_instance_for_tests, serve_next_windows_attach,
-    serve_next_windows_attach_until, windows_attach_pipe_path, Welcome, WindowsAttachAcceptError,
+    decode_frame, fail_next_windows_attach_pipe_instance_for_tests, load_windows_attach_pipe_path,
+    serve_next_windows_attach, serve_next_windows_attach_until, Welcome, WindowsAttachAcceptError,
     WindowsAttachAcceptOutcome, WindowsAttachBindError, WindowsAttachInstanceLockError,
     WindowsAttachListener, WindowsAttachServeOutcome, WindowsAttachStopEvent,
 };
@@ -95,7 +95,7 @@ fn binds_the_current_user_pipe_and_rejects_a_second_listener() {
     let _guard = LISTENER_TEST_LOCK.lock().unwrap();
     let listener = bind_listener();
     let expected_path =
-        windows_attach_pipe_path(current_process_user_sid().unwrap().as_str()).unwrap();
+        load_windows_attach_pipe_path(current_process_user_sid().unwrap().as_str()).unwrap();
 
     assert_eq!(listener.path(), expected_path);
     assert!(matches!(

@@ -191,9 +191,9 @@ fn install_archive(archive: &Path, root: &Path) -> PathBuf {
     .expect("install verified pinned Pi archive")
 }
 
-struct CandidateBoundaries(PathBuf);
+struct LaunchBoundaries(PathBuf);
 
-impl PiLaunchBoundaries for CandidateBoundaries {
+impl PiLaunchBoundaries for LaunchBoundaries {
     fn pi_session_root(&self) -> Result<PathBuf, PiLaunchError> {
         Ok(self.0.join("sessions"))
     }
@@ -204,14 +204,10 @@ impl PiLaunchBoundaries for CandidateBoundaries {
 }
 
 #[test]
-fn candidate_cold_launch_without_node_or_npm() {
-    use muniment_core::sidecar::pi_install::PI_CANDIDATE_ARTIFACT;
+fn cold_launch_without_node_or_npm() {
     use std::fs;
     use std::process::Command;
 
-    if PI_SELECTED_ARTIFACT != PI_CANDIDATE_ARTIFACT {
-        return;
-    }
     let Ok(archive) = std::env::var("MUNIMENT_PI_ARCHIVE") else {
         eprintln!("The cold-launch test requires MUNIMENT_PI_ARCHIVE.");
         return;
@@ -221,11 +217,7 @@ fn candidate_cold_launch_without_node_or_npm() {
         let root = std::env::temp_dir().join(format!("muniment-cold-pi-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(root.join("empty-path")).unwrap();
         let status = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "candidate_cold_launch_without_node_or_npm",
-                "--nocapture",
-            ])
+            .args(["--exact", "cold_launch_without_node_or_npm", "--nocapture"])
             .env("MUNIMENT_COLD_PI_CHILD", &root)
             .env("MUNIMENT_PI_ARCHIVE", fs::canonicalize(archive).unwrap())
             .env("PATH", root.join("empty-path"))
@@ -275,7 +267,7 @@ export default function (pi) {
     for grant in [ChatGrant::local(), cloud] {
         let start = Instant::now();
         let mut config = pi_launch_config_for_executable(
-            &CandidateBoundaries(root.clone()),
+            &LaunchBoundaries(root.clone()),
             executable.clone(),
             &grant,
             None,
@@ -301,7 +293,7 @@ export default function (pi) {
         supervisor.shutdown().unwrap();
         assert_eq!(status, SidecarStatus::Healthy);
         eprintln!(
-            "The candidate acquired packages in {:.1} seconds and reached readiness in {:.1} seconds without Node or npm.",
+            "The runtime acquired packages in {:.1} seconds and reached readiness in {:.1} seconds without Node or npm.",
             acquisition_elapsed.as_secs_f64(), readiness_elapsed.as_secs_f64()
         );
         let tools: Vec<String> =
@@ -327,16 +319,26 @@ export default function (pi) {
             );
         }
     }
+    // The launch points Pi at the state root's agent directory.
+    let agent = muniment_core::state_root::agent_directory(
+        &muniment_core::state_root::state_directory().unwrap(),
+    );
+    assert_eq!(
+        fs::read_to_string(agent.join("npm/bun.lock")).unwrap(),
+        muniment_core::pi_packages::PI_PACKAGES_LOCK
+    );
     let settings: serde_json::Value =
-        serde_json::from_slice(&fs::read(root.join("agent files/settings.json")).unwrap()).unwrap();
-    assert_eq!(settings["packages"].as_array().unwrap().len(), 4);
+        serde_json::from_slice(&fs::read(agent.join("settings.json")).unwrap()).unwrap();
+    assert_eq!(
+        settings["packages"].as_array().unwrap().len(),
+        muniment_core::pi_packages::PI_PACKAGES.len()
+    );
     assert_eq!(settings["defaultTools"].as_array().unwrap().len(), 8);
 }
 
 /// Opt-in because release/CI jobs must acquire the pinned executable rather
 /// than committing it. Example:
 /// `MUNIMENT_PI_ARCHIVE=/path/to/pi-<target>.<tar.gz|zip> cargo test --test pi_sidecar`
-/// Set `MUNIMENT_PI_CANDIDATE=1` at build time to test the candidate archive.
 #[test]
 fn real_pinned_pi_reaches_ready_through_the_supervisor() {
     let Ok(archive) = std::env::var("MUNIMENT_PI_ARCHIVE") else {

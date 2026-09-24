@@ -18,9 +18,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
 
 use super::{
-    verify_windows_endpoint_owner_with_reader, windows_attach_pipe_path, WindowsAttachConnectError,
-    WindowsAttachStream, WindowsPipeAccessControlEntry, WindowsPipeSecurityError,
-    WindowsPipeSecurityReadError, WindowsPipeSecurityReader,
+    load_windows_attach_pipe_path, verify_windows_endpoint_owner_with_reader,
+    WindowsAttachConnectError, WindowsAttachStream, WindowsPipeAccessControlEntry,
+    WindowsPipeSecurityError, WindowsPipeSecurityReadError, WindowsPipeSecurityReader,
 };
 use crate::windows_sid::{copy_sid_bytes, current_process_user_sid};
 
@@ -81,8 +81,14 @@ pub fn connect_windows_attach_endpoint(
 
     let local_sid =
         current_process_user_sid().map_err(|_| WindowsAttachConnectError::IdentityUnavailable)?;
-    let path = windows_attach_pipe_path(local_sid.as_str())
-        .map_err(|_| WindowsAttachConnectError::InvalidPipePath)?;
+    // The runtime stores the pipe path when it binds, so a missing file means no endpoint.
+    let path = load_windows_attach_pipe_path(local_sid.as_str()).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            WindowsAttachConnectError::EndpointAbsent
+        } else {
+            WindowsAttachConnectError::InvalidPipePath
+        }
+    })?;
     let wide: Vec<u16> = OsStr::new(&path).encode_wide().chain(Some(0)).collect();
 
     let handle = loop {

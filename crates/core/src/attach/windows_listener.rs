@@ -43,7 +43,7 @@ use super::{
 use crate::attach::thread_service::ThreadListService;
 use crate::attach::{
     acquire_windows_attach_instance_lock, serve_windows_attach_session_with_factory,
-    windows_attach_pipe_path, WindowsAttachInstanceLock, WindowsAttachInstanceLockError,
+    WindowsAttachInstanceLock, WindowsAttachInstanceLockError,
 };
 use crate::windows_security::OwnerSecurity;
 use crate::windows_sid::{copy_sid_bytes, current_process_user_sid};
@@ -204,8 +204,7 @@ impl WindowsAttachListener {
         let sid = current_process_user_sid()
             .map_err(io::Error::other)
             .map_err(WindowsAttachBindError::Pipe)?;
-        let path = windows_attach_pipe_path(sid.as_str())
-            .map_err(|_| io::Error::other("could not derive the Windows attach pipe path"))
+        let path = super::load_or_create_windows_attach_pipe_path(sid.as_str())
             .map_err(WindowsAttachBindError::Pipe)?;
         let handle = create_pipe_instance(&path, true)
             .map_err(io::Error::other)

@@ -46,6 +46,7 @@ fn credentials() -> PeerCredentials {
         pid: std::process::id() as libc::pid_t,
         uid: unsafe { libc::geteuid() },
         gid: unsafe { libc::getegid() },
+        accept_image: None,
     }
 }
 

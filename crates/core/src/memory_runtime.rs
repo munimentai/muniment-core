@@ -175,7 +175,18 @@ impl ApplicationMemoryRuntime {
         database: PathBuf,
     ) {
         self.insert_session(session, thread, capability, home, database);
-        self.build_session(session);
+        self.build_session_in_background(session);
+    }
+
+    /// Starts the first index build beside the reply. The session's first
+    /// search waits for that build, so recall reads the built index.
+    fn build_session_in_background(&self, session: &str) {
+        if let Some(session) = self.session(session) {
+            session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .build_in_background(muniment_core::memory_index::DEFAULT_BUILD_TIMEOUT);
+        }
     }
 
     fn insert_session(
@@ -734,6 +745,31 @@ mod tests {
         runtime.write_agent_extension("session-1").unwrap();
 
         assert!(runtime.agent_extension_path().exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_search_right_after_open_reads_the_built_index() {
+        let root = std::env::temp_dir().join(format!("muniment-app-memory-{}", Uuid::now_v7()));
+        let home = root.join("home");
+        fs::create_dir_all(home.join("memory")).unwrap();
+        fs::write(home.join("memory/fact.md"), "saffron belongs in the pantry").unwrap();
+        let runtime = ApplicationMemoryRuntime::new(root.join("config"), root.join("cache"));
+        runtime.open_session_for_home(
+            "session-1",
+            "thread-1",
+            ModelMemoryCapability {
+                minimum_cacheable_prefix_characters: 100,
+            },
+            &home,
+            root.join("cache/index.sqlite3"),
+        );
+
+        let result = runtime
+            .dispatch_tool_call("session-1", "memory-search", br#"{"query":"saffron"}"#)
+            .unwrap();
+
+        assert_eq!(result.items.len(), 1);
         fs::remove_dir_all(root).unwrap();
     }
 

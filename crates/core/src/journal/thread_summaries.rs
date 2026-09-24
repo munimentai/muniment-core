@@ -67,6 +67,22 @@ struct ThreadCursor {
     authenticator: String,
 }
 
+/// How a summary scan walks the listing: pages of `page_size` rows, or of the
+/// rows still needed to reach `limit` when `page_size` is `None`, for at most
+/// `max_pages` pages or until `limit` threads are kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadSummaryScan {
+    pub limit: usize,
+    pub page_size: Option<usize>,
+    pub max_pages: usize,
+}
+
+#[derive(Debug)]
+pub enum ThreadSummaryScanError<E> {
+    List(ThreadSummaryListError),
+    Keep(E),
+}
+
 impl RunJournal {
     /// Lists non-deleted threads by latest event time, then thread ID.
     ///
@@ -97,16 +113,84 @@ impl RunJournal {
         limit: usize,
         cursor: Option<&str>,
     ) -> Result<ThreadSummaryPage, ThreadSummaryListError> {
-        if !(1..=MAX_PAGE_SIZE).contains(&limit) {
-            return Err(ThreadSummaryListError::InvalidLimit {
-                limit,
-                max: MAX_PAGE_SIZE,
-            });
+        let scan = ThreadSummaryScan {
+            limit,
+            page_size: None,
+            max_pages: 1,
+        };
+        self.scan_thread_summaries(workspace, cursor, scan, |_, _| {
+            Ok::<_, std::convert::Infallible>(true)
+        })
+        .map_err(|error| match error {
+            ThreadSummaryScanError::List(error) => error,
+            ThreadSummaryScanError::Keep(never) => match never {},
+        })
+    }
+
+    /// Walks the summary listing page by page and keeps the threads `keep`
+    /// accepts, as a caller that reads successive pages would. The summary
+    /// aggregate runs once for the whole walk, so a scan over 2,000 threads
+    /// costs one pass. The next cursor follows the last row the walk read.
+    pub fn scan_thread_summaries<E>(
+        &mut self,
+        workspace: Option<&str>,
+        cursor: Option<&str>,
+        scan: ThreadSummaryScan,
+        mut keep: impl FnMut(&mut RunJournal, &str) -> Result<bool, E>,
+    ) -> Result<ThreadSummaryPage, ThreadSummaryScanError<E>> {
+        let widest_page = scan.page_size.unwrap_or(scan.limit);
+        for size in [scan.limit.min(widest_page), widest_page] {
+            if !(1..=MAX_PAGE_SIZE).contains(&size) {
+                return Err(ThreadSummaryScanError::List(
+                    ThreadSummaryListError::InvalidLimit {
+                        limit: size,
+                        max: MAX_PAGE_SIZE,
+                    },
+                ));
+            }
         }
         let boundary = cursor
             .map(|value| decode_cursor(value, &self.cursor_key, workspace))
-            .transpose()?;
+            .transpose()
+            .map_err(ThreadSummaryScanError::List)?;
+        let scan_rows = scan.max_pages.saturating_mul(widest_page);
+        let keys = self
+            .thread_summary_keys(workspace, boundary.as_ref(), scan_rows.saturating_add(1))
+            .map_err(ThreadSummaryScanError::List)?;
 
+        let mut kept = Vec::new();
+        let mut consumed = 0;
+        'pages: for _ in 0..scan.max_pages {
+            let page_size = scan.page_size.unwrap_or(scan.limit - kept.len());
+            let page_end = (consumed + page_size).min(keys.len()).min(scan_rows);
+            while consumed < page_end {
+                let key: &(String, String) = &keys[consumed];
+                consumed += 1;
+                if keep(self, &key.0).map_err(ThreadSummaryScanError::Keep)? {
+                    kept.push(key.clone());
+                    if kept.len() == scan.limit {
+                        break 'pages;
+                    }
+                }
+            }
+            if consumed >= keys.len().min(scan_rows) {
+                break;
+            }
+        }
+        let next_boundary =
+            (consumed > 0 && consumed < keys.len()).then(|| keys[consumed - 1].clone());
+        self.titled_summary_page(workspace, kept, next_boundary)
+            .map_err(ThreadSummaryScanError::List)
+    }
+
+    /// The listing's `(thread_id, updated_at)` rows after `boundary`, newest
+    /// first, from one evaluation of the summary aggregate.
+    fn thread_summary_keys(
+        &mut self,
+        workspace: Option<&str>,
+        boundary: Option<&ThreadCursor>,
+        rows: usize,
+    ) -> Result<Vec<(String, String)>, ThreadSummaryListError> {
         let coordination = self.coordination.clone();
         let _operation = coordination
             .as_ref()
@@ -131,7 +215,7 @@ impl RunJournal {
                 JOIN run_workspaces rw ON rw.run_id=scoped.run_id \
                 WHERE scoped.thread_id=tt.thread_id AND rw.workspace=?1)))";
 
-        if let Some(boundary) = &boundary {
+        if let Some(boundary) = boundary {
             let exists: bool = connection.query_row(
                 "WITH thread_time AS (\
                     SELECT MAX(recorded_at) AS updated_at FROM thread_events \
@@ -154,21 +238,20 @@ impl RunJournal {
             }
         }
 
-        let page_size = limit + 1;
-        let mut keys = Vec::with_capacity(page_size);
-        if let Some(boundary) = &boundary {
+        let mut keys = Vec::new();
+        if let Some(boundary) = boundary {
             let sql = format!(
                 "{summary_rows} SELECT thread_id, updated_at FROM summaries \
                  WHERE updated_at < ?2 OR (updated_at=?2 AND thread_id>?3) \
                  ORDER BY updated_at DESC, thread_id ASC LIMIT ?4"
             );
-            let mut statement = connection.prepare(&sql)?;
+            let mut statement = connection.prepare_cached(&sql)?;
             let rows = statement.query_map(
                 rusqlite::params![
                     workspace,
                     boundary.updated_at,
                     boundary.thread_id,
-                    page_size as u64
+                    rows as u64
                 ],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )?;
@@ -178,16 +261,30 @@ impl RunJournal {
                 "{summary_rows} SELECT thread_id, updated_at FROM summaries \
                  ORDER BY updated_at DESC, thread_id ASC LIMIT ?2"
             );
-            let mut statement = connection.prepare(&sql)?;
-            let rows = statement
-                .query_map(rusqlite::params![workspace, page_size as u64], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?;
+            let mut statement = connection.prepare_cached(&sql)?;
+            let rows = statement.query_map(rusqlite::params![workspace, rows as u64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
             keys.extend(rows.collect::<Result<Vec<_>, _>>()?);
         }
+        Ok(keys)
+    }
 
-        let has_more = keys.len() > limit;
-        keys.truncate(limit);
+    fn titled_summary_page(
+        &mut self,
+        workspace: Option<&str>,
+        keys: Vec<(String, String)>,
+        next_boundary: Option<(String, String)>,
+    ) -> Result<ThreadSummaryPage, ThreadSummaryListError> {
+        let coordination = self.coordination.clone();
+        let _operation = coordination
+            .as_ref()
+            .map(|state| state.operation.lock().unwrap());
+        self.refresh_after_compaction()?;
+        let connection = self
+            .connection
+            .as_ref()
+            .expect("journal connection is always present outside compaction");
         let mut summaries = Vec::with_capacity(keys.len());
         for (thread_id, updated_at) in keys {
             let renamed = connection
@@ -235,14 +332,19 @@ impl RunJournal {
                 updated_at,
             });
         }
-        let next_cursor = if has_more {
-            summaries
-                .last()
-                .map(|summary| encode_cursor(summary, workspace, &self.cursor_key))
-                .transpose()?
-        } else {
-            None
-        };
+        let next_cursor = next_boundary
+            .map(|(thread_id, updated_at)| {
+                encode_cursor(
+                    &ThreadSummary {
+                        thread_id,
+                        title: String::new(),
+                        updated_at,
+                    },
+                    workspace,
+                    &self.cursor_key,
+                )
+            })
+            .transpose()?;
         Ok(ThreadSummaryPage {
             summaries,
             next_cursor,

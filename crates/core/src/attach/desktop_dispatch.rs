@@ -1,8 +1,8 @@
 //! Platform-neutral desktop client request dispatch.
 
 use std::collections::{HashSet, VecDeque};
-use std::sync::mpsc::TryRecvError;
-use std::time::Instant;
+use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use sha2::{Digest, Sha256};
@@ -164,11 +164,14 @@ impl<S: ThreadListService> DesktopSessionService for S {
     fn drain_chat_events(
         &mut self,
         state: &mut Self::State,
+        wait: Duration,
     ) -> Result<(Vec<Event>, bool), AttachSessionError> {
         state
             .chat_subscription
             .as_ref()
-            .map_or(Ok((Vec::new(), false)), drain_chat_events)
+            .map_or(Ok((Vec::new(), false)), |subscription| {
+                drain_chat_events(subscription, wait)
+            })
     }
 
     fn dispatch_request(
@@ -198,21 +201,31 @@ impl<S: ThreadListService> DesktopSessionService for S {
     }
 }
 
+/// Waits up to `wait` for the first chat event, then takes the events that
+/// are already queued behind it.
 fn drain_chat_events(
     subscription: &ActiveChatSubscription,
+    wait: Duration,
 ) -> Result<(Vec<Event>, bool), AttachSessionError> {
+    let chat_frame = |event: crate::run_events::ChatEvent| -> Result<Event, AttachSessionError> {
+        Ok(Event {
+            protocol: Protocol,
+            subscription_id: subscription.subscription_id.clone(),
+            event: EventName::ChatEvent,
+            run_id: None,
+            run_seq: None,
+            body: serde_json::to_value(event).map_err(|_| AttachSessionError::MalformedFrame)?,
+        })
+    };
     let mut events = Vec::new();
-    for _ in 0..MAX_CHAT_EVENTS_PER_POLL {
+    match subscription.receiver.recv_timeout(wait) {
+        Ok(event) => events.push(chat_frame(event)?),
+        Err(RecvTimeoutError::Timeout) => return Ok((events, false)),
+        Err(RecvTimeoutError::Disconnected) => return Ok((events, true)),
+    }
+    while events.len() < MAX_CHAT_EVENTS_PER_POLL {
         match subscription.receiver.try_recv() {
-            Ok(event) => events.push(Event {
-                protocol: Protocol,
-                subscription_id: subscription.subscription_id.clone(),
-                event: EventName::ChatEvent,
-                run_id: None,
-                run_seq: None,
-                body: serde_json::to_value(event)
-                    .map_err(|_| AttachSessionError::MalformedFrame)?,
-            }),
+            Ok(event) => events.push(chat_frame(event)?),
             Err(TryRecvError::Empty) => return Ok((events, false)),
             Err(TryRecvError::Disconnected) => return Ok((events, true)),
         }

@@ -141,10 +141,14 @@ pub fn command(root: &Path, action: &str, mut data: Value) -> Result<Value, Stri
 }
 
 /// A disabled item cannot enter the MCP snapshot or the skill/extension arguments.
+/// Plugin code, its extension entries and its MCP servers, loads only for an
+/// explicit pick in `selected`. An automatic pick adds the plugin's skills,
+/// which are instructions and never run.
 pub fn snapshot(state: &Value, thread: &str, ambient: Value) -> Value {
     let rules = &state["turns"][thread];
     let disabled = rules["disabled"].as_array().cloned().unwrap_or_default();
-    let mut selected = rules["selected"].as_array().cloned().unwrap_or_default();
+    let explicit = rules["selected"].as_array().cloned().unwrap_or_default();
+    let mut selected = explicit.clone();
     selected.extend(
         rules["automaticSelected"]
             .as_array()
@@ -176,7 +180,7 @@ pub fn snapshot(state: &Value, thread: &str, ambient: Value) -> Value {
             for (name, definition) in item["servers"].as_object().into_iter().flatten() {
                 let server_id = format!("{id}:{name}");
                 if disabled.contains(&json!(server_id))
-                    || (!selected.contains(&json!(server_id)) && !selected.contains(&json!(id)))
+                    || (!explicit.contains(&json!(server_id)) && !explicit.contains(&json!(id)))
                 {
                     continue;
                 }
@@ -200,7 +204,7 @@ pub fn snapshot(state: &Value, thread: &str, ambient: Value) -> Value {
                 }
             }
             // Code plugins require explicit invocation. Tool-only plugins remain available through toggles.
-            if selected.contains(&json!(id)) {
+            if explicit.contains(&json!(id)) {
                 for entry in item["extensions"]
                     .as_array()
                     .into_iter()
@@ -655,6 +659,36 @@ mod tests {
         zip.finish().unwrap();
         assert!(extract_archive(zip_path, &temp.0).is_err());
         assert!(!&temp.0.join("outside").exists());
+    }
+
+    #[test]
+    fn automatic_picks_load_plugin_skills_but_never_plugin_code() {
+        let plugin = json!({"id":"p","kind":"plugin","base":"/p",
+            "servers":{"docs":{"command":"docs-server"}},
+            "skills":[{"name":"review","path":"SKILL.md"}],"extensions":["index.ts"]});
+        for automatic in [json!(["p"]), json!(["p:docs", "p:SKILL.md"])] {
+            let state = json!({"items":[plugin.clone()],
+                "turns":{"chat":{"selected":[],"automaticSelected":automatic}}});
+            let result = snapshot(&state, "chat", json!({}));
+            assert_eq!(result["extensions"], json!([]));
+            assert_eq!(result["mcpServers"], json!({}));
+            assert_eq!(result["names"], json!([]));
+            assert_eq!(result["skills"].as_array().unwrap().len(), 1);
+        }
+        let state = json!({"items":[plugin],
+            "turns":{"chat":{"selected":["p:docs"],"automaticSelected":["p"]}}});
+        let result = snapshot(&state, "chat", json!({}));
+        assert_eq!(result["extensions"], json!([]));
+        assert_eq!(result["mcpServers"].as_object().unwrap().len(), 1);
+        let state = json!({"items":[{"id":"m","kind":"mcp","definition":{"url":"https://example.com/mcp"}}],
+            "turns":{"chat":{"selected":[],"automaticSelected":["m"]}}});
+        assert_eq!(
+            snapshot(&state, "chat", json!({}))["mcpServers"]
+                .as_object()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

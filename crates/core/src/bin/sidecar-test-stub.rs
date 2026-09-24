@@ -25,6 +25,10 @@ fn main() {
         pi_resume(args.collect());
         return;
     }
+    if first.as_deref() == Some("install") && std::env::var_os("BUN_BE_BUN").is_some() {
+        bun_install(args.collect());
+        return;
+    }
     match first.as_deref() {
         Some("hold-stderr") => thread::sleep(Duration::from_secs(10)),
         Some("stderr-descendant") => {
@@ -722,4 +726,47 @@ fn delayed_response(id: serde_json::Value, mut response: serde_json::Value, dela
         println!("{response}");
         io::stdout().flush().unwrap();
     });
+}
+
+/// Stands in for Bun's package manager: it writes each dependency the manifest
+/// names at its pinned version, plus the source lines the runtime brands.
+fn bun_install(args: Vec<String>) {
+    let directory = args
+        .windows(2)
+        .find(|pair| pair[0] == "--cwd")
+        .map(|pair| Path::new(&pair[1]).to_owned())
+        .expect("the install names its directory");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(directory.join("package.json")).unwrap()).unwrap();
+    let modules = directory.join("node_modules");
+    for (name, version) in manifest["dependencies"].as_object().unwrap() {
+        let package = modules.join(name);
+        fs::create_dir_all(&package).unwrap();
+        fs::write(
+            package.join("package.json"),
+            serde_json::json!({ "name": name, "version": version }).to_string(),
+        )
+        .unwrap();
+    }
+    let sources = [
+        ("pi-background-tasks/src/core/registry.ts", "'.pi'"),
+        ("pi-background-tasks/src/extension.ts", ".pi/tasks"),
+        (
+            "pi-background-tasks/src/core/attested-pi-run.ts",
+            "parts[0] === '.pi'",
+        ),
+        (
+            "pi-mcp-adapter/agent-dir.ts",
+            "export function getAppName(): string {\n  const name = readPiConfig()?.name\n  return typeof name === \"string\" && name.trim() ? name.trim() : \"pi\"\n}",
+        ),
+        (
+            "pi-mcp-adapter/host-html-template.ts",
+            "You can close this page and return to Pi.",
+        ),
+    ];
+    for (relative, source) in sources {
+        let path = modules.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, source).unwrap();
+    }
 }

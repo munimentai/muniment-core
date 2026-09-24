@@ -3290,6 +3290,7 @@ dependencies = [
  "sha2",
  "sherpa-onnx",
  "sherpa-onnx-sys",
+ "subtle",
  "syn 2.0.119",
  "tar",
  "ureq 2.12.1",

@@ -80,6 +80,11 @@ impl CompanionRegistry {
         Ok(())
     }
 
+    /// Revokes every live companion connection, as a sign-out does.
+    pub fn revoke_live_connections(&self) -> usize {
+        self.live_connections.revoke_all()
+    }
+
     /// Lists companions by identity without exposing their secret credentials.
     pub fn list(&self) -> Result<Vec<CompanionRecord>, ProtocolError> {
         let credentials = self

@@ -90,6 +90,8 @@ pub trait ThreadListService {
         None
     }
 
+    /// Authorizes a companion credential. An empty `issued_credential` marks a
+    /// reconnect that no visible approval preceded.
     fn authorize_client(
         &mut self,
         client_identity: &str,
@@ -568,7 +570,7 @@ impl ThreadListService for RunJournal {
                 RunEventPageError::Journal(_) => ProtocolError::persistence_failed(),
             })?;
         let projected = self
-            .projected_run_stream_text(workspace, run_id, page.current_run_seq)
+            .projected_run_stream_text_after(workspace, run_id, page.current_run_seq, after_run_seq)
             .map_err(|_| ProtocolError::persistence_failed())?;
         let projected_len = page
             .events

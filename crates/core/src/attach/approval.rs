@@ -4,6 +4,30 @@ use std::time::{Duration, Instant};
 
 use super::Approval;
 
+/// The subject a companion approval in local mode binds to. An account subject
+/// always starts with `account:`, so it never equals this value.
+pub const LOCAL_APPROVAL_SUBJECT: &str = "local";
+
+/// The longest approval subject a companion credential record holds.
+pub const MAX_APPROVAL_SUBJECT_LENGTH: usize = 256;
+
+/// The subject a companion approval binds to while an account is signed in.
+/// Returns `None` when either id is empty or the subject would exceed its bound.
+pub fn account_approval_subject(org_id: &str, user_id: &str) -> Option<String> {
+    if org_id.is_empty() || user_id.is_empty() {
+        return None;
+    }
+    let subject = format!("account:{org_id}:{user_id}");
+    is_valid_approval_subject(&subject).then_some(subject)
+}
+
+/// Whether a stored or resolved approval subject is well formed.
+pub fn is_valid_approval_subject(subject: &str) -> bool {
+    !subject.is_empty()
+        && subject.len() <= MAX_APPROVAL_SUBJECT_LENGTH
+        && !subject.chars().any(char::is_control)
+}
+
 #[derive(Clone, Default)]
 pub struct SignedWorkspaceApproval {
     workspace: Arc<Mutex<Option<String>>>,

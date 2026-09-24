@@ -274,7 +274,7 @@ impl<C: AuthorizationClock, G: AuthorizationTokenGenerator> AuthorizationState<C
             _ => return Err(AuthorizationError::NotAuthorized),
         };
         // Rejected requests deliberately leave last_activity untouched.
-        if capability != active.token.as_str() {
+        if !super::secret_eq(capability, active.token.as_str()) {
             return Err(AuthorizationError::CapabilityMismatch);
         }
         if binding != &active.binding {
