@@ -347,7 +347,11 @@ where
 /// route until it is classified here.
 fn companion_scope(operation: Operation) -> Option<Option<&'static str>> {
     match operation {
-        Operation::WorkspaceOnboard | Operation::HomeEnsure => Some(None),
+        // The service admits migration control only from the installed runtime
+        // binary, so the companion route forwards it with no capability scope.
+        Operation::WorkspaceOnboard | Operation::HomeEnsure | Operation::MigrationControl => {
+            Some(None)
+        }
         Operation::ThreadList
         | Operation::ThreadOpen
         | Operation::RunOpen
@@ -367,7 +371,7 @@ fn companion_scope(operation: Operation) -> Option<Option<&'static str>> {
         | Operation::PermissionAnswer
         | Operation::RecordPropose
         | Operation::RecordCommit => Some(Some("run.write")),
-        Operation::MigrationControl | Operation::ApprovalPresent => None,
+        Operation::ApprovalPresent => None,
         Operation::ThreadRename
         | Operation::ThreadDelete
         | Operation::ThreadSelect
@@ -476,7 +480,7 @@ mod tests {
 
     #[test]
     fn companion_route_denies_desktop_only_operations_by_name() {
-        assert_eq!(companion_scope(Operation::MigrationControl), None);
+        assert_eq!(companion_scope(Operation::MigrationControl), Some(None));
         assert_eq!(companion_scope(Operation::ApprovalPresent), None);
         assert_eq!(companion_scope(Operation::SessionSignOut), None);
         assert_eq!(companion_scope(Operation::HomeEnsure), Some(None));

@@ -4557,7 +4557,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn legacy_attach_credentials_authenticate_with_unknown_claims() {
+    fn legacy_attach_credentials_load_and_need_a_fresh_approval() {
         use crate::attach::load_client_credentials;
         use std::os::unix::fs::PermissionsExt;
 
@@ -4588,12 +4588,11 @@ mod tests {
             client_identity: None,
             drain_state: crate::attach::DrainState::new(),
         };
-        assert_eq!(
-            service
-                .authorize_client(identity, Some(&credential), "", "changed", "9.9.9")
-                .unwrap(),
-            credential
-        );
+        // A credential stored before approvals named their subject reconnects
+        // only through a fresh visible approval.
+        assert!(service
+            .authorize_client(identity, Some(&credential), "", "changed", "9.9.9")
+            .is_err());
         assert_eq!(
             service
                 .authorize_client(new_identity, None, &new_credential, "desktop", "1.0.0")
@@ -4617,7 +4616,7 @@ mod tests {
         };
         assert!(restarted
             .authorize_client(identity, Some(&credential), "", "changed", "9.9.9")
-            .is_ok());
+            .is_err());
         assert!(restarted
             .authorize_client(new_identity, Some(&new_credential), "", "changed", "9.9.9")
             .is_ok());
