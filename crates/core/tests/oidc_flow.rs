@@ -145,7 +145,8 @@ fn tampered_state_is_rejected_before_any_token_request() {
         idp.browser(|cb| {
             cb.insert("state".to_string(), "forged-by-attacker".to_string());
         }),
-        Duration::from_secs(10),
+        // A forged state is skipped, so the attempt ends at its deadline.
+        Duration::from_secs(1),
     )
     .unwrap_err();
     assert_eq!(err, AuthError::StateMismatch);

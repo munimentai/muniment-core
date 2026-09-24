@@ -8,7 +8,7 @@ use muniment_attach::ProtocolError;
 
 use super::desktop_admission::{admit_desktop_client_over_stream, write_protocol_error};
 use super::linux::{CompanionProvenance, PeerCredentials};
-use super::{verify_desktop_client_peer_with_reader, Approval, DesktopClientAdmissionError};
+use super::{verify_accepted_desktop_peer, Approval, DesktopClientAdmissionError};
 use crate::browser_control::LinuxProcReader;
 
 /// Authority and provenance carried by an admitted desktop client session.
@@ -33,14 +33,12 @@ pub fn admit_desktop_client(
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or(DesktopClientAdmissionError::Timeout)?;
-    let peer_authorized = u32::try_from(peer_credentials.pid).is_ok_and(|peer_pid| {
-        verify_desktop_client_peer_with_reader(
-            peer_pid,
-            expected_desktop_executable,
-            process_reader,
-        )
-        .is_ok()
-    });
+    let peer_authorized = verify_accepted_desktop_peer(
+        &peer_credentials,
+        expected_desktop_executable,
+        process_reader,
+    )
+    .is_ok();
     if !peer_authorized {
         write_protocol_error(&mut stream, ProtocolError::unauthorized(), deadline);
         return Err(DesktopClientAdmissionError::PeerUnauthorized);

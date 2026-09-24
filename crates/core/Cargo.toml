@@ -46,6 +46,7 @@ sha1 = "0.10"
 sha2 = "0.10"
 sherpa-onnx = { version = "=1.13.2", default-features = false, features = ["shared"] }
 sherpa-onnx-sys = { version = "=1.13.2", default-features = false, features = ["shared"] }
+subtle = "2.6"
 tar = "0.4"
 ureq = { version = "2", default-features = false, features = ["json"] }
 url = "2"

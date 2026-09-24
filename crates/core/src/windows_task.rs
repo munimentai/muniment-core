@@ -128,6 +128,9 @@ pub enum RemovalScope {
         machine_payload_path: Option<PathBuf>,
     },
     Machine {
+        /// The SID of the user who runs the uninstaller. Only that user's task moves to
+        /// the per-user payload, because the per-user payload lives in that user's profile.
+        invoking_user_sid: String,
         payload_path: PathBuf,
         per_user_payload_path: Option<PathBuf>,
     },
@@ -672,16 +675,27 @@ pub fn plan_task_registration(
 
 /// Plans how an uninstaller handles an observed runtime task.
 pub fn plan_task_removal(scope: &RemovalScope, observed: &ObservedRegistration) -> TaskRemovalPlan {
-    let (payload_path, replacement_path, user_sid) = match scope {
+    let (payload_path, replacement_path, user_sid, replacement_sid) = match scope {
         RemovalScope::PerUser {
             user_sid,
             payload_path,
             machine_payload_path,
-        } => (payload_path, machine_payload_path, Some(user_sid.as_str())),
+        } => (
+            payload_path,
+            machine_payload_path,
+            Some(user_sid.as_str()),
+            None,
+        ),
         RemovalScope::Machine {
+            invoking_user_sid,
             payload_path,
             per_user_payload_path,
-        } => (payload_path, per_user_payload_path, None),
+        } => (
+            payload_path,
+            per_user_payload_path,
+            None,
+            Some(invoking_user_sid.as_str()),
+        ),
     };
 
     let observed_sid = sid_from_task_uri(&observed.uri);
@@ -691,6 +705,11 @@ pub fn plan_task_removal(scope: &RemovalScope, observed: &ObservedRegistration) 
         || observed.action_path != *payload_path
     {
         return TaskRemovalPlan::LeaveUnchanged;
+    }
+
+    // Another user's task never moves to the invoking user's per-user payload.
+    if replacement_sid.is_some_and(|replacement_sid| observed_sid != Some(replacement_sid)) {
+        return TaskRemovalPlan::StopAndDelete;
     }
 
     replacement_path

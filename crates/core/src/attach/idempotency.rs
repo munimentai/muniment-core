@@ -26,17 +26,12 @@ pub struct IdempotencyStore {
 
 impl IdempotencyStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ProtocolError> {
-        let connection = Connection::open(path).map_err(|_| ProtocolError::persistence_failed())?;
+        let mut connection =
+            Connection::open(path).map_err(|_| ProtocolError::persistence_failed())?;
         connection
-            .execute_batch(
-                "PRAGMA foreign_keys = ON;
-            CREATE TABLE IF NOT EXISTS attach_idempotency (
-              profile TEXT NOT NULL, operation TEXT NOT NULL, idempotency_key TEXT NOT NULL,
-              hash_version INTEGER NOT NULL, canonical_hash BLOB NOT NULL,
-              committed_result TEXT NOT NULL,
-              PRIMARY KEY (profile, operation, idempotency_key));",
-            )
+            .execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(|_| ProtocolError::persistence_failed())?;
+        scope_ledger_by_client(&mut connection)?;
         Ok(Self { connection })
     }
 
@@ -44,9 +39,13 @@ impl IdempotencyStore {
     /// ledger replay/conflict, and only then mutable preconditions and work.
     /// The callback receives the ledger transaction so its domain commit and
     /// the accepted result record commit atomically.
+    ///
+    /// The ledger scope is the profile, the authorized client identity, the
+    /// operation and the key, so one client never replays another's result.
     pub fn execute<A, W>(
         &mut self,
         profile: &str,
+        client_identity: &str,
         request: &Request,
         canonical_resolved_input: &Value,
         authorize: A,
@@ -74,8 +73,13 @@ impl IdempotencyStore {
         let existing: Option<(i64, Vec<u8>, String)> = transaction
             .query_row(
                 "SELECT hash_version, canonical_hash, committed_result FROM attach_idempotency
-             WHERE profile=?1 AND operation=?2 AND idempotency_key=?3",
-                params![profile, request.operation.as_str(), key.as_str()],
+             WHERE profile=?1 AND client_identity=?2 AND operation=?3 AND idempotency_key=?4",
+                params![
+                    profile,
+                    client_identity,
+                    request.operation.as_str(),
+                    key.as_str()
+                ],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
@@ -104,10 +108,12 @@ impl IdempotencyStore {
         transaction
             .execute(
                 "INSERT INTO attach_idempotency
-            (profile,operation,idempotency_key,hash_version,canonical_hash,committed_result)
-            VALUES (?1,?2,?3,?4,?5,?6)",
+            (profile,client_identity,operation,idempotency_key,hash_version,canonical_hash,
+             committed_result)
+            VALUES (?1,?2,?3,?4,?5,?6,?7)",
                 params![
                     profile,
+                    client_identity,
                     request.operation.as_str(),
                     key.as_str(),
                     HASH_VERSION,
@@ -134,6 +140,55 @@ impl IdempotencyStore {
             .execute("DELETE FROM attach_idempotency WHERE profile=?1", [profile])
             .map_err(|_| ProtocolError::persistence_failed())
     }
+}
+
+const CREATE_LEDGER: &str = "CREATE TABLE IF NOT EXISTS attach_idempotency (
+  profile TEXT NOT NULL, client_identity TEXT NOT NULL, operation TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL, hash_version INTEGER NOT NULL, canonical_hash BLOB NOT NULL,
+  committed_result TEXT NOT NULL,
+  PRIMARY KEY (profile, client_identity, operation, idempotency_key));";
+
+/// Creates the ledger, or moves a ledger without a client column into the scoped
+/// table. A moved row carries an empty client identity, which no companion holds.
+fn scope_ledger_by_client(connection: &mut Connection) -> Result<(), ProtocolError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| ProtocolError::persistence_failed())?;
+    let columns: Vec<String> = {
+        let mut statement = transaction
+            .prepare("SELECT name FROM pragma_table_info('attach_idempotency')")
+            .map_err(|_| ProtocolError::persistence_failed())?;
+        let rows = statement
+            .query_map([], |row| row.get(0))
+            .map_err(|_| ProtocolError::persistence_failed())?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|_| ProtocolError::persistence_failed())?
+    };
+    let unscoped = !columns.is_empty() && !columns.iter().any(|name| name == "client_identity");
+    if unscoped {
+        transaction
+            .execute_batch("ALTER TABLE attach_idempotency RENAME TO attach_idempotency_unscoped;")
+            .map_err(|_| ProtocolError::persistence_failed())?;
+    }
+    transaction
+        .execute_batch(CREATE_LEDGER)
+        .map_err(|_| ProtocolError::persistence_failed())?;
+    if unscoped {
+        transaction
+            .execute_batch(
+                "INSERT INTO attach_idempotency
+                   (profile,client_identity,operation,idempotency_key,hash_version,
+                    canonical_hash,committed_result)
+                 SELECT profile,'',operation,idempotency_key,hash_version,canonical_hash,
+                    committed_result
+                 FROM attach_idempotency_unscoped;
+                 DROP TABLE attach_idempotency_unscoped;",
+            )
+            .map_err(|_| ProtocolError::persistence_failed())?;
+    }
+    transaction
+        .commit()
+        .map_err(|_| ProtocolError::persistence_failed())
 }
 
 fn canonical_hash(value: &Value) -> Vec<u8> {

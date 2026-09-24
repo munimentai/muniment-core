@@ -41,7 +41,11 @@ impl RedirectCatcher {
     /// a small "return to the app" page, and hand back the authorization
     /// code. The callback is accepted only when its `state` matches
     /// `expected_state`; other paths (favicon probes etc.) get a 404 and the
-    /// wait continues. The listener shuts down when this returns.
+    /// wait continues. A callback with another `state`, including one that
+    /// carries `error=`, is answered and skipped, so a stray local request
+    /// cannot end the attempt. If the deadline passes after such a callback,
+    /// the wait ends with `StateMismatch`. The listener shuts down when this
+    /// returns.
     pub fn wait_for_callback(
         self,
         expected_state: &str,
@@ -57,6 +61,14 @@ impl RedirectCatcher {
         active: &dyn Fn() -> bool,
     ) -> Result<String, AuthError> {
         let deadline = Instant::now() + timeout;
+        let mut rejected_state = false;
+        let expired = |rejected_state: bool| {
+            if rejected_state {
+                AuthError::StateMismatch
+            } else {
+                AuthError::Timeout
+            }
+        };
         loop {
             if !active() {
                 return Err(AuthError::Timeout);
@@ -65,7 +77,7 @@ impl RedirectCatcher {
                 Ok((s, _)) => s,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     if Instant::now() >= deadline {
-                        return Err(AuthError::Timeout);
+                        return Err(expired(rejected_state));
                     }
                     std::thread::sleep(Duration::from_millis(25));
                     continue;
@@ -76,7 +88,7 @@ impl RedirectCatcher {
             // mode; the request read below wants a plain blocking socket.
             let _ = stream.set_nonblocking(false);
 
-            let Some(target) = read_request_target(&mut stream) else {
+            let Some(target) = read_request_target(&mut stream, deadline, active) else {
                 continue;
             };
             let (path, query) = match target.split_once('?') {
@@ -96,6 +108,15 @@ impl RedirectCatcher {
                     .map(|(_, v)| v.clone())
             };
 
+            if param("state").as_deref() != Some(expected_state) {
+                respond_page(
+                    &mut stream,
+                    "Sign-in rejected",
+                    "This sign-in attempt could not be verified. Close this tab and try again from the app.",
+                );
+                rejected_state = true;
+                continue;
+            }
             if let Some(error) = param("error") {
                 respond_page(
                     &mut stream,
@@ -108,14 +129,6 @@ impl RedirectCatcher {
                 } else {
                     format!("{error}: {desc}")
                 }));
-            }
-            if param("state").as_deref() != Some(expected_state) {
-                respond_page(
-                    &mut stream,
-                    "Sign-in rejected",
-                    "This sign-in attempt could not be verified. Close this tab and try again from the app.",
-                );
-                return Err(AuthError::StateMismatch);
             }
             if !active() {
                 return Err(AuthError::Timeout);
@@ -144,16 +157,41 @@ impl RedirectCatcher {
     }
 }
 
+/// One connection gets this much time in total to send its request head.
+const REQUEST_READ_BUDGET: Duration = Duration::from_secs(2);
+/// A single read waits at most this long, so `active()` is checked often.
+const REQUEST_READ_SLICE: Duration = Duration::from_millis(100);
+
 /// First line of the HTTP request → request target (e.g. `/callback?x=y`);
 /// `None` for anything unreadable (connection probes, non-GET methods).
-fn read_request_target(stream: &mut TcpStream) -> Option<String> {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+/// The read stops at the connection's read budget, at the attempt deadline,
+/// or when `active()` turns false, whichever comes first.
+fn read_request_target(
+    stream: &mut TcpStream,
+    attempt_deadline: Instant,
+    active: &dyn Fn() -> bool,
+) -> Option<String> {
+    let deadline = (Instant::now() + REQUEST_READ_BUDGET).min(attempt_deadline);
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 512];
     while !buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.len() < 8192 {
+        if !active() {
+            return None;
+        }
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        if remaining.is_zero() {
+            return None;
+        }
+        let _ = stream.set_read_timeout(Some(remaining.min(REQUEST_READ_SLICE)));
         match stream.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => break,
         }
     }
     let head = String::from_utf8_lossy(&buf);
@@ -226,6 +264,65 @@ mod tests {
         let (favicon, callback) = browser.join().unwrap();
         assert!(favicon.starts_with("HTTP/1.1 404"));
         assert!(callback.contains("return to muniment"));
+    }
+
+    #[test]
+    fn skips_a_callback_with_another_state_even_when_it_carries_an_error() {
+        let catcher = RedirectCatcher::bind().unwrap();
+        let port = catcher.port();
+        let browser = std::thread::spawn(move || {
+            let forged = get(port, "/callback?error=access_denied&state=forged");
+            let callback = get(port, "/callback?code=abc&state=xyz");
+            (forged, callback)
+        });
+        let code = catcher
+            .wait_for_callback("xyz", Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(code, "abc");
+        let (forged, callback) = browser.join().unwrap();
+        assert!(forged.contains("Sign-in rejected"));
+        assert!(callback.contains("return to muniment"));
+    }
+
+    #[test]
+    fn reports_a_state_mismatch_when_only_forged_callbacks_arrive() {
+        let catcher = RedirectCatcher::bind().unwrap();
+        let port = catcher.port();
+        let browser = std::thread::spawn(move || get(port, "/callback?code=abc&state=forged"));
+        let err = catcher
+            .wait_for_callback("xyz", Duration::from_millis(500))
+            .unwrap_err();
+        assert_eq!(err, AuthError::StateMismatch);
+        assert!(browser.join().unwrap().contains("Sign-in rejected"));
+    }
+
+    #[test]
+    fn a_trickling_connection_uses_one_read_budget_and_the_wait_continues() {
+        let catcher = RedirectCatcher::bind().unwrap();
+        let port = catcher.port();
+        let mut trickle = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        // A byte every 300 ms never trips a per-read timeout. Only the total
+        // budget ends this connection.
+        let trickler = std::thread::spawn(move || {
+            for _ in 0..30 {
+                if trickle.write_all(b"G").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        });
+        let browser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            get(port, "/callback?code=abc&state=xyz")
+        });
+        let start = Instant::now();
+        let code = catcher
+            .wait_for_callback("xyz", Duration::from_secs(20))
+            .unwrap();
+        assert_eq!(code, "abc");
+        assert!(start.elapsed() < REQUEST_READ_BUDGET + Duration::from_secs(2));
+        assert!(browser.join().unwrap().contains("return to muniment"));
+        trickler.join().unwrap();
     }
 
     #[test]

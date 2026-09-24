@@ -22,7 +22,7 @@ Tools:
 - bash, powershell: run a shell command in the working directory.
 - grep, find, ls: search file contents, find files by pattern, list a directory. Prefer these to shell commands for exploring files.
 - web_search, fetch_content: search the web and fetch a page. For get_search_content, copy the exact responseId from the tool result. Never invent a placeholder such as $(prev).
-- subagent: hand a bounded task to a child agent and get its result.
+- subagent: hand a bounded task to a child agent and get its result. When subagent is not in your tools, call subagents_enable first.
 - bg_run, bg_status, bg_logs, bg_kill: start a long command in the background and read its progress and result.
 - mcp: discover and call the user's MCP servers. The `record` server is the company record: `sql` reads it through one read-only query over the `v_<kind>` views, `edges_open`, `entity_identities` and `recent_events`, and `propose` then `commit` change it. Read before you write. A commit is the only change that exists.
 
@@ -542,11 +542,8 @@ pub fn pi_launch_config_for_executable(
             agent.to_string_lossy().into_owned(),
         );
     }
-    if boundaries.pi_artifact().version == crate::sidecar::pi_install::PI_CANDIDATE_ARTIFACT.version
-    {
-        // Extension loading precedes the first RPC response.
-        config.startup_timeout = std::time::Duration::from_secs(120);
-    }
+    // Extension loading precedes the first RPC response.
+    config.startup_timeout = std::time::Duration::from_secs(120);
     // The prompt states what the assistant does; the facts state where it runs.
     let model = if grant.is_local() {
         boundaries.local_default_model()

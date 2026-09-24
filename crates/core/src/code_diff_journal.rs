@@ -455,6 +455,94 @@ pub fn load_pending_code_diff(
     run_id: &str,
     gate: &Option<PermissionGate>,
 ) -> Option<CodeDiff> {
+    load_pending_code_diff_cached(journal, cas, run_id, gate, &mut CodeDiffCache::default())
+}
+
+/// Loads verified diffs for applied code-diff records without dropping invalid records.
+pub fn load_applied_code_diffs(
+    journal: &mut RunJournal,
+    cas: &LocalCas,
+    run_id: &str,
+    records: Vec<ProjectedAppliedDiff>,
+) -> Vec<ChatAppliedDiff> {
+    load_applied_code_diffs_cached(journal, cas, run_id, records, &mut CodeDiffCache::default())
+}
+
+/// The verified code diffs of one run by effect id. An entry holds until a
+/// diff or write-plan event for its effect lands, because only such an event
+/// changes what the journal links to that effect.
+#[derive(Clone, Debug, Default)]
+pub struct CodeDiffCache {
+    verified: BTreeMap<String, VerifiedCodeDiff>,
+}
+
+#[derive(Clone, Debug)]
+struct VerifiedCodeDiff {
+    code_diff_id: String,
+    diff_sha256: String,
+    write_plan_sha256: String,
+    diff: CodeDiff,
+}
+
+struct CodeDiffReference<'a> {
+    effect_id: &'a str,
+    code_diff_id: &'a str,
+    diff_sha256: &'a str,
+    write_plan_sha256: &'a str,
+}
+
+impl CodeDiffCache {
+    /// Drops the verified diff of one effect after its proposal changes.
+    pub fn forget(&mut self, effect_id: &str) {
+        self.verified.remove(effect_id);
+    }
+
+    fn load(
+        &mut self,
+        journal: &mut RunJournal,
+        cas: &LocalCas,
+        run_id: &str,
+        reference: CodeDiffReference<'_>,
+    ) -> Option<CodeDiff> {
+        if let Some(verified) = self.verified.get(reference.effect_id) {
+            if verified.code_diff_id == reference.code_diff_id
+                && verified.diff_sha256 == reference.diff_sha256
+                && verified.write_plan_sha256 == reference.write_plan_sha256
+            {
+                return Some(verified.diff.clone());
+            }
+        }
+        let diff =
+            load_code_diff_proposal_with_references(journal, cas, run_id, reference.effect_id)
+                .ok()
+                .flatten()
+                .and_then(|(_, diff, diff_hash, plan_hash)| {
+                    (diff.id == reference.code_diff_id
+                        && diff_hash.to_string() == reference.diff_sha256
+                        && plan_hash.to_string() == reference.write_plan_sha256)
+                        .then_some(diff)
+                })?;
+        self.verified.insert(
+            reference.effect_id.to_owned(),
+            VerifiedCodeDiff {
+                code_diff_id: reference.code_diff_id.to_owned(),
+                diff_sha256: reference.diff_sha256.to_owned(),
+                write_plan_sha256: reference.write_plan_sha256.to_owned(),
+                diff: diff.clone(),
+            },
+        );
+        Some(diff)
+    }
+}
+
+/// Loads a verified diff for a pending code-diff gate through a run's cache.
+pub fn load_pending_code_diff_cached(
+    journal: &mut RunJournal,
+    cas: &LocalCas,
+    run_id: &str,
+    gate: &Option<PermissionGate>,
+    cache: &mut CodeDiffCache,
+) -> Option<CodeDiff> {
     let Some(PermissionGate {
         request:
             PermissionRequest::CodeDiff {
@@ -468,48 +556,45 @@ pub fn load_pending_code_diff(
     else {
         return None;
     };
-    load_code_diff_proposal_with_references(journal, cas, run_id, effect_id)
-        .ok()
-        .flatten()
-        .and_then(|(_, diff, diff_hash, plan_hash)| {
-            (diff.id == *code_diff_id
-                && diff_hash.to_string() == *diff_sha256
-                && plan_hash.to_string() == *write_plan_sha256)
-                .then_some(diff)
-        })
+    cache.load(
+        journal,
+        cas,
+        run_id,
+        CodeDiffReference {
+            effect_id,
+            code_diff_id,
+            diff_sha256,
+            write_plan_sha256,
+        },
+    )
 }
 
-/// Loads verified diffs for applied code-diff records without dropping invalid records.
-pub fn load_applied_code_diffs(
+/// Loads verified diffs for applied code-diff records through a run's cache
+/// without dropping invalid records.
+pub fn load_applied_code_diffs_cached(
     journal: &mut RunJournal,
     cas: &LocalCas,
     run_id: &str,
     records: Vec<ProjectedAppliedDiff>,
+    cache: &mut CodeDiffCache,
 ) -> Vec<ChatAppliedDiff> {
     records
         .into_iter()
         .map(|record| {
-            let diff = load_applied_code_diff(journal, cas, run_id, &record);
+            let diff = cache.load(
+                journal,
+                cas,
+                run_id,
+                CodeDiffReference {
+                    effect_id: &record.effect_id,
+                    code_diff_id: &record.code_diff_id,
+                    diff_sha256: &record.diff_sha256,
+                    write_plan_sha256: &record.write_plan_sha256,
+                },
+            );
             ChatAppliedDiff::from_projected(record, diff)
         })
         .collect()
-}
-
-fn load_applied_code_diff(
-    journal: &mut RunJournal,
-    cas: &LocalCas,
-    run_id: &str,
-    record: &ProjectedAppliedDiff,
-) -> Option<CodeDiff> {
-    load_code_diff_proposal_with_references(journal, cas, run_id, &record.effect_id)
-        .ok()
-        .flatten()
-        .and_then(|(_, diff, diff_hash, plan_hash)| {
-            (diff.id == record.code_diff_id
-                && diff_hash.to_string() == record.diff_sha256
-                && plan_hash.to_string() == record.write_plan_sha256)
-                .then_some(diff)
-        })
 }
 
 fn load_proposal_object(
@@ -768,6 +853,25 @@ mod tests {
         )
         .unwrap();
         (store, plan, diff, gate, run_id, effect_id)
+    }
+
+    #[test]
+    fn the_run_cache_reuses_a_verified_diff_until_its_effect_changes() {
+        let (mut store, _, diff, gate, run_id, effect_id) = proposal();
+        let (_, _, _, diff_hash, _) = code_diff_answers(&gate);
+        let gate = Some(gate);
+        let mut cache = CodeDiffCache::default();
+        let load = |store: &mut TestStore, cache: &mut CodeDiffCache| {
+            load_pending_code_diff_cached(&mut store.journal, &store.cas, &run_id, &gate, cache)
+        };
+        assert_eq!(load(&mut store, &mut cache), Some(diff.clone()));
+
+        // A cached diff reads neither the journal nor the CAS.
+        fs::remove_file(object_path(&store, &diff_hash)).unwrap();
+        assert_eq!(load(&mut store, &mut cache), Some(diff));
+
+        cache.forget(&effect_id);
+        assert_eq!(load(&mut store, &mut cache), None);
     }
 
     fn code_diff_answers(gate: &PermissionGate) -> (String, String, String, String, String) {

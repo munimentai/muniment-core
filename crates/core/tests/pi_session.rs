@@ -24,14 +24,17 @@ fn root() -> PathBuf {
 fn new_and_reopen_launch_arguments_are_owned() {
     let root = root();
     let new = pi_sidecar_config("pi", &root, None).unwrap();
-    assert_eq!(&new.args[..3], ["--mode", "rpc", "--session-dir"]);
-    assert_eq!(Path::new(&new.args[3]), root.canonicalize().unwrap());
+    assert_eq!(
+        &new.args[..4],
+        ["--mode", "rpc", "--approve", "--session-dir"]
+    );
+    assert_eq!(Path::new(&new.args[4]), root.canonicalize().unwrap());
     assert!(!new.args.iter().any(|arg| arg == "--no-session"));
 
     fs::write(root.join("session.jsonl"), "{}\n").unwrap();
     let (locator, path) = validate_pi_session(&root, "session.jsonl").unwrap();
     let reopen = pi_sidecar_config("pi", &root, Some(&locator)).unwrap();
-    assert_eq!(&reopen.args[4..], ["--session", path.to_str().unwrap()]);
+    assert_eq!(&reopen.args[5..], ["--session", path.to_str().unwrap()]);
     fs::remove_dir_all(root).unwrap();
 }
 

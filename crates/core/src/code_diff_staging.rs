@@ -146,7 +146,47 @@ pub(crate) fn validate_path(path: &str) -> Result<(), StageProposedOperationsErr
             path.to_owned(),
         ));
     }
+    // The rules below hold on every platform, so a proposal staged on one host
+    // names the same files when the workspace is checked out on Windows.
+    if path.split('/').any(|part| part.contains(':')) {
+        return Err(StageProposedOperationsError::ColonInPath(path.to_owned()));
+    }
+    if path.split('/').any(is_windows_reserved_name) {
+        return Err(StageProposedOperationsError::ReservedDeviceName(
+            path.to_owned(),
+        ));
+    }
+    if path
+        .split('/')
+        .any(|part| part.ends_with('.') || part.ends_with(' '))
+    {
+        return Err(StageProposedOperationsError::TrailingDotOrSpace(
+            path.to_owned(),
+        ));
+    }
     Ok(())
+}
+
+/// Windows opens a device, not a file, for these names with any extension
+/// and in any case. Windows ignores trailing spaces before the extension.
+fn is_windows_reserved_name(component: &str) -> bool {
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or(component)
+        .trim_end_matches(' ');
+    let upper = stem.to_ascii_uppercase();
+    match upper.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" => true,
+        _ => ["COM", "LPT"].iter().any(|prefix| {
+            upper.strip_prefix(prefix).is_some_and(|digit| {
+                matches!(
+                    digit,
+                    "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            })
+        }),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -161,6 +201,9 @@ pub enum StageProposedOperationsError {
     ParentPathComponent(String),
     BackslashInPath(String),
     NulInPath(String),
+    ColonInPath(String),
+    ReservedDeviceName(String),
+    TrailingDotOrSpace(String),
     ConflictingPath(String),
     RenameSourceMissing(String),
     RenameTargetExists(String),
@@ -195,6 +238,14 @@ impl fmt::Display for StageProposedOperationsError {
             }
             Self::BackslashInPath(path) => write!(formatter, "path {path:?} contains a backslash"),
             Self::NulInPath(path) => write!(formatter, "path {path:?} contains a NUL byte"),
+            Self::ColonInPath(path) => write!(formatter, "path {path:?} contains a colon"),
+            Self::ReservedDeviceName(path) => {
+                write!(formatter, "path {path:?} names a Windows device")
+            }
+            Self::TrailingDotOrSpace(path) => write!(
+                formatter,
+                "path {path:?} has a component that ends in a dot or a space"
+            ),
             Self::ConflictingPath(path) => {
                 write!(
                     formatter,
@@ -286,7 +337,40 @@ mod tests {
                 "a\0b",
                 StageProposedOperationsError::NulInPath("a\0b".into()),
             ),
+            (
+                "src/file.txt:stream",
+                StageProposedOperationsError::ColonInPath("src/file.txt:stream".into()),
+            ),
+            (
+                "ab:c",
+                StageProposedOperationsError::ColonInPath("ab:c".into()),
+            ),
         ];
+        let cases = cases.into_iter().chain(
+            [
+                "CON",
+                "con",
+                "nul.txt",
+                "src/Aux.tar.gz",
+                "prn",
+                "COM1",
+                "lpt9.log",
+                "com³",
+                "CON .txt",
+            ]
+            .map(|path| {
+                (
+                    path,
+                    StageProposedOperationsError::ReservedDeviceName(path.into()),
+                )
+            }),
+        );
+        let cases = cases.chain(["a.", "a/b. ", "src /x", "..."].map(|path| {
+            (
+                path,
+                StageProposedOperationsError::TrailingDotOrSpace(path.into()),
+            )
+        }));
         for (path, expected) in cases {
             let error = stage_proposed_operations(
                 &BTreeMap::new(),
@@ -295,6 +379,20 @@ mod tests {
             .unwrap_err();
             assert_eq!(error, expected);
             assert!(error.to_string().contains(&format!("{path:?}")));
+        }
+    }
+
+    #[test]
+    fn accepts_names_that_only_resemble_windows_devices() {
+        for path in [
+            "console.txt",
+            "com10",
+            "lpt10",
+            "auxiliary/x",
+            "nul_file",
+            "a.b/c",
+        ] {
+            validate_path(path).unwrap();
         }
     }
 

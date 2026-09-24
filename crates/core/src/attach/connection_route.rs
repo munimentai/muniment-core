@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use muniment_attach::{decode_frame, Hello};
 
 use super::linux::PeerCredentials;
-use super::verify_approval_presenter_peer_with_reader;
+use super::verify_accepted_desktop_peer;
 use crate::browser_control::LinuxProcReader;
 
 const ROUTE_PEEK_CAP: usize = 4 * 1024;
@@ -30,15 +30,15 @@ pub fn name_attach_connection_route(
     process_reader: &dyn LinuxProcReader,
     timeout: Duration,
 ) -> AttachConnectionRoute {
-    let peer_authorized = u32::try_from(peer_credentials.pid).is_ok_and(|peer_pid| {
-        verify_approval_presenter_peer_with_reader(
-            peer_pid,
+    let peer_authorized = || {
+        verify_accepted_desktop_peer(
+            &peer_credentials,
             expected_desktop_executable,
             process_reader,
         )
         .is_ok()
-    });
-    if !peer_authorized || timeout.is_zero() {
+    };
+    if !peer_authorized() || timeout.is_zero() {
         return AttachConnectionRoute::Companion;
     }
 
@@ -59,6 +59,12 @@ pub fn name_attach_connection_route(
             "desktop-client" => AttachConnectionRoute::DesktopClient,
             _ => AttachConnectionRoute::Companion,
         });
+    // The hello is in hand, so read the peer image again and require the accept read.
+    let route = if route != AttachConnectionRoute::Companion && !peer_authorized() {
+        AttachConnectionRoute::Companion
+    } else {
+        route
+    };
     let _ = stream.set_read_timeout(previous_timeout);
     route
 }

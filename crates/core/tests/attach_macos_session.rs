@@ -78,6 +78,10 @@ mod unix_tests {
         fn peer_process(&self) -> Result<(u32, PathBuf), MacosPeerReadError> {
             self.0.clone()
         }
+
+        fn peer_code_matches(&self, _: &Path) -> bool {
+            true
+        }
     }
 
     fn route_reader(path: &str) -> StubRouteReader {

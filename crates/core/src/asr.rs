@@ -15,10 +15,13 @@ pub use vad::{
     SileroVoiceActivityDetector, VadDecisionSource, VadError, VAD_FRAME_SIZE, VAD_SAMPLE_RATE,
 };
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
@@ -261,6 +264,16 @@ impl AsrRevisionLifecycle {
         self.resolve_pointer("current").map(|pointer| pointer.path)
     }
 
+    /// Resolves and verifies the current revision, then stamps the files that
+    /// verification accepted so a caller can tell when they change.
+    pub fn resolve_current_stamped(
+        &self,
+    ) -> Result<(PathBuf, AsrModelSetStamp), AsrLifecycleError> {
+        let pointer = self.resolve_pointer("current")?;
+        let stamp = AsrModelSetStamp::of(&pointer.path, pointer.manifest);
+        Ok((pointer.path, stamp))
+    }
+
     pub fn publish(
         &self,
         staged_directory: &Path,
@@ -379,7 +392,11 @@ impl AsrRevisionLifecycle {
             .ok_or(AsrLifecycleError::UnknownPointer)?;
         let path = self.root.join("revisions").join(revision);
         verify_model_set(&path, manifest).map_err(AsrLifecycleError::RevisionInvalid)?;
-        Ok(ResolvedPointer { path, value })
+        Ok(ResolvedPointer {
+            path,
+            value,
+            manifest,
+        })
     }
 
     fn write_pointer(
@@ -425,7 +442,116 @@ impl AsrRevisionLifecycle {
 struct ResolvedPointer {
     path: PathBuf,
     value: String,
+    manifest: &'static AsrArtifactManifest,
 }
+
+/// The file stamps of a verified model set. Two stamps match only when every
+/// artifact still has the size, times and file identity verification saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AsrModelSetStamp(Option<Vec<ArtifactStamp>>);
+
+impl AsrModelSetStamp {
+    fn of(directory: &Path, manifest: &AsrArtifactManifest) -> Self {
+        let filenames = manifest
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.filename)
+            .chain(
+                manifest
+                    .additional_artifact
+                    .map(|artifact| artifact.artifact.filename),
+            );
+        Self(
+            filenames
+                .map(|filename| {
+                    fs::metadata(directory.join(filename))
+                        .ok()
+                        .and_then(|metadata| ArtifactStamp::of(&metadata))
+                })
+                .collect(),
+        )
+    }
+
+    /// A stamp that could not read every file matches nothing, itself included.
+    pub fn matches(&self, other: &Self) -> bool {
+        self.0.is_some() && self.0 == other.0
+    }
+}
+
+/// Size, times and file identity of one artifact. On Unix the change time
+/// moves on every content, mode or owner change and no user tool can set it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArtifactStamp {
+    len: u64,
+    modified: SystemTime,
+    changed: SystemTime,
+    identity: (u64, u64),
+}
+
+impl ArtifactStamp {
+    #[cfg(unix)]
+    fn of(metadata: &fs::Metadata) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let changed = SystemTime::UNIX_EPOCH.checked_add(Duration::new(
+            u64::try_from(metadata.ctime()).ok()?,
+            u32::try_from(metadata.ctime_nsec()).ok()?,
+        ))?;
+        Some(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok()?,
+            changed,
+            identity: (metadata.dev(), metadata.ino()),
+        })
+    }
+
+    #[cfg(windows)]
+    fn of(metadata: &fs::Metadata) -> Option<Self> {
+        use std::os::windows::fs::MetadataExt;
+        let modified = metadata.modified().ok()?;
+        Some(Self {
+            len: metadata.len(),
+            modified,
+            changed: modified,
+            identity: (
+                metadata.creation_time(),
+                u64::from(metadata.file_attributes()),
+            ),
+        })
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn of(_: &fs::Metadata) -> Option<Self> {
+        None
+    }
+
+    /// A file written within the timestamp granularity of the hash start can
+    /// change again without moving its stamp, so only settled files are kept.
+    fn settled_before(&self, started: SystemTime) -> bool {
+        self.modified
+            .max(self.changed)
+            .checked_add(VERIFIED_SETTLE)
+            .is_some_and(|settled| settled <= started)
+    }
+}
+
+/// Covers the coarsest file timestamp the supported file systems record.
+const VERIFIED_SETTLE: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct VerifiedArtifact {
+    stamp: ArtifactStamp,
+    sha256: &'static str,
+}
+
+/// Artifacts whose full digest passed, keyed by path. A record holds only
+/// while the file keeps its stamp, so a changed file hashes again.
+fn verified_artifacts() -> &'static Mutex<HashMap<PathBuf, VerifiedArtifact>> {
+    static VERIFIED: OnceLock<Mutex<HashMap<PathBuf, VerifiedArtifact>>> = OnceLock::new();
+    VERIFIED.get_or_init(Mutex::default)
+}
+
+/// Serializes full hashes so concurrent callers wait for one digest.
+static HASHING: Mutex<()> = Mutex::new(());
 
 /// Atomically swaps a legacy incomplete revision directory for the freshly
 /// completed stage. The old directory is moved aside first so a failed swap can
@@ -507,6 +633,79 @@ pub(super) fn verify_artifact(
     path: &Path,
     descriptor: &AsrArtifactDescriptor,
 ) -> Result<(), AsrModelSetVerificationError> {
+    verify_artifact_at(path, descriptor, SystemTime::now())
+}
+
+fn verify_artifact_at(
+    path: &Path,
+    descriptor: &AsrArtifactDescriptor,
+    started: SystemTime,
+) -> Result<(), AsrModelSetVerificationError> {
+    let result = verify_artifact_stamped(path, descriptor, started);
+    if result.is_err() {
+        forget_verified(path);
+    }
+    result
+}
+
+fn verify_artifact_stamped(
+    path: &Path,
+    descriptor: &AsrArtifactDescriptor,
+    started: SystemTime,
+) -> Result<(), AsrModelSetVerificationError> {
+    let metadata = artifact_metadata(path, descriptor)?;
+    let stamp = ArtifactStamp::of(&metadata);
+    let trusted = |stamp: Option<ArtifactStamp>| {
+        stamp.is_some_and(|stamp| {
+            verified_artifacts()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(path)
+                == Some(&VerifiedArtifact {
+                    stamp,
+                    sha256: descriptor.sha256,
+                })
+        })
+    };
+    if trusted(stamp) {
+        return Ok(());
+    }
+    let _hashing = HASHING.lock().unwrap_or_else(|error| error.into_inner());
+    // Another caller may have hashed these bytes while this one waited.
+    if trusted(stamp) {
+        return Ok(());
+    }
+    let file = File::open(path).map_err(|_| AsrModelSetVerificationError::Unreadable)?;
+    let digest = hash_reader(BufReader::new(file))?;
+    if digest != descriptor.sha256 {
+        return Err(AsrModelSetVerificationError::DigestMismatch);
+    }
+    // Keep the record only when the file kept its stamp through the hash.
+    let after = fs::metadata(path)
+        .ok()
+        .and_then(|metadata| ArtifactStamp::of(&metadata));
+    match stamp {
+        Some(stamp) if after == Some(stamp) && stamp.settled_before(started) => {
+            verified_artifacts()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(
+                    path.to_owned(),
+                    VerifiedArtifact {
+                        stamp,
+                        sha256: descriptor.sha256,
+                    },
+                );
+        }
+        _ => forget_verified(path),
+    }
+    Ok(())
+}
+
+fn artifact_metadata(
+    path: &Path,
+    descriptor: &AsrArtifactDescriptor,
+) -> Result<fs::Metadata, AsrModelSetVerificationError> {
     let metadata = std::fs::metadata(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             AsrModelSetVerificationError::Missing
@@ -523,16 +722,19 @@ pub(super) fn verify_artifact(
             actual: metadata.len(),
         });
     }
+    Ok(metadata)
+}
 
-    let file = File::open(path).map_err(|_| AsrModelSetVerificationError::Unreadable)?;
-    let digest = hash_reader(BufReader::new(file))?;
-    if digest != descriptor.sha256 {
-        return Err(AsrModelSetVerificationError::DigestMismatch);
-    }
-    Ok(())
+fn forget_verified(path: &Path) {
+    verified_artifacts()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(path);
 }
 
 fn hash_reader(mut reader: impl Read) -> Result<String, AsrModelSetVerificationError> {
+    #[cfg(test)]
+    tests::HASHES.with(|count| count.set(count.get() + 1));
     let mut hasher = Sha256::new();
     std::io::copy(&mut reader, &mut hasher)
         .map_err(|_| AsrModelSetVerificationError::Unreadable)?;
@@ -708,6 +910,77 @@ mod tests {
         let lifecycle =
             AsrRevisionLifecycle::new(root.clone(), &KNOWN_MANIFESTS, &MANIFEST).unwrap();
         (root, lifecycle, stage)
+    }
+
+    thread_local! {
+        pub(super) static HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn hashes() -> usize {
+        HASHES.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn settled_verified_artifacts_hash_once_until_their_stamp_changes() {
+        let directory = fixture_directory();
+        let path = directory.join("one");
+        let later = SystemTime::now() + Duration::from_secs(3600);
+
+        let before = hashes();
+        assert_eq!(verify_artifact_at(&path, &FIXTURES[0], later), Ok(()));
+        assert_eq!(verify_artifact_at(&path, &FIXTURES[0], later), Ok(()));
+        assert_eq!(hashes(), before + 1);
+
+        // Same size, new bytes, and a moved modification time.
+        fs::write(&path, b"x").unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(
+            verify_artifact_at(&path, &FIXTURES[0], later),
+            Err(AsrModelSetVerificationError::DigestMismatch)
+        );
+        assert!(!verified_artifacts().lock().unwrap().contains_key(&path));
+
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            verify_artifact_at(&path, &FIXTURES[0], later),
+            Err(AsrModelSetVerificationError::Missing)
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn freshly_written_artifacts_hash_on_every_verification() {
+        let directory = fixture_directory();
+        let path = directory.join("two");
+        let before = hashes();
+        assert_eq!(verify_artifact(&path, &FIXTURES[1]), Ok(()));
+        assert_eq!(verify_artifact(&path, &FIXTURES[1]), Ok(()));
+        assert_eq!(hashes(), before + 2);
+        assert!(!verified_artifacts().lock().unwrap().contains_key(&path));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn model_set_stamps_match_only_unchanged_readable_files() {
+        let directory = fixture_directory();
+        let first = AsrModelSetStamp::of(&directory, &MANIFEST);
+        assert!(first.matches(&AsrModelSetStamp::of(&directory, &MANIFEST)));
+        File::options()
+            .write(true)
+            .open(directory.join("three"))
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
+            .unwrap();
+        assert!(!first.matches(&AsrModelSetStamp::of(&directory, &MANIFEST)));
+        fs::remove_file(directory.join("four")).unwrap();
+        let missing = AsrModelSetStamp::of(&directory, &MANIFEST);
+        assert!(!missing.matches(&missing.clone()));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

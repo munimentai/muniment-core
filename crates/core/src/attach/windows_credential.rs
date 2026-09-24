@@ -81,6 +81,97 @@ pub fn save_client_credentials(
     result
 }
 
+/// Reads the current user's attach pipe path from its owner-only file.
+///
+/// A missing file reads as `NotFound`, which means no runtime has bound the pipe.
+pub fn load_windows_attach_pipe_path(sid: &str) -> io::Result<String> {
+    let local_app_data = crate::windows_known_folders::windows_local_app_data()
+        .map_err(|_| io::Error::other("the local application data folder is unavailable"))?;
+    read_pipe_name_file(&super::windows_attach_pipe_name_file(&local_app_data), sid)
+}
+
+/// Reads the current user's attach pipe path, or generates and stores a new one.
+/// Only the runtime listener calls this.
+pub fn load_or_create_windows_attach_pipe_path(sid: &str) -> io::Result<String> {
+    let local_app_data = crate::windows_known_folders::windows_local_app_data()
+        .map_err(|_| io::Error::other("the local application data folder is unavailable"))?;
+    let path = super::windows_attach_pipe_name_file(&local_app_data);
+    match read_pipe_name_file(&path, sid) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        result => return result,
+    }
+    let suffix = super::new_windows_attach_pipe_suffix()
+        .map_err(|_| io::Error::other("could not generate the attach pipe suffix"))?;
+    let pipe_path = super::windows_attach_pipe_path(sid, &suffix)
+        .map_err(|_| io::Error::other("could not derive the attach pipe path"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("the attach pipe name file has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".attach-pipe-name-{}.tmp", Uuid::now_v7()));
+    let result = (|| {
+        let mut security = OwnerSecurity::new(FILE_ALL_ACCESS)?;
+        let attributes = security.attributes();
+        let file = open_file(
+            &temporary,
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            CREATE_NEW,
+            &attributes,
+        )?;
+        std::io::Write::write_all(&mut &file, pipe_path.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        // No replace flag, so a name another runtime stored first wins.
+        move_file_once(&temporary, &path)
+    })();
+    let _ = std::fs::remove_file(&temporary);
+    match result {
+        Ok(()) => Ok(pipe_path),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            read_pipe_name_file(&path, sid)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn read_pipe_name_file(path: &Path, sid: &str) -> io::Result<String> {
+    let file = open_file(
+        path,
+        GENERIC_READ | READ_CONTROL,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        OPEN_EXISTING,
+        null(),
+    )?;
+    let security = OwnerSecurity::new(FILE_ALL_ACCESS)?;
+    validate_owner_access(file.as_raw_handle(), security.sid())?;
+    let mut contents = String::new();
+    std::io::Read::read_to_string(&mut std::io::Read::take(&file, 256), &mut contents)?;
+    super::validate_windows_attach_pipe_path(sid, contents.trim()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the attach pipe name file is invalid",
+        )
+    })
+}
+
+fn move_file_once(source: &Path, destination: &Path) -> io::Result<()> {
+    let source = wide(source);
+    let destination = wide(destination);
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 fn open_file(
     path: &Path,
     access: u32,

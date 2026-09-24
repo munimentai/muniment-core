@@ -1,9 +1,30 @@
 //! Automatic, project-scoped recall of sibling conversations.
 use crate::{
-    journal::{reducer::project_chat, RunJournal},
+    journal::{
+        thread_summaries::{ThreadSummaryScan, ThreadSummaryScanError},
+        RunJournal,
+    },
     thread_ownership::subject_owns_first_run,
 };
 use std::{collections::BTreeSet, path::Path};
+
+/// The thread ids with a creation record, from one directory read, so the
+/// scan opens a record file only for a thread that has one.
+fn creation_thread_ids(profile: &Path) -> Result<BTreeSet<String>, String> {
+    let entries = match std::fs::read_dir(profile.join("creation-threads")) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut ids = BTreeSet::new();
+    for entry in entries {
+        let name = entry.map_err(|e| e.to_string())?.file_name();
+        if let Some(id) = name.to_str().and_then(|name| name.strip_suffix(".json")) {
+            ids.insert(id.to_owned());
+        }
+    }
+    Ok(ids)
+}
 
 fn words(text: &str) -> BTreeSet<String> {
     text.split(|c: char| !c.is_alphanumeric())
@@ -38,82 +59,57 @@ pub fn retrieve(
         return Ok(String::new());
     }
     let agents = crate::agents::state(profile)?;
+    let creations = creation_thread_ids(profile)?;
     let terms = words(query);
+    // Summary order favors recent work. The scan reads at most 1,000 threads
+    // from one pass over the summaries, and recall reads at most 1,000 runs,
+    // each thread's newest first, from the thread projection.
+    let scan = ThreadSummaryScan {
+        limit: usize::MAX,
+        page_size: Some(100),
+        max_pages: 10,
+    };
+    let page = journal
+        .scan_thread_summaries(Some(workspace), None, scan, |journal, id| {
+            Ok::<_, String>(
+                id != current
+                    && catalog.threads.get(id) == Some(project)
+                    && !agents.threads.contains_key(id)
+                    && !(creations.contains(id) && crate::creations::read(profile, id)?.is_some())
+                    && subject_owns_first_run(journal, id, subject).unwrap_or(false),
+            )
+        })
+        .map_err(|error| match error {
+            ThreadSummaryScanError::List(error) => error.to_string(),
+            ThreadSummaryScanError::Keep(error) => error,
+        })?;
     let mut matches = Vec::new();
-    let mut cursor = None;
     let mut remaining = 1000usize;
-    // Summary order favors recent work. Bound reads and injected context separately.
-    for _ in 0..10 {
-        let page = journal
-            .workspace_thread_summaries(workspace, 100, cursor.as_deref())
-            .map_err(|e| e.to_string())?;
-        for summary in page.summaries {
-            let id = &summary.thread_id;
-            if id == current
-                || catalog.threads.get(id) != Some(project)
-                || agents.threads.contains_key(id)
-                || crate::creations::read(profile, id)?.is_some()
-                || !subject_owns_first_run(journal, id, subject).unwrap_or(false)
-            {
-                continue;
-            }
-            let mut run_cursor = None;
-            loop {
-                let runs = journal
-                    .thread_run_ids(id, 100, run_cursor.as_deref())
-                    .map_err(|e| format!("{e:?}"))?;
-                for run in runs.run_ids {
-                    if remaining == 0 {
-                        break;
-                    }
-                    remaining -= 1;
-                    if !journal
-                        .run_belongs_to_workspace(&run, workspace)
-                        .unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    let events = journal.events(&run).map_err(|e| e.to_string())?;
-                    let Ok(projection) = project_chat(&events) else {
-                        continue;
-                    };
-                    #[cfg(feature = "keyring")]
-                    let user = if projection.prompt_storage_notice.is_none() {
-                        crate::thread_history::load_prompt(&run, subject)
-                            .ok()
-                            .flatten()
-                            .unwrap_or_default()
-                    } else {
-                        String::new()
-                    };
-                    #[cfg(not(feature = "keyring"))]
-                    let user = String::new();
-                    let text = format!("User: {user}\nAssistant: {}", projection.text);
-                    for paragraph in text.split('\n').filter(|s| !s.trim().is_empty()) {
-                        let score = words(paragraph).intersection(&terms).count();
-                        if score > 0 {
-                            matches.push((
-                                score,
-                                summary.updated_at.clone(),
-                                id.clone(),
-                                summary.title.clone(),
-                                paragraph.chars().take(1800).collect::<String>(),
-                            ));
-                        }
-                    }
-                }
-                run_cursor = runs.next_cursor;
-                if remaining == 0 || run_cursor.is_none() {
-                    break;
-                }
-            }
-            if remaining == 0 {
-                break;
-            }
-        }
-        cursor = page.next_cursor;
-        if remaining == 0 || cursor.is_none() {
+    for summary in page.summaries {
+        if remaining == 0 {
             break;
+        }
+        let id = &summary.thread_id;
+        let runs = journal
+            .thread_recall_texts(id, workspace, remaining)
+            .map_err(|e| e.to_string())?;
+        remaining -= runs.len();
+        // Prompts live in the keychain. Recall reads only the journal's
+        // projected text, so it never opens the keychain once per run.
+        for (user, assistant) in runs {
+            let text = format!("User: {user}\nAssistant: {assistant}");
+            for paragraph in text.split('\n').filter(|s| !s.trim().is_empty()) {
+                let score = words(paragraph).intersection(&terms).count();
+                if score > 0 {
+                    matches.push((
+                        score,
+                        summary.updated_at.clone(),
+                        id.clone(),
+                        summary.title.clone(),
+                        paragraph.chars().take(1800).collect::<String>(),
+                    ));
+                }
+            }
         }
     }
     matches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));

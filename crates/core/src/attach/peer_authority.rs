@@ -1,6 +1,8 @@
 //! Linux attach peer verification.
 
+use super::linux::PeerCredentials;
 use crate::browser_control::{LinuxProcReader, ProcReader};
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -96,6 +98,47 @@ pub fn verify_desktop_client_peer_with_reader(
 ) -> Result<AuthorizedDesktopClientPeer, PeerAuthorityError> {
     verify_peer_executable(peer_pid, expected_executable, reader)?;
     Ok(AuthorizedDesktopClientPeer(()))
+}
+
+/// A peer's start time and the digest of its canonical executable path at one read.
+///
+/// Linux has no identity that survives exec, so the desktop routes read this at
+/// accept and again when the hello arrives, and require both reads to match. A
+/// same-user process that execs the desktop binary before the first read still
+/// passes, which the threat model states.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeerImage {
+    start_identity: u64,
+    executable: [u8; 32],
+}
+
+/// Reads the peer image of `peer_pid`, or `None` when procfs cannot name it.
+pub fn peer_image(peer_pid: u32, reader: &(impl LinuxProcReader + ?Sized)) -> Option<PeerImage> {
+    let start_identity = reader.start_identity(peer_pid).ok()?;
+    let executable = std::fs::canonicalize(reader.executable(peer_pid).ok()?).ok()?;
+    Some(PeerImage {
+        start_identity,
+        executable: Sha256::digest(executable.as_os_str().as_bytes()).into(),
+    })
+}
+
+/// Verifies a desktop route peer against the installed desktop executable and
+/// against the image read when the connection was accepted.
+pub fn verify_accepted_desktop_peer(
+    peer_credentials: &PeerCredentials,
+    expected_executable: &Path,
+    reader: &(impl LinuxProcReader + ?Sized),
+) -> Result<(), PeerAuthorityError> {
+    let peer_pid =
+        u32::try_from(peer_credentials.pid).map_err(|_| PeerAuthorityError::PeerUnavailable)?;
+    let accepted = peer_credentials
+        .accept_image
+        .ok_or(PeerAuthorityError::PeerUnavailable)?;
+    verify_peer_executable(peer_pid, expected_executable, reader)?;
+    if peer_image(peer_pid, reader) != Some(accepted) {
+        return Err(PeerAuthorityError::PeerIdentityChanged);
+    }
+    Ok(())
 }
 
 fn verify_peer_executable(

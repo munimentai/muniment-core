@@ -567,6 +567,7 @@ fn leaves_another_users_task_unchanged_during_per_user_removal() {
 fn plans_machine_task_removal() {
     let observed = observed_registration(&task_uri(SID).unwrap());
     let scope = RemovalScope::Machine {
+        invoking_user_sid: SID.to_owned(),
         payload_path: PathBuf::from(PAYLOAD),
         per_user_payload_path: Some(PathBuf::from(USER_PAYLOAD)),
     };
@@ -576,6 +577,7 @@ fn plans_machine_task_removal() {
     );
 
     let scope = RemovalScope::Machine {
+        invoking_user_sid: SID.to_owned(),
         payload_path: PathBuf::from(PAYLOAD),
         per_user_payload_path: None,
     };
@@ -586,8 +588,29 @@ fn plans_machine_task_removal() {
 }
 
 #[test]
+fn deletes_another_users_task_instead_of_repointing_it_during_machine_removal() {
+    const OTHER_SID: &str = "S-1-5-21-111-222-333-1002";
+
+    let mut observed = observed_registration(&task_uri(OTHER_SID).unwrap());
+    observed.principal_sid = OTHER_SID.to_owned();
+
+    for per_user_payload_path in [Some(PathBuf::from(USER_PAYLOAD)), None] {
+        let scope = RemovalScope::Machine {
+            invoking_user_sid: SID.to_owned(),
+            payload_path: PathBuf::from(PAYLOAD),
+            per_user_payload_path,
+        };
+        assert_eq!(
+            plan_task_removal(&scope, &observed),
+            TaskRemovalPlan::StopAndDelete
+        );
+    }
+}
+
+#[test]
 fn leaves_tasks_unchanged_when_removal_ownership_does_not_match() {
     let scope = RemovalScope::Machine {
+        invoking_user_sid: SID.to_owned(),
         payload_path: PathBuf::from(PAYLOAD),
         per_user_payload_path: Some(PathBuf::from(USER_PAYLOAD)),
     };

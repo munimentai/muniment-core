@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use muniment_core::attach::linux::PeerCredentials;
 use muniment_core::attach::{
-    encode_frame, name_attach_connection_route, AttachConnectionRoute, Client, Hello, Id, Protocol,
-    VersionRange,
+    encode_frame, name_attach_connection_route, peer_image, AttachConnectionRoute, Client, Hello,
+    Id, Protocol, VersionRange,
 };
 use muniment_core::browser_control::{LinuxProcReader, ProcReadError};
 
@@ -33,6 +33,7 @@ fn credentials() -> PeerCredentials {
         pid: 424242,
         uid: 1000,
         gid: 1000,
+        accept_image: peer_image(424242, &expected_and_reader().1),
     }
 }
 
@@ -231,4 +232,42 @@ fn delayed_prefix_and_incomplete_payload_share_one_timeout() {
     assert!(started.elapsed() < timeout + Duration::from_millis(125));
     assert_eq!(server.read_timeout().unwrap(), Some(previous_timeout));
     writer.join().unwrap();
+}
+
+#[test]
+fn a_peer_image_that_changed_since_accept_routes_to_companion() {
+    struct StartReader(u64, PathBuf);
+    impl LinuxProcReader for StartReader {
+        fn start_identity(&self, _pid: u32) -> Result<u64, ProcReadError> {
+            Ok(self.0)
+        }
+        fn executable(&self, _pid: u32) -> Result<PathBuf, ProcReadError> {
+            Ok(self.1.clone())
+        }
+    }
+    let (expected, _) = expected_and_reader();
+    for accept_image in [
+        None,
+        peer_image(424242, &StartReader(8, expected.clone())),
+        peer_image(
+            424242,
+            &StartReader(7, fs::canonicalize("/bin/sh").unwrap()),
+        ),
+    ] {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&hello("desktop-client")).unwrap();
+        assert_eq!(
+            name_attach_connection_route(
+                &server,
+                PeerCredentials {
+                    accept_image,
+                    ..credentials()
+                },
+                &expected,
+                &StartReader(7, expected.clone()),
+                Duration::from_secs(1),
+            ),
+            AttachConnectionRoute::Companion
+        );
+    }
 }

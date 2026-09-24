@@ -8,8 +8,8 @@ use serde_json::{json, Value};
 
 use super::{ProbeOutcome, RestartPolicy, SidecarConfig, SidecarIo};
 
-pub const PI_NPM_PACKAGE: &str = "@mariozechner/pi-coding-agent";
-pub const PI_VERSION: &str = "0.73.1";
+pub const PI_NPM_PACKAGE: &str = "@earendil-works/pi-coding-agent";
+pub const PI_VERSION: &str = super::pi_install::PI_ARTIFACT.version;
 
 type PendingCalls = Arc<Mutex<HashMap<String, Option<mpsc::Sender<Result<Value, String>>>>>>;
 type CurrentTransport = Arc<Mutex<Option<(u64, Arc<PiRpcTransport>)>>>;
@@ -81,6 +81,10 @@ pub fn pi_sidecar_config(
     config.args = vec![
         "--mode".into(),
         "rpc".into(),
+        // The app trusts the working directory it selects, so project-local
+        // `.pi` settings, extensions, skills and prompts load without the
+        // trust prompt that RPC mode cannot show.
+        "--approve".into(),
         "--session-dir".into(),
         root.to_string_lossy().into_owned(),
     ];
@@ -98,7 +102,7 @@ pub fn pi_sidecar_config(
 }
 
 impl PiRpcTransport {
-    /// Reads the pinned 0.73.1 state contract and turns its session file into a
+    /// Reads the pinned `get_state` contract and turns its session file into a
     /// root-relative, non-secret locator suitable for the journal.
     pub fn session_locator(
         &self,

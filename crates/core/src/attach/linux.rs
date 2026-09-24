@@ -449,10 +449,15 @@ impl<'a> AttachTransport<'a> {
                 }
             }
         };
-        let credentials = peer_credentials(&stream)?;
+        let mut credentials = peer_credentials(&stream)?;
         if credentials.uid != unsafe { libc::geteuid() } {
             return Err(AttachAcceptError::WrongUid(credentials));
         }
+        // Read the peer image now, before any frame, so a desktop route can require the
+        // same image when the hello arrives.
+        credentials.accept_image = u32::try_from(credentials.pid)
+            .ok()
+            .and_then(|pid| super::peer_image(pid, &crate::browser_control::ProcReader));
         Ok((stream, credentials))
     }
 
@@ -494,6 +499,8 @@ pub struct PeerCredentials {
     pub pid: libc::pid_t,
     pub uid: libc::uid_t,
     pub gid: libc::gid_t,
+    /// The peer's executable and start time read at accept, before any frame.
+    pub accept_image: Option<super::PeerImage>,
 }
 
 /// Injectable authority for migration control session admission.
@@ -948,7 +955,9 @@ fn run_migration_control_session<S: ThreadListService>(
             .ok_or(AttachSessionError::Timeout)?;
         let request = read_request_before(stream, deadline)?;
         let request_id = request.request_id.clone();
-        if request.operation != Operation::MigrationControl || request.capability != capability {
+        if request.operation != Operation::MigrationControl
+            || !super::secret_eq(&request.capability, &capability)
+        {
             write_request_error(
                 stream,
                 Some(request_id),
@@ -1236,6 +1245,7 @@ fn peer_credentials(stream: &UnixStream) -> Result<PeerCredentials, AttachAccept
         pid: credentials.pid,
         uid: credentials.uid,
         gid: credentials.gid,
+        accept_image: None,
     })
 }
 

@@ -4,9 +4,15 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use muniment_core::journal::{EventEnvelope, EventPayload, Provenance, RunJournal};
-use muniment_core::thread_history::{chat_thread_open_page, ThreadHistoryError};
+use muniment_core::thread_history::{
+    chat_thread_open_page, chat_thread_open_page_without_prompts, load_page_prompts,
+    ThreadHistoryError,
+};
 use serde_json::{json, Value};
 use uuid::Uuid;
+
+/// Serializes the tests that install a keyring credential builder.
+static KEYRING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn journal_file() -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
@@ -45,6 +51,9 @@ fn started_event(run_id: &str, actor_id: &str) -> EventEnvelope {
 
 #[test]
 fn open_page_uses_the_webview_contract() {
+    let _keyring = KEYRING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
     let path = journal_file();
     let mut journal = RunJournal::open_with_busy_timeout(&path, Duration::from_secs(60)).unwrap();
@@ -128,5 +137,37 @@ fn open_page_rejects_a_thread_owned_by_another_subject() {
     );
 
     drop(journal);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_page_without_prompts_reads_them_after_the_journal() {
+    let _keyring = KEYRING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    muniment_core::chat_prompt::use_mock_keyring_for_tests();
+    let path = journal_file();
+    let mut journal = RunJournal::open_with_busy_timeout(&path, Duration::from_secs(60)).unwrap();
+    let run_id = Uuid::now_v7().to_string();
+    let thread_id = journal
+        .append_new_run("workspace", &started_event(&run_id, "owner"))
+        .unwrap();
+    muniment_core::chat_prompt::store_prompt(&run_id, "Plan the week.", Some("owner")).unwrap();
+
+    let mut page = chat_thread_open_page_without_prompts(
+        &mut journal,
+        None,
+        Some("owner"),
+        std::path::Path::new("."),
+        &thread_id,
+        10,
+        None,
+    )
+    .unwrap();
+    drop(journal);
+    assert_eq!(page.entries[0].prompt, None);
+    load_page_prompts(&mut page, Some("owner")).unwrap();
+    assert_eq!(page.entries[0].prompt.as_deref(), Some("Plan the week."));
+
     std::fs::remove_file(path).unwrap();
 }

@@ -108,6 +108,7 @@ where
         match *state {
             LiveConnectionState::Blocked => {
                 drop(state);
+                drop(gate);
                 std::thread::sleep(Duration::from_millis(50));
                 continue;
             }
@@ -264,38 +265,7 @@ where
             );
             continue;
         }
-        if matches!(
-            request.operation,
-            Operation::ThreadRename
-                | Operation::ThreadDelete
-                | Operation::ThreadSelect
-                | Operation::ThreadSummaries
-                | Operation::ThreadHistory
-                | Operation::SessionStatus
-                | Operation::EntitlementSnapshot
-                | Operation::DeviceList
-                | Operation::SessionSignIn
-                | Operation::SessionSignOut
-                | Operation::CompanionList
-                | Operation::CompanionRevoke
-                | Operation::CompanyList
-                | Operation::CompanyCreate
-                | Operation::CompanySelect
-                | Operation::CompanyRename
-                | Operation::CompanyDelete
-                | Operation::ReaderDescribe
-                | Operation::ReaderRun
-                | Operation::ReaderQueue
-                | Operation::ReaderObjects
-                | Operation::ReaderConnect
-                | Operation::RunChatEvents
-                | Operation::RunSubmit
-                | Operation::RunResume
-                | Operation::RunSteer
-                | Operation::RunFollowUp
-                | Operation::RunPermissionAnswer
-                | Operation::RetentionRecheck
-        ) {
+        let Some(required_scope) = companion_scope(request.operation) else {
             write_request_error(
                 stream,
                 Some(request.request_id),
@@ -303,29 +273,6 @@ where
                 deadline,
             );
             return Err(AttachSessionError::Authorization);
-        }
-        let required_scope = match request.operation {
-            Operation::WorkspaceOnboard | Operation::HomeEnsure => None,
-            Operation::ThreadList
-            | Operation::ThreadOpen
-            | Operation::RunOpen
-            | Operation::RunStream
-            | Operation::RunCursorAck
-            | Operation::ArtifactFetch
-            | Operation::ArtifactWindow
-            | Operation::RequestCancel
-            | Operation::RecordSql
-            | Operation::RecordKinds
-            | Operation::RecordQuery
-            | Operation::RecordEntity
-            | Operation::RecordReport => Some("thread.read"),
-            Operation::ThreadCreate
-            | Operation::RunStart
-            | Operation::RunCancel
-            | Operation::PermissionAnswer
-            | Operation::RecordPropose
-            | Operation::RecordCommit => Some("run.write"),
-            _ => None,
         };
         if authorization
             .validate_request_with_scope(
@@ -391,6 +338,69 @@ where
         }
         drop(admission);
         drop(admission_gate);
+    }
+}
+
+/// The companion allow list. `None` denies the operation. `Some(scope)` admits it under
+/// the capability scope it names, and `Some(None)` admits it under the connection's
+/// capability alone. The match is exhaustive, so a new operation stays off the companion
+/// route until it is classified here.
+fn companion_scope(operation: Operation) -> Option<Option<&'static str>> {
+    match operation {
+        // The service admits migration control only from the installed runtime
+        // binary, so the companion route forwards it with no capability scope.
+        Operation::WorkspaceOnboard | Operation::HomeEnsure | Operation::MigrationControl => {
+            Some(None)
+        }
+        Operation::ThreadList
+        | Operation::ThreadOpen
+        | Operation::RunOpen
+        | Operation::RunStream
+        | Operation::RunCursorAck
+        | Operation::ArtifactFetch
+        | Operation::ArtifactWindow
+        | Operation::RequestCancel
+        | Operation::RecordSql
+        | Operation::RecordKinds
+        | Operation::RecordQuery
+        | Operation::RecordEntity
+        | Operation::RecordReport => Some(Some("thread.read")),
+        Operation::ThreadCreate
+        | Operation::RunStart
+        | Operation::RunCancel
+        | Operation::PermissionAnswer
+        | Operation::RecordPropose
+        | Operation::RecordCommit => Some(Some("run.write")),
+        Operation::ApprovalPresent => None,
+        Operation::ThreadRename
+        | Operation::ThreadDelete
+        | Operation::ThreadSelect
+        | Operation::ThreadSummaries
+        | Operation::ThreadHistory
+        | Operation::SessionStatus
+        | Operation::EntitlementSnapshot
+        | Operation::DeviceList
+        | Operation::SessionSignIn
+        | Operation::SessionSignOut
+        | Operation::CompanionList
+        | Operation::CompanionRevoke
+        | Operation::CompanyList
+        | Operation::CompanyCreate
+        | Operation::CompanySelect
+        | Operation::CompanyRename
+        | Operation::CompanyDelete
+        | Operation::ReaderDescribe
+        | Operation::ReaderRun
+        | Operation::ReaderQueue
+        | Operation::ReaderObjects
+        | Operation::ReaderConnect
+        | Operation::RunChatEvents
+        | Operation::RunSubmit
+        | Operation::RunResume
+        | Operation::RunSteer
+        | Operation::RunFollowUp
+        | Operation::RunPermissionAnswer
+        | Operation::RetentionRecheck => None,
     }
 }
 
@@ -467,6 +477,22 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn companion_route_denies_desktop_only_operations_by_name() {
+        assert_eq!(companion_scope(Operation::MigrationControl), Some(None));
+        assert_eq!(companion_scope(Operation::ApprovalPresent), None);
+        assert_eq!(companion_scope(Operation::SessionSignOut), None);
+        assert_eq!(companion_scope(Operation::HomeEnsure), Some(None));
+        assert_eq!(
+            companion_scope(Operation::ThreadList),
+            Some(Some("thread.read"))
+        );
+        assert_eq!(
+            companion_scope(Operation::RunStart),
+            Some(Some("run.write"))
+        );
+    }
 
     #[test]
     fn companion_wire_redacts_desktop_persistence_diagnostics() {

@@ -14,6 +14,10 @@ use super::ReadableWait;
 
 pub(super) const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const READABLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// How long a session with a chat subscription waits for a readable request
+/// after it waits on the chat event source. The subscription connection
+/// carries events, so the event source holds the long wait.
+const SUBSCRIBED_READABLE_CHECK: Duration = Duration::from_millis(1);
 
 /// Closed outcomes from an attach session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,9 +71,12 @@ pub(super) trait DesktopSessionService {
     #[cfg(target_os = "linux")]
     fn record_chat_delivery_failure(&mut self, run_id: &str, cause: &str);
 
+    /// Waits up to `wait` for a chat event, then drains the queued events.
+    /// The flag reports a closed subscription.
     fn drain_chat_events(
         &mut self,
         state: &mut Self::State,
+        wait: Duration,
     ) -> Result<(Vec<Event>, bool), AttachSessionError>;
 
     fn dispatch_request(
@@ -178,8 +185,9 @@ where
             #[cfg(not(target_os = "linux"))]
             write_before(stream, &frame, Instant::now() + REQUEST_TIMEOUT)?;
         }
-        if service.has_chat_subscription(&state) {
-            let (events, closed) = service.drain_chat_events(&mut state)?;
+        let chat_subscribed = service.has_chat_subscription(&state);
+        if chat_subscribed {
+            let (events, closed) = service.drain_chat_events(&mut state, READABLE_POLL_INTERVAL)?;
             for event in events {
                 #[cfg(target_os = "linux")]
                 write_run_frame_before(
@@ -201,7 +209,12 @@ where
             }
         }
 
-        match stream.wait_until_readable(Instant::now() + READABLE_POLL_INTERVAL) {
+        let readable_wait = if chat_subscribed {
+            SUBSCRIBED_READABLE_CHECK
+        } else {
+            READABLE_POLL_INTERVAL
+        };
+        match stream.wait_until_readable(Instant::now() + readable_wait) {
             ReadableWait::Ready => {}
             ReadableWait::Closed if service.has_chat_subscription(&state) => {
                 return Err(AttachSessionError::Closed);
@@ -226,7 +239,7 @@ where
             );
             Instant::now()
         });
-        let dispatched = if request.capability != capability
+        let dispatched = if !super::secret_eq(&request.capability, capability)
             || matches!(
                 request.operation,
                 Operation::MigrationControl | Operation::ApprovalPresent
@@ -763,6 +776,7 @@ mod tests {
             fn drain_chat_events(
                 &mut self,
                 _: &mut (),
+                _: Duration,
             ) -> Result<(Vec<Event>, bool), AttachSessionError> {
                 unreachable!()
             }
@@ -821,6 +835,87 @@ mod tests {
                 "muniment-runtime: desktop session closed reason=Timeout"
             );
         }
+    }
+
+    #[test]
+    fn a_chat_subscription_waits_on_its_event_source_and_checks_the_socket_briefly() {
+        struct Idle(std::cell::Cell<Option<Duration>>);
+        impl Read for Idle {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                unreachable!()
+            }
+        }
+        impl Write for Idle {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl DeadlineStream for Idle {
+            fn wait_until_readable(&self, deadline: Instant) -> ReadableWait {
+                self.0
+                    .set(Some(deadline.saturating_duration_since(Instant::now())));
+                ReadableWait::Closed
+            }
+            fn set_read_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+                Ok(())
+            }
+            fn set_write_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        #[derive(Default)]
+        struct Subscribed {
+            waits: Vec<Duration>,
+        }
+        impl DesktopSessionService for Subscribed {
+            type State = ();
+            type Provenance = ();
+            fn new_session_state(&self) {}
+            fn poll_run_streams(&mut self, _: &mut ()) -> Result<Vec<Event>, ProtocolError> {
+                Ok(Vec::new())
+            }
+            fn has_chat_subscription(&self, _: &()) -> bool {
+                true
+            }
+            #[cfg(target_os = "linux")]
+            fn record_chat_delivery_failure(&mut self, _: &str, _: &str) {}
+            fn drain_chat_events(
+                &mut self,
+                _: &mut (),
+                wait: Duration,
+            ) -> Result<(Vec<Event>, bool), AttachSessionError> {
+                self.waits.push(wait);
+                Ok((Vec::new(), false))
+            }
+            fn dispatch_request(
+                &mut self,
+                _: Request,
+                _: &str,
+                _: (),
+                _: &mut (),
+            ) -> Result<DesktopDispatchResult, DesktopDispatchFailure> {
+                unreachable!()
+            }
+        }
+        let mut stream = Idle(std::cell::Cell::new(None));
+        let mut service = Subscribed::default();
+        let result = serve_desktop_client_requests_with_diagnostics(
+            &mut stream,
+            "capability",
+            "workspace",
+            (),
+            &mut service,
+            |_| {},
+        );
+
+        assert_eq!(result, Err(AttachSessionError::Closed));
+        // The long wait sits on the chat event source, so an event goes out
+        // as soon as it arrives. The socket check after it is brief.
+        assert_eq!(service.waits, [READABLE_POLL_INTERVAL]);
+        assert!(stream.0.get().unwrap() <= SUBSCRIBED_READABLE_CHECK);
     }
 
     struct Service;

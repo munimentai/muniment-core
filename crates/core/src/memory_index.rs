@@ -10,7 +10,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_ITEM_CAP: usize = 5;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -21,6 +22,12 @@ const MAX_QUERY_CHARACTERS: usize = 1_024;
 const MAX_QUERY_TERMS: usize = 64;
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DIRECTORY_DEPTH: usize = 32;
+/// Directories that hold build output, dependencies or tool state, never notes.
+/// The scan also skips every hidden directory.
+const SKIPPED_DIRECTORIES: [&str; 6] = ["node_modules", ".git", "target", "dist", "build", ".venv"];
+/// A file modified this recently can change again within the same timestamp,
+/// so the index records no size and time for it and reads it on the next build.
+const SETTLED_MODIFICATION_AGE: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetrievalLimits {
@@ -133,6 +140,9 @@ pub struct MemoryRuntimeSession {
     configured: RetrievalLimits,
     declaration: MemorySearchSession,
     recalls: Vec<RecallRecord>,
+    /// Set once the session's first index build ran. A search takes this lock,
+    /// so it waits for a first build that runs on another thread.
+    first_build: Arc<Mutex<bool>>,
 }
 
 impl MemoryRuntimeSession {
@@ -161,6 +171,7 @@ impl MemoryRuntimeSession {
             configured,
             declaration: MemorySearchSession::default(),
             recalls: Vec::new(),
+            first_build: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -173,7 +184,21 @@ impl MemoryRuntimeSession {
     }
 
     pub fn build_with_timeout(&self, timeout: Duration) -> Result<ReindexReport, MemoryIndexError> {
+        let mut built = self
+            .first_build
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *built = true;
         self.index.reindex_with_deadline(Instant::now() + timeout)
+    }
+
+    /// Runs the session's first index build on another thread, so opening a
+    /// session never waits for the Home scan. A search that arrives first runs
+    /// the build itself, or waits for the build that already runs.
+    pub fn build_in_background(&self, timeout: Duration) {
+        let first_build = Arc::clone(&self.first_build);
+        let index = self.index.clone();
+        std::thread::spawn(move || build_once(&first_build, &index, timeout));
     }
 
     pub fn tool_declaration_count(&self) -> usize {
@@ -183,6 +208,7 @@ impl MemoryRuntimeSession {
     pub fn call(&mut self, arguments: &[u8]) -> Result<MemorySearchResult, MemoryIndexError> {
         let call: MemorySearchCall = serde_json::from_slice(arguments)
             .map_err(|_| MemoryIndexError::InvalidToolArguments)?;
+        build_once(&self.first_build, &self.index, DEFAULT_BUILD_TIMEOUT);
         let requested = if call.item_count.is_none()
             && call.character_budget.is_none()
             && call.timeout_milliseconds.is_none()
@@ -209,6 +235,14 @@ impl MemoryRuntimeSession {
 
     pub fn recall_records(&self) -> &[RecallRecord] {
         &self.recalls
+    }
+}
+
+fn build_once(first_build: &Mutex<bool>, index: &MemoryIndex, timeout: Duration) {
+    let mut built = first_build.lock().unwrap_or_else(PoisonError::into_inner);
+    if !*built {
+        *built = true;
+        let _ = index.reindex_with_deadline(Instant::now() + timeout);
     }
 }
 
@@ -246,6 +280,7 @@ impl MemorySearchSession {
     }
 }
 
+#[derive(Clone)]
 pub struct MemoryIndex {
     home: PathBuf,
     database: PathBuf,
@@ -392,6 +427,11 @@ impl MemoryIndex {
                 path TEXT PRIMARY KEY NOT NULL,
                 content_hash TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS memory_file_stats (
+                path TEXT PRIMARY KEY NOT NULL,
+                byte_length INTEGER NOT NULL,
+                modified_ns INTEGER NOT NULL
+             );
              CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(path UNINDEXED, content);",
             )
             .map_err(|error| sqlite_error(error, deadline))?;
@@ -436,7 +476,8 @@ impl MemoryIndex {
         connection: &mut Connection,
         deadline: Instant,
     ) -> Result<ReindexReport, MemoryIndexError> {
-        let documents = scan_home(&self.home, deadline)?;
+        let known = known_files(connection).map_err(|error| sqlite_error(error, deadline))?;
+        let documents = scan_home(&self.home, deadline, known)?;
         Self::write_documents(connection, &documents, deadline)
     }
 
@@ -453,19 +494,29 @@ impl MemoryIndex {
         for (path, document) in documents {
             check_deadline(deadline)?;
             if existing.get(path) == Some(&document.hash) {
+                if !document.stat_recorded {
+                    write_file_stat(&transaction, path, document.stat)?;
+                }
                 report.unchanged += 1;
                 continue;
             }
+            // The scan skipped a file the index recorded, and another build
+            // changed that record since. That build holds the newer content.
+            let Some(content) = &document.content else {
+                report.unchanged += 1;
+                continue;
+            };
             transaction.execute("DELETE FROM memory_fts WHERE path = ?1", [path])?;
             transaction.execute(
                 "INSERT INTO memory_fts(path, content) VALUES (?1, ?2)",
-                params![path, document.content],
+                params![path, content],
             )?;
             transaction.execute(
                 "INSERT INTO memory_files(path, content_hash) VALUES (?1, ?2)
                  ON CONFLICT(path) DO UPDATE SET content_hash = excluded.content_hash",
                 params![path, document.hash],
             )?;
+            write_file_stat(&transaction, path, document.stat)?;
             report.indexed.push(path.clone());
         }
         for path in existing
@@ -475,6 +526,7 @@ impl MemoryIndex {
             check_deadline(deadline)?;
             transaction.execute("DELETE FROM memory_fts WHERE path = ?1", [path])?;
             transaction.execute("DELETE FROM memory_files WHERE path = ?1", [path])?;
+            transaction.execute("DELETE FROM memory_file_stats WHERE path = ?1", [path])?;
             report.removed.push(path.clone());
         }
         let source_digest = compute_source_state(&transaction)?;
@@ -561,18 +613,91 @@ fn normalize_timeout(error: MemoryIndexError, deadline: Instant) -> MemoryIndexE
 }
 
 struct Document {
-    content: String,
+    /// The file content, or nothing when its size and time match the record.
+    content: Option<String>,
     hash: String,
+    stat: Option<FileStat>,
+    /// The index already records `stat` for this path.
+    stat_recorded: bool,
+}
+
+/// The size and modification time of a settled file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStat {
+    byte_length: u64,
+    modified_ns: i64,
+}
+
+impl FileStat {
+    fn of(metadata: &fs::Metadata) -> Option<Self> {
+        let modified = metadata.modified().ok()?;
+        if SystemTime::now().duration_since(modified).ok()? < SETTLED_MODIFICATION_AGE {
+            return None;
+        }
+        let modified_ns = modified.duration_since(UNIX_EPOCH).ok()?.as_nanos();
+        Some(Self {
+            byte_length: metadata.len(),
+            modified_ns: i64::try_from(modified_ns).ok()?,
+        })
+    }
+}
+
+/// A file the index holds: its recorded size and time, and its content hash.
+struct KnownFile {
+    stat: FileStat,
+    hash: String,
+}
+
+fn known_files(connection: &Connection) -> Result<BTreeMap<String, KnownFile>, rusqlite::Error> {
+    let mut statement = connection.prepare(
+        "SELECT s.path, s.byte_length, s.modified_ns, f.content_hash \
+         FROM memory_file_stats s JOIN memory_files f ON f.path = s.path",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            KnownFile {
+                stat: FileStat {
+                    byte_length: row.get::<_, i64>(1)?.max(0) as u64,
+                    modified_ns: row.get(2)?,
+                },
+                hash: row.get(3)?,
+            },
+        ))
+    })?;
+    rows.collect()
+}
+
+fn write_file_stat(
+    transaction: &Transaction<'_>,
+    path: &str,
+    stat: Option<FileStat>,
+) -> Result<(), rusqlite::Error> {
+    match stat {
+        Some(stat) => transaction.execute(
+            "INSERT INTO memory_file_stats(path, byte_length, modified_ns) VALUES (?1, ?2, ?3)
+             ON CONFLICT(path) DO UPDATE SET byte_length = excluded.byte_length,
+             modified_ns = excluded.modified_ns",
+            params![
+                path,
+                i64::try_from(stat.byte_length).unwrap_or(i64::MAX),
+                stat.modified_ns
+            ],
+        )?,
+        None => transaction.execute("DELETE FROM memory_file_stats WHERE path = ?1", [path])?,
+    };
+    Ok(())
 }
 
 fn scan_home(
     home: &Path,
     deadline: Instant,
+    known: BTreeMap<String, KnownFile>,
 ) -> Result<BTreeMap<String, Document>, MemoryIndexError> {
     let home = home.to_owned();
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
-        let _ = sender.send(scan_home_with_hook(&home, deadline, || {}));
+        let _ = sender.send(scan_home_with_hook(&home, deadline, &known, || {}));
     });
     receiver
         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -582,6 +707,7 @@ fn scan_home(
 fn scan_home_with_hook(
     home: &Path,
     deadline: Instant,
+    known: &BTreeMap<String, KnownFile>,
     after_collection: impl FnOnce(),
 ) -> Result<BTreeMap<String, Document>, MemoryIndexError> {
     let home_directory = open_home_directory(home)?;
@@ -621,13 +747,37 @@ fn scan_home_with_hook(
         if !metadata.file_type().is_file() || metadata.len() > MAX_FILE_BYTES {
             continue;
         }
+        let relative = path.to_string_lossy().replace('\\', "/");
+        let stat = FileStat::of(&metadata);
+        if let Some(recorded) = known
+            .get(&relative)
+            .filter(|recorded| stat == Some(recorded.stat))
+        {
+            documents.insert(
+                relative,
+                Document {
+                    content: None,
+                    hash: recorded.hash.clone(),
+                    stat,
+                    stat_recorded: true,
+                },
+            );
+            continue;
+        }
         let bytes = read_utf8_bytes_blocking(file, metadata.len() as usize, deadline)?;
         let Ok(content) = String::from_utf8(bytes) else {
             continue;
         };
-        let relative = path.to_string_lossy().replace('\\', "/");
         let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
-        documents.insert(relative, Document { content, hash });
+        documents.insert(
+            relative,
+            Document {
+                content: Some(content),
+                hash,
+                stat,
+                stat_recorded: false,
+            },
+        );
     }
     Ok(documents)
 }
@@ -732,6 +882,9 @@ fn collect_markdown(
         if kind.is_symlink() {
             continue;
         }
+        if kind.is_dir() && skipped_directory(&entry.file_name()) {
+            continue;
+        }
         if kind.is_dir() {
             let child = directory.open_dir_nofollow(entry.file_name())?;
             collect_markdown(&child, &path, files, depth + 1, deadline)?;
@@ -745,6 +898,11 @@ fn collect_markdown(
         }
     }
     Ok(())
+}
+
+fn skipped_directory(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.starts_with('.') || SKIPPED_DIRECTORIES.contains(&name))
 }
 
 fn existing_hashes(
@@ -889,6 +1047,88 @@ mod tests {
         }
     }
 
+    fn age(path: &Path) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(60))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_settled_file_with_its_recorded_size_and_time_is_not_read_again() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("memory/fact.md");
+        fixture.file("fact.md", "orchid fact");
+        age(&path);
+        let index = fixture.index();
+        assert_eq!(index.reindex().unwrap().indexed, ["memory/fact.md"]);
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+
+        // Same size and time: the build keeps the record without a read.
+        fs::write(&path, "dahlia fact").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let report = index.reindex().unwrap();
+        assert!(report.indexed.is_empty());
+        assert_eq!(report.unchanged, 1);
+        let search = |query| {
+            index
+                .search("thread", query, Fixture::limits(5, 1000), None)
+                .unwrap()
+                .items
+                .len()
+        };
+        assert_eq!(search("orchid"), 1);
+
+        // A new size is a change, so the build reads the file.
+        fs::write(&path, "dahlia fact, revised").unwrap();
+        age(&path);
+        assert_eq!(index.reindex().unwrap().indexed, ["memory/fact.md"]);
+        assert_eq!(search("orchid"), 0);
+        assert_eq!(search("revised"), 1);
+    }
+
+    #[test]
+    fn a_recently_modified_file_is_read_on_every_build() {
+        let fixture = Fixture::new();
+        fixture.file("fact.md", "orchid fact");
+        let index = fixture.index();
+        index.reindex().unwrap();
+        fixture.file("fact.md", "dahlia fact");
+        assert_eq!(index.reindex().unwrap().indexed, ["memory/fact.md"]);
+    }
+
+    #[test]
+    fn dependency_build_and_hidden_directories_are_not_indexed() {
+        let fixture = Fixture::new();
+        fixture.file("kept.md", "orchid kept");
+        for directory in [
+            "projects/app/node_modules/pkg",
+            "projects/app/.git",
+            "projects/app/target",
+            "projects/app/dist",
+            "projects/app/build",
+            "projects/app/.venv",
+            "projects/app/.cache",
+        ] {
+            fs::create_dir_all(fixture.root.join(directory)).unwrap();
+            fs::write(
+                fixture.root.join(directory).join("README.md"),
+                "orchid skipped",
+            )
+            .unwrap();
+        }
+        fs::write(fixture.root.join("projects/app/notes.md"), "orchid notes").unwrap();
+        let report = fixture.index().reindex().unwrap();
+        assert_eq!(report.indexed, ["memory/kept.md", "projects/app/notes.md"]);
+    }
+
     #[test]
     fn deleted_database_reads_as_an_empty_cache() {
         let fixture = Fixture::new();
@@ -969,7 +1209,12 @@ mod tests {
         }
 
         // The scan runs first, so the short deadline can only land inside the write.
-        let documents = scan_home(&fixture.root, Instant::now() + Duration::from_secs(60)).unwrap();
+        let documents = scan_home(
+            &fixture.root,
+            Instant::now() + Duration::from_secs(60),
+            BTreeMap::new(),
+        )
+        .unwrap();
         let mut connection = index
             .open(Instant::now() + Duration::from_secs(60))
             .unwrap();
@@ -1491,6 +1736,7 @@ mod tests {
         let result = scan_home_with_hook(
             &fixture.root,
             Instant::now() + Duration::from_secs(5),
+            &BTreeMap::new(),
             || {
                 fs::remove_file(&selected).unwrap();
                 symlink(outside.root.join("memory/secret.md"), &selected).unwrap();
@@ -1499,8 +1745,10 @@ mod tests {
         .unwrap();
 
         assert!(!result.contains_key("memory/replace.md"));
-        assert!(result
-            .values()
-            .all(|document| !document.content.contains("outside marigold credential")));
+        assert!(result.values().all(|document| !document
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .contains("outside marigold credential")));
     }
 }

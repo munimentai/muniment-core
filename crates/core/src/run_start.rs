@@ -148,6 +148,11 @@ pub trait RunAttachBoundaries {
     fn sign_out(&self, _provenance: Provenance) -> Result<crate::auth::AuthStatus, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
+    /// The subject a companion approval binds to now: `LOCAL_APPROVAL_SUBJECT` in
+    /// local mode, the signed-in account otherwise. `None` refuses every approval.
+    fn approval_subject(&self) -> Option<String> {
+        None
+    }
     #[cfg(any(unix, target_os = "windows"))]
     fn list_devices(&self) -> Result<crate::auth::NativeDeviceList, ProtocolError> {
         Err(ProtocolError::unsupported_operation())

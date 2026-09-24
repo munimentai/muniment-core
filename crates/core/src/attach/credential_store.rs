@@ -15,6 +15,10 @@ pub struct ClientCredential {
     pub claimed_version: String,
     #[serde(deserialize_with = "deserialize_approval_time")]
     pub approved_at: Option<String>,
+    /// The signed-in account, or local mode, that approved this companion. A record
+    /// without a subject needs a fresh visible approval before it reconnects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
 }
 
 fn deserialize_approval_time<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -63,6 +67,7 @@ pub(super) fn decode_client_credentials(
                         claimed_kind: "unknown".into(),
                         claimed_version: "unknown".into(),
                         approved_at: None,
+                        subject: None,
                     },
                 )
             })
@@ -90,6 +95,10 @@ fn credentials_are_valid(credentials: &HashMap<String, ClientCredential>) -> boo
                     .map(|time| time.offset().local_minus_utc() == 0)
                     .unwrap_or(false)
             })
+            && entry
+                .subject
+                .as_deref()
+                .is_none_or(super::is_valid_approval_subject)
     })
 }
 
@@ -105,6 +114,7 @@ mod tests {
             claimed_kind: "cli".into(),
             claimed_version: "1.2.3".into(),
             approved_at: Some("2026-08-04T12:00:00Z".into()),
+            subject: Some("account:org:user".into()),
         }
     }
 
@@ -123,12 +133,31 @@ mod tests {
     }
 
     #[test]
+    fn decodes_a_record_written_without_a_subject() {
+        let mut entry = serde_json::to_value(credential()).unwrap();
+        entry.as_object_mut().unwrap().remove("subject");
+        let value = serde_json::json!({"version": 1, "companions": {IDENTITY: entry}});
+        let decoded = decode_client_credentials(value).unwrap();
+        assert_eq!(decoded[IDENTITY].subject, None);
+    }
+
+    #[test]
+    fn rejects_an_invalid_subject() {
+        for subject in ["", "account:\n", &"x".repeat(257)] {
+            let mut entry = credential();
+            entry.subject = Some(subject.into());
+            assert!(!credentials_are_valid(&store(entry)));
+        }
+    }
+
+    #[test]
     fn decodes_legacy_store_with_unknown_claims() {
         let value = serde_json::json!({IDENTITY: "ab".repeat(32)});
         let decoded = decode_client_credentials(value).unwrap();
         assert_eq!(decoded[IDENTITY].claimed_kind, "unknown");
         assert_eq!(decoded[IDENTITY].claimed_version, "unknown");
         assert_eq!(decoded[IDENTITY].approved_at, None);
+        assert_eq!(decoded[IDENTITY].subject, None);
     }
 
     #[test]

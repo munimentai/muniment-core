@@ -20,6 +20,8 @@ const BSD_INFO_SIZE: usize = 136;
 // `sizeof(struct socket_fdinfo)` in the macOS SDK. The large tail is the
 // `socket_info.soi_proto` union (not merely its TCP member).
 const SOCKET_INFO_SIZE: usize = 792;
+// The most map regions the image search reads before it gives up.
+const MAX_IMAGE_REGIONS: usize = 4096;
 
 const _: () = assert!(PROC_UID_ONLY == 4);
 const _: () = assert!(PROC_PIDLISTFDS == 1);
@@ -119,12 +121,16 @@ impl NativeProcessReader for MacOsProcessReader {
     }
 
     fn executable_identity(&self, pid: u32) -> Result<ExecutableIdentity, ProcessReadError> {
-        let pid = pid.try_into().map_err(|_| ProcessReadError)?;
+        let pid: c_int = pid.try_into().map_err(|_| ProcessReadError)?;
+        let image_path = process_image_path(pid)?;
         let mut address = 0;
-        // The first region can be an anonymous __PAGEZERO mapping. The first
-        // file-backed mapping is the process image; keep this walk bounded and
-        // reject malformed or unexpectedly fragmented maps.
-        for _ in 0..256 {
+        // The first file-backed region of the map is not guaranteed to be the
+        // process image, because dyld and the shared cache map files too. The
+        // image is the mapping whose path is the one proc_pidpath names. Its
+        // vnode, not the file at that path now, carries the identity, so a file
+        // replaced after the process started never matches. The walk is bounded
+        // and rejects malformed maps.
+        for _ in 0..MAX_IMAGE_REGIONS {
             let mut info = std::mem::MaybeUninit::<ProcRegionWithPathInfo>::zeroed();
             let read = unsafe {
                 proc_pidinfo(
@@ -140,7 +146,10 @@ impl NativeProcessReader for MacOsProcessReader {
             }
             let info = unsafe { info.assume_init() };
             let stat = info.vnode.vip_vi.vi_stat;
-            if stat.vst_dev != 0 && stat.vst_ino != 0 {
+            if stat.vst_dev != 0
+                && stat.vst_ino != 0
+                && c_path_bytes(info.vnode.vip_path.as_flattened()) == image_path.as_slice()
+            {
                 return Ok(ExecutableIdentity {
                     device: stat.vst_dev.into(),
                     inode: stat.vst_ino,
@@ -199,6 +208,32 @@ impl NativeProcessReader for MacOsProcessReader {
     }
 }
 
+/// The path of the vnode the kernel holds as the process image.
+fn process_image_path(pid: c_int) -> Result<Vec<u8>, ProcessReadError> {
+    let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let capacity = u32::try_from(buffer.len()).map_err(|_| ProcessReadError)?;
+    let length = unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), capacity) };
+    let length = usize::try_from(length).map_err(|_| ProcessReadError)?;
+    if length == 0 || length > buffer.len() {
+        return Err(ProcessReadError);
+    }
+    buffer.truncate(length);
+    if buffer.last() == Some(&0) {
+        buffer.pop();
+    }
+    if buffer.is_empty() || buffer.contains(&0) {
+        return Err(ProcessReadError);
+    }
+    Ok(buffer)
+}
+
+fn c_path_bytes(path: &[libc::c_char]) -> Vec<u8> {
+    path.iter()
+        .take_while(|byte| **byte != 0)
+        .map(|byte| *byte as u8)
+        .collect()
+}
+
 fn parse_tcp_socket(bytes: &[u8]) -> Result<Option<ProcessSocket>, ProcessReadError> {
     let family = read_i32(bytes, 184)?;
     let flags = *bytes.get(288).ok_or(ProcessReadError)?;
@@ -243,4 +278,25 @@ fn read_i32(bytes: &[u8], offset: usize) -> Result<i32, ProcessReadError> {
 
 fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, ProcessReadError> {
     Ok(u64::from_ne_bytes(read_array(bytes, offset)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn reads_the_image_of_the_running_process() {
+        let identity = MacOsProcessReader
+            .executable_identity(std::process::id())
+            .unwrap();
+        let metadata = std::fs::metadata(std::env::current_exe().unwrap()).unwrap();
+        assert_eq!(
+            identity,
+            ExecutableIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }
+        );
+    }
 }

@@ -160,8 +160,9 @@ fn builds_removal_scopes_from_resolved_payloads() {
         }))
     );
     assert_eq!(
-        scopes.machine_removal_scope(),
+        scopes.machine_removal_scope(SID),
         Some(RemovalScope::Machine {
+            invoking_user_sid: SID.to_owned(),
             payload_path: machine_payload,
             per_user_payload_path: Some(user_payload),
         })
@@ -180,7 +181,7 @@ fn removal_scope_is_absent_when_its_payload_is_absent() {
     };
 
     assert_eq!(scopes.per_user_removal_scope(SID), Ok(None));
-    assert_eq!(scopes.machine_removal_scope(), None);
+    assert_eq!(scopes.machine_removal_scope(SID), None);
 }
 
 #[test]

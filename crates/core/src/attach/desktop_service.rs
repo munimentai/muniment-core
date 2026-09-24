@@ -103,9 +103,12 @@ impl From<PathBuf> for AttachHome {
 
 /// Production adapter from the authorized attach seam into the desktop coordinator.
 pub trait RunStartIdempotency {
+    /// The ledger scope is the profile, the authorized client identity, the
+    /// operation and the key, so one client never replays another's result.
     fn execute<A, W>(
         &mut self,
         profile: &str,
+        client_identity: &str,
         request: &AttachRequest,
         canonical_input: &Value,
         authorize: A,
@@ -120,6 +123,7 @@ impl RunStartIdempotency for IdempotencyStore {
     fn execute<A, W>(
         &mut self,
         profile: &str,
+        client_identity: &str,
         request: &AttachRequest,
         canonical_input: &Value,
         authorize: A,
@@ -129,9 +133,15 @@ impl RunStartIdempotency for IdempotencyStore {
         A: FnOnce() -> Result<(), ProtocolError>,
         W: FnOnce() -> Result<CommittedResult, ProtocolError>,
     {
-        IdempotencyStore::execute(self, profile, request, canonical_input, authorize, |_| {
-            work()
-        })
+        IdempotencyStore::execute(
+            self,
+            profile,
+            client_identity,
+            request,
+            canonical_input,
+            authorize,
+            |_| work(),
+        )
     }
 }
 
@@ -158,6 +168,7 @@ fn queue_run_message<B: RunAttachBoundaries, I: RunStartIdempotency>(
     request_id: &Id,
     idempotency_key: &Id,
     companion: CompanionProvenance,
+    client_identity: &str,
 ) -> Result<RunMessageAccepted, ProtocolError> {
     let canonical_input = json!({
         "workspace": workspace,
@@ -174,6 +185,7 @@ fn queue_run_message<B: RunAttachBoundaries, I: RunStartIdempotency>(
     };
     let outcome = idempotency.execute(
         &companion.profile,
+        client_identity,
         &ledger_request,
         &canonical_input,
         || Ok(()),
@@ -239,6 +251,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency>
         };
         let outcome = self.idempotency.execute(
             &companion.profile,
+            self.client_identity.as_deref().unwrap_or_default(),
             &ledger_request,
             &canonical_input,
             || Ok(()),
@@ -298,6 +311,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         };
         self.idempotency.execute(
             &provenance.profile,
+            self.client_identity.as_deref().unwrap_or_default(),
             &ledger_request,
             &canonical_input,
             || Ok(()),
@@ -510,6 +524,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         let payload = body;
         let outcome = self.idempotency.execute(
             &provenance.profile,
+            self.client_identity.as_deref().unwrap_or_default(),
             &ledger_request,
             &ledger_body,
             || Ok(()),
@@ -548,6 +563,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         let payload = body.clone();
         let outcome = self.idempotency.execute(
             &provenance.profile,
+            self.client_identity.as_deref().unwrap_or_default(),
             &ledger_request,
             &body,
             || Ok(()),
@@ -584,6 +600,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         let payload = body.clone();
         let outcome = self.idempotency.execute(
             &provenance.profile,
+            self.client_identity.as_deref().unwrap_or_default(),
             &ledger_request,
             &body,
             || Ok(()),
@@ -608,16 +625,45 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         claimed_kind: &str,
         claimed_version: &str,
     ) -> Result<String, ProtocolError> {
+        // A reconnect carries no visible approval, so it must match the subject that
+        // approved the credential. A visible approval binds the credential to the
+        // subject that is signed in now.
+        let reconnect = issued_credential.is_empty();
+        let subject = self
+            .boundaries
+            .approval_subject()
+            .filter(|subject| super::is_valid_approval_subject(subject))
+            .ok_or_else(ProtocolError::unauthorized)?;
         let mut credentials = self
             .client_credentials
             .lock()
             .map_err(|_| ProtocolError::unauthorized())?;
         let credential = match credentials.get(client_identity) {
-            Some(expected) if presented_credential == Some(expected.credential.as_str()) => {
-                expected.credential.clone()
+            Some(expected)
+                if presented_credential
+                    .is_some_and(|presented| super::secret_eq(presented, &expected.credential)) =>
+            {
+                let credential = expected.credential.clone();
+                if expected.subject.as_deref() != Some(subject.as_str()) {
+                    if reconnect {
+                        return Err(ProtocolError::unauthorized());
+                    }
+                    let previous = credentials
+                        .get_mut(client_identity)
+                        .and_then(|entry| entry.subject.replace(subject));
+                    if let Some(path) = &self.credential_path {
+                        if persist_client_credentials(path, &credentials).is_err() {
+                            if let Some(entry) = credentials.get_mut(client_identity) {
+                                entry.subject = previous;
+                            }
+                            return Err(ProtocolError::persistence_failed());
+                        }
+                    }
+                }
+                credential
             }
             Some(_) => return Err(ProtocolError::unauthorized()),
-            None if presented_credential.is_none() => {
+            None if presented_credential.is_none() && !reconnect => {
                 credentials.insert(
                     client_identity.to_owned(),
                     ClientCredential {
@@ -627,6 +673,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
                         approved_at: Some(
                             chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
                         ),
+                        subject: Some(subject),
                     },
                 );
                 if let Some(path) = &self.credential_path {
@@ -689,6 +736,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         let provenance = attach_provenance(request_id, idempotency_key, &companion);
         let outcome = self.idempotency.execute(
             &companion.profile,
+            self.client_identity.as_deref().unwrap_or_default(),
             &ledger_request,
             &canonical_input,
             || Ok(()),
@@ -726,6 +774,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         let provenance = attach_provenance(request_id, idempotency_key, &companion);
         let outcome = self.idempotency.execute(
             &companion.profile,
+            self.client_identity.as_deref().unwrap_or_default(),
             &ledger_request,
             &canonical_input,
             || Ok(()),
@@ -868,6 +917,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         };
         let outcome = self.idempotency.execute(
             &companion.profile,
+            self.client_identity.as_deref().unwrap_or_default(),
             &ledger_request,
             &canonical_input,
             || Ok(()),
@@ -911,6 +961,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         let provenance = attach_provenance(request_id, idempotency_key, &companion);
         self.idempotency.execute(
             &companion.profile,
+            self.client_identity.as_deref().unwrap_or_default(),
             &ledger_request,
             &canonical_input,
             || Ok(()),
@@ -950,6 +1001,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         let provenance = attach_provenance(request_id, idempotency_key, &companion);
         self.idempotency.execute(
             &companion.profile,
+            self.client_identity.as_deref().unwrap_or_default(),
             &ledger_request,
             &canonical_input,
             || Ok(()),
@@ -1030,6 +1082,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         let mut pending_launch = None;
         let outcome = self.idempotency.execute(
             &profile,
+            self.client_identity.as_deref().unwrap_or_default(),
             &ledger_request,
             &canonical_input,
             || Ok(()),
@@ -1107,6 +1160,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         };
         let outcome = self.idempotency.execute(
             &companion.profile,
+            self.client_identity.as_deref().unwrap_or_default(),
             &ledger_request,
             &canonical_input,
             || Ok(()),
@@ -1217,6 +1271,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         };
         let outcome = self.idempotency.execute(
             &companion.profile,
+            self.client_identity.as_deref().unwrap_or_default(),
             &ledger_request,
             &canonical_input,
             || Ok(()),
@@ -1272,6 +1327,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         };
         let outcome = self.idempotency.execute(
             &companion.profile,
+            self.client_identity.as_deref().unwrap_or_default(),
             &ledger_request,
             &canonical_input,
             || Ok(()),
@@ -1312,6 +1368,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
             request_id,
             idempotency_key,
             companion,
+            self.client_identity.as_deref().unwrap_or_default(),
         )
     }
 
@@ -1334,6 +1391,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
             request_id,
             idempotency_key,
             companion,
+            self.client_identity.as_deref().unwrap_or_default(),
         )
     }
 
@@ -1362,6 +1420,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         };
         let outcome = self.idempotency.execute(
             &companion.profile,
+            self.client_identity.as_deref().unwrap_or_default(),
             &ledger_request,
             &canonical_input,
             || Ok(()),
@@ -1448,6 +1507,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         };
         let outcome = self.idempotency.execute(
             &companion.profile,
+            self.client_identity.as_deref().unwrap_or_default(),
             &ledger_request,
             &canonical_input,
             || Ok(()),
@@ -1864,6 +1924,10 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     impl RunAttachBoundaries for FakeRunStartBoundaries {
+        fn approval_subject(&self) -> Option<String> {
+            Some(crate::attach::LOCAL_APPROVAL_SUBJECT.to_owned())
+        }
+
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         fn list_threads(
             &self,
@@ -2424,6 +2488,7 @@ mod tests {
         fn execute<A, W>(
             &mut self,
             _profile: &str,
+            _client_identity: &str,
             _request: &AttachRequest,
             _canonical_input: &Value,
             authorize: A,
@@ -4492,7 +4557,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn legacy_attach_credentials_authenticate_with_unknown_claims() {
+    fn legacy_attach_credentials_load_and_need_a_fresh_approval() {
         use crate::attach::load_client_credentials;
         use std::os::unix::fs::PermissionsExt;
 
@@ -4523,12 +4588,11 @@ mod tests {
             client_identity: None,
             drain_state: crate::attach::DrainState::new(),
         };
-        assert_eq!(
-            service
-                .authorize_client(identity, Some(&credential), "", "changed", "9.9.9")
-                .unwrap(),
-            credential
-        );
+        // A credential stored before approvals named their subject reconnects
+        // only through a fresh visible approval.
+        assert!(service
+            .authorize_client(identity, Some(&credential), "", "changed", "9.9.9")
+            .is_err());
         assert_eq!(
             service
                 .authorize_client(new_identity, None, &new_credential, "desktop", "1.0.0")
@@ -4552,10 +4616,223 @@ mod tests {
         };
         assert!(restarted
             .authorize_client(identity, Some(&credential), "", "changed", "9.9.9")
-            .is_ok());
+            .is_err());
         assert!(restarted
             .authorize_client(new_identity, Some(&new_credential), "", "changed", "9.9.9")
             .is_ok());
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod approval_subject_tests {
+    use super::*;
+    use crate::attach::{ErrorCode, RuntimeActivityGuard, LOCAL_APPROVAL_SUBJECT};
+    use crate::auth::TokenSet;
+    use crate::chat_grant::ChatGrant;
+    use crate::chat_view::{ChatAttachment, SelectedFile};
+    use crate::journal::reducer::ChatProjector;
+    use crate::run_start::{ActiveRun, RunStartError, RunStartLaunch};
+
+    struct SubjectBoundaries(Mutex<Option<String>>);
+
+    impl RunStartBoundaries for SubjectBoundaries {
+        fn mark_active_run(&self) -> RuntimeActivityGuard {
+            unreachable!()
+        }
+        fn active_run_exists(&self) -> bool {
+            unreachable!()
+        }
+        fn fresh_tokens(&self) -> Result<TokenSet, RunStartError> {
+            unreachable!()
+        }
+        fn configure_run(
+            &self,
+            _: &str,
+            _: &str,
+            _: &TokenSet,
+            _: Option<&str>,
+        ) -> Result<ChatGrant, RunStartError> {
+            unreachable!()
+        }
+        fn install_active_run(&self, _: ActiveRun) -> Result<(), RunStartError> {
+            unreachable!()
+        }
+        fn prepare_run(
+            &self,
+            _: &str,
+            _: &str,
+            _: &ChatGrant,
+            _: &TokenSet,
+            _: Vec<SelectedFile>,
+            _: Option<Provenance>,
+            _: Option<&str>,
+        ) -> Result<(u64, ChatProjector), RunStartError> {
+            unreachable!()
+        }
+        fn project_attachments(
+            &self,
+            _: &ChatProjector,
+        ) -> Result<Vec<ChatAttachment>, RunStartError> {
+            unreachable!()
+        }
+        fn run_thread_id(&self, _: &str) -> Result<String, RunStartError> {
+            unreachable!()
+        }
+        fn open_memory_session(&self, _: &str, _: &str, _: usize) -> Result<(), RunStartError> {
+            unreachable!()
+        }
+        fn close_memory_session(&self, _: &str) {}
+        fn fail_prepared_run(&self, _: &RunStartLaunch) -> Result<(), RunStartError> {
+            unreachable!()
+        }
+        fn cancel_run(&self, _: &str, _: &str) -> Result<(), RunStartError> {
+            unreachable!()
+        }
+        fn clear_active_run(&self, _: &str) {}
+        fn launch(&self, _: RunStartLaunch) {}
+    }
+
+    impl RunAttachBoundaries for SubjectBoundaries {
+        fn list_threads(
+            &self,
+            _: &str,
+            _: ThreadListRequest,
+        ) -> Result<ThreadListPage, ProtocolError> {
+            unreachable!()
+        }
+        fn open_thread(
+            &self,
+            _: &str,
+            _: ThreadOpenRequest,
+        ) -> Result<ThreadOpenPage, ProtocolError> {
+            unreachable!()
+        }
+        fn stream_run(&self, _: &str, _: &str, _: u64) -> Result<RunStreamPage, ProtocolError> {
+            unreachable!()
+        }
+        fn subscribe_run_commits(
+            &self,
+            _: &str,
+        ) -> Result<crate::journal::CommitSubscription, ProtocolError> {
+            unreachable!()
+        }
+        fn queue_attach_permission_answer(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: ChatPermissionAnswer,
+        ) -> Result<std::sync::mpsc::Receiver<Option<u64>>, RunStartError> {
+            unreachable!()
+        }
+        fn approval_subject(&self) -> Option<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    fn service(
+        credentials: &Arc<Mutex<HashMap<String, ClientCredential>>>,
+        subject: Option<&str>,
+    ) -> DesktopAttachService<SubjectBoundaries> {
+        DesktopAttachService {
+            boundaries: SubjectBoundaries(Mutex::new(subject.map(str::to_owned))),
+            idempotency: IdempotencyStore::open(":memory:").unwrap(),
+            home: std::env::temp_dir()
+                .join("muniment-approval-subject")
+                .into(),
+            workspace_contexts: Arc::new(Mutex::new(WorkspaceContextMap::default())),
+            client_credentials: credentials.clone(),
+            credential_path: None,
+            client_identity: None,
+            drain_state: crate::attach::DrainState::new(),
+        }
+    }
+
+    const ACCOUNT_A: &str = "account:org-a:user-a";
+    const ACCOUNT_B: &str = "account:org-b:user-a";
+
+    #[test]
+    fn a_reconnect_needs_the_subject_that_approved_the_credential() {
+        let credentials = Arc::new(Mutex::new(HashMap::new()));
+        let issued = "aa".repeat(32);
+        service(&credentials, Some(ACCOUNT_A))
+            .authorize_client("client-a", None, &issued, "cli", "1.2.3")
+            .unwrap();
+        assert_eq!(
+            credentials.lock().unwrap()["client-a"].subject.as_deref(),
+            Some(ACCOUNT_A)
+        );
+        assert_eq!(
+            service(&credentials, Some(ACCOUNT_A))
+                .authorize_client("client-a", Some(&issued), "", "cli", "1.2.3")
+                .unwrap(),
+            issued
+        );
+        for other in [Some(ACCOUNT_B), Some(LOCAL_APPROVAL_SUBJECT), None] {
+            assert_eq!(
+                service(&credentials, other)
+                    .authorize_client("client-a", Some(&issued), "", "cli", "1.2.3")
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Unauthorized
+            );
+        }
+
+        // A fresh visible approval under the other account rebinds the credential.
+        assert_eq!(
+            service(&credentials, Some(ACCOUNT_B))
+                .authorize_client("client-a", Some(&issued), &"bb".repeat(32), "cli", "1.2.3")
+                .unwrap(),
+            issued
+        );
+        assert_eq!(
+            credentials.lock().unwrap()["client-a"].subject.as_deref(),
+            Some(ACCOUNT_B)
+        );
+        assert!(service(&credentials, Some(ACCOUNT_A))
+            .authorize_client("client-a", Some(&issued), "", "cli", "1.2.3")
+            .is_err());
+    }
+
+    #[test]
+    fn a_record_without_a_subject_needs_a_fresh_approval() {
+        let issued = "cc".repeat(32);
+        let credentials = Arc::new(Mutex::new(HashMap::from([(
+            "client-a".to_owned(),
+            ClientCredential {
+                credential: issued.clone(),
+                claimed_kind: "cli".into(),
+                claimed_version: "1.2.3".into(),
+                approved_at: None,
+                subject: None,
+            },
+        )])));
+        assert!(service(&credentials, Some(LOCAL_APPROVAL_SUBJECT))
+            .authorize_client("client-a", Some(&issued), "", "cli", "1.2.3")
+            .is_err());
+        service(&credentials, Some(LOCAL_APPROVAL_SUBJECT))
+            .authorize_client("client-a", Some(&issued), &"dd".repeat(32), "cli", "1.2.3")
+            .unwrap();
+        service(&credentials, Some(LOCAL_APPROVAL_SUBJECT))
+            .authorize_client("client-a", Some(&issued), "", "cli", "1.2.3")
+            .unwrap();
+    }
+
+    #[test]
+    fn no_subject_refuses_every_approval() {
+        let credentials = Arc::new(Mutex::new(HashMap::new()));
+        assert!(service(&credentials, None)
+            .authorize_client("client-a", None, &"aa".repeat(32), "cli", "1.2.3")
+            .is_err());
+        assert!(credentials.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_and_account_subjects_never_match() {
+        let account = crate::attach::account_approval_subject("org", "user").unwrap();
+        assert_ne!(account, LOCAL_APPROVAL_SUBJECT);
+        assert!(account.starts_with("account:"));
+        assert_eq!(crate::attach::account_approval_subject("", "user"), None);
     }
 }

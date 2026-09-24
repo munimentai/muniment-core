@@ -87,6 +87,7 @@ fn ledger_identity_includes_each_effectful_operation() {
         let outcome = store
             .execute(
                 "profile",
+                "client-a",
                 &req,
                 &json!({"resolved":true}),
                 || Ok(()),
@@ -114,6 +115,7 @@ fn exact_retry_reopens_and_conflict_performs_no_work() {
         let outcome = store
             .execute(
                 "profile-a",
+                "client-a",
                 &req,
                 &json!({"workspace":"resolved", "text":"hello"}),
                 || Ok(()),
@@ -134,6 +136,7 @@ fn exact_retry_reopens_and_conflict_performs_no_work() {
     let replay = reopened
         .execute(
             "profile-a",
+            "client-a",
             &retry,
             &json!({"text":"hello", "workspace":"resolved"}),
             || Ok(()),
@@ -151,6 +154,7 @@ fn exact_retry_reopens_and_conflict_performs_no_work() {
     let conflict = reopened
         .execute(
             "profile-a",
+            "client-a",
             &req,
             &json!({"workspace":"resolved", "text":"different"}),
             || Ok(()),
@@ -163,6 +167,115 @@ fn exact_retry_reopens_and_conflict_performs_no_work() {
 }
 
 #[test]
+fn another_client_never_replays_a_result_under_the_same_key() {
+    let path = path("client-scope");
+    let req = request(Operation::RunStart, Some(id(6)));
+    let input = json!({"workspace":"resolved", "text":"hello"});
+    let mut store = IdempotencyStore::open(&path).unwrap();
+    let commit = |run: &'static str| {
+        move |_: &rusqlite::Transaction<'_>| {
+            Ok(CommittedResult {
+                body: json!({"run_id": run}),
+                cursor: None,
+            })
+        }
+    };
+    assert!(matches!(
+        store
+            .execute(
+                "profile",
+                "client-a",
+                &req,
+                &input,
+                || Ok(()),
+                commit("run-a")
+            )
+            .unwrap(),
+        IdempotencyOutcome::Committed(_)
+    ));
+    assert_eq!(
+        store
+            .execute(
+                "profile",
+                "client-b",
+                &req,
+                &input,
+                || Ok(()),
+                commit("run-b")
+            )
+            .unwrap(),
+        IdempotencyOutcome::Committed(CommittedResult {
+            body: json!({"run_id":"run-b"}),
+            cursor: None,
+        })
+    );
+    assert_eq!(
+        store
+            .execute(
+                "profile",
+                "client-a",
+                &req,
+                &input,
+                || Ok(()),
+                |_| panic!("replayed work")
+            )
+            .unwrap(),
+        IdempotencyOutcome::Replayed(CommittedResult {
+            body: json!({"run_id":"run-a"}),
+            cursor: None,
+        })
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn a_ledger_without_a_client_column_moves_into_the_scoped_ledger() {
+    let path = path("client-scope-move");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE attach_idempotency (
+              profile TEXT NOT NULL, operation TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+              hash_version INTEGER NOT NULL, canonical_hash BLOB NOT NULL,
+              committed_result TEXT NOT NULL,
+              PRIMARY KEY (profile, operation, idempotency_key));
+             INSERT INTO attach_idempotency VALUES
+              ('profile', 'run.start', 'key', 1, x'00', '{\"body\":{}}');",
+        )
+        .unwrap();
+    drop(connection);
+    let mut store = IdempotencyStore::open(&path).unwrap();
+    let req = request(Operation::RunStart, Some(id(7)));
+    store
+        .execute(
+            "profile",
+            "client-a",
+            &req,
+            &json!({}),
+            || Ok(()),
+            |_| {
+                Ok(CommittedResult {
+                    body: json!({}),
+                    cursor: None,
+                })
+            },
+        )
+        .unwrap();
+    drop(store);
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let clients: Vec<String> = connection
+        .prepare("SELECT client_identity FROM attach_idempotency ORDER BY client_identity")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(clients, ["", "client-a"]);
+    drop(connection);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn authorization_precedes_lookup_and_replay_precedes_mutable_preconditions() {
     let path = path("ordering");
     let req = request(Operation::RunCancel, Some(id(3)));
@@ -170,6 +283,7 @@ fn authorization_precedes_lookup_and_replay_precedes_mutable_preconditions() {
     store
         .execute(
             "profile",
+            "client-a",
             &req,
             &json!({"run":"resolved"}),
             || Ok(()),
@@ -186,6 +300,7 @@ fn authorization_precedes_lookup_and_replay_precedes_mutable_preconditions() {
         store
             .execute(
                 "profile",
+                "client-a",
                 &req,
                 &json!({"run":"resolved"}),
                 || Err(auth_error.clone()),
@@ -198,6 +313,7 @@ fn authorization_precedes_lookup_and_replay_precedes_mutable_preconditions() {
         store
             .execute(
                 "profile",
+                "client-a",
                 &req,
                 &json!({"run":"resolved"}),
                 || Ok(()),
@@ -217,6 +333,7 @@ fn failed_commit_rolls_back_work_and_record_and_profile_deletion_is_explicit() {
     let error = store
         .execute(
             "profile",
+            "client-a",
             &req,
             &json!({"gate":"g", "answer":"allow"}),
             || Ok(()),
@@ -234,6 +351,7 @@ fn failed_commit_rolls_back_work_and_record_and_profile_deletion_is_explicit() {
     store
         .execute(
             "profile",
+            "client-a",
             &req,
             &json!({"gate":"g", "answer":"allow"}),
             || Ok(()),
@@ -251,6 +369,7 @@ fn failed_commit_rolls_back_work_and_record_and_profile_deletion_is_explicit() {
     store
         .execute(
             "profile",
+            "client-a",
             &req,
             &json!({"gate":"g", "answer":"allow"}),
             || Ok(()),
@@ -294,6 +413,7 @@ fn sign_in_persistence_failures_name_the_ledger_step_without_sql_or_credentials(
         let error = store
             .execute(
                 "profile",
+                "client-a",
                 &request(Operation::SessionSignIn, Some(id(5))),
                 &json!({}),
                 || Ok(()),

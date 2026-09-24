@@ -1,4 +1,5 @@
-//! Typed projection of the Pi 0.73.1 chat event stream.
+//! Typed projection of the pinned Pi chat event stream. `message_update`
+//! frames carry only the `assistantMessageEvent` delta, never the cumulative message.
 //!
 //! Pi has one active agent stream. Muniment nevertheless tags every projected
 //! event with the locally-owned run id; callers must create a fresh adapter for

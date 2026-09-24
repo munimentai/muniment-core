@@ -1,4 +1,6 @@
-use crate::journal::thread_summaries::ThreadSummaryPage;
+use crate::journal::thread_summaries::{
+    ThreadSummaryPage, ThreadSummaryScan, ThreadSummaryScanError,
+};
 use crate::journal::RunJournal;
 use crate::thread_ownership::{subject_owns_first_run, ThreadOwnershipError};
 
@@ -11,29 +13,35 @@ pub enum OwnedThreadsError {
     ThreadOwnershipUnavailable(ThreadOwnershipError),
 }
 
+fn scan_error(error: ThreadSummaryScanError<ThreadOwnershipError>) -> OwnedThreadsError {
+    match error {
+        ThreadSummaryScanError::List(error) => {
+            OwnedThreadsError::ThreadSummariesUnavailable(error.to_string())
+        }
+        ThreadSummaryScanError::Keep(error) => OwnedThreadsError::ThreadOwnershipUnavailable(error),
+    }
+}
+
 pub fn newest_owned_workspace_thread(
     journal: &mut RunJournal,
     workspace: &str,
     subject: Option<&str>,
 ) -> Result<Option<String>, OwnedThreadsError> {
-    let mut cursor = None;
-    for _ in 0..MAX_THREAD_SUMMARY_CORE_PAGES {
-        let page = journal
-            .workspace_thread_summaries(workspace, 100, cursor.as_deref())
-            .map_err(|error| OwnedThreadsError::ThreadSummariesUnavailable(error.to_string()))?;
-        for summary in page.summaries {
-            if subject_owns_first_run(journal, &summary.thread_id, subject)
-                .map_err(OwnedThreadsError::ThreadOwnershipUnavailable)?
-            {
-                return Ok(Some(summary.thread_id));
-            }
-        }
-        match page.next_cursor {
-            Some(next_cursor) => cursor = Some(next_cursor),
-            None => return Ok(None),
-        }
-    }
-    Ok(None)
+    let scan = ThreadSummaryScan {
+        limit: 1,
+        page_size: Some(100),
+        max_pages: MAX_THREAD_SUMMARY_CORE_PAGES,
+    };
+    let page = journal
+        .scan_thread_summaries(Some(workspace), None, scan, |journal, thread_id| {
+            subject_owns_first_run(journal, thread_id, subject)
+        })
+        .map_err(scan_error)?;
+    Ok(page
+        .summaries
+        .into_iter()
+        .next()
+        .map(|summary| summary.thread_id))
 }
 
 pub fn chat_thread_summaries_page(
@@ -45,28 +53,18 @@ pub fn chat_thread_summaries_page(
     if !(1..=100).contains(&limit) {
         return Err(OwnedThreadsError::InvalidLimit);
     }
-    let mut summaries = Vec::with_capacity(limit);
-    let mut next_cursor = cursor.map(str::to_owned);
-    for _ in 0..MAX_THREAD_SUMMARY_CORE_PAGES {
-        let page = journal
-            .thread_summaries(limit - summaries.len(), next_cursor.as_deref())
-            .map_err(|error| OwnedThreadsError::ThreadSummariesUnavailable(error.to_string()))?;
-        for summary in page.summaries {
-            if subject_owns_first_run(journal, &summary.thread_id, subject)
-                .map_err(OwnedThreadsError::ThreadOwnershipUnavailable)?
-            {
-                summaries.push(summary);
-            }
-        }
-        next_cursor = page.next_cursor;
-        if summaries.len() == limit || next_cursor.is_none() {
-            break;
-        }
-    }
-    Ok(ThreadSummaryPage {
-        summaries,
-        next_cursor,
-    })
+    // Pages shrink to the rows still needed, so the scan bound matches a walk
+    // of MAX_THREAD_SUMMARY_CORE_PAGES successive listing pages.
+    let scan = ThreadSummaryScan {
+        limit,
+        page_size: None,
+        max_pages: MAX_THREAD_SUMMARY_CORE_PAGES,
+    };
+    journal
+        .scan_thread_summaries(None, cursor, scan, |journal, thread_id| {
+            subject_owns_first_run(journal, thread_id, subject)
+        })
+        .map_err(scan_error)
 }
 
 #[cfg(test)]

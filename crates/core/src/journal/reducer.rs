@@ -6,7 +6,9 @@ use crate::assistant_text::stream::{AssistantText, RunStreamProjector};
 use crate::memory_index::RecallRecord;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::BTreeMap, fmt};
+use std::collections::{BTreeMap, VecDeque};
+use std::fmt;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectedThreadEntry {
@@ -35,38 +37,74 @@ impl super::RunJournal {
         run_id: &str,
         snapshot_seq: u64,
     ) -> Result<BTreeMap<u64, AssistantText>, super::RunEventPageError> {
+        self.projected_run_stream_text_after(workspace, run_id, snapshot_seq, 0)
+    }
+
+    /// Projects the assistant-text stream through one stable snapshot and
+    /// returns the entries after `after_run_seq`. The journal keeps the stream
+    /// projector of recent runs, so a later snapshot reads only the events it
+    /// has not projected.
+    pub fn projected_run_stream_text_after(
+        &mut self,
+        workspace: &str,
+        run_id: &str,
+        snapshot_seq: u64,
+        after_run_seq: u64,
+    ) -> Result<BTreeMap<u64, AssistantText>, super::RunEventPageError> {
         let owned = self
             .run_belongs_to_workspace(run_id, workspace)
             .map_err(super::RunEventPageError::Journal)?;
         if !owned {
             return Err(super::RunEventPageError::NotFoundOrInaccessible);
         }
-        let events = self
-            .events(run_id)
+        let coordination = self.coordination.clone();
+        let _operation = coordination
+            .as_ref()
+            .map(|state| state.operation.lock().unwrap());
+        self.refresh_after_compaction()
             .map_err(super::RunEventPageError::Journal)?;
-        let mut projector = RunStreamProjector::new(workspace, |path: &std::path::Path| {
-            std::fs::canonicalize(path)
-        });
-        let mut projected = BTreeMap::new();
+        let generation = self.generation;
+        let cached = self.run_stream_cache.take(workspace, run_id, generation);
+        let mut stream = match cached {
+            Some(stream) if stream.projected_through <= snapshot_seq => stream,
+            _ => RunStreamCacheEntry::new(workspace, run_id, generation),
+        };
+        let events = run_events_between(
+            self.connection
+                .as_ref()
+                .expect("journal connection is always present outside compaction"),
+            run_id,
+            stream.projected_through,
+            snapshot_seq,
+        )
+        .map_err(super::RunEventPageError::Journal)?;
         let empty_payload = Value::Null;
-        for event in events.iter().filter(|event| event.run_seq <= snapshot_seq) {
+        for event in &events {
             let payload = match &event.payload {
                 EventPayload::Inline { payload_json } => payload_json,
                 EventPayload::Cas { .. } | EventPayload::Attachment { .. } => &empty_payload,
             };
-            let emittable = projector
+            let emittable = stream
+                .projector
                 .push(event.run_seq, &event.event_type, payload)
                 .map_err(|_| {
                     super::RunEventPageError::Journal(super::JournalError::Corrupt(
                         "assistant text stream projection failed".into(),
                     ))
                 })?;
-            projected.extend(
+            stream.projected.extend(
                 emittable
                     .into_iter()
                     .map(|event| (event.run_seq, event.assistant_text)),
             );
+            stream.projected_through = event.run_seq;
         }
+        let projected = stream
+            .projected
+            .range(after_run_seq.saturating_add(1)..)
+            .map(|(run_seq, text)| (*run_seq, text.clone()))
+            .collect();
+        self.run_stream_cache.keep(stream);
         Ok(projected)
     }
 
@@ -358,6 +396,91 @@ impl super::RunJournal {
     }
 }
 
+/// How many runs keep their assistant-text stream projector between pages.
+const RUN_STREAM_CACHE_RUNS: usize = 8;
+
+type CanonicalizePath = fn(&Path) -> std::io::Result<PathBuf>;
+
+fn canonicalize_path(path: &Path) -> std::io::Result<PathBuf> {
+    std::fs::canonicalize(path)
+}
+
+/// The stream projectors of the runs a journal streamed most recently.
+#[derive(Default)]
+pub(crate) struct RunStreamCache {
+    entries: VecDeque<RunStreamCacheEntry>,
+}
+
+struct RunStreamCacheEntry {
+    workspace: String,
+    run_id: String,
+    generation: u64,
+    projected_through: u64,
+    projector: RunStreamProjector<CanonicalizePath>,
+    projected: BTreeMap<u64, AssistantText>,
+}
+
+impl RunStreamCacheEntry {
+    fn new(workspace: &str, run_id: &str, generation: u64) -> Self {
+        Self {
+            workspace: workspace.to_owned(),
+            run_id: run_id.to_owned(),
+            generation,
+            projected_through: 0,
+            projector: RunStreamProjector::new(workspace, canonicalize_path as CanonicalizePath),
+            projected: BTreeMap::new(),
+        }
+    }
+}
+
+impl RunStreamCache {
+    /// Removes the entry for one run. A compaction since the entry was built discards it.
+    fn take(
+        &mut self,
+        workspace: &str,
+        run_id: &str,
+        generation: u64,
+    ) -> Option<RunStreamCacheEntry> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.workspace == workspace && entry.run_id == run_id)?;
+        self.entries
+            .remove(index)
+            .filter(|entry| entry.generation == generation)
+    }
+
+    fn keep(&mut self, entry: RunStreamCacheEntry) {
+        if self.entries.len() >= RUN_STREAM_CACHE_RUNS {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(entry);
+    }
+}
+
+fn run_events_between(
+    connection: &rusqlite::Connection,
+    run_id: &str,
+    after_run_seq: u64,
+    through_run_seq: u64,
+) -> Result<Vec<EventEnvelope>, super::JournalError> {
+    let mut statement = connection.prepare(
+        "SELECT envelope_json FROM events WHERE run_id=?1 AND run_seq>?2 AND run_seq<=?3 \
+         ORDER BY run_seq",
+    )?;
+    let rows = statement.query_map(
+        rusqlite::params![run_id, after_run_seq, through_run_seq],
+        |row| row.get::<_, String>(0),
+    )?;
+    rows.map(|row| {
+        let raw = row?;
+        serde_json::from_str(&raw).map_err(|error| {
+            super::JournalError::Corrupt(format!("invalid stored envelope JSON: {error}"))
+        })
+    })
+    .collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionGate {
     pub gate_id: String,
@@ -581,11 +704,102 @@ pub fn project_chat_fragment(events: &[EventEnvelope]) -> Result<ChatProjection,
 pub struct ChatProjector {
     chat: ChatProjection,
     reducer: RunReducer,
+    /// The length of `chat.text` in UTF-16 code units, the unit the webview counts.
+    text_utf16_len: usize,
+    /// Verified code diffs of this run, kept until a diff event for their effect lands.
+    pub(crate) code_diffs: crate::code_diff_journal::CodeDiffCache,
+    /// What the live chat event stream of this run last delivered in full.
+    pub(crate) delivery: crate::run_events::ChatDelivery,
+}
+
+/// The projector fields one event can change, so a failed append restores
+/// them without a copy of the whole transcript.
+pub(crate) struct ChatCheckpoint {
+    reducer: RunReducer,
+    text_len: usize,
+    text_utf16_len: usize,
+    prompt_accepted: bool,
+    turn_started: bool,
+    routing_stage: Option<String>,
+    prompt_storage_notice: Option<String>,
+    receipt: Option<Option<Value>>,
+    tool_activity_len: usize,
+    finished_activity: Option<(usize, ToolActivity)>,
+    attachments_len: usize,
+    recalls_len: usize,
+    applied_diffs_len: usize,
 }
 
 impl ChatProjector {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The length of the projected text in UTF-16 code units.
+    pub fn text_utf16_len(&self) -> usize {
+        self.text_utf16_len
+    }
+
+    /// The run status after the last applied event.
+    pub fn status(&self) -> Option<&RunStatus> {
+        self.reducer.state.as_ref().map(|state| &state.status)
+    }
+
+    pub(crate) fn checkpoint(&self, event: &EventEnvelope) -> ChatCheckpoint {
+        let finished_activity = matches!(
+            event.event_type.as_str(),
+            "tool.effect.completed" | "tool.effect.failed"
+        )
+        .then(|| optional_field(event, "effect_id").ok().flatten())
+        .flatten()
+        .and_then(|effect_id| {
+            self.chat
+                .tool_activity
+                .iter()
+                .rposition(|activity| activity.effect_id == effect_id)
+        })
+        .map(|index| (index, self.chat.tool_activity[index].clone()));
+        ChatCheckpoint {
+            reducer: self.reducer.clone(),
+            text_len: self.chat.text.len(),
+            text_utf16_len: self.text_utf16_len,
+            prompt_accepted: self.chat.prompt_accepted,
+            turn_started: self.chat.turn_started,
+            routing_stage: self.chat.routing_stage.clone(),
+            prompt_storage_notice: self.chat.prompt_storage_notice.clone(),
+            receipt: (event.event_type == "run.completed").then(|| self.chat.receipt.clone()),
+            tool_activity_len: self.chat.tool_activity.len(),
+            finished_activity,
+            attachments_len: self.chat.attachments.len(),
+            recalls_len: self.chat.recalls.len(),
+            applied_diffs_len: self.chat.applied_diffs.len(),
+        }
+    }
+
+    pub(crate) fn restore(&mut self, checkpoint: ChatCheckpoint) {
+        self.reducer = checkpoint.reducer;
+        self.chat.text.truncate(checkpoint.text_len);
+        self.text_utf16_len = checkpoint.text_utf16_len;
+        self.chat.prompt_accepted = checkpoint.prompt_accepted;
+        self.chat.turn_started = checkpoint.turn_started;
+        self.chat.routing_stage = checkpoint.routing_stage;
+        self.chat.prompt_storage_notice = checkpoint.prompt_storage_notice;
+        if let Some(receipt) = checkpoint.receipt {
+            self.chat.receipt = receipt;
+        }
+        self.chat
+            .tool_activity
+            .truncate(checkpoint.tool_activity_len);
+        if let Some((index, activity)) = checkpoint.finished_activity {
+            if let Some(slot) = self.chat.tool_activity.get_mut(index) {
+                *slot = activity;
+            }
+        }
+        self.chat.attachments.truncate(checkpoint.attachments_len);
+        self.chat.recalls.truncate(checkpoint.recalls_len);
+        self.chat
+            .applied_diffs
+            .truncate(checkpoint.applied_diffs_len);
     }
 
     pub fn apply(&mut self, event: &EventEnvelope) -> Result<(), ReduceError> {
@@ -621,13 +835,21 @@ impl ChatProjector {
                 }
             }
             "model.stream.delta" => {
+                let text = field(event, "text")?;
                 self.chat.routing_stage = None;
-                self.chat.text.push_str(&field(event, "text")?);
+                self.text_utf16_len += text.encode_utf16().count();
+                self.chat.text.push_str(&text);
             }
             "memory.recalled" => self.chat.recalls.push(projected_recall(event)?),
             "code.diff.applied" => self.chat.applied_diffs.push(projected_applied_diff(event)?),
+            crate::code_diff_journal::DIFF_EVENT_TYPE
+            | crate::code_diff_journal::WRITE_PLAN_EVENT_TYPE => {
+                if let Some(effect_id) = event.correlation_id.as_deref() {
+                    self.code_diffs.forget(effect_id);
+                }
+            }
             "tool.effect.started" => self.chat.tool_activity.push(ToolActivity {
-                text_offset: self.chat.text.encode_utf16().count(),
+                text_offset: self.text_utf16_len,
                 effect_id: field(event, "effect_id")?,
                 display_name: optional_field(event, "display_name")?,
                 status: ToolActivityStatus::Running,
@@ -1086,4 +1308,101 @@ fn is_state_event(t: &str) -> bool {
         || t.starts_with("tool.")
         || t.starts_with("runtime.pi_session.")
         || t.starts_with("runtime.pi_acquire.")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{EventEnvelope, EventPayload, Provenance, RunJournal};
+    use serde_json::{json, Value};
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    fn envelope(run_id: &str, run_seq: u64, event_type: &str, payload: Value) -> EventEnvelope {
+        EventEnvelope {
+            event_id: Uuid::now_v7().to_string(),
+            run_id: run_id.into(),
+            run_seq,
+            event_type: event_type.into(),
+            event_version: 1,
+            envelope_version: 1,
+            recorded_at: "2026-08-05T00:00:00Z".into(),
+            occurred_at: None,
+            correlation_id: None,
+            causation_id: None,
+            payload: EventPayload::Inline {
+                payload_json: payload,
+            },
+            provenance: Provenance {
+                source: "test".into(),
+                source_version: "1".into(),
+                actor_id: None,
+                device_id: None,
+                rpc_request_id: None,
+                capability_versions: None,
+                extra: BTreeMap::new(),
+            },
+            extra: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_later_stream_page_projects_only_the_events_after_the_cached_ones() {
+        let path =
+            std::env::temp_dir().join(format!("muniment-run-stream-{}.sqlite3", Uuid::now_v7()));
+        let mut journal =
+            RunJournal::open_with_busy_timeout(&path, Duration::from_secs(60)).unwrap();
+        let run_id = Uuid::now_v7().to_string();
+        journal
+            .append_new_run("workspace", &envelope(&run_id, 1, "run.started", json!({})))
+            .unwrap();
+        for seq in 2..=3 {
+            let text = json!({"text": format!("part {seq}. ")});
+            journal
+                .append(seq - 1, &envelope(&run_id, seq, "model.stream.delta", text))
+                .unwrap();
+        }
+        let first = journal
+            .projected_run_stream_text_after("workspace", &run_id, 3, 0)
+            .unwrap();
+        for seq in 4..=5 {
+            let text = json!({"text": format!("part {seq}. ")});
+            journal
+                .append(seq - 1, &envelope(&run_id, seq, "model.stream.delta", text))
+                .unwrap();
+        }
+        journal
+            .append(5, &envelope(&run_id, 6, "run.completed", json!({})))
+            .unwrap();
+        let expected = RunJournal::open_with_busy_timeout(&path, Duration::from_secs(60))
+            .unwrap()
+            .projected_run_stream_text("workspace", &run_id, 6)
+            .unwrap();
+
+        // The cached projector never reads the first events again.
+        journal
+            .connection
+            .as_ref()
+            .unwrap()
+            .execute(
+                "UPDATE events SET envelope_json='{}' WHERE run_id=?1 AND run_seq<=3",
+                [&run_id],
+            )
+            .unwrap();
+        let later = journal
+            .projected_run_stream_text_after("workspace", &run_id, 6, 3)
+            .unwrap();
+
+        assert!(first.keys().all(|run_seq| *run_seq <= 3));
+        assert_eq!(
+            later,
+            expected
+                .into_iter()
+                .filter(|(run_seq, _)| *run_seq > 3)
+                .collect::<BTreeMap<_, _>>()
+        );
+        assert!(!later.is_empty());
+        drop(journal);
+        let _ = std::fs::remove_file(path);
+    }
 }

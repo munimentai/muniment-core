@@ -47,6 +47,12 @@ fn credentials() -> PeerCredentials {
         pid: 424242,
         uid: 1000,
         gid: 1000,
+        accept_image: muniment_core::attach::peer_image(
+            424242,
+            &FakeProcReader {
+                executable: fs::canonicalize("/proc/self/exe").unwrap(),
+            },
+        ),
     }
 }
 

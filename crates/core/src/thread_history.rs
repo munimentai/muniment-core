@@ -70,6 +70,20 @@ pub fn project_history_entry(
     subject: Option<&str>,
     session_root: &Path,
 ) -> Result<HistoryEntry, ThreadHistoryError> {
+    let mut entry =
+        project_history_entry_without_prompt(journal, cas, run_id, subject, session_root)?;
+    load_entry_prompt(&mut entry, subject)?;
+    Ok(entry)
+}
+
+/// Projects one run's history entry without its prompt, which lives in the keychain.
+fn project_history_entry_without_prompt(
+    journal: &mut RunJournal,
+    cas: Option<&LocalCas>,
+    run_id: String,
+    subject: Option<&str>,
+    session_root: &Path,
+) -> Result<HistoryEntry, ThreadHistoryError> {
     let events = journal
         .events(&run_id)
         .map_err(|error| ThreadHistoryError::RunEventsUnavailable(error.to_string()))?;
@@ -89,12 +103,7 @@ pub fn project_history_entry(
     };
     Ok(HistoryEntry {
         sent_at: events.first().map(|event| event.recorded_at.clone()),
-        // A refused write leaves no prompt history to read from the keyring.
-        prompt: if projection.prompt_storage_notice.is_some() {
-            None
-        } else {
-            load_prompt(&run_id, subject)?
-        },
+        prompt: None,
         prompt_storage_notice: projection.prompt_storage_notice,
         phase: projection_phase(&projection.status).into(),
         text: projection.text,
@@ -108,6 +117,30 @@ pub fn project_history_entry(
         resumable,
         run_id,
     })
+}
+
+/// Reads the stored prompt of one entry. A refused write leaves no prompt
+/// history to read from the keyring.
+fn load_entry_prompt(
+    entry: &mut HistoryEntry,
+    subject: Option<&str>,
+) -> Result<(), ThreadHistoryError> {
+    if entry.prompt_storage_notice.is_none() {
+        entry.prompt = load_prompt(&entry.run_id, subject)?;
+    }
+    Ok(())
+}
+
+/// Reads the stored prompts of a page from
+/// [`chat_thread_open_page_without_prompts`]. It needs no journal, so the
+/// caller releases the journal before these keychain reads.
+pub fn load_page_prompts(
+    page: &mut ChatThreadOpenPage,
+    subject: Option<&str>,
+) -> Result<(), ThreadHistoryError> {
+    page.entries
+        .iter_mut()
+        .try_for_each(|entry| load_entry_prompt(entry, subject))
 }
 
 pub fn history_resumable(
@@ -128,6 +161,30 @@ pub fn chat_thread_open_page(
     limit: usize,
     cursor: Option<&str>,
 ) -> Result<ChatThreadOpenPage, ThreadHistoryError> {
+    let mut page = chat_thread_open_page_without_prompts(
+        journal,
+        cas,
+        subject,
+        session_root,
+        thread_id,
+        limit,
+        cursor,
+    )?;
+    load_page_prompts(&mut page, subject)?;
+    Ok(page)
+}
+
+/// Reads one thread page with every entry's prompt left out.
+/// [`load_page_prompts`] fills them after the caller releases the journal.
+pub fn chat_thread_open_page_without_prompts(
+    journal: &mut RunJournal,
+    cas: Option<&LocalCas>,
+    subject: Option<&str>,
+    session_root: &Path,
+    thread_id: &str,
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<ChatThreadOpenPage, ThreadHistoryError> {
     if !subject_owns_first_run(journal, thread_id, subject)
         .map_err(ThreadHistoryError::ThreadOwnershipUnavailable)?
     {
@@ -139,7 +196,9 @@ pub fn chat_thread_open_page(
     let entries = page
         .run_ids
         .into_iter()
-        .map(|run_id| project_history_entry(journal, cas, run_id, subject, session_root))
+        .map(|run_id| {
+            project_history_entry_without_prompt(journal, cas, run_id, subject, session_root)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ChatThreadOpenPage {
         entries,

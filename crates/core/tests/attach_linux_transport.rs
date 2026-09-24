@@ -459,6 +459,7 @@ fn rejects_a_different_uid_peer_with_complete_diagnostics_when_permitted() {
         pid: child,
         uid: 1,
         gid: 1,
+        accept_image: None,
     };
     assert_eq!(
         transport.accept().unwrap_err(),

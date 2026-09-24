@@ -76,7 +76,7 @@ class CloudWire(unittest.TestCase):
             gateway_url = f'http://127.0.0.1:{server.server_port}/v1'
             env.update(HOME=str(root), PI_CODING_AGENT_DIR=str(root / 'agent'),
                        OPENAI_BASE_URL=gateway_url, PI_DEFAULT_MODEL='allowed-model')
-            command = [EXECUTABLE, '--mode', 'rpc', '--session-dir', str(root / 'sessions'),
+            command = [EXECUTABLE, '--mode', 'rpc', '--approve', '--session-dir', str(root / 'sessions'),
                        '--extension', str(root / 'provider.mjs'), '--provider', 'muniment', '--model', 'allowed-model',
                        '--api-key', 'muniment-runtime-boundary']
             if naming:
@@ -199,6 +199,6 @@ class CloudWire(unittest.TestCase):
 
 if __name__ == '__main__':
     version = subprocess.check_output([EXECUTABLE, '--version'], text=True, stderr=subprocess.STDOUT).strip()
-    if version not in ('0.73.1', '0.85.1'):
-        raise SystemExit(f'The wire test requires Pi 0.73.1 or 0.85.1. The executable reports {version}.')
+    if version not in ('0.85.1', '0.87.1'):
+        raise SystemExit(f'The wire test requires Pi 0.85.1 or 0.87.1. The executable reports {version}.')
     unittest.main()
