@@ -108,11 +108,11 @@ pub fn question(config: &RouterConfig, options: &[Route], state: &str) -> Value 
 pub fn parse(answer: &Value) -> Option<(String, f64)> {
     let choice = answer.get("answers")?.get(QUESTION)?;
     let key = choice.get("choice")?.as_str()?.to_owned();
-    // An answer with no confidence is a certain one.
+    // Missing or invalid confidence must not authorize a model switch.
     let confidence = choice
         .get("confidence")
         .and_then(Value::as_f64)
-        .unwrap_or(1.0);
+        .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))?;
     Some((key, confidence))
 }
 
@@ -531,7 +531,7 @@ mod tests {
         assert_eq!(parse(&answer), Some(("deep".to_owned(), 0.82)));
         assert_eq!(
             parse(&json!({ "answers": { "route": { "choice": "fast" } } })),
-            Some(("fast".to_owned(), 1.0))
+            None
         );
         assert_eq!(parse(&json!({ "answers": {} })), None);
         assert_eq!(parse(&json!({})), None);
@@ -562,7 +562,8 @@ mod tests {
             usage.tokens,
             Some(Tokens {
                 input: 1000,
-                output: 12
+                output: 12,
+                ..Default::default()
             })
         );
         assert_eq!(usage.cost, Some(0.000042));

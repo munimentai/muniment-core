@@ -179,6 +179,15 @@ pub fn response_classifier(id: &str) -> Option<ClassifierUsage> {
 pub struct Tokens {
     pub input: u64,
     pub output: u64,
+    /// Input includes all input categories. Cache categories are subsets.
+    #[serde(default)]
+    pub cache_read: u64,
+    #[serde(default)]
+    pub cache_write: u64,
+    #[serde(default)]
+    pub cache_write_1h: u64,
+    #[serde(default)]
+    pub reasoning: u64,
 }
 
 /// The model an OpenAI chat request names.
@@ -238,6 +247,7 @@ pub fn wants_usage(request: &Value) -> bool {
 pub fn upstream_request(request: &Value, model: &str) -> Value {
     let mut upstream = request.clone();
     if let Some(object) = upstream.as_object_mut() {
+        object.remove("muniment_routing");
         object.insert("model".into(), Value::String(model.to_owned()));
         if streams(request) {
             let options = object
@@ -266,9 +276,37 @@ pub fn tokens(value: &Value) -> Option<Tokens> {
             .find_map(|name| usage.get(*name).and_then(Value::as_u64))
             .unwrap_or(0)
     };
+    let cache_read = usage["cache_read_input_tokens"]
+        .as_u64()
+        .or_else(|| usage["prompt_tokens_details"]["cached_tokens"].as_u64())
+        .or_else(|| usage["input_tokens_details"]["cached_tokens"].as_u64())
+        .unwrap_or(0);
+    let cache_write = usage["cache_creation_input_tokens"]
+        .as_u64()
+        .or_else(|| usage["input_tokens_details"]["cache_write_tokens"].as_u64())
+        .or_else(|| usage["prompt_tokens_details"]["cache_write_tokens"].as_u64())
+        .unwrap_or(0);
+    let mut input = count(["prompt_tokens", "input_tokens"]);
+    // Anthropic reports uncached input separately. OpenAI includes cached input.
+    if usage.get("prompt_tokens").is_none()
+        && (usage.get("cache_read_input_tokens").is_some()
+            || usage.get("cache_creation_input_tokens").is_some())
+    {
+        input = input.saturating_add(cache_read).saturating_add(cache_write);
+    }
     Some(Tokens {
-        input: count(["prompt_tokens", "input_tokens"]),
+        input,
         output: count(["completion_tokens", "output_tokens"]),
+        cache_read: cache_read.min(input),
+        cache_write: cache_write.min(input.saturating_sub(cache_read)),
+        cache_write_1h: usage["cache_creation"]["ephemeral_1h_input_tokens"]
+            .as_u64()
+            .unwrap_or(0)
+            .min(cache_write),
+        reasoning: usage["completion_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .or_else(|| usage["output_tokens_details"]["reasoning_tokens"].as_u64())
+            .unwrap_or(0),
     })
 }
 
@@ -375,14 +413,16 @@ mod tests {
             tokens(&json!({ "usage": { "prompt_tokens": 312, "completion_tokens": 48 } })),
             Some(Tokens {
                 input: 312,
-                output: 48
+                output: 48,
+                ..Default::default()
             })
         );
         assert_eq!(
             tokens(&json!({ "usage": { "input_tokens": 7, "output_tokens": 2 } })),
             Some(Tokens {
                 input: 7,
-                output: 2
+                output: 2,
+                ..Default::default()
             })
         );
         assert_eq!(tokens(&json!({ "usage": null })), None);

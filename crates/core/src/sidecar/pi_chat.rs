@@ -1290,6 +1290,7 @@ mod tests {
             tokens: Some(crate::model_router::wire::Tokens {
                 input: 1000,
                 output: 0,
+                ..Default::default()
             }),
             cost: Some(0.000042),
         };

@@ -91,6 +91,9 @@ pub fn prepare(account: &Account, request: &Value, model: &str) -> Result<Reques
         Protocol::Responses => ("responses", responses_request(request, model)?),
         Protocol::Messages => ("messages", messages_request(request, model)?),
     };
+    if account.family == "anthropic" {
+        body["cache_control"] = json!({"type":"ephemeral"});
+    }
     if provider == Some("anthropic") {
         // Match Pi's OAuth adapter. Anthropic requires this separate identity
         // block for subscription requests; preserve the harness prompt after it.
@@ -336,6 +339,9 @@ impl Decoder {
                     self.tokens.output = counts.output;
                     if counts.input > 0 {
                         self.tokens.input = counts.input;
+                        self.tokens.cache_read = counts.cache_read;
+                        self.tokens.cache_write = counts.cache_write;
+                        self.tokens.cache_write_1h = counts.cache_write_1h;
                     }
                 }
                 if event["delta"]["stop_reason"] == "max_tokens" {
@@ -360,14 +366,14 @@ impl Decoder {
         json!({"id":self.response_id,"object":"chat.completion.chunk","model":self.model,"choices":[{"index":0,"delta":{},"finish_reason":self.finish_reason}]})
     }
     pub fn usage_chunk(&self) -> Value {
-        json!({"id":self.response_id,"object":"chat.completion.chunk","model":self.model,"choices":[],"usage":{"prompt_tokens":self.tokens.input,"completion_tokens":self.tokens.output,"total_tokens":self.tokens.input+self.tokens.output}})
+        json!({"id":self.response_id,"object":"chat.completion.chunk","model":self.model,"choices":[],"usage":{"prompt_tokens":self.tokens.input,"completion_tokens":self.tokens.output,"total_tokens":self.tokens.input+self.tokens.output,"prompt_tokens_details":{"cached_tokens":self.tokens.cache_read},"cache_creation_input_tokens":self.tokens.cache_write,"completion_tokens_details":{"reasoning_tokens":self.tokens.reasoning}}})
     }
     pub fn completion(&self) -> Value {
         let mut message = json!({"role":"assistant","content":self.text});
         if !self.tools.is_empty() {
             message["tool_calls"] = json!(self.tools);
         }
-        json!({"id":self.response_id,"object":"chat.completion","model":self.model,"choices":[{"index":0,"message":message,"finish_reason":self.finish_reason}],"usage":{"prompt_tokens":self.tokens.input,"completion_tokens":self.tokens.output,"total_tokens":self.tokens.input+self.tokens.output}})
+        json!({"id":self.response_id,"object":"chat.completion","model":self.model,"choices":[{"index":0,"message":message,"finish_reason":self.finish_reason}],"usage":{"prompt_tokens":self.tokens.input,"completion_tokens":self.tokens.output,"total_tokens":self.tokens.input+self.tokens.output,"prompt_tokens_details":{"cached_tokens":self.tokens.cache_read},"cache_creation_input_tokens":self.tokens.cache_write,"completion_tokens_details":{"reasoning_tokens":self.tokens.reasoning}}})
     }
 }
 
@@ -451,7 +457,10 @@ mod tests {
         assert!(oauth.headers.iter().any(
             |(name, value)| *name == "anthropic-beta" && value.contains("claude-code-20250219")
         ));
-        assert!(oauth.headers.iter().any(|(name, value)| *name == "user-agent" && value == "claude-cli/2.1.282"));
+        assert!(oauth
+            .headers
+            .iter()
+            .any(|(name, value)| *name == "user-agent" && value == "claude-cli/2.1.282"));
         account.credential = Credential::ApiKey {
             key: "test-key".into(),
         };

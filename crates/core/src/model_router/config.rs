@@ -340,6 +340,10 @@ pub struct Route {
 /// The whole router record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct RouterConfig {
+    #[serde(skip)]
+    pub routing_models: std::collections::BTreeMap<String, super::policy::Model>,
+    #[serde(default)]
+    pub policy: super::policy::Settings,
     /// Runtime-only provider catalogs. Saving settings never pins discoveries.
     #[serde(skip)]
     pub discovered_models: std::collections::BTreeMap<String, Vec<String>>,
@@ -428,6 +432,7 @@ pub fn load(agent: &Path) -> io::Result<RouterConfig> {
                     })
                 })
                 .collect();
+            super::policy::load_metadata(agent, &mut config);
             Ok(config)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(RouterConfig::default()),
@@ -689,6 +694,8 @@ mod tests {
     fn a_saved_record_reads_back_whole_and_stays_private() {
         let agent = tempdir();
         let config = RouterConfig {
+            routing_models: Default::default(),
+            policy: Default::default(),
             discovered_models: Default::default(),
             enabled: true,
             accounts: vec![key_account("a1", "openai"), key_account("a2", "openai")],

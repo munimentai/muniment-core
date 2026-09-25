@@ -14,6 +14,12 @@ use super::server::Endpoint;
 
 /// The `models.json` entry for the router.
 pub fn provider_entry(endpoint: &Endpoint, config: &RouterConfig) -> Value {
+    let options = super::options(config);
+    let profiles: Vec<_> = options
+        .iter()
+        .filter_map(|route| super::policy::model(config, route))
+        .collect();
+    let smallest_context = profiles.iter().map(|m| m.context).min().unwrap_or(128000);
     json!({
         "baseUrl": endpoint.base_url(),
         "api": "openai-completions",
@@ -24,7 +30,14 @@ pub fn provider_entry(endpoint: &Endpoint, config: &RouterConfig) -> Value {
         },
         "models": served_models(config)
             .iter()
-            .map(|id| json!({ "id": id }))
+            .map(|id| {
+                let profile = options.iter().find(|r| &r.key == id).and_then(|r| super::policy::model(config,r));
+                json!({ "id": id,
+                    "contextWindow": profile.as_ref().map(|m| m.context).unwrap_or(smallest_context),
+                    "maxTokens": profile.as_ref().map(|m| m.output_limit).unwrap_or(8192),
+                    "input": if profile.as_ref().is_some_and(|m| m.images) { vec!["text","image"] } else { vec!["text"] },
+                })
+            })
             .collect::<Vec<_>>(),
     })
 }

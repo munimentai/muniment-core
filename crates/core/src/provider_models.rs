@@ -94,7 +94,7 @@ fn parse_subscription_catalog(value: &Value) -> Option<Vec<Value>> {
         // executable settings and credentials never enter the account config.
         let mut model = json!({"id":id,"name":entry["name"].as_str().unwrap_or(id),
             "contextWindow":context,"maxTokens":output});
-        for field in ["input", "cost", "reasoning"] {
+        for field in ["input", "cost", "reasoning", "supportsTools"] {
             if let Some(value) = entry.get(field) {
                 model[field] = value.clone();
             }
