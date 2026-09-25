@@ -1197,6 +1197,7 @@ fn relay_native(
         }
         return Ok(None);
     }
+    record_subscription_probe(state, account, model, &decoder);
     state.record_success(account, decoder.tokens);
     if streaming {
         if !started && stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n").is_err() { return Ok(None); }
@@ -1212,6 +1213,49 @@ fn relay_native(
         respond(stream, 200, "OK", &decoder.completion());
     }
     Ok(Some(decoder.tokens))
+}
+
+// The installed probe exports only model IDs and a digest of its synthetic reply.
+fn record_subscription_probe(state: &State, account: &str, model: &str, decoder: &transport::Decoder) {
+    use sha2::{Digest, Sha256};
+    if std::env::var("MUNIMENT_SUBSCRIPTION_PROBE").as_deref() != Ok("1") {
+        return;
+    }
+    let Ok(config) = config::load(&state.agent) else {
+        return;
+    };
+    let subscription = config.account(account).is_some_and(|account| {
+        matches!(account.credential, config::Credential::Subscription { .. })
+    });
+    let valid_id = |id: &str| {
+        !id.is_empty()
+            && id.len() <= 128
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+    };
+    let actual = decoder.reported_model.as_deref().filter(|id| valid_id(id));
+    if !valid_id(model) {
+        return;
+    }
+    let receipt = serde_json::json!({
+        "requested": model,
+        "actual": if decoder.conflicting_models { None } else { actual },
+        "subscription": subscription,
+        "finished": decoder.finished,
+        "tools": decoder.tools.len(),
+        "reply_sha256": format!("{:x}", Sha256::digest(decoder.text.trim().as_bytes())),
+    });
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    if let Ok(mut file) = options.open(state.agent.join("subscription-probe-transports.jsonl")) {
+        let _ = writeln!(file, "{receipt}");
+    }
 }
 
 fn write_event(stream: &mut TcpStream, value: &Value) -> io::Result<()> {

@@ -247,6 +247,9 @@ pub struct Decoder {
     pub finish_reason: String,
     pub text: String,
     pub tools: Vec<Value>,
+    /// The provider's model field, not the route the caller requested.
+    pub reported_model: Option<String>,
+    pub conflicting_models: bool,
     indices: BTreeMap<String, usize>,
     model: String,
 }
@@ -259,6 +262,8 @@ impl Decoder {
             finish_reason: "stop".into(),
             text: String::new(),
             tools: vec![],
+            reported_model: None,
+            conflicting_models: false,
             indices: BTreeMap::new(),
             model: model.into(),
         }
@@ -289,6 +294,19 @@ impl Decoder {
     }
     pub fn event(&mut self, event: &Value) -> Result<Option<Value>, String> {
         let kind = event["type"].as_str().unwrap_or_default();
+        if let Some(model) = event["response"]["model"]
+            .as_str()
+            .or_else(|| event["message"]["model"].as_str())
+        {
+            if self
+                .reported_model
+                .as_deref()
+                .is_some_and(|previous| previous != model)
+            {
+                self.conflicting_models = true;
+            }
+            self.reported_model = Some(model.to_owned());
+        }
         let value = match kind {
             "response.output_text.delta" => {
                 let text = event["delta"].as_str().unwrap_or_default();
@@ -415,6 +433,42 @@ pub fn collect(response: ureq::Response, protocol: Protocol, model: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_receipts_use_provider_models_not_requested_models() {
+        let mut decoder = Decoder::new("requested");
+        assert_eq!(decoder.reported_model, None);
+        decoder
+            .event(&json!({"type":"response.created","response":{"model":"actual"}}))
+            .unwrap();
+        assert_eq!(decoder.reported_model.as_deref(), Some("actual"));
+        assert!(!decoder.conflicting_models);
+        decoder
+            .event(&json!({"type":"response.completed","response":{"model":"other"}}))
+            .unwrap();
+        assert!(decoder.conflicting_models);
+    }
+
+    #[test]
+    fn subscription_receipts_read_messages_and_do_not_invent_missing_models() {
+        let mut decoder = Decoder::new("requested");
+        decoder
+            .event(&json!({"type":"message_start","message":{"model":"actual"}}))
+            .unwrap();
+        assert_eq!(decoder.reported_model.as_deref(), Some("actual"));
+        decoder.event(&json!({"type":"message_stop"})).unwrap();
+        assert!(decoder.finished);
+        assert_eq!(decoder.reported_model.as_deref(), Some("actual"));
+        let mut absent = Decoder::new("requested");
+        absent
+            .event(&json!({"type":"response.completed","response":{}}))
+            .unwrap();
+        assert_eq!(absent.reported_model, None);
+        let mut failed = Decoder::new("requested");
+        assert!(failed.event(&json!({"type":"response.failed"})).is_err());
+        assert!(!failed.finished);
+    }
+
     #[test]
     fn muse_subscription_uses_responses_and_its_minted_key() {
         let account: Account = serde_json::from_value(json!({
