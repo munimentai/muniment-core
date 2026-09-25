@@ -890,3 +890,62 @@ fn project_launch_uses_the_folder_after_rename_and_rejects_a_missing_folder() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn composer_selection_overrides_the_model_on_new_and_reopened_local_threads() {
+    struct SelectedModel {
+        root: PathBuf,
+        choice: String,
+    }
+    impl PiLaunchBoundaries for SelectedModel {
+        fn memory_agent_extension_path(&self) -> Option<PathBuf> {
+            None
+        }
+        fn pi_session_root(&self) -> Result<PathBuf, PiLaunchError> {
+            Ok(self.root.clone())
+        }
+        fn local_default_model(&self) -> Option<String> {
+            Some(self.choice.clone())
+        }
+        fn prepare_pi_settings(
+            &self,
+            _: muniment_core::sidecar::pi_install::PiArtifactDescriptor,
+            _: &Path,
+        ) -> Result<(), PiLaunchError> {
+            Ok(())
+        }
+    }
+    let root = temporary_directory();
+    fs::write(root.join("session.jsonl"), "").unwrap();
+    let (locator, _) = validate_pi_session(&root, "session.jsonl").unwrap();
+    for (provider, model) in [
+        ("anthropic", "claude-opus-5-5"),
+        ("muniment-router", "anthropic/claude-opus-5-5"),
+        ("muniment-router", "auto"),
+    ] {
+        let boundary = SelectedModel {
+            root: root.clone(),
+            choice: format!("{provider}/{model}"),
+        };
+        for reopen in [None, Some(&locator)] {
+            let config = pi_launch_config_for_executable(
+                &boundary,
+                "pi".into(),
+                &ChatGrant::local(),
+                reopen,
+            )
+            .unwrap();
+            let values = |flag: &str| {
+                config
+                    .args
+                    .windows(2)
+                    .filter(|pair| pair[0] == flag)
+                    .map(|pair| pair[1].as_str())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(values("--provider"), [provider]);
+            assert_eq!(values("--model"), [model]);
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
