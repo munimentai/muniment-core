@@ -394,7 +394,7 @@ fn ask(url: &str, bearer: Option<&str>, body: &Value, timeout: Duration) -> Opti
         request = request.set("authorization", &format!("Bearer {bearer}"));
     }
     request
-        .send_json(&classifier_body(url, body))
+        .send_json(classifier_body(url, body))
         .ok()?
         .into_json::<Value>()
         .ok()
@@ -420,7 +420,7 @@ pub fn check(classifier: &Classifier, timeout: Duration) -> Result<(), String> {
     if let Some(bearer) = bearer {
         request = request.set("authorization", &format!("Bearer {bearer}"));
     }
-    match request.send_json(&classifier_body(&url, &probe)) {
+    match request.send_json(classifier_body(&url, &probe)) {
         Ok(response) => match response.into_json::<Value>() {
             Ok(value)
                 if parse(&classifier_response(value.clone()))

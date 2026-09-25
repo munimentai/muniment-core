@@ -354,8 +354,10 @@ mod tests {
         let agent =
             std::env::temp_dir().join(format!("muniment-discovery-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&agent).unwrap();
-        let mut settings = config::RouterConfig::default();
-        settings.enabled = true;
+        let mut settings = config::RouterConfig {
+            enabled: true,
+            ..Default::default()
+        };
         settings.accounts.push(
             serde_json::from_value(json!({
                 "id":"claude-account","family":"anthropic","label":"Claude",

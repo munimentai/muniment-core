@@ -355,11 +355,14 @@ impl Session {
         route: &Route,
         account: &str,
         features: &Features,
-        tokens: Tokens,
+        completion: Completion,
         price: Option<&Model>,
-        now: i64,
-        elapsed: u64,
     ) {
+        let Completion {
+            tokens,
+            finished_ms: now,
+            elapsed_ms: elapsed,
+        } = completion;
         if self.route != route.key {
             if !self.route.is_empty() {
                 self.switches = self.switches.saturating_add(1);
@@ -403,18 +406,32 @@ impl Session {
         }
     }
 }
+pub struct Proposal<'a> {
+    pub route: &'a str,
+    pub confident: bool,
+}
+
+pub struct Completion {
+    pub tokens: Tokens,
+    pub finished_ms: i64,
+    pub elapsed_ms: u64,
+}
+
 /// Select among capable models. A classifier may nominate a stronger model at
 /// entry or after new evidence. Cost-driven downgrades require a task boundary.
 pub fn choose(
     config: &RouterConfig,
     routes: &[Route],
-    proposed: &str,
-    confident: bool,
+    proposal: Proposal<'_>,
     session: &Session,
     features: &Features,
     boundary: bool,
     now: i64,
 ) -> Result<(Route, String), String> {
+    let Proposal {
+        route: proposed,
+        confident,
+    } = proposal;
     let eligible: Vec<(&Route, Model)> = routes
         .iter()
         .filter_map(|r| {

@@ -780,8 +780,10 @@ fn complete(
             match super::policy::choose(
                 &config,
                 &super::options(&config),
-                &plan.route,
-                plan.reason == super::classify::Reason::Classified,
+                super::policy::Proposal {
+                    route: &plan.route,
+                    confident: plan.reason == super::classify::Reason::Classified,
+                },
                 &session,
                 &features,
                 boundary,
@@ -978,10 +980,12 @@ fn complete(
                                         &route,
                                         &account.id,
                                         &features,
-                                        tokens,
+                                        super::policy::Completion {
+                                            tokens,
+                                            finished_ms: (state.now_ms)(),
+                                            elapsed_ms: started.elapsed().as_millis() as u64,
+                                        },
                                         super::policy::model(&config, &route).as_ref(),
-                                        (state.now_ms)(),
-                                        started.elapsed().as_millis() as u64,
                                     );
                                     session.remember_cache(&config, &route);
                                     if let Ok(mut sessions) = state.sessions.lock() {
@@ -1017,10 +1021,12 @@ fn complete(
                                     &route,
                                     &account.id,
                                     &features,
-                                    tokens,
+                                    super::policy::Completion {
+                                        tokens,
+                                        finished_ms: (state.now_ms)(),
+                                        elapsed_ms: started.elapsed().as_millis() as u64,
+                                    },
                                     super::policy::model(&config, &route).as_ref(),
-                                    (state.now_ms)(),
-                                    started.elapsed().as_millis() as u64,
                                 );
                                 session.remember_cache(&config, &route);
                                 if let Ok(mut sessions) = state.sessions.lock() {
