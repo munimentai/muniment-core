@@ -708,7 +708,8 @@ mod tests {
             fs::write(package.join("fixture.ts"), "export default () => {};").unwrap();
             fs::write(
                 package.join("package.json"),
-                format!("{{\"name\":\"{name}\",\"version\":\"{version}\",\"pi\":{{\"extensions\":[\"./fixture.ts\"]}}}}"),
+                json!({"name": name, "version": version, "pi": {"extensions": ["./fixture.ts"]}})
+                    .to_string(),
             )
             .unwrap();
         }
@@ -891,7 +892,8 @@ mod tests {
             fs::write(directory.join("fixture.ts"), "export default () => {};").unwrap();
             fs::write(
                 directory.join("package.json"),
-                format!("{{\"name\":\"{name}\",\"version\":\"{version}\",\"pi\":{{\"extensions\":[\"./fixture.ts\"]}}}}"),
+                json!({"name": name, "version": version, "pi": {"extensions": ["./fixture.ts"]}})
+                    .to_string(),
             )
             .unwrap();
         }
@@ -918,7 +920,8 @@ mod tests {
             fs::write(directory.join("fixture.ts"), "export default () => {};").unwrap();
             fs::write(
                 directory.join("package.json"),
-                format!("{{\"name\":\"{name}\",\"version\":\"{version}\",\"pi\":{{\"extensions\":[\"./fixture.ts\"]}}}}"),
+                json!({"name": name, "version": version, "pi": {"extensions": ["./fixture.ts"]}})
+                    .to_string(),
             )
             .unwrap();
         }
