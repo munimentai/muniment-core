@@ -119,7 +119,7 @@ impl Credential {
     /// Whether a native transport is available for this credential.
     pub fn servable(&self) -> bool {
         matches!(self, Self::ApiKey { .. })
-            || matches!(self, Self::Subscription { provider, .. } if matches!(provider.as_str(), "openai-codex" | "xai" | "anthropic" | "kimi"))
+            || matches!(self, Self::Subscription { provider, .. } if matches!(provider.as_str(), "openai-codex" | "xai" | "anthropic" | "kimi" | "meta"))
     }
 
     /// Pi's provider id behind a subscription, none for a key.

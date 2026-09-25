@@ -31,11 +31,12 @@ pub fn save(agent: &Path, cache: &Cache) -> std::io::Result<()> {
 /// Only providers with a documented model-list route. Subscription tokens are
 /// not API keys: xAI is the supported subscription discovery endpoint.
 pub fn endpoint(provider: &str, oauth: bool) -> Option<(&'static str, &'static str)> {
-    if oauth && provider != "xai" {
+    if oauth && !matches!(provider, "xai" | "meta") {
         return None;
     }
     Some(match provider {
         "xai" => ("https://api.x.ai/v1/language-models", "openai-responses"),
+        "meta" => ("https://api.meta.ai/v1/models", "openai-responses"),
         "openai" => ("https://api.openai.com/v1/models", "openai-responses"),
         "anthropic" => (
             "https://api.anthropic.com/v1/models?limit=1000",

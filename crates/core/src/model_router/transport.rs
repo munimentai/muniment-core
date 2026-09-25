@@ -23,7 +23,7 @@ pub struct Request {
 pub fn prepare(account: &Account, request: &Value, model: &str) -> Result<Request, String> {
     let provider = account.credential.pi_provider();
     let protocol = match provider {
-        Some("openai-codex" | "xai") => Protocol::Responses,
+        Some("openai-codex" | "xai" | "meta") => Protocol::Responses,
         Some("anthropic" | "kimi") => Protocol::Messages,
         Some(_) => return Err("This subscription does not support routed turns yet.".into()),
         None if account.family == "anthropic" => Protocol::Messages,
@@ -49,6 +49,10 @@ pub fn prepare(account: &Account, request: &Value, model: &str) -> Result<Reques
         "authorization",
         format!("Bearer {}", account.credential.bearer()),
     )];
+    if provider == Some("meta") {
+        headers.push(("user-agent", "muse-code/1.0.2".into()));
+        headers.push(("x-client-id", "tbh:tui".into()));
+    }
     if protocol == Protocol::Messages {
         headers.push(("anthropic-version", "2023-06-01".into()));
         if provider == Some("anthropic") {
@@ -405,6 +409,31 @@ pub fn collect(response: ureq::Response, protocol: Protocol, model: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn muse_subscription_uses_responses_and_its_minted_key() {
+        let account: Account = serde_json::from_value(json!({
+            "id":"muse", "family":"meta", "label":"Muse Code", "enabled":true,
+            "weight":1, "models":[],
+            "credential":{"type":"subscription", "provider":"meta", "access":"minted-fixture"}
+        }))
+        .unwrap();
+        let prepared = prepare(
+            &account,
+            &json!({"messages":[{"role":"user","content":"Hello"}]}),
+            "muse-fixture",
+        )
+        .unwrap();
+        assert_eq!(prepared.protocol, Protocol::Responses);
+        assert_eq!(prepared.url, "https://api.meta.ai/v1/responses");
+        assert!(prepared
+            .headers
+            .contains(&("authorization", "Bearer minted-fixture".into())));
+        assert!(prepared
+            .headers
+            .contains(&("x-client-id", "tbh:tui".into())));
+        assert_eq!(prepared.body["model"], "muse-fixture");
+    }
+
     #[test]
     fn subscription_identity_is_separate_from_the_harness_prompt_and_api_key_requests() {
         let mut account: Account = serde_json::from_value(json!({

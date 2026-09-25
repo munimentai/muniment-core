@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use base64::Engine;
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::config::Credential;
@@ -152,6 +152,101 @@ fn read(result: Result<ureq::Response, ureq::Error>) -> Result<(u16, Value), Str
         }
         Err(ureq::Error::Transport(_)) => Err("The sign-in service did not answer.".into()),
     }
+}
+
+// Muse Code uses a device token to mint the subscription request credential.
+pub const MUSE_DEVICE_URL: &str = "https://auth.meta.com/oidc/device/authorization/";
+pub const MUSE_TOKEN_URL: &str = "https://auth.meta.com/oidc/device/token/";
+pub const MUSE_MINT_URL: &str = "https://api.meta.ai/muse-code/key";
+const MUSE_CLIENT_ID: &str = "1031625952748946";
+
+pub fn muse_device_code(url: &str, timeout: Duration) -> Result<DeviceCode, String> {
+    let (status, body) = read(
+        agent(timeout)
+            .post(url)
+            .set("user-agent", "muse-code/1.0.2")
+            .send_form(&[("client_id", MUSE_CLIENT_ID)]),
+    )?;
+    if status != 200 {
+        return Err(format!(
+            "Muse Code answered {status} to the sign-in request."
+        ));
+    }
+    let code = parse_kimi_device_code(&body).ok_or("Muse Code answered without a device code.")?;
+    if !code.verification_uri_complete.starts_with("https://") {
+        return Err("Muse Code returned an invalid sign-in URL.".into());
+    }
+    Ok(code)
+}
+
+pub enum MusePoll {
+    Pending,
+    SlowDown,
+    Granted(Credential),
+}
+
+pub fn muse_poll(
+    token_url: &str,
+    mint_url: &str,
+    code: &str,
+    timeout: Duration,
+) -> Result<MusePoll, String> {
+    let (status, body) = read(
+        agent(timeout)
+            .post(token_url)
+            .set("user-agent", "muse-code/1.0.2")
+            .send_form(&[
+                ("client_id", MUSE_CLIENT_ID),
+                ("device_code", code),
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ]),
+    )?;
+    match body["error"].as_str() {
+        Some("authorization_pending") => return Ok(MusePoll::Pending),
+        Some("slow_down") => return Ok(MusePoll::SlowDown),
+        Some("access_denied") => return Err("The Muse Code sign-in was denied.".into()),
+        Some("expired_token") => return Err("The Muse Code sign-in code expired.".into()),
+        Some(_) => return Err("Muse Code refused the sign-in. Start again.".into()),
+        None => {}
+    }
+    if status != 200 {
+        return Err(format!("Muse Code answered {status} to the sign-in poll."));
+    }
+    let dca = text(body.get("access_token")).ok_or("Muse Code returned no device token.")?;
+    let (status, minted) = read(
+        agent(timeout)
+            .post(mint_url)
+            .set("user-agent", "muse-code/1.0.2")
+            .set("authorization", &format!("Bearer {dca}"))
+            .send_json(json!({"dca_token":dca})),
+    )?;
+    if status != 200 {
+        return Err(format!(
+            "Muse Code answered {status} to the credential request."
+        ));
+    }
+    muse_credential(&minted).map(MusePoll::Granted)
+}
+
+fn muse_credential(minted: &Value) -> Result<Credential, String> {
+    // Do not send the minted credential to an unrecognized destination.
+    if text(minted.get("base_url"))
+        .is_some_and(|url| url.trim_end_matches('/') != "https://api.meta.ai/v1")
+    {
+        return Err("Muse Code returned an unsupported API address.".into());
+    }
+    let access = text(minted.get("api_key"))
+        .ok_or("Muse Code did not grant a request credential. Check your subscription.")?;
+    Ok(Credential::Subscription {
+        provider: "meta".into(),
+        access,
+        refresh: None,
+        expires_ms: None,
+        account_id: None,
+        email: text(minted.get("user_email")),
+        plan: text(minted.get("subs_tier_name")),
+        renews_at_ms: None,
+    })
 }
 
 // Kimi.
@@ -736,6 +831,26 @@ pub fn refresh_if_expiring(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn muse_requires_a_minted_key_and_keeps_subscription_identity() {
+        let credential = muse_credential(&json!({"api_key":"fixture-key",
+            "user_email":"fixture@example.com", "subs_tier_name":"Pro",
+            "base_url":"https://api.meta.ai/v1/"}))
+        .unwrap();
+        assert_eq!(credential.pi_provider(), Some("meta"));
+        assert!(credential.servable());
+        assert_eq!(credential.bearer(), "fixture-key");
+        assert_eq!(
+            credential.clone().into_email().as_deref(),
+            Some("fixture@example.com")
+        );
+        assert!(muse_credential(&json!({"access_token":"dca:device"})).is_err());
+        assert!(muse_credential(
+            &json!({"api_key":"fixture-key","base_url":"https://untrusted.example/v1"})
+        )
+        .is_err());
+    }
 
     #[test]
     fn pkce_is_the_s256_challenge_of_a_url_safe_verifier() {

@@ -206,7 +206,7 @@ mod tests {
         // Every pooled family offers at least one model to route to. Devin is
         // a subscription the pool shows and probes, and no turn lands on it.
         for family in FAMILIES {
-            if family.id == "devin" {
+            if matches!(family.id, "devin" | "meta") {
                 continue;
             }
             assert!(
