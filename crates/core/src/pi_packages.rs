@@ -14,7 +14,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 pub const PI_PACKAGES: [(&str, &str); 5] = [
-    ("pi-web-access", "0.30.0"),
+    ("pi-web-access", "0.31.0"),
     ("pi-subagents", "0.71.0"),
     ("pi-background-tasks", "2.5.0"),
     ("pi-mcp-adapter", "2.37.0"),
