@@ -318,6 +318,20 @@ pub fn merge_models(
             changed = true;
         }
     }
+    // Pi rejects the entire file if a cost object omits a required field.
+    // Use the uncached input price when an upstream catalog omits cache pricing.
+    for model in existing {
+        if let Some(cost) = model.get_mut("cost").and_then(Value::as_object_mut) {
+            if let Some(input) = cost.get("input").cloned() {
+                for field in ["cacheRead", "cacheWrite"] {
+                    if !cost.contains_key(field) {
+                        cost.insert(field.into(), input.clone());
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
     changed
 }
 
@@ -483,4 +497,20 @@ mod tests {
         server.join().unwrap();
         assert!(discover_at("xai", &url, "test-token", Duration::from_millis(50)).is_none());
     }
+}
+
+#[test]
+fn cached_discovery_repairs_incomplete_prices_without_removing_other_providers() {
+    let mut root = json!({"providers":{"muniment-router":{"models":[{"id":"auto"}]},"xai":{"models":[{"id":"grok","cost":{"input":2,"output":6,"cacheRead":0.2}}]}}}).as_object().unwrap().clone();
+    let models = vec![json!({"id":"grok","cost":{"input":2,"output":6,"cacheRead":0.2}})];
+    assert!(merge_models(&mut root, "xai", &models));
+    assert_eq!(
+        root["providers"]["xai"]["models"][0]["cost"],
+        json!({"input":2,"output":6,"cacheRead":0.2,"cacheWrite":2})
+    );
+    assert_eq!(
+        root["providers"]["muniment-router"]["models"][0]["id"],
+        "auto"
+    );
+    assert!(!merge_models(&mut root, "xai", &models));
 }
