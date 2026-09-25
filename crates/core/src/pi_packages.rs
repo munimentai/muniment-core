@@ -14,7 +14,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 pub const PI_PACKAGES: [(&str, &str); 5] = [
-    ("pi-web-access", "0.30.0"),
+    ("pi-web-access", "0.31.0"),
     ("pi-subagents", "0.71.0"),
     ("pi-background-tasks", "2.5.0"),
     ("pi-mcp-adapter", "2.37.0"),
@@ -61,7 +61,29 @@ fn installed(directory: &Path) -> bool {
         )
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .is_some_and(|manifest| manifest["version"] == *version)
+        .is_some_and(|manifest| {
+            manifest["name"] == *name
+                && manifest["version"] == *version
+                && manifest["pi"]["extensions"]
+                    .as_array()
+                    .is_some_and(|entries| {
+                        !entries.is_empty()
+                            && entries.iter().all(|entry| {
+                                entry.as_str().is_some_and(|entry| {
+                                    let path = Path::new(entry);
+                                    !path.is_absolute()
+                                        && !path.components().any(|part| {
+                                            matches!(part, std::path::Component::ParentDir)
+                                        })
+                                        && directory
+                                            .join("node_modules")
+                                            .join(name)
+                                            .join(path)
+                                            .exists()
+                                })
+                            })
+                    })
+        })
     })
 }
 
@@ -105,6 +127,7 @@ fn install_command(executable: &Path, directory: &Path) -> Command {
         // to resolve or write anything the lockfile does not hold.
         .args([
             "--frozen-lockfile",
+            "--force",
             "--omit=peer",
             "--ignore-scripts",
             "--cwd",
@@ -682,9 +705,11 @@ mod tests {
         for (name, version) in PI_PACKAGES {
             let package = npm.join("node_modules").join(name);
             fs::create_dir_all(&package).unwrap();
+            fs::write(package.join("fixture.ts"), "export default () => {};").unwrap();
             fs::write(
                 package.join("package.json"),
-                format!("{{\"version\":\"{version}\"}}"),
+                json!({"name": name, "version": version, "pi": {"extensions": ["./fixture.ts"]}})
+                    .to_string(),
             )
             .unwrap();
         }
@@ -765,6 +790,7 @@ mod tests {
             [
                 "install",
                 "--frozen-lockfile",
+                "--force",
                 "--omit=peer",
                 "--ignore-scripts",
                 "--cwd",
@@ -824,6 +850,38 @@ mod tests {
     }
 
     #[test]
+    fn version_only_manifests_and_missing_extensions_are_not_installed() {
+        let root = std::env::temp_dir().join(format!(
+            "muniment-package-integrity-{}",
+            uuid::Uuid::new_v4()
+        ));
+        for (name, version) in PI_PACKAGES {
+            let package = root.join("node_modules").join(name);
+            fs::create_dir_all(&package).unwrap();
+            fs::write(
+                package.join("package.json"),
+                serde_json::to_vec(&json!({"name": name, "version": version})).unwrap(),
+            )
+            .unwrap();
+        }
+        assert!(!installed(&root));
+        for (name, version) in PI_PACKAGES {
+            let package = root.join("node_modules").join(name);
+            fs::write(package.join("package.json"), serde_json::to_vec(&json!({"name": name, "version": version, "pi": {"extensions": ["./index.ts"]}})).unwrap()).unwrap();
+        }
+        assert!(!installed(&root));
+        for (name, _) in PI_PACKAGES {
+            fs::write(
+                root.join("node_modules").join(name).join("index.ts"),
+                "export default () => {};",
+            )
+            .unwrap();
+        }
+        assert!(installed(&root));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_tree_another_package_manager_wrote_starts_over() {
         let root = std::env::temp_dir().join(format!("muniment-packages-{}", uuid::Uuid::new_v4()));
         let npm = root.join("npm");
@@ -831,9 +889,11 @@ mod tests {
         for (name, version) in PI_PACKAGES {
             let directory = npm.join("node_modules").join(name);
             fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("fixture.ts"), "export default () => {};").unwrap();
             fs::write(
                 directory.join("package.json"),
-                format!("{{\"version\":\"{version}\"}}"),
+                json!({"name": name, "version": version, "pi": {"extensions": ["./fixture.ts"]}})
+                    .to_string(),
             )
             .unwrap();
         }
@@ -857,9 +917,11 @@ mod tests {
         for (name, version) in PI_PACKAGES {
             let directory = npm.join("node_modules").join(name);
             fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("fixture.ts"), "export default () => {};").unwrap();
             fs::write(
                 directory.join("package.json"),
-                format!("{{\"version\":\"{version}\"}}"),
+                json!({"name": name, "version": version, "pi": {"extensions": ["./fixture.ts"]}})
+                    .to_string(),
             )
             .unwrap();
         }

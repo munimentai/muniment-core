@@ -558,7 +558,7 @@ pub fn pi_launch_config_for_executable(
         working_directory: boundaries
             .project_directory()?
             .or_else(|| boundaries.working_directory()),
-        model,
+        model: model.clone(),
     };
     config.working_directory = facts.working_directory.clone();
     let mut prompt = crate::launch_facts::system_prompt_with_facts(SYSTEM_PROMPT, &facts);
@@ -613,6 +613,16 @@ pub fn pi_launch_config_for_executable(
         progress.to_string_lossy().into_owned(),
     ]);
     if grant.is_local() {
+        // Session restoration may restore the previous model. The composer choice
+        // is an explicit override, including when reopening an existing thread.
+        if let Some((provider, model)) = model.as_deref().and_then(|value| value.split_once('/')) {
+            config.args.extend([
+                "--provider".into(),
+                provider.into(),
+                "--model".into(),
+                model.into(),
+            ]);
+        }
         config
             .env_remove
             .extend(LOCAL_MODE_ENV_REMOVE.iter().map(|name| (*name).to_owned()));

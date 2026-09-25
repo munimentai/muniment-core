@@ -117,6 +117,8 @@ impl Drop for Handle {
 /// What the router keeps between turns: where its files are, and the counters
 /// it has not yet written down.
 struct State {
+    sessions: Mutex<super::policy::Sessions>,
+    active_sessions: Mutex<std::collections::HashSet<String>>,
     progress: super::progress::Progress,
     agent: PathBuf,
     ledger: Mutex<Ledger>,
@@ -270,11 +272,22 @@ impl State {
 
     /// The configuration as it stands right now. It is read per turn, so a
     /// change in Settings takes the next turn with no restart.
+    #[cfg(test)]
     fn reserve(
         &self,
         config: &RouterConfig,
         family: &str,
         model: &str,
+    ) -> Result<(config::Account, InFlight), balance::PickError> {
+        self.reserve_preferred(config, family, model, None)
+    }
+
+    fn reserve_preferred(
+        &self,
+        config: &RouterConfig,
+        family: &str,
+        model: &str,
+        preferred: Option<&str>,
     ) -> Result<(config::Account, InFlight), balance::PickError> {
         let mut active = self
             .active
@@ -299,8 +312,17 @@ impl State {
                 usage.cooldown_until_ms = Some(usage.cooldown_until_ms.unwrap_or(0).max(reset));
             }
         }
+        let mut preferred_config = config.clone();
+        for account in &mut preferred_config.accounts {
+            account.enabled &= preferred.is_some_and(|id| {
+                super::policy::scope(config, id) == super::policy::scope(config, &account.id)
+            });
+        }
         let account =
-            balance::pick_with_active(config, &ledger, family, model, (self.now_ms)(), &active)?
+            balance::pick_with_active(&preferred_config, &ledger, family, model, now, &active)
+                .or_else(|_| {
+                    balance::pick_with_active(config, &ledger, family, model, now, &active)
+                })?
                 .clone();
         *active.entry(account.id.clone()).or_insert(0) += 1;
         let guard = InFlight {
@@ -308,6 +330,78 @@ impl State {
             account: account.id.clone(),
         };
         Ok((account, guard))
+    }
+
+    fn reserve_delivery(
+        &self,
+        config: &RouterConfig,
+        selected: &config::Route,
+        session: &super::policy::Session,
+        features: &super::policy::Features,
+    ) -> Result<(config::Account, config::Route, InFlight), balance::PickError> {
+        // Keep an established service pool even if one account becomes unavailable.
+        // A subscription must not silently spill into an API or gateway pool.
+        let anchor = config
+            .accounts
+            .iter()
+            .find(|a| {
+                a.id == session.account && a.family == selected.family && a.serves(&selected.model)
+            })
+            .or_else(|| {
+                config.accounts.iter().find(|a| {
+                    a.enabled
+                        && a.weight > 0
+                        && a.credential.servable()
+                        && a.family == selected.family
+                        && a.serves(&selected.model)
+                })
+            })
+            .ok_or(balance::PickError::NoneServesModel)?;
+        let routes = super::options(config);
+        let mut deliveries = Vec::new();
+        for route in routes
+            .iter()
+            .filter(|r| super::policy::same_model(config, selected, r))
+        {
+            if route.key != selected.key
+                && !super::policy::model(config, route).is_some_and(|m| features.fits(&m))
+            {
+                continue;
+            }
+            for account in config.accounts.iter().filter(|a| {
+                a.family == route.family
+                    && a.serves(&route.model)
+                    && super::policy::same_service(anchor, a)
+            }) {
+                if !deliveries
+                    .iter()
+                    .any(|(a, _): &(config::Account, config::Route)| a.id == account.id)
+                {
+                    deliveries.push((account.clone(), route.clone()));
+                }
+            }
+        }
+        // A warm scope wins equal-load ties. Served shares and reservations still
+        // distribute requests across like accounts serving this model.
+        deliveries.sort_by_key(|(account, _)| {
+            super::policy::scope(config, &account.id) != session.cache_scope
+        });
+        let mut pool = config.clone();
+        pool.accounts = deliveries
+            .iter()
+            .map(|(account, _)| {
+                let mut a = account.clone();
+                a.family = "openai".into();
+                a.models = vec!["delivery".into()];
+                a
+            })
+            .collect();
+        let (picked, guard) = self.reserve_preferred(&pool, "openai", "delivery", None)?;
+        let (account, route) = deliveries
+            .into_iter()
+            .find(|(a, _)| a.id == picked.id)
+            .unwrap();
+        Ok((account, route, guard))
     }
 
     fn config(&self) -> RouterConfig {
@@ -318,6 +412,7 @@ impl State {
         let now = (self.now_ms)();
         if let Ok(mut ledger) = self.ledger.lock() {
             ledger.record_success(account, &day(now), now, tokens.input, tokens.output);
+            ledger.record_cache(account, tokens);
             let _ = usage::save(&self.agent, &ledger);
         }
     }
@@ -370,6 +465,8 @@ fn start_with_clock(agent: PathBuf, clock: fn() -> i64) -> io::Result<Handle> {
     write_endpoint(&agent, &endpoint)?;
     let active: Active = Arc::new(Mutex::new(BTreeMap::new()));
     let state = Arc::new(State {
+        sessions: Mutex::new(super::policy::Sessions::load(&agent)),
+        active_sessions: Default::default(),
         progress: Default::default(),
         ledger: Mutex::new(usage::load(&agent)),
         agent,
@@ -563,7 +660,16 @@ fn serve(stream: TcpStream, state: &State, token: &str) {
             let progress = state
                 .progress
                 .start(head.header("x-muniment-routing-id"), (state.now_ms)());
-            complete(&mut stream, state, &request, progress.as_deref());
+            complete(
+                &mut stream,
+                state,
+                &request,
+                progress.as_deref(),
+                head.header("x-muniment-thread"),
+                head.header("x-muniment-task").unwrap_or("default"),
+                head.header("x-muniment-validation-failures")
+                    .and_then(|v| v.parse::<u32>().ok()),
+            );
             state.progress.finish(progress.as_deref());
         }
         _ => respond(
@@ -588,16 +694,68 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 
 /// Classify once, try the selected pool, then eligible fallback models.
 /// Once response output starts, never replay the request on another model.
-fn complete(stream: &mut TcpStream, state: &State, request: &Value, progress: Option<&str>) {
+struct SessionGuard<'a>(&'a Mutex<std::collections::HashSet<String>>, String);
+impl Drop for SessionGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.0.lock() {
+            active.remove(&self.1);
+        }
+    }
+}
+#[allow(clippy::too_many_arguments)]
+fn complete(
+    stream: &mut TcpStream,
+    state: &State,
+    request: &Value,
+    progress: Option<&str>,
+    thread: Option<&str>,
+    task: &str,
+    failures: Option<u32>,
+) {
+    let thread = thread.filter(|id| id.len() == 64 && id.bytes().all(|c| c.is_ascii_hexdigit()));
+    let _lease = if let Some(id) = thread {
+        let mut active = state
+            .active_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !active.insert(id.into()) {
+            respond(
+                stream,
+                409,
+                "Conflict",
+                &wire::error_body(
+                    "This thread already has a request in flight.",
+                    "router_busy",
+                ),
+            );
+            return;
+        }
+        Some(SessionGuard(&state.active_sessions, id.into()))
+    } else {
+        None
+    };
+    let mut session = thread
+        .and_then(|id| state.sessions.lock().ok()?.entries.get(id).cloned())
+        .unwrap_or_default();
+    let features = super::policy::Features::read(request);
+    let boundary = session.observe(&features, &super::policy::digest(task));
+    if let Some(failures) = failures {
+        session.failures = failures.min(100);
+    }
+    let started = std::time::Instant::now();
     state
         .progress
         .stage(progress, "choosing-model", (state.now_ms)());
     let config = state.classifier_config();
+    if session.cache_scope != super::policy::scope(&config, &session.account) {
+        session.tokens.cache_read = 0;
+    }
+
     let requested = wire::requested_model(request).unwrap_or(config::AUTO_MODEL);
-    let text = wire::classifier_state(request);
+    let text = super::policy::classifier_context(request, &session);
     // Reuse the decision across attempts so failure never spends the classifier twice.
     let classification_started = std::time::Instant::now();
-    let plan = match plan(&config, &state.ledger(), requested, &text, (state.now_ms)()) {
+    let mut plan = match plan(&config, &state.ledger(), requested, &text, (state.now_ms)()) {
         Ok(plan) => plan,
         Err(error) => {
             let status = match error {
@@ -615,6 +773,50 @@ fn complete(stream: &mut TcpStream, state: &State, request: &Value, progress: Op
     };
     if let Some(spent_on) = &plan.classifier_spent_on {
         state.record_success(spent_on, plan.classifier_spent);
+    }
+    let mut policy_reason = None;
+    if thread.is_some() {
+        if requested == config::AUTO_MODEL {
+            match super::policy::choose(
+                &config,
+                &super::options(&config),
+                super::policy::Proposal {
+                    route: &plan.route,
+                    confident: plan.reason == super::classify::Reason::Classified,
+                },
+                &session,
+                &features,
+                boundary,
+                (state.now_ms)(),
+            ) {
+                Ok((route, reason)) => {
+                    plan.family = route.family;
+                    plan.model = route.model;
+                    plan.route = route.key;
+                    policy_reason = Some(reason);
+                }
+                Err(message) => {
+                    respond(
+                        stream,
+                        422,
+                        "Unprocessable Content",
+                        &wire::error_body(&message, "routing_capability"),
+                    );
+                    return;
+                }
+            }
+        } else {
+            let route = config::Route {
+                key: plan.route.clone(),
+                family: plan.family.clone(),
+                model: plan.model.clone(),
+                description: String::new(),
+            };
+            if super::policy::model(&config, &route).is_some_and(|m| !features.fits(&m)) {
+                respond(stream, 422, "Unprocessable Content", &wire::error_body("The selected model cannot fit this request or lacks a required capability.","routing_capability"));
+                return;
+            }
+        }
     }
     let classification_ms = classification_started
         .elapsed()
@@ -640,13 +842,16 @@ fn complete(stream: &mut TcpStream, state: &State, request: &Value, progress: Op
             model: plan.model.clone(),
         },
     );
+    if requested != config::AUTO_MODEL || thread.is_some() {
+        routes.truncate(1);
+    }
     let mut last_failure = (503, "No eligible model served this turn.".to_owned());
     let mut attempted = false;
     for route in routes {
         let mut candidates = config.clone();
         loop {
-            let (account, _in_flight) =
-                match state.reserve(&candidates, &route.family, &route.model) {
+            let (account, delivered_route, _in_flight) =
+                match state.reserve_delivery(&candidates, &route, &session, &features) {
                     Ok(account) => account,
                     Err(error) => {
                         refusals.push(format!(
@@ -658,6 +863,7 @@ fn complete(stream: &mut TcpStream, state: &State, request: &Value, progress: Op
                         break;
                     }
                 };
+            let route = delivered_route;
             if attempted
                 || matches!(
                     plan.reason,
@@ -719,26 +925,28 @@ fn complete(stream: &mut TcpStream, state: &State, request: &Value, progress: Op
                         wire::RoutingEvidence {
                             account: account.label.clone(),
                             selected_model: format!("{}/{}", plan.family, plan.model),
-                            decision: match plan.reason {
-                                super::classify::Reason::Classified => {
-                                    "Classifier selected the model"
+                            decision: policy_reason.clone().unwrap_or_else(|| {
+                                match plan.reason {
+                                    super::classify::Reason::Classified => {
+                                        "Classifier selected the model"
+                                    }
+                                    super::classify::Reason::NotClassified
+                                        if requested != config::AUTO_MODEL =>
+                                    {
+                                        "User selected the model"
+                                    }
+                                    super::classify::Reason::NotClassified => {
+                                        "Fallback used without classification"
+                                    }
+                                    super::classify::Reason::LowConfidence => {
+                                        "Fallback used because classifier confidence was low"
+                                    }
+                                    super::classify::Reason::Failed => {
+                                        "Fallback used because the classifier failed"
+                                    }
                                 }
-                                super::classify::Reason::NotClassified
-                                    if requested != config::AUTO_MODEL =>
-                                {
-                                    "User selected the model"
-                                }
-                                super::classify::Reason::NotClassified => {
-                                    "Fallback used without classification"
-                                }
-                                super::classify::Reason::LowConfidence => {
-                                    "Fallback used because classifier confidence was low"
-                                }
-                                super::classify::Reason::Failed => {
-                                    "Fallback used because the classifier failed"
-                                }
-                            }
-                            .into(),
+                                .into()
+                            }),
                             confidence: matches!(
                                 plan.reason,
                                 super::classify::Reason::Classified
@@ -764,7 +972,29 @@ fn complete(stream: &mut TcpStream, state: &State, request: &Value, progress: Op
                             &response_id,
                         );
                         match result {
-                            Ok(()) => return,
+                            Ok(tokens) => {
+                                if let (Some(id), Some(tokens)) = (thread, tokens) {
+                                    session.cache_scope =
+                                        super::policy::scope(&config, &account.id);
+                                    session.finish(
+                                        &route,
+                                        &account.id,
+                                        &features,
+                                        super::policy::Completion {
+                                            tokens,
+                                            finished_ms: (state.now_ms)(),
+                                            elapsed_ms: started.elapsed().as_millis() as u64,
+                                        },
+                                        super::policy::model(&config, &route).as_ref(),
+                                    );
+                                    session.remember_cache(&config, &route);
+                                    if let Ok(mut sessions) = state.sessions.lock() {
+                                        sessions.entries.insert(id.into(), session.clone());
+                                        let _ = sessions.save(&state.agent, (state.now_ms)());
+                                    }
+                                }
+                                return;
+                            }
                             Err(message) => {
                                 last_failure = (502, message);
                                 continue;
@@ -784,7 +1014,28 @@ fn complete(stream: &mut TcpStream, state: &State, request: &Value, progress: Op
                         relay_once(stream, state, &account.id, response, &response_id)
                     };
                     match result {
-                        Ok(()) => return,
+                        Ok(tokens) => {
+                            if let (Some(id), Some(tokens)) = (thread, tokens) {
+                                session.cache_scope = super::policy::scope(&config, &account.id);
+                                session.finish(
+                                    &route,
+                                    &account.id,
+                                    &features,
+                                    super::policy::Completion {
+                                        tokens,
+                                        finished_ms: (state.now_ms)(),
+                                        elapsed_ms: started.elapsed().as_millis() as u64,
+                                    },
+                                    super::policy::model(&config, &route).as_ref(),
+                                );
+                                session.remember_cache(&config, &route);
+                                if let Ok(mut sessions) = state.sessions.lock() {
+                                    sessions.entries.insert(id.into(), session.clone());
+                                    let _ = sessions.save(&state.agent, (state.now_ms)());
+                                }
+                            }
+                            return;
+                        }
                         Err(message) => last_failure = (502, message),
                     }
                 }
@@ -871,7 +1122,7 @@ fn relay_native(
     request: &Value,
     model: &str,
     response_id: &str,
-) -> Result<(), String> {
+) -> Result<Option<wire::Tokens>, String> {
     let streaming = wire::streams(request);
     let mut started = false;
     let mut decoder = transport::Decoder::new(model);
@@ -917,12 +1168,12 @@ fn relay_native(
         match decoder.event(&event) {
             Ok(Some(chunk)) if streaming => {
                 if !started {
-                    if stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n").is_err() { return Ok(()); }
+                    if stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n").is_err() { return Ok(None); }
                     started = true;
                 }
                 if write_event(stream, &chunk).is_err() {
                     state.record_error(account, "The client closed the stream.", false);
-                    return Ok(());
+                    return Ok(None);
                 }
             }
             Ok(_) => {}
@@ -944,23 +1195,23 @@ fn relay_native(
         } else {
             return Err(message);
         }
-        return Ok(());
+        return Ok(None);
     }
     state.record_success(account, decoder.tokens);
     if streaming {
-        if !started && stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n").is_err() { return Ok(()); }
+        if !started && stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n").is_err() { return Ok(None); }
         if write_event(stream, &decoder.final_chunk()).is_err() {
-            return Ok(());
+            return Ok(None);
         }
         if wire::wants_usage(request) && write_event(stream, &decoder.usage_chunk()).is_err() {
-            return Ok(());
+            return Ok(None);
         }
         let _ = stream.write_all(b"data: [DONE]\n\n");
         let _ = stream.flush();
     } else {
         respond(stream, 200, "OK", &decoder.completion());
     }
-    Ok(())
+    Ok(Some(decoder.tokens))
 }
 
 fn write_event(stream: &mut TcpStream, value: &Value) -> io::Result<()> {
@@ -975,7 +1226,7 @@ fn relay_once(
     account: &str,
     response: ureq::Response,
     response_id: &str,
-) -> Result<(), String> {
+) -> Result<Option<wire::Tokens>, String> {
     let Ok(mut value) = response.into_json::<Value>() else {
         state.record_error(
             account,
@@ -994,7 +1245,7 @@ fn relay_once(
     }
     state.record_success(account, wire::tokens(&value).unwrap_or_default());
     respond(stream, 200, "OK", &value);
-    Ok(())
+    Ok(Some(wire::tokens(&value).unwrap_or_default()))
 }
 
 /// A streamed answer: forward every frame as it arrives, and keep the usage
@@ -1007,7 +1258,7 @@ fn relay_stream(
     response: ureq::Response,
     keep_usage: bool,
     response_id: &str,
-) -> Result<(), String> {
+) -> Result<Option<wire::Tokens>, String> {
     let mut reader = BufReader::new(response.into_reader().take(BODY_LIMIT as u64));
     let mut tokens = wire::Tokens::default();
     let mut line = String::new();
@@ -1042,7 +1293,7 @@ fn relay_stream(
             continue;
         }
         if !started {
-            if stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n").is_err() { return Ok(()); }
+            if stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n").is_err() { return Ok(None); }
             started = true;
         }
         chunk["id"] = Value::String(response_id.into());
@@ -1060,7 +1311,7 @@ fn relay_stream(
         }
         let _ = write_event(stream, &wire::error_body(message, "provider_error"));
     }
-    Ok(())
+    Ok(finished.then_some(tokens))
 }
 
 #[cfg(test)]
@@ -1381,6 +1632,8 @@ mod tests {
     fn reservations_distribute_concurrent_turns_and_release_on_drop() {
         let agent = agent_dir();
         let state = State {
+            sessions: Default::default(),
+            active_sessions: Default::default(),
             progress: Default::default(),
             agent,
             ledger: Mutex::new(Ledger::default()),
@@ -1397,6 +1650,80 @@ mod tests {
         drop(first_guard);
         drop(second_guard);
         assert!(state.active.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn routing_balances_like_subscriptions_without_api_spillover() {
+        for provider in ["openai-codex", "anthropic", "xai", "kimi"] {
+            check_subscription_pool(provider);
+        }
+    }
+
+    fn check_subscription_pool(provider: &str) {
+        let state = State {
+            sessions: Default::default(),
+            active_sessions: Default::default(),
+            progress: Default::default(),
+            agent: agent_dir(),
+            ledger: Mutex::new(Ledger::default()),
+            active: Arc::new(Mutex::new(BTreeMap::new())),
+            now_ms: fixed_clock,
+        };
+        let mut first = account("subscription-a", "http://native");
+        first.credential = Credential::from_pi_auth(
+            provider,
+            &json!({
+                "type":"oauth", "access":"fixture", "accountId":"a"
+            }),
+        )
+        .unwrap();
+        let mut second = first.clone();
+        second.id = "subscription-b".into();
+        second.credential = Credential::from_pi_auth(
+            provider,
+            &json!({
+                "type":"oauth", "access":"fixture", "accountId":"b"
+            }),
+        )
+        .unwrap();
+        let api = account("api", "http://native");
+        let mut gateway = second.clone();
+        gateway.id = "gateway".into();
+        gateway.base_url = Some("http://gateway".into());
+        let mut saved = config(vec![first, second, api, gateway]);
+        let route = saved.routes[0].clone();
+        let session = super::super::policy::Session {
+            account: "subscription-a".into(),
+            cache_scope: super::super::policy::scope(&saved, "subscription-a"),
+            ..Default::default()
+        };
+        let features = super::super::policy::Features::read(&turn("auto", false));
+        let (a, _, ga) = state
+            .reserve_delivery(&saved, &route, &session, &features)
+            .unwrap();
+        let (b, _, gb) = state
+            .reserve_delivery(&saved, &route, &session, &features)
+            .unwrap();
+        assert_eq!(a.id, "subscription-a");
+        assert_eq!(b.id, "subscription-b");
+        drop((ga, gb));
+        // An explicit shared namespace cannot cross a service or credential type.
+        for id in ["subscription-a", "subscription-b", "api", "gateway"] {
+            saved
+                .policy
+                .cache_scopes
+                .insert(id.into(), "verified-namespace".into());
+        }
+        let scope = |id| super::super::policy::scope(&saved, id);
+        assert_eq!(scope("subscription-a"), scope("subscription-b"));
+        assert_ne!(scope("subscription-a"), scope("api"));
+        assert_ne!(scope("subscription-a"), scope("gateway"));
+        for a in &mut saved.accounts[..2] {
+            a.enabled = false;
+        }
+        assert!(state
+            .reserve_delivery(&saved, &route, &session, &features)
+            .is_err());
     }
 
     #[test]
@@ -1461,7 +1788,7 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_provider_falls_back_and_reports_the_successful_model() {
+    fn explicit_model_never_falls_back_to_another_model() {
         let agent = agent_dir();
         let (limited, seen_limited) = upstream(vec![
             (429, "limited".into(), false),
@@ -1490,18 +1817,10 @@ mod tests {
             Some(&turn("fast", false)),
             &handle.endpoint().token,
         );
-        assert_eq!(status, 200, "{body}");
-        assert!(body.contains("fallback reply"));
-        let body: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(
-            wire::response_model(body["id"].as_str().unwrap()),
-            Some(("xai".into(), "grok-test".into()))
-        );
+        assert_eq!(status, 429, "{body}");
         assert_eq!(seen_limited.try_iter().count(), 2);
-        assert_eq!(seen_serving.try_iter().count(), 1);
-        let ledger = usage::load(&agent);
-        assert_eq!(ledger.account("spare").unwrap().requests, 1);
-        assert!(ledger.account("disabled").is_none());
+        assert_eq!(seen_serving.try_iter().count(), 0);
+        assert!(usage::load(&agent).account("spare").is_none());
     }
 
     #[test]
@@ -1519,7 +1838,7 @@ mod tests {
             handle.endpoint(),
             "POST",
             "/v1/chat/completions",
-            Some(&turn("fast", false)),
+            Some(&turn("auto", false)),
             &handle.endpoint().token,
         );
         assert_eq!(status, 200, "{body}");
@@ -1547,13 +1866,15 @@ mod tests {
         native.family = "anthropic".into();
         native.models = vec!["claude-test".into()];
         let (serving, _) = upstream(vec![(200, answer("recovered", 1, 1), false)]);
-        config::save(&agent, &config(vec![native, account("spare", &serving)])).unwrap();
+        let mut saved = config(vec![native, account("spare", &serving)]);
+        saved.fallback = Some("anthropic/claude-test".into());
+        config::save(&agent, &saved).unwrap();
         let handle = start_with_clock(agent, fixed_clock).unwrap();
         let (status, body) = call(
             handle.endpoint(),
             "POST",
             "/v1/chat/completions",
-            Some(&turn("anthropic/claude-test", false)),
+            Some(&turn("auto", false)),
             &handle.endpoint().token,
         );
         assert_eq!(status, 200, "{body}");

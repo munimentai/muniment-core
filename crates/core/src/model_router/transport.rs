@@ -23,7 +23,7 @@ pub struct Request {
 pub fn prepare(account: &Account, request: &Value, model: &str) -> Result<Request, String> {
     let provider = account.credential.pi_provider();
     let protocol = match provider {
-        Some("openai-codex" | "xai") => Protocol::Responses,
+        Some("openai-codex" | "xai" | "meta") => Protocol::Responses,
         Some("anthropic" | "kimi") => Protocol::Messages,
         Some(_) => return Err("This subscription does not support routed turns yet.".into()),
         None if account.family == "anthropic" => Protocol::Messages,
@@ -49,6 +49,10 @@ pub fn prepare(account: &Account, request: &Value, model: &str) -> Result<Reques
         "authorization",
         format!("Bearer {}", account.credential.bearer()),
     )];
+    if provider == Some("meta") {
+        headers.push(("user-agent", "muse-code/1.0.2".into()));
+        headers.push(("x-client-id", "tbh:tui".into()));
+    }
     if protocol == Protocol::Messages {
         headers.push(("anthropic-version", "2023-06-01".into()));
         if provider == Some("anthropic") {
@@ -56,7 +60,7 @@ pub fn prepare(account: &Account, request: &Value, model: &str) -> Result<Reques
                 "anthropic-beta",
                 "claude-code-20250219,oauth-2025-04-20".into(),
             ));
-            headers.push(("user-agent", "claude-cli/2.1.251".into()));
+            headers.push(("user-agent", "claude-cli/2.1.282".into()));
             headers.push(("x-app", "cli".into()));
         }
         if matches!(account.credential, Credential::ApiKey { .. }) {
@@ -87,6 +91,9 @@ pub fn prepare(account: &Account, request: &Value, model: &str) -> Result<Reques
         Protocol::Responses => ("responses", responses_request(request, model)?),
         Protocol::Messages => ("messages", messages_request(request, model)?),
     };
+    if account.family == "anthropic" {
+        body["cache_control"] = json!({"type":"ephemeral"});
+    }
     if provider == Some("anthropic") {
         // Match Pi's OAuth adapter. Anthropic requires this separate identity
         // block for subscription requests; preserve the harness prompt after it.
@@ -332,6 +339,9 @@ impl Decoder {
                     self.tokens.output = counts.output;
                     if counts.input > 0 {
                         self.tokens.input = counts.input;
+                        self.tokens.cache_read = counts.cache_read;
+                        self.tokens.cache_write = counts.cache_write;
+                        self.tokens.cache_write_1h = counts.cache_write_1h;
                     }
                 }
                 if event["delta"]["stop_reason"] == "max_tokens" {
@@ -356,14 +366,14 @@ impl Decoder {
         json!({"id":self.response_id,"object":"chat.completion.chunk","model":self.model,"choices":[{"index":0,"delta":{},"finish_reason":self.finish_reason}]})
     }
     pub fn usage_chunk(&self) -> Value {
-        json!({"id":self.response_id,"object":"chat.completion.chunk","model":self.model,"choices":[],"usage":{"prompt_tokens":self.tokens.input,"completion_tokens":self.tokens.output,"total_tokens":self.tokens.input+self.tokens.output}})
+        json!({"id":self.response_id,"object":"chat.completion.chunk","model":self.model,"choices":[],"usage":{"prompt_tokens":self.tokens.input,"completion_tokens":self.tokens.output,"total_tokens":self.tokens.input+self.tokens.output,"prompt_tokens_details":{"cached_tokens":self.tokens.cache_read},"cache_creation_input_tokens":self.tokens.cache_write,"completion_tokens_details":{"reasoning_tokens":self.tokens.reasoning}}})
     }
     pub fn completion(&self) -> Value {
         let mut message = json!({"role":"assistant","content":self.text});
         if !self.tools.is_empty() {
             message["tool_calls"] = json!(self.tools);
         }
-        json!({"id":self.response_id,"object":"chat.completion","model":self.model,"choices":[{"index":0,"message":message,"finish_reason":self.finish_reason}],"usage":{"prompt_tokens":self.tokens.input,"completion_tokens":self.tokens.output,"total_tokens":self.tokens.input+self.tokens.output}})
+        json!({"id":self.response_id,"object":"chat.completion","model":self.model,"choices":[{"index":0,"message":message,"finish_reason":self.finish_reason}],"usage":{"prompt_tokens":self.tokens.input,"completion_tokens":self.tokens.output,"total_tokens":self.tokens.input+self.tokens.output,"prompt_tokens_details":{"cached_tokens":self.tokens.cache_read},"cache_creation_input_tokens":self.tokens.cache_write,"completion_tokens_details":{"reasoning_tokens":self.tokens.reasoning}}})
     }
 }
 
@@ -406,6 +416,31 @@ pub fn collect(response: ureq::Response, protocol: Protocol, model: &str) -> Res
 mod tests {
     use super::*;
     #[test]
+    fn muse_subscription_uses_responses_and_its_minted_key() {
+        let account: Account = serde_json::from_value(json!({
+            "id":"muse", "family":"meta", "label":"Muse Code", "enabled":true,
+            "weight":1, "models":[],
+            "credential":{"type":"subscription", "provider":"meta", "access":"minted-fixture"}
+        }))
+        .unwrap();
+        let prepared = prepare(
+            &account,
+            &json!({"messages":[{"role":"user","content":"Hello"}]}),
+            "muse-fixture",
+        )
+        .unwrap();
+        assert_eq!(prepared.protocol, Protocol::Responses);
+        assert_eq!(prepared.url, "https://api.meta.ai/v1/responses");
+        assert!(prepared
+            .headers
+            .contains(&("authorization", "Bearer minted-fixture".into())));
+        assert!(prepared
+            .headers
+            .contains(&("x-client-id", "tbh:tui".into())));
+        assert_eq!(prepared.body["model"], "muse-fixture");
+    }
+
+    #[test]
     fn subscription_identity_is_separate_from_the_harness_prompt_and_api_key_requests() {
         let mut account: Account = serde_json::from_value(json!({
             "id":"claude", "family":"anthropic", "label":"Claude", "enabled":true,
@@ -422,6 +457,10 @@ mod tests {
         assert!(oauth.headers.iter().any(
             |(name, value)| *name == "anthropic-beta" && value.contains("claude-code-20250219")
         ));
+        assert!(oauth
+            .headers
+            .iter()
+            .any(|(name, value)| *name == "user-agent" && value == "claude-cli/2.1.282"));
         account.credential = Credential::ApiKey {
             key: "test-key".into(),
         };

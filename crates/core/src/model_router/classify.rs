@@ -108,11 +108,11 @@ pub fn question(config: &RouterConfig, options: &[Route], state: &str) -> Value 
 pub fn parse(answer: &Value) -> Option<(String, f64)> {
     let choice = answer.get("answers")?.get(QUESTION)?;
     let key = choice.get("choice")?.as_str()?.to_owned();
-    // An answer with no confidence is a certain one.
+    // Missing or invalid confidence must not authorize a model switch.
     let confidence = choice
         .get("confidence")
         .and_then(Value::as_f64)
-        .unwrap_or(1.0);
+        .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))?;
     Some((key, confidence))
 }
 
@@ -361,6 +361,30 @@ pub fn parse_pooled_answer(content: &str) -> Option<(String, f64)> {
     Some((choice, confidence))
 }
 
+// Workers AI wraps the same decision request in its model/input envelope.
+fn classifier_body(url: &str, body: &Value) -> Value {
+    let cloudflare = url::Url::parse(url).ok().is_some_and(|url| {
+        url.host_str() == Some("api.cloudflare.com") && url.path().ends_with("/ai/run")
+    });
+    if cloudflare {
+        let mut input = body.clone();
+        if let Some(object) = input.as_object_mut() {
+            object.remove("model");
+        }
+        json!({ "model": body["model"], "input": input })
+    } else {
+        body.clone()
+    }
+}
+
+fn classifier_response(value: Value) -> Value {
+    value
+        .get("result")
+        .filter(|result| result.is_object())
+        .cloned()
+        .unwrap_or(value)
+}
+
 /// One classifier call. Nothing here fails a turn: an unreachable classifier,
 /// a refusal and a body that is not JSON all read as no answer.
 fn ask(url: &str, bearer: Option<&str>, body: &Value, timeout: Duration) -> Option<Value> {
@@ -369,7 +393,12 @@ fn ask(url: &str, bearer: Option<&str>, body: &Value, timeout: Duration) -> Opti
     if let Some(bearer) = bearer {
         request = request.set("authorization", &format!("Bearer {bearer}"));
     }
-    request.send_json(body).ok()?.into_json::<Value>().ok()
+    request
+        .send_json(classifier_body(url, body))
+        .ok()?
+        .into_json::<Value>()
+        .ok()
+        .map(classifier_response)
 }
 
 /// Whether the classifier answers at all, for the Test button in Settings.
@@ -391,9 +420,14 @@ pub fn check(classifier: &Classifier, timeout: Duration) -> Result<(), String> {
     if let Some(bearer) = bearer {
         request = request.set("authorization", &format!("Bearer {bearer}"));
     }
-    match request.send_json(&probe) {
+    match request.send_json(classifier_body(&url, &probe)) {
         Ok(response) => match response.into_json::<Value>() {
-            Ok(value) if parse(&value).is_some() => Ok(()),
+            Ok(value)
+                if parse(&classifier_response(value.clone()))
+                    .is_some_and(|(choice, _)| matches!(choice.as_str(), "fast" | "deep")) =>
+            {
+                Ok(())
+            }
             Ok(_) => Err("The classifier answered without a choice.".into()),
             Err(_) => Err("The classifier answered with something that is not JSON.".into()),
         },
@@ -497,7 +531,7 @@ mod tests {
         assert_eq!(parse(&answer), Some(("deep".to_owned(), 0.82)));
         assert_eq!(
             parse(&json!({ "answers": { "route": { "choice": "fast" } } })),
-            Some(("fast".to_owned(), 1.0))
+            None
         );
         assert_eq!(parse(&json!({ "answers": {} })), None);
         assert_eq!(parse(&json!({})), None);
@@ -528,7 +562,8 @@ mod tests {
             usage.tokens,
             Some(Tokens {
                 input: 1000,
-                output: 12
+                output: 12,
+                ..Default::default()
             })
         );
         assert_eq!(usage.cost, Some(0.000042));
@@ -729,5 +764,32 @@ mod tests {
             url: format!("http://127.0.0.1:{port}/v1/systemone"),
             authorization,
         }
+    }
+}
+
+#[cfg(test)]
+mod connection_wire_tests {
+    use super::*;
+    #[test]
+    fn cloudflare_wraps_only_its_own_endpoint() {
+        let body = json!({"model":"typesafe/jev", "state":"sample", "questions":{"route":{"type":"choice"}}});
+        let wrapped = classifier_body(
+            "https://api.cloudflare.com/client/v4/accounts/abc/ai/run",
+            &body,
+        );
+        assert_eq!(wrapped["model"], "typesafe/jev");
+        assert_eq!(wrapped["input"]["state"], "sample");
+        assert!(wrapped["input"].get("model").is_none());
+        assert_eq!(
+            classifier_body("https://openrouter.ai/api/v1/systemone", &body),
+            body
+        );
+        assert_eq!(classifier_body("http://127.0.0.1:8000/ai/run", &body), body);
+        let answer = json!({"answers":{"route":{"choice":"fast","confidence":0.9}}});
+        assert_eq!(
+            classifier_response(json!({"success":true,"result":answer})),
+            answer
+        );
+        assert_eq!(classifier_response(answer.clone()), answer);
     }
 }

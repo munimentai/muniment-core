@@ -64,10 +64,22 @@ impl AccountUsage {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ledger {
     #[serde(default)]
+    pub cache: BTreeMap<String, super::wire::Tokens>,
+    #[serde(default)]
     pub accounts: BTreeMap<String, AccountUsage>,
 }
 
 impl Ledger {
+    pub fn record_cache(&mut self, id: &str, tokens: super::wire::Tokens) {
+        let sum = self.cache.entry(id.into()).or_default();
+        sum.input = sum.input.saturating_add(tokens.input);
+        sum.output = sum.output.saturating_add(tokens.output);
+        sum.cache_read = sum.cache_read.saturating_add(tokens.cache_read);
+        sum.cache_write = sum.cache_write.saturating_add(tokens.cache_write);
+        sum.cache_write_1h = sum.cache_write_1h.saturating_add(tokens.cache_write_1h);
+        sum.reasoning = sum.reasoning.saturating_add(tokens.reasoning);
+    }
+
     pub fn account(&self, id: &str) -> Option<&AccountUsage> {
         self.accounts.get(id)
     }
@@ -123,6 +135,7 @@ impl Ledger {
     /// Drops the record of an account the user removed.
     pub fn forget(&mut self, id: &str) {
         self.accounts.remove(id);
+        self.cache.remove(id);
     }
 }
 

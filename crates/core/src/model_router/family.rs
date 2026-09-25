@@ -22,7 +22,7 @@ pub struct Family {
 }
 
 /// Every family the router balances. Each one takes many accounts.
-pub const FAMILIES: [Family; 6] = [
+pub const FAMILIES: [Family; 7] = [
     Family {
         id: "openai",
         name: "OpenAI",
@@ -56,6 +56,12 @@ pub const FAMILIES: [Family; 6] = [
         base_url: "https://api.moonshot.ai/v1",
         wire: Wire::OpenAiCompatible,
     },
+    Family {
+        id: "meta",
+        name: "Meta",
+        base_url: "https://api.meta.ai/v1",
+        wire: Wire::OpenAiCompatible,
+    },
     // Devin is a subscription alone. The pool holds it and shows what it has
     // left, and no turn lands on it until the router speaks its wire.
     Family {
@@ -70,9 +76,9 @@ pub const FAMILIES: [Family; 6] = [
 /// three are Pi's own sign-ins, under Pi's provider ids. Kimi, Antigravity
 /// and Devin have no Pi sign-in, so the router runs its own: Kimi by device
 /// code, Antigravity and Devin through the browser.
-pub const SUBSCRIPTION_PROVIDERS: [(&str, &str, &str); 6] = [
+pub const SUBSCRIPTION_PROVIDERS: [(&str, &str, &str); 7] = [
     ("openai-codex", "openai", "ChatGPT Plus or Pro"),
-    ("xai", "xai", "SuperGrok or X Premium"),
+    ("xai", "xai", "Grok Build"),
     ("anthropic", "anthropic", "Claude Pro or Max"),
     ("kimi", "kimi", "Kimi Code"),
     (
@@ -81,10 +87,11 @@ pub const SUBSCRIPTION_PROVIDERS: [(&str, &str, &str); 6] = [
         "Antigravity, with a Google account",
     ),
     ("devin", "devin", "Devin"),
+    ("meta", "meta", "Muse Code"),
 ];
 
 /// The sign-ins the router runs itself rather than through Pi.
-pub const NATIVE_SIGN_INS: [&str; 3] = ["kimi", "antigravity", "devin"];
+pub const NATIVE_SIGN_INS: [&str; 4] = ["kimi", "antigravity", "devin", "meta"];
 
 /// Whether a subscription provider signs in through the router's own flow.
 pub fn native_sign_in(provider: &str) -> bool {
@@ -107,6 +114,29 @@ pub fn family(id: &str) -> Option<Family> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_catalog_contains_the_six_providers_and_muse() {
+        for provider in [
+            "antigravity",
+            "openai-codex",
+            "anthropic",
+            "xai",
+            "devin",
+            "kimi",
+            "meta",
+        ] {
+            assert_eq!(
+                SUBSCRIPTION_PROVIDERS
+                    .iter()
+                    .filter(|(id, _, _)| *id == provider)
+                    .count(),
+                1
+            );
+            assert!(family_for_pi_provider(provider).is_some());
+        }
+        assert!(native_sign_in("meta"));
+    }
 
     #[test]
     fn every_family_is_addressable_by_its_id() {

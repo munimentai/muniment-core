@@ -744,7 +744,14 @@ fn bun_install(args: Vec<String>) {
         fs::create_dir_all(&package).unwrap();
         fs::write(
             package.join("package.json"),
-            serde_json::json!({ "name": name, "version": version }).to_string(),
+            serde_json::json!({ "name": name, "version": version, "pi": { "extensions": ["./fixture.js"] } }).to_string(),
+        )
+        .unwrap();
+    }
+    for name in manifest["dependencies"].as_object().unwrap().keys() {
+        fs::write(
+            modules.join(name).join("fixture.js"),
+            "export default () => {};\n",
         )
         .unwrap();
     }

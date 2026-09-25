@@ -61,8 +61,11 @@ pub fn command(root: &Path, action: &str, mut data: Value) -> Result<Value, Stri
         crate::pi_packages::brand_mcp_adapter(&root.join("agent/npm"))
             .map_err(|_| "The MCP adapter display name could not be configured.")?;
     }
-    let executable = crate::sidecar::pi_install::resolve_current(&root.join("harness"))
-        .map_err(|_| "The local runtime must be installed first.")?;
+    let executable = crate::sidecar::pi_install::acquire_pi(
+        &root.join("harness"),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .map_err(|_| "The local runtime could not be prepared. Try again.")?;
     let directory = root.join("extensions");
     fs::create_dir_all(&directory).map_err(|_| "The extension folder could not be created.")?;
     let archive = if action == "preview" {

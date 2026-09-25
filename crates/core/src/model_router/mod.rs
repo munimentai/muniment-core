@@ -18,6 +18,7 @@ pub mod family;
 pub mod model_catalog;
 pub mod native_auth;
 pub mod pi_provider;
+pub mod policy;
 mod progress;
 pub mod quota;
 pub mod server;
@@ -317,6 +318,8 @@ mod tests {
     /// user. Every catalog model of both families is in the running.
     fn pooled() -> RouterConfig {
         RouterConfig {
+            routing_models: Default::default(),
+            policy: Default::default(),
             discovered_models: Default::default(),
             enabled: true,
             accounts: vec![

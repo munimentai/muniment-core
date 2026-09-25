@@ -732,7 +732,7 @@ mod tests {
             serde_json::from_str::<Value>(&rendered).unwrap(),
             json!({
                 "packages": [
-                    "npm:pi-web-access@0.30.0",
+                    "npm:pi-web-access@0.31.0",
                     "npm:pi-subagents@0.71.0",
                     "npm:pi-background-tasks@2.5.0",
                     "npm:pi-mcp-adapter@2.37.0",
