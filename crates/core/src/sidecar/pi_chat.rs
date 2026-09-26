@@ -750,6 +750,9 @@ impl PiRunAdapter {
             }
             match self.next(Duration::from_millis(10).min(remaining)) {
                 Ok(event) => {
+                    // Pi can defer the session file until its first reply ends. Active
+                    // streaming must not exhaust the session binding's idle timeout.
+                    deadline = std::time::Instant::now() + timeout;
                     let started = std::time::Instant::now();
                     if consume(&event)? {
                         // Native recovery has its own timeout. Keep Pi's binding wait separate.

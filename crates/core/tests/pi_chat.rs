@@ -590,6 +590,36 @@ fn accepted_prompt_waits_for_session_file_and_preserves_stream_frames() {
 }
 
 #[test]
+fn active_thinking_keeps_session_binding_alive_until_pi_persists_the_reply() {
+    let temp = TempDir::new();
+    let session_file = temp.path().join("session.jsonl");
+    let mut config = SidecarConfig::new(env!("CARGO_BIN_EXE_sidecar-test-stub"));
+    config.args = vec![
+        "pi-session-streaming".into(),
+        session_file.to_string_lossy().into_owned(),
+    ];
+    config.health_interval = Duration::from_secs(60);
+    let wiring = PiRpcWiring::new();
+    let mut supervisor =
+        SidecarSupervisor::spawn(config, wiring.readiness_probe(Duration::from_secs(1))).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while supervisor.status() != SidecarStatus::Healthy && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(supervisor.status(), SidecarStatus::Healthy);
+    let transport = wiring.transport().unwrap();
+    let (adapter, _) =
+        PiRunAdapter::start("run-thinking", &transport, "prompt", Duration::from_secs(1)).unwrap();
+    let started = Instant::now();
+    let (locator, _) = adapter
+        .await_session_binding(&transport, temp.path(), Duration::from_secs(1))
+        .unwrap();
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert_eq!(locator.as_str(), "session.jsonl");
+    supervisor.shutdown().unwrap();
+}
+
+#[test]
 fn invalid_session_state_cancels_accepted_agent_work() {
     let owned_root = TempDir::new();
     let outside_root = TempDir::new();
