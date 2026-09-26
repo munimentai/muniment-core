@@ -220,7 +220,7 @@ impl PairingTransport for UreqPairingTransport {
                 .send_json(body)
                 .map_err(Box::new)
         })
-        .map_err(map_http)?;
+        .map_err(|error| map_http(*error))?;
         if response.status() != 201 {
             return Err(PairingError::HttpStatus(response.status()));
         }
@@ -239,7 +239,7 @@ impl PairingTransport for UreqPairingTransport {
                 .call()
                 .map_err(Box::new)
         })
-        .map_err(map_http)?;
+        .map_err(|error| map_http(*error))?;
         if response.status() != 200 {
             return Err(PairingError::HttpStatus(response.status()));
         }
@@ -260,7 +260,7 @@ impl PairingTransport for UreqPairingTransport {
                 .send_json(body)
                 .map_err(Box::new)
         })
-        .map_err(map_http)?;
+        .map_err(|error| map_http(*error))?;
         if response.status() != 200 {
             return Err(PairingError::HttpStatus(response.status()));
         }
@@ -268,8 +268,8 @@ impl PairingTransport for UreqPairingTransport {
     }
 }
 
-fn map_http(error: Box<super::native_http::Error>) -> PairingError {
-    match *error {
+fn map_http(error: super::native_http::Error) -> PairingError {
+    match error {
         super::native_http::Error::Status(status, _) => PairingError::HttpStatus(status),
         super::native_http::Error::Transport(_) => PairingError::Transport("request failed".into()),
     }
