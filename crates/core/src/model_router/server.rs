@@ -1216,7 +1216,12 @@ fn relay_native(
 }
 
 // The installed probe exports only model IDs and a digest of its synthetic reply.
-fn record_subscription_probe(state: &State, account: &str, model: &str, decoder: &transport::Decoder) {
+fn record_subscription_probe(
+    state: &State,
+    account: &str,
+    model: &str,
+    decoder: &transport::Decoder,
+) {
     use sha2::{Digest, Sha256};
     if std::env::var("MUNIMENT_SUBSCRIPTION_PROBE").as_deref() != Ok("1") {
         return;
