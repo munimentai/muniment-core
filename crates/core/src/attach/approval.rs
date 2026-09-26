@@ -102,9 +102,16 @@ impl ApprovalCoordinator {
     where
         F: Fn(&ApprovalRequest) -> bool + Send + Sync + 'static,
     {
+        self.register_presenter_until(move |request, _| presenter(request));
+    }
+
+    pub fn register_presenter_until<F>(&self, presenter: F)
+    where
+        F: Fn(&ApprovalRequest, Instant) -> bool + Send + Sync + 'static,
+    {
         if let Ok(mut state) = self.state.lock() {
             if !state.presenter_claimed {
-                state.presenter = Some(Arc::new(move |request, _| presenter(request)));
+                state.presenter = Some(Arc::new(presenter));
             }
         }
     }
