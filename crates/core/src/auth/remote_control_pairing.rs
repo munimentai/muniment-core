@@ -13,6 +13,8 @@ use uuid::Uuid;
 
 use crate::atomic_file;
 
+pub type PairId = Uuid;
+
 pub const CONTRACT_VERSION: &str = "muniment.remote-control-pairing/1";
 pub const CHALLENGE_PATH: &str = "/v1/remote-control/pairing/challenges";
 pub const PAIRING_PATH: &str = "/v1/remote-control/pairing";
@@ -67,7 +69,7 @@ pub struct PairingChallengeResponse {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayPair {
-    pub pair_id: Uuid,
+    pub pair_id: PairId,
     pub desktop_device_id: Uuid,
     pub mobile_device_id: Uuid,
     pub desktop_public_key: String,
@@ -119,7 +121,7 @@ pub struct PairingChallengeView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorizedPhone {
-    pub pair_id: Uuid,
+    pub pair_id: PairId,
     pub mobile_device_id: Uuid,
     pub created_at: DateTime<Utc>,
 }
@@ -346,7 +348,7 @@ pub fn revoke_pairing(
     transport: &dyn PairingTransport,
     base_url: &str,
     access_token: &str,
-    pair_id: Uuid,
+    pair_id: PairId,
     store_path: &Path,
 ) -> Result<PairingRevokeView, PairingError> {
     let request = authorized_request(base_url, access_token)?;

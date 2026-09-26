@@ -94,7 +94,7 @@ pub use native_token::{
 pub use pkce::{random_state, PkcePair};
 pub use remote_control_pairing::{
     challenge_expired, create_pairing_challenge, qr_json, qr_svg, read_pairing, revoke_pairing,
-    AuthorizedPhone, PairingChallengeView, PairingError, PairingQr, PairingRevokeView,
+    AuthorizedPhone, PairId, PairingChallengeView, PairingError, PairingQr, PairingRevokeView,
     PairingStatusView, PairingTransport, RelayPair, UreqPairingTransport, CHALLENGE_PATH,
     CONTRACT_VERSION, PAIRING_PATH, PAIR_FILE_NAME, POLL_INTERVAL, REPLACEMENT_INTERVAL,
 };
