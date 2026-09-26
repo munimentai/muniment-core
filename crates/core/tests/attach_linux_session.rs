@@ -7019,6 +7019,13 @@ fn companion_refuses_desktop_only_session_operations() {
         (193, Operation::SessionStatus, json!({})),
         (194, Operation::EntitlementSnapshot, json!({})),
         (195, Operation::DeviceList, json!({})),
+        (218, Operation::PairingStatus, json!({})),
+        (219, Operation::PairingChallenge, json!({})),
+        (
+            220,
+            Operation::PairingRevoke,
+            json!({"pair_id": "22222222-2222-4222-8222-222222222222"}),
+        ),
         (196, Operation::SessionSignIn, json!({})),
         (197, Operation::SessionSignOut, json!({})),
         (198, Operation::CompanionList, json!({})),
@@ -7063,6 +7070,8 @@ fn companion_refuses_desktop_only_session_operations() {
                 | Operation::CompanyCreate
                 | Operation::CompanySelect
                 | Operation::CompanyRename
+                | Operation::PairingChallenge
+                | Operation::PairingRevoke
         ) {
             request_with_idempotency(id, operation, body)
         } else {

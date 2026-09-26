@@ -30,6 +30,7 @@ pub mod native_session;
 pub mod native_sign_in;
 pub mod native_token;
 pub mod pkce;
+pub mod remote_control_pairing;
 pub mod store;
 pub mod urlenc;
 
@@ -91,6 +92,12 @@ pub use native_token::{
     NativeTokenRequest, NativeTokenResponse, TokenTransport, UreqTokenTransport,
 };
 pub use pkce::{random_state, PkcePair};
+pub use remote_control_pairing::{
+    challenge_expired, create_pairing_challenge, qr_json, qr_svg, read_pairing, revoke_pairing,
+    AuthorizedPhone, PairingChallengeView, PairingError, PairingQr, PairingRevokeView,
+    PairingStatusView, PairingTransport, RelayPair, UreqPairingTransport, CHALLENGE_PATH,
+    CONTRACT_VERSION, PAIRING_PATH, PAIR_FILE_NAME, POLL_INTERVAL, REPLACEMENT_INTERVAL,
+};
 pub use store::{status, AuthStatus, InMemoryTokenStore, TokenSet, TokenStore};
 
 use std::fmt;

@@ -128,6 +128,29 @@ pub trait ThreadListService {
         Err(ProtocolError::unsupported_operation())
     }
 
+    fn pairing_status(&mut self) -> Result<crate::auth::PairingStatusView, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn create_pairing_challenge(
+        &mut self,
+        _request_id: &super::Id,
+        _idempotency_key: &super::Id,
+        _provenance: CompanionProvenance,
+    ) -> Result<crate::auth::PairingChallengeView, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn revoke_pairing(
+        &mut self,
+        _pair_id: uuid::Uuid,
+        _request_id: &super::Id,
+        _idempotency_key: &super::Id,
+        _provenance: CompanionProvenance,
+    ) -> Result<crate::auth::PairingRevokeView, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
     fn list_companions(&mut self) -> Result<Vec<super::CompanionRecord>, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
