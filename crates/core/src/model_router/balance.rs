@@ -20,6 +20,8 @@ pub enum PickError {
     NoneServesModel,
     /// Every candidate is cooling. Carries the earliest moment one returns.
     AllCooling { ready_at_ms: i64 },
+    /// Every eligible account has a known exhausted allowance.
+    UsageLimit,
 }
 
 impl PickError {
@@ -30,6 +32,7 @@ impl PickError {
             Self::AllDisabled => "Every account for this provider is turned off. Turn one on in Settings → Models.".into(),
             Self::NoneServesModel => "No connected account serves this model. Add the model to an account in Settings → Models.".into(),
             Self::AllCooling { .. } => "Every account for this provider is temporarily unavailable.".into(),
+            Self::UsageLimit => "This provider has no remaining allowance. Wait for the reset, add an account, or choose another provider.".into(),
         }
     }
 }

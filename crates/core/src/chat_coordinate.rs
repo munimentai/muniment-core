@@ -1120,7 +1120,8 @@ pub fn coordinate(
                     break 'coordinate;
                 }
             }
-            Ok(PiChatEvent::Completed | PiChatEvent::Failed) if gateway_failure.is_some() => {}
+            Ok(PiChatEvent::Completed | PiChatEvent::Failed | PiChatEvent::UsageLimit)
+                if gateway_failure.is_some() => {}
             Ok(PiChatEvent::Completed) => {
                 diagnostics.outcome = "completed";
                 let receipt = if grant.is_local() {
@@ -1174,7 +1175,7 @@ pub fn coordinate(
                 );
                 break;
             }
-            Ok(PiChatEvent::Failed) => {
+            Ok(event @ (PiChatEvent::Failed | PiChatEvent::UsageLimit)) => {
                 diagnostics.outcome = "failed";
                 fail_with_open_effects(
                     &app,
@@ -1183,7 +1184,11 @@ pub fn coordinate(
                     &run_id,
                     &mut seq,
                     &mut open_effects,
-                    "The model could not complete this reply.",
+                    &if event == PiChatEvent::UsageLimit {
+                        crate::model_router::balance::PickError::UsageLimit.message()
+                    } else {
+                        "The model could not complete this reply.".into()
+                    },
                     subject.as_deref(),
                 );
                 break;

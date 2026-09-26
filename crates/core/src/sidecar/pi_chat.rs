@@ -186,6 +186,7 @@ pub enum PiChatEvent {
     Completed,
     Cancelled,
     Failed,
+    UsageLimit,
     /// A valid Pi event for another part of the agent lifecycle.
     Interleaved,
 }
@@ -416,17 +417,19 @@ pub fn parse_frame(frame: &Value) -> Result<PiChatEvent, &'static str> {
         // Pi owns generation, not billing/routing provenance. Any similarly
         // named member is deliberately ignored; the control plane supplies it.
         Some("agent_end") => {
-            let stop_reason = frame
+            let last_message = frame
                 .get("messages")
                 .and_then(Value::as_array)
                 .and_then(|messages| {
                     messages.iter().rev().find(|message| {
                         message.get("role").and_then(Value::as_str) == Some("assistant")
                     })
-                })
-                .and_then(|message| message.get("stopReason"))
+                });
+            let stop_reason = last_message.and_then(|message| message.get("stopReason"))
                 .and_then(Value::as_str);
             match stop_reason {
+                Some("error") if last_message.and_then(|message| message.get("errorMessage")).and_then(Value::as_str)
+                    .is_some_and(|message| message.contains("This provider has no remaining allowance.")) => Ok(PiChatEvent::UsageLimit),
                 Some("error" | "length") => Ok(PiChatEvent::Failed),
                 Some("aborted") => Ok(PiChatEvent::Cancelled),
                 _ => Ok(PiChatEvent::Completed),
@@ -790,9 +793,12 @@ impl PiRunAdapter {
         while std::time::Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match self.next(remaining) {
-                Ok(PiChatEvent::Completed | PiChatEvent::Cancelled | PiChatEvent::Failed) => {
-                    return Ok(())
-                }
+                Ok(
+                    PiChatEvent::Completed
+                    | PiChatEvent::Cancelled
+                    | PiChatEvent::Failed
+                    | PiChatEvent::UsageLimit,
+                ) => return Ok(()),
                 Ok(_) => {}
                 Err(error) => return Err(error),
             }
@@ -852,7 +858,12 @@ impl PiRunAdapter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match result {
-            Ok(event @ (PiChatEvent::Completed | PiChatEvent::Failed | PiChatEvent::Cancelled)) => {
+            Ok(
+                event @ (PiChatEvent::Completed
+                | PiChatEvent::Failed
+                | PiChatEvent::UsageLimit
+                | PiChatEvent::Cancelled),
+            ) => {
                 *pending = Some(event);
                 Ok(PiChatEvent::Interleaved)
             }
@@ -987,7 +998,7 @@ impl PiRunAdapter {
             PiChatEvent::ExtensionUiRequest(_) => Some("extension_ui_request"),
             PiChatEvent::Completed => Some("completed"),
             PiChatEvent::Cancelled => Some("cancelled"),
-            PiChatEvent::Failed => Some("failed"),
+            PiChatEvent::Failed | PiChatEvent::UsageLimit => Some("failed"),
             _ => match frame.get("type").and_then(Value::as_str) {
                 Some(
                     kind @ ("agent_start" | "turn_start" | "turn_end" | "message_start"
@@ -1396,6 +1407,14 @@ mod tests {
                 PiChatEvent::Interleaved
             );
         }
+    }
+
+    #[test]
+    fn usage_limit_has_a_safe_terminal_event_without_raw_provider_details() {
+        assert_eq!(parse_frame(&json!({"type":"agent_end", "messages":[{
+            "role":"assistant", "stopReason":"error",
+            "errorMessage":"503: This provider has no remaining allowance. private account details"
+        }]})).unwrap(), PiChatEvent::UsageLimit);
     }
 
     #[test]
