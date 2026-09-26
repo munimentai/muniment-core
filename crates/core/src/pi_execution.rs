@@ -12,6 +12,36 @@ use crate::sidecar::{PiRpcWiring, PiSessionLocator, SidecarSupervisor};
 
 pub const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
+pub fn previous_thread_session(
+    storage: &SharedStorage,
+    run_id: &str,
+    subject: Option<&str>,
+    session_root: &std::path::Path,
+) -> Result<Option<PiSessionLocator>, String> {
+    let binding = storage
+        .lock()
+        .map_err(|_| "Conversation history is busy.")?
+        .journal
+        .previous_thread_session_binding(run_id)
+        .map_err(|_| "Conversation history could not load.")?;
+    let Some(binding) = binding else {
+        return Ok(None);
+    };
+    if binding.provenance.actor_id.as_deref() != subject {
+        return Err("Conversation history belongs to another account.".into());
+    }
+    let crate::journal::EventPayload::Inline { payload_json } = binding.payload else {
+        return Err("Conversation history is unavailable.".into());
+    };
+    let locator = payload_json
+        .get("locator")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("Conversation history is unavailable.")?;
+    crate::sidecar::validate_pi_session(session_root, locator)
+        .map(|(locator, _)| Some(locator))
+        .map_err(|_| "Conversation history is unavailable. Start a new thread.".into())
+}
+
 pub struct PiRuntime {
     pub supervisor: SidecarSupervisor,
     pub wiring: PiRpcWiring,
@@ -241,6 +271,66 @@ mod tests {
         STANDARD
             .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
             .unwrap()
+    }
+
+    #[test]
+    fn follow_up_reopens_only_its_threads_previous_session() {
+        let (root, storage) = storage();
+        let first = Uuid::now_v7().to_string();
+        let second = Uuid::now_v7().to_string();
+        let other = Uuid::now_v7().to_string();
+        let start = |run_id: &str| {
+            let mut event = attachment_event(run_id, 1);
+            event.event_type = "run.started".into();
+            event.event_version = 1;
+            event.provenance.actor_id = Some("owner".into());
+            event
+        };
+        std::fs::write(root.join("conversation.jsonl"), "{}\n").unwrap();
+        {
+            let mut storage = storage.lock().unwrap();
+            let thread = storage
+                .journal
+                .append_new_run("local", &start(&first))
+                .unwrap();
+            let mut binding = start(&first);
+            binding.run_seq = 2;
+            binding.event_type = "runtime.pi_session.bound".into();
+            binding.payload = EventPayload::Inline {
+                payload_json: json!({"run_id": first, "locator": "conversation.jsonl"}),
+            };
+            storage.journal.append(1, &binding).unwrap();
+            storage
+                .journal
+                .append_new_run_in_thread("local", &thread, &start(&second))
+                .unwrap();
+            storage
+                .journal
+                .append_new_run("local", &start(&other))
+                .unwrap();
+        }
+        assert!(
+            previous_thread_session(&storage, &first, Some("owner"), &root)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            previous_thread_session(&storage, &second, Some("owner"), &root)
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "conversation.jsonl"
+        );
+        assert!(
+            previous_thread_session(&storage, &other, Some("owner"), &root)
+                .unwrap()
+                .is_none()
+        );
+        assert!(previous_thread_session(&storage, &second, Some("another-owner"), &root).is_err());
+        std::fs::remove_file(root.join("conversation.jsonl")).unwrap();
+        assert!(previous_thread_session(&storage, &second, Some("owner"), &root).is_err());
+        drop(storage);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

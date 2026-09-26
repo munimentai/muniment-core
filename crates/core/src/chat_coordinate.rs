@@ -427,8 +427,7 @@ pub fn coordinate(
     let mut runtime = runtime
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // A local run owns one Pi conversation. Do not carry a previous run's
-    // active session into this prompt.
+    // Each run owns its process. Reopen only its own thread's saved conversation.
     *runtime = None;
     let startup_timeout = {
         if let Err(error) = crate::chat_grant::renew_grant_if_needed(&mut grant, || {
@@ -482,11 +481,25 @@ pub fn coordinate(
                     crate::model_install::ModelInstallError::Cancelled,
                 ));
             }
+            let previous_session = if resume.is_none() {
+                crate::pi_execution::previous_thread_session(
+                    &journal,
+                    &run_id,
+                    subject.as_deref(),
+                    &app.pi_session_root()?,
+                )
+                .map_err(|error| PiLaunchError::rejected("thread_session", error))?
+            } else {
+                None
+            };
             let config = pi_launch_config(
                 &app,
                 Some(&root),
                 &grant,
-                resume.as_ref().map(|resume| &resume.locator),
+                resume
+                    .as_ref()
+                    .map(|resume| &resume.locator)
+                    .or(previous_session.as_ref()),
             )?;
             if matches!(
                 projector
