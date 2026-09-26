@@ -427,7 +427,7 @@ pub fn parse_frame(frame: &Value) -> Result<PiChatEvent, &'static str> {
                 .and_then(|message| message.get("stopReason"))
                 .and_then(Value::as_str);
             match stop_reason {
-                Some("error") => Ok(PiChatEvent::Failed),
+                Some("error" | "length") => Ok(PiChatEvent::Failed),
                 Some("aborted") => Ok(PiChatEvent::Cancelled),
                 _ => Ok(PiChatEvent::Completed),
             }
@@ -1399,9 +1399,10 @@ mod tests {
     }
 
     #[test]
-    fn provider_error_and_abort_do_not_become_success_at_agent_end() {
+    fn provider_error_token_limit_and_abort_do_not_become_success_at_agent_end() {
         for (reason, expected) in [
             ("error", PiChatEvent::Failed),
+            ("length", PiChatEvent::Failed),
             ("aborted", PiChatEvent::Cancelled),
         ] {
             assert_eq!(
