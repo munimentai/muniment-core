@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use muniment_core::auth::{
+use super::{
     challenge_expired, create_pairing_challenge, qr_json, read_pairing, revoke_pairing,
     PairingError, PairingQr, UreqPairingTransport, CHALLENGE_PATH, CONTRACT_VERSION, PAIRING_PATH,
     REPLACEMENT_INTERVAL,
@@ -90,7 +90,10 @@ fn store_path(name: &str) -> PathBuf {
 }
 
 fn fixture() -> Value {
-    serde_json::from_str(include_str!("fixtures/remote-control/pairing-v1.json")).unwrap()
+    serde_json::from_str(include_str!(
+        "../../../tests/fixtures/remote-control/pairing-v1.json"
+    ))
+    .unwrap()
 }
 
 #[test]
@@ -287,6 +290,22 @@ fn revoke_keeps_a_replacement_pair_when_the_deleted_id_differs() {
     let server = Server::spawn(200, REVOKE_BODY.into());
     revoke_pairing(&transport(), &server.base_url, TOKEN, other, &store).unwrap();
     assert!(store.exists());
+}
+
+#[test]
+fn expiry_at_the_deadline_removes_the_code() {
+    let deadline = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:02:00.000Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    assert!(!challenge_expired(
+        deadline,
+        deadline - chrono::TimeDelta::seconds(1)
+    ));
+    assert!(challenge_expired(deadline, deadline));
+    assert!(challenge_expired(
+        deadline,
+        deadline + chrono::TimeDelta::seconds(1)
+    ));
 }
 
 #[test]

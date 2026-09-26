@@ -556,22 +556,4 @@ fn validate_base_url(value: &str) -> Result<(), PairingError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn expiry_at_the_deadline_removes_the_code() {
-        let deadline = DateTime::parse_from_rfc3339("2026-01-01T00:02:00.000Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        assert!(!challenge_expired(
-            deadline,
-            deadline - chrono::TimeDelta::seconds(1)
-        ));
-        assert!(challenge_expired(deadline, deadline));
-        assert!(challenge_expired(
-            deadline,
-            deadline + chrono::TimeDelta::seconds(1)
-        ));
-    }
-}
+mod tests;
