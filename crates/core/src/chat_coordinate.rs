@@ -427,8 +427,7 @@ pub fn coordinate(
     let mut runtime = runtime
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // A local run owns one Pi conversation. Do not carry a previous run's
-    // active session into this prompt.
+    // Each run owns its process. Reopen only its own thread's saved conversation.
     *runtime = None;
     let startup_timeout = {
         if let Err(error) = crate::chat_grant::renew_grant_if_needed(&mut grant, || {
@@ -482,11 +481,25 @@ pub fn coordinate(
                     crate::model_install::ModelInstallError::Cancelled,
                 ));
             }
+            let previous_session = if resume.is_none() {
+                crate::pi_execution::previous_thread_session(
+                    &journal,
+                    &run_id,
+                    subject.as_deref(),
+                    &app.pi_session_root()?,
+                )
+                .map_err(|error| PiLaunchError::rejected("thread_session", error))?
+            } else {
+                None
+            };
             let config = pi_launch_config(
                 &app,
                 Some(&root),
                 &grant,
-                resume.as_ref().map(|resume| &resume.locator),
+                resume
+                    .as_ref()
+                    .map(|resume| &resume.locator)
+                    .or(previous_session.as_ref()),
             )?;
             if matches!(
                 projector
@@ -1107,7 +1120,8 @@ pub fn coordinate(
                     break 'coordinate;
                 }
             }
-            Ok(PiChatEvent::Completed | PiChatEvent::Failed) if gateway_failure.is_some() => {}
+            Ok(PiChatEvent::Completed | PiChatEvent::Failed | PiChatEvent::UsageLimit)
+                if gateway_failure.is_some() => {}
             Ok(PiChatEvent::Completed) => {
                 diagnostics.outcome = "completed";
                 let receipt = if grant.is_local() {
@@ -1161,7 +1175,7 @@ pub fn coordinate(
                 );
                 break;
             }
-            Ok(PiChatEvent::Failed) => {
+            Ok(event @ (PiChatEvent::Failed | PiChatEvent::UsageLimit)) => {
                 diagnostics.outcome = "failed";
                 fail_with_open_effects(
                     &app,
@@ -1170,7 +1184,11 @@ pub fn coordinate(
                     &run_id,
                     &mut seq,
                     &mut open_effects,
-                    "The model could not complete this reply.",
+                    &if event == PiChatEvent::UsageLimit {
+                        crate::model_router::balance::PickError::UsageLimit.message()
+                    } else {
+                        "The model could not complete this reply.".into()
+                    },
                     subject.as_deref(),
                 );
                 break;

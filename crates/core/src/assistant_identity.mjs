@@ -1,5 +1,24 @@
 import { completeSimple } from '@mariozechner/pi-ai'
 
+// Pi's bundled Bun can throw from native releaseLock after a completed HTTP
+// stream. Keep that cleanup fault from discarding a valid reply or tool call.
+// Other errors and other Bun versions retain their native behavior.
+export function installBunStreamReleaseFix(runtime = globalThis) {
+  if (runtime.Bun?.version !== '1.3.14') return
+  const prototype = runtime.ReadableStreamDefaultReader?.prototype
+  const release = prototype?.releaseLock
+  const patched = Symbol.for('muniment.stream-release-fix')
+  if (typeof release !== 'function' || release[patched]) return
+  function releaseLock() {
+    try { return release.call(this) }
+    catch (error) {
+      if (!(error instanceof TypeError) || error.message !== 'undefined is not a function') throw error
+    }
+  }
+  Object.defineProperty(releaseLock, patched, { value: true })
+  prototype.releaseLock = releaseLock
+}
+
 // The runtime writes this extension beside the session logs and loads it on
 // every launch. The model knows itself as the assistant inside a desktop app
 // and nothing more: the harness name and the product name reach neither the
@@ -148,6 +167,7 @@ export async function nameFirstThread(context, complete) {
 }
 
 export default function (pi) {
+  installBunStreamReleaseFix()
   pi.on('before_agent_start', async (event, context) => {
     if (context?.model) {
       await nameFirstThread(context, completeSimple)

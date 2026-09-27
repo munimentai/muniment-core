@@ -297,6 +297,7 @@ impl State {
         let now = (self.now_ms)();
         // Respect known account-wide exhaustion until its reset. Unknown or
         // stale windows do not disable an account indefinitely.
+        let mut exhausted = std::collections::BTreeSet::new();
         for (id, quota) in super::quota::load(&self.agent).accounts {
             let reset = quota
                 .windows
@@ -308,6 +309,7 @@ impl State {
                 .filter_map(|window| window.resets_at_ms.filter(|reset| *reset > now))
                 .max();
             if let Some(reset) = reset {
+                exhausted.insert(id.clone());
                 let usage = ledger.accounts.entry(id).or_default();
                 usage.cooldown_until_ms = Some(usage.cooldown_until_ms.unwrap_or(0).max(reset));
             }
@@ -322,6 +324,24 @@ impl State {
             balance::pick_with_active(&preferred_config, &ledger, family, model, now, &active)
                 .or_else(|_| {
                     balance::pick_with_active(config, &ledger, family, model, now, &active)
+                })
+                .map_err(|error| {
+                    if matches!(error, balance::PickError::AllCooling { .. })
+                        && config
+                            .pool(family)
+                            .into_iter()
+                            .filter(|account| {
+                                account.enabled
+                                    && account.weight > 0
+                                    && account.credential.servable()
+                                    && account.serves(model)
+                            })
+                            .all(|account| exhausted.contains(&account.id))
+                    {
+                        balance::PickError::UsageLimit
+                    } else {
+                        error
+                    }
                 })?
                 .clone();
         *active.entry(account.id.clone()).or_insert(0) += 1;
@@ -1675,6 +1695,56 @@ mod tests {
         let usage = ledger.account("s1").unwrap();
         assert_eq!(usage.requests, 0);
         assert_eq!(usage.errors, 1);
+    }
+
+    #[test]
+    fn known_exhaustion_reports_usage_limit_until_reset() {
+        use crate::model_router::quota::{self, Quota, QuotaStore, Window, WindowKind};
+        let state = State {
+            sessions: Default::default(),
+            active_sessions: Default::default(),
+            progress: Default::default(),
+            agent: agent_dir(),
+            ledger: Mutex::new(Ledger::default()),
+            active: Arc::new(Mutex::new(BTreeMap::new())),
+            now_ms: fixed_clock,
+        };
+        let mut quotas = QuotaStore::default();
+        quotas.accounts.insert(
+            "a".into(),
+            Quota {
+                windows: vec![Window {
+                    kind: WindowKind::Weekly,
+                    scope: String::new(),
+                    used_percent: 100.0,
+                    resets_at_ms: Some(fixed_clock() + 1000),
+                    limit_reached: true,
+                }],
+                ..Quota::default()
+            },
+        );
+        quota::save(&state.agent, &quotas).unwrap();
+        let saved = config(vec![account("a", "http://unused")]);
+        assert!(matches!(
+            state.reserve(&saved, "openai", "gpt-5.6-mini"),
+            Err(balance::PickError::UsageLimit)
+        ));
+        let available = config(vec![
+            account("a", "http://unused"),
+            account("b", "http://unused"),
+        ]);
+        assert_eq!(
+            state
+                .reserve(&available, "openai", "gpt-5.6-mini")
+                .unwrap()
+                .0
+                .id,
+            "b"
+        );
+        quotas.accounts.get_mut("a").unwrap().windows[0].resets_at_ms = Some(fixed_clock() - 1);
+        quota::save(&state.agent, &quotas).unwrap();
+        assert!(state.reserve(&saved, "openai", "gpt-5.6-mini").is_ok());
+        std::fs::remove_dir_all(&state.agent).unwrap();
     }
 
     #[test]

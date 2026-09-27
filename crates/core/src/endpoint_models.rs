@@ -1,7 +1,9 @@
 //! Model discovery for an OpenAI-compatible endpoint: Ollama's own list at
 //! `/api/tags` first, then the `/models` route every compatible server answers.
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -39,42 +41,165 @@ fn fetch(agent: &ureq::Agent, url: &str) -> Result<Option<Value>, ()> {
     }
 }
 
-/// Every model the server at `base_url` serves, or nothing when it does not answer.
-pub fn discover_models(base_url: &str, timeout: Duration) -> Vec<String> {
-    let Ok(mut origin) = url::Url::parse(base_url) else {
-        return Vec::new();
+fn embedding_only(value: &Value) -> bool {
+    let Some(capabilities) = value.get("capabilities").and_then(Value::as_array) else {
+        return false;
     };
+    capabilities.iter().any(|value| value == "embedding")
+        && !capabilities.iter().any(|value| value == "completion")
+}
+
+fn chat_models(
+    agent: &ureq::Agent,
+    origin: &mut url::Url,
+    models: Vec<String>,
+    deadline: Instant,
+) -> Vec<String> {
+    origin.set_path("/api/show");
+    let url = origin.as_str();
+    let next = AtomicUsize::new(0);
+    let excluded = Mutex::new(vec![false; models.len()]);
+    // Bound both concurrent metadata requests and the whole discovery budget.
+    std::thread::scope(|scope| {
+        for _ in 0..models.len().min(4) {
+            scope.spawn(|| loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(model) = models.get(index) else {
+                    break;
+                };
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                if let Ok(response) = agent
+                    .post(url)
+                    .timeout(remaining)
+                    .send_json(serde_json::json!({"model": model}))
+                {
+                    if response
+                        .into_json::<Value>()
+                        .is_ok_and(|value| embedding_only(&value))
+                    {
+                        excluded.lock().unwrap()[index] = true;
+                    }
+                }
+            });
+        }
+    });
+    let excluded = excluded.into_inner().unwrap();
+    models
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, model)| (!excluded[index]).then_some(model))
+        .collect()
+}
+
+/// Chat models the endpoint serves. `None` means discovery failed; an empty
+/// list means the server answered but has no chat models.
+pub fn discover_models(base_url: &str, timeout: Duration) -> Option<Vec<String>> {
+    let mut origin = url::Url::parse(base_url).ok()?;
     if !matches!(origin.scheme(), "http" | "https") || origin.host().is_none() {
-        return Vec::new();
+        return None;
     }
+    let deadline = Instant::now() + timeout;
     let agent = ureq::AgentBuilder::new().timeout(timeout).build();
     origin.set_path("/api/tags");
     origin.set_query(None);
     origin.set_fragment(None);
     match fetch(&agent, origin.as_str()) {
-        Ok(Some(tags)) => {
-            let models = parse_ollama_tags(&tags);
-            if !models.is_empty() {
-                return models;
-            }
+        Ok(Some(tags)) if tags.get("models").is_some_and(Value::is_array) => {
+            return Some(chat_models(
+                &agent,
+                &mut origin,
+                parse_ollama_tags(&tags),
+                deadline,
+            ));
         }
-        Ok(None) => {}
-        // The host never answered its first route, so the second route on the
-        // same host would only spend the timeout again.
-        Err(()) => return Vec::new(),
+        Ok(_) => {}
+        Err(()) => return None,
     }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return None;
+    }
+    let agent = ureq::AgentBuilder::new().timeout(remaining).build();
     let models_url = format!("{}/models", base_url.trim_end_matches('/'));
     fetch(&agent, &models_url)
         .ok()
         .flatten()
+        .filter(|value| value.get("data").is_some_and(Value::is_array))
         .map(|value| parse_openai_models(&value))
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn only_explicit_embedding_only_models_are_excluded() {
+        assert!(embedding_only(&json!({"capabilities":["embedding"]})));
+        assert!(!embedding_only(
+            &json!({"capabilities":["completion", "embedding"]})
+        ));
+        assert!(!embedding_only(
+            &json!({"capabilities":["completion", "vision"]})
+        ));
+        assert!(!embedding_only(&json!({})));
+    }
+
+    #[test]
+    fn an_embedding_only_server_returns_an_empty_catalog_without_fallback() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for (route, body) in [
+                (
+                    "GET /api/tags",
+                    r#"{"models":[{"name":"nomic-embed-text"}]}"#,
+                ),
+                ("POST /api/show", r#"{"capabilities":["embedding"]}"#),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.starts_with(route));
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                let mut data = vec![0; length];
+                reader.read_exact(&mut data).unwrap();
+                if length > 0 {
+                    assert_eq!(
+                        serde_json::from_slice::<Value>(&data).unwrap()["model"],
+                        "nomic-embed-text"
+                    );
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        assert_eq!(discover_models(&url, Duration::from_secs(3)), Some(vec![]));
+        server.join().unwrap();
+    }
 
     #[test]
     fn both_list_shapes_parse_in_server_order_without_repeats() {
@@ -100,8 +225,8 @@ mod tests {
 
     #[test]
     fn a_server_that_does_not_answer_yields_nothing() {
-        assert!(discover_models("http://127.0.0.1:9/v1", Duration::from_millis(300)).is_empty());
-        assert!(discover_models("ftp://host/v1", Duration::from_millis(300)).is_empty());
-        assert!(discover_models("not a url", Duration::from_millis(300)).is_empty());
+        assert!(discover_models("http://127.0.0.1:9/v1", Duration::from_millis(300)).is_none());
+        assert!(discover_models("ftp://host/v1", Duration::from_millis(300)).is_none());
+        assert!(discover_models("not a url", Duration::from_millis(300)).is_none());
     }
 }

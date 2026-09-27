@@ -66,7 +66,10 @@ fn main() {
         Some("pi-chat-capture") => pi_chat_capture(args.next().unwrap()),
         Some("pi-chat-extension-ui") => pi_chat_extension_ui(args.next().unwrap()),
         Some("pi-chat-late-response") => pi_chat_late_response(args.next().unwrap()),
-        Some("pi-session-deferred") => pi_session_deferred(args.next().unwrap(), args.next()),
+        Some("pi-session-deferred") => {
+            pi_session_deferred(args.next().unwrap(), args.next(), false)
+        }
+        Some("pi-session-streaming") => pi_session_deferred(args.next().unwrap(), None, true),
         Some("pi-rpc-restart-once") => {
             let marker = args.next().unwrap();
             if fs::create_dir(marker).is_ok() {
@@ -357,16 +360,22 @@ fn pi_resume(args: Vec<String>) {
     }
 }
 
-fn pi_session_deferred(session_file: String, cancel_marker: Option<String>) {
+fn pi_session_deferred(session_file: String, cancel_marker: Option<String>, streaming: bool) {
     let mut prompt_accepted = false;
     let mut state_calls = 0;
+    let mut stream_started = std::time::Instant::now();
     for line in io::stdin().lock().lines() {
         let request: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
         let command = request["type"].as_str().unwrap();
         match command {
             "get_state" => {
                 state_calls += 1;
-                if prompt_accepted && state_calls >= 3 && cancel_marker.is_none() {
+                let ready = if streaming {
+                    stream_started.elapsed() >= Duration::from_secs(2)
+                } else {
+                    state_calls >= 3
+                };
+                if prompt_accepted && ready && cancel_marker.is_none() {
                     fs::write(&session_file, "{}\n").unwrap();
                 }
                 println!(
@@ -376,6 +385,15 @@ fn pi_session_deferred(session_file: String, cancel_marker: Option<String>) {
                         "id":request["id"], "data":{"sessionFile":session_file}
                     })
                 );
+                if prompt_accepted && streaming && !ready {
+                    println!(
+                        "{}",
+                        serde_json::json!({"type":"message_update",
+                        "assistantMessageEvent":{"type":"thinking_delta", "delta":"progress"}})
+                    );
+                    io::stdout().flush().unwrap();
+                    thread::sleep(Duration::from_millis(50));
+                }
                 if prompt_accepted && state_calls == 2 {
                     println!(
                         "{}",
@@ -386,6 +404,7 @@ fn pi_session_deferred(session_file: String, cancel_marker: Option<String>) {
             }
             "prompt" => {
                 prompt_accepted = true;
+                stream_started = std::time::Instant::now();
                 println!(
                     "{}",
                     serde_json::json!({"type":"response", "command":"prompt",

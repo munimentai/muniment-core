@@ -385,6 +385,49 @@ pub fn probe_xai(
 }
 
 /// Asks Anthropic what this account has left.
+/// Claude's OAuth token is opaque. Resolve its account and organization before
+/// pooling it so a repeated sign-in refreshes the same subscription.
+pub fn identify_claude(credential: &mut Credential, timeout: Duration) {
+    let Credential::Subscription {
+        provider,
+        access,
+        account_id,
+        email,
+        ..
+    } = credential
+    else {
+        return;
+    };
+    if provider != "anthropic" || account_id.is_some() {
+        return;
+    }
+    let bearer = format!("Bearer {access}");
+    let headers = [
+        ("Authorization", bearer.as_str()),
+        ("anthropic-beta", CLAUDE_OAUTH_BETA),
+    ];
+    let Some(profile) = fetch(
+        "https://api.anthropic.com/api/oauth/profile",
+        &headers,
+        timeout,
+    ) else {
+        return;
+    };
+    if let Some((identity, address)) = claude_identity(&profile) {
+        *account_id = Some(identity);
+        *email = address;
+    }
+}
+
+fn claude_identity(profile: &Value) -> Option<(String, Option<String>)> {
+    let account = text(profile.pointer("/account/uuid"))?;
+    let organization = text(profile.pointer("/organization/uuid"))?;
+    Some((
+        format!("{account}:{organization}"),
+        text(profile.pointer("/account/email")),
+    ))
+}
+
 pub fn probe_claude(access: &str, now_ms: i64, timeout: Duration) -> Option<Quota> {
     let bearer = format!("Bearer {access}");
     let headers = [
@@ -885,6 +928,22 @@ pub fn save(agent: &Path, store: &QuotaStore) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_identity_keeps_organizations_separate_and_requires_both_ids() {
+        let first = serde_json::json!({"account":{"uuid":"user","email":"personal@example.test"},"organization":{"uuid":"personal"}});
+        assert_eq!(
+            claude_identity(&first),
+            Some(("user:personal".into(), Some("personal@example.test".into())))
+        );
+        let mut work = first.clone();
+        work["organization"]["uuid"] = "work".into();
+        assert_ne!(claude_identity(&first), claude_identity(&work));
+        assert!(
+            claude_identity(&serde_json::json!({"account":{"email":"personal@example.test"}}))
+                .is_none()
+        );
+    }
 
     #[test]
     fn grok_credits_parse_weekly_monthly_empty_and_exhausted() {
