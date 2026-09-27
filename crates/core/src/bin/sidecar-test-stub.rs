@@ -178,6 +178,21 @@ fn pi_rpc_blocked_stdin() {
     let line = io::stdin().lock().lines().next().unwrap().unwrap();
     let request: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(request["type"], "get_state");
+    if let Ok(delay) = std::env::var("PI_STUB_READY_DELAY_MS") {
+        thread::sleep(Duration::from_millis(delay.parse().unwrap()));
+    }
+    if let Ok(address) = std::env::var("PI_STUB_READY_SIGNAL") {
+        use std::io::Read;
+        let mut signal =
+            std::net::TcpStream::connect_timeout(&address.parse().unwrap(), Duration::from_secs(5))
+                .unwrap();
+        signal
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut acknowledgment = [0];
+        signal.read_exact(&mut acknowledgment).unwrap();
+        assert_eq!(acknowledgment, [1]);
+    }
     eprintln!("Pi stub stopped reading stdin.");
     io::stderr().flush().unwrap();
     println!(
