@@ -20,7 +20,8 @@ use uuid::Uuid;
 
 mod stdin_deadline {
     use std::collections::VecDeque;
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::sync::atomic::AtomicBool;
@@ -51,7 +52,7 @@ mod stdin_deadline {
 
     struct Boundary {
         root: PathBuf,
-        started: Instant,
+        ready: Arc<Mutex<Option<Instant>>>,
     }
 
     impl ChatEventSink for Boundary {
@@ -63,9 +64,18 @@ mod stdin_deadline {
             eprintln!("shell-event: {}", serde_json::to_string(&event).unwrap());
             if event.phase == "failed" && event.failure_reason.as_deref() == Some(FAILURE) {
                 // Measure delivery here, not when the parent gets CPU time to read stderr.
-                // Allow one second for readiness and scheduling, not another timeout.
+                // Readiness has its own budget. Allow one second for scheduling after readiness.
                 let bound = FIRST_EVENT_TIMEOUT + Duration::from_secs(1);
-                let elapsed = self.started.elapsed();
+                let elapsed = self
+                    .ready
+                    .lock()
+                    .unwrap()
+                    .expect("Pi never became ready.")
+                    .elapsed();
+                assert!(
+                    elapsed >= FIRST_EVENT_TIMEOUT,
+                    "The shell failed early: {elapsed:?}."
+                );
                 assert!(elapsed <= bound, "Late shell failure: {elapsed:?}");
             }
             Ok(())
@@ -122,6 +132,7 @@ mod stdin_deadline {
             .env("MUNIMENT_STDIN_DEADLINE_CHILD", &root)
             .env("MUNIMENT_PI_ROOT", &root)
             .env("PI_STUB_BLOCK_STDIN", "1")
+            .env("PI_STUB_READY_DELAY_MS", "2000")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -195,10 +206,41 @@ mod stdin_deadline {
         )
         .unwrap();
         let runtime = Arc::new(Mutex::new(None));
+        let ready = Arc::new(Mutex::new(None));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::env::set_var(
+            "PI_STUB_READY_SIGNAL",
+            listener.local_addr().unwrap().to_string(),
+        );
+        let signal_ready = Arc::clone(&ready);
+        let setup_started = Instant::now();
+        let readiness = std::thread::spawn(move || loop {
+            assert!(
+                setup_started.elapsed() < Duration::from_secs(30),
+                "Pi readiness timed out."
+            );
+            match listener.accept() {
+                Ok((mut signal, _)) => {
+                    assert!(setup_started.elapsed() >= Duration::from_secs(2));
+                    // Start the reply clock before the stub releases its readiness response.
+                    *signal_ready.lock().unwrap() = Some(Instant::now());
+                    signal
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    signal.write_all(&[1]).unwrap();
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("The Pi readiness signal failed: {error}."),
+            }
+        });
         coordinate(
             Boundary {
                 root: root.clone(),
-                started: Instant::now(),
+                ready,
             },
             Arc::clone(&storage),
             Arc::clone(&runtime),
@@ -220,6 +262,8 @@ mod stdin_deadline {
             None,
             Some(prepared),
         );
+        readiness.join().unwrap();
+        std::env::remove_var("PI_STUB_READY_SIGNAL");
         let events = storage.lock().unwrap().journal.events(RUN_ID).unwrap();
         let terminal = events.last().unwrap();
         assert_eq!(terminal.event_type, "run.failed");
