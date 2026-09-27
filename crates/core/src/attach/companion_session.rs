@@ -400,7 +400,10 @@ fn companion_scope(operation: Operation) -> Option<Option<&'static str>> {
         | Operation::RunSteer
         | Operation::RunFollowUp
         | Operation::RunPermissionAnswer
-        | Operation::RetentionRecheck => None,
+        | Operation::RetentionRecheck
+        | Operation::PairingChallenge
+        | Operation::PairingStatus
+        | Operation::PairingRevoke => None,
     }
 }
 

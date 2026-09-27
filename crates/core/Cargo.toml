@@ -33,6 +33,7 @@ image = { version = "0.25", default-features = false, features = ["gif", "jpeg",
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native"], optional = true }
 libloading = "0.7"
 quick-xml = "0.41"
+qrcode = "0.14"
 muniment-attach = { path = "../attach", features = ["client"] }
 muniment-code-diff = { path = "../code-diff" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
@@ -54,6 +55,8 @@ uuid = { version = "1", features = ["serde", "v4", "v7"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+quircs = "0.10"
+resvg = { version = "0.45", default-features = false }
 syn = { version = "2", features = ["full", "visit"] }
 # Tests need to author AES-encrypted entries to exercise the encrypted-entry
 # rejection; the library itself only ever reads and needs no crypto stack.

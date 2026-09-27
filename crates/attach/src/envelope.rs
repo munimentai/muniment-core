@@ -351,6 +351,12 @@ pub enum Operation {
     ApprovalPresent,
     #[serde(rename = "retention.recheck")]
     RetentionRecheck,
+    #[serde(rename = "pairing.challenge")]
+    PairingChallenge,
+    #[serde(rename = "pairing.status")]
+    PairingStatus,
+    #[serde(rename = "pairing.revoke")]
+    PairingRevoke,
 }
 
 impl Operation {
@@ -378,6 +384,8 @@ impl Operation {
                 | Self::RunFollowUp
                 | Self::RunCancel
                 | Self::PermissionAnswer
+                | Self::PairingChallenge
+                | Self::PairingRevoke
         )
     }
 
@@ -435,6 +443,9 @@ impl Operation {
             Self::MigrationControl => "migration.control",
             Self::ApprovalPresent => "approval.present",
             Self::RetentionRecheck => "retention.recheck",
+            Self::PairingChallenge => "pairing.challenge",
+            Self::PairingStatus => "pairing.status",
+            Self::PairingRevoke => "pairing.revoke",
         }
     }
 }

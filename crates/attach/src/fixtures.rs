@@ -572,6 +572,9 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         ("reader-objects", Operation::ReaderObjects),
         ("reader-connect", Operation::ReaderConnect),
         ("record-report", Operation::RecordReport),
+        ("pairing-challenge", Operation::PairingChallenge),
+        ("pairing-status", Operation::PairingStatus),
+        ("pairing-revoke", Operation::PairingRevoke),
     ];
     for (index, (name, operation)) in operations.into_iter().enumerate() {
         insert(
@@ -823,8 +826,11 @@ fn request_body(operation: Operation) -> serde_json::Value {
         | Operation::DeviceList
         | Operation::SessionSignOut
         | Operation::SessionSignIn
-        | Operation::CompanionList => json!({}),
+        | Operation::CompanionList
+        | Operation::PairingChallenge
+        | Operation::PairingStatus => json!({}),
         Operation::CompanionRevoke => json!({"client_identity": "companion-1"}),
+        Operation::PairingRevoke => json!({"pair_id": "22222222-2222-4222-8222-222222222222"}),
         Operation::CompanyList => json!({}),
         Operation::CompanyCreate => json!({"name": "Northwind Traders"}),
         Operation::CompanySelect => {
@@ -1135,6 +1141,9 @@ mod tests {
             Operation::MigrationControl,
             Operation::ApprovalPresent,
             Operation::RetentionRecheck,
+            Operation::PairingChallenge,
+            Operation::PairingStatus,
+            Operation::PairingRevoke,
         ];
         for operation in operations {
             let name = operation.as_str().replace(['.', '_'], "-");
@@ -1187,7 +1196,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            96,
+            99,
             "every canonical fixture must be inventoried"
         );
     }

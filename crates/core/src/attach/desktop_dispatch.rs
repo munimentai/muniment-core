@@ -765,6 +765,8 @@ pub(super) fn dispatch_request<S: ThreadListService>(
             | Operation::SessionSignIn
             | Operation::SessionSignOut
             | Operation::CompanionList
+            | Operation::PairingChallenge
+            | Operation::PairingStatus
     ) {
         if request.body != serde_json::json!({}) {
             return Err(ProtocolError::invalid_request().into());
@@ -779,6 +781,18 @@ pub(super) fn dispatch_request<S: ThreadListService>(
                 }))
             }
             Operation::DeviceList => serde_json::to_value(service.list_devices()?),
+            Operation::PairingStatus => serde_json::to_value(service.pairing_status()?),
+            Operation::PairingChallenge => {
+                let idempotency_key = request
+                    .idempotency_key
+                    .as_ref()
+                    .ok_or_else(ProtocolError::idempotency_key_required)?;
+                serde_json::to_value(service.create_pairing_challenge(
+                    &request.request_id,
+                    idempotency_key,
+                    provenance,
+                )?)
+            }
             Operation::CompanionList => {
                 let companions = service.list_companions()?;
                 Ok(serde_json::json!({
@@ -843,6 +857,26 @@ pub(super) fn dispatch_request<S: ThreadListService>(
             provenance,
         )?;
         return bounded_response(serde_json::json!({}));
+    }
+    if request.operation == Operation::PairingRevoke {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            pair_id: String,
+        }
+        let body: Body =
+            serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
+        let pair_id =
+            uuid::Uuid::parse_str(&body.pair_id).map_err(|_| ProtocolError::invalid_request())?;
+        let idempotency_key = request
+            .idempotency_key
+            .as_ref()
+            .ok_or_else(ProtocolError::idempotency_key_required)?;
+        let result =
+            service.revoke_pairing(pair_id, &request.request_id, idempotency_key, provenance)?;
+        return bounded_response(
+            serde_json::to_value(result).map_err(|_| ProtocolError::persistence_failed())?,
+        );
     }
     if request.operation == Operation::WorkspaceOnboard {
         #[derive(serde::Deserialize)]

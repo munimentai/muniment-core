@@ -1,0 +1,57 @@
+{
+  "contract_version": "muniment.remote-control-pairing/1",
+  "valid": [
+    { "operation": "challenge", "body": { "contract_version": "muniment.remote-control-pairing/1" } },
+    { "operation": "authorize", "body": {
+      "contract_version": "muniment.remote-control-pairing/1",
+      "desktop_device_id": "11111111-1111-4111-8111-111111111111",
+      "desktop_public_key": "ERERERERERERERERERERERERERERERERERERERERERE",
+      "challenge": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI"
+    } },
+    { "operation": "revoke", "body": { "contract_version": "muniment.remote-control-pairing/1", "pair_id": "22222222-2222-4222-8222-222222222222" } }
+  ],
+  "invalid": [
+    { "operation": "challenge", "body": null },
+    { "operation": "challenge", "body": [] },
+    { "operation": "challenge", "body": {} },
+    { "operation": "challenge", "body": { "contract_version": "muniment.remote-control-pairing/2" } },
+    { "operation": "challenge", "body": { "contract_version": "muniment.remote-control-pairing/1", "expires_in": 0 } },
+    { "operation": "challenge", "body": { "contract_version": "muniment.remote-control-pairing/1", "owner_user_id": "owner" } },
+    { "operation": "revoke", "body": { "contract_version": "muniment.remote-control-pairing/1", "pair_id": "" } }
+  ],
+  "responses": [
+    {
+      "contract_version": "muniment.remote-control-pairing/1",
+      "expires_at": "2026-01-01T00:02:00.000Z",
+      "qr": {
+        "contract_version": "muniment.remote-control-pairing/1",
+        "desktop_device_id": "11111111-1111-4111-8111-111111111111",
+        "desktop_public_key": "ERERERERERERERERERERERERERERERERERERERERERE",
+        "challenge": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI"
+      }
+    },
+    {
+      "contract_version": "muniment.remote-control-pairing/1",
+      "pair": {
+        "pair_id": "22222222-2222-4222-8222-222222222222",
+        "desktop_device_id": "11111111-1111-4111-8111-111111111111",
+        "mobile_device_id": "33333333-3333-4333-8333-333333333333",
+        "desktop_public_key": "ERERERERERERERERERERERERERERERERERERERERERE",
+        "mobile_public_key": "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM",
+        "created_at": "2026-01-01T00:01:00.000Z"
+      }
+    },
+    { "contract_version": "muniment.remote-control-pairing/1", "pair": null },
+    { "contract_version": "muniment.remote-control-pairing/1", "revoked": true },
+    { "error": { "code": "pairing_unavailable", "message": "The pairing request failed." } }
+  ],
+  "semantic_rejections": [
+    { "change": "wrong_account", "status": 403, "code": "pairing_unavailable" },
+    { "change": "wrong_organization", "status": 403, "code": "pairing_unavailable" },
+    { "change": "wrong_desktop", "status": 403, "code": "pairing_unavailable" },
+    { "change": "wrong_key", "status": 403, "code": "pairing_unavailable" },
+    { "change": "wrong_challenge", "status": 403, "code": "pairing_unavailable" },
+    { "change": "expired", "status": 403, "code": "pairing_unavailable" },
+    { "change": "replay", "status": 403, "code": "pairing_unavailable" }
+  ]
+}

@@ -798,6 +798,88 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         self.boundaries.list_devices()
     }
 
+    #[cfg(any(unix, target_os = "windows"))]
+    fn pairing_status(&mut self) -> Result<crate::auth::PairingStatusView, ProtocolError> {
+        self.boundaries.pairing_status()
+    }
+
+    #[cfg(any(unix, target_os = "windows"))]
+    fn create_pairing_challenge(
+        &mut self,
+        request_id: &Id,
+        idempotency_key: &Id,
+        companion: CompanionProvenance,
+    ) -> Result<crate::auth::PairingChallengeView, ProtocolError> {
+        let canonical_input = json!({});
+        let ledger_request = AttachRequest {
+            protocol: Protocol,
+            request_id: request_id.clone(),
+            operation: Operation::PairingChallenge,
+            capability: String::new(),
+            idempotency_key: Some(idempotency_key.clone()),
+            body: canonical_input.clone(),
+        };
+        let provenance = attach_provenance(request_id, idempotency_key, &companion);
+        let outcome = self.idempotency.execute(
+            &companion.profile,
+            self.client_identity.as_deref().unwrap_or_default(),
+            &ledger_request,
+            &canonical_input,
+            || Ok(()),
+            || {
+                let view = self.boundaries.create_pairing_challenge(provenance)?;
+                Ok(CommittedResult {
+                    body: serde_json::to_value(view)
+                        .map_err(|_| ProtocolError::persistence_failed())?,
+                    cursor: None,
+                })
+            },
+        )?;
+        let committed = match outcome {
+            IdempotencyOutcome::Committed(result) | IdempotencyOutcome::Replayed(result) => result,
+        };
+        serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
+    }
+
+    #[cfg(any(unix, target_os = "windows"))]
+    fn revoke_pairing(
+        &mut self,
+        pair_id: uuid::Uuid,
+        request_id: &Id,
+        idempotency_key: &Id,
+        companion: CompanionProvenance,
+    ) -> Result<crate::auth::PairingRevokeView, ProtocolError> {
+        let canonical_input = json!({ "pair_id": pair_id });
+        let ledger_request = AttachRequest {
+            protocol: Protocol,
+            request_id: request_id.clone(),
+            operation: Operation::PairingRevoke,
+            capability: String::new(),
+            idempotency_key: Some(idempotency_key.clone()),
+            body: canonical_input.clone(),
+        };
+        let provenance = attach_provenance(request_id, idempotency_key, &companion);
+        let outcome = self.idempotency.execute(
+            &companion.profile,
+            self.client_identity.as_deref().unwrap_or_default(),
+            &ledger_request,
+            &canonical_input,
+            || Ok(()),
+            || {
+                let view = self.boundaries.revoke_pairing(pair_id, provenance)?;
+                Ok(CommittedResult {
+                    body: serde_json::to_value(view)
+                        .map_err(|_| ProtocolError::persistence_failed())?,
+                    cursor: None,
+                })
+            },
+        )?;
+        let committed = match outcome {
+            IdempotencyOutcome::Committed(result) | IdempotencyOutcome::Replayed(result) => result,
+        };
+        serde_json::from_value(committed.body).map_err(|_| ProtocolError::persistence_failed())
+    }
+
     #[cfg(target_os = "linux")]
     fn control_migration(
         &mut self,

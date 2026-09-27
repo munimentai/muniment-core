@@ -109,6 +109,9 @@ fn export_includes_second_tranche_requests() {
         ("session.sign_in", Operation::SessionSignIn, true),
         ("companion.list", Operation::CompanionList, false),
         ("companion.revoke", Operation::CompanionRevoke, true),
+        ("pairing.challenge", Operation::PairingChallenge, true),
+        ("pairing.status", Operation::PairingStatus, false),
+        ("pairing.revoke", Operation::PairingRevoke, true),
     ] {
         let name = wire_name.replace(['.', '_'], "-");
         let request: Request = serde_json::from_slice(

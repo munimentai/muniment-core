@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"00000000000000000000000000000098","operation":"pairing.revoke","capability":"fixture-capability","idempotency_key":"000000000000000000000000000000fc","body":{"pair_id":"22222222-2222-4222-8222-222222222222"}}
