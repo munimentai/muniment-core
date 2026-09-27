@@ -72,6 +72,40 @@ impl DesktopClientHolder {
         self.with_client(DesktopClient::list_devices)
     }
 
+    pub fn pairing_status(&self) -> Result<Value, ClientError> {
+        self.pairing_status_with_diagnostics()
+            .map_err(|(error, _)| error)
+    }
+
+    pub fn pairing_status_with_diagnostics(
+        &self,
+    ) -> Result<Value, (ClientError, Option<crate::ProtocolError>)> {
+        Self::pairing_request(self, DesktopClient::pairing_status)
+    }
+
+    pub fn create_pairing_challenge(&self) -> Result<Value, ClientError> {
+        self.create_pairing_challenge_with_diagnostics()
+            .map_err(|(error, _)| error)
+    }
+
+    pub fn create_pairing_challenge_with_diagnostics(
+        &self,
+    ) -> Result<Value, (ClientError, Option<crate::ProtocolError>)> {
+        Self::pairing_request(self, DesktopClient::create_pairing_challenge)
+    }
+
+    pub fn revoke_pairing(&self, pair_id: &str) -> Result<Value, ClientError> {
+        self.revoke_pairing_with_diagnostics(pair_id)
+            .map_err(|(error, _)| error)
+    }
+
+    pub fn revoke_pairing_with_diagnostics(
+        &self,
+        pair_id: &str,
+    ) -> Result<Value, (ClientError, Option<crate::ProtocolError>)> {
+        Self::pairing_request(self, |client| client.revoke_pairing(pair_id))
+    }
+
     pub fn sign_out(&self) -> Result<Value, ClientError> {
         self.with_client(DesktopClient::sign_out)
     }
@@ -274,6 +308,21 @@ impl DesktopClientHolder {
         compatible: impl FnOnce(&str) -> bool,
     ) -> Result<RunMessageAccepted, ClientError> {
         self.with_compatible_client(compatible, |client| client.run_follow_up(run_id, text))
+    }
+
+    fn pairing_request(
+        holder: &Self,
+        step: impl FnOnce(&mut DesktopClient) -> Result<Value, ClientError>,
+    ) -> Result<Value, (ClientError, Option<crate::ProtocolError>)> {
+        let mut failure = None;
+        let result = holder.with_client(|client| {
+            let result = step(client);
+            if result.is_err() {
+                failure = client.last_request_error().cloned();
+            }
+            result
+        });
+        result.map_err(|error| (error, failure))
     }
 
     fn with_compatible_client<T>(

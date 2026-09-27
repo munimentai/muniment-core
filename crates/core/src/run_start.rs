@@ -158,6 +158,25 @@ pub trait RunAttachBoundaries {
         Err(ProtocolError::unsupported_operation())
     }
     #[cfg(any(unix, target_os = "windows"))]
+    fn pairing_status(&self) -> Result<crate::auth::PairingStatusView, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(any(unix, target_os = "windows"))]
+    fn create_pairing_challenge(
+        &self,
+        _provenance: Provenance,
+    ) -> Result<crate::auth::PairingChallengeView, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(any(unix, target_os = "windows"))]
+    fn revoke_pairing(
+        &self,
+        _pair_id: uuid::Uuid,
+        _provenance: Provenance,
+    ) -> Result<crate::auth::PairingRevokeView, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(any(unix, target_os = "windows"))]
     fn list_companions(&self) -> Result<Vec<crate::attach::CompanionRecord>, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }

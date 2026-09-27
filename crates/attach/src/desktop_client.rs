@@ -371,6 +371,36 @@ impl DesktopClient {
         )
     }
 
+    pub fn pairing_status(&mut self) -> Result<Value, ClientError> {
+        self.request_body(
+            Operation::PairingStatus,
+            None,
+            serde_json::json!({}),
+            &["pair"],
+        )
+    }
+
+    pub fn create_pairing_challenge(&mut self) -> Result<Value, ClientError> {
+        self.request_body(
+            Operation::PairingChallenge,
+            Some(fresh_request_id()?),
+            serde_json::json!({}),
+            &["expires_at", "qr_svg"],
+        )
+    }
+
+    pub fn revoke_pairing(&mut self, pair_id: &str) -> Result<Value, ClientError> {
+        if uuid::Uuid::parse_str(pair_id).is_err() {
+            return Err(ClientError::UnexpectedMessage);
+        }
+        self.request_body(
+            Operation::PairingRevoke,
+            Some(fresh_request_id()?),
+            serde_json::json!({ "pair_id": pair_id }),
+            &["revoked"],
+        )
+    }
+
     pub fn sign_out(&mut self) -> Result<Value, ClientError> {
         self.request_body(
             Operation::SessionSignOut,

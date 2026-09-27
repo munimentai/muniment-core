@@ -62,6 +62,12 @@ impl NativeHttpFailure {
                         Some("forbidden") => Some("forbidden"),
                         Some("rate_limited") => Some("rate_limited"),
                         Some("internal_error") => Some("internal_error"),
+                        Some("session_invalid") => Some("session_invalid"),
+                        Some("pairing_request_invalid") => Some("pairing_request_invalid"),
+                        Some("pairing_unavailable") => Some("pairing_unavailable"),
+                        Some("pairing_conflict") => Some("pairing_conflict"),
+                        Some("pairing_rate_limited") => Some("pairing_rate_limited"),
+                        Some("pairing_store_unavailable") => Some("pairing_store_unavailable"),
                         _ => None,
                     }
                 })
