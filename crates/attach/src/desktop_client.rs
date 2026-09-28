@@ -9,7 +9,8 @@ use crate::protocol_helpers::{
 };
 use crate::{
     encode_frame, Authorization, Client, DesktopClientAuthorizedGrant, Envelope, EventName, Hello,
-    Id, Operation, Protocol, Request, Response, VersionRange, Welcome, MAX_TEXT_LENGTH, PROTOCOL,
+    Id, Operation, Protocol, Request, Response, SnapshotAssembly, VersionRange, Welcome,
+    MAX_TEXT_LENGTH, PROTOCOL,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -101,16 +102,28 @@ impl DesktopClient {
         };
         let bytes = encode_frame(&request).map_err(map_frame_error)?;
         write_all_before(self.stream.as_mut(), &bytes, request_deadline)?;
-        match serde_json::from_value(read_value(self.stream.as_mut(), request_deadline)?)
-            .map_err(|_| ClientError::UnexpectedMessage)?
-        {
-            Envelope::Response(response) if response.request_id == request_id => Ok(response),
-            Envelope::Error(error) if error.request_id.as_ref() == Some(&request_id) => {
-                let outcome = map_protocol_error(error.error.code());
-                self.last_request_error = Some(error.error);
-                Err(outcome)
+        let mut snapshot = SnapshotAssembly::default();
+        loop {
+            match serde_json::from_value(read_value(self.stream.as_mut(), request_deadline)?)
+                .map_err(|_| ClientError::UnexpectedMessage)?
+            {
+                Envelope::Response(mut response) if response.request_id == request_id => {
+                    if operation == Operation::ThreadHistory {
+                        let Some(body) = snapshot.push(response.body).map_err(map_frame_error)?
+                        else {
+                            continue;
+                        };
+                        response.body = body;
+                    }
+                    return Ok(response);
+                }
+                Envelope::Error(error) if error.request_id.as_ref() == Some(&request_id) => {
+                    let outcome = map_protocol_error(error.error.code());
+                    self.last_request_error = Some(error.error);
+                    return Err(outcome);
+                }
+                _ => return Err(ClientError::UnexpectedMessage),
             }
-            _ => Err(ClientError::UnexpectedMessage),
         }
     }
 
@@ -446,6 +459,7 @@ impl DesktopClient {
         }
         let mut body = thread_read_body(limit, cursor)?;
         body["thread_id"] = Value::String(thread_id.into());
+        body["snapshot_chunks"] = Value::Bool(true);
         Ok(self.request(Operation::ThreadHistory, None, body)?.body)
     }
 
@@ -456,7 +470,11 @@ impl DesktopClient {
             subscription_id: String,
         }
 
-        let response = self.request(Operation::RunChatEvents, None, serde_json::json!({}))?;
+        let response = self.request(
+            Operation::RunChatEvents,
+            None,
+            serde_json::json!({"snapshot_chunks": true}),
+        )?;
         let subscription: Subscription =
             serde_json::from_value(response.body).map_err(|_| ClientError::UnexpectedMessage)?;
         let subscription_id =
@@ -478,38 +496,46 @@ impl DesktopClient {
         if wait.is_zero() {
             return Err(ClientError::AuthorizationExpired);
         }
-        let value = read_value(self.stream.as_mut(), deadline(wait)).map_err(|error| {
-            if error == ClientError::ConnectionClosed {
-                ClientError::DesktopUnavailable
-            } else {
-                error
+        let mut snapshot = SnapshotAssembly::default();
+        let mut read_deadline = deadline(wait);
+        loop {
+            let value = read_value(self.stream.as_mut(), read_deadline).map_err(|error| {
+                if error == ClientError::ConnectionClosed {
+                    ClientError::DesktopUnavailable
+                } else {
+                    error
+                }
+            })?;
+            if value
+                .get("protocol")
+                .and_then(Value::as_str)
+                .is_some_and(|protocol| protocol != PROTOCOL)
+            {
+                return Err(ClientError::ProtocolIncompatible);
             }
-        })?;
-        if value
-            .get("protocol")
-            .and_then(Value::as_str)
-            .is_some_and(|protocol| protocol != PROTOCOL)
-        {
-            return Err(ClientError::ProtocolIncompatible);
+            let event =
+                match serde_json::from_value(value).map_err(|_| ClientError::UnexpectedMessage)? {
+                    Envelope::Event(event) => event,
+                    Envelope::Error(error) => return Err(map_protocol_error(error.error.code())),
+                    _ => return Err(ClientError::UnexpectedMessage),
+                };
+            if event.event == EventName::CapabilityRevoked {
+                validate_capability_revocation(&event)?.ok_or(ClientError::UnexpectedMessage)?;
+                return Err(ClientError::CapabilityRevoked);
+            }
+            if &event.subscription_id != subscription_id
+                || event.event != EventName::ChatEvent
+                || event.run_id.is_some()
+                || event.run_seq.is_some()
+            {
+                return Err(ClientError::UnexpectedMessage);
+            }
+            if let Some(body) = snapshot.push(event.body).map_err(map_frame_error)? {
+                return Ok(body);
+            }
+            // The first chunk ends the idle wait. Bound the remaining snapshot I/O.
+            read_deadline = read_deadline.min(deadline(self.io_timeout));
         }
-        let event =
-            match serde_json::from_value(value).map_err(|_| ClientError::UnexpectedMessage)? {
-                Envelope::Event(event) => event,
-                Envelope::Error(error) => return Err(map_protocol_error(error.error.code())),
-                _ => return Err(ClientError::UnexpectedMessage),
-            };
-        if event.event == EventName::CapabilityRevoked {
-            validate_capability_revocation(&event)?.ok_or(ClientError::UnexpectedMessage)?;
-            return Err(ClientError::CapabilityRevoked);
-        }
-        if &event.subscription_id != subscription_id
-            || event.event != EventName::ChatEvent
-            || event.run_id.is_some()
-            || event.run_seq.is_some()
-        {
-            return Err(ClientError::UnexpectedMessage);
-        }
-        Ok(event.body)
     }
 
     pub fn list_companions(&mut self) -> Result<Value, ClientError> {
@@ -780,6 +806,103 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn snapshot_reads_validate_every_envelope_and_discard_partial_state() {
+        for chat in [false, true] {
+            for fault in ["none", "disconnect", "identity", "order", "timeout"] {
+                let (socket, mut server) = UnixStream::pair().unwrap();
+                let body = serde_json::json!({"runId": "018f0000-0000-7000-8000-000000000201",
+                    "phase": "complete", "text": "🦀".repeat(10_000)});
+                let expected = body.clone();
+                let subscription = fresh_request_id().unwrap();
+                let subscription_id = subscription.clone();
+                let worker = std::thread::spawn(move || {
+                    let request_id = if chat {
+                        None
+                    } else {
+                        let value =
+                            read_value(&mut server, deadline(Duration::from_secs(5))).unwrap();
+                        assert_eq!(value["body"]["snapshot_chunks"], true);
+                        Some(value["request_id"].clone())
+                    };
+                    let chunks = crate::snapshot_chunks(&body).unwrap();
+                    for (index, chunk) in chunks.iter().enumerate() {
+                        if index == 1 && fault == "disconnect" {
+                            return;
+                        }
+                        if index == 1 && fault == "timeout" {
+                            std::thread::sleep(Duration::from_millis(500));
+                            return;
+                        }
+                        let chunk = if index == 1 && fault == "order" {
+                            &chunks[0]
+                        } else {
+                            chunk
+                        };
+                        let wrong_id = index == 1 && fault == "identity";
+                        let value = if chat {
+                            serde_json::json!({"protocol": PROTOCOL, "event": "chat.event",
+                                "subscription_id": if wrong_id { fresh_request_id().unwrap() } else { subscription_id.clone() },
+                                "body": chunk})
+                        } else {
+                            serde_json::json!({"protocol": PROTOCOL, "ok": true,
+                                "request_id": if wrong_id { serde_json::to_value(fresh_request_id().unwrap()).unwrap() } else { request_id.clone().unwrap() },
+                                "body": chunk})
+                        };
+                        if server.write_all(&encode_frame(&value).unwrap()).is_err() {
+                            return;
+                        }
+                    }
+                    if chat && fault == "none" {
+                        server
+                            .write_all(
+                                &encode_frame(&serde_json::json!({"protocol": PROTOCOL,
+                            "event": "chat.event", "subscription_id": subscription_id,
+                            "body": {"phase": "complete", "text": "next"}}))
+                                .unwrap(),
+                            )
+                            .unwrap();
+                    }
+                });
+                let mut client = desktop_client_for_test(
+                    Box::new(socket),
+                    "1.0.0".into(),
+                    if fault == "timeout" {
+                        Duration::from_millis(200)
+                    } else {
+                        Duration::from_secs(5)
+                    },
+                );
+                if chat {
+                    client.chat_subscription_id = Some(subscription);
+                }
+                let result = if chat {
+                    client.read_chat_event()
+                } else {
+                    client.thread_history("thread-1", 100, None)
+                };
+                if fault == "none" {
+                    assert_eq!(result.unwrap(), expected);
+                    if chat {
+                        assert_eq!(client.read_chat_event().unwrap()["text"], "next");
+                    }
+                } else {
+                    let expected = match fault {
+                        "disconnect" if chat => ClientError::DesktopUnavailable,
+                        "disconnect" => ClientError::ConnectionClosed,
+                        "identity" => ClientError::UnexpectedMessage,
+                        "order" => ClientError::MalformedFrame,
+                        "timeout" => ClientError::Timeout,
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(result.unwrap_err(), expected, "{fault}");
+                }
+                drop(client);
+                worker.join().unwrap();
+            }
+        }
+    }
 
     #[test]
     fn sign_in_keeps_the_authorization_code_for_the_shell() {

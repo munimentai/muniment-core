@@ -54,6 +54,7 @@ mod negotiation;
 mod presenter_client;
 #[cfg(feature = "client")]
 mod protocol_helpers;
+mod snapshot;
 mod workspace;
 
 #[cfg(feature = "client")]
@@ -78,4 +79,5 @@ pub use presenter_client::{
     handshake_approval_presenter, serve_approval_presenter_with, ApprovalPresenterClient,
     ApprovalPresenterStopHandle, ApprovalPresenterSupervisorStop,
 };
+pub use snapshot::{snapshot_chunks, SnapshotAssembly};
 pub use workspace::*;

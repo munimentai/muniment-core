@@ -126,6 +126,7 @@ pub(super) struct ActiveRunStream {
 }
 
 pub(super) struct ActiveChatSubscription {
+    snapshot_chunks: bool,
     subscription_id: super::Id,
     receiver: crate::run_events::ChatEventSubscription,
 }
@@ -154,6 +155,13 @@ impl<S: ThreadListService> DesktopSessionService for S {
 
     fn has_chat_subscription(&self, state: &Self::State) -> bool {
         state.chat_subscription.is_some()
+    }
+
+    fn chat_snapshot_chunks(&self, state: &Self::State) -> bool {
+        state
+            .chat_subscription
+            .as_ref()
+            .is_some_and(|subscription| subscription.snapshot_chunks)
     }
 
     #[cfg(target_os = "linux")]
@@ -740,9 +748,14 @@ pub(super) fn dispatch_request<S: ThreadListService>(
         })));
     }
     if request.operation == Operation::RunChatEvents {
-        if request.body != serde_json::json!({}) {
-            return Err(ProtocolError::invalid_request().into());
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            #[serde(default)]
+            snapshot_chunks: bool,
         }
+        let body: Body =
+            serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
         let receiver = service.subscribe_chat_events()?;
         let mut subscription_random = [0u8; 16];
         getrandom::fill(&mut subscription_random)
@@ -750,6 +763,7 @@ pub(super) fn dispatch_request<S: ThreadListService>(
         let subscription_id = super::Id::new(hex(&subscription_random))
             .map_err(|_| ProtocolError::persistence_failed())?;
         *chat_subscription = Some(ActiveChatSubscription {
+            snapshot_chunks: body.snapshot_chunks,
             subscription_id: subscription_id.clone(),
             receiver,
         });
@@ -2114,6 +2128,8 @@ pub(super) fn dispatch_request<S: ThreadListService>(
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Body {
+            #[serde(default, rename = "snapshot_chunks")]
+            _snapshot_chunks: bool,
             thread_id: String,
             limit: u8,
             #[serde(default)]
