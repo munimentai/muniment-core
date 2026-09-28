@@ -1341,7 +1341,8 @@ fn desktop_thread_read_methods_send_requests_and_return_bodies() {
                 serde_json::json!({
                     "thread_id": "thread-1",
                     "limit": 100,
-                    "cursor": "message-cursor-1"
+                    "cursor": "message-cursor-1",
+                    "snapshot_chunks": true
                 }),
                 serde_json::json!({
                     "thread_id": "thread-1",
@@ -1391,7 +1392,10 @@ fn desktop_chat_subscription_reads_events_and_refuses_other_frames() {
             complete_desktop_client_handshake(&mut server);
             let request = read_client_value(&mut server);
             assert_eq!(request["operation"], "run.chat_events");
-            assert_eq!(request["body"], serde_json::json!({}));
+            assert_eq!(
+                request["body"],
+                serde_json::json!({"snapshot_chunks": true})
+            );
             assert!(request.get("idempotency_key").is_none());
             server
                 .write_all(

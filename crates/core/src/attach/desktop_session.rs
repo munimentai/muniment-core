@@ -5,8 +5,9 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use muniment_attach::{
-    decode_frame, encode_frame, Envelope, ErrorEnvelope, Event, Failure, Operation, Protocol,
-    ProtocolError, Request, Response, Success, MAX_FRAME_LENGTH,
+    decode_frame, encode_frame, snapshot_chunks, Envelope, ErrorEnvelope, Event, EventName,
+    Failure, FrameError, Operation, Protocol, ProtocolError, Request, Response, Success,
+    MAX_FRAME_LENGTH,
 };
 
 use super::deadline_io::DeadlineStream;
@@ -67,6 +68,10 @@ pub(super) trait DesktopSessionService {
     fn poll_run_streams(&mut self, state: &mut Self::State) -> Result<Vec<Event>, ProtocolError>;
 
     fn has_chat_subscription(&self, state: &Self::State) -> bool;
+
+    fn chat_snapshot_chunks(&self, _state: &Self::State) -> bool {
+        false
+    }
 
     #[cfg(target_os = "linux")]
     fn record_chat_delivery_failure(&mut self, run_id: &str, cause: &str);
@@ -173,36 +178,19 @@ where
             }
         };
         for event in live_events {
-            let frame = encode_frame(&event).map_err(|_| AttachSessionError::MalformedFrame)?;
-            #[cfg(target_os = "linux")]
-            write_run_frame_before(
-                stream,
-                &frame,
-                Instant::now() + REQUEST_TIMEOUT,
-                service,
-                diagnostic,
-            )?;
-            #[cfg(not(target_os = "linux"))]
-            write_before(stream, &frame, Instant::now() + REQUEST_TIMEOUT)?;
+            write_event(stream, event, false, service, diagnostic)?;
         }
         let chat_subscribed = service.has_chat_subscription(&state);
         if chat_subscribed {
             let (events, closed) = service.drain_chat_events(&mut state, READABLE_POLL_INTERVAL)?;
             for event in events {
-                #[cfg(target_os = "linux")]
-                write_run_frame_before(
+                write_event(
                     stream,
-                    &encode_frame(&event).map_err(|_| AttachSessionError::MalformedFrame)?,
-                    Instant::now() + REQUEST_TIMEOUT,
+                    event,
+                    service.chat_snapshot_chunks(&state),
                     service,
                     diagnostic,
                 )?;
-                #[cfg(not(target_os = "linux"))]
-                {
-                    let frame =
-                        encode_frame(&event).map_err(|_| AttachSessionError::MalformedFrame)?;
-                    write_before(stream, &frame, Instant::now() + REQUEST_TIMEOUT)?;
-                }
             }
             if closed {
                 return Ok(SessionClose::ChatSubscriptionClosed);
@@ -233,6 +221,12 @@ where
         };
         let request_id = request.request_id.clone();
         let operation = request.operation;
+        let chunk_history = operation == Operation::ThreadHistory
+            && request
+                .body
+                .get("snapshot_chunks")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
         let sign_in_started = (operation == Operation::SessionSignIn).then(|| {
             diagnostic(
                 "muniment-runtime: native-auth start method=RPC path=session.sign_in".into(),
@@ -267,51 +261,169 @@ where
             Ok(dispatched) => {
                 let response = Response {
                     protocol: Protocol,
-                    request_id,
+                    request_id: request_id.clone(),
                     ok: Success,
                     body: dispatched.body,
                 };
-                let frame =
-                    encode_frame(&response).map_err(|_| AttachSessionError::MalformedFrame)?;
-                #[cfg(target_os = "linux")]
-                write_run_frame_before(stream, &frame, deadline, service, diagnostic)?;
-                #[cfg(not(target_os = "linux"))]
-                write_before(stream, &frame, deadline)?;
+                match desktop_frames(
+                    &response,
+                    chunk_history,
+                    operation.as_str(),
+                    response
+                        .body
+                        .get("entries")
+                        .and_then(|entries| entries.get(0))
+                        .and_then(|entry| entry.get("runId"))
+                        .and_then(serde_json::Value::as_str),
+                    diagnostic,
+                ) {
+                    Ok(frames) => {
+                        for frame in frames {
+                            #[cfg(target_os = "linux")]
+                            write_run_frame_before(stream, &frame, deadline, service, diagnostic)?;
+                            #[cfg(not(target_os = "linux"))]
+                            write_before(stream, &frame, deadline)?;
+                        }
+                    }
+                    Err(error) => {
+                        // Encoding has written no bytes. Reject this response, not the session.
+                        let error = if error == AttachSessionError::PayloadTooLarge {
+                            ProtocolError::payload_too_large()
+                        } else {
+                            ProtocolError::malformed_frame()
+                        };
+                        write_request_error(stream, Some(request_id), error, deadline);
+                    }
+                }
                 for event in dispatched.events {
-                    let frame =
-                        encode_frame(&event).map_err(|_| AttachSessionError::MalformedFrame)?;
-                    #[cfg(target_os = "linux")]
-                    write_run_frame_before(
+                    write_event(
                         stream,
-                        &frame,
-                        Instant::now() + REQUEST_TIMEOUT,
+                        event,
+                        service.chat_snapshot_chunks(&state),
                         service,
                         diagnostic,
                     )?;
-                    #[cfg(not(target_os = "linux"))]
-                    write_before(stream, &frame, deadline)?;
                 }
             }
             Err(failure) => {
                 diagnostic(request_rejection_line(Some(operation), &failure.error));
                 write_request_error(stream, Some(request_id), failure.error, deadline);
                 for event in failure.events {
-                    let frame =
-                        encode_frame(&event).map_err(|_| AttachSessionError::MalformedFrame)?;
-                    #[cfg(target_os = "linux")]
-                    write_run_frame_before(
+                    write_event(
                         stream,
-                        &frame,
-                        Instant::now() + REQUEST_TIMEOUT,
+                        event,
+                        service.chat_snapshot_chunks(&state),
                         service,
                         diagnostic,
                     )?;
-                    #[cfg(not(target_os = "linux"))]
-                    write_before(stream, &frame, deadline)?;
                 }
             }
         }
     }
+}
+
+fn frame_error_kind(error: &FrameError) -> &'static str {
+    match error {
+        FrameError::PayloadTooLarge => "PayloadTooLarge",
+        FrameError::InvalidUtf8 => "InvalidUtf8",
+        FrameError::InvalidJson => "InvalidJson",
+        FrameError::StructureLimit => "StructureLimit",
+        FrameError::Serialize(_) => "Serialize",
+    }
+}
+
+fn desktop_frames<T: serde::Serialize>(
+    message: &T,
+    chunks: bool,
+    kind: &str,
+    run_id: Option<&str>,
+    diagnostic: &mut impl FnMut(String),
+) -> Result<Vec<Vec<u8>>, AttachSessionError> {
+    let error = match encode_frame(message) {
+        Ok(frame) => return Ok(vec![frame]),
+        Err(error) => error,
+    };
+    let bytes = serde_json::to_vec(message)
+        .map(|bytes| bytes.len())
+        .unwrap_or(0);
+    let run_id = run_id
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+        .unwrap_or("none");
+    diagnostic(format!(
+        "muniment-runtime: desktop frame rejected direction=outbound kind={kind} run_id={run_id} bytes={bytes} error={}",
+        frame_error_kind(&error),
+    ));
+    if chunks
+        && matches!(
+            error,
+            FrameError::StructureLimit | FrameError::PayloadTooLarge
+        )
+    {
+        let frames = (|| {
+            let mut envelope = serde_json::to_value(message).map_err(FrameError::Serialize)?;
+            let chunks = snapshot_chunks(&envelope["body"])?;
+            chunks
+                .into_iter()
+                .map(|chunk| {
+                    envelope["body"] = chunk;
+                    encode_frame(&envelope)
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })();
+        return frames.map_err(|error| {
+            diagnostic(format!(
+                "muniment-runtime: desktop snapshot rejected direction=outbound kind={kind} run_id={run_id} bytes={bytes} error={}",
+                frame_error_kind(&error),
+            ));
+            frame_session_error(&error)
+        });
+    }
+    Err(frame_session_error(&error))
+}
+
+fn frame_session_error(error: &FrameError) -> AttachSessionError {
+    match error {
+        FrameError::PayloadTooLarge | FrameError::StructureLimit => {
+            AttachSessionError::PayloadTooLarge
+        }
+        _ => AttachSessionError::MalformedFrame,
+    }
+}
+
+fn write_event<S: DeadlineStream + ?Sized, H: DesktopSessionService>(
+    stream: &mut S,
+    event: Event,
+    chunks: bool,
+    service: &mut H,
+    diagnostic: &mut impl FnMut(String),
+) -> Result<(), AttachSessionError> {
+    let kind = match &event.event {
+        EventName::Unknown(_) => serde_json::Value::String("unknown".into()),
+        known => serde_json::to_value(known).expect("event has a wire name"),
+    };
+    let run_id = event
+        .run_id
+        .as_ref()
+        .map(|id| id.as_str())
+        .or_else(|| event.body.get("runId").and_then(serde_json::Value::as_str));
+    let frames = desktop_frames(
+        &event,
+        chunks && event.event == EventName::ChatEvent,
+        kind.as_str().unwrap_or("unknown"),
+        run_id,
+        diagnostic,
+    )?;
+    let deadline = Instant::now() + REQUEST_TIMEOUT;
+    for frame in frames {
+        #[cfg(target_os = "linux")]
+        write_run_frame_before(stream, &frame, deadline, service, diagnostic)?;
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = &service;
+            write_before(stream, &frame, deadline)?;
+        }
+    }
+    Ok(())
 }
 
 fn request_rejection_line(operation: Option<Operation>, error: &ProtocolError) -> String {
@@ -330,6 +442,7 @@ fn read_request_before<S: DeadlineStream + ?Sized>(
     read_before(stream, &mut prefix, deadline)?;
     let length = u32::from_be_bytes(prefix) as usize;
     if length > MAX_FRAME_LENGTH {
+        diagnostic(format!("muniment-runtime: desktop frame rejected direction=inbound kind=unknown bytes={length} error=PayloadTooLarge"));
         diagnostic(request_rejection_line(
             None,
             &ProtocolError::payload_too_large(),
@@ -343,7 +456,12 @@ fn read_request_before<S: DeadlineStream + ?Sized>(
     read_before(stream, &mut frame[4..], deadline)?;
     match decode_frame::<Envelope>(&frame) {
         Ok(Some((Envelope::Request(request), consumed))) if consumed == frame.len() => Ok(request),
-        _ => {
+        result => {
+            let error = match &result {
+                Err(error) => frame_error_kind(error),
+                _ => "UnexpectedEnvelope",
+            };
+            diagnostic(format!("muniment-runtime: desktop frame rejected direction=inbound kind=unknown bytes={length} error={error}"));
             diagnostic(request_rejection_line(
                 None,
                 &ProtocolError::malformed_frame(),
@@ -533,12 +651,41 @@ fn write_before<S: DeadlineStream + ?Sized>(
     })
 }
 
+#[cfg(all(test, unix, feature = "keyring"))]
+#[path = "desktop_snapshot_tests.rs"]
+mod snapshot_tests;
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::super::thread_service::{ThreadListPage, ThreadListRequest, ThreadListService};
     use super::*;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn frame_diagnostics_do_not_echo_unknown_event_names_or_invalid_run_ids() {
+        let (_client, mut stream) = UnixStream::pair().unwrap();
+        let event = Event {
+            protocol: Protocol,
+            subscription_id: super::super::Id::new("018f0000-0000-7000-8000-000000000201").unwrap(),
+            event: serde_json::from_value(serde_json::json!("private-event\n".repeat(1000)))
+                .unwrap(),
+            run_id: None,
+            run_seq: None,
+            body: serde_json::json!({"runId": "private-run", "text": "private-text".repeat(7000)}),
+        };
+        let mut lines = Vec::new();
+        assert_eq!(
+            write_event(&mut stream, event, false, &mut Service, &mut |line| lines
+                .push(line)),
+            Err(AttachSessionError::PayloadTooLarge)
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("direction=outbound kind=unknown run_id=none"));
+        assert!(lines[0].contains("error=StructureLimit"));
+        assert!(lines[0].len() < 200);
+        assert!(!lines[0].contains("private"));
+    }
 
     #[test]
     fn dispatch_time_does_not_consume_the_response_frame_deadline() {
@@ -1089,12 +1236,20 @@ mod tests {
             read_error(&mut client);
             let (result, lines) = worker.join().unwrap();
             assert_eq!(result, Err(error));
-            assert_eq!(lines.len(), 2);
-            assert!(lines[0]
+            assert_eq!(lines.len(), 3);
+            assert!(lines[0].starts_with(
+                "muniment-runtime: desktop frame rejected direction=inbound kind=unknown bytes="
+            ));
+            assert!(lines[0].contains(if code == "payload_too_large" {
+                "error=PayloadTooLarge"
+            } else {
+                "error=InvalidJson"
+            }));
+            assert!(lines[1]
                 .starts_with("muniment-runtime: desktop request rejected operation=\"unknown\" "));
-            assert!(lines[0].contains(&format!("code=\"{code}\"")));
+            assert!(lines[1].contains(&format!("code=\"{code}\"")));
             assert_eq!(
-                lines[1],
+                lines[2],
                 format!("muniment-runtime: desktop session closed reason={error:?}")
             );
             assert!(!lines.join("").contains("secret"));
