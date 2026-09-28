@@ -874,6 +874,14 @@ fn complete(
                 match state.reserve_delivery(&candidates, &route, &session, &features) {
                     Ok(account) => account,
                     Err(error) => {
+                        if matches!(error, balance::PickError::UsageLimit) {
+                            super::subscription_probe::transport(
+                                &state.agent,
+                                &route.model,
+                                "failed",
+                                "quota",
+                            );
+                        }
                         refusals.push(format!(
                             "{}/{}: {}",
                             route.family,
@@ -934,9 +942,16 @@ fn complete(
             for (name, value) in &prepared.headers {
                 call = call.set(name, value);
             }
+            super::subscription_probe::transport(&state.agent, &route.model, "pending", "none");
             let call = call.send_json(&prepared.body);
             match call {
                 Ok(response) => {
+                    super::subscription_probe::transport(
+                        &state.agent,
+                        &route.model,
+                        "accepted",
+                        "none",
+                    );
                     state.progress.stage(progress, "thinking", (state.now_ms)());
                     let response_id = wire::evidenced_response_id(
                         &route.family,
@@ -1060,6 +1075,12 @@ fn complete(
                     }
                 }
                 Err(ureq::Error::Status(status, response)) => {
+                    super::subscription_probe::transport(
+                        &state.agent,
+                        &route.model,
+                        "failed",
+                        super::subscription_probe::http_error(status),
+                    );
                     let retry_after = response
                         .header("retry-after")
                         .and_then(|s| s.parse::<u64>().ok());
@@ -1111,6 +1132,12 @@ fn complete(
                     }
                 }
                 Err(ureq::Error::Transport(error)) => {
+                    super::subscription_probe::transport(
+                        &state.agent,
+                        &route.model,
+                        "failed",
+                        "network",
+                    );
                     state.record_error(&account.id, &error.to_string(), true);
                     refusals.push(format!("{} did not answer.", account.label));
                 }
@@ -1209,6 +1236,7 @@ fn relay_native(
     if !decoder.finished || failure.is_some() {
         let message =
             failure.unwrap_or_else(|| "The provider stream ended before completion.".into());
+        super::subscription_probe::transport(&state.agent, model, "failed", "stream");
         state.record_error(account, &message, false);
         if started {
             let _ = write_event(stream, &wire::error_body(&message, "provider_error"));
@@ -1217,6 +1245,7 @@ fn relay_native(
         }
         return Ok(None);
     }
+    super::subscription_probe::transport(&state.agent, model, "complete", "none");
     record_subscription_probe(state, account, model, &decoder);
     state.record_success(account, decoder.tokens);
     if streaming {
