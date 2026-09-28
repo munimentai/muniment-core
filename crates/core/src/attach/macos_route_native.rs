@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::os::fd::AsRawFd;
 use std::os::raw::c_void;
@@ -11,12 +12,33 @@ use super::{MacosAttachRouteReader, MacosPeerReadError};
 /// Reads the connected peer process from a Unix-domain stream.
 pub struct NativeMacosAttachRouteReader<'stream> {
     stream: &'stream UnixStream,
+    code_check: RefCell<CodeCheck>,
+}
+
+/// Each status stays absent until its Security call runs.
+#[derive(Debug, Default)]
+struct CodeCheck {
+    audit_token: bool,
+    bundle: bool,
+    plist_read: bool,
+    sec_static_code_create_with_path: Option<OSStatus>,
+    sec_static_code_check_validity: Option<OSStatus>,
+    sec_code_copy_designated_requirement: Option<OSStatus>,
+    sec_code_copy_guest_with_attributes: Option<OSStatus>,
+    sec_code_copy_guest_with_attributes_disk: Option<OSStatus>,
+    sec_code_check_validity: Option<OSStatus>,
+    sec_code_copy_signing_information_disk: Option<OSStatus>,
+    sec_code_copy_signing_information_peer: Option<OSStatus>,
+    code_hash_match: bool,
 }
 
 impl<'stream> NativeMacosAttachRouteReader<'stream> {
     /// Creates a route reader for the connected stream.
     pub fn new(stream: &'stream UnixStream) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            code_check: RefCell::new(CodeCheck::default()),
+        }
     }
 }
 
@@ -69,8 +91,23 @@ impl MacosAttachRouteReader for NativeMacosAttachRouteReader<'_> {
     }
 
     fn peer_code_matches(&self, expected_desktop_executable: &Path) -> bool {
-        peer_audit_token(self.stream)
-            .is_some_and(|token| audit_token_satisfies(&token, expected_desktop_executable))
+        let mut check = self.code_check.borrow_mut();
+        *check = CodeCheck::default();
+        let Some(token) = peer_audit_token(self.stream) else {
+            return false;
+        };
+        check.audit_token = true;
+        audit_token_satisfies(&token, expected_desktop_executable, &mut check)
+    }
+
+    fn log_companion_fallback(&self, peer_pid: u32, path_match: bool) {
+        if !path_match {
+            *self.code_check.borrow_mut() = CodeCheck::default();
+        }
+        crate::runtime_eprintln!(
+            "muniment-runtime: macos attach route=Companion peer_pid={peer_pid} path_match={path_match} code_check={:?}",
+            self.code_check.borrow()
+        );
     }
 }
 
@@ -99,6 +136,7 @@ type OSStatus = i32;
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     static kCFAllocatorDefault: CFTypeRef;
+    static kCFBooleanTrue: CFTypeRef;
     static kCFTypeDictionaryKeyCallBacks: u8;
     static kCFTypeDictionaryValueCallBacks: u8;
     fn CFDataCreate(allocator: CFTypeRef, bytes: *const u8, length: isize) -> CFTypeRef;
@@ -116,12 +154,20 @@ extern "C" {
         length: isize,
         is_directory: u8,
     ) -> CFTypeRef;
+    fn CFDictionaryGetValue(dictionary: CFTypeRef, key: CFTypeRef) -> CFTypeRef;
+    fn CFArrayGetCount(array: CFTypeRef) -> isize;
+    fn CFArrayGetValueAtIndex(array: CFTypeRef, index: isize) -> CFTypeRef;
+    fn CFEqual(left: CFTypeRef, right: CFTypeRef) -> u8;
     fn CFRelease(value: CFTypeRef);
 }
 
 #[link(name = "Security", kind = "framework")]
 extern "C" {
     static kSecGuestAttributeAudit: CFTypeRef;
+    static kSecGuestAttributeDynamicCode: CFTypeRef;
+    static kSecGuestAttributeDynamicCodeInfoPlist: CFTypeRef;
+    static kSecCodeInfoUnique: CFTypeRef;
+    static kSecCodeInfoCdHashes: CFTypeRef;
     fn SecCodeCopyGuestWithAttributes(
         host: CFTypeRef,
         attributes: CFTypeRef,
@@ -129,12 +175,18 @@ extern "C" {
         guest: *mut CFTypeRef,
     ) -> OSStatus;
     fn SecStaticCodeCreateWithPath(path: CFTypeRef, flags: u32, code: *mut CFTypeRef) -> OSStatus;
+    fn SecStaticCodeCheckValidity(code: CFTypeRef, flags: u32, requirement: CFTypeRef) -> OSStatus;
     fn SecCodeCopyDesignatedRequirement(
         code: CFTypeRef,
         flags: u32,
         requirement: *mut CFTypeRef,
     ) -> OSStatus;
     fn SecCodeCheckValidity(code: CFTypeRef, flags: u32, requirement: CFTypeRef) -> OSStatus;
+    fn SecCodeCopySigningInformation(
+        code: CFTypeRef,
+        flags: u32,
+        information: *mut CFTypeRef,
+    ) -> OSStatus;
 }
 
 /// Releases one owned Core Foundation reference when it drops.
@@ -155,27 +207,68 @@ impl Drop for Owned {
 /// Checks the process named by `token` against the designated requirement of the
 /// installed desktop executable. The lookup by audit token fails for a process whose
 /// pid version changed, so an exec after connect never passes.
-fn audit_token_satisfies(token: &AuditToken, expected_desktop_executable: &Path) -> bool {
+fn audit_token_satisfies(
+    token: &AuditToken,
+    expected_desktop_executable: &Path,
+    check: &mut CodeCheck,
+) -> bool {
     const DEFAULT_FLAGS: u32 = 0;
-    let path = expected_desktop_executable.as_os_str().as_bytes();
+    let contents = expected_desktop_executable
+        .parent()
+        .filter(|parent| parent.file_name() == Some(std::ffi::OsStr::new("MacOS")))
+        .and_then(Path::parent)
+        .filter(|parent| parent.file_name() == Some(std::ffi::OsStr::new("Contents")));
+    let bundle = contents.and_then(Path::parent);
+    check.bundle = bundle.is_some();
+    let plist = if let Some(contents) = contents {
+        let Ok(bytes) = std::fs::read(contents.join("Info.plist")) else {
+            return false;
+        };
+        check.plist_read = true;
+        Some(bytes)
+    } else {
+        None
+    };
+    let path = bundle
+        .unwrap_or(expected_desktop_executable)
+        .as_os_str()
+        .as_bytes();
     unsafe {
         let Some(url) = Owned::new(CFURLCreateFromFileSystemRepresentation(
             kCFAllocatorDefault,
             path.as_ptr(),
             path.len() as isize,
-            0,
+            u8::from(bundle.is_some()),
         )) else {
             return false;
         };
         let mut static_code = std::ptr::null();
-        if SecStaticCodeCreateWithPath(url.0, DEFAULT_FLAGS, &mut static_code) != 0 {
+        let status = SecStaticCodeCreateWithPath(url.0, DEFAULT_FLAGS, &mut static_code);
+        check.sec_static_code_create_with_path = Some(status);
+        if status != 0 {
             return false;
         }
         let Some(static_code) = Owned::new(static_code) else {
             return false;
         };
+        if bundle.is_some() {
+            // Validate the bundle seal before binding its plist to the live code.
+            const CHECK_ALL_ARCHITECTURES: u32 = 1 << 0;
+            let status = SecStaticCodeCheckValidity(
+                static_code.0,
+                CHECK_ALL_ARCHITECTURES,
+                std::ptr::null(),
+            );
+            check.sec_static_code_check_validity = Some(status);
+            if status != 0 {
+                return false;
+            }
+        }
         let mut requirement = std::ptr::null();
-        if SecCodeCopyDesignatedRequirement(static_code.0, DEFAULT_FLAGS, &mut requirement) != 0 {
+        let status =
+            SecCodeCopyDesignatedRequirement(static_code.0, DEFAULT_FLAGS, &mut requirement);
+        check.sec_code_copy_designated_requirement = Some(status);
+        if status != 0 {
             return false;
         }
         let Some(requirement) = Owned::new(requirement) else {
@@ -188,9 +281,68 @@ fn audit_token_satisfies(token: &AuditToken, expected_desktop_executable: &Path)
         )) else {
             return false;
         };
-        let keys = [kSecGuestAttributeAudit];
-        let values = [token_data.0];
+        // Executable-path bundle discovery can lose the signed Info.plist binding.
+        // Supply the raw plist with the audit token. Security checks its signed hash.
+        // Keep both the bundle seal check and the live designated requirement check.
+        let plist_data = match plist {
+            Some(bytes) => {
+                let Some(data) = Owned::new(CFDataCreate(
+                    kCFAllocatorDefault,
+                    bytes.as_ptr(),
+                    bytes.len() as isize,
+                )) else {
+                    return false;
+                };
+                Some(data)
+            }
+            None => None,
+        };
+        let mut keys = vec![kSecGuestAttributeAudit];
+        let mut values = vec![token_data.0];
+        if let Some(data) = &plist_data {
+            keys.extend([
+                kSecGuestAttributeDynamicCode,
+                kSecGuestAttributeDynamicCodeInfoPlist,
+            ]);
+            values.extend([kCFBooleanTrue, data.0]);
+        }
         let Some(attributes) = Owned::new(CFDictionaryCreate(
+            kCFAllocatorDefault,
+            keys.as_ptr(),
+            values.as_ptr(),
+            keys.len() as isize,
+            std::ptr::addr_of!(kCFTypeDictionaryKeyCallBacks).cast(),
+            std::ptr::addr_of!(kCFTypeDictionaryValueCallBacks).cast(),
+        )) else {
+            return false;
+        };
+        let mut guest = std::ptr::null();
+        let status = SecCodeCopyGuestWithAttributes(
+            std::ptr::null(),
+            attributes.0,
+            DEFAULT_FLAGS,
+            &mut guest,
+        );
+        check.sec_code_copy_guest_with_attributes = Some(status);
+        if status != 0 {
+            return false;
+        }
+        let Some(guest) = Owned::new(guest) else {
+            return false;
+        };
+        let status = SecCodeCheckValidity(guest.0, DEFAULT_FLAGS, requirement.0);
+        check.sec_code_check_validity = Some(status);
+        if status != 0 {
+            return false;
+        }
+        if bundle.is_none() {
+            return true;
+        }
+
+        // Bind the live code to the installed build, not just its signing identity.
+        // A replaced executable must not admit an older process with the same requirement.
+        // The disk guest selects the peer's slice, including a peer under Rosetta.
+        let Some(disk_attributes) = Owned::new(CFDictionaryCreate(
             kCFAllocatorDefault,
             keys.as_ptr(),
             values.as_ptr(),
@@ -200,16 +352,47 @@ fn audit_token_satisfies(token: &AuditToken, expected_desktop_executable: &Path)
         )) else {
             return false;
         };
-        let mut guest = std::ptr::null();
-        if SecCodeCopyGuestWithAttributes(std::ptr::null(), attributes.0, DEFAULT_FLAGS, &mut guest)
-            != 0
-        {
+        let mut disk_guest = std::ptr::null();
+        let status = SecCodeCopyGuestWithAttributes(
+            std::ptr::null(),
+            disk_attributes.0,
+            DEFAULT_FLAGS,
+            &mut disk_guest,
+        );
+        check.sec_code_copy_guest_with_attributes_disk = Some(status);
+        if status != 0 {
             return false;
         }
-        let Some(guest) = Owned::new(guest) else {
+        let Some(disk_guest) = Owned::new(disk_guest) else {
             return false;
         };
-        SecCodeCheckValidity(guest.0, DEFAULT_FLAGS, requirement.0) == 0
+        let mut disk_information = std::ptr::null();
+        let status =
+            SecCodeCopySigningInformation(disk_guest.0, DEFAULT_FLAGS, &mut disk_information);
+        check.sec_code_copy_signing_information_disk = Some(status);
+        if status != 0 {
+            return false;
+        }
+        let Some(disk_information) = Owned::new(disk_information) else {
+            return false;
+        };
+        let mut peer_information = std::ptr::null();
+        let status = SecCodeCopySigningInformation(guest.0, DEFAULT_FLAGS, &mut peer_information);
+        check.sec_code_copy_signing_information_peer = Some(status);
+        if status != 0 {
+            return false;
+        }
+        let Some(peer_information) = Owned::new(peer_information) else {
+            return false;
+        };
+        let disk_hashes = CFDictionaryGetValue(disk_information.0, kSecCodeInfoCdHashes);
+        let peer_hash = CFDictionaryGetValue(peer_information.0, kSecCodeInfoUnique);
+        if disk_hashes.is_null() || peer_hash.is_null() {
+            return false;
+        }
+        check.code_hash_match = (0..CFArrayGetCount(disk_hashes))
+            .any(|index| CFEqual(CFArrayGetValueAtIndex(disk_hashes, index), peer_hash) != 0);
+        check.code_hash_match
     }
 }
 
@@ -230,6 +413,155 @@ mod tests {
         let client = UnixStream::connect(&path).unwrap();
         let (server, _) = listener.accept().unwrap();
         (client, server, directory)
+    }
+
+    #[test]
+    fn signed_bundle_routes_require_the_live_signature_and_unchanged_bundle() {
+        use super::super::{name_macos_attach_connection_route, MacosAttachConnectionRoute};
+        use std::io::Read;
+        use std::process::{Child, Command};
+
+        struct Fixture {
+            directory: PathBuf,
+            child: Option<Child>,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                if let Some(child) = &mut self.child {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                let _ = std::fs::remove_dir_all(&self.directory);
+            }
+        }
+        fn run(command: &mut Command) {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let mut fixture = Fixture {
+            directory: PathBuf::from("/tmp").join(format!(
+                "muniment-signed-route-{}",
+                uuid::Uuid::now_v7().simple()
+            )),
+            child: None,
+        };
+        let app = fixture.directory.join("Peer.app");
+        let contents = app.join("Contents");
+        std::fs::create_dir_all(contents.join("MacOS")).unwrap();
+        let executable = contents.join("MacOS/peer");
+        let plist = contents.join("Info.plist");
+        let plist_bytes = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>peer</string>
+<key>CFBundleIdentifier</key><string>ai.muniment.route-test</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+</dict></plist>"#;
+        std::fs::write(&plist, plist_bytes).unwrap();
+        let source = fixture.directory.join("peer.c");
+        std::fs::write(
+            &source,
+            r#"#include <sys/socket.h>
+#include <sys/un.h>
+#include <string.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    if (argc != 2) return BUILD;
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    if (strlen(argv[1]) >= sizeof(address.sun_path)) return 2;
+    strcpy(address.sun_path, argv[1]);
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0 || connect(fd, (void *)&address, sizeof(address))) return 3;
+    if (write(fd, "!", 1) != 1) return 4;
+    char done;
+    read(fd, &done, 1);
+    close(fd);
+    return 0;
+}
+"#,
+        )
+        .unwrap();
+        let compile = |output: &Path, build: &str| {
+            run(Command::new("/usr/bin/clang")
+                .arg(format!("-DBUILD={build}"))
+                .arg(&source)
+                .arg("-o")
+                .arg(output));
+        };
+        let sign = || {
+            run(Command::new("/usr/bin/codesign")
+                .args([
+                    "--force",
+                    "--sign",
+                    "-",
+                    "--identifier",
+                    "ai.muniment.route-test",
+                ])
+                .args([
+                    "--requirements",
+                    "designated => identifier \"ai.muniment.route-test\"",
+                ])
+                .arg(&app));
+        };
+        compile(&executable, "1");
+        sign();
+        let endpoint = fixture.directory.join("s.sock");
+        let listener = UnixListener::bind(&endpoint).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        fixture.child = Some(Command::new(&executable).arg(&endpoint).spawn().unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut server = loop {
+            match listener.accept() {
+                Ok((server, _)) => break server,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "The peer did not connect."
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        };
+        server
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        server.read_exact(&mut [0]).unwrap();
+        let peer_pid = fixture.child.as_ref().unwrap().id();
+        // proc_pidpath resolves /tmp to /private/tmp on macOS.
+        let expected = executable.canonicalize().unwrap();
+        let reader = NativeMacosAttachRouteReader::new(&server);
+        assert_eq!(
+            name_macos_attach_connection_route(&reader, &expected),
+            MacosAttachConnectionRoute::DesktopClient { peer_pid },
+            "{:?}",
+            reader.code_check.borrow()
+        );
+        assert_eq!(reader.code_check.borrow().sec_code_check_validity, Some(0));
+        assert!(reader.code_check.borrow().code_hash_match);
+
+        std::fs::write(&plist, b"invalid plist").unwrap();
+        assert_eq!(
+            name_macos_attach_connection_route(&reader, &expected),
+            MacosAttachConnectionRoute::Companion { peer_pid }
+        );
+        std::fs::write(&plist, plist_bytes).unwrap();
+
+        // Replace the file without changing the running image or the designated requirement.
+        let replacement = fixture.directory.join("replacement");
+        compile(&replacement, "2");
+        std::fs::rename(replacement, &executable).unwrap();
+        sign();
+        assert!(!reader.peer_code_matches(&expected));
+        assert_eq!(reader.code_check.borrow().sec_code_check_validity, Some(0));
+        assert!(!reader.code_check.borrow().code_hash_match);
+        assert_eq!(
+            name_macos_attach_connection_route(&reader, &expected),
+            MacosAttachConnectionRoute::Companion { peer_pid }
+        );
     }
 
     #[test]
