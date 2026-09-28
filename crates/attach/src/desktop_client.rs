@@ -459,8 +459,28 @@ impl DesktopClient {
         }
         let mut body = thread_read_body(limit, cursor)?;
         body["thread_id"] = Value::String(thread_id.into());
-        body["snapshot_chunks"] = Value::Bool(true);
-        Ok(self.request(Operation::ThreadHistory, None, body)?.body)
+        Ok(self.snapshot_request(Operation::ThreadHistory, body)?.body)
+    }
+
+    fn snapshot_request(
+        &mut self,
+        operation: Operation,
+        body: Value,
+    ) -> Result<Response, ClientError> {
+        let request_deadline = deadline(self.io_timeout);
+        let mut chunk_body = body.clone();
+        chunk_body["snapshot_chunks"] = Value::Bool(true);
+        let result = self.request_before(operation, None, chunk_body, request_deadline);
+        if result.is_err()
+            && self
+                .last_request_error()
+                .is_some_and(|error| error.code() == crate::ErrorCode::InvalidRequest)
+        {
+            // An older runtime can keep active runs alive during an upgrade.
+            // Retry its original request shape within the same deadline.
+            return self.request_before(operation, None, body, request_deadline);
+        }
+        result
     }
 
     pub fn subscribe_chat_events(&mut self) -> Result<String, ClientError> {
@@ -470,11 +490,7 @@ impl DesktopClient {
             subscription_id: String,
         }
 
-        let response = self.request(
-            Operation::RunChatEvents,
-            None,
-            serde_json::json!({"snapshot_chunks": true}),
-        )?;
+        let response = self.snapshot_request(Operation::RunChatEvents, serde_json::json!({}))?;
         let subscription: Subscription =
             serde_json::from_value(response.body).map_err(|_| ClientError::UnexpectedMessage)?;
         let subscription_id =
@@ -806,6 +822,236 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
+
+    fn snapshot_request(server: &mut UnixStream, operation: Operation, body: Value) -> Request {
+        let request: Request =
+            serde_json::from_value(read_value(server, deadline(Duration::from_secs(5))).unwrap())
+                .unwrap();
+        assert_eq!(request.operation, operation);
+        assert_eq!(request.body, body);
+        request
+    }
+
+    fn snapshot_reply(server: &mut UnixStream, request: &Request, body: Value) {
+        server
+            .write_all(
+                &encode_frame(&Response {
+                    protocol: Protocol,
+                    request_id: request.request_id.clone(),
+                    ok: crate::Success,
+                    body,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+    }
+
+    fn snapshot_reject(server: &mut UnixStream, request: &Request, error: crate::ProtocolError) {
+        server
+            .write_all(
+                &encode_frame(&crate::ErrorEnvelope {
+                    protocol: Protocol,
+                    request_id: Some(request.request_id.clone()),
+                    ok: crate::Failure,
+                    error,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+    }
+
+    fn legacy_snapshot_request(
+        server: &mut UnixStream,
+        operation: Operation,
+        body: Value,
+    ) -> Request {
+        let mut chunk_body = body.clone();
+        chunk_body["snapshot_chunks"] = Value::Bool(true);
+        let first = snapshot_request(server, operation, chunk_body);
+        snapshot_reject(server, &first, crate::ProtocolError::invalid_request());
+        let retry = snapshot_request(server, operation, body);
+        assert_ne!(first.request_id, retry.request_id);
+        assert!(retry.idempotency_key.is_none());
+        retry
+    }
+
+    #[test]
+    fn snapshot_legacy_runtime_drain_keeps_history_events_and_stop_usable() {
+        let (control_socket, mut control) = UnixStream::pair().unwrap();
+        let (event_socket, mut events) = UnixStream::pair().unwrap();
+        let run_id = "018f0000-0000-7000-8000-000000000201";
+        let subscription = fresh_request_id().unwrap();
+        let worker = std::thread::spawn(move || {
+            let history_body = serde_json::json!({
+                "thread_id": "thread-1", "limit": 100, "cursor": "message-cursor-1"
+            });
+            let request = legacy_snapshot_request(
+                &mut control,
+                Operation::ThreadHistory,
+                history_body.clone(),
+            );
+            snapshot_reply(
+                &mut control,
+                &request,
+                serde_json::json!({
+                    "thread_id": "thread-1", "entries": [{"run_id": run_id, "phase": "running"}],
+                    "next_cursor": null
+                }),
+            );
+            let request = legacy_snapshot_request(
+                &mut events,
+                Operation::RunChatEvents,
+                serde_json::json!({}),
+            );
+            snapshot_reply(
+                &mut events,
+                &request,
+                serde_json::json!({
+                    "subscription_id": subscription
+                }),
+            );
+            let request = snapshot_request(
+                &mut control,
+                Operation::RunSubmit,
+                serde_json::json!({
+                    "text": "next", "files": [], "thread_id": "thread-1"
+                }),
+            );
+            snapshot_reject(
+                &mut control,
+                &request,
+                crate::ProtocolError::runtime_draining(),
+            );
+            let request = snapshot_request(
+                &mut control,
+                Operation::RunCancel,
+                serde_json::json!({
+                    "run_id": run_id
+                }),
+            );
+            assert!(request.idempotency_key.is_some());
+            snapshot_reply(
+                &mut control,
+                &request,
+                serde_json::json!({
+                    "run_id": run_id, "accepted_at": "2026-01-01T00:00:00Z"
+                }),
+            );
+            events.write_all(&encode_frame(&serde_json::json!({
+                "protocol": PROTOCOL, "event": "chat.event", "subscription_id": subscription,
+                "body": {"runId": run_id, "phase": "complete"}
+            })).unwrap()).unwrap();
+            let request =
+                legacy_snapshot_request(&mut control, Operation::ThreadHistory, history_body);
+            snapshot_reply(
+                &mut control,
+                &request,
+                serde_json::json!({
+                    "thread_id": "thread-1", "entries": [{"run_id": run_id, "phase": "complete"}],
+                    "next_cursor": null
+                }),
+            );
+        });
+        let mut control = desktop_client_for_test(
+            Box::new(control_socket),
+            "0.0.1".into(),
+            Duration::from_secs(5),
+        );
+        let mut events = desktop_client_for_test(
+            Box::new(event_socket),
+            "0.0.1".into(),
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            control
+                .thread_history("thread-1", 100, Some("message-cursor-1"))
+                .unwrap()["entries"][0]["phase"],
+            "running"
+        );
+        assert_eq!(control.last_request_error(), None);
+        events.subscribe_chat_events().unwrap();
+        assert_eq!(events.last_request_error(), None);
+        assert_eq!(
+            control.run_submit("next", &[], Some("thread-1")),
+            Err(ClientError::RequestRejected)
+        );
+        assert_eq!(
+            control.last_request_error(),
+            Some(&crate::ProtocolError::runtime_draining())
+        );
+        assert_eq!(control.run_cancel(run_id).unwrap().run_id, run_id);
+        assert_eq!(control.last_request_error(), None);
+        assert_eq!(
+            events.read_chat_event().unwrap(),
+            serde_json::json!({"runId": run_id, "phase": "complete"})
+        );
+        assert_eq!(
+            control
+                .thread_history("thread-1", 100, Some("message-cursor-1"))
+                .unwrap()["entries"][0]["phase"],
+            "complete"
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn snapshot_fallback_retries_only_invalid_request_once() {
+        for chat in [false, true] {
+            for error in [
+                crate::ProtocolError::invalid_request(),
+                crate::ProtocolError::runtime_draining(),
+                crate::ProtocolError::unauthorized(),
+            ] {
+                let (socket, mut server) = UnixStream::pair().unwrap();
+                let expected = error.clone();
+                let worker = std::thread::spawn(move || {
+                    let (operation, body) = if chat {
+                        (Operation::RunChatEvents, serde_json::json!({}))
+                    } else {
+                        (
+                            Operation::ThreadHistory,
+                            serde_json::json!({"thread_id": "thread-1", "limit": 1}),
+                        )
+                    };
+                    let mut chunk_body = body.clone();
+                    chunk_body["snapshot_chunks"] = Value::Bool(true);
+                    let request = snapshot_request(&mut server, operation, chunk_body);
+                    snapshot_reject(&mut server, &request, error.clone());
+                    if error.code() == crate::ErrorCode::InvalidRequest {
+                        let request = snapshot_request(&mut server, operation, body);
+                        snapshot_reject(&mut server, &request, error);
+                    }
+                    // The next request must remain usable after either rejection.
+                    let request = snapshot_request(
+                        &mut server,
+                        Operation::SessionStatus,
+                        serde_json::json!({}),
+                    );
+                    snapshot_reply(
+                        &mut server,
+                        &request,
+                        serde_json::json!({"signed_in": false, "subject": null, "expires_at": null}),
+                    );
+                });
+                let mut client = desktop_client_for_test(
+                    Box::new(socket),
+                    "0.0.1".into(),
+                    Duration::from_secs(5),
+                );
+                let result = if chat {
+                    client.subscribe_chat_events().map(Value::String)
+                } else {
+                    client.thread_history("thread-1", 1, None)
+                };
+                assert_eq!(result, Err(map_protocol_error(expected.code())));
+                assert_eq!(client.last_request_error(), Some(&expected));
+                assert!(client.chat_subscription_id.is_none());
+                client.session_status().unwrap();
+                assert_eq!(client.last_request_error(), None);
+                worker.join().unwrap();
+            }
+        }
+    }
 
     #[test]
     fn snapshot_reads_validate_every_envelope_and_discard_partial_state() {
