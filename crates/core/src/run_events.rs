@@ -153,20 +153,31 @@ impl Serialize for ChatEvent {
 #[derive(Clone, Debug, Default)]
 pub struct ChatDelivery {
     snapshot: Option<(u64, Instant)>,
+    #[cfg(test)]
+    now: Option<Instant>,
 }
 
 impl ChatDelivery {
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = self.now {
+            return now;
+        }
+        Instant::now()
+    }
+
     /// Reports whether a text event may go out as a delta: a whole state went
     /// out since the newest subscription started, and less than the snapshot
     /// interval ago.
     fn allows_delta(&self, generation: u64) -> bool {
         self.snapshot.is_some_and(|(delivered, at)| {
-            delivered == generation && at.elapsed() < CHAT_SNAPSHOT_INTERVAL
+            delivered == generation
+                && self.now().saturating_duration_since(at) < CHAT_SNAPSHOT_INTERVAL
         })
     }
 
     pub(crate) fn delivered_snapshot(&mut self, generation: u64) {
-        self.snapshot = Some((generation, Instant::now()));
+        self.snapshot = Some((generation, self.now()));
     }
 }
 
@@ -1040,12 +1051,43 @@ mod tests {
         }
     }
 
+    fn projector_with_frozen_clock() -> ChatProjector {
+        let mut projector = ChatProjector::new();
+        // Journal writes must not advance the snapshot clock in these tests.
+        projector.delivery.now = Some(Instant::now());
+        projector
+    }
+
+    #[test]
+    fn deltas_require_a_current_subscription_and_an_unexpired_snapshot() {
+        let start = Instant::now();
+        let mut delivery = ChatDelivery {
+            now: Some(start),
+            ..ChatDelivery::default()
+        };
+        assert!(!delivery.allows_delta(1));
+        delivery.delivered_snapshot(1);
+        assert!(delivery.allows_delta(1));
+        assert!(!delivery.allows_delta(2));
+
+        delivery.now = Some(start + CHAT_SNAPSHOT_INTERVAL - Duration::from_nanos(1));
+        assert!(delivery.allows_delta(1));
+        delivery.now = Some(start + CHAT_SNAPSHOT_INTERVAL);
+        assert!(!delivery.allows_delta(1));
+        delivery.now = Some(start + CHAT_SNAPSHOT_INTERVAL + Duration::from_nanos(1));
+        assert!(!delivery.allows_delta(1));
+
+        delivery.delivered_snapshot(2);
+        assert!(delivery.allows_delta(2));
+        assert!(!delivery.allows_delta(1));
+    }
+
     #[test]
     fn a_text_event_after_a_whole_state_carries_only_the_appended_text() {
         let (sink, projector, run_id) = without_new_subscriptions(|| {
             let sink = RecordingSink::default();
             let storage = storage();
-            let mut projector = ChatProjector::new();
+            let mut projector = projector_with_frozen_clock();
             let mut seq = 0;
             let run_id = Uuid::now_v7().to_string();
             for (kind, payload) in [
@@ -1088,7 +1130,7 @@ mod tests {
         let (sink, storage, mut projector, mut seq, run_id) = without_new_subscriptions(|| {
             let sink = RecordingSink::default();
             let storage = storage();
-            let mut projector = ChatProjector::new();
+            let mut projector = projector_with_frozen_clock();
             let mut seq = 0;
             let run_id = Uuid::now_v7().to_string();
             stream(
@@ -1140,7 +1182,7 @@ mod tests {
     fn a_text_stream_sends_its_whole_state_again_after_the_snapshot_interval() {
         let sink = RecordingSink::default();
         let storage = storage();
-        let mut projector = ChatProjector::new();
+        let mut projector = projector_with_frozen_clock();
         let mut seq = 0;
         let run_id = Uuid::now_v7().to_string();
         stream(
@@ -1152,11 +1194,7 @@ mod tests {
             "run.started",
             json!({}),
         );
-        let generation = projector.delivery.snapshot.unwrap().0;
-        projector.delivery.snapshot = Some((
-            generation,
-            Instant::now().checked_sub(CHAT_SNAPSHOT_INTERVAL).unwrap(),
-        ));
+        projector.delivery.now = Some(projector.delivery.now() + CHAT_SNAPSHOT_INTERVAL);
         stream(
             &sink,
             &storage,
