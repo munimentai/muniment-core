@@ -3362,6 +3362,7 @@ dependencies = [
  "cc",
  "cef",
  "chrono",
+ "core-foundation 0.10.1",
  "core-graphics",
  "cpal",
  "flate2",
