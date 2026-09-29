@@ -27,7 +27,14 @@ pub trait MacosAttachRouteReader {
     fn peer_code_matches(&self, expected_desktop_executable: &Path) -> bool;
 
     /// Records a payload-free diagnostic when the peer cannot use desktop routes.
-    fn log_companion_fallback(&self, _peer_pid: u32, _path_match: bool) {}
+    fn log_companion_fallback(
+        &self,
+        _peer_pid: u32,
+        _path_match: bool,
+        _peer_image_path: Option<&Path>,
+        _expected_desktop_executable: &Path,
+    ) {
+    }
 }
 
 /// Names the route from the connected peer image path.
@@ -36,16 +43,28 @@ pub fn name_macos_attach_connection_route(
     expected_desktop_executable: &Path,
 ) -> MacosAttachConnectionRoute {
     let Ok((peer_pid, peer_image_path)) = reader.peer_process() else {
-        reader.log_companion_fallback(0, false);
+        reader.log_companion_fallback(0, false, None, expected_desktop_executable);
         return MacosAttachConnectionRoute::Companion { peer_pid: 0 };
     };
     let path_match = peer_image_path.is_absolute()
         && expected_desktop_executable.is_absolute()
-        && peer_image_path == expected_desktop_executable;
+        && match (
+            peer_image_path.canonicalize(),
+            expected_desktop_executable.canonicalize(),
+        ) {
+            (Ok(peer), Ok(expected)) => peer == expected,
+            _ => false,
+        };
+    // Canonical paths select candidates. The audit-token code check controls admission.
     if path_match && reader.peer_code_matches(expected_desktop_executable) {
         MacosAttachConnectionRoute::DesktopClient { peer_pid }
     } else {
-        reader.log_companion_fallback(peer_pid, path_match);
+        reader.log_companion_fallback(
+            peer_pid,
+            path_match,
+            Some(&peer_image_path),
+            expected_desktop_executable,
+        );
         MacosAttachConnectionRoute::Companion { peer_pid }
     }
 }
@@ -72,22 +91,54 @@ pub fn name_macos_desktop_attach_connection_route(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
 
-    struct StubRouteReader(Result<(u32, PathBuf), MacosPeerReadError>, bool);
+    struct Bundle {
+        root: PathBuf,
+        executable: PathBuf,
+    }
+
+    impl Bundle {
+        fn new() -> Self {
+            let root =
+                std::env::temp_dir().join(format!("muniment-macos-route-{}", uuid::Uuid::new_v4()));
+            let executable = root.join("Muniment.app/Contents/MacOS/muniment");
+            std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+            std::fs::write(&executable, b"desktop fixture").unwrap();
+            Self { root, executable }
+        }
+    }
+
+    impl Drop for Bundle {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    struct StubRouteReader {
+        peer: Result<(u32, PathBuf), MacosPeerReadError>,
+        code_matches: bool,
+        checked: RefCell<Option<PathBuf>>,
+    }
 
     impl StubRouteReader {
         fn signed(peer: Result<(u32, PathBuf), MacosPeerReadError>) -> Self {
-            Self(peer, true)
+            Self {
+                peer,
+                code_matches: true,
+                checked: RefCell::new(None),
+            }
         }
     }
 
     impl MacosAttachRouteReader for StubRouteReader {
         fn peer_process(&self) -> Result<(u32, PathBuf), MacosPeerReadError> {
-            self.0.clone()
+            self.peer.clone()
         }
 
-        fn peer_code_matches(&self, _: &Path) -> bool {
-            self.1
+        fn peer_code_matches(&self, expected: &Path) -> bool {
+            *self.checked.borrow_mut() = Some(expected.to_owned());
+            self.code_matches
         }
     }
 
@@ -95,15 +146,23 @@ mod tests {
     fn reports_failed_desktop_checks_without_admitting_the_peer() {
         use std::cell::Cell;
 
+        #[derive(Debug, PartialEq)]
+        struct Fallback {
+            pid: u32,
+            path_match: bool,
+            peer: Option<PathBuf>,
+            expected: PathBuf,
+        }
+
         struct Reader {
-            path: PathBuf,
+            peer: Result<(u32, PathBuf), MacosPeerReadError>,
             code_matches: bool,
             checked: Cell<bool>,
-            fallback: Cell<Option<(u32, bool)>>,
+            fallback: RefCell<Option<Fallback>>,
         }
         impl MacosAttachRouteReader for Reader {
             fn peer_process(&self) -> Result<(u32, PathBuf), MacosPeerReadError> {
-                Ok((42, self.path.clone()))
+                self.peer.clone()
             }
 
             fn peer_code_matches(&self, _: &Path) -> bool {
@@ -111,68 +170,83 @@ mod tests {
                 self.code_matches
             }
 
-            fn log_companion_fallback(&self, pid: u32, path_match: bool) {
-                self.fallback.set(Some((pid, path_match)));
+            fn log_companion_fallback(
+                &self,
+                pid: u32,
+                path_match: bool,
+                peer_image_path: Option<&Path>,
+                expected_desktop_executable: &Path,
+            ) {
+                *self.fallback.borrow_mut() = Some(Fallback {
+                    pid,
+                    path_match,
+                    peer: peer_image_path.map(Path::to_owned),
+                    expected: expected_desktop_executable.to_owned(),
+                });
             }
         }
-        let expected = Path::new("/Applications/Muniment.app/Contents/MacOS/muniment");
+        let bundle = Bundle::new();
+        let expected = bundle.executable.as_path();
         for (path, code_matches, path_match) in [
-            (expected, false, true),
+            (Some(expected), false, true),
             (
-                Path::new("/Applications/Other.app/Contents/MacOS/other"),
+                Some(Path::new("/Applications/Other.app/Contents/MacOS/other")),
                 true,
                 false,
             ),
-            (Path::new("muniment"), true, false),
+            (Some(Path::new("muniment")), true, false),
+            (Some(Path::new("")), true, false),
+            (None, true, false),
         ] {
+            let peer_pid = if path.is_some() { 42 } else { 0 };
             let reader = Reader {
-                path: path.to_owned(),
+                peer: path
+                    .map(|path| (peer_pid, path.to_owned()))
+                    .ok_or(MacosPeerReadError),
                 code_matches,
                 checked: Cell::new(false),
-                fallback: Cell::new(None),
+                fallback: RefCell::new(None),
             };
             assert_eq!(
                 name_macos_attach_connection_route(&reader, expected),
-                MacosAttachConnectionRoute::Companion { peer_pid: 42 }
+                MacosAttachConnectionRoute::Companion { peer_pid }
             );
             assert_eq!(reader.checked.get(), path_match);
-            assert_eq!(reader.fallback.get(), Some((42, path_match)));
+            assert_eq!(
+                *reader.fallback.borrow(),
+                Some(Fallback {
+                    pid: peer_pid,
+                    path_match,
+                    peer: path.map(Path::to_owned),
+                    expected: expected.to_owned(),
+                })
+            );
         }
     }
 
     #[test]
     fn routes_a_matching_path_without_the_code_signature_to_companion() {
-        let reader = StubRouteReader(
-            Ok((
-                42,
-                PathBuf::from("/Applications/Muniment.app/Contents/MacOS/muniment"),
-            )),
-            false,
-        );
+        let bundle = Bundle::new();
+        let mut reader = StubRouteReader::signed(Ok((42, bundle.executable.clone())));
+        reader.code_matches = false;
 
         assert_eq!(
-            name_macos_attach_connection_route(
-                &reader,
-                Path::new("/Applications/Muniment.app/Contents/MacOS/muniment")
-            ),
+            name_macos_attach_connection_route(&reader, &bundle.executable),
             MacosAttachConnectionRoute::Companion { peer_pid: 42 }
         );
+        assert_eq!(*reader.checked.borrow(), Some(bundle.executable.clone()));
     }
 
     #[test]
     fn routes_matching_absolute_image_to_desktop_client() {
-        let reader = StubRouteReader::signed(Ok((
-            42,
-            PathBuf::from("/Applications/Muniment.app/Contents/MacOS/muniment"),
-        )));
+        let bundle = Bundle::new();
+        let reader = StubRouteReader::signed(Ok((42, bundle.executable.clone())));
 
         assert_eq!(
-            name_macos_attach_connection_route(
-                &reader,
-                Path::new("/Applications/Muniment.app/Contents/MacOS/muniment")
-            ),
+            name_macos_attach_connection_route(&reader, &bundle.executable),
             MacosAttachConnectionRoute::DesktopClient { peer_pid: 42 }
         );
+        assert_eq!(*reader.checked.borrow(), Some(bundle.executable.clone()));
     }
 
     #[test]
@@ -190,23 +264,19 @@ mod tests {
 
     #[test]
     fn routes_relative_peer_image_to_companion() {
+        let bundle = Bundle::new();
         let reader = StubRouteReader::signed(Ok((42, PathBuf::from("muniment"))));
 
         assert_eq!(
-            name_macos_attach_connection_route(
-                &reader,
-                Path::new("/Applications/Muniment.app/Contents/MacOS/muniment")
-            ),
+            name_macos_attach_connection_route(&reader, &bundle.executable),
             MacosAttachConnectionRoute::Companion { peer_pid: 42 }
         );
     }
 
     #[test]
     fn routes_relative_expected_image_to_companion() {
-        let reader = StubRouteReader::signed(Ok((
-            42,
-            PathBuf::from("/Applications/Muniment.app/Contents/MacOS/muniment"),
-        )));
+        let bundle = Bundle::new();
+        let reader = StubRouteReader::signed(Ok((42, bundle.executable.clone())));
 
         assert_eq!(
             name_macos_attach_connection_route(&reader, Path::new("muniment")),
@@ -216,17 +286,84 @@ mod tests {
 
     #[test]
     fn routes_mismatched_image_to_companion() {
-        let reader = StubRouteReader::signed(Ok((
-            42,
-            PathBuf::from("/Applications/Other.app/Contents/MacOS/other"),
-        )));
+        let bundle = Bundle::new();
+        let other = Bundle::new();
+        let reader = StubRouteReader::signed(Ok((42, other.executable.clone())));
 
         assert_eq!(
-            name_macos_attach_connection_route(
-                &reader,
-                Path::new("/Applications/Muniment.app/Contents/MacOS/muniment")
-            ),
+            name_macos_attach_connection_route(&reader, &bundle.executable),
             MacosAttachConnectionRoute::Companion { peer_pid: 42 }
         );
+        assert_eq!(*reader.checked.borrow(), None);
+    }
+
+    #[test]
+    fn routes_unresolvable_paths_to_companion_without_a_code_check() {
+        let bundle = Bundle::new();
+        let missing = bundle.root.join("missing");
+        for (peer, expected) in [
+            (&missing, &bundle.executable),
+            (&bundle.executable, &missing),
+            (&missing, &missing),
+        ] {
+            let reader = StubRouteReader::signed(Ok((42, peer.clone())));
+            assert_eq!(
+                name_macos_attach_connection_route(&reader, expected),
+                MacosAttachConnectionRoute::Companion { peer_pid: 42 }
+            );
+            assert_eq!(*reader.checked.borrow(), None);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn routes_a_symlinked_bundle_location_only_after_the_code_check() {
+        let bundle = Bundle::new();
+        let location = bundle.root.join("linked-location");
+        std::os::unix::fs::symlink(&bundle.root, &location).unwrap();
+        let linked = location.join("Muniment.app/Contents/MacOS/muniment");
+        let canonical = bundle.executable.canonicalize().unwrap();
+        assert_ne!(linked, canonical);
+
+        for (peer, expected) in [(&canonical, &linked), (&linked, &canonical)] {
+            for code_matches in [true, false] {
+                let mut reader = StubRouteReader::signed(Ok((42, peer.clone())));
+                reader.code_matches = code_matches;
+                assert_eq!(
+                    name_macos_attach_connection_route(&reader, expected),
+                    if code_matches {
+                        MacosAttachConnectionRoute::DesktopClient { peer_pid: 42 }
+                    } else {
+                        MacosAttachConnectionRoute::Companion { peer_pid: 42 }
+                    }
+                );
+                assert_eq!(*reader.checked.borrow(), Some(expected.clone()));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn routes_broken_and_looping_symlinks_to_companion() {
+        let bundle = Bundle::new();
+        let broken = bundle.root.join("broken");
+        let looping = bundle.root.join("looping");
+        std::os::unix::fs::symlink(bundle.root.join("missing"), &broken).unwrap();
+        std::os::unix::fs::symlink(&looping, &looping).unwrap();
+
+        for path in [&broken, &looping] {
+            for (peer, expected) in [
+                (path, &bundle.executable),
+                (&bundle.executable, path),
+                (path, path),
+            ] {
+                let reader = StubRouteReader::signed(Ok((42, peer.clone())));
+                assert_eq!(
+                    name_macos_attach_connection_route(&reader, expected),
+                    MacosAttachConnectionRoute::Companion { peer_pid: 42 }
+                );
+                assert_eq!(*reader.checked.borrow(), None);
+            }
+        }
     }
 }

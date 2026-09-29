@@ -100,12 +100,18 @@ impl MacosAttachRouteReader for NativeMacosAttachRouteReader<'_> {
         audit_token_satisfies(&token, expected_desktop_executable, &mut check)
     }
 
-    fn log_companion_fallback(&self, peer_pid: u32, path_match: bool) {
+    fn log_companion_fallback(
+        &self,
+        peer_pid: u32,
+        path_match: bool,
+        peer_image_path: Option<&Path>,
+        expected_desktop_executable: &Path,
+    ) {
         if !path_match {
             *self.code_check.borrow_mut() = CodeCheck::default();
         }
         crate::runtime_eprintln!(
-            "muniment-runtime: macos attach route=Companion peer_pid={peer_pid} path_match={path_match} code_check={:?}",
+            "muniment-runtime: macos attach route=Companion peer_pid={peer_pid} path_match={path_match} peer_path={peer_image_path:?} expected_path={expected_desktop_executable:?} code_check={:?}",
             self.code_check.borrow()
         );
     }
