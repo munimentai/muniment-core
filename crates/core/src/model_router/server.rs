@@ -689,6 +689,7 @@ fn serve(stream: TcpStream, state: &State, token: &str) {
                 head.header("x-muniment-task").unwrap_or("default"),
                 head.header("x-muniment-validation-failures")
                     .and_then(|v| v.parse::<u32>().ok()),
+                head.header("x-muniment-request-purpose"),
             );
             state.progress.finish(progress.as_deref());
         }
@@ -731,6 +732,7 @@ fn complete(
     thread: Option<&str>,
     task: &str,
     failures: Option<u32>,
+    purpose: Option<&str>,
 ) {
     let thread = thread.filter(|id| id.len() == 64 && id.bytes().all(|c| c.is_ascii_hexdigit()));
     let _lease = if let Some(id) = thread {
@@ -1002,9 +1004,12 @@ fn complete(
                             state,
                             &account.id,
                             response,
-                            request,
-                            &route.model,
-                            &response_id,
+                            NativeRequest {
+                                body: request,
+                                model: &route.model,
+                                response_id: &response_id,
+                                purpose,
+                            },
                         );
                         match result {
                             Ok(tokens) => {
@@ -1159,6 +1164,13 @@ fn complete(
     );
 }
 
+struct NativeRequest<'a> {
+    body: &'a Value,
+    model: &'a str,
+    response_id: &'a str,
+    purpose: Option<&'a str>,
+}
+
 /// Native providers stream even when the caller wants one complete answer.
 /// Once a delta is delivered, errors end this turn and never replay it.
 fn relay_native(
@@ -1166,10 +1178,14 @@ fn relay_native(
     state: &State,
     account: &str,
     response: ureq::Response,
-    request: &Value,
-    model: &str,
-    response_id: &str,
+    request: NativeRequest<'_>,
 ) -> Result<Option<wire::Tokens>, String> {
+    let NativeRequest {
+        body: request,
+        model,
+        response_id,
+        purpose,
+    } = request;
     let streaming = wire::streams(request);
     let mut started = false;
     let mut decoder = transport::Decoder::new(model);
@@ -1248,7 +1264,7 @@ fn relay_native(
         return Ok(None);
     }
     super::subscription_probe::transport(&state.agent, model, "complete", "none");
-    record_subscription_probe(state, account, model, &decoder);
+    record_subscription_probe(state, account, model, &decoder, purpose);
     state.record_success(account, decoder.tokens);
     if streaming {
         if !started && stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n").is_err() { return Ok(None); }
@@ -1266,12 +1282,13 @@ fn relay_native(
     Ok(Some(decoder.tokens))
 }
 
-// The installed probe exports only model IDs and a digest of its synthetic reply.
+// The installed probe exports model IDs, a reply digest, and fixed request labels.
 fn record_subscription_probe(
     state: &State,
     account: &str,
     model: &str,
     decoder: &transport::Decoder,
+    purpose: Option<&str>,
 ) {
     use sha2::{Digest, Sha256};
     if std::env::var("MUNIMENT_SUBSCRIPTION_PROBE").as_deref() != Ok("1") {
@@ -1294,7 +1311,13 @@ fn record_subscription_probe(
     if !valid_id(model) {
         return;
     }
+    let purpose = match purpose {
+        None | Some("chat") => "chat",
+        Some("thread-name") => "thread-name",
+        Some(_) => "unknown",
+    };
     let receipt = serde_json::json!({
+        "purpose": purpose,
         "requested": model,
         "actual": if decoder.conflicting_models { None } else { actual },
         "subscription": subscription,
@@ -1690,6 +1713,77 @@ mod tests {
     }
 
     #[test]
+    fn native_probe_receipts_record_only_fixed_request_purposes() {
+        // Isolate the probe flag from concurrent router tests.
+        if std::env::var("MUNIMENT_SUBSCRIPTION_PROBE").as_deref() != Ok("1") {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "model_router::server::tests::native_probe_receipts_record_only_fixed_request_purposes",
+                ])
+                .env("MUNIMENT_SUBSCRIPTION_PROBE", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let agent = agent_dir();
+        let payload = [
+            json!({"type":"response.output_text.delta","delta":"PRIVATE REPLY"}),
+            json!({"type":"response.completed","response":{"model":"gpt-5.6-mini"}}),
+        ]
+        .iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+        let (url, _) = upstream(vec![(200, payload, true); 4]);
+        let mut native = account("s1", &url);
+        native.credential = Credential::Subscription {
+            provider: "openai-codex".into(),
+            access: "PRIVATE TOKEN".into(),
+            refresh: None,
+            expires_ms: None,
+            account_id: Some("s1".into()),
+            email: None,
+            plan: None,
+            renews_at_ms: None,
+        };
+        config::save(&agent, &config(vec![native])).unwrap();
+        let handle = start_with_clock(agent.clone(), fixed_clock).unwrap();
+        for (purpose, expected) in [
+            (Some("thread-name"), "thread-name"),
+            (None, "chat"),
+            (Some("chat"), "chat"),
+            (Some("PRIVATE PURPOSE"), "unknown"),
+        ] {
+            let endpoint = handle.endpoint();
+            let mut request = ureq::post(&format!(
+                "http://127.0.0.1:{}/v1/chat/completions",
+                endpoint.port
+            ))
+            .set("authorization", &format!("Bearer {}", endpoint.token));
+            if let Some(purpose) = purpose {
+                request = request.set("x-muniment-request-purpose", purpose);
+            }
+            request
+                .send_json(turn("auto", false))
+                .unwrap()
+                .into_string()
+                .unwrap();
+            let text =
+                std::fs::read_to_string(agent.join("subscription-probe-transports.jsonl")).unwrap();
+            assert!(!text.contains("PRIVATE"));
+            let receipt: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+            assert_eq!(receipt["purpose"], expected);
+            assert_eq!(receipt["requested"], "gpt-5.6-mini");
+            assert_eq!(receipt["actual"], "gpt-5.6-mini");
+            assert_eq!(receipt["subscription"], true);
+            assert_eq!(receipt["finished"], true);
+        }
+        drop(handle);
+        std::fs::remove_dir_all(agent).unwrap();
+    }
+
+    #[test]
     fn native_http_200_error_events_record_redacted_failure_classes() {
         // Isolate the probe flag from concurrent router tests.
         if std::env::var("MUNIMENT_SUBSCRIPTION_PROBE").as_deref() != Ok("1") {
@@ -1755,9 +1849,12 @@ mod tests {
                     &state,
                     "test-account",
                     response,
-                    &turn("test-model", true),
-                    "test-model",
-                    "test-response",
+                    NativeRequest {
+                        body: &turn("test-model", true),
+                        model: "test-model",
+                        response_id: "test-response",
+                        purpose: None,
+                    },
                 );
                 if partial {
                     assert!(result.unwrap().is_none());
