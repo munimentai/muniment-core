@@ -255,10 +255,10 @@ where
                 started.elapsed().as_millis(),
             ));
         }
-        // Dispatch can wait for browser sign-in. Its elapsed time is not frame I/O time.
-        let deadline = Instant::now() + REQUEST_TIMEOUT;
         match dispatched {
             Ok(dispatched) => {
+                // Dispatch can wait for browser sign-in. Its elapsed time is not frame I/O time.
+                let deadline = Instant::now() + REQUEST_TIMEOUT;
                 let response = Response {
                     protocol: Protocol,
                     request_id: request_id.clone(),
@@ -307,6 +307,8 @@ where
             }
             Err(failure) => {
                 diagnostic(request_rejection_line(Some(operation), &failure.error));
+                // Log writes do not consume the response frame deadline.
+                let deadline = Instant::now() + REQUEST_TIMEOUT;
                 write_request_error(stream, Some(request_id), failure.error, deadline);
                 for event in failure.events {
                     write_event(
@@ -1261,11 +1263,13 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("muniment-session-log-{}", uuid::Uuid::new_v4()));
         let log_directory = directory.clone();
+        let (recorded, records) = std::sync::mpsc::channel();
         let (mut client, mut server) = UnixStream::pair().unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         let worker = std::thread::spawn(move || {
+            let mut first_record = true;
             serve_desktop_client_requests_with_diagnostics(
                 &mut server,
                 "secret-capability",
@@ -1279,11 +1283,17 @@ mod tests {
                 },
                 &mut Service,
                 |line| {
+                    if first_record {
+                        // A slow log sink must not consume the response frame deadline.
+                        std::thread::sleep(REQUEST_TIMEOUT + Duration::from_millis(10));
+                        first_record = false;
+                    }
                     crate::runtime_diagnostics::write_runtime_service_record(
                         &log_directory,
                         format_args!("{line}"),
                     )
-                    .unwrap()
+                    .unwrap();
+                    recorded.send(()).unwrap();
                 },
             )
         });
@@ -1299,6 +1309,8 @@ mod tests {
                     .unwrap(),
                 )
                 .unwrap();
+            // Wait for disk I/O before the client's separate response read timeout starts.
+            records.recv_timeout(Duration::from_secs(30)).unwrap();
             read_error(&mut client);
         }
         drop(client);
