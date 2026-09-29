@@ -22,6 +22,7 @@ pub mod policy;
 mod progress;
 pub mod quota;
 pub mod server;
+pub mod subscription_probe;
 pub mod transport;
 pub mod usage;
 pub mod wire;
