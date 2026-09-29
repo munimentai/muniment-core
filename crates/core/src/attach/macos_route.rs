@@ -25,6 +25,9 @@ pub trait MacosAttachRouteReader {
     /// connect, and the token's pid version changes on exec, so a process that execs
     /// the desktop binary after it connects never matches.
     fn peer_code_matches(&self, expected_desktop_executable: &Path) -> bool;
+
+    /// Records a payload-free diagnostic when the peer cannot use desktop routes.
+    fn log_companion_fallback(&self, _peer_pid: u32, _path_match: bool) {}
 }
 
 /// Names the route from the connected peer image path.
@@ -33,17 +36,16 @@ pub fn name_macos_attach_connection_route(
     expected_desktop_executable: &Path,
 ) -> MacosAttachConnectionRoute {
     let Ok((peer_pid, peer_image_path)) = reader.peer_process() else {
+        reader.log_companion_fallback(0, false);
         return MacosAttachConnectionRoute::Companion { peer_pid: 0 };
     };
-    if !peer_image_path.is_absolute() || !expected_desktop_executable.is_absolute() {
-        return MacosAttachConnectionRoute::Companion { peer_pid };
-    }
-
-    if peer_image_path == expected_desktop_executable
-        && reader.peer_code_matches(expected_desktop_executable)
-    {
+    let path_match = peer_image_path.is_absolute()
+        && expected_desktop_executable.is_absolute()
+        && peer_image_path == expected_desktop_executable;
+    if path_match && reader.peer_code_matches(expected_desktop_executable) {
         MacosAttachConnectionRoute::DesktopClient { peer_pid }
     } else {
+        reader.log_companion_fallback(peer_pid, path_match);
         MacosAttachConnectionRoute::Companion { peer_pid }
     }
 }
@@ -86,6 +88,55 @@ mod tests {
 
         fn peer_code_matches(&self, _: &Path) -> bool {
             self.1
+        }
+    }
+
+    #[test]
+    fn reports_failed_desktop_checks_without_admitting_the_peer() {
+        use std::cell::Cell;
+
+        struct Reader {
+            path: PathBuf,
+            code_matches: bool,
+            checked: Cell<bool>,
+            fallback: Cell<Option<(u32, bool)>>,
+        }
+        impl MacosAttachRouteReader for Reader {
+            fn peer_process(&self) -> Result<(u32, PathBuf), MacosPeerReadError> {
+                Ok((42, self.path.clone()))
+            }
+
+            fn peer_code_matches(&self, _: &Path) -> bool {
+                self.checked.set(true);
+                self.code_matches
+            }
+
+            fn log_companion_fallback(&self, pid: u32, path_match: bool) {
+                self.fallback.set(Some((pid, path_match)));
+            }
+        }
+        let expected = Path::new("/Applications/Muniment.app/Contents/MacOS/muniment");
+        for (path, code_matches, path_match) in [
+            (expected, false, true),
+            (
+                Path::new("/Applications/Other.app/Contents/MacOS/other"),
+                true,
+                false,
+            ),
+            (Path::new("muniment"), true, false),
+        ] {
+            let reader = Reader {
+                path: path.to_owned(),
+                code_matches,
+                checked: Cell::new(false),
+                fallback: Cell::new(None),
+            };
+            assert_eq!(
+                name_macos_attach_connection_route(&reader, expected),
+                MacosAttachConnectionRoute::Companion { peer_pid: 42 }
+            );
+            assert_eq!(reader.checked.get(), path_match);
+            assert_eq!(reader.fallback.get(), Some((42, path_match)));
         }
     }
 
