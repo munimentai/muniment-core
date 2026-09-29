@@ -101,6 +101,15 @@ pub fn folder(profile: &Path, id: &str) -> Result<PathBuf, String> {
     Ok(folder)
 }
 fn write(path: &Path, content: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    write_with(path, content, fs::File::write_all, fs::File::sync_all)
+}
+fn write_with(
+    path: &Path,
+    content: &[u8],
+    write_temp: impl FnOnce(&mut fs::File, &[u8]) -> std::io::Result<()>,
+    sync_temp: impl FnOnce(&fs::File) -> std::io::Result<()>,
+) -> Result<(), String> {
     if path.is_symlink() {
         return Err("The agent file must not be a symbolic link.".into());
     }
@@ -110,17 +119,15 @@ fn write(path: &Path, content: &[u8]) -> Result<(), String> {
         .write(true)
         .open(&temporary)
         .map_err(|error| write_error("create_temp", error))?;
-    let result = (|| {
-        use std::io::Write;
-        file.write_all(content)
-            .map_err(|error| write_error("write_temp", error))?;
-        file.sync_all()
-            .map_err(|error| write_error("sync_temp", error))?;
-        // ReplaceFileW opens the replacement without sharing. Close our handle first.
-        drop(file);
+    let result = write_temp(&mut file, content)
+        .map_err(|error| write_error("write_temp", error))
+        .and_then(|()| sync_temp(&file).map_err(|error| write_error("sync_temp", error)));
+    // Close the handle before replacement or cleanup, including write and sync failures.
+    drop(file);
+    let result = result.and_then(|()| {
         crate::home::replace_file(&temporary, path)
             .map_err(|error| write_error("replace_file", error))
-    })();
+    });
     let _ = fs::remove_file(temporary);
     result
 }
@@ -534,6 +541,70 @@ mod tests {
         assert_eq!(fs::read(path.join("keep")).unwrap(), b"original");
         assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn write_and_sync_failures_remove_private_temporary_content() {
+        use std::io::Write;
+
+        for step in ["write_temp", "sync_temp"] {
+            for existing in [false, true] {
+                let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+                fs::create_dir_all(&root).unwrap();
+                let path = root.join("agent.md");
+                if existing {
+                    write(&path, b"original").unwrap();
+                }
+                let error = write_with(
+                    &path,
+                    b"private instructions",
+                    |file, content| {
+                        #[cfg(windows)]
+                        {
+                            use std::os::windows::fs::OpenOptionsExt;
+                            use windows_sys::Win32::Storage::FileSystem::{
+                                FILE_SHARE_READ, FILE_SHARE_WRITE,
+                            };
+
+                            // Deny deletion until the writer closes its handle.
+                            let temporary = fs::read_dir(&root)
+                                .unwrap()
+                                .map(|entry| entry.unwrap().path())
+                                .find(|entry| entry != &path)
+                                .unwrap();
+                            *file = fs::OpenOptions::new()
+                                .write(true)
+                                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                                .open(temporary)?;
+                        }
+                        if step == "write_temp" {
+                            file.write_all(&content[..7])?;
+                            return Err(std::io::Error::from_raw_os_error(112));
+                        }
+                        file.write_all(content)
+                    },
+                    |_| {
+                        assert_eq!(step, "sync_temp");
+                        Err(std::io::Error::from_raw_os_error(112))
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(
+                    error,
+                    write_error(step, std::io::Error::from_raw_os_error(112))
+                );
+                assert_eq!(fs::read_dir(&root).unwrap().count(), usize::from(existing));
+                if existing {
+                    assert_eq!(fs::read(&path).unwrap(), b"original");
+                } else {
+                    assert!(!path.exists());
+                }
+                write(&path, b"retry").unwrap();
+                assert_eq!(fs::read(&path).unwrap(), b"retry");
+                assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
     }
 
     #[test]
