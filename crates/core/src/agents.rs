@@ -105,18 +105,35 @@ fn write(path: &Path, content: &[u8]) -> Result<(), String> {
         return Err("The agent file must not be a symbolic link.".into());
     }
     let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-    let result = (|| -> std::io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|error| write_error("create_temp", error))?;
+    let result = (|| {
         use std::io::Write;
-        let mut file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
-        file.write_all(content)?;
-        file.sync_all()?;
+        file.write_all(content)
+            .map_err(|error| write_error("write_temp", error))?;
+        file.sync_all()
+            .map_err(|error| write_error("sync_temp", error))?;
+        // ReplaceFileW opens the replacement without sharing. Close our handle first.
+        drop(file);
         crate::home::replace_file(&temporary, path)
+            .map_err(|error| write_error("replace_file", error))
     })();
     let _ = fs::remove_file(temporary);
-    result.map_err(|_| "The agent could not be saved.".into())
+    result
+}
+fn write_error(step: &str, error: std::io::Error) -> String {
+    let code = error
+        .raw_os_error()
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "unavailable".into());
+    // Error text can contain paths or content. Report only the step and error codes.
+    format!(
+        "The agent save failed at {step} (OS error {code}, kind {:?}).",
+        error.kind()
+    )
 }
 pub fn state(profile: &Path) -> Result<State, String> {
     match fs::read(profile.join("agent-state.json")) {
@@ -477,6 +494,128 @@ pub fn delete(profile: &Path, id: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_diagnostics_report_steps_and_codes_without_private_text() {
+        for step in ["create_temp", "write_temp", "sync_temp", "replace_file"] {
+            let error = std::io::Error::from_raw_os_error(32);
+            assert_eq!(
+                write_error(step, error),
+                format!(
+                    "The agent save failed at {step} (OS error 32, kind {:?}).",
+                    std::io::Error::from_raw_os_error(32).kind()
+                )
+            );
+            let error =
+                std::io::Error::other("C:\\private\\agent.md contains private instructions");
+            assert_eq!(
+                write_error(step, error),
+                format!("The agent save failed at {step} (OS error unavailable, kind Other).")
+            );
+        }
+    }
+
+    #[test]
+    fn write_failures_report_the_step_and_remove_only_the_temporary_file() {
+        let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let path = root.join("private-agent.md");
+        let error = write(&path, b"private instructions").unwrap_err();
+        assert!(error.starts_with("The agent save failed at create_temp (OS error "));
+        assert!(!error.contains("unavailable"));
+        assert!(!error.contains("private"));
+        assert!(!root.exists());
+
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("keep"), b"original").unwrap();
+        let error = write(&path, b"private instructions").unwrap_err();
+        assert!(error.starts_with("The agent save failed at replace_file (OS error "));
+        assert!(!error.contains("unavailable"));
+        assert!(!error.contains("private"));
+        assert_eq!(fs::read(path.join("keep")).unwrap(), b"original");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn write_creates_and_replaces_agent_files_without_temporary_files() {
+        let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        fs::create_dir_all(&root).unwrap();
+        for name in [
+            "agent.md",
+            "agent-state.json",
+            "agent.backup.md",
+            "agent",
+            "agént.md",
+        ] {
+            let path = root.join(name);
+            for content in [b"first".as_slice(), b"replacement", b""] {
+                write(&path, content).unwrap();
+                assert_eq!(fs::read(&path).unwrap(), content);
+            }
+            fs::remove_file(path).unwrap();
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replacement_requires_a_closed_temporary_file() {
+        use std::io::Write;
+        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+
+        let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("agent-state.json");
+        fs::write(&path, b"original").unwrap();
+        let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .unwrap();
+        file.write_all(b"replacement").unwrap();
+        file.sync_all().unwrap();
+        let error = crate::home::replace_file(&temporary, &path).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(ERROR_SHARING_VIOLATION as i32));
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+        drop(file);
+        crate::home::replace_file(&temporary, &path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
+        assert!(!temporary.exists());
+
+        let reader = fs::File::open(&path).unwrap();
+        write(&path, b"saved with an open reader").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"saved with an open reader");
+        drop(reader);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_locked_target_reports_the_error_and_preserves_the_saved_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("agent.md");
+        write(&path, b"original").unwrap();
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)
+            .unwrap();
+        let error = write(&path, b"replacement").unwrap_err();
+        assert!(error.starts_with("The agent save failed at replace_file (OS error 32,"));
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        drop(locked);
+        write(&path, b"replacement").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn primary_selection_survives_later_runs_and_project_changes() {
         let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
