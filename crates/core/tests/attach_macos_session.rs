@@ -84,12 +84,13 @@ mod unix_tests {
         }
     }
 
-    fn route_reader(path: &str) -> StubRouteReader {
-        StubRouteReader(Ok((42, PathBuf::from(path))))
+    fn route_reader(path: &Path) -> StubRouteReader {
+        StubRouteReader(Ok((42, path.to_owned())))
     }
 
     fn expected_desktop_executable() -> &'static Path {
-        Path::new("/Applications/Muniment.app/Contents/MacOS/muniment")
+        static EXECUTABLE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        EXECUTABLE.get_or_init(|| std::env::current_exe().unwrap())
     }
 
     fn hello_frame(client_kind: &str) -> Vec<u8> {
@@ -131,7 +132,7 @@ mod unix_tests {
             let mut service = TestService::default();
             let outcome = serve_macos_attach_session_with_reader_and_state(
                 server,
-                &route_reader("/Applications/Muniment.app/Contents/MacOS/muniment"),
+                &route_reader(expected_desktop_executable()),
                 501,
                 expected_desktop_executable(),
                 "1.2.3",
@@ -265,7 +266,7 @@ mod unix_tests {
             client.write_all(&bytes).unwrap();
             let outcome = serve_macos_attach_session_with_reader_and_state(
                 server,
-                &route_reader("/Applications/Muniment.app/Contents/MacOS/muniment"),
+                &route_reader(expected_desktop_executable()),
                 501,
                 expected_desktop_executable(),
                 "1.2.3",
@@ -365,8 +366,9 @@ mod unix_tests {
 
     #[test]
     fn companion_route_records_the_verified_peer_identity() {
-        let (pairing_identity, provenance) =
-            run_companion_session(route_reader("/Applications/Other.app/Contents/MacOS/other"));
+        let (pairing_identity, provenance) = run_companion_session(route_reader(Path::new(
+            "/Applications/Other.app/Contents/MacOS/other",
+        )));
 
         assert_eq!(pairing_identity, "501:42");
         assert_eq!(provenance.peer_uid, 501);
@@ -391,7 +393,7 @@ mod unix_tests {
         let _presenter = coordinator.claim_presenter(|_| false).unwrap();
         let outcome = serve_macos_attach_session_with_reader_and_state(
             server,
-            &route_reader("/Applications/Muniment.app/Contents/MacOS/muniment"),
+            &route_reader(expected_desktop_executable()),
             501,
             expected_desktop_executable(),
             "1.2.3",
@@ -429,7 +431,7 @@ mod unix_tests {
         let session = std::thread::spawn(move || {
             serve_macos_attach_session_with_reader_and_state(
                 server,
-                &route_reader("/Applications/Muniment.app/Contents/MacOS/muniment"),
+                &route_reader(expected_desktop_executable()),
                 501,
                 expected_desktop_executable(),
                 "1.2.3",
@@ -469,7 +471,7 @@ mod unix_tests {
         client.write_all(&hello_frame("editor-extension")).unwrap();
         let outcome = serve_macos_attach_session_with_reader_and_state(
             server,
-            &route_reader("/Applications/Muniment.app/Contents/MacOS/muniment"),
+            &route_reader(expected_desktop_executable()),
             501,
             expected_desktop_executable(),
             "1.2.3",
