@@ -139,6 +139,36 @@ pub fn http_error(status: u16) -> &'static str {
     }
 }
 
+// Read structured codes only. Provider messages can contain credentials or reply text.
+pub fn event_error(event: &serde_json::Value) -> &'static str {
+    let error = match event["type"].as_str() {
+        Some("error") => event.get("error").unwrap_or(event),
+        Some("response.failed") => &event["response"]["error"],
+        _ => return "stream",
+    };
+    // A specific code takes precedence over a generic error type.
+    for field in ["code", "type"] {
+        match error[field].as_str().unwrap_or("") {
+            "authentication_error"
+            | "invalid_api_key"
+            | "invalid_token"
+            | "token_expired"
+            | "permission_error"
+            | "access_denied" => return "auth",
+            "rate_limit_error"
+            | "rate_limit_exceeded"
+            | "usage_limit_reached"
+            | "insufficient_quota"
+            | "quota_exceeded"
+            | "billing_hard_limit_reached" => {
+                return "quota";
+            }
+            _ => {}
+        }
+    }
+    "stream"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +199,46 @@ mod tests {
         while record(root, "reply", Some(0), "pending", "none").is_ok() {}
         assert!(std::fs::metadata(file).unwrap().len() <= LIMIT);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn http_200_error_events_separate_access_from_product_errors() {
+        use serde_json::json;
+        for (code, class) in [
+            ("invalid_api_key", "auth"),
+            ("authentication_error", "auth"),
+            ("permission_error", "auth"),
+            ("rate_limit_error", "quota"),
+            ("rate_limit_exceeded", "quota"),
+            ("usage_limit_reached", "quota"),
+            ("insufficient_quota", "quota"),
+            ("server_error", "stream"),
+            ("PRIVATE TOKEN", "stream"),
+        ] {
+            for event in [
+                json!({"type":"error","code":code,"message":"PRIVATE REPLY"}),
+                json!({"type":"error","error":{"type":code,"message":"PRIVATE REPLY"}}),
+                json!({"type":"response.failed","response":{"error":{"code":code,"message":"PRIVATE REPLY"}}}),
+            ] {
+                let body = format!("data: {event}\n\n");
+                let response = ureq::Response::new(200, "OK", &body).unwrap();
+                let text = response.into_string().unwrap();
+                let parsed: serde_json::Value =
+                    serde_json::from_str(text.trim().strip_prefix("data: ").unwrap()).unwrap();
+                let mut decoder = super::super::transport::Decoder::new("test-model");
+                assert!(decoder.event(&parsed).is_err());
+                assert_eq!(event_error(&parsed), class);
+            }
+        }
+        for event in [
+            json!({"type":"error","error":{"message":"rate_limit_exceeded"}}),
+            json!({"type":"response.incomplete","response":{"error":{"code":"insufficient_quota"}}}),
+            json!({"type":"response.output_text.delta","code":"invalid_api_key"}),
+            json!({"type":"error","error":{"code":429}}),
+            json!({}),
+        ] {
+            assert_eq!(event_error(&event), "stream");
+        }
     }
 
     #[test]

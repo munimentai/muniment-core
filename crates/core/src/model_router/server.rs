@@ -1178,6 +1178,7 @@ fn relay_native(
     let mut line = String::new();
     let mut data = String::new();
     let mut failure = None;
+    let mut failure_class = "stream";
     loop {
         line.clear();
         match reader.read_line(&mut line) {
@@ -1225,6 +1226,7 @@ fn relay_native(
             }
             Ok(_) => {}
             Err(error) => {
+                failure_class = super::subscription_probe::event_error(&event);
                 failure = Some(error);
                 break;
             }
@@ -1236,7 +1238,7 @@ fn relay_native(
     if !decoder.finished || failure.is_some() {
         let message =
             failure.unwrap_or_else(|| "The provider stream ended before completion.".into());
-        super::subscription_probe::transport(&state.agent, model, "failed", "stream");
+        super::subscription_probe::transport(&state.agent, model, "failed", failure_class);
         state.record_error(account, &message, false);
         if started {
             let _ = write_event(stream, &wire::error_body(&message, "provider_error"));
@@ -1685,6 +1687,99 @@ mod tests {
         assert_eq!(ledger.account("s1").unwrap().errors, 1);
         assert_eq!(ledger.account("s2").unwrap().input_tokens, 11);
         assert_eq!(ledger.account("s2").unwrap().requests, 1);
+    }
+
+    #[test]
+    fn native_http_200_error_events_record_redacted_failure_classes() {
+        // Isolate the probe flag from concurrent router tests.
+        if std::env::var("MUNIMENT_SUBSCRIPTION_PROBE").as_deref() != Ok("1") {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "model_router::server::tests::native_http_200_error_events_record_redacted_failure_classes",
+                ])
+                .env("MUNIMENT_SUBSCRIPTION_PROBE", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let root = agent_dir();
+        let agent = root.join("agent");
+        std::fs::create_dir(&agent).unwrap();
+        std::fs::write(
+            root.join("subscription-probe.json"),
+            r#"{"phase":"chat","models":[{"id":"test-model"}]}"#,
+        )
+        .unwrap();
+        let state = State {
+            sessions: Default::default(),
+            active_sessions: Default::default(),
+            progress: Default::default(),
+            agent,
+            ledger: Mutex::new(Ledger::default()),
+            active: Arc::new(Mutex::new(BTreeMap::new())),
+            now_ms: fixed_clock,
+        };
+        for (event, expected) in [
+            (
+                json!({"type":"error","error":{"type":"authentication_error","message":"PRIVATE TOKEN"}}),
+                "auth",
+            ),
+            (
+                json!({"type":"error","error":{"type":"rate_limit_error","message":"PRIVATE TOKEN"}}),
+                "quota",
+            ),
+            (
+                json!({"type":"response.failed","response":{"error":{"code":"usage_limit_reached","message":"PRIVATE TOKEN"}}}),
+                "quota",
+            ),
+            (
+                json!({"type":"response.failed","response":{"error":{"code":"server_error","message":"PRIVATE TOKEN"}}}),
+                "stream",
+            ),
+        ] {
+            for partial in [false, true] {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+                let (mut server, _) = listener.accept().unwrap();
+                let prefix = if partial {
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"PRIVATE REPLY\"}\n\n"
+                } else {
+                    ""
+                };
+                let payload = format!("{prefix}data: {event}\n\n");
+                let response = ureq::Response::new(200, "OK", &payload).unwrap();
+                let result = relay_native(
+                    &mut server,
+                    &state,
+                    "test-account",
+                    response,
+                    &turn("test-model", true),
+                    "test-model",
+                    "test-response",
+                );
+                if partial {
+                    assert!(result.unwrap().is_none());
+                } else {
+                    assert!(result.is_err());
+                }
+                drop(server);
+                let mut reply = String::new();
+                client.read_to_string(&mut reply).unwrap();
+                assert!(!reply.contains("PRIVATE TOKEN"));
+                let progress = std::fs::read_to_string(
+                    root.join("subscription-probe-transport-progress.jsonl"),
+                )
+                .unwrap();
+                assert!(!progress.contains("PRIVATE"));
+                let row: Value = serde_json::from_str(progress.lines().last().unwrap()).unwrap();
+                assert_eq!(row["error_class"], expected);
+                assert_eq!(row["transport"], "failed");
+                assert_eq!(row["turn"], 0);
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
