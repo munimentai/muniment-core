@@ -9,6 +9,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, path::Path};
 
+/// Revision shared by desktop routing and headless shadow evidence.
+pub const VERSION: &str = "muniment-routing/1";
+
 const FILE: &str = "muniment-router-sessions.json";
 const TTL: i64 = 24 * 60 * 60 * 1000;
 const LIMIT: usize = 256;

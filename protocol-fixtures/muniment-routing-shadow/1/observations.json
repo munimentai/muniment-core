@@ -1,0 +1,12 @@
+[
+  {"status":"answer","elapsed_ms":10,"answer":{},"fallback":"invalid_output"},
+  {"status":"answer","elapsed_ms":10,"answer":{"answers":{"route":{"choice":"anthropic/claude-sonnet-4-6"}}},"fallback":"invalid_output"},
+  {"status":"answer","elapsed_ms":10,"answer":{"answers":{"route":{"choice":"absent","confidence":1}}},"fallback":"invalid_output"},
+  {"status":"answer","elapsed_ms":10,"answer":{"answers":{"route":{"choice":"anthropic/claude-sonnet-4-6","confidence":2}}},"fallback":"invalid_output"},
+  {"status":"answer","elapsed_ms":10,"answer":{"answers":{"route":{"choice":"anthropic/claude-sonnet-4-6","confidence":-0.1}}},"fallback":"invalid_output"},
+  {"status":"answer","elapsed_ms":10,"answer":{"answers":{"route":{"choice":"anthropic/claude-sonnet-4-6","confidence":0.1}}},"fallback":"low_confidence"},
+  {"status":"answer","elapsed_ms":10,"answer":{"answers":{"route":{"choice":"anthropic/claude-sonnet-4-6","confidence":0.9}}},"fallback":"none"},
+  {"status":"timeout","elapsed_ms":10,"answer":{"answers":{"route":{"choice":"anthropic/claude-sonnet-4-6","confidence":1}}},"fallback":"timeout"},
+  {"status":"failed","elapsed_ms":10,"answer":{"answers":{"route":{"choice":"anthropic/claude-sonnet-4-6","confidence":1}}},"fallback":"classifier_failed"},
+  {"status":"answer","elapsed_ms":8000,"answer":{"answers":{"route":{"choice":"anthropic/claude-sonnet-4-6","confidence":1}}},"fallback":"timeout"}
+]
