@@ -210,24 +210,36 @@ pub fn decide_for(
             }
         }
     };
-    let settle = |route: Route, confidence: f64, reason: Reason| Decision {
-        route,
-        confidence,
-        reason,
-        spent_on: asked.spent_on.clone(),
-        spent: asked.spent.unwrap_or_default(),
-        classifier: Some(classifier_usage(&config.classifier, asked.spent)),
-    };
-    let Some((key, confidence)) = asked.answer.clone() else {
-        return Some(settle(fallback, 0.0, Reason::Failed));
+    let mut decision = select(config, options, asked.answer)?;
+    decision.spent_on = asked.spent_on;
+    decision.spent = asked.spent.unwrap_or_default();
+    decision.classifier = Some(classifier_usage(&config.classifier, asked.spent));
+    Some(decision)
+}
+
+/// Apply the desktop confidence and eligibility rules to an external observation.
+pub fn select(
+    config: &RouterConfig,
+    options: &[Route],
+    answer: Option<(String, f64)>,
+) -> Option<Decision> {
+    let fallback = super::fallback(config, options)?.clone();
+    let Some((key, confidence)) =
+        answer.filter(|(_, confidence)| confidence.is_finite() && (0.0..=1.0).contains(confidence))
+    else {
+        return Some(Decision::plain(fallback, 0.0, Reason::Failed));
     };
     let Some(route) = options.iter().find(|option| option.key == key) else {
-        return Some(settle(fallback, confidence, Reason::Failed));
+        return Some(Decision::plain(fallback, confidence, Reason::Failed));
     };
     if confidence < config.min_confidence {
-        return Some(settle(fallback, confidence, Reason::LowConfidence));
+        return Some(Decision::plain(fallback, confidence, Reason::LowConfidence));
     }
-    Some(settle(route.clone(), confidence, Reason::Classified))
+    Some(Decision::plain(
+        route.clone(),
+        confidence,
+        Reason::Classified,
+    ))
 }
 
 fn classifier_usage(

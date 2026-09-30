@@ -1,0 +1,32 @@
+{
+  "version": "muniment-routing-shadow/1",
+  "operation": "reserve",
+  "job": {
+    "job_id": "job-1",
+    "session_id": "session-1",
+    "trace_id": "0123456789abcdef0123456789abcdef",
+    "role": "implement",
+    "task_context": "Fix a parser boundary check.",
+    "input_tokens": 1000,
+    "output_tokens": 1000,
+    "tools": true,
+    "images": false,
+    "minimum_capability": 1,
+    "budget_usd": 0.02,
+    "baseline": { "account": "claude-isolated", "family": "anthropic", "model": "claude-sonnet-4-6" }
+  },
+  "snapshot": {
+    "revision": 1,
+    "accounts": [
+      { "id": "a", "family": "anthropic", "weight": 3, "enabled": true, "cooldown_until_ms": 0,
+        "models": { "claude-sonnet-4-6": { "epoch": 1, "limit": 100, "resets_at_ms": 4102444800000 } } },
+      { "id": "b", "family": "anthropic", "weight": 1, "enabled": true, "cooldown_until_ms": 0,
+        "models": { "claude-sonnet-4-6": { "epoch": 1, "limit": 100, "resets_at_ms": 4102444800000 } } }
+    ],
+    "models": [
+      { "family": "anthropic", "model": "claude-sonnet-4-6", "context": 200000, "output_limit": 8192,
+        "tools": true, "images": true, "input_price": 3.0, "output_price": 15.0, "capability": 2 }
+    ]
+  },
+  "observation": null
+}

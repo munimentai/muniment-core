@@ -15,6 +15,7 @@ pub mod balance;
 pub mod classify;
 pub mod config;
 pub mod family;
+pub mod headless;
 pub mod model_catalog;
 pub mod native_auth;
 pub mod pi_provider;
