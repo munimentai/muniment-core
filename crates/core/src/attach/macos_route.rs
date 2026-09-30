@@ -37,7 +37,7 @@ pub trait MacosAttachRouteReader {
     }
 }
 
-/// Names the route from the connected peer image path.
+/// Names the route from the connected peer's code identity.
 pub fn name_macos_attach_connection_route(
     reader: &impl MacosAttachRouteReader,
     expected_desktop_executable: &Path,
@@ -46,17 +46,24 @@ pub fn name_macos_attach_connection_route(
         reader.log_companion_fallback(0, false, None, expected_desktop_executable);
         return MacosAttachConnectionRoute::Companion { peer_pid: 0 };
     };
-    let path_match = peer_image_path.is_absolute()
-        && expected_desktop_executable.is_absolute()
-        && match (
-            peer_image_path.canonicalize(),
-            expected_desktop_executable.canonicalize(),
-        ) {
-            (Ok(peer), Ok(expected)) => peer == expected,
-            _ => false,
+    let resolved_paths =
+        if peer_image_path.is_absolute() && expected_desktop_executable.is_absolute() {
+            peer_image_path
+                .canonicalize()
+                .ok()
+                .zip(expected_desktop_executable.canonicalize().ok())
+        } else {
+            None
         };
-    // Canonical paths select candidates. The audit-token code check controls admission.
-    if path_match && reader.peer_code_matches(expected_desktop_executable) {
+    let path_match = resolved_paths
+        .as_ref()
+        .is_some_and(|(peer, expected)| peer == expected);
+    // Chromium can run an identical signed bundle from a code-sign clone.
+    // Paths must resolve, but only the audit-token code check admits the peer.
+    if peer_pid != 0
+        && resolved_paths.is_some()
+        && reader.peer_code_matches(expected_desktop_executable)
+    {
         MacosAttachConnectionRoute::DesktopClient { peer_pid }
     } else {
         reader.log_companion_fallback(
@@ -191,7 +198,7 @@ mod tests {
             (Some(expected), false, true),
             (
                 Some(Path::new("/Applications/Other.app/Contents/MacOS/other")),
-                true,
+                false,
                 false,
             ),
             (Some(Path::new("muniment")), true, false),
@@ -260,6 +267,7 @@ mod tests {
             ),
             MacosAttachConnectionRoute::Companion { peer_pid: 0 }
         );
+        assert_eq!(*reader.checked.borrow(), None);
     }
 
     #[test]
@@ -285,14 +293,57 @@ mod tests {
     }
 
     #[test]
-    fn routes_mismatched_image_to_companion() {
+    fn routes_an_unrelated_signed_image_to_companion() {
         let bundle = Bundle::new();
         let other = Bundle::new();
-        let reader = StubRouteReader::signed(Ok((42, other.executable.clone())));
+        let mut reader = StubRouteReader::signed(Ok((42, other.executable.clone())));
+        reader.code_matches = false;
 
         assert_eq!(
             name_macos_attach_connection_route(&reader, &bundle.executable),
             MacosAttachConnectionRoute::Companion { peer_pid: 42 }
+        );
+        assert_eq!(*reader.checked.borrow(), Some(bundle.executable.clone()));
+    }
+
+    #[test]
+    fn routes_a_code_sign_clone_only_when_its_code_matches() {
+        let bundle = Bundle::new();
+        let clone = bundle.root.join(
+            "X/ai.muniment.desktop.code_sign_clone/code_sign_clone.fixture/muniment.app.bundle/Contents/MacOS/muniment",
+        );
+        std::fs::create_dir_all(clone.parent().unwrap()).unwrap();
+        std::fs::copy(&bundle.executable, &clone).unwrap();
+        assert_ne!(
+            clone.canonicalize().unwrap(),
+            bundle.executable.canonicalize().unwrap()
+        );
+
+        // The runtime can also run from the clone.
+        for (peer, expected) in [(&clone, &bundle.executable), (&bundle.executable, &clone)] {
+            for code_matches in [true, false] {
+                let mut reader = StubRouteReader::signed(Ok((42, peer.clone())));
+                reader.code_matches = code_matches;
+                assert_eq!(
+                    name_macos_attach_connection_route(&reader, expected),
+                    if code_matches {
+                        MacosAttachConnectionRoute::DesktopClient { peer_pid: 42 }
+                    } else {
+                        MacosAttachConnectionRoute::Companion { peer_pid: 42 }
+                    }
+                );
+                assert_eq!(*reader.checked.borrow(), Some(expected.clone()));
+            }
+        }
+    }
+
+    #[test]
+    fn routes_a_zero_pid_to_companion_without_a_code_check() {
+        let bundle = Bundle::new();
+        let reader = StubRouteReader::signed(Ok((0, bundle.executable.clone())));
+        assert_eq!(
+            name_macos_attach_connection_route(&reader, &bundle.executable),
+            MacosAttachConnectionRoute::Companion { peer_pid: 0 }
         );
         assert_eq!(*reader.checked.borrow(), None);
     }
