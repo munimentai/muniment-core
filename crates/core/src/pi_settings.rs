@@ -373,6 +373,8 @@ pub fn store_pi_settings(path: &Path, artifact: PiArtifactDescriptor) -> io::Res
         let mut file = options.open(&temporary)?;
         file.write_all(&serde_json::to_vec_pretty(&settings)?)?;
         file.sync_all()?;
+        // Windows requires the write handle to close before replacement.
+        drop(file);
         lock.check()?;
         crate::atomic_file::replace(&temporary, path)
     })();
@@ -609,6 +611,36 @@ mod tests {
         assert_eq!(rendered["foreign"], json!({"nested": 42}));
         store_pi_settings(&path, PI_ARTIFACT).unwrap();
         assert_eq!(fs::read(&path).unwrap(), bytes);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_blocked_settings_replace_preserves_settings_and_cleans_up() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        let root = temporary_directory();
+        let path = root.join("settings.json");
+        let original = br#"{"defaultProvider":"ollama","foreign":42}"#;
+        fs::write(&path, original).unwrap();
+        let reader = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&path)
+            .unwrap();
+        let error = store_pi_settings(&path, PI_ARTIFACT).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(ERROR_SHARING_VIOLATION as i32));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        drop(reader);
+        store_pi_settings(&path, PI_ARTIFACT).unwrap();
+        let settings: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(settings["defaultProvider"], "ollama");
+        assert_eq!(settings["foreign"], 42);
+        assert_eq!(settings["packages"].as_array().unwrap().len(), 5);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
         fs::remove_dir_all(root).unwrap();
     }
 
