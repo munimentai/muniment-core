@@ -125,7 +125,7 @@ try {
     const entry = { id, kind: 'mcp', name: data.name.trim(), description: data.description || '', source: data.source || '', definition, enabled: data.enabled !== false }
     if (!entry.name) throw new Error('Enter a name.')
     const old = state.items.find(item => item.id === id)
-    entry.icon = old?.definition?.url === definition.url ? old.icon : null
+    entry.icon = old?.definition?.url === definition.url ? old?.icon ?? null : null
     if (data.fetchIcon && definition.url) entry.icon = await serviceFavicon(definition.url) || entry.icon
     if (data.token) {
       if (!definition.url) throw new Error('Tokens require a remote server URL.')
