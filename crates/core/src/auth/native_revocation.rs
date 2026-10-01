@@ -111,7 +111,8 @@ impl RevocationTransport for UreqRevocationTransport {
         request: &NativeRevocationRequest,
     ) -> Result<NativeRevocationResponse, NativeRevocationError> {
         let response = super::native_http::request("POST", REVOCATION_PATH, || {
-            ureq::post(url)
+            crate::http::agent()
+                .post(url)
                 .timeout(self.timeout)
                 .set("Content-Type", "application/json")
                 .set("Authorization", request.authorization())

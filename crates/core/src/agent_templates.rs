@@ -22,7 +22,7 @@ pub fn public_url(input: &str) -> Result<String, String> {
 }
 pub fn fetch_public_template(input: &str) -> Result<serde_json::Value, String> {
     let url = public_url(input)?;
-    let response = ureq::AgentBuilder::new()
+    let response = crate::http::agent_builder()
         .timeout(std::time::Duration::from_secs(20))
         .redirects(0)
         .build()

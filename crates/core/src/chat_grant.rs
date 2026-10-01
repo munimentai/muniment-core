@@ -190,7 +190,7 @@ pub(crate) fn issue_grant(
     if access_token.trim().is_empty() || expected_device_id.trim().is_empty() {
         return Err(GrantFailure::SessionInvalid);
     }
-    let response = ureq::AgentBuilder::new()
+    let response = crate::http::agent_builder()
         .redirects(0)
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -336,7 +336,7 @@ pub fn fetch_receipt(
     access_token: &str,
     run_id: &str,
 ) -> Result<Receipt, FetchReceiptError> {
-    ureq::AgentBuilder::new()
+    crate::http::agent_builder()
         .redirects(0)
         .timeout(std::time::Duration::from_secs(30))
         .build()

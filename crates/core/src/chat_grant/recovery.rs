@@ -273,7 +273,7 @@ mod native {
             url: &str,
             request: &NativeSessionRequest,
         ) -> Result<NativeSession, NativeSessionError> {
-            let response = ureq::AgentBuilder::new()
+            let response = crate::http::agent_builder()
                 .redirects(0)
                 .timeout(Duration::from_secs(30))
                 .build()

@@ -130,7 +130,8 @@ impl RegistrationTransport for UreqRegistrationTransport {
         request: &NativeDeviceRegistrationRequest,
     ) -> Result<NativeDeviceRegistrationResponse, NativeRegistrationError> {
         let response = super::native_http::request("POST", REGISTRATION_PATH, || {
-            ureq::post(url)
+            crate::http::agent()
+                .post(url)
                 .timeout(self.timeout)
                 .set("Content-Type", "application/json")
                 .send_json(request)

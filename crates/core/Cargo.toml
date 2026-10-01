@@ -15,8 +15,8 @@ edition = "2021"
 # ADR 0030 fences staying contracts until port callers use separate values.
 default = ["desktop-integration"]
 desktop-integration = []
-# The desktop crate turns on rustls with the ring provider through ureq.
-tls = ["ureq/tls", "ureq/native-certs", "ureq/proxy-from-env"]
+# Desktop and runtime HTTPS use the OS certificate verifier.
+tls = ["ureq/tls", "ureq/proxy-from-env", "dep:rustls", "dep:rustls-platform-verifier"]
 keyring = ["dep:keyring", "dep:security-framework"]
 network-tests = ["tls"]
 
@@ -40,6 +40,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 flate2 = "1"
 fs2 = "0.4"
 rusqlite = { version = "0.32", features = ["bundled", "hooks", "limits"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-platform-verifier = { version = "0.7", optional = true }
 same-file = "1.0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
@@ -56,6 +58,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 quircs = "0.10"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 resvg = { version = "0.45", default-features = false }
 syn = { version = "2", features = ["full", "visit"] }
 # Tests need to author AES-encrypted entries to exercise the encrypted-entry

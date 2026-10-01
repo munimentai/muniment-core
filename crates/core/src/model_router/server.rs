@@ -935,7 +935,7 @@ fn complete(
                 }
             };
             let mut upstream = super::subscription_probe::TransportRequest::new(
-                ureq::AgentBuilder::new()
+                crate::http::agent_builder()
                     .timeout_connect(CONNECT_TIMEOUT)
                     .timeout_read(READ_TIMEOUT),
                 &prepared.url,

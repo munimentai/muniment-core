@@ -108,7 +108,7 @@ fn parse_subscription_catalog(value: &Value) -> Option<Vec<Value>> {
 
 fn discover_subscription_catalog(url: &str, timeout: Duration) -> Option<Vec<Value>> {
     let url = format!("{url}?types=chat&pi-version={}", crate::sidecar::PI_VERSION);
-    let response = ureq::AgentBuilder::new()
+    let response = crate::http::agent_builder()
         .timeout(timeout)
         .redirects(0)
         .build()
@@ -248,7 +248,7 @@ pub fn discover(provider: &str, oauth: bool, token: &str, timeout: Duration) -> 
 }
 
 fn discover_at(provider: &str, url: &str, token: &str, timeout: Duration) -> Option<Vec<Value>> {
-    let agent = ureq::AgentBuilder::new()
+    let agent = crate::http::agent_builder()
         .timeout(timeout)
         .redirects(0)
         .build();

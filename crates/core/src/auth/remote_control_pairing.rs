@@ -215,7 +215,8 @@ impl PairingTransport for UreqPairingTransport {
         body: &serde_json::Value,
     ) -> Result<PairingChallengeResponse, PairingError> {
         let response = super::native_http::request("POST", CHALLENGE_PATH, || {
-            ureq::post(url)
+            crate::http::agent()
+                .post(url)
                 .timeout(self.timeout)
                 .set("Content-Type", "application/json")
                 .set("Authorization", &request.authorization)
@@ -235,7 +236,8 @@ impl PairingTransport for UreqPairingTransport {
         request: &PairingHttpRequest,
     ) -> Result<PairingStatusResponse, PairingError> {
         let response = super::native_http::request("GET", PAIRING_PATH, || {
-            ureq::get(url)
+            crate::http::agent()
+                .get(url)
                 .timeout(self.timeout)
                 .set("Authorization", &request.authorization)
                 .call()
@@ -255,7 +257,8 @@ impl PairingTransport for UreqPairingTransport {
         body: &serde_json::Value,
     ) -> Result<PairingRevokeResponse, PairingError> {
         let response = super::native_http::request("DELETE", PAIRING_PATH, || {
-            ureq::request("DELETE", url)
+            crate::http::agent()
+                .request("DELETE", url)
                 .timeout(self.timeout)
                 .set("Content-Type", "application/json")
                 .set("Authorization", &request.authorization)

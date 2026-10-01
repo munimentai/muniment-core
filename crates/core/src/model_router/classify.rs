@@ -315,7 +315,7 @@ fn ask_pool(call: PoolCall<'_>, state: &str, now_ms: i64, timeout: Duration) -> 
             { "role": "user", "content": clip(state) },
         ],
     });
-    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    let agent = crate::http::agent_builder().timeout(timeout).build();
     let Ok(prepared) = super::transport::prepare(account, &body, model) else {
         return empty;
     };
@@ -400,7 +400,7 @@ fn classifier_response(value: Value) -> Value {
 /// One classifier call. Nothing here fails a turn: an unreachable classifier,
 /// a refusal and a body that is not JSON all read as no answer.
 fn ask(url: &str, bearer: Option<&str>, body: &Value, timeout: Duration) -> Option<Value> {
-    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    let agent = crate::http::agent_builder().timeout(timeout).build();
     let mut request = agent.post(url).set("content-type", "application/json");
     if let Some(bearer) = bearer {
         request = request.set("authorization", &format!("Bearer {bearer}"));
@@ -427,7 +427,7 @@ pub fn check(classifier: &Classifier, timeout: Duration) -> Result<(), String> {
             "criteria": { "fast": "A short question", "deep": "A long reasoning task" },
         }},
     });
-    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    let agent = crate::http::agent_builder().timeout(timeout).build();
     let mut request = agent.post(&url).set("content-type", "application/json");
     if let Some(bearer) = bearer {
         request = request.set("authorization", &format!("Bearer {bearer}"));

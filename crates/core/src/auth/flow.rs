@@ -215,7 +215,8 @@ pub fn revoke_token_with_timeout(
     token_type_hint: &str,
     timeout: Duration,
 ) -> Result<(), AuthError> {
-    match ureq::post(revocation_endpoint)
+    match crate::http::agent()
+        .post(revocation_endpoint)
         .timeout(timeout)
         .send_form(&[
             ("token", token),
@@ -248,7 +249,11 @@ pub fn sign_out(store: &dyn TokenStore, cfg: &OidcConfig) -> Result<(), AuthErro
 }
 
 fn post_token_form(endpoint: &str, form: &[(&str, &str)]) -> Result<TokenResponse, AuthError> {
-    match ureq::post(endpoint).timeout(HTTP_TIMEOUT).send_form(form) {
+    match crate::http::agent()
+        .post(endpoint)
+        .timeout(HTTP_TIMEOUT)
+        .send_form(form)
+    {
         Ok(resp) => resp
             .into_json::<TokenResponse>()
             .map_err(|e| AuthError::Token(format!("malformed token response: {e}"))),

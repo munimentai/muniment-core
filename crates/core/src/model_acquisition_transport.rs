@@ -229,7 +229,7 @@ struct UreqBackend;
 
 impl HttpBackend for UreqBackend {
     fn execute(&mut self, request: &BackendRequest) -> Result<BackendResponse, TransportFailure> {
-        let agent = ureq::AgentBuilder::new()
+        let agent = crate::http::agent_builder()
             .redirects(0)
             .https_only(true)
             .try_proxy_from_env(true)

@@ -35,6 +35,7 @@ pub mod endpoint_models;
 pub mod extend;
 pub mod harness_scan;
 pub mod home;
+pub mod http;
 pub mod import_preview;
 pub mod journal;
 pub mod kokoro;
