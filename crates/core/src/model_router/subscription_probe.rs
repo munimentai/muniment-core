@@ -229,7 +229,7 @@ impl TransportRequest {
         &mut self,
         headers: &[(&str, String)],
         body: &serde_json::Value,
-    ) -> Result<ureq::Response, ureq::Error> {
+    ) -> Result<ureq::Response, Box<ureq::Error>> {
         let mut method = "POST";
         for hop in 0..5 {
             let mut call = self
@@ -256,14 +256,18 @@ impl TransportRequest {
                 return Ok(response);
             }
             if hop == 4 {
-                return Err(
-                    std::io::Error::other("The provider reached the redirect limit.").into(),
-                );
+                return Err(ureq::Error::from(std::io::Error::other(
+                    "The provider reached the redirect limit.",
+                ))
+                .into());
             }
             let Some(location) = response.header("location") else {
                 return Ok(response);
             };
-            let next = url::Url::parse(&self.url)?.join(location)?;
+            let next = url::Url::parse(&self.url)
+                .map_err(ureq::Error::from)?
+                .join(location)
+                .map_err(ureq::Error::from)?;
             match response.status() {
                 301..=303 => method = "GET",
                 307 | 308 if method == "GET" => {}
@@ -719,6 +723,26 @@ mod tests {
         let mut request = direct_request(ureq::AgentBuilder::new(), &url);
         assert!(request.send_json(&[], &serde_json::json!({})).is_err());
         assert_eq!(server.join().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn boxed_http_errors_keep_the_status_and_response() {
+        for status in [401, 429, 503] {
+            let (url, server) = http_server(vec![format!(
+                "HTTP/1.1 {status} Error\r\ncontent-length: 6\r\nconnection: close\r\n\r\nfailed"
+            )]);
+            let mut request = direct_request(ureq::AgentBuilder::new(), &url);
+            let error = request.send_json(&[], &serde_json::json!({})).unwrap_err();
+            match *error {
+                ureq::Error::Status(code, response) => {
+                    assert_eq!(code, status);
+                    assert_eq!(response.status(), status);
+                    assert_eq!(response.into_string().unwrap(), "failed");
+                }
+                ureq::Error::Transport(error) => panic!("Expected an HTTP status error: {error}"),
+            }
+            assert_eq!(server.join().unwrap().len(), 1);
+        }
     }
 
     #[cfg(feature = "tls")]

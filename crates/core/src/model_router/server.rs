@@ -941,7 +941,9 @@ fn complete(
                 &prepared.url,
             );
             super::subscription_probe::transport(&state.agent, &route.model, "pending", "none");
-            let call = upstream.send_json(&prepared.headers, &prepared.body);
+            let call = upstream
+                .send_json(&prepared.headers, &prepared.body)
+                .map_err(|error| *error);
             match call {
                 Ok(response) => {
                     super::subscription_probe::transport(
