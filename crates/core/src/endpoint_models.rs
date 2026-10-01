@@ -102,7 +102,7 @@ pub fn discover_models(base_url: &str, timeout: Duration) -> Option<Vec<String>>
         return None;
     }
     let deadline = Instant::now() + timeout;
-    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    let agent = crate::http::agent_builder().timeout(timeout).build();
     origin.set_path("/api/tags");
     origin.set_query(None);
     origin.set_fragment(None);
@@ -122,7 +122,7 @@ pub fn discover_models(base_url: &str, timeout: Duration) -> Option<Vec<String>>
     if remaining.is_zero() {
         return None;
     }
-    let agent = ureq::AgentBuilder::new().timeout(remaining).build();
+    let agent = crate::http::agent_builder().timeout(remaining).build();
     let models_url = format!("{}/models", base_url.trim_end_matches('/'));
     fetch(&agent, &models_url)
         .ok()

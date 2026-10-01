@@ -342,14 +342,29 @@ fn transport_host(url: &url::Url) -> Option<String> {
     Some(host.to_string())
 }
 
-fn transport_kind(
+pub(crate) fn transport_kind(
     kind: ureq::ErrorKind,
     message: Option<&str>,
     mut source: Option<&(dyn Error + 'static)>,
 ) -> &'static str {
+    let mut tls_kind = None;
     // Timeouts can wrap connect, proxy, or TLS failures. Bound the source walk.
     for _ in 0..16 {
         let Some(error) = source else { break };
+        #[cfg(feature = "tls")]
+        let detected = error.downcast_ref::<rustls::Error>().map(|error| {
+            if matches!(
+                error,
+                rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented
+            ) {
+                "tls_certificate"
+            } else {
+                "tls"
+            }
+        });
+        #[cfg(not(feature = "tls"))]
+        let detected: Option<&'static str> = None;
+        tls_kind = tls_kind.or(detected);
         if let Some(io) = error.downcast_ref::<std::io::Error>() {
             if matches!(
                 io.kind(),
@@ -361,6 +376,9 @@ fn transport_kind(
         } else {
             source = error.source();
         }
+    }
+    if let Some(kind) = tls_kind {
+        return kind;
     }
     match kind {
         ureq::ErrorKind::Dns => "dns",
@@ -797,6 +815,55 @@ mod tests {
         assert_eq!(transport_kind(Io, None, Some(&text)), "other");
     }
 
+    #[cfg(feature = "tls")]
+    #[test]
+    fn certificate_failures_use_types_not_error_text() {
+        use rustls::{CertificateError, Error as TlsError};
+        for error in [
+            CertificateError::UnknownIssuer,
+            CertificateError::Expired,
+            CertificateError::NotValidForName,
+            CertificateError::Revoked,
+            CertificateError::BadSignature,
+            CertificateError::BadEncoding,
+            CertificateError::InvalidPurpose,
+            CertificateError::Other(rustls::OtherError(std::sync::Arc::new(
+                std::io::Error::other("PRIVATE certificate details"),
+            ))),
+        ] {
+            let wrapped =
+                std::io::Error::other(std::io::Error::other(TlsError::InvalidCertificate(error)));
+            let transport = ureq::Error::from(wrapped).into_transport().unwrap();
+            let failure = TransportFailure::new(
+                "https://user:PRIVATE@chatgpt.com/PRIVATE?token=PRIVATE#PRIVATE",
+                &transport,
+            );
+            assert_artifact(&failure, "tls_certificate", Some("chatgpt.com"));
+        }
+        for (error, expected) in [
+            (TlsError::NoCertificatesPresented, "tls_certificate"),
+            (
+                TlsError::General("PRIVATE certificate UnknownIssuer".into()),
+                "tls",
+            ),
+        ] {
+            assert_eq!(
+                transport_kind(ureq::ErrorKind::Io, None, Some(&error)),
+                expected
+            );
+            let timeout = std::io::Error::new(std::io::ErrorKind::TimedOut, error);
+            assert_eq!(
+                transport_kind(ureq::ErrorKind::Io, None, Some(&timeout)),
+                "timeout"
+            );
+        }
+        let text = std::io::Error::other("InvalidCertificate(UnknownIssuer) PRIVATE");
+        assert_eq!(
+            transport_kind(ureq::ErrorKind::Io, None, Some(&text)),
+            "other"
+        );
+    }
+
     #[test]
     fn transport_failures_export_only_the_kind_and_host() {
         let directory =
@@ -901,7 +968,7 @@ mod tests {
             // Plain HTTP cannot complete a TLS handshake.
             let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n");
         });
-        let error = ureq::AgentBuilder::new()
+        let error = crate::http::agent_builder()
             .try_proxy_from_env(false)
             .timeout(Duration::from_secs(5))
             .build()

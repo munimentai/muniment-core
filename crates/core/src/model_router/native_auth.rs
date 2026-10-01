@@ -135,7 +135,7 @@ fn expires_ms(expires_in: Option<f64>, now_ms: i64) -> Option<i64> {
 }
 
 fn agent(timeout: Duration) -> ureq::Agent {
-    ureq::AgentBuilder::new().timeout(timeout).build()
+    crate::http::agent_builder().timeout(timeout).build()
 }
 
 /// The status and body of a response, whatever the status.

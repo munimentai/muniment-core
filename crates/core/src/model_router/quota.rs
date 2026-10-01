@@ -301,7 +301,7 @@ pub fn parse_claude(payload: &Value, now_ms: i64) -> Option<Quota> {
 }
 
 fn fetch(url: &str, headers: &[(&str, &str)], timeout: Duration) -> Option<Value> {
-    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    let agent = crate::http::agent_builder().timeout(timeout).build();
     let mut request = agent.get(url);
     for (name, value) in headers {
         request = request.set(name, value);
@@ -439,7 +439,7 @@ pub fn probe_claude(access: &str, now_ms: i64, timeout: Duration) -> Option<Quot
 }
 
 fn post_json(url: &str, headers: &[(&str, &str)], body: Value, timeout: Duration) -> Option<Value> {
-    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    let agent = crate::http::agent_builder().timeout(timeout).build();
     let mut request = agent.post(url);
     for (name, value) in headers {
         request = request.set(name, value);
@@ -453,7 +453,7 @@ fn post_bytes(
     body: &[u8],
     timeout: Duration,
 ) -> Option<Vec<u8>> {
-    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    let agent = crate::http::agent_builder().timeout(timeout).build();
     let mut request = agent.post(url);
     for (name, value) in headers {
         request = request.set(name, value);

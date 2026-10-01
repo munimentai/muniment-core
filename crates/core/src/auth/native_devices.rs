@@ -126,7 +126,8 @@ impl NativeDeviceListTransport for UreqNativeDeviceListTransport {
         request: &NativeDeviceListRequest,
     ) -> Result<NativeDeviceList, NativeDeviceListError> {
         let response = super::native_http::request("GET", DEVICES_PATH, || {
-            ureq::get(url)
+            crate::http::agent()
+                .get(url)
                 .timeout(self.timeout)
                 .set("Authorization", request.authorization())
                 .call()

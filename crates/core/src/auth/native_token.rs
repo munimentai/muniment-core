@@ -243,7 +243,8 @@ impl TokenTransport for UreqTokenTransport {
         request: &NativeTokenRequest,
     ) -> Result<NativeTokenResponse, NativeTokenError> {
         let response = super::native_http::request("POST", TOKEN_PATH, || {
-            ureq::post(url)
+            crate::http::agent()
+                .post(url)
                 .timeout(self.timeout)
                 .set("Content-Type", "application/json")
                 .send_json(request)

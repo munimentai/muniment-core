@@ -38,7 +38,8 @@ pub fn discover_with_timeout(
         )));
     }
     let url = format!("{issuer}/.well-known/openid-configuration");
-    let meta: ProviderMetadata = ureq::get(&url)
+    let meta: ProviderMetadata = crate::http::agent()
+        .get(&url)
         .timeout(timeout)
         .call()
         .map_err(|e| AuthError::Discovery(format!("fetching {url}: {e}")))?

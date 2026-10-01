@@ -53,6 +53,7 @@ Module rows name the module below `muniment-core`.
 | module | endpoint_models | It lists the models an OpenAI-compatible endpoint serves. |
 | module | harness_scan | It counts durable assistant memory in user-level roots. |
 | module | home | It owns the local memory filesystem. |
+| module | http | It shares HTTP agent configuration and OS certificate verification. |
 | module | import_preview | It previews bounded assistant exports. |
 | module | journal | It owns the run journal and reader projections. |
 | module | kokoro | It owns on-device read-aloud. |

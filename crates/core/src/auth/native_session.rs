@@ -277,7 +277,8 @@ impl SessionTransport for UreqSessionTransport {
         request: &NativeSessionRequest,
     ) -> Result<NativeSession, NativeSessionError> {
         let response = super::native_http::request("GET", SESSION_PATH, || {
-            ureq::get(url)
+            crate::http::agent()
+                .get(url)
                 .timeout(self.timeout)
                 .set("Authorization", request.authorization())
                 .call()
