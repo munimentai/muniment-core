@@ -43,6 +43,26 @@ pub fn record(
             | "http"
             | "network"
             | "stream"
+            | "update-profile"
+            | "update-plan"
+            | "update-phase"
+            | "update-state"
+            | "update-address"
+            | "update-builder"
+            | "update-check"
+            | "update-download"
+            | "update-unavailable"
+            | "update-not-prepared"
+            | "update-package-digest"
+            | "update-tamper-rejection"
+            | "update-version-rejection"
+            | "update-active-work-refusal"
+            | "update-checkpoint-encode"
+            | "update-checkpoint-write"
+            | "update-busy"
+            | "update-install-task"
+            | "update-install"
+            | "update-restart"
     ) {
         return Err("The probe progress is invalid.");
     }
@@ -198,6 +218,60 @@ mod tests {
         }
         while record(root, "reply", Some(0), "pending", "none").is_ok() {}
         assert!(std::fs::metadata(file).unwrap().len() <= LIMIT);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn update_failures_survive_the_restart_checkpoint() {
+        let directory =
+            std::env::temp_dir().join(format!("subscription-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        for phase in ["update", "update-restart"] {
+            std::fs::write(
+                directory.join("subscription-probe.json"),
+                serde_json::json!({"phase": phase}).to_string(),
+            )
+            .unwrap();
+            for code in [
+                "update-profile",
+                "update-plan",
+                "update-phase",
+                "update-state",
+                "update-address",
+                "update-builder",
+                "update-check",
+                "update-download",
+                "update-unavailable",
+                "update-not-prepared",
+                "update-package-digest",
+                "update-tamper-rejection",
+                "update-version-rejection",
+                "update-active-work-refusal",
+                "update-checkpoint-encode",
+                "update-checkpoint-write",
+                "update-busy",
+                "update-install-task",
+                "update-install",
+                "update-restart",
+            ] {
+                record(&directory, "features", None, "not-started", code).unwrap();
+                let text =
+                    std::fs::read_to_string(directory.join("subscription-probe-progress.jsonl"))
+                        .unwrap();
+                let row: serde_json::Value =
+                    serde_json::from_str(text.lines().last().unwrap()).unwrap();
+                assert_eq!(row["error_class"], code);
+                assert_eq!(row["phase"], phase);
+            }
+            assert!(record(
+                &directory,
+                "features",
+                None,
+                "not-started",
+                "update-PRIVATE"
+            )
+            .is_err());
+        }
         std::fs::remove_dir_all(directory).unwrap();
     }
 
