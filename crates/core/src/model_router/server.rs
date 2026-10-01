@@ -934,18 +934,14 @@ fn complete(
                     break;
                 }
             };
-            let agent = ureq::AgentBuilder::new()
-                .timeout_connect(CONNECT_TIMEOUT)
-                .timeout_read(READ_TIMEOUT)
-                .build();
-            let mut call = agent
-                .post(&prepared.url)
-                .set("content-type", "application/json");
-            for (name, value) in &prepared.headers {
-                call = call.set(name, value);
-            }
+            let mut upstream = super::subscription_probe::TransportRequest::new(
+                ureq::AgentBuilder::new()
+                    .timeout_connect(CONNECT_TIMEOUT)
+                    .timeout_read(READ_TIMEOUT),
+                &prepared.url,
+            );
             super::subscription_probe::transport(&state.agent, &route.model, "pending", "none");
-            let call = call.send_json(&prepared.body);
+            let call = upstream.send_json(&prepared.headers, &prepared.body);
             match call {
                 Ok(response) => {
                     super::subscription_probe::transport(
@@ -1140,7 +1136,7 @@ fn complete(
                     super::subscription_probe::transport_failed(
                         &state.agent,
                         &route.model,
-                        &prepared.url,
+                        &upstream,
                         &error,
                     );
                     state.record_error(&account.id, &error.to_string(), true);

@@ -150,14 +150,149 @@ pub fn transport(agent: &Path, model: &str, outcome: &str, error_class: &str) {
     transport_progress(agent, model, outcome, error_class, None);
 }
 
-pub fn transport_failed(agent: &Path, model: &str, url: &str, error: &ureq::Transport) {
+pub fn transport_failed(
+    agent: &Path,
+    model: &str,
+    request: &TransportRequest,
+    error: &ureq::Transport,
+) {
     transport_progress(
         agent,
         model,
         "failed",
         "network",
-        Some(&TransportFailure::new(url, error)),
+        Some(&request.failure(error)),
     );
+}
+
+// ureq attaches the original URL to redirect errors. Keep the current target ourselves.
+// Each router attempt owns this context and its agent.
+pub struct TransportRequest {
+    agent: ureq::Agent,
+    url: String,
+    proxy_host: Option<Option<String>>,
+}
+
+impl TransportRequest {
+    pub fn new(builder: ureq::AgentBuilder, url: &str) -> Self {
+        let mut builder = builder.try_proxy_from_env(false).redirects(0);
+        let mut proxy_host = None;
+        if cfg!(feature = "tls") {
+            // Match ureq 2's environment precedence and parser, including scheme-free proxies.
+            for name in [
+                "ALL_PROXY",
+                "all_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "HTTP_PROXY",
+                "http_proxy",
+            ] {
+                let Ok(value) = std::env::var(name) else {
+                    continue;
+                };
+                let Ok(proxy) = ureq::Proxy::new(&value) else {
+                    continue;
+                };
+                let authority = value
+                    .trim_end_matches('/')
+                    .split_once("://")
+                    .map_or(value.trim_end_matches('/'), |(_, rest)| rest);
+                let host = authority
+                    .rsplit('@')
+                    .next()
+                    .unwrap_or("")
+                    .split(':')
+                    .next()
+                    .unwrap_or("");
+                proxy_host = Some(
+                    url::Url::parse(&format!("http://{host}/"))
+                        .ok()
+                        .filter(|url| {
+                            url.host_str()
+                                .is_some_and(|parsed| parsed.eq_ignore_ascii_case(host))
+                        })
+                        .as_ref()
+                        .and_then(transport_host),
+                );
+                builder = builder.proxy(proxy);
+                break;
+            }
+        }
+        Self {
+            agent: builder.build(),
+            url: url.into(),
+            proxy_host,
+        }
+    }
+
+    pub fn send_json(
+        &mut self,
+        headers: &[(&str, String)],
+        body: &serde_json::Value,
+    ) -> Result<ureq::Response, ureq::Error> {
+        let mut method = "POST";
+        for hop in 0..5 {
+            let mut call = self
+                .agent
+                .request(method, &self.url)
+                .set("content-type", "application/json");
+            for (name, value) in headers {
+                // Drop explicit authorization and cookies on redirects, as ureq does.
+                if hop > 0
+                    && ["authorization", "cookie", "content-length"]
+                        .iter()
+                        .any(|header| name.eq_ignore_ascii_case(header))
+                {
+                    continue;
+                }
+                call = call.set(name, value);
+            }
+            let response = if hop == 0 {
+                call.send_json(body)
+            } else {
+                call.call()
+            }?;
+            if !(300..399).contains(&response.status()) {
+                return Ok(response);
+            }
+            if hop == 4 {
+                return Err(
+                    std::io::Error::other("The provider reached the redirect limit.").into(),
+                );
+            }
+            let Some(location) = response.header("location") else {
+                return Ok(response);
+            };
+            let next = url::Url::parse(&self.url)?.join(location)?;
+            match response.status() {
+                301..=303 => method = "GET",
+                307 | 308 if method == "GET" => {}
+                _ => return Ok(response),
+            }
+            self.url = next.into();
+        }
+        unreachable!()
+    }
+
+    fn failure(&self, error: &ureq::Transport) -> TransportFailure {
+        let mut failure = TransportFailure::new(&self.url, error);
+        if let Some(host) = &self.proxy_host {
+            if matches!(failure.kind, "dns" | "connect" | "proxy")
+                || (failure.kind == "timeout"
+                    && matches!(
+                        error.kind(),
+                        ureq::ErrorKind::Dns | ureq::ErrorKind::ConnectionFailed
+                    )
+                    && error.message() != Some("tls connection init failed"))
+            {
+                if failure.kind != "timeout" {
+                    failure.kind = "proxy";
+                }
+                failure.host = host.clone();
+            }
+        }
+        failure
+    }
 }
 
 struct TransportFailure {
@@ -167,8 +302,8 @@ struct TransportFailure {
 
 impl TransportFailure {
     fn new(request_url: &str, error: &ureq::Transport) -> Self {
-        // Prefer the failed redirect host. Never export the URL or error text.
-        let url = error.url().cloned().or_else(|| request_url.parse().ok());
+        // Never export the URL or error text.
+        let url = request_url.parse().ok();
         Self {
             kind: transport_kind(error.kind(), error.message(), error.source()),
             host: url.as_ref().and_then(transport_host),
@@ -318,6 +453,292 @@ pub fn event_error(event: &serde_json::Value) -> &'static str {
 mod tests {
     use super::*;
 
+    fn assert_artifact(failure: &TransportFailure, kind: &str, host: Option<&str>) {
+        let directory =
+            std::env::temp_dir().join(format!("subscription-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(
+            directory.join("subscription-probe.json"),
+            r#"{"phase":"chat","models":[{"id":"model-one"}]}"#,
+        )
+        .unwrap();
+        record_progress(
+            &directory,
+            "transport",
+            Some(0),
+            "failed",
+            "network",
+            Some(failure),
+        )
+        .unwrap();
+        let text =
+            std::fs::read_to_string(directory.join("subscription-probe-transport-progress.jsonl"))
+                .unwrap();
+        for secret in [
+            "PRIVATE",
+            "Authorization",
+            "authorization",
+            "user",
+            "dXNlcjpQUklWQVRF",
+            "://",
+            "?",
+            "#",
+        ] {
+            assert!(
+                !text.contains(secret),
+                "The artifact contains a secret or URL component."
+            );
+        }
+        let row: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(row["transport_kind"], kind);
+        assert_eq!(row["host"], serde_json::json!(host));
+        assert_eq!(row["phase"], "chat");
+        assert_eq!(row["error_class"], "network");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn direct_request(builder: ureq::AgentBuilder, url: &str) -> TransportRequest {
+        TransportRequest {
+            agent: builder
+                .try_proxy_from_env(false)
+                .redirects(0)
+                .timeout(std::time::Duration::from_secs(5))
+                .build(),
+            url: url.into(),
+            proxy_host: None,
+        }
+    }
+
+    // Child processes isolate real proxy variables from parallel router tests.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn environment_proxy_failures_name_the_proxy_without_credentials() {
+        use std::net::ToSocketAddrs;
+        const CASE: &str = "MUNIMENT_TEST_PROXY_CASE";
+        let Ok(case) = std::env::var(CASE) else {
+            for (case, proxy) in [
+                ("connect", "http://user:PRIVATE@127.0.0.1:0"),
+                ("dns", "http://user:PRIVATE@proxy.example:80"),
+                ("scheme-free", "user:PRIVATE@proxy.example:80"),
+                ("precedence", "http://user:PRIVATE@unused.example:80"),
+                ("invalid-precedence", "http://user:PRIVATE@proxy.example:80"),
+                (
+                    "unsafe-host",
+                    "http://user:PRIVATE@proxy.example/PRIVATE?token=PRIVATE",
+                ),
+            ] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child.args(["--exact", "model_router::subscription_probe::tests::environment_proxy_failures_name_the_proxy_without_credentials", "--nocapture"]);
+                for name in [
+                    "ALL_PROXY",
+                    "all_proxy",
+                    "HTTPS_PROXY",
+                    "https_proxy",
+                    "HTTP_PROXY",
+                    "http_proxy",
+                ] {
+                    child.env_remove(name);
+                }
+                child.env(CASE, case).env("HTTPS_PROXY", proxy);
+                if case == "precedence" {
+                    child.env("ALL_PROXY", "http://user:PRIVATE@proxy.example:80");
+                } else if case == "invalid-precedence" {
+                    child.env("ALL_PROXY", "invalid://PRIVATE");
+                }
+                let output = child.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let connect = case == "connect";
+        let unsafe_host = case == "unsafe-host";
+        let builder = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(5))
+            .resolver(move |netloc: &str| {
+                if connect {
+                    assert_eq!(netloc, "127.0.0.1:0");
+                    netloc.to_socket_addrs().map(Iterator::collect)
+                } else {
+                    assert_eq!(
+                        netloc,
+                        if unsafe_host {
+                            "proxy.example/PRIVATE?token=PRIVATE:80"
+                        } else {
+                            "proxy.example:80"
+                        }
+                    );
+                    Err(std::io::Error::other("PRIVATE DNS detail"))
+                }
+            });
+        let mut request = TransportRequest::new(
+            builder,
+            "https://provider.example/PRIVATE?token=PRIVATE#PRIVATE",
+        );
+        let error = request
+            .send_json(
+                &[("authorization", "Bearer PRIVATE".into())],
+                &serde_json::json!({"secret":"PRIVATE"}),
+            )
+            .unwrap_err()
+            .into_transport()
+            .unwrap();
+        assert_eq!(
+            error.kind(),
+            if connect {
+                ureq::ErrorKind::ConnectionFailed
+            } else {
+                ureq::ErrorKind::Dns
+            }
+        );
+        assert_artifact(
+            &request.failure(&error),
+            "proxy",
+            if connect {
+                Some("127.0.0.1")
+            } else if unsafe_host {
+                None
+            } else {
+                Some("proxy.example")
+            },
+        );
+    }
+
+    fn http_server(responses: Vec<String>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{BufRead, BufReader, Read};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut request = String::new();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    request.push_str(&line);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                stream.write_all(response.as_bytes()).unwrap();
+                requests.push(request);
+            }
+            requests
+        });
+        (url, server)
+    }
+
+    fn redirect(status: u16, location: &str) -> String {
+        format!("HTTP/1.1 {status} Redirect\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+    }
+
+    #[test]
+    fn redirect_failures_name_the_current_endpoint_without_url_secrets() {
+        use std::net::ToSocketAddrs;
+        for connect in [false, true] {
+            let (url, server) = http_server(vec![redirect(
+                302,
+                "http://user:PRIVATE@redirect.example:80/PRIVATE?token=PRIVATE#PRIVATE",
+            )]);
+            let builder = ureq::AgentBuilder::new().resolver(move |netloc: &str| {
+                if netloc == "redirect.example:80" {
+                    if connect {
+                        Ok(vec!["127.0.0.1:0".parse().unwrap()])
+                    } else {
+                        Err(std::io::Error::other("PRIVATE DNS detail"))
+                    }
+                } else {
+                    netloc.to_socket_addrs().map(Iterator::collect)
+                }
+            });
+            let mut request = direct_request(builder, &format!("{url}/PRIVATE?token=PRIVATE"));
+            let error = request
+                .send_json(
+                    &[("authorization", "Bearer PRIVATE".into())],
+                    &serde_json::json!({"secret":"PRIVATE"}),
+                )
+                .unwrap_err()
+                .into_transport()
+                .unwrap();
+            assert!(server.join().unwrap()[0].starts_with("POST "));
+            assert_artifact(
+                &request.failure(&error),
+                if connect { "connect" } else { "dns" },
+                Some("redirect.example"),
+            );
+        }
+    }
+
+    #[test]
+    fn redirects_keep_the_ureq_method_credential_and_limit_rules() {
+        for status in [301, 302, 303, 307, 308] {
+            let follows = status <= 303;
+            let mut responses = vec![redirect(status, "/next")];
+            if follows {
+                responses.push(
+                    "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".into(),
+                );
+            }
+            let (url, server) = http_server(responses);
+            let mut request = direct_request(ureq::AgentBuilder::new(), &url);
+            let response = request
+                .send_json(
+                    &[
+                        ("authorization", "Bearer PRIVATE".into()),
+                        ("cookie", "PRIVATE".into()),
+                    ],
+                    &serde_json::json!({"secret":"PRIVATE"}),
+                )
+                .unwrap();
+            assert_eq!(response.status(), if follows { 200 } else { status });
+            let requests = server.join().unwrap();
+            assert!(requests[0].starts_with("POST "));
+            assert!(requests[0].contains("PRIVATE"));
+            if follows {
+                assert!(requests[1].starts_with("GET /next "));
+                assert!(!requests[1].contains("PRIVATE"));
+                assert!(!requests[1].to_ascii_lowercase().contains("content-length"));
+            }
+        }
+        let (url, server) = http_server(vec![redirect(302, "/next"); 5]);
+        let mut request = direct_request(ureq::AgentBuilder::new(), &url);
+        assert!(request.send_json(&[], &serde_json::json!({})).is_err());
+        assert_eq!(server.join().unwrap().len(), 5);
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_failures_through_a_proxy_name_the_provider() {
+        let (proxy, server) = http_server(vec!["HTTP/1.1 200 OK\r\n\r\n".into()]);
+        let mut request = direct_request(
+            ureq::AgentBuilder::new().proxy(ureq::Proxy::new(proxy).unwrap()),
+            "https://provider.example/PRIVATE?token=PRIVATE",
+        );
+        request.proxy_host = Some(Some("127.0.0.1".into()));
+        let error = request
+            .send_json(&[], &serde_json::json!({}))
+            .unwrap_err()
+            .into_transport()
+            .unwrap();
+        assert!(server.join().unwrap()[0].starts_with("CONNECT provider.example:443 "));
+        assert_artifact(&request.failure(&error), "tls", Some("provider.example"));
+    }
+
     #[test]
     fn transport_kinds_use_structured_errors_and_fixed_tls_markers() {
         use ureq::ErrorKind::*;
@@ -431,7 +852,10 @@ mod tests {
             .unwrap_err()
             .into_transport()
             .unwrap();
-        let failure = TransportFailure::new("https://original.invalid", &error);
+        let failure = TransportFailure::new(
+            "https://user:PRIVATE@example.invalid/PRIVATE?token=PRIVATE",
+            &error,
+        );
         assert_eq!(failure.kind, "dns");
         assert_eq!(failure.host.as_deref(), Some("example.invalid"));
     }
@@ -463,7 +887,7 @@ mod tests {
             .into_transport()
             .unwrap();
         server.join().unwrap();
-        let failure = TransportFailure::new("", &error);
+        let failure = TransportFailure::new(&format!("https://{address}/?token=PRIVATE"), &error);
         assert_eq!(failure.kind, "tls");
         assert_eq!(failure.host.as_deref(), Some("127.0.0.1"));
     }
