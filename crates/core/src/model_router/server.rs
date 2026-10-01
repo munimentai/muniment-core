@@ -934,18 +934,16 @@ fn complete(
                     break;
                 }
             };
-            let agent = ureq::AgentBuilder::new()
-                .timeout_connect(CONNECT_TIMEOUT)
-                .timeout_read(READ_TIMEOUT)
-                .build();
-            let mut call = agent
-                .post(&prepared.url)
-                .set("content-type", "application/json");
-            for (name, value) in &prepared.headers {
-                call = call.set(name, value);
-            }
+            let mut upstream = super::subscription_probe::TransportRequest::new(
+                ureq::AgentBuilder::new()
+                    .timeout_connect(CONNECT_TIMEOUT)
+                    .timeout_read(READ_TIMEOUT),
+                &prepared.url,
+            );
             super::subscription_probe::transport(&state.agent, &route.model, "pending", "none");
-            let call = call.send_json(&prepared.body);
+            let call = upstream
+                .send_json(&prepared.headers, &prepared.body)
+                .map_err(|error| *error);
             match call {
                 Ok(response) => {
                     super::subscription_probe::transport(
@@ -1137,11 +1135,11 @@ fn complete(
                     }
                 }
                 Err(ureq::Error::Transport(error)) => {
-                    super::subscription_probe::transport(
+                    super::subscription_probe::transport_failed(
                         &state.agent,
                         &route.model,
-                        "failed",
-                        "network",
+                        &upstream,
+                        &error,
                     );
                     state.record_error(&account.id, &error.to_string(), true);
                     refusals.push(format!("{} did not answer.", account.label));
@@ -1781,6 +1779,67 @@ mod tests {
         }
         drop(handle);
         std::fs::remove_dir_all(agent).unwrap();
+    }
+
+    #[test]
+    fn provider_connect_failures_record_redacted_transport_details() {
+        // Isolate the probe flag and proxy settings from concurrent router tests.
+        if std::env::var("MUNIMENT_SUBSCRIPTION_PROBE").as_deref() != Ok("1") {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args([
+                "--exact",
+                "model_router::server::tests::provider_connect_failures_record_redacted_transport_details",
+            ]).env("MUNIMENT_SUBSCRIPTION_PROBE", "1");
+            for name in [
+                "ALL_PROXY",
+                "all_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "HTTP_PROXY",
+                "http_proxy",
+            ] {
+                child.env_remove(name);
+            }
+            assert!(child.status().unwrap().success());
+            return;
+        }
+        let root = agent_dir();
+        let agent = root.join("agent");
+        std::fs::create_dir(&agent).unwrap();
+        std::fs::write(
+            root.join("subscription-probe.json"),
+            r#"{"phase":"chat","models":[{"id":"gpt-5.6-mini"}]}"#,
+        )
+        .unwrap();
+        config::save(
+            &agent,
+            &config(vec![account(
+                "PRIVATE",
+                "http://127.0.0.1:0/PRIVATE?token=PRIVATE",
+            )]),
+        )
+        .unwrap();
+        let handle = start_with_clock(agent, fixed_clock).unwrap();
+        let (status, _) = call(
+            handle.endpoint(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&turn("auto", false)),
+            &handle.endpoint().token,
+        );
+        assert_eq!(status, 503);
+        let text =
+            std::fs::read_to_string(root.join("subscription-probe-transport-progress.jsonl"))
+                .unwrap();
+        assert!(!text.contains("PRIVATE"));
+        let row: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(row["transport"], "failed");
+        assert_eq!(row["error_class"], "network");
+        assert_eq!(row["transport_kind"], "connect");
+        assert_eq!(row["host"], "127.0.0.1");
+        assert_eq!(row["turn"], 0);
+        drop(handle);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
