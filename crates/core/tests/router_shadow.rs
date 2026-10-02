@@ -93,6 +93,65 @@ fn fixture_uses_shared_policy_without_changing_the_baseline() {
 }
 
 #[test]
+fn schema_failure_rolls_back_all_new_objects() {
+    let state = State::new();
+    let db = rusqlite::Connection::open(&state.0).unwrap();
+    db.execute_batch("CREATE VIEW jobs AS SELECT 1 AS account;")
+        .unwrap();
+    assert!(matches!(Router::open(&state.0), Err(Error::Storage)));
+    let objects: Vec<String> = db
+        .prepare("SELECT name FROM sqlite_master ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(objects, vec!["jobs"]);
+    assert_eq!(
+        db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+            .unwrap(),
+        0
+    );
+    db.execute_batch("DROP VIEW jobs;").unwrap();
+    assert_eq!(inspect(&mut state.open(), &request(1)).eligible.len(), 2);
+}
+
+#[test]
+fn concurrent_first_opens_commit_one_schema() {
+    let state = State::new();
+    let barrier = Arc::new(Barrier::new(8));
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let path = state.0.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                Router::open(&path).unwrap();
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    let db = rusqlite::Connection::open(&state.0).unwrap();
+    assert_eq!(
+        db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+            .unwrap(),
+        1
+    );
+    let data_version: u32 = db
+        .pragma_query_value(None, "data_version", |row| row.get(0))
+        .unwrap();
+    drop(state.open());
+    assert_eq!(
+        db.pragma_query_value(None, "data_version", |row| row.get::<_, u32>(0))
+            .unwrap(),
+        data_version
+    );
+    assert_eq!(inspect(&mut state.open(), &request(1)).eligible.len(), 2);
+}
+
+#[test]
 fn concurrent_process_connections_share_weighted_reservations() {
     let state = State::new();
     drop(state.open());
