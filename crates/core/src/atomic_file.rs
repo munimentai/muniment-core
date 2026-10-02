@@ -69,7 +69,49 @@ mod tests {
     use super::*;
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
-    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    #[test]
+    fn closes_the_source_writer_while_pi_keeps_the_destination_open() {
+        use std::io::{Read, Write};
+
+        for writable in [false, true] {
+            let root =
+                std::env::temp_dir().join(format!("muniment-replace-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&root).unwrap();
+            let source = root.join("settings.tmp");
+            let destination = root.join("settings.json");
+            fs::write(&destination, b"old").unwrap();
+            // Pi uses Node's libuv file opens, which share read, write, and delete access.
+            let mut pi = fs::OpenOptions::new()
+                .read(true)
+                .write(writable)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .open(&destination)
+                .unwrap();
+            let mut writer = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&source)
+                .unwrap();
+            writer.write_all(b"new").unwrap();
+            writer.sync_all().unwrap();
+            let error = replace_once(&source, &destination).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(ERROR_SHARING_VIOLATION as i32));
+            assert_eq!(fs::read(&destination).unwrap(), b"old");
+            drop(writer);
+            replace(&source, &destination).unwrap();
+            assert_eq!(fs::read(&destination).unwrap(), b"new");
+            assert!(!source.exists());
+            let mut old = String::new();
+            pi.read_to_string(&mut old).unwrap();
+            assert_eq!(old, "old");
+            drop(pi);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
 
     #[test]
     fn retries_sharing_and_access_errors_until_success() {
