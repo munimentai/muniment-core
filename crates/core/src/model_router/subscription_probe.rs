@@ -14,7 +14,91 @@ pub fn record(
     outcome: &str,
     error_class: &str,
 ) -> Result<(), &'static str> {
-    record_progress(root, stage, turn, outcome, error_class, None)
+    record_progress(root, stage, turn, outcome, error_class, None, None)
+}
+
+pub fn record_model_save(
+    root: &Path,
+    provider: &str,
+    model: &str,
+    outcome: &str,
+    os_error: Option<i32>,
+) -> Result<(), &'static str> {
+    if provider != "muniment-router" || !matches!(outcome, "pending" | "complete" | "failed") {
+        return Err("The probe model save is invalid.");
+    }
+    let plan: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join("subscription-probe.json"))
+            .map_err(|_| "The probe plan is missing.")?,
+    )
+    .map_err(|_| "The probe plan is invalid.")?;
+    let turn = plan["models"]
+        .as_array()
+        .and_then(|models| {
+            models.iter().position(|entry| {
+                model
+                    == format!(
+                        "{}/{}",
+                        entry["family"].as_str().unwrap_or(""),
+                        entry["id"].as_str().unwrap_or("")
+                    )
+            })
+        })
+        .ok_or("The probe model save is invalid.")?;
+    record_progress(
+        root,
+        "model-save",
+        Some(turn),
+        outcome,
+        "none",
+        None,
+        os_error,
+    )
+}
+
+fn saved_default(
+    value: &serde_json::Value,
+    plan: &serde_json::Value,
+    provider: bool,
+) -> serde_json::Value {
+    if value.is_null() {
+        return serde_json::Value::Null;
+    }
+    let allowed = value.as_str().is_some_and(|value| {
+        if provider && value == "muniment-router" {
+            return true;
+        }
+        plan["models"].as_array().is_some_and(|models| {
+            models.iter().any(|entry| {
+                let family = entry["family"].as_str().unwrap_or("");
+                let id = entry["id"].as_str().unwrap_or("");
+                let identifier = |text: &str, model: bool| {
+                    text.len() <= 128
+                        && text
+                            .bytes()
+                            .next()
+                            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+                        && text.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric()
+                                || b"._-".contains(&byte)
+                                || (model && byte == b':')
+                        })
+                };
+                identifier(family, false)
+                    && identifier(id, true)
+                    && if provider {
+                        value == family
+                    } else {
+                        value == id || value == format!("{family}/{id}")
+                    }
+            })
+        })
+    });
+    if allowed {
+        value.clone()
+    } else {
+        "[redacted]".into()
+    }
 }
 
 fn record_progress(
@@ -24,12 +108,14 @@ fn record_progress(
     outcome: &str,
     error_class: &str,
     failure: Option<&TransportFailure>,
+    os_error: Option<i32>,
 ) -> Result<(), &'static str> {
     if !matches!(
         stage,
         "composer"
             | "runtime"
             | "selection"
+            | "model-save"
             | "inventory"
             | "send"
             | "reply"
@@ -110,6 +196,25 @@ fn record_progress(
         "phase": phase, "stage": stage, "turn": turn, "requested": requested,
         "transport": outcome, "error_class": error_class,
     });
+    if stage == "model-save" {
+        row["model_save_rejected"] = match outcome {
+            "complete" => false.into(),
+            "failed" => true.into(),
+            _ => serde_json::Value::Null,
+        };
+        row["os_error"] = serde_json::json!(os_error.filter(|_| outcome == "failed"));
+    }
+    if stage == "inventory" {
+        // Read the file without inventory adoption so diagnostics cannot change the saved choice.
+        let settings = std::fs::read(root.join("agent/settings.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .filter(serde_json::Value::is_object);
+        row["settings_read"] = settings.is_some().into();
+        let settings = settings.unwrap_or_default();
+        row["defaultProvider"] = saved_default(&settings["defaultProvider"], &plan, true);
+        row["defaultModel"] = saved_default(&settings["defaultModel"], &plan, false);
+    }
     if let Some(failure) = failure {
         row["transport_kind"] = failure.kind.into();
         row["host"] = serde_json::json!(failure.host);
@@ -429,7 +534,7 @@ fn transport_progress(
             .position(|entry| entry["id"].as_str() == Some(model))
     });
     if turn.is_some() {
-        let _ = record_progress(root, "transport", turn, outcome, error_class, failure);
+        let _ = record_progress(root, "transport", turn, outcome, error_class, failure, None);
     }
 }
 
@@ -491,6 +596,7 @@ mod tests {
             "failed",
             "network",
             Some(failure),
+            None,
         )
         .unwrap();
         let text =
@@ -904,6 +1010,7 @@ mod tests {
                 "failed",
                 "network",
                 Some(&failure),
+                None,
             )
             .unwrap();
             let text = std::fs::read_to_string(
@@ -981,6 +1088,88 @@ mod tests {
         let failure = TransportFailure::new(&format!("https://{address}/?token=PRIVATE"), &error);
         assert_eq!(failure.kind, "tls");
         assert_eq!(failure.host.as_deref(), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn model_save_and_inventory_diagnostics_keep_codes_and_saved_defaults() {
+        let root =
+            std::env::temp_dir().join(format!("subscription-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("agent")).unwrap();
+        std::fs::write(root.join("subscription-probe.json"), r#"{"phase":"chat","models":[{"family":"openai-codex","id":"luna"},{"family":"openai-codex","id":"terra"}]}"#).unwrap();
+        let settings = root.join("agent/settings.json");
+        let bytes = br#"{"defaultProvider":"muniment-router","defaultModel":"openai-codex/luna","token":"PRIVATE"}"#;
+        std::fs::write(&settings, bytes).unwrap();
+        let last = || {
+            let text =
+                std::fs::read_to_string(root.join("subscription-probe-progress.jsonl")).unwrap();
+            assert!(!text.contains("PRIVATE"));
+            serde_json::from_str::<serde_json::Value>(text.lines().last().unwrap()).unwrap()
+        };
+        for (outcome, code, rejected) in [
+            ("pending", None, serde_json::Value::Null),
+            ("failed", Some(32), true.into()),
+            ("failed", Some(1175), true.into()),
+            ("failed", None, true.into()),
+            ("complete", None, false.into()),
+        ] {
+            record_model_save(
+                &root,
+                "muniment-router",
+                "openai-codex/terra",
+                outcome,
+                code,
+            )
+            .unwrap();
+            let row = last();
+            assert_eq!(row["turn"], 1);
+            assert_eq!(row["requested"], "terra");
+            assert_eq!(row["model_save_rejected"], rejected);
+            assert_eq!(row["os_error"], serde_json::json!(code));
+        }
+        record(&root, "inventory", Some(1), "not-started", "timeout").unwrap();
+        let row = last();
+        assert_eq!(row["settings_read"], true);
+        assert_eq!(row["defaultProvider"], "muniment-router");
+        assert_eq!(row["defaultModel"], "openai-codex/luna");
+        assert_eq!(std::fs::read(&settings).unwrap(), bytes);
+        for value in [
+            serde_json::json!("C:/PRIVATE"),
+            serde_json::json!("/PRIVATE"),
+            serde_json::json!("PRIVATE"),
+            serde_json::json!({"token":"PRIVATE"}),
+        ] {
+            std::fs::write(
+                &settings,
+                serde_json::json!({"defaultProvider":value, "defaultModel":value}).to_string(),
+            )
+            .unwrap();
+            record(&root, "inventory", Some(1), "not-started", "timeout").unwrap();
+            assert_eq!(last()["defaultProvider"], "[redacted]");
+            assert_eq!(last()["defaultModel"], "[redacted]");
+        }
+        std::fs::write(&settings, b"{}").unwrap();
+        record(&root, "inventory", Some(1), "not-started", "timeout").unwrap();
+        assert_eq!(last()["settings_read"], true);
+        assert!(last()["defaultModel"].is_null());
+        for bytes in [b"invalid".as_slice(), b"null".as_slice()] {
+            std::fs::write(&settings, bytes).unwrap();
+            record(&root, "inventory", Some(1), "not-started", "timeout").unwrap();
+            assert_eq!(last()["settings_read"], false);
+        }
+        std::fs::remove_file(&settings).unwrap();
+        record(&root, "inventory", Some(1), "not-started", "timeout").unwrap();
+        assert_eq!(last()["settings_read"], false);
+        assert!(record_model_save(&root, "PRIVATE", "openai-codex/terra", "failed", None).is_err());
+        assert!(record_model_save(&root, "muniment-router", "PRIVATE", "failed", None).is_err());
+        assert!(record_model_save(
+            &root,
+            "muniment-router",
+            "openai-codex/terra",
+            "PRIVATE",
+            None
+        )
+        .is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
