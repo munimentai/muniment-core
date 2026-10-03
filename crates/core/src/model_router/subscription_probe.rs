@@ -148,6 +148,13 @@ fn record_progress(
             | "update-address"
             | "update-builder"
             | "update-check"
+            | "update-check-network"
+            | "update-check-target-not-found"
+            | "update-check-manifest-parse"
+            | "update-check-release-not-found"
+            | "update-check-version"
+            | "update-check-address"
+            | "update-check-other"
             | "update-download"
             | "update-unavailable"
             | "update-not-prepared"
@@ -1219,6 +1226,13 @@ mod tests {
                 "update-address",
                 "update-builder",
                 "update-check",
+                "update-check-network",
+                "update-check-target-not-found",
+                "update-check-manifest-parse",
+                "update-check-release-not-found",
+                "update-check-version",
+                "update-check-address",
+                "update-check-other",
                 "update-download",
                 "update-unavailable",
                 "update-not-prepared",
@@ -1242,14 +1256,13 @@ mod tests {
                 assert_eq!(row["error_class"], code);
                 assert_eq!(row["phase"], phase);
             }
-            assert!(record(
-                &directory,
-                "features",
-                None,
-                "not-started",
-                "update-PRIVATE"
-            )
-            .is_err());
+            for code in [
+                "update-PRIVATE",
+                "update-check-PRIVATE",
+                "update-check-network https://PRIVATE/path?token=SECRET",
+            ] {
+                assert!(record(&directory, "features", None, "not-started", code).is_err());
+            }
         }
         std::fs::remove_dir_all(directory).unwrap();
     }
