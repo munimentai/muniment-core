@@ -2330,6 +2330,7 @@ mod linux {
                 #[cfg(not(target_os = "linux"))]
                 {
                     let stream = interruptible_connect(endpoint, &connect_stop)?;
+                    let started = std::time::Instant::now();
                     match handshake_approval_presenter_stream(stream, client_version, io_timeout) {
                         Ok(presenter) => {
                             last_failure = None;
@@ -2338,7 +2339,13 @@ mod linux {
                         Err(error) => {
                             // The loop retries every interval, so a reason prints once until it changes.
                             if last_failure != Some(error) {
-                                eprintln!("muniment-desktop: approval presenter handshake failed endpoint={endpoint:?} reason={error:?}");
+                                log_handshake_failure(
+                                    endpoint,
+                                    "approval-presenter",
+                                    error,
+                                    started.elapsed(),
+                                    io_timeout,
+                                );
                                 last_failure = Some(error);
                             }
                             None
@@ -2365,6 +2372,8 @@ mod linux {
         let connect_stop = stop.clone();
         #[cfg(target_os = "linux")]
         let mut diagnostic = crate::LinuxConnectDiagnostic::default();
+        #[cfg(not(target_os = "linux"))]
+        let mut last_failure: Option<ClientError> = None;
         serve_desktop_client_with(
             || {
                 #[cfg(target_os = "linux")]
@@ -2375,7 +2384,26 @@ mod linux {
                 #[cfg(not(target_os = "linux"))]
                 let client = {
                     let stream = interruptible_desktop_connect(endpoint, &connect_stop)?;
-                    handshake_desktop_client_stream(stream, client_version, io_timeout).ok()
+                    let started = std::time::Instant::now();
+                    match handshake_desktop_client_stream(stream, client_version, io_timeout) {
+                        Ok(client) => {
+                            last_failure = None;
+                            Some(client)
+                        }
+                        Err(error) => {
+                            if last_failure != Some(error) {
+                                log_handshake_failure(
+                                    endpoint,
+                                    "desktop-client",
+                                    error,
+                                    started.elapsed(),
+                                    io_timeout,
+                                );
+                                last_failure = Some(error);
+                            }
+                            None
+                        }
+                    }
                 };
                 if client.is_none() {
                     clear_desktop_stream(&connect_stop);
@@ -2386,6 +2414,35 @@ mod linux {
             holder,
             retry_interval,
             observe,
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn log_handshake_failure(
+        endpoint: &Path,
+        route: &str,
+        error: ClientError,
+        elapsed: Duration,
+        bound: Duration,
+    ) {
+        let closed_by = if error == ClientError::ConnectionClosed {
+            "runtime_or_transport"
+        } else {
+            "desktop"
+        };
+        eprintln!(
+            "muniment-desktop: {}",
+            serde_json::json!({
+                "event": "macos_attach_admission",
+                "observer": "desktop",
+                "peer_pid": std::process::id(),
+                "endpoint": endpoint,
+                "requested_route": route,
+                "closed_by": closed_by,
+                "error": format!("{error:?}"),
+                "handshake_elapsed_ms": elapsed.as_millis(),
+                "io_bound_ms": bound.as_millis(),
+            })
         );
     }
 

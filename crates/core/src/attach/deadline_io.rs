@@ -86,6 +86,7 @@ pub fn read_exact_before<S: DeadlineStream + ?Sized>(
         match stream.read(bytes) {
             Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
             Ok(read) => bytes = &mut bytes[read..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         }
     }
@@ -103,6 +104,7 @@ pub fn write_all_before<S: DeadlineStream + ?Sized>(
         match stream.write(bytes) {
             Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
             Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         }
     }
@@ -131,4 +133,103 @@ pub(super) fn is_timeout(error: &io::Error) -> bool {
         error.kind(),
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct InterruptedStream {
+        input: io::Cursor<Vec<u8>>,
+        output: Vec<u8>,
+        interrupt: bool,
+        stall_until: Option<Instant>,
+    }
+
+    impl InterruptedStream {
+        fn step(&mut self) -> io::Result<()> {
+            if let Some(until) = self.stall_until {
+                std::thread::sleep(until.saturating_duration_since(Instant::now()));
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            self.interrupt = !self.interrupt;
+            if self.interrupt {
+                Err(io::ErrorKind::Interrupted.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Read for InterruptedStream {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.step()?;
+            self.input.read(&mut bytes[..1])
+        }
+    }
+
+    impl Write for InterruptedStream {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.step()?;
+            self.output.push(bytes[0]);
+            Ok(1)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl DeadlineStream for InterruptedStream {
+        fn wait_until_readable(&self, _: Instant) -> ReadableWait {
+            ReadableWait::Ready
+        }
+        fn set_read_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
+        fn set_write_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn interrupted_partial_io_preserves_bytes_and_eof() {
+        let mut stream = InterruptedStream {
+            input: io::Cursor::new(b"hello".to_vec()),
+            output: Vec::new(),
+            interrupt: false,
+            stall_until: None,
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut bytes = [0; 5];
+        read_exact_before(&mut stream, &mut bytes, deadline).unwrap();
+        assert_eq!(&bytes, b"hello");
+        write_all_before(&mut stream, &bytes, deadline).unwrap();
+        assert_eq!(stream.output, b"hello");
+        assert_eq!(
+            read_exact_before(&mut stream, &mut [0], deadline)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn interruptions_do_not_reset_the_admission_deadline() {
+        for read in [true, false] {
+            let deadline = Instant::now() + Duration::from_millis(5);
+            let mut stream = InterruptedStream {
+                input: io::Cursor::new(Vec::new()),
+                output: Vec::new(),
+                interrupt: false,
+                stall_until: Some(deadline),
+            };
+            let result = if read {
+                read_exact_before(&mut stream, &mut [0], deadline)
+            } else {
+                write_all_before(&mut stream, &[0], deadline)
+            };
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+            assert!(stream.output.is_empty());
+        }
+    }
 }

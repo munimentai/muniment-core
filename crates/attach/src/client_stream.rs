@@ -29,9 +29,11 @@ pub(crate) fn read_exact_before<S: ClientStream + ?Sized>(
     while !bytes.is_empty() {
         unless_disconnected(stream.set_read_timeout(Some(remaining(deadline)?)))
             .map_err(|_| ClientError::DesktopUnavailable)?;
-        match stream.read(bytes).map_err(map_io_error)? {
-            0 => return Err(ClientError::ConnectionClosed),
-            read => bytes = &mut bytes[read..],
+        match stream.read(bytes) {
+            Ok(0) => return Err(ClientError::ConnectionClosed),
+            Ok(read) => bytes = &mut bytes[read..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(map_io_error(error)),
         }
     }
     Ok(())
@@ -45,9 +47,11 @@ pub(crate) fn write_all_before<S: ClientStream + ?Sized>(
     while !bytes.is_empty() {
         unless_disconnected(stream.set_write_timeout(Some(remaining(deadline)?)))
             .map_err(|_| ClientError::DesktopUnavailable)?;
-        match stream.write(bytes).map_err(map_io_error)? {
-            0 => return Err(ClientError::ConnectionClosed),
-            written => bytes = &bytes[written..],
+        match stream.write(bytes) {
+            Ok(0) => return Err(ClientError::ConnectionClosed),
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(map_io_error(error)),
         }
     }
     Ok(())
@@ -126,5 +130,154 @@ fn map_frame_error(error: FrameError) -> ClientError {
     match error {
         FrameError::PayloadTooLarge => ClientError::PayloadTooLarge,
         _ => ClientError::MalformedFrame,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    struct InterruptedStream {
+        input: VecDeque<u8>,
+        output: Vec<u8>,
+        interrupt: bool,
+        stall_until: Option<Instant>,
+    }
+
+    impl InterruptedStream {
+        fn step(&mut self) -> io::Result<()> {
+            if let Some(until) = self.stall_until {
+                std::thread::sleep(until.saturating_duration_since(Instant::now()));
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            self.interrupt = !self.interrupt;
+            if self.interrupt {
+                Err(io::ErrorKind::Interrupted.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Read for InterruptedStream {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.step()?;
+            let Some(byte) = self.input.pop_front() else {
+                return Ok(0);
+            };
+            bytes[0] = byte;
+            Ok(1)
+        }
+    }
+
+    impl Write for InterruptedStream {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.step()?;
+            self.output.push(bytes[0]);
+            Ok(1)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ClientStream for InterruptedStream {
+        fn set_read_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
+        fn set_write_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn interrupted_partial_io_preserves_bytes_and_eof() {
+        let mut stream = InterruptedStream {
+            input: VecDeque::from(*b"hello"),
+            output: Vec::new(),
+            interrupt: false,
+            stall_until: None,
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut bytes = [0; 5];
+        read_exact_before(&mut stream, &mut bytes, deadline).unwrap();
+        assert_eq!(&bytes, b"hello");
+        write_all_before(&mut stream, &bytes, deadline).unwrap();
+        assert_eq!(stream.output, b"hello");
+        assert_eq!(
+            read_exact_before(&mut stream, &mut [0], deadline),
+            Err(ClientError::ConnectionClosed)
+        );
+    }
+
+    #[test]
+    fn desktop_and_presenter_handshakes_survive_interrupted_frames() {
+        for presenter in [false, true] {
+            let welcome = crate::reconnect_welcome(1, "1.2.3", "aa".repeat(16), "");
+            let mut input = crate::encode_frame(&welcome).unwrap();
+            let capability = "bb".repeat(32);
+            let grant = if presenter {
+                crate::encode_frame(&crate::PeerAuthorizedGrant {
+                    capability: capability.clone(),
+                    expires_at: 60,
+                    idle_timeout_seconds: 30,
+                })
+                .unwrap()
+            } else {
+                crate::encode_frame(&crate::DesktopClientAuthorizedGrant {
+                    capability: capability.clone(),
+                    expires_at: 60,
+                    idle_timeout_seconds: 30,
+                    profile_id: "desktop-owner".into(),
+                    workspace_scopes: Default::default(),
+                })
+                .unwrap()
+            };
+            input.extend(grant);
+            let stream = Box::new(InterruptedStream {
+                input: input.into(),
+                output: Vec::new(),
+                interrupt: false,
+                stall_until: None,
+            });
+            let admitted = if presenter {
+                crate::presenter_client::handshake_approval_presenter(
+                    stream,
+                    "1.2.3",
+                    Duration::from_secs(1),
+                )
+                .map(|client| client.capability().to_owned())
+            } else {
+                crate::desktop_client::handshake_desktop_client(
+                    stream,
+                    "1.2.3",
+                    Duration::from_secs(1),
+                )
+                .map(|client| client.capability().to_owned())
+            };
+            assert_eq!(admitted, Ok(capability));
+        }
+    }
+
+    #[test]
+    fn interruptions_do_not_reset_the_io_deadline() {
+        for read in [true, false] {
+            let deadline = Instant::now() + Duration::from_millis(5);
+            let mut stream = InterruptedStream {
+                input: VecDeque::new(),
+                output: Vec::new(),
+                interrupt: false,
+                stall_until: Some(deadline),
+            };
+            let result = if read {
+                read_exact_before(&mut stream, &mut [0], deadline)
+            } else {
+                write_all_before(&mut stream, &[0], deadline)
+            };
+            assert_eq!(result, Err(ClientError::Timeout));
+            assert!(stream.output.is_empty());
+        }
     }
 }
