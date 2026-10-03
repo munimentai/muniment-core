@@ -489,6 +489,7 @@ fn read_before<S: DeadlineStream + ?Sized>(
         match stream.read(bytes) {
             Ok(0) => return Err(AttachSessionError::Closed),
             Ok(read) => bytes = &mut bytes[read..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error)
                 if matches!(
                     error.kind(),
@@ -663,6 +664,67 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn interrupted_request_read_keeps_the_original_deadline() {
+        struct Interrupted {
+            remaining: std::cell::Cell<Duration>,
+            reads: usize,
+        }
+        impl Read for Interrupted {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                assert_eq!(
+                    self.reads, 1,
+                    "the expired deadline must prevent another read"
+                );
+                std::thread::sleep(self.remaining.get() + Duration::from_millis(1));
+                Err(io::ErrorKind::Interrupted.into())
+            }
+        }
+        impl Write for Interrupted {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                unreachable!()
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                unreachable!()
+            }
+        }
+        impl DeadlineStream for Interrupted {
+            fn wait_until_readable(&self, _: Instant) -> ReadableWait {
+                unreachable!()
+            }
+            fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+                self.remaining.set(timeout.unwrap());
+                Ok(())
+            }
+            fn set_write_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+                unreachable!()
+            }
+        }
+        let mut stream = Interrupted {
+            remaining: Default::default(),
+            reads: 0,
+        };
+        assert_eq!(
+            read_before(
+                &mut stream,
+                &mut [0; 4],
+                Instant::now() + Duration::from_millis(10)
+            ),
+            Err(AttachSessionError::Timeout),
+        );
+        assert_eq!(stream.reads, 1);
+        assert_eq!(
+            read_before(
+                &mut stream,
+                &mut [0; 4],
+                Instant::now() - Duration::from_millis(1)
+            ),
+            Err(AttachSessionError::Timeout),
+        );
+        assert_eq!(stream.reads, 1);
+    }
 
     #[test]
     fn frame_diagnostics_do_not_echo_unknown_event_names_or_invalid_run_ids() {

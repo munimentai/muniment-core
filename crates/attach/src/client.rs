@@ -2320,7 +2320,7 @@ mod linux {
         #[cfg(target_os = "linux")]
         let mut diagnostic = crate::LinuxConnectDiagnostic::default();
         #[cfg(not(target_os = "linux"))]
-        let mut last_failure: Option<ClientError> = None;
+        let mut diagnostic = crate::macos_connect_diagnostic::MacosConnectDiagnostic::default();
         serve_approval_presenter_with(
             || {
                 #[cfg(target_os = "linux")]
@@ -2329,28 +2329,15 @@ mod linux {
                 });
                 #[cfg(not(target_os = "linux"))]
                 {
-                    let stream = interruptible_connect(endpoint, &connect_stop)?;
-                    let started = std::time::Instant::now();
-                    match handshake_approval_presenter_stream(stream, client_version, io_timeout) {
-                        Ok(presenter) => {
-                            last_failure = None;
-                            Some(presenter)
-                        }
-                        Err(error) => {
-                            // The loop retries every interval, so a reason prints once until it changes.
-                            if last_failure != Some(error) {
-                                log_handshake_failure(
-                                    endpoint,
-                                    "approval-presenter",
-                                    error,
-                                    started.elapsed(),
-                                    io_timeout,
-                                );
-                                last_failure = Some(error);
-                            }
-                            None
-                        }
-                    }
+                    diagnostic.connect(
+                        endpoint,
+                        "approval-presenter",
+                        &connect_stop.inner,
+                        io_timeout,
+                        |stream| {
+                            handshake_approval_presenter_stream(stream, client_version, io_timeout)
+                        },
+                    )
                 }
             },
             stop,
@@ -2373,7 +2360,9 @@ mod linux {
         #[cfg(target_os = "linux")]
         let mut diagnostic = crate::LinuxConnectDiagnostic::default();
         #[cfg(not(target_os = "linux"))]
-        let mut last_failure: Option<ClientError> = None;
+        let mut diagnostic = crate::macos_connect_diagnostic::MacosConnectDiagnostic::default();
+        #[cfg(not(target_os = "linux"))]
+        let diagnostic_holder = holder.clone();
         serve_desktop_client_with(
             || {
                 #[cfg(target_os = "linux")]
@@ -2383,27 +2372,13 @@ mod linux {
                     });
                 #[cfg(not(target_os = "linux"))]
                 let client = {
-                    let stream = interruptible_desktop_connect(endpoint, &connect_stop)?;
-                    let started = std::time::Instant::now();
-                    match handshake_desktop_client_stream(stream, client_version, io_timeout) {
-                        Ok(client) => {
-                            last_failure = None;
-                            Some(client)
-                        }
-                        Err(error) => {
-                            if last_failure != Some(error) {
-                                log_handshake_failure(
-                                    endpoint,
-                                    "desktop-client",
-                                    error,
-                                    started.elapsed(),
-                                    io_timeout,
-                                );
-                                last_failure = Some(error);
-                            }
-                            None
-                        }
-                    }
+                    diagnostic.connect_desktop(
+                        endpoint,
+                        client_version,
+                        &connect_stop,
+                        &diagnostic_holder,
+                        io_timeout,
+                    )
                 };
                 if client.is_none() {
                     clear_desktop_stream(&connect_stop);
@@ -2415,51 +2390,6 @@ mod linux {
             retry_interval,
             observe,
         );
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn log_handshake_failure(
-        endpoint: &Path,
-        route: &str,
-        error: ClientError,
-        elapsed: Duration,
-        bound: Duration,
-    ) {
-        let closed_by = if error == ClientError::ConnectionClosed {
-            "runtime_or_transport"
-        } else {
-            "desktop"
-        };
-        eprintln!(
-            "muniment-desktop: {}",
-            serde_json::json!({
-                "event": "macos_attach_admission",
-                "observer": "desktop",
-                "peer_pid": std::process::id(),
-                "endpoint": endpoint,
-                "requested_route": route,
-                "closed_by": closed_by,
-                "error": format!("{error:?}"),
-                "handshake_elapsed_ms": elapsed.as_millis(),
-                "io_bound_ms": bound.as_millis(),
-            })
-        );
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn interruptible_desktop_connect(
-        endpoint: &Path,
-        stop: &DesktopClientStopHandle,
-    ) -> Option<UnixStream> {
-        interruptible_connect_with_state(endpoint, &stop.inner)
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn interruptible_connect(
-        endpoint: &Path,
-        stop: &ApprovalPresenterStopHandle,
-    ) -> Option<UnixStream> {
-        interruptible_connect_with_state(endpoint, &stop.inner)
     }
 
     pub fn interruptible_connect_with_state<S>(
@@ -3022,7 +2952,7 @@ mod linux {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub use linux::interruptible_connect_result;
 
 #[cfg(unix)]

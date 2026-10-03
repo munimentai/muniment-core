@@ -45,6 +45,9 @@ struct AdmissionDiagnostic {
     code_check: serde_json::Value,
     bound: Duration,
     io_failure: std::cell::RefCell<Option<(String, std::io::Error)>>,
+    io_bound: std::cell::Cell<Option<(Instant, Duration)>>,
+    #[cfg(test)]
+    records: std::cell::RefCell<Vec<serde_json::Value>>,
 }
 
 struct AdmissionStream<'a, S: ?Sized> {
@@ -69,13 +72,19 @@ impl<S: DeadlineStream + ?Sized> std::io::Read for AdmissionStream<'_, S> {
 impl<S: DeadlineStream + ?Sized> std::io::Write for AdmissionStream<'_, S> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         let result = self.stream.write(bytes);
-        if let Err(error) = &result {
-            self.diagnostic.io_failed("write", error);
+        match &result {
+            Ok(0) if !bytes.is_empty() => self
+                .diagnostic
+                .io_failed("write", &std::io::ErrorKind::WriteZero.into()),
+            Err(error) => self.diagnostic.io_failed("write", error),
+            _ => {}
         }
         result
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        self.stream.flush()
+        self.stream
+            .flush()
+            .inspect_err(|error| self.diagnostic.io_failed("flush", error))
     }
 }
 
@@ -84,10 +93,18 @@ impl<S: DeadlineStream + ?Sized> DeadlineStream for AdmissionStream<'_, S> {
         self.stream.wait_until_readable(deadline)
     }
     fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
-        self.stream.set_read_timeout(timeout)
+        self.diagnostic.set_timeout(
+            "set_read_timeout",
+            timeout,
+            self.stream.set_read_timeout(timeout),
+        )
     }
     fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
-        self.stream.set_write_timeout(timeout)
+        self.diagnostic.set_timeout(
+            "set_write_timeout",
+            timeout,
+            self.stream.set_write_timeout(timeout),
+        )
     }
 }
 
@@ -108,6 +125,9 @@ impl AdmissionDiagnostic {
             code_check: reader.code_check_diagnostic(),
             bound,
             io_failure: Default::default(),
+            io_bound: Default::default(),
+            #[cfg(test)]
+            records: Default::default(),
         }
     }
 
@@ -121,12 +141,40 @@ impl AdmissionDiagnostic {
         }
     }
 
+    fn set_timeout(
+        &self,
+        operation: &str,
+        timeout: Option<Duration>,
+        result: std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        if self.io_failure.borrow().is_none() {
+            self.io_bound
+                .set(timeout.map(|bound| (Instant::now(), bound)));
+        }
+        match result {
+            // macOS rejects the timeout on a closed socket. Let I/O report the closure.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::InvalidInput
+                    && timeout != Some(Duration::ZERO) =>
+            {
+                Ok(())
+            }
+            Err(error) => {
+                self.io_failed(operation, &error);
+                Err(error)
+            }
+            Ok(()) => Ok(()),
+        }
+    }
+
     fn io_failed(&self, operation: &str, error: &std::io::Error) {
         if error.kind() != std::io::ErrorKind::Interrupted {
             let copy = error
                 .raw_os_error()
                 .map_or_else(|| error.kind().into(), std::io::Error::from_raw_os_error);
-            *self.io_failure.borrow_mut() = Some((operation.to_owned(), copy));
+            self.io_failure
+                .borrow_mut()
+                .get_or_insert_with(|| (operation.to_owned(), copy));
         }
     }
 
@@ -154,6 +202,8 @@ impl AdmissionDiagnostic {
             "closed_by": closed_by,
             "error": error,
             "io_error": io_error,
+            "io_elapsed_ms": self.io_bound.get().map(|(started, _)| now.saturating_duration_since(started).as_millis()),
+            "io_bound_ms": self.io_bound.get().map(|(_, bound)| bound.as_millis()),
             "elapsed_ms": now.duration_since(self.started).as_millis(),
             "route_elapsed_ms": self.admission_started.duration_since(self.started).as_millis(),
             "admission_elapsed_ms": now.duration_since(self.admission_started).as_millis(),
@@ -162,10 +212,13 @@ impl AdmissionDiagnostic {
     }
 
     fn record(&self, phase: &str, error: Option<&str>, closed_by: &str) {
-        crate::runtime_eprintln!(
-            "muniment-runtime: {}",
-            self.envelope(phase, error, closed_by)
-        );
+        self.record_envelope(self.envelope(phase, error, closed_by));
+    }
+
+    fn record_envelope(&self, envelope: serde_json::Value) {
+        crate::runtime_eprintln!("muniment-runtime: {envelope}");
+        #[cfg(test)]
+        self.records.borrow_mut().push(envelope);
     }
 
     fn failure(&self, phase: &str, error: &MacosAttachSessionError) {
@@ -205,13 +258,13 @@ where
     H: ThreadListService,
     W: ApprovalWaiter,
 {
-    let diagnostic = {
+    let mut diagnostic = {
         let route_reader = super::NativeMacosAttachRouteReader::new(&stream);
         AdmissionDiagnostic::route(&route_reader, expected_desktop_executable, timeout)
     };
     serve_macos_attach_route_with_state(
         stream,
-        diagnostic,
+        &mut diagnostic,
         unsafe { libc::geteuid() },
         desktop_version,
         service,
@@ -244,10 +297,11 @@ where
     H: ThreadListService,
     W: ApprovalWaiter,
 {
-    let diagnostic = AdmissionDiagnostic::route(route_reader, expected_desktop_executable, timeout);
+    let mut diagnostic =
+        AdmissionDiagnostic::route(route_reader, expected_desktop_executable, timeout);
     serve_macos_attach_route_with_state(
         stream,
-        diagnostic,
+        &mut diagnostic,
         peer_uid,
         desktop_version,
         service,
@@ -263,7 +317,7 @@ where
 #[allow(clippy::too_many_arguments)]
 fn serve_macos_attach_route_with_state<H, W>(
     mut stream: UnixStream,
-    mut diagnostic: AdmissionDiagnostic,
+    diagnostic: &mut AdmissionDiagnostic,
     peer_uid: u32,
     desktop_version: &str,
     service: &mut H,
@@ -281,7 +335,9 @@ where
         serve_pairing_exchange, AuthorizationSessionDependencies, NoMigration, PairingPeer,
         PairingSession, SessionClock, SessionTokens,
     };
-    use super::{serve_approval_presenter, ApprovalPresenterConnection};
+    use super::{
+        approval_waiter_with_claims, serve_approval_presenter, ApprovalPresenterConnection,
+    };
 
     let deadline = diagnostic
         .admission_started
@@ -323,7 +379,6 @@ where
             )
             .map_err(MacosAttachSessionError::DesktopClientAdmission)
             .inspect_err(|error| diagnostic.failure("presenter-handshake", error))?;
-            diagnostic.record("presenter-handshake", None, "none");
             let connection = ApprovalPresenterConnection::new(stream, admitted.capability);
             let Some(session) = serve_approval_presenter(coordinator.clone(), connection) else {
                 if let Some(line) = coordinator.presenter_refusal_diagnostic() {
@@ -335,6 +390,7 @@ where
                 );
                 return Err(MacosAttachSessionError::ApprovalPresenterUnavailable);
             };
+            diagnostic.record("presenter-handshake", None, "none");
             session.wait_until_closed();
             Ok(MacosAttachSessionOutcome::ApprovalPresenter)
         }
@@ -356,8 +412,35 @@ where
             let mut random = |bytes: &mut [u8]| getrandom::fill(bytes).map_err(|_| ());
             let companion_identity = format!("{peer_uid}:{peer_pid}");
             pairing_identity_observer(&companion_identity);
+            let mut approvals = approvals;
+            let approvals = approval_waiter_with_claims(
+                |challenge: &super::PairingChallenge,
+                 kind: &str,
+                 version: &str,
+                 remaining: Duration| {
+                    let started = Instant::now();
+                    let decision = approvals.wait(challenge, kind, version, remaining);
+                    // A zero bound drains repeat actions after approval. It is not a pairing attempt.
+                    if !remaining.is_zero()
+                        && !matches!(decision, Some(super::ApprovalDecision::Approve(_)))
+                    {
+                        let error = if decision.is_none() || started.elapsed() >= remaining {
+                            "PairingTimeout"
+                        } else {
+                            "PairingDenied"
+                        };
+                        let mut envelope =
+                            diagnostic.envelope("companion-pairing", Some(error), "runtime");
+                        envelope["pairing_elapsed_ms"] =
+                            serde_json::json!(started.elapsed().as_millis());
+                        envelope["pairing_bound_ms"] = serde_json::json!(remaining.as_millis());
+                        diagnostic.record_envelope(envelope);
+                    }
+                    decision
+                },
+            );
             serve_pairing_exchange(
-                &mut stream,
+                &mut diagnostic.stream(&mut stream),
                 PairingSession {
                     peer: PairingPeer {
                         companion_identity,
@@ -379,7 +462,8 @@ where
                 service,
                 NoMigration,
             )
-            .map_err(MacosAttachSessionError::CompanionSession)?;
+            .map_err(MacosAttachSessionError::CompanionSession)
+            .inspect_err(|error| diagnostic.failure("companion-exchange", error))?;
             Ok(MacosAttachSessionOutcome::Companion)
         }
     }
@@ -460,6 +544,235 @@ mod tests {
         fn code_check_diagnostic(&self) -> serde_json::Value {
             serde_json::json!({"matched": self.0, "sec_code_check_validity": if self.0 { 0 } else { -67030 }})
         }
+    }
+
+    fn hello(kind: &str) -> Vec<u8> {
+        super::super::encode_frame(&serde_json::json!({
+            "protocol": "muniment.attach/1", "client": {"kind": kind, "version": "1.0.0"},
+            "supported": {"min": 1, "max": 1}, "client_nonce": "nonce",
+            "authorized_client_id": "018f0000-0000-7000-8000-000000000099",
+        }))
+        .unwrap()
+    }
+
+    #[derive(Default)]
+    struct Service(usize);
+    impl ThreadListService for Service {
+        fn list_threads(
+            &mut self,
+            _: &str,
+            _: super::super::thread_service::ThreadListRequest,
+        ) -> Result<super::super::thread_service::ThreadListPage, ProtocolError> {
+            self.0 += 1;
+            Ok(super::super::thread_service::ThreadListPage {
+                threads: vec![],
+                next_cursor: None,
+            })
+        }
+    }
+
+    #[test]
+    fn admitted_desktop_continues_after_an_interrupted_partial_request() {
+        use std::io::{Read, Write};
+        struct InterruptedRequest {
+            input: std::io::Cursor<Vec<u8>>,
+            output: Vec<u8>,
+            interrupt_at: usize,
+            interrupted: bool,
+        }
+        impl Read for InterruptedRequest {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                let position = self.input.position() as usize;
+                if position == self.interrupt_at && !self.interrupted {
+                    self.interrupted = true;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                let count = if self.interrupted {
+                    bytes.len()
+                } else {
+                    bytes.len().min(self.interrupt_at - position)
+                };
+                self.input.read(&mut bytes[..count])
+            }
+        }
+        impl Write for InterruptedRequest {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.output.write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl DeadlineStream for InterruptedRequest {
+            fn wait_until_readable(&self, _: Instant) -> super::super::ReadableWait {
+                if self.input.position() == self.input.get_ref().len() as u64 {
+                    super::super::ReadableWait::Closed
+                } else {
+                    super::super::ReadableWait::Ready
+                }
+            }
+            fn set_read_timeout(&self, _: Option<Duration>) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn set_write_timeout(&self, _: Option<Duration>) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for interrupt_at in [2, 6] {
+            let mut stream = InterruptedRequest {
+                input: std::io::Cursor::new(vec![]),
+                output: vec![],
+                interrupt_at,
+                interrupted: false,
+            };
+            let admitted = admit_desktop_client_over_stream_with_frame(
+                &mut stream,
+                &hello("desktop-client"),
+                "1.0.0",
+                None,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+            let request = super::super::encode_frame(&serde_json::json!({
+                "protocol": "muniment.attach/1", "request_id": "018f0000-0000-7000-8000-000000000201",
+                "operation": "thread.list", "capability": admitted.capability, "body": {"limit": 20},
+            })).unwrap();
+            stream.input = std::io::Cursor::new([request.clone(), request].concat());
+            stream.output.clear();
+            let mut service = Service::default();
+            assert!(matches!(
+                serve_desktop_client(&mut stream, admitted, (501, 42), &mut service),
+                Ok(MacosAttachSessionOutcome::DesktopClient(_))
+            ));
+            assert!(stream.interrupted);
+            assert_eq!(service.0, 2);
+            let mut responses = stream.output.as_slice();
+            for _ in 0..2 {
+                let (response, consumed) =
+                    super::super::decode_frame::<serde_json::Value>(responses)
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(response["ok"], true);
+                responses = &responses[consumed..];
+            }
+            assert!(responses.is_empty());
+        }
+    }
+
+    #[test]
+    fn rejected_code_check_reports_companion_peer_closure_and_pairing_timeout() {
+        use std::io::Write;
+        for kind in ["desktop-client", "desktop"] {
+            for peer_closed in [false, true] {
+                let (mut peer, server) = UnixStream::pair().unwrap();
+                peer.write_all(&hello(kind)).unwrap();
+                let _peer = (!peer_closed).then_some(peer);
+                let mut diagnostic = AdmissionDiagnostic::route(
+                    &Reader(false),
+                    &std::env::current_exe().unwrap(),
+                    Duration::from_secs(1),
+                );
+                let outcome = serve_macos_attach_route_with_state(
+                    server,
+                    &mut diagnostic,
+                    501,
+                    "1.0.0",
+                    &mut Service::default(),
+                    None,
+                    ApprovalCoordinator::default(),
+                    |_: &super::super::PairingChallenge, _: Duration| None,
+                    &LiveConnectionRegistry::default(),
+                    |_| {},
+                );
+                let records = diagnostic.records.borrow();
+                let envelope = records.last().unwrap();
+                assert_eq!(envelope["route"], "Companion { peer_pid: 42 }");
+                assert_eq!(envelope["code_check"]["sec_code_check_validity"], -67030);
+                assert_eq!(envelope["admission_bound_ms"], 1000);
+                assert!(envelope["elapsed_ms"].is_number());
+                assert!(envelope["route_elapsed_ms"].is_number());
+                assert!(envelope["admission_elapsed_ms"].is_number());
+                if peer_closed {
+                    assert_eq!(
+                        outcome,
+                        Err(MacosAttachSessionError::CompanionSession(
+                            AttachSessionError::Closed
+                        ))
+                    );
+                    assert_eq!(envelope["phase"], "companion-exchange");
+                    assert_eq!(envelope["error"], "CompanionSession(Closed)");
+                    assert_eq!(envelope["closed_by"], "peer_or_transport");
+                    assert_eq!(envelope["io_error"]["operation"], "write");
+                    assert_eq!(envelope["io_error"]["kind"], "BrokenPipe");
+                } else {
+                    assert_eq!(outcome, Ok(MacosAttachSessionOutcome::Companion));
+                    assert_eq!(envelope["phase"], "companion-pairing");
+                    assert_eq!(envelope["error"], "PairingTimeout");
+                    assert_eq!(envelope["closed_by"], "runtime");
+                    assert!(envelope["pairing_elapsed_ms"].is_number());
+                    assert!(envelope["pairing_bound_ms"].as_u64().unwrap() > 0);
+                    assert!(
+                        envelope["pairing_bound_ms"].as_u64().unwrap()
+                            <= super::super::CHALLENGE_LIFETIME.as_millis() as u64
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_code_check_reports_a_pairing_write_timeout() {
+        use std::io::Write;
+        let (mut peer, mut server) = UnixStream::pair().unwrap();
+        peer.write_all(&hello("desktop-client")).unwrap();
+        server.set_nonblocking(true).unwrap();
+        loop {
+            match server.write(&[0; 8192]) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("{error}"),
+            }
+        }
+        server.set_nonblocking(false).unwrap();
+        let mut diagnostic = AdmissionDiagnostic::route(
+            &Reader(false),
+            &std::env::current_exe().unwrap(),
+            Duration::from_millis(20),
+        );
+        let outcome = serve_macos_attach_route_with_state(
+            server,
+            &mut diagnostic,
+            501,
+            "1.0.0",
+            &mut Service::default(),
+            None,
+            ApprovalCoordinator::default(),
+            |_: &super::super::PairingChallenge, _: Duration| {
+                panic!("the welcome must time out before approval")
+            },
+            &LiveConnectionRegistry::default(),
+            |_| {},
+        );
+        assert_eq!(
+            outcome,
+            Err(MacosAttachSessionError::CompanionSession(
+                AttachSessionError::Timeout
+            ))
+        );
+        let records = diagnostic.records.borrow();
+        let envelope = records.last().unwrap();
+        assert_eq!(envelope["route"], "Companion { peer_pid: 42 }");
+        assert_eq!(envelope["code_check"]["sec_code_check_validity"], -67030);
+        assert_eq!(envelope["phase"], "companion-exchange");
+        assert_eq!(envelope["error"], "CompanionSession(Timeout)");
+        assert_eq!(envelope["closed_by"], "runtime");
+        assert_eq!(envelope["io_error"]["operation"], "write");
+        assert_eq!(envelope["admission_bound_ms"], 20);
+        assert!(envelope["admission_elapsed_ms"].as_u64().unwrap() >= 20);
+        assert!(
+            envelope["io_elapsed_ms"].as_u64().unwrap()
+                >= envelope["io_bound_ms"].as_u64().unwrap()
+        );
     }
 
     #[test]
