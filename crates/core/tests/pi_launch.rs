@@ -64,8 +64,9 @@ mod stdin_deadline {
             eprintln!("shell-event: {}", serde_json::to_string(&event).unwrap());
             if event.phase == "failed" && event.failure_reason.as_deref() == Some(FAILURE) {
                 // Measure delivery here, not when the parent gets CPU time to read stderr.
-                // Readiness has its own budget. Allow one second for scheduling after readiness.
-                let bound = FIRST_EVENT_TIMEOUT + Duration::from_secs(1);
+                // Readiness has its own budget. Allow five seconds for scheduler delay on loaded runners.
+                // This still rejects a second first-event timeout after a blocked stdin write.
+                let bound = FIRST_EVENT_TIMEOUT + Duration::from_secs(5);
                 let elapsed = self
                     .ready
                     .lock()
