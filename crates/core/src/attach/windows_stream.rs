@@ -44,7 +44,7 @@ impl WindowsAttachStream {
         }
     }
 
-    /// Registers the shared stop event that interrupts blocked operations.
+    /// Registers the shared stop event that aborts blocked operations.
     pub fn set_stop_event(&mut self, stop_event: Arc<WindowsAttachStopEvent>) {
         self.stop_event = Some(stop_event);
     }
@@ -118,7 +118,8 @@ impl WindowsAttachStream {
     ) -> io::Result<usize> {
         if let Some(stop_event) = &self.stop_event {
             match unsafe { WaitForSingleObject(stop_event.as_raw_handle(), 0) } {
-                WAIT_OBJECT_0 => return Err(io::Error::from(io::ErrorKind::Interrupted)),
+                // A manual-reset stop event stays signaled. Retrying cannot resume the stream.
+                WAIT_OBJECT_0 => return Err(io::Error::from(io::ErrorKind::ConnectionAborted)),
                 WAIT_TIMEOUT => {}
                 WAIT_FAILED => return Err(io::Error::last_os_error()),
                 _ => return Err(io::Error::other("unexpected stop event wait result")),
@@ -190,7 +191,7 @@ impl WindowsAttachStream {
         }
         if self.stop_event.is_some() && wait == WAIT_OBJECT_0 + 1 {
             cancel_and_wait(handle, &overlapped);
-            return Err(io::Error::from(io::ErrorKind::Interrupted));
+            return Err(io::Error::from(io::ErrorKind::ConnectionAborted));
         }
         if wait != WAIT_OBJECT_0 {
             cancel_and_wait(handle, &overlapped);

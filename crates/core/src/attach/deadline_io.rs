@@ -139,6 +139,54 @@ pub(super) fn is_timeout(error: &io::Error) -> bool {
 mod tests {
     use super::*;
 
+    struct AbortedStream(usize);
+
+    impl Read for AbortedStream {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            self.0 += 1;
+            assert_eq!(self.0, 1, "the runtime must not retry a permanent stop");
+            Err(io::ErrorKind::ConnectionAborted.into())
+        }
+    }
+
+    impl Write for AbortedStream {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            self.read(&mut [])
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl DeadlineStream for AbortedStream {
+        fn wait_until_readable(&self, _: Instant) -> ReadableWait {
+            ReadableWait::Closed
+        }
+        fn set_read_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
+        fn set_write_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn permanent_stop_closes_io_without_retry() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert_eq!(
+            read_exact_before(&mut AbortedStream(0), &mut [0], deadline)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::ConnectionAborted
+        );
+        assert_eq!(
+            write_all_before(&mut AbortedStream(0), &[0], deadline)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::ConnectionAborted
+        );
+    }
+
     struct InterruptedStream {
         input: io::Cursor<Vec<u8>>,
         output: Vec<u8>,

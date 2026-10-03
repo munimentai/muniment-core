@@ -503,6 +503,16 @@ mod tests {
     }
 
     #[test]
+    fn a_permanent_stop_closes_the_idle_presenter_without_retry() {
+        let mut presenter = client("unused");
+        presenter.stream = Box::new(crate::client_stream::tests::AbortedStream(0));
+        assert_eq!(
+            presenter.serve(|_| panic!("the stopped presenter must not present a request")),
+            Err(ClientError::ConnectionClosed)
+        );
+    }
+
+    #[test]
     fn a_stopped_supervisor_does_not_connect_or_register_shutdown() {
         let stop = ApprovalPresenterStopHandle::new();
         stop.stop();

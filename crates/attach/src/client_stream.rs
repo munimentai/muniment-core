@@ -120,6 +120,7 @@ pub(crate) fn map_io_error(error: io::Error) -> ClientError {
     match error.kind() {
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => ClientError::Timeout,
         io::ErrorKind::UnexpectedEof
+        | io::ErrorKind::ConnectionAborted
         | io::ErrorKind::ConnectionReset
         | io::ErrorKind::BrokenPipe => ClientError::ConnectionClosed,
         _ => ClientError::DesktopUnavailable,
@@ -134,9 +135,50 @@ fn map_frame_error(error: FrameError) -> ClientError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    pub(crate) struct AbortedStream(pub usize);
+
+    impl Read for AbortedStream {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            self.0 += 1;
+            assert_eq!(self.0, 1, "the client must not retry a permanent stop");
+            Err(io::ErrorKind::ConnectionAborted.into())
+        }
+    }
+
+    impl Write for AbortedStream {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            self.read(&mut [])
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ClientStream for AbortedStream {
+        fn set_read_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
+        fn set_write_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn permanent_stop_closes_io_without_retry() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert_eq!(
+            read_exact_before(&mut AbortedStream(0), &mut [0], deadline),
+            Err(ClientError::ConnectionClosed)
+        );
+        assert_eq!(
+            write_all_before(&mut AbortedStream(0), &[0], deadline),
+            Err(ClientError::ConnectionClosed)
+        );
+    }
 
     struct InterruptedStream {
         input: VecDeque<u8>,
