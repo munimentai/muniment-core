@@ -10,7 +10,7 @@ use crate::chat_view::{
     ChatAppliedDiff, ChatAttachment, ChatPendingPermission, ChatToolActivity,
 };
 use crate::code_diff_journal::{load_applied_code_diffs, load_pending_code_diff};
-use crate::journal::reducer::{project_chat_with_state, ProjectedRecall, RunState};
+use crate::journal::reducer::{ChatProjector, ProjectedRecall, RunState};
 use crate::journal::{EventEnvelope, RunJournal};
 use crate::thread_ownership::{subject_owns_first_run, ThreadOwnershipError};
 
@@ -36,6 +36,12 @@ pub struct HistoryEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_permission: Option<ChatPendingPermission>,
     pub resumable: bool,
+}
+
+/// The runtime supplies ownership and session files for one history snapshot.
+pub struct HistoryRuntime<'a> {
+    pub session_root: &'a Path,
+    pub active_run_id: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -71,7 +77,7 @@ pub fn project_history_entry(
     session_root: &Path,
 ) -> Result<HistoryEntry, ThreadHistoryError> {
     let mut entry =
-        project_history_entry_without_prompt(journal, cas, run_id, subject, session_root)?;
+        project_history_entry_without_prompt(journal, cas, run_id, subject, session_root, false)?;
     load_entry_prompt(&mut entry, subject)?;
     Ok(entry)
 }
@@ -83,13 +89,25 @@ fn project_history_entry_without_prompt(
     run_id: String,
     subject: Option<&str>,
     session_root: &Path,
+    active: bool,
 ) -> Result<HistoryEntry, ThreadHistoryError> {
     let events = journal
         .events(&run_id)
         .map_err(|error| ThreadHistoryError::RunEventsUnavailable(error.to_string()))?;
-    let (projection, state) = project_chat_with_state(&events)
-        .map_err(|error| ThreadHistoryError::ProjectionUnavailable(error.to_string()))?;
-    let resumable = history_resumable(&events, &state, subject, session_root);
+    let project = || {
+        let mut projector = ChatProjector::new();
+        for event in &events {
+            projector.apply(event)?;
+        }
+        // A live journal can end between an effect start and its outcome.
+        // Only a run without a runtime owner uses crash recovery for that gap.
+        let live = active.then(|| projector.projection()).transpose()?;
+        let (projection, state) = projector.finish()?;
+        Ok::<_, crate::journal::reducer::ReduceError>((live.unwrap_or(projection), state))
+    };
+    let (projection, state) =
+        project().map_err(|error| ThreadHistoryError::ProjectionUnavailable(error.to_string()))?;
+    let resumable = !active && history_resumable(&events, &state, subject, session_root);
     let code_diff = cas.and_then(|cas| {
         load_pending_code_diff(journal, cas, &run_id, &projection.pending_permission)
     });
@@ -165,7 +183,10 @@ pub fn chat_thread_open_page(
         journal,
         cas,
         subject,
-        session_root,
+        HistoryRuntime {
+            session_root,
+            active_run_id: None,
+        },
         thread_id,
         limit,
         cursor,
@@ -176,11 +197,12 @@ pub fn chat_thread_open_page(
 
 /// Reads one thread page with every entry's prompt left out.
 /// [`load_page_prompts`] fills them after the caller releases the journal.
+/// The runtime supplies its owned run ID while it holds the active-run lock.
 pub fn chat_thread_open_page_without_prompts(
     journal: &mut RunJournal,
     cas: Option<&LocalCas>,
     subject: Option<&str>,
-    session_root: &Path,
+    runtime: HistoryRuntime<'_>,
     thread_id: &str,
     limit: usize,
     cursor: Option<&str>,
@@ -197,7 +219,15 @@ pub fn chat_thread_open_page_without_prompts(
         .run_ids
         .into_iter()
         .map(|run_id| {
-            project_history_entry_without_prompt(journal, cas, run_id, subject, session_root)
+            let active = runtime.active_run_id == Some(run_id.as_str());
+            project_history_entry_without_prompt(
+                journal,
+                cas,
+                run_id,
+                subject,
+                runtime.session_root,
+                active,
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ChatThreadOpenPage {

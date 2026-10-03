@@ -6,7 +6,7 @@ use std::time::Duration;
 use muniment_core::journal::{EventEnvelope, EventPayload, Provenance, RunJournal};
 use muniment_core::thread_history::{
     chat_thread_open_page, chat_thread_open_page_without_prompts, load_page_prompts,
-    ThreadHistoryError,
+    HistoryRuntime, ThreadHistoryError,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -158,7 +158,10 @@ fn a_page_without_prompts_reads_them_after_the_journal() {
         &mut journal,
         None,
         Some("owner"),
-        std::path::Path::new("."),
+        HistoryRuntime {
+            session_root: std::path::Path::new("."),
+            active_run_id: None,
+        },
         &thread_id,
         10,
         None,

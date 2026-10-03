@@ -6,8 +6,8 @@ use muniment_code_diff::CodeDiff;
 use serde::{Deserialize, Serialize};
 
 use crate::journal::reducer::{
-    PermissionGate, PermissionRequest, ProjectedAppliedDiff, ProjectedAttachment, RunStatus,
-    ToolActivity, ToolActivityStatus,
+    AttentionReason, PermissionGate, PermissionRequest, ProjectedAppliedDiff, ProjectedAttachment,
+    RunStatus, ToolActivity, ToolActivityStatus,
 };
 
 #[derive(Debug, Deserialize)]
@@ -127,6 +127,12 @@ pub fn chat_tool_activity(activity: &[ToolActivity]) -> Vec<ChatToolActivity> {
 pub fn failure_reason(status: &Option<RunStatus>) -> Option<String> {
     match status {
         Some(RunStatus::Failed { reason }) => reason.clone(),
+        Some(RunStatus::NeedsAttention(AttentionReason::Recorded { reason })) => {
+            Some(reason.clone())
+        }
+        Some(RunStatus::NeedsAttention(AttentionReason::UnknownEffectOutcome { .. })) => {
+            Some("unknown-effect-outcome".into())
+        }
         _ => None,
     }
 }
