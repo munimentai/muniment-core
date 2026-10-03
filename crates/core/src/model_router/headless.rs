@@ -271,13 +271,17 @@ pub struct Router {
 }
 impl Router {
     pub fn open(path: &Path) -> Result<Self, Error> {
-        let db = Connection::open(path)?;
+        let mut db = Connection::open(path)?;
         db.busy_timeout(Duration::from_secs(2))?;
-        let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        db.pragma_update(None, "synchronous", "FULL")?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: u32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version > 1 {
             return Err(Error::UnsupportedVersion);
         }
-        db.execute_batch("PRAGMA synchronous=FULL;
+        // Commit the schema once, not once per statement, even on slow storage.
+        if version == 0 {
+            tx.execute_batch("
             CREATE TABLE IF NOT EXISTS snapshot (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL, digest TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS caps (account TEXT NOT NULL, model TEXT NOT NULL, epoch INTEGER NOT NULL, cap_limit INTEGER NOT NULL, resets INTEGER NOT NULL, PRIMARY KEY(account,model));
             CREATE TABLE IF NOT EXISTS jobs (job TEXT PRIMARY KEY, session TEXT NOT NULL UNIQUE, fingerprint TEXT NOT NULL, account TEXT NOT NULL, model TEXT NOT NULL, epoch INTEGER NOT NULL, response TEXT NOT NULL, outcome TEXT);
@@ -285,6 +289,8 @@ impl Router {
             CREATE INDEX IF NOT EXISTS job_caps ON jobs(account,model,epoch);
             CREATE INDEX IF NOT EXISTS job_active ON jobs(account,outcome);
             PRAGMA user_version=1;")?;
+        }
+        tx.commit()?;
         Ok(Self { db })
     }
 
