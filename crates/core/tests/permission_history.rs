@@ -1,3 +1,5 @@
+#![cfg(feature = "keyring")]
+
 use muniment_core::journal::reducer::{ChatProjector, RunStatus};
 use muniment_core::journal::run_append::append_run_event;
 use muniment_core::journal::{EventEnvelope, EventPayload, Provenance, RunJournal};
