@@ -1173,6 +1173,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "muniment-atomic-file"
+version = "0.0.1"
+dependencies = [
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "muniment-attach"
 version = "0.0.1"
 dependencies = [
@@ -1209,17 +1217,16 @@ dependencies = [
  "keyring",
  "libc",
  "libloading",
+ "muniment-atomic-file",
  "muniment-attach",
  "muniment-code-diff",
  "muniment-pins",
+ "muniment-router",
  "qrcode",
  "quick-xml",
  "quircs",
- "rcgen",
  "resvg",
  "rusqlite",
- "rustls",
- "rustls-platform-verifier",
  "same-file",
  "security-framework 3.7.0",
  "serde",
@@ -1244,6 +1251,27 @@ version = "0.0.1"
 dependencies = [
  "serde",
  "toml",
+]
+
+[[package]]
+name = "muniment-router"
+version = "0.0.1"
+dependencies = [
+ "base64",
+ "chrono",
+ "getrandom 0.3.4",
+ "muniment-atomic-file",
+ "muniment-pins",
+ "rcgen",
+ "rusqlite",
+ "rustls",
+ "rustls-platform-verifier",
+ "serde",
+ "serde_json",
+ "sha2",
+ "ureq",
+ "url",
+ "uuid",
 ]
 
 [[package]]

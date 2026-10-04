@@ -129,7 +129,7 @@ pub fn pick_with_active<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_router::config::{Credential, RouterConfig};
+    use crate::config::{Credential, RouterConfig};
 
     fn account(id: &str, family: &str, weight: u32) -> Account {
         Account {

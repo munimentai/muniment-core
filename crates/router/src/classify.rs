@@ -467,7 +467,7 @@ fn clip(state: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_router::config::{Classifier, Route, RouterConfig};
+    use crate::config::{Classifier, Route, RouterConfig};
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
@@ -679,11 +679,11 @@ mod tests {
             family: "openai".into(),
             model: "gpt-5.6-nano".into(),
         });
-        config.accounts.push(crate::model_router::config::Account {
+        config.accounts.push(crate::config::Account {
             id: "a1".into(),
             family: "openai".into(),
             label: "work".into(),
-            credential: crate::model_router::config::Credential::ApiKey {
+            credential: crate::config::Credential::ApiKey {
                 key: "sk-a1".into(),
             },
             // The mock's URL already ends at the version, so the call lands on

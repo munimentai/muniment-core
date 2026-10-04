@@ -121,7 +121,7 @@ mod tests {
             .unwrap();
         server.join().unwrap();
         assert_eq!(
-            crate::model_router::subscription_probe::transport_kind(
+            crate::subscription_probe::transport_kind(
                 error.kind(),
                 error.message(),
                 std::error::Error::source(&error),

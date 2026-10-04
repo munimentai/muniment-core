@@ -74,7 +74,7 @@ pub fn is_default(settings: &serde_json::Map<String, Value>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_router::config::Route;
+    use crate::config::Route;
 
     fn endpoint() -> Endpoint {
         Endpoint {
@@ -86,11 +86,11 @@ mod tests {
     fn routed() -> RouterConfig {
         RouterConfig {
             enabled: true,
-            accounts: vec![crate::model_router::config::Account {
+            accounts: vec![crate::config::Account {
                 id: "a1".into(),
                 family: "openai".into(),
                 label: "work".into(),
-                credential: crate::model_router::config::Credential::ApiKey { key: "sk".into() },
+                credential: crate::config::Credential::ApiKey { key: "sk".into() },
                 base_url: None,
                 models: vec!["gpt-5.6-mini".into()],
                 enabled: true,

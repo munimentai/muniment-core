@@ -14,13 +14,16 @@
 pub mod balance;
 pub mod classify;
 pub mod config;
+pub mod endpoint_models;
 pub mod family;
 pub mod headless;
+pub mod http;
 pub mod model_catalog;
 pub mod native_auth;
 pub mod pi_provider;
 pub mod policy;
 mod progress;
+pub mod provider_models;
 pub mod quota;
 pub mod server;
 pub mod subscription_probe;

@@ -466,7 +466,7 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
             file.write_all(bytes)?;
             file.sync_all()
         })
-        .and_then(|()| crate::atomic_file::replace(&temporary, path));
+        .and_then(|()| muniment_atomic_file::replace(&temporary, path));
     if written.is_err() {
         let _ = fs::remove_file(&temporary);
     }

@@ -1438,7 +1438,7 @@ fn relay_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_router::config::{Account, Credential, Route, RouterConfig};
+    use crate::config::{Account, Credential, Route, RouterConfig};
     use serde_json::json;
 
     /// The clock every server test reads, so a day bucket never drifts.
@@ -1717,7 +1717,7 @@ mod tests {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "model_router::server::tests::native_probe_receipts_record_only_fixed_request_purposes",
+                    "server::tests::native_probe_receipts_record_only_fixed_request_purposes",
                 ])
                 .env("MUNIMENT_SUBSCRIPTION_PROBE", "1")
                 .status()
@@ -1786,10 +1786,12 @@ mod tests {
         // Isolate the probe flag and proxy settings from concurrent router tests.
         if std::env::var("MUNIMENT_SUBSCRIPTION_PROBE").as_deref() != Ok("1") {
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
-            child.args([
-                "--exact",
-                "model_router::server::tests::provider_connect_failures_record_redacted_transport_details",
-            ]).env("MUNIMENT_SUBSCRIPTION_PROBE", "1");
+            child
+                .args([
+                    "--exact",
+                    "server::tests::provider_connect_failures_record_redacted_transport_details",
+                ])
+                .env("MUNIMENT_SUBSCRIPTION_PROBE", "1");
             for name in [
                 "ALL_PROXY",
                 "all_proxy",
@@ -1849,7 +1851,7 @@ mod tests {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "model_router::server::tests::native_http_200_error_events_record_redacted_failure_classes",
+                    "server::tests::native_http_200_error_events_record_redacted_failure_classes",
                 ])
                 .env("MUNIMENT_SUBSCRIPTION_PROBE", "1")
                 .status()
@@ -1979,7 +1981,7 @@ mod tests {
 
     #[test]
     fn known_exhaustion_reports_usage_limit_until_reset() {
-        use crate::model_router::quota::{self, Quota, QuotaStore, Window, WindowKind};
+        use crate::quota::{self, Quota, QuotaStore, Window, WindowKind};
         let state = State {
             sessions: Default::default(),
             active_sessions: Default::default(),

@@ -850,7 +850,7 @@ mod tests {
                 ),
             ] {
                 let mut child = std::process::Command::new(std::env::current_exe().unwrap());
-                child.args(["--exact", "model_router::subscription_probe::tests::environment_proxy_failures_name_the_proxy_without_credentials", "--nocapture"]);
+                child.args(["--exact", "subscription_probe::tests::environment_proxy_failures_name_the_proxy_without_credentials", "--nocapture"]);
                 for name in [
                     "ALL_PROXY",
                     "all_proxy",

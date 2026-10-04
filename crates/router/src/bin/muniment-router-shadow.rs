@@ -1,5 +1,5 @@
 //! One bounded JSON request per process. Stdout contains only the response envelope.
-use muniment_core::model_router::headless::{Error, Request, Router, MAX_REQUEST_BYTES, VERSION};
+use muniment_router::headless::{Error, Request, Router, MAX_REQUEST_BYTES, VERSION};
 use serde_json::json;
 use std::{io::Read, path::Path};
 
@@ -17,7 +17,7 @@ fn main() {
     }
 }
 
-fn run() -> Result<muniment_core::model_router::headless::Response, Error> {
+fn run() -> Result<muniment_router::headless::Response, Error> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.len() != 2 || args[0] != "--state" {
         return Err(Error::InvalidRequest);

@@ -1,4 +1,4 @@
-use muniment_core::model_router::{classify, headless::*, policy};
+use muniment_router::{classify, headless::*, policy};
 use serde_json::{json, Value};
 use std::{
     io::Write,

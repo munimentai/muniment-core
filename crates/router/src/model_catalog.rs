@@ -190,7 +190,7 @@ pub fn entry(family: &str, model: &str) -> Option<&'static ModelEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_router::family::FAMILIES;
+    use crate::family::FAMILIES;
 
     #[test]
     fn every_catalog_model_belongs_to_a_family_the_router_pools() {

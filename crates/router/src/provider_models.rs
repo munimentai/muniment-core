@@ -25,7 +25,7 @@ pub fn save(agent: &Path, cache: &Cache) -> std::io::Result<()> {
     fs::create_dir_all(agent)?;
     let temporary = agent.join(format!("provider-models-{}.tmp", uuid::Uuid::new_v4()));
     fs::write(&temporary, serde_json::to_vec(cache)?)?;
-    crate::atomic_file::replace(&temporary, &agent.join(CACHE_FILE))
+    muniment_atomic_file::replace(&temporary, &agent.join(CACHE_FILE))
 }
 
 /// Provider model-list routes and Pi public subscription catalogs.
@@ -107,14 +107,14 @@ fn parse_subscription_catalog(value: &Value) -> Option<Vec<Value>> {
 }
 
 fn discover_subscription_catalog(url: &str, timeout: Duration) -> Option<Vec<Value>> {
-    let url = format!("{url}?types=chat&pi-version={}", crate::sidecar::PI_VERSION);
+    let url = format!("{url}?types=chat&pi-version={}", muniment_pins::PI.version);
     let response = crate::http::agent_builder()
         .timeout(timeout)
         .redirects(0)
         .build()
         .get(&url)
         .set("Accept", "application/json")
-        .set("User-Agent", &format!("pi/{}", crate::sidecar::PI_VERSION))
+        .set("User-Agent", &format!("pi/{}", muniment_pins::PI.version))
         .call()
         .ok()?;
     let mut bytes = Vec::new();
@@ -340,7 +340,7 @@ mod tests {
     use super::*;
     #[test]
     fn a_new_subscription_model_reaches_the_router_without_a_catalog_edit() {
-        use crate::model_router::{config, options};
+        use crate::{config, options};
         let models = parse_subscription_catalog(&json!([
             {"id":"brand-new-model", "contextWindow":123456, "maxTokens":8192,
              "cost":{"input":2,"output":8}, "input":["text"], "reasoning":true,

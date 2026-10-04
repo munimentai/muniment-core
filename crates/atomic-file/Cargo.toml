@@ -1,0 +1,10 @@
+[package]
+name = "muniment-atomic-file"
+version = "0.0.1"
+edition = "2021"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+uuid = { version = "1", features = ["v4"] }

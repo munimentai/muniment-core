@@ -7,7 +7,7 @@
 pub mod active_run;
 pub mod asr;
 pub mod assistant_text;
-pub mod atomic_file;
+pub use muniment_atomic_file as atomic_file;
 pub mod attach;
 pub mod attachment;
 #[cfg(feature = "desktop-integration")]
@@ -31,11 +31,11 @@ pub mod code_diff_journal;
 pub mod code_diff_observe;
 pub mod code_diff_staging;
 pub mod creations;
-pub mod endpoint_models;
+pub use muniment_router::endpoint_models;
 pub mod extend;
 pub mod harness_scan;
 pub mod home;
-pub mod http;
+pub use muniment_router::http;
 pub mod import_preview;
 pub mod journal;
 pub mod kokoro;
@@ -50,7 +50,7 @@ pub mod model_acquisition_transport;
 pub mod model_artifact;
 pub mod model_install;
 pub mod model_install_native;
-pub mod model_router;
+pub use muniment_router as model_router;
 pub mod onnx_runtime;
 pub mod owned_threads;
 pub mod permission_gate;
@@ -109,4 +109,4 @@ pub mod project_context;
 pub mod projects;
 pub mod workspace_names;
 
-pub mod provider_models;
+pub use muniment_router::provider_models;

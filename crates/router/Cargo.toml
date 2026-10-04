@@ -1,0 +1,31 @@
+[package]
+name = "muniment-router"
+version = "0.0.1"
+edition = "2021"
+
+# The multi-account model router shared by the desktop and the factory. It
+# depends on no other Muniment crate except the pins and the atomic file
+# helper, so a headless host can embed it without the desktop runtime.
+
+[features]
+# HTTPS uses the OS certificate verifier.
+tls = ["ureq/tls", "ureq/proxy-from-env", "dep:rustls", "dep:rustls-platform-verifier"]
+
+[dependencies]
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+getrandom = "0.3"
+muniment-atomic-file = { path = "../atomic-file" }
+muniment-pins = { path = "../pins" }
+rusqlite = { version = "0.32", features = ["bundled", "hooks", "limits"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-platform-verifier = { version = "0.7", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"
+ureq = { version = "2", default-features = false, features = ["json"] }
+url = "2"
+uuid = { version = "1", features = ["serde", "v4", "v7"] }
+
+[dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }

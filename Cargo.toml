@@ -1,3 +1,10 @@
 [workspace]
-members = ["crates/core", "crates/attach", "crates/code-diff", "crates/pins"]
+members = [
+    "crates/core",
+    "crates/attach",
+    "crates/atomic-file",
+    "crates/code-diff",
+    "crates/pins",
+    "crates/router",
+]
 resolver = "2"
