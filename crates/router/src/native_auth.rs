@@ -25,11 +25,14 @@ pub const XAI_TOKEN_URL: &str = "https://auth.x.ai/oauth2/token";
 /// How long an xAI token lives when the answer does not say.
 const XAI_TOKEN_LIFETIME_SECONDS: f64 = 3600.0;
 
-/// Antigravity signs in with a Google account through the client its IDE
-/// presents, and its redirect lands on this fixed loopback port.
-pub const ANTIGRAVITY_CLIENT_ID: &str =
-    "***REMOVED***";
-pub const ANTIGRAVITY_CLIENT_SECRET: &str = "***REMOVED***";
+/// Antigravity signs in with a Google account through an OAuth client the host
+/// supplies at runtime, and its redirect lands on this fixed loopback port.
+pub const ANTIGRAVITY_CLIENT_ID_ENV: &str = "MUNIMENT_ANTIGRAVITY_CLIENT_ID";
+pub const ANTIGRAVITY_CLIENT_SECRET_ENV: &str = "MUNIMENT_ANTIGRAVITY_CLIENT_SECRET";
+/// The error every Antigravity sign-in and refresh answers without a client.
+pub const ANTIGRAVITY_CLIENT_MISSING: &str = "Antigravity sign-in is not configured: \
+    the host supplies no OAuth client and MUNIMENT_ANTIGRAVITY_CLIENT_ID or \
+    MUNIMENT_ANTIGRAVITY_CLIENT_SECRET is unset.";
 pub const ANTIGRAVITY_CALLBACK_PORT: u16 = 51121;
 pub const ANTIGRAVITY_CALLBACK_PATH: &str = "/oauth-callback";
 pub const ANTIGRAVITY_SCOPES: [&str; 5] = [
@@ -414,18 +417,84 @@ pub fn kimi_refresh(
 
 // Antigravity.
 
+/// An installed-app OAuth client: the id and secret a sign-in presents.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OAuthClient {
+    pub id: String,
+    pub secret: String,
+}
+
+impl std::fmt::Debug for OAuthClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthClient")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The OAuth clients a host supplies for the sign-ins the router runs. A
+/// provider without a client cannot sign in or refresh; the others still work.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderClients {
+    pub antigravity: Option<OAuthClient>,
+}
+
+static PROVIDER_CLIENTS: std::sync::RwLock<Option<ProviderClients>> = std::sync::RwLock::new(None);
+
+/// Registers the host's OAuth clients for this process. Call it once at
+/// startup, before any sign-in or refresh. A later call replaces the clients.
+pub fn set_provider_clients(clients: ProviderClients) {
+    *PROVIDER_CLIENTS
+        .write()
+        .unwrap_or_else(|error| error.into_inner()) = Some(clients);
+}
+
+/// The Antigravity client from `registered`, or else from the two environment
+/// variables `variable` reads. An empty value counts as absent.
+fn resolve_antigravity_client(
+    registered: Option<&ProviderClients>,
+    variable: impl Fn(&str) -> Option<String>,
+) -> Result<OAuthClient, String> {
+    let present = |client: &OAuthClient| !client.id.is_empty() && !client.secret.is_empty();
+    if let Some(client) = registered.and_then(|clients| clients.antigravity.as_ref()) {
+        if present(client) {
+            return Ok(client.clone());
+        }
+    }
+    let client = OAuthClient {
+        id: variable(ANTIGRAVITY_CLIENT_ID_ENV).unwrap_or_default(),
+        secret: variable(ANTIGRAVITY_CLIENT_SECRET_ENV).unwrap_or_default(),
+    };
+    if present(&client) {
+        Ok(client)
+    } else {
+        Err(ANTIGRAVITY_CLIENT_MISSING.into())
+    }
+}
+
+/// The Antigravity OAuth client: the registered one first, then the
+/// `MUNIMENT_ANTIGRAVITY_CLIENT_ID` and `MUNIMENT_ANTIGRAVITY_CLIENT_SECRET`
+/// environment variables. Without either it answers `ANTIGRAVITY_CLIENT_MISSING`.
+pub fn antigravity_client() -> Result<OAuthClient, String> {
+    let registered = PROVIDER_CLIENTS
+        .read()
+        .unwrap_or_else(|error| error.into_inner());
+    resolve_antigravity_client(registered.as_ref(), |name| std::env::var(name).ok())
+}
+
 /// The Google sign-in page for Antigravity, with the loopback redirect.
-pub fn antigravity_auth_url(state: &str, redirect_uri: &str) -> String {
+pub fn antigravity_auth_url(state: &str, redirect_uri: &str) -> Result<String, String> {
+    let client = antigravity_client()?;
     let mut url = url::Url::parse(GOOGLE_AUTH_URL).expect("a fixed URL parses");
     url.query_pairs_mut()
         .append_pair("access_type", "offline")
-        .append_pair("client_id", ANTIGRAVITY_CLIENT_ID)
+        .append_pair("client_id", &client.id)
         .append_pair("prompt", "consent")
         .append_pair("redirect_uri", redirect_uri)
         .append_pair("response_type", "code")
         .append_pair("scope", &ANTIGRAVITY_SCOPES.join(" "))
         .append_pair("state", state);
-    url.to_string()
+    Ok(url.to_string())
 }
 
 /// The redirect Antigravity's client registers.
@@ -455,10 +524,11 @@ pub fn antigravity_exchange(
     now_ms: i64,
     timeout: Duration,
 ) -> Result<Credential, String> {
+    let client = antigravity_client()?;
     let (status, body) = read(agent(timeout).post(token_url).send_form(&[
         ("code", code),
-        ("client_id", ANTIGRAVITY_CLIENT_ID),
-        ("client_secret", ANTIGRAVITY_CLIENT_SECRET),
+        ("client_id", &client.id),
+        ("client_secret", &client.secret),
         ("redirect_uri", redirect_uri),
         ("grant_type", "authorization_code"),
     ]))?;
@@ -476,9 +546,10 @@ pub fn antigravity_refresh(
     now_ms: i64,
     timeout: Duration,
 ) -> Result<Credential, String> {
+    let client = antigravity_client()?;
     let (status, body) = read(agent(timeout).post(token_url).send_form(&[
-        ("client_id", ANTIGRAVITY_CLIENT_ID),
-        ("client_secret", ANTIGRAVITY_CLIENT_SECRET),
+        ("client_id", &client.id),
+        ("client_secret", &client.secret),
         ("refresh_token", refresh),
         ("grant_type", "refresh_token"),
     ]))?;
@@ -830,6 +901,56 @@ pub fn refresh_if_expiring(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_clients() -> ProviderClients {
+        ProviderClients {
+            antigravity: Some(OAuthClient {
+                id: "test-antigravity-client".into(),
+                secret: "test-antigravity-secret".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn the_antigravity_client_prefers_the_host_then_the_environment() {
+        let environment = |name: &str| match name {
+            ANTIGRAVITY_CLIENT_ID_ENV => Some("env-id".to_string()),
+            ANTIGRAVITY_CLIENT_SECRET_ENV => Some("env-secret".to_string()),
+            _ => None,
+        };
+        let none = |_: &str| None;
+        assert_eq!(
+            resolve_antigravity_client(Some(&test_clients()), environment).unwrap(),
+            test_clients().antigravity.unwrap()
+        );
+        assert_eq!(
+            resolve_antigravity_client(Some(&ProviderClients::default()), environment).unwrap(),
+            OAuthClient {
+                id: "env-id".into(),
+                secret: "env-secret".into()
+            }
+        );
+        assert_eq!(
+            resolve_antigravity_client(None, none).unwrap_err(),
+            ANTIGRAVITY_CLIENT_MISSING
+        );
+        let blank = ProviderClients {
+            antigravity: Some(OAuthClient {
+                id: "id".into(),
+                secret: String::new(),
+            }),
+        };
+        assert_eq!(
+            resolve_antigravity_client(Some(&blank), none).unwrap_err(),
+            ANTIGRAVITY_CLIENT_MISSING
+        );
+        let half = |name: &str| (name == ANTIGRAVITY_CLIENT_ID_ENV).then(|| "env-id".to_string());
+        assert_eq!(
+            resolve_antigravity_client(None, half).unwrap_err(),
+            ANTIGRAVITY_CLIENT_MISSING
+        );
+        assert!(!format!("{:?}", test_clients()).contains("test-antigravity-secret"));
+    }
     use serde_json::json;
 
     #[test]
@@ -929,7 +1050,10 @@ mod tests {
 
     #[test]
     fn the_antigravity_url_carries_its_client_scopes_and_loopback_redirect() {
-        let url = antigravity_auth_url("st4te", &antigravity_redirect_uri());
+        set_provider_clients(test_clients());
+        let url = antigravity_auth_url("st4te", &antigravity_redirect_uri()).unwrap();
+        assert!(url.contains("client_id=test-antigravity-client"));
+        assert!(!url.contains("test-antigravity-secret"));
         assert!(url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"));
         assert!(url.contains("access_type=offline"));
         assert!(url.contains("prompt=consent"));
