@@ -100,7 +100,7 @@ class Pins:
                                             "output": tail(result.stdout + result.stderr)}]}
 
 
-def select(pins, workspace_tests=True):
+def select(pins, workspace_tests=True, tests=None):
     report = pins.check()
     groups = candidates(report)
     result = {"check": report, "changes": [], "title": None, "blocked": [], "passed": []}
@@ -140,12 +140,15 @@ def select(pins, workspace_tests=True):
         pins.restore()
         bumped = pins.bump([arg for _, _, args in kept for arg in args]) if kept else {"changes": []}
     if kept and workspace_tests:
-        tests = run(WORKSPACE_TESTS, check=False)
+        tests = (tests or (lambda: run(WORKSPACE_TESTS, check=False)))()
         if tests.returncode != 0:
-            output = f"### workspace tests\n\n```\n{tail(tests.stdout + tests.stderr).strip()}\n```"
-            for component, version, _ in kept:
-                result["blocked"].append({"component": component, "version": version,
-                                          "title": issue_title(component, version), "output": output})
+            # One issue names the leading pin. Its body lists every pin in the failed set.
+            component, version, _ = kept[0]
+            pins_list = ", ".join(f"{c} {v}" for c, v, _ in kept)
+            output = (f"The workspace tests failed with {pins_list}.\n\n### workspace tests\n\n"
+                      f"```\n{tail(tests.stdout + tests.stderr).strip()}\n```")
+            result["blocked"].append({"component": component, "version": version,
+                                      "title": issue_title(component, version), "output": output})
             pins.restore()
             kept, bumped = [], {"changes": []}
     result["changes"] = bumped["changes"]
@@ -216,7 +219,7 @@ def publish(result, darwin, github, commit):
         actions.append(("pr", result["title"]))
     existing = github.open_issues()
     for item in blocked:
-        text = (f"`muniment-pins compat` failed for {item['component']} {item['version']}. "
+        text = (f"The pin update to {item['component']} {item['version']} failed. "
                 f"The current pins stay in place.\n\n{item['output']}")
         match = next((issue for issue in existing if issue["title"] == item["title"]), None)
         if match:

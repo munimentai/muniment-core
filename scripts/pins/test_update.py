@@ -115,6 +115,14 @@ class SelectTest(unittest.TestCase):
         self.assertEqual([b["component"] for b in result["blocked"]], ["pi-mcp-adapter"])
 
 
+    def test_a_workspace_failure_files_one_issue_and_ships_nothing(self):
+        failed = type("Result", (), {"returncode": 1, "stdout": "pi_settings test FAILED", "stderr": ""})
+        result = update.select(FakePins(report(), {}), tests=lambda: failed)
+        self.assertEqual(result["changes"], [])
+        self.assertEqual([b["title"] for b in result["blocked"]], ["Pin update blocked: Pi 1.0.2"])
+        self.assertIn("pi-mcp-adapter 5.0.0", result["blocked"][0]["output"])
+
+
 class PublishTest(unittest.TestCase):
     def result(self, blocked=()):
         return {

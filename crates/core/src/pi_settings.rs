@@ -760,16 +760,14 @@ mod tests {
         let mut settings = Map::new();
         merge_pi_settings(&mut settings, PI_ARTIFACT);
         let rendered = serde_json::to_string(&settings).unwrap();
+        let packages: Vec<String> = muniment_pins::PACKAGES
+            .iter()
+            .map(|package| format!("npm:{}@{}", package.name, package.version))
+            .collect();
         assert_eq!(
             serde_json::from_str::<Value>(&rendered).unwrap(),
             json!({
-                "packages": [
-                    "npm:pi-web-access@0.31.0",
-                    "npm:pi-subagents@0.71.0",
-                    "npm:pi-background-tasks@2.5.0",
-                    "npm:pi-mcp-adapter@2.37.0",
-                    "npm:pi-claude-bridge@0.8.0"
-                ],
+                "packages": packages,
                 "defaultTools": ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"]
             })
         );
