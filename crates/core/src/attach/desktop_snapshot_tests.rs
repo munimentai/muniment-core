@@ -70,7 +70,10 @@ impl Profile {
                 &mut self.journal,
                 None,
                 None,
-                &self.root,
+                crate::thread_history::HistoryRuntime {
+                    session_root: &self.root,
+                    active_run_id: None,
+                },
                 &self.thread,
                 100,
                 None,
