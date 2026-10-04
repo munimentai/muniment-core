@@ -9,7 +9,7 @@ routing and runtime pins match in both.
 | Crate | Path | What it is |
 | --- | --- | --- |
 | `muniment-core` | `crates/core` | Local runtime logic and storage contracts: the run journal, Pi sidecar supervision and install, memory, projects, attach server, on-device speech and voice. |
-| `muniment-router` | `crates/router` | The multi-account model router: account pools, routing policy, the loopback OpenAI-compatible server, provider model discovery, and the `muniment-router-shadow` binary. |
+| `muniment-router` | `crates/router` | The multi-account model router: account pools, routing policy, the loopback OpenAI-compatible server, provider model discovery, the `muniment-router` server binary (`server` feature) and the `muniment-router-shadow` binary. |
 | `muniment-pins` | `crates/pins` | Typed constants compiled from `pins/pins.toml`, plus the embedded package lockfile. |
 | `muniment-attach` | `crates/attach` | The reader and companion attach protocol and its client. |
 | `muniment-code-diff` | `crates/code-diff` | Portable code-diff values and fixtures. |
@@ -77,17 +77,70 @@ The factory builds the router binaries from a release tag and reads the pins
 from the release asset:
 
 ```sh
-cargo install --git https://github.com/munimentai/muniment-core --tag v0.1.0 muniment-router
+cargo install --git https://github.com/munimentai/muniment-core --tag v0.1.0 --features server muniment-router
 gh release download v0.1.0 --repo munimentai/muniment-core --pattern pins.toml
 ```
+
+## Router server
+
+`muniment-router serve` runs the router for the factory. It builds only with
+the `server` feature, so the desktop never compiles Postgres, OpenBao or the
+run-token code. `deploy/router/Containerfile` builds a non-root image whose
+health check runs `muniment-router health`.
+
+Settings come from a TOML file (`--config` or `MUNIMENT_ROUTER_CONFIG`), and a
+`MUNIMENT_ROUTER_*` variable overrides each one: `openbao.role_id` is
+`MUNIMENT_ROUTER_OPENBAO_ROLE_ID`.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `listen` | `127.0.0.1:8790` | Bind address. |
+| `admin_token` | required | Bearer for `/v1/runs` and `/v1/outcomes`, 16 characters or more. |
+| `run_token_signing_key` | required | HMAC-SHA256 key for run tokens: 64 hex characters, or 32 bytes of text. |
+| `database_url` | | Postgres store. Migrations run at start. |
+| `state_dir` | | The desktop's JSON files instead of Postgres, for development. |
+| `openbao.address`, `.mount`, `.prefix` | `secret`, `muniment-router/accounts` | KV v2 secret per account at `<mount>/data/<prefix>/<account id>`. |
+| `openbao.token` or `.role_id` and `.secret_id` | | Token or AppRole login (`openbao.approle_mount`, default `approle`). |
+| `openbao.cache_ttl_s` | `60` | How long a read credential is reused. |
+| `catalog`, `catalog_poll_s` | embedded, `5` | Catalog file, reloaded when its contents change. |
+| `policy_mode` | `adaptive` | `current`, `strong`, `ratchet` or `adaptive`. |
+| `classifier.kind` | `none` | `typesafe`, `endpoint` or `pooled`, with `base_url`, `api_key`, `model`, `family`. |
+| `success.half_life_days`, `.min_samples` | `7`, `5` | Decay and sample floor of measured success rates. |
+| `quota_probe_interval_s` | `900` | Subscription quota probes. `0` turns them off. |
+| `drain_timeout_s` | `100` | How long SIGTERM waits for open streams. |
+| `metrics` | `true` | Serve `/metrics`. |
+
+Endpoints: `POST /v1/runs`, `GET` and `DELETE /v1/runs/{run_id}` and
+`POST /v1/outcomes` take the admin token. `POST /v1/chat/completions` and
+`GET /v1/models` take a run token and read the `x-muniment-task` and
+`x-muniment-validation-failures` headers. A run's turn reserves its uncached
+cost estimate before it goes upstream and settles the priced cost after. Once
+spend reaches the budget the router answers 402 with
+`{"error":{"type":"budget_exhausted",…}}`. `GET /healthz` and `GET /metrics`
+take no token.
+
+`muniment-router accounts list|add-key|login|import-pi-auth|set-weight|disable|enable|remove|probe`
+manages the pool in the configured store and secret source. `muniment-router
+catalog check <file>` checks a catalog file.
+
+The catalog (`crates/router/catalog.toml`) is a list of `[[model]]` tables with
+`family`, `model`, `name`, `tier` (`deep`, `balanced` or `fast`), `price` and
+`output` in US dollars per million tokens, `context` (`400K`, `1M`),
+`strengths` and `limits`. A file that fails the check keeps the last good
+catalog in force.
 
 ## Development
 
 ```sh
 cargo build --workspace
 cargo test --workspace -- --test-threads=1
+cargo test -p muniment-router --features server -- --test-threads=1
 scripts/check-core-boundary.sh
 ```
+
+The router's Postgres tests run when `MUNIMENT_ROUTER_TEST_DATABASE_URL` names a
+database they may create schemas in. The OpenBao integration test runs when
+`MUNIMENT_ROUTER_TEST_OPENBAO_ADDR` and `MUNIMENT_ROUTER_TEST_OPENBAO_TOKEN` are set.
 
 `muniment-core` links `sherpa-onnx`. Its build script downloads the prebuilt
 shared libraries on first build. `third-party/` holds the ONNX Runtime

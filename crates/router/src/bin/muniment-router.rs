@@ -24,6 +24,7 @@ commands:
   serve                     answer the router API until SIGTERM, then drain
   accounts <subcommand>     manage the account pool (muniment-router accounts help)
   catalog check <file>      check a catalog file without loading it
+  health                    exit 0 when the local server answers /healthz
 
 Settings come from the TOML file and MUNIMENT_ROUTER_* variables.";
 
@@ -53,6 +54,7 @@ fn main() {
                 .map(|models| println!("{path}: {} models", models.len())),
             _ => Err(USAGE.into()),
         },
+        "health" => settings(config.as_deref()).and_then(health),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             Ok(())
@@ -100,6 +102,22 @@ fn backend(settings: &Settings) -> Result<Backend, String> {
         config.policy.mode = mode;
     }));
     Ok(backend)
+}
+
+/// Asks the server on this host's listen port for its health, for a
+/// container health check that needs no other tool.
+fn health(settings: Settings) -> Result<(), String> {
+    let port = settings
+        .listen
+        .rsplit_once(':')
+        .map(|(_, port)| port)
+        .ok_or("The listen address has no port.")?;
+    let url = format!("http://127.0.0.1:{port}/healthz");
+    ureq::get(&url)
+        .timeout(Duration::from_secs(5))
+        .call()
+        .map(|_| ())
+        .map_err(|error| format!("{url}: {error}"))
 }
 
 fn serve(settings: Settings) -> Result<(), String> {

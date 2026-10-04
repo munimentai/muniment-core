@@ -1,0 +1,28 @@
+# The muniment-router server: built from this checkout with the `server`
+# feature, run as a non-root user on a distroless base that carries only libc
+# and the CA bundle the OS certificate verifier reads.
+#
+#   docker build -f deploy/router/Containerfile -t muniment-router .
+#
+# The image runs `muniment-router serve`. Settings come from MUNIMENT_ROUTER_*
+# variables or a TOML file named by MUNIMENT_ROUTER_CONFIG.
+
+ARG RUST_IMAGE=rust:1-slim-bookworm
+ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian12:nonroot
+
+FROM ${RUST_IMAGE} AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --release --locked -p muniment-router --features server --bin muniment-router \
+    && strip target/release/muniment-router
+
+FROM ${RUNTIME_IMAGE}
+COPY --from=build /src/target/release/muniment-router /usr/local/bin/muniment-router
+USER 65532:65532
+ENV MUNIMENT_ROUTER_LISTEN=0.0.0.0:8080
+EXPOSE 8080
+STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/usr/local/bin/muniment-router", "health"]
+ENTRYPOINT ["/usr/local/bin/muniment-router"]
+CMD ["serve"]

@@ -554,4 +554,44 @@ pub(crate) mod tests {
             .swap("gone", &subscription("old"), &subscription("new"))
             .is_err());
     }
+
+    /// Runs against a real OpenBao when `MUNIMENT_ROUTER_TEST_OPENBAO_ADDR`
+    /// and `MUNIMENT_ROUTER_TEST_OPENBAO_TOKEN` are set, on a KV v2 mount
+    /// named by `MUNIMENT_ROUTER_TEST_OPENBAO_MOUNT` (default `secret`).
+    #[test]
+    fn a_real_openbao_keeps_and_rotates_a_credential() {
+        let (Ok(address), Ok(token)) = (
+            std::env::var("MUNIMENT_ROUTER_TEST_OPENBAO_ADDR"),
+            std::env::var("MUNIMENT_ROUTER_TEST_OPENBAO_TOKEN"),
+        ) else {
+            eprintln!(
+                "MUNIMENT_ROUTER_TEST_OPENBAO_ADDR is unset; skipping the OpenBao integration test"
+            );
+            return;
+        };
+        let bao = OpenBao::new(Settings {
+            address,
+            mount: std::env::var("MUNIMENT_ROUTER_TEST_OPENBAO_MOUNT")
+                .unwrap_or_else(|_| "secret".into()),
+            prefix: format!("muniment-router-test/{}", uuid::Uuid::new_v4().simple()),
+            method: Auth::Token(token),
+            cache_ttl: Duration::ZERO,
+            timeout: Duration::from_secs(10),
+        });
+        assert_eq!(bao.read("a1").unwrap(), None);
+        bao.write("a1", &subscription("old")).unwrap();
+        assert_eq!(bao.read("a1").unwrap(), Some(subscription("old")));
+        assert_eq!(
+            bao.swap("a1", &subscription("old"), &subscription("new"))
+                .unwrap(),
+            subscription("new")
+        );
+        assert_eq!(
+            bao.swap("a1", &subscription("old"), &subscription("other"))
+                .unwrap(),
+            subscription("new")
+        );
+        bao.remove("a1").unwrap();
+        assert_eq!(bao.read("a1").unwrap(), None);
+    }
 }
