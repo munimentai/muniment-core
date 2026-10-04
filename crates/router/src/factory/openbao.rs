@@ -51,6 +51,97 @@ pub struct Settings {
     pub method: Auth,
     pub cache_ttl: Duration,
     pub timeout: Duration,
+    /// The SHA-256 of the server's certificate. When set, the router trusts
+    /// that one certificate instead of the OS store, for a self-signed server.
+    pub tls_pin_sha256: Option<[u8; 32]>,
+}
+
+/// A 64-character hex SHA-256 pin, with or without colons.
+pub fn parse_pin(text: &str) -> Result<[u8; 32], String> {
+    let hex: String = text.chars().filter(|c| *c != ':').collect();
+    let bytes: Option<Vec<u8>> = (0..hex.len())
+        .step_by(2)
+        .map(|index| {
+            hex.get(index..index + 2)
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+        })
+        .collect();
+    bytes
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| "The OpenBao TLS pin is not a SHA-256 in hex.".to_owned())
+}
+
+/// Accepts exactly one server certificate, by its SHA-256, and checks the
+/// handshake signatures with it as usual.
+#[derive(Debug)]
+struct Pinned {
+    digest: [u8; 32],
+    provider: std::sync::Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for Pinned {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        use sha2::{Digest, Sha256};
+        if Sha256::digest(end_entity.as_ref()).as_slice() == self.digest {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "The OpenBao certificate does not match its pin.".into(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            signature,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            signature,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn pinned_config(digest: [u8; 32]) -> std::sync::Arc<rustls::ClientConfig> {
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .expect("The TLS protocol versions are invalid.")
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(Pinned { digest, provider }))
+        .with_no_client_auth();
+    std::sync::Arc::new(config)
 }
 
 struct Login {
@@ -84,9 +175,11 @@ fn valid_id(id: &str) -> bool {
 
 impl OpenBao {
     pub fn new(settings: Settings) -> Self {
-        let agent = crate::http::agent_builder()
-            .timeout(settings.timeout)
-            .build();
+        let mut builder = crate::http::agent_builder().timeout(settings.timeout);
+        if let Some(digest) = settings.tls_pin_sha256 {
+            builder = builder.tls_config(pinned_config(digest));
+        }
+        let agent = builder.build();
         Self {
             settings,
             agent,
@@ -428,6 +521,7 @@ pub(crate) mod tests {
             method,
             cache_ttl: ttl,
             timeout: Duration::from_secs(5),
+            tls_pin_sha256: None,
         }
     }
 
@@ -577,6 +671,7 @@ pub(crate) mod tests {
             method: Auth::Token(token),
             cache_ttl: Duration::ZERO,
             timeout: Duration::from_secs(10),
+            tls_pin_sha256: None,
         });
         assert_eq!(bao.read("a1").unwrap(), None);
         bao.write("a1", &subscription("old")).unwrap();
@@ -593,5 +688,69 @@ pub(crate) mod tests {
         );
         bao.remove("a1").unwrap();
         assert_eq!(bao.read("a1").unwrap(), None);
+    }
+
+    #[test]
+    fn a_pinned_certificate_is_trusted_and_any_other_is_refused() {
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+        use sha2::{Digest, Sha256};
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let digest: [u8; 32] = Sha256::digest(cert.der()).into();
+        let config = Arc::new(
+            rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into(),
+            )
+            .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut socket) = stream else { return };
+                let mut connection = rustls::ServerConnection::new(Arc::clone(&config)).unwrap();
+                let mut tls = rustls::Stream::new(&mut connection, &mut socket);
+                let mut request = [0_u8; 4096];
+                if tls.read(&mut request).is_err() {
+                    continue;
+                }
+                let body =
+                    r#"{"data":{"data":{"type":"api_key","key":"k"},"metadata":{"version":1}}}"#;
+                let _ = write!(tls, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                let _ = tls.flush();
+                connection.send_close_notify();
+                let _ = connection.write_tls(&mut socket);
+            }
+        });
+        let at = |pin: Option<[u8; 32]>| {
+            let mut settings = settings(
+                &format!("https://localhost:{port}"),
+                Auth::Token("static".into()),
+                Duration::ZERO,
+            );
+            settings.tls_pin_sha256 = pin;
+            OpenBao::new(settings).read("a1")
+        };
+        assert_eq!(
+            at(Some(digest)).unwrap(),
+            Some(Credential::ApiKey { key: "k".into() })
+        );
+        assert!(at(Some([0; 32])).is_err());
+        // Without a pin the OS store refuses the self-signed certificate.
+        assert!(at(None).is_err());
+        let hex: String = digest
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        assert_eq!(parse_pin(&hex).unwrap(), digest);
+        assert!(parse_pin("abcd").is_err());
     }
 }

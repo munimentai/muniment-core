@@ -102,6 +102,7 @@ Settings come from a TOML file (`--config` or `MUNIMENT_ROUTER_CONFIG`), and a
 | `openbao.address`, `.mount`, `.prefix` | `secret`, `muniment-router/accounts` | KV v2 secret per account at `<mount>/data/<prefix>/<account id>`. |
 | `openbao.token` or `.role_id` and `.secret_id` | | Token or AppRole login (`openbao.approle_mount`, default `approle`). |
 | `openbao.cache_ttl_s` | `60` | How long a read credential is reused. |
+| `openbao.tls_pin_sha256` | | SHA-256 of a self-signed OpenBao certificate to trust instead of the OS store. |
 | `catalog`, `catalog_poll_s` | embedded, `5` | Catalog file, reloaded when its contents change. |
 | `policy_mode` | `adaptive` | `current`, `strong`, `ratchet` or `adaptive`. |
 | `classifier.kind` | `none` | `typesafe`, `endpoint` or `pooled`, with `base_url`, `api_key`, `model`, `family`. |

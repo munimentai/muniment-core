@@ -53,6 +53,7 @@ struct OpenBaoFile {
     secret_id: Option<String>,
     approle_mount: Option<String>,
     cache_ttl_s: Option<u64>,
+    tls_pin_sha256: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -208,6 +209,9 @@ impl Settings {
                         number("openbao.cache_ttl_s", file.openbao.cache_ttl_s)?.unwrap_or(60),
                     ),
                     timeout: Duration::from_secs(10),
+                    tls_pin_sha256: get("openbao.tls_pin_sha256", file.openbao.tls_pin_sha256)
+                        .map(|pin| openbao::parse_pin(&pin))
+                        .transpose()?,
                 })
             }
         };
@@ -278,6 +282,7 @@ mod tests {
 
     #[test]
     fn the_environment_overrides_the_file() {
+        let pin = "ab".repeat(32);
         let path = std::env::temp_dir().join(format!(
             "muniment-router-settings-{}.toml",
             uuid::Uuid::now_v7()
@@ -312,6 +317,7 @@ half_life_days = 2
             ("MUNIMENT_ROUTER_OPENBAO_MOUNT", "kv"),
             ("MUNIMENT_ROUTER_METRICS", "true"),
             ("MUNIMENT_ROUTER_SUCCESS_MIN_SAMPLES", "3"),
+            ("MUNIMENT_ROUTER_OPENBAO_TLS_PIN_SHA256", pin.as_str()),
         ]
         .into();
         let settings =
@@ -329,6 +335,7 @@ half_life_days = 2
         let bao = settings.openbao.unwrap();
         assert_eq!(bao.mount, "kv");
         assert_eq!(bao.prefix, "factory/router");
+        assert_eq!(bao.tls_pin_sha256, Some([0xab; 32]));
         assert!(
             matches!(bao.method, openbao::Auth::AppRole { ref mount, .. } if mount == "approle")
         );
