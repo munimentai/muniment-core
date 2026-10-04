@@ -349,6 +349,11 @@ pub fn coordinate(
             ChatProjector::new(),
         )
     });
+    diagnostics.startup_stage(if resume.is_some() {
+        "resume_projection"
+    } else {
+        "run_started"
+    });
     if let Some(resume) = &resume {
         for event in &resume.events {
             if projector.apply(event).is_err() {
@@ -371,6 +376,7 @@ pub fn coordinate(
         return;
     }
     if cancelled.load(Ordering::SeqCst) {
+        diagnostics.startup_stage("cancelled");
         if resume.is_none() {
             let _ = append_emit(
                 &app,
@@ -385,6 +391,7 @@ pub fn coordinate(
         }
         return;
     }
+    diagnostics.startup_stage("thread_name");
     if resume.is_none() {
         let fallback = prompt
             .split_whitespace()
@@ -403,6 +410,7 @@ pub fn coordinate(
     }
     // The model reads the clock from the message, so each one opens with its time.
     let stamped_prompt = crate::launch_facts::stamp_message(&prompt);
+    diagnostics.startup_stage("prepared_prompt");
     let prepared_prompt = if resume.is_some() {
         None
     } else {
@@ -424,12 +432,15 @@ pub fn coordinate(
         };
         Some(prepared_prompt)
     };
+    diagnostics.startup_stage("runtime_lock");
     let mut runtime = runtime
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Each run owns its process. Reopen only its own thread's saved conversation.
+    diagnostics.startup_stage("runtime_reset");
     *runtime = None;
     let startup_timeout = {
+        diagnostics.startup_stage("grant_renewal");
         if let Err(error) = crate::chat_grant::renew_grant_if_needed(&mut grant, || {
             app.renew_chat_grant(&access_token)
         }) {
@@ -450,8 +461,10 @@ pub fn coordinate(
             access_token = token;
         }
         let config = (|| {
+            diagnostics.startup_stage("install_root");
             let root = app.pi_install_root()?;
             if crate::sidecar::pi_install::resolve_current_for(&root, app.pi_artifact()).is_err() {
+                diagnostics.startup_stage("pi_acquire");
                 eprintln!("muniment-runtime: run_id={run_id} pi_acquire started");
                 crate::run_events::append_emit_detailed(
                     &app,
@@ -481,6 +494,7 @@ pub fn coordinate(
                     crate::model_install::ModelInstallError::Cancelled,
                 ));
             }
+            diagnostics.startup_stage("thread_session");
             let previous_session = if resume.is_none() {
                 crate::pi_execution::previous_thread_session(
                     &journal,
@@ -492,6 +506,7 @@ pub fn coordinate(
             } else {
                 None
             };
+            diagnostics.startup_stage("pi_config");
             let config = pi_launch_config(
                 &app,
                 Some(&root),
@@ -501,6 +516,7 @@ pub fn coordinate(
                     .map(|resume| &resume.locator)
                     .or(previous_session.as_ref()),
             )?;
+            diagnostics.startup_stage("acquire_completed");
             if matches!(
                 projector
                     .projection()
@@ -585,6 +601,7 @@ pub fn coordinate(
         };
         let startup_timeout = config.startup_timeout;
         let wiring = PiRpcWiring::new();
+        diagnostics.startup_stage("pi_spawn");
         let supervisor = match SidecarSupervisor::spawn(
             config,
             wiring.readiness_probe_with_startup_timeout(startup_timeout, Duration::from_secs(10)),

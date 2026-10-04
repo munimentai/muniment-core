@@ -160,7 +160,11 @@ impl DesktopClientHolder {
         limit: u8,
         cursor: Option<&str>,
     ) -> Result<Value, ClientError> {
-        self.with_client(|client| client.thread_history(thread_id, limit, cursor))
+        // Reply polling can overlap run submission on the same connection.
+        // Wait for that request without resending it or dropping the connection.
+        self.with_client_within(crate::desktop_client::RUN_SUBMIT_TIMEOUT, |client| {
+            client.thread_history(thread_id, limit, cursor)
+        })
     }
 
     pub fn list_companions(&self) -> Result<Value, ClientError> {
@@ -363,8 +367,16 @@ impl DesktopClientHolder {
         &self,
         call: impl FnOnce(&mut DesktopClient) -> Result<T, ClientError>,
     ) -> Result<T, ClientError> {
+        self.with_client_within(DESKTOP_CLIENT_LOCK_TIMEOUT, call)
+    }
+
+    fn with_client_within<T>(
+        &self,
+        wait: Duration,
+        call: impl FnOnce(&mut DesktopClient) -> Result<T, ClientError>,
+    ) -> Result<T, ClientError> {
         let (client, wake) = &*self.inner;
-        let mut client = Self::lock_client(client)?;
+        let mut client = Self::lock_client(client, wait)?;
         let result = call(client.as_mut().ok_or(ClientError::DesktopUnavailable)?);
         // A refusal the runtime answered does not break the transport. Keep the client so the
         // shell can report the refusal without a reconnect that repeats the same request, and
@@ -391,8 +403,9 @@ impl DesktopClientHolder {
 
     fn lock_client(
         client: &Mutex<Option<DesktopClient>>,
+        wait: Duration,
     ) -> Result<MutexGuard<'_, Option<DesktopClient>>, ClientError> {
-        let deadline = Instant::now() + DESKTOP_CLIENT_LOCK_TIMEOUT;
+        let deadline = Instant::now() + wait;
         loop {
             match client.try_lock() {
                 Ok(client) => return Ok(client),
@@ -687,6 +700,89 @@ mod tests {
         assert!(started.elapsed() < DESKTOP_CLIENT_LOCK_TIMEOUT * 2);
         assert_eq!(slow_call.join().unwrap(), Ok(()));
         assert!(client.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn reply_history_waits_for_submission_without_replaying_requests() {
+        use std::io::{Read, Write};
+
+        let holder = DesktopClientHolder::new();
+        let (stream, mut server) = UnixStream::pair().unwrap();
+        server.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+        *holder.inner.0.lock().unwrap() = Some(desktop_client_for_test(
+            Box::new(stream),
+            "1.0.0".into(),
+            IO_TIMEOUT,
+        ));
+        let thread_id = "018f0000-0000-7000-8000-000000000001";
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            for turn in 0..4 {
+                for operation in [Operation::RunSubmit, Operation::ThreadHistory] {
+                    let mut prefix = [0; 4];
+                    server.read_exact(&mut prefix).unwrap();
+                    let mut bytes = vec![0; u32::from_be_bytes(prefix) as usize];
+                    server.read_exact(&mut bytes).unwrap();
+                    let request: crate::Request = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(request.operation, operation);
+                    assert_eq!(request.body["thread_id"], thread_id);
+                    let run_id = format!("018f0000-0000-7000-8000-00000000001{turn}");
+                    let body = if operation == Operation::RunSubmit {
+                        entered.send(()).unwrap();
+                        if turn == 2 {
+                            std::thread::sleep(DESKTOP_CLIENT_LOCK_TIMEOUT * 3);
+                        }
+                        serde_json::json!({
+                            "run_id": run_id, "thread_id": thread_id, "attachments": [],
+                            "committed_seq": 1, "accepted_at": "2026-01-01T00:00:00Z",
+                        })
+                    } else {
+                        serde_json::json!({"entries": [{"runId": run_id, "phase": "complete"}], "nextCursor": null})
+                    };
+                    let response = serde_json::json!({
+                        "protocol": "muniment.attach/1", "request_id": request.request_id,
+                        "ok": true, "body": body,
+                    });
+                    server
+                        .write_all(&crate::encode_frame(&response).unwrap())
+                        .unwrap();
+                }
+            }
+        });
+        for turn in 0..4 {
+            let submitter = holder.clone();
+            let submission =
+                std::thread::spawn(move || submitter.run_submit("prompt", &[], Some(thread_id)));
+            waiting.recv_timeout(IO_TIMEOUT).unwrap();
+            let history = holder.thread_history(thread_id, 10, None);
+            let accepted = submission.join().unwrap().unwrap();
+            assert_eq!(history.unwrap()["entries"][0]["runId"], accepted.run_id);
+            assert_eq!(
+                accepted.run_id,
+                format!("018f0000-0000-7000-8000-00000000001{turn}")
+            );
+            assert!(holder.inner.0.lock().unwrap().is_some());
+        }
+        worker.join().unwrap();
+        assert_eq!(
+            holder.thread_history("018f0000-0000-7000-8000-000000000001", 10, None),
+            Err(ClientError::ConnectionClosed)
+        );
+        assert!(holder.inner.0.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_bounded_history_wait_does_not_call_or_clear_a_busy_client() {
+        let holder = DesktopClientHolder::new();
+        let mut locked = holder.inner.0.lock().unwrap();
+        *locked = Some(test_client("1.0.0"));
+        assert_eq!(
+            holder.with_client_within(Duration::ZERO, |_| -> Result<(), ClientError> {
+                panic!("A busy client must not send a request.")
+            }),
+            Err(ClientError::DesktopBusy)
+        );
+        assert!(locked.is_some());
     }
 
     #[test]

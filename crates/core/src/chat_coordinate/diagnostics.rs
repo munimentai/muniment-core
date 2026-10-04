@@ -9,6 +9,7 @@ pub(super) struct RunDiagnostics {
     pub prompt_submitted: bool,
     stderr: Option<LineReader>,
     lifecycle: Option<Receiver<SidecarEvent>>,
+    startup_stage: Option<&'static str>,
 }
 
 impl RunDiagnostics {
@@ -21,7 +22,25 @@ impl RunDiagnostics {
             prompt_submitted: false,
             stderr: None,
             lifecycle: None,
+            startup_stage: Some("projector"),
         }
+    }
+
+    pub fn startup_stage(&mut self, stage: &'static str) {
+        self.startup_stage = Some(stage);
+        eprintln!(
+            "muniment-runtime: run_id={} run_setup stage={stage} state=started",
+            self.run_id
+        );
+    }
+
+    fn startup_exit_line(&self) -> Option<String> {
+        self.startup_stage.map(|stage| {
+            format!(
+                "muniment-runtime: run_id={} run_setup stage={stage} state=exited",
+                self.run_id
+            )
+        })
     }
 
     pub fn prompt_failed(&mut self, error: &str) {
@@ -69,6 +88,7 @@ impl RunDiagnostics {
     }
 
     pub fn spawned(&mut self, supervisor: &SidecarSupervisor) {
+        self.startup_stage = None;
         self.stderr = Some(supervisor.io().stderr);
         self.lifecycle = Some(supervisor.subscribe());
         self.log_lifecycle();
@@ -88,6 +108,9 @@ impl RunDiagnostics {
 
 impl Drop for RunDiagnostics {
     fn drop(&mut self) {
+        if let Some(line) = self.startup_exit_line() {
+            eprintln!("{line}");
+        }
         self.log_lifecycle();
         if !self.prompt_submitted {
             eprintln!(
@@ -141,6 +164,38 @@ fn stderr_line(run_id: &str, tail: Vec<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_exits_report_the_last_stage_without_error_text() {
+        let mut diagnostics = RunDiagnostics::new("run-startup");
+        for stage in [
+            "projector",
+            "resume_projection",
+            "run_started",
+            "cancelled",
+            "thread_name",
+            "prepared_prompt",
+            "runtime_lock",
+            "runtime_reset",
+            "grant_renewal",
+            "install_root",
+            "pi_acquire",
+            "thread_session",
+            "pi_config",
+            "acquire_completed",
+            "pi_spawn",
+        ] {
+            diagnostics.startup_stage(stage);
+            assert_eq!(
+                diagnostics.startup_exit_line(),
+                Some(format!(
+                    "muniment-runtime: run_id=run-startup run_setup stage={stage} state=exited"
+                ))
+            );
+        }
+        diagnostics.startup_stage = None;
+        assert_eq!(diagnostics.startup_exit_line(), None);
+    }
 
     #[test]
     fn config_failure_names_the_run_step_and_redacted_cause() {
