@@ -78,6 +78,8 @@ fn write(home: &Path, relative: &str, content: &str) -> Result<(), String> {
             .open(&temporary)?;
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
+        // ReplaceFileW opens the replacement without sharing on Windows.
+        drop(file);
         crate::home::replace_file(&temporary, &destination)
     })();
     let _ = fs::remove_file(temporary);
@@ -215,6 +217,74 @@ pub fn fact_restore_in(profile: &Path, home: &Path, id: &str) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn profile_save_creates_missing_directory_and_restores_exact_bytes() {
+        let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        fs::create_dir_all(&root).unwrap();
+        let profile = root.join("private");
+        let home = root.join("muniment");
+        crate::home::confirm_home(&profile, &home).unwrap();
+        fs::remove_dir_all(home.join("memory")).unwrap();
+        assert_eq!(profile_read(&profile).unwrap(), "");
+
+        let original = "# Profile\r\n\r\nCall me Alex.\r\n";
+        profile_save(&profile, original).unwrap();
+        assert_eq!(profile_read(&profile).unwrap(), original);
+        profile_save(&profile, "# Profile\n\nAcceptance profile.\n").unwrap();
+        assert_eq!(
+            profile_read(&profile).unwrap(),
+            "# Profile\n\nAcceptance profile.\n"
+        );
+        profile_save(&profile, original).unwrap();
+        assert_eq!(
+            fs::read(home.join("memory/profile.md")).unwrap(),
+            original.as_bytes()
+        );
+        profile_save(&profile, "").unwrap();
+        assert_eq!(profile_read(&profile).unwrap(), "");
+        assert_eq!(fs::read_dir(home.join("memory")).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn profile_save_preserves_locked_target_and_recovers_after_unlock() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        fs::create_dir_all(&root).unwrap();
+        let profile = root.join("private");
+        let home = root.join("muniment");
+        crate::home::confirm_home(&profile, &home).unwrap();
+        let destination = home.join("memory/profile.md");
+        let original = "# Profile\r\n\r\nOriginal profile.\r\n";
+        fs::write(&destination, original).unwrap();
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
+            .open(&destination)
+            .unwrap();
+
+        assert_eq!(
+            profile_save(&profile, "New profile.").unwrap_err(),
+            "The memory file could not be saved."
+        );
+        assert_eq!(profile_read(&profile).unwrap(), original);
+        assert!(!fs::read_dir(home.join("memory")).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".memory-")
+        }));
+        drop(locked);
+        profile_save(&profile, "New profile.").unwrap();
+        assert_eq!(profile_read(&profile).unwrap(), "New profile.");
+        profile_save(&profile, original).unwrap();
+        assert_eq!(profile_read(&profile).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn files_round_trip_and_duplicate_capture_is_idempotent() {
         let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
