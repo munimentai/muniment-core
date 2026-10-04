@@ -447,7 +447,7 @@ fn rejects_a_launch_when_settings_cannot_be_saved() {
 #[cfg(unix)]
 fn pinned_pi_cloud_wire_contract() {
     let Ok(executable) = std::env::var("MUNIMENT_PI_WIRE_EXECUTABLE") else {
-        eprintln!("The wire test requires MUNIMENT_PI_WIRE_EXECUTABLE for Pi 0.85.1 or 0.87.1.");
+        eprintln!("The wire test requires MUNIMENT_PI_WIRE_EXECUTABLE for a Pi release in pins/pins.toml.");
         return;
     };
     let output = std::process::Command::new("python3")

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import tomllib
 import unittest
 
 EXECUTABLE = sys.argv.pop(1)
@@ -199,6 +200,9 @@ class CloudWire(unittest.TestCase):
 
 if __name__ == '__main__':
     version = subprocess.check_output([EXECUTABLE, '--version'], text=True, stderr=subprocess.STDOUT).strip()
-    if version not in ('0.85.1', '0.87.1'):
-        raise SystemExit(f'The wire test requires Pi 0.85.1 or 0.87.1. The executable reports {version}.')
+    with open(pathlib.Path(__file__).resolve().parents[3] / 'pins/pins.toml', 'rb') as file:
+        pi = tomllib.load(file)['pi']
+    pinned = (pi['version'], pi['rollback_version'])
+    if version not in pinned:
+        raise SystemExit(f'The wire test requires a pinned Pi, {" or ".join(pinned)}. The executable reports {version}.')
     unittest.main()

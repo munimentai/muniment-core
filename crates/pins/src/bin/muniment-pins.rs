@@ -315,6 +315,7 @@ fn compat(options: &Options, http: &dyn Http) -> Result<ExitCode> {
             .args([
                 "test",
                 "--locked",
+                "--no-fail-fast",
                 "-p",
                 "muniment-core",
                 "--features",
