@@ -219,6 +219,8 @@ pub enum Reload {
 pub struct Reloader {
     path: PathBuf,
     seen: Option<[u8; 32]>,
+    /// The last read failure, so one missing file is reported once.
+    unreadable: Option<String>,
 }
 
 impl Reloader {
@@ -226,19 +228,26 @@ impl Reloader {
         Self {
             path: path.into(),
             seen: None,
+            unreadable: None,
         }
     }
 
     /// Reads the file and installs it when its contents differ from the last
-    /// look. A file that cannot be read counts as rejected.
+    /// look. A file that cannot be read counts as rejected once, until the
+    /// failure changes.
     pub fn poll(&mut self) -> Reload {
         let bytes = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(error) => {
                 let message = format!("{}: {error}", self.path.display());
+                if self.unreadable.as_ref() == Some(&message) {
+                    return Reload::Unchanged;
+                }
+                self.unreadable = Some(message.clone());
                 return Reload::Rejected(message);
             }
         };
+        self.unreadable = None;
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
         if self.seen == Some(digest) {
             return Reload::Unchanged;
@@ -369,6 +378,7 @@ mod tests {
         );
         let mut reloader = Reloader::new(&path);
         assert!(matches!(reloader.poll(), Reload::Rejected(_)));
+        assert_eq!(reloader.poll(), Reload::Unchanged);
         std::fs::write(&path, &extended).unwrap();
         assert_eq!(reloader.poll(), Reload::Installed(MODELS.len() + 1));
         assert_eq!(
