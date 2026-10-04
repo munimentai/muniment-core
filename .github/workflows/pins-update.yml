@@ -1,0 +1,122 @@
+name: Pins update
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+# One update at a time, so two runs never push the same branch.
+concurrency:
+  group: pins-update
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  select:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.select.outputs.changed }}
+      blocked: ${{ steps.select.outputs.blocked }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: pins-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: pins-${{ runner.os }}-
+      - run: python3 -B scripts/pins/test_update.py
+      - run: cargo build --release --locked -p muniment-pins --features cli
+      # Check, bump, and keep every pin that passes compat and the workspace tests.
+      - id: select
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B scripts/pins/update.py select --out update.json
+      - if: steps.select.outputs.changed == 'true'
+        run: git diff --binary -- pins > pins.patch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pins-update
+          path: |
+            update.json
+            pins.patch
+          if-no-files-found: ignore
+
+  # The darwin archives and the macOS runtime get their own compat run.
+  darwin:
+    needs: select
+    if: needs.select.outputs.changed == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: pins-update
+      - run: git apply pins.patch
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: pins-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: pins-${{ runner.os }}-
+      - env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo run --release --locked -p muniment-pins --features cli -- compat --report darwin.json || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pins-darwin
+          path: darwin.json
+          if-no-files-found: ignore
+
+  # Opens the pull request and the blocked-pin issues. PINS_UPDATE_TOKEN is a
+  # token with contents, pull request and issue write access. Pushes and pull
+  # requests made with the default token start no CI and cut no release.
+  publish:
+    needs: [select, darwin]
+    if: always() && needs.select.result == 'success' && (needs.select.outputs.changed == 'true' || needs.select.outputs.blocked == 'true')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PINS_UPDATE_TOKEN || github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: pins-update
+      - uses: actions/download-artifact@v4
+        if: needs.darwin.result == 'success'
+        continue-on-error: true
+        with:
+          name: pins-darwin
+      - if: needs.select.outputs.changed == 'true'
+        run: git apply pins.patch && rm pins.patch
+      - name: Open the pull request and issues
+        env:
+          GH_TOKEN: ${{ secrets.PINS_UPDATE_TOKEN || github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          python3 -B scripts/pins/update.py publish --result update.json --darwin darwin.json
