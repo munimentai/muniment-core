@@ -538,11 +538,11 @@ fn pi_login(
         .status()
         .map_err(|error| format!("{pi} could not start: {error}"));
     let imported = status.and_then(|_| {
-        let auth = scratch.join("auth.json");
-        if !auth.exists() {
+        let written = scratch.join("auth.json");
+        if !written.exists() {
             return Err("Pi wrote no sign-in.".into());
         }
-        import_pi_auth(backend, &auth, Some(provider), label)
+        import_pi_auth(backend, &written, Some(provider), label)
     });
     let _ = std::fs::remove_dir_all(&scratch);
     imported?

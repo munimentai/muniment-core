@@ -48,7 +48,7 @@ pub struct Settings {
     pub mount: String,
     /// The path under the mount that holds one secret per account.
     pub prefix: String,
-    pub auth: Auth,
+    pub method: Auth,
     pub cache_ttl: Duration,
     pub timeout: Duration,
 }
@@ -118,7 +118,7 @@ impl OpenBao {
 
     /// The token to send, logging in through AppRole when none is current.
     fn token(&self, fresh: bool) -> Result<String, String> {
-        let (mount, role_id, secret_id) = match &self.settings.auth {
+        let (mount, role_id, secret_id) = match &self.settings.method {
             Auth::Token(token) => return Ok(token.clone()),
             Auth::AppRole {
                 mount,
@@ -173,7 +173,7 @@ impl OpenBao {
                 Some(body) => request.send_json(body.clone()),
                 None => request.call(),
             })?;
-            if answer.0 == 403 && !fresh && matches!(self.settings.auth, Auth::AppRole { .. }) {
+            if answer.0 == 403 && !fresh && matches!(self.settings.method, Auth::AppRole { .. }) {
                 fresh = true;
                 continue;
             }
@@ -420,12 +420,12 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn settings(address: &str, auth: Auth, ttl: Duration) -> Settings {
+    pub(crate) fn settings(address: &str, method: Auth, ttl: Duration) -> Settings {
         Settings {
             address: address.into(),
             mount: "kv".into(),
             prefix: "router/accounts".into(),
-            auth,
+            method,
             cache_ttl: ttl,
             timeout: Duration::from_secs(5),
         }

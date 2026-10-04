@@ -176,7 +176,7 @@ impl Settings {
         let openbao = match get("openbao.address", file.openbao.address) {
             None => None,
             Some(address) => {
-                let auth = match (
+                let method = match (
                     get("openbao.token", file.openbao.token),
                     get("openbao.role_id", file.openbao.role_id),
                     get("openbao.secret_id", file.openbao.secret_id),
@@ -203,7 +203,7 @@ impl Settings {
                         .unwrap_or_else(|| "secret".into()),
                     prefix: get("openbao.prefix", file.openbao.prefix)
                         .unwrap_or_else(|| "muniment-router/accounts".into()),
-                    auth,
+                    method,
                     cache_ttl: Duration::from_secs(
                         number("openbao.cache_ttl_s", file.openbao.cache_ttl_s)?.unwrap_or(60),
                     ),
@@ -329,7 +329,9 @@ half_life_days = 2
         let bao = settings.openbao.unwrap();
         assert_eq!(bao.mount, "kv");
         assert_eq!(bao.prefix, "factory/router");
-        assert!(matches!(bao.auth, openbao::Auth::AppRole { ref mount, .. } if mount == "approle"));
+        assert!(
+            matches!(bao.method, openbao::Auth::AppRole { ref mount, .. } if mount == "approle")
+        );
         assert!(matches!(settings.classifier, Classifier::Pooled { .. }));
         std::fs::remove_file(path).unwrap();
     }
