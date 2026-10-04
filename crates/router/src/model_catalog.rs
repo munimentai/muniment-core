@@ -371,10 +371,10 @@ mod tests {
     fn a_reloaded_catalog_takes_effect_and_a_bad_file_keeps_the_last_good_one() {
         let path =
             std::env::temp_dir().join(format!("muniment-catalog-{}.toml", uuid::Uuid::now_v7()));
-        // A superset of the default, so tests that read the catalog at the
-        // same time still find every default model.
+        // The default plus one model of a family no other test counts, so
+        // tests that read the catalog at the same time see what they expect.
         let extended = format!(
-            "{DEFAULT_CATALOG}\n[[model]]\nfamily = \"openai\"\nmodel = \"gpt-reload-test\"\nname = \"Reload Test\"\ntier = \"fast\"\nprice = 0.1\noutput = 0.2\ncontext = \"64K\"\nstrengths = \"Short work\"\nlimits = \"Weak at long work\"\n"
+            "{DEFAULT_CATALOG}\n[[model]]\nfamily = \"meta\"\nmodel = \"gpt-reload-test\"\nname = \"Reload Test\"\ntier = \"fast\"\nprice = 0.1\noutput = 0.2\ncontext = \"64K\"\nstrengths = \"Short work\"\nlimits = \"Weak at long work\"\n"
         );
         let mut reloader = Reloader::new(&path);
         assert!(matches!(reloader.poll(), Reload::Rejected(_)));
@@ -382,16 +382,16 @@ mod tests {
         std::fs::write(&path, &extended).unwrap();
         assert_eq!(reloader.poll(), Reload::Installed(MODELS.len() + 1));
         assert_eq!(
-            entry("openai", "gpt-reload-test").unwrap().name,
+            entry("meta", "gpt-reload-test").unwrap().name,
             "Reload Test"
         );
         assert_eq!(reloader.poll(), Reload::Unchanged);
         std::fs::write(&path, "[[model]]\nfamily = \"nobody\"").unwrap();
         assert!(matches!(reloader.poll(), Reload::Rejected(_)));
-        assert!(entry("openai", "gpt-reload-test").is_some());
+        assert!(entry("meta", "gpt-reload-test").is_some());
         assert_eq!(reloader.poll(), Reload::Unchanged);
         reset();
-        assert!(entry("openai", "gpt-reload-test").is_none());
+        assert!(entry("meta", "gpt-reload-test").is_none());
         assert_eq!(models().len(), MODELS.len());
         std::fs::remove_file(path).unwrap();
     }
