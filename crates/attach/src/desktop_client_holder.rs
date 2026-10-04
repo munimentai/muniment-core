@@ -17,11 +17,32 @@ pub struct DesktopClientHolder {
     /// disconnect observer run while the client lock is held, so they read
     /// the version here instead of locking the client again.
     pub(crate) runtime_version: Arc<Mutex<Option<String>>>,
+    #[cfg(unix)]
+    admission_failure: Arc<Mutex<Option<(Instant, Value)>>>,
 }
 
 impl DesktopClientHolder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(unix)]
+    pub fn admission_failure_since(&self, since: Instant) -> Option<Value> {
+        self.admission_failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .filter(|(observed, _)| *observed >= since)
+            .map(|(_, failure)| failure.clone())
+    }
+
+    #[cfg(all(unix, any(test, not(target_os = "linux"))))]
+    pub(crate) fn record_admission_failure(&self, failure: Option<Value>) {
+        *self
+            .admission_failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            failure.map(|failure| (Instant::now(), failure));
     }
 
     pub fn runtime_version(&self) -> Option<String> {

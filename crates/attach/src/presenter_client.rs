@@ -130,7 +130,31 @@ pub fn serve_approval_presenter_with<S>(
 
         if let Some(mut presenter) = connect() {
             observe(true);
-            let _ = presenter.serve(&mut choose);
+            let started = std::time::Instant::now();
+            let result = presenter.serve(&mut choose);
+            let closed_by = if stop.stopped() {
+                "desktop"
+            } else if matches!(
+                result,
+                Ok(ApprovalPresenterServeOutcome::ConnectionClosed)
+                    | Err(ClientError::ConnectionClosed)
+            ) {
+                "runtime_or_transport"
+            } else {
+                "desktop"
+            };
+            eprintln!(
+                "muniment-desktop: {}",
+                serde_json::json!({
+                    "event": "approval_presenter_closed",
+                    "observer": "desktop",
+                    "peer_pid": std::process::id(),
+                    "closed_by": closed_by,
+                    "result": format!("{result:?}"),
+                    "session_elapsed_ms": started.elapsed().as_millis(),
+                    "frame_bound_ms": presenter.io_timeout.as_millis(),
+                })
+            );
             observe(false);
         }
 
@@ -248,10 +272,12 @@ impl ApprovalPresenterClient {
                 .set_read_timeout(None)
                 .map_err(|_| ClientError::DesktopUnavailable)?;
             let mut first = [0u8; 1];
-            match self.stream.read(&mut first).map_err(map_io_error)? {
-                0 => return Ok(ApprovalPresenterServeOutcome::ConnectionClosed),
-                1 => {}
-                _ => unreachable!("a one-byte read returned more than one byte"),
+            match self.stream.read(&mut first) {
+                Ok(0) => return Ok(ApprovalPresenterServeOutcome::ConnectionClosed),
+                Ok(1) => {}
+                Ok(_) => unreachable!("a one-byte read returned more than one byte"),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(map_io_error(error)),
             }
 
             let request_deadline = deadline(self.io_timeout);
@@ -346,6 +372,7 @@ mod tests {
 
     struct FixtureStream {
         reads: VecDeque<u8>,
+        interrupt: bool,
     }
 
     impl FixtureStream {
@@ -367,12 +394,16 @@ mod tests {
             };
             Self {
                 reads: VecDeque::from(encode_frame(&request).unwrap()),
+                interrupt: false,
             }
         }
     }
 
     impl Read for FixtureStream {
         fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            if std::mem::take(&mut self.interrupt) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
             let count = bytes.len().min(self.reads.len());
             for byte in &mut bytes[..count] {
                 *byte = self.reads.pop_front().unwrap();
@@ -452,6 +483,33 @@ mod tests {
         assert_eq!(observed, [true, false, true, false]);
         assert_eq!(presented, ["first", "second"]);
         assert!(clients.is_empty());
+    }
+
+    #[test]
+    fn an_interrupted_idle_presenter_keeps_its_connection() {
+        let mut presenter = client("after-signal");
+        let mut stream = FixtureStream::with_request("after-signal");
+        stream.interrupt = true;
+        presenter.stream = Box::new(stream);
+        let mut presented = Vec::new();
+        assert_eq!(
+            presenter.serve(|request| {
+                presented.push(request.challenge.clone());
+                ApprovalDecision::Approve
+            }),
+            Ok(ApprovalPresenterServeOutcome::ConnectionClosed)
+        );
+        assert_eq!(presented, ["after-signal"]);
+    }
+
+    #[test]
+    fn a_permanent_stop_closes_the_idle_presenter_without_retry() {
+        let mut presenter = client("unused");
+        presenter.stream = Box::new(crate::client_stream::tests::AbortedStream(0));
+        assert_eq!(
+            presenter.serve(|_| panic!("the stopped presenter must not present a request")),
+            Err(ClientError::ConnectionClosed)
+        );
     }
 
     #[test]

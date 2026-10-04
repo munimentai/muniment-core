@@ -16,8 +16,10 @@ pub struct NativeMacosAttachRouteReader<'stream> {
 }
 
 /// Each status stays absent until its Security call runs.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize)]
 struct CodeCheck {
+    matched: Option<bool>,
+    elapsed_ms: Option<u128>,
     audit_token: bool,
     bundle: bool,
     plist_read: bool,
@@ -129,11 +131,21 @@ impl MacosAttachRouteReader for NativeMacosAttachRouteReader<'_> {
     fn peer_code_matches(&self, expected_desktop_executable: &Path) -> bool {
         let mut check = self.code_check.borrow_mut();
         *check = CodeCheck::default();
-        let Some(token) = peer_audit_token(self.stream) else {
-            return false;
+        let started = std::time::Instant::now();
+        let matched = if let Some(token) = peer_audit_token(self.stream) {
+            check.audit_token = true;
+            audit_token_satisfies(&token, expected_desktop_executable, &mut check)
+        } else {
+            false
         };
-        check.audit_token = true;
-        audit_token_satisfies(&token, expected_desktop_executable, &mut check)
+        check.matched = Some(matched);
+        check.elapsed_ms = Some(started.elapsed().as_millis());
+        matched
+    }
+
+    fn code_check_diagnostic(&self) -> serde_json::Value {
+        serde_json::to_value(&*self.code_check.borrow())
+            .expect("The code check fields must serialize.")
     }
 
     fn log_companion_fallback(
@@ -644,6 +656,8 @@ int main(int argc, char **argv) {
         );
         assert_eq!(reader.code_check.borrow().sec_code_check_validity, Some(0));
         assert!(reader.code_check.borrow().code_hash_match);
+        assert_eq!(reader.code_check_diagnostic()["matched"], true);
+        assert!(reader.code_check_diagnostic()["elapsed_ms"].is_number());
         assert_eq!(
             name_macos_attach_connection_route(&reader, &clone_executable),
             MacosAttachConnectionRoute::DesktopClient { peer_pid },
@@ -666,6 +680,7 @@ int main(int argc, char **argv) {
         assert!(!reader.peer_code_matches(&expected));
         assert_eq!(reader.code_check.borrow().sec_code_check_validity, Some(0));
         assert!(!reader.code_check.borrow().code_hash_match);
+        assert_eq!(reader.code_check_diagnostic()["matched"], false);
         assert_eq!(
             name_macos_attach_connection_route(&reader, &expected),
             MacosAttachConnectionRoute::Companion { peer_pid }
