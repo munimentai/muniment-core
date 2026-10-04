@@ -15,6 +15,8 @@ pub mod balance;
 pub mod classify;
 pub mod config;
 pub mod endpoint_models;
+#[cfg(feature = "server")]
+pub mod factory;
 pub mod family;
 pub mod headless;
 pub mod http;

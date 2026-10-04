@@ -166,7 +166,6 @@ impl Hooks for NoHooks {}
 pub(crate) struct Attempt {
     pub route: config::Route,
     pub account: String,
-    pub estimate_usd: f64,
     /// What the attempt cost: the priced tokens of a completed answer, the
     /// estimate for an answer that broke off after output began, and zero for
     /// an attempt that produced nothing.
@@ -1076,7 +1075,6 @@ pub(crate) fn complete(
                 hooks.settle(&Attempt {
                     route: route.clone(),
                     account: account.id.clone(),
-                    estimate_usd,
                     cost_usd,
                     tokens,
                     served,
@@ -2301,8 +2299,20 @@ mod tests {
                 let Ok((mut stream, _)) = listener.accept() else {
                     return;
                 };
-                let mut buffer = [0_u8; 65536];
-                let _ = stream.read(&mut buffer);
+                // Read the whole request so closing never resets the client.
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut request = vec![0_u8; length];
+                let _ = reader.read_exact(&mut request);
                 let body = "{\"error\":\"limited\"}";
                 let _ = write!(
                     stream,

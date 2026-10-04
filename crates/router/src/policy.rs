@@ -13,7 +13,9 @@ use std::{collections::BTreeMap, path::Path};
 pub const VERSION: &str = "muniment-routing/1";
 
 const FILE: &str = "muniment-router-sessions.json";
-const TTL: i64 = 24 * 60 * 60 * 1000;
+/// How long a session lives after its last turn.
+pub const SESSION_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+const TTL: i64 = SESSION_TTL_MS;
 const LIMIT: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
