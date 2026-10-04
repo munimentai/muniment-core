@@ -39,6 +39,13 @@ The desktop depends on a release tag:
 muniment-core = { git = "https://github.com/munimentai/muniment-core", tag = "v0.1.0", features = ["tls"] }
 ```
 
+The repository carries no third-party OAuth client secrets. A host that offers
+Antigravity sign-in registers its client at startup with
+`muniment_router::native_auth::set_provider_clients`, or sets
+`MUNIMENT_ANTIGRAVITY_CLIENT_ID` and `MUNIMENT_ANTIGRAVITY_CLIENT_SECRET`.
+Without a client, Antigravity sign-in and token refresh answer a configuration
+error and every other provider keeps working.
+
 The factory builds the router binaries from a release tag and reads the pins
 from the release asset:
 
