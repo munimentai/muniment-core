@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
 // Grant issuance can take longer than the default desktop request deadline.
-const RUN_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const RUN_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_THREAD_ID_LENGTH: usize = 36;
 const MAX_CURSOR_LENGTH: usize = 1024;
 const MAX_RUN_MESSAGE_TEXT_LENGTH: usize = 32 * 1024;

@@ -29,6 +29,7 @@ struct Boundary {
     events: Arc<Mutex<Vec<ChatEvent>>>,
     acquisitions: Arc<AtomicUsize>,
     outcome: &'static str,
+    model: Option<String>,
 }
 
 impl ChatEventSink for Boundary {
@@ -42,6 +43,9 @@ impl ChatEventSink for Boundary {
 }
 
 impl PiLaunchBoundaries for Boundary {
+    fn local_default_model(&self) -> Option<String> {
+        self.model.clone()
+    }
     fn pi_session_root(&self) -> Result<PathBuf, PiLaunchError> {
         Ok(self.profile.pi_session_root())
     }
@@ -131,6 +135,8 @@ fn coordinate_acquires_from_the_profile_once_without_an_environment_root() {
             .unwrap();
         assert!(stderr.contains(&format!("{run} pi_acquire completed")));
         assert!(stderr.contains(&format!("{run} pi_spawn not_started")));
+        assert!(stderr.contains(&format!("{run} run_setup stage=pi_config state=exited")));
+        assert!(stderr.contains("run_setup stage=pi_acquire state=exited"));
         let publication = stderr
             .lines()
             .find(|line| {
@@ -147,37 +153,52 @@ fn coordinate_acquires_from_the_profile_once_without_an_environment_root() {
         return;
     }
     assert!(std::env::var_os("MUNIMENT_PI_ROOT").is_none());
-    for outcome in [
-        "complete",
-        "failed",
-        "publication-failed",
-        "cancelled",
-        "config-failed",
+    for (outcome, consecutive) in [
+        ("complete", false),
+        ("complete", true),
+        ("failed", false),
+        ("publication-failed", false),
+        ("cancelled", false),
+        ("config-failed", false),
     ] {
         let directory =
             std::env::temp_dir().join(format!("muniment-pi-coordinate-{}", uuid::Uuid::new_v4()));
         let profile = ChatProfile::new(&directory);
         let (journal, cas) = profile.open_storage().unwrap();
         let storage = Arc::new(Mutex::new(ChatStorage { journal, cas }));
-        let boundary = Boundary {
+        let mut boundary = Boundary {
             profile,
             events: Arc::new(Mutex::new(Vec::new())),
             acquisitions: Arc::new(AtomicUsize::new(0)),
             outcome,
+            model: None,
         };
         assert_eq!(
             boundary.pi_install_root().unwrap(),
             directory.join("harness")
         );
-        let runs = if outcome == "complete" { 2 } else { 1 };
+        let runs = if consecutive {
+            4
+        } else if outcome == "complete" {
+            2
+        } else {
+            1
+        };
+        let runtime = Arc::new(Mutex::new(None));
+        let tracker = SessionThread::default();
+        let mut thread = None;
+        let mut locator = None;
+        let args_path = directory.join("stub-args");
+        std::env::set_var("PI_RESUME_STUB_ARGS", &args_path);
         for index in 0..runs {
+            boundary.model = consecutive.then(|| format!("openai/test-model-{index}"));
             boundary.events.lock().unwrap().clear();
             let run_id = uuid::Uuid::now_v7().to_string();
             let prepared = prepare_new_run_with_session_thread(
                 &storage,
                 SessionThreadStart {
-                    tracker: &SessionThread::default(),
-                    continue_existing: false,
+                    tracker: &tracker,
+                    continue_existing: consecutive,
                 },
                 &run_id,
                 "local",
@@ -189,7 +210,14 @@ fn coordinate_acquires_from_the_profile_once_without_an_environment_root() {
                 || Ok(()),
             )
             .unwrap();
-            let runtime = Arc::new(Mutex::new(None));
+            if consecutive {
+                if index == 0 {
+                    thread = tracker.current(None);
+                    assert!(thread.is_some());
+                } else {
+                    assert_eq!(tracker.current(None), thread);
+                }
+            }
             let started = std::time::Instant::now();
             coordinate(
                 boundary.clone(),
@@ -263,10 +291,36 @@ fn coordinate_acquires_from_the_profile_once_without_an_environment_root() {
                     .count(),
                 usize::from(index == 0)
             );
-            if let Some(mut runtime) = runtime.lock().unwrap().take() {
+            if consecutive {
+                let args = std::fs::read_to_string(&args_path).unwrap();
+                let args = args.lines().collect::<Vec<_>>();
+                assert!(args.windows(2).any(|pair| pair == ["--provider", "openai"]));
+                assert!(args
+                    .windows(2)
+                    .any(|pair| pair == ["--model", &format!("test-model-{index}")]));
+                assert_eq!(args.contains(&"--session"), index > 0);
+                let binding = history
+                    .iter()
+                    .find(|event| event.event_type == "runtime.pi_session.bound")
+                    .unwrap();
+                let muniment_core::journal::EventPayload::Inline { payload_json } =
+                    &binding.payload
+                else {
+                    panic!("The session binding must use an inline payload.");
+                };
+                if index == 0 {
+                    locator = Some(payload_json["locator"].clone());
+                } else {
+                    assert_eq!(Some(payload_json["locator"].clone()), locator);
+                }
+            } else if let Some(mut runtime) = runtime.lock().unwrap().take() {
                 runtime.supervisor.shutdown().unwrap();
             };
         }
+        if let Some(mut runtime) = runtime.lock().unwrap().take() {
+            runtime.supervisor.shutdown().unwrap();
+        };
+        std::env::remove_var("PI_RESUME_STUB_ARGS");
         std::env::set_var("MUNIMENT_PI_ROOT", directory.join("override"));
         assert_eq!(
             boundary.pi_install_root().unwrap(),

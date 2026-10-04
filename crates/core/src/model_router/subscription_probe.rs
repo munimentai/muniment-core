@@ -17,6 +17,78 @@ pub fn record(
     record_progress(root, stage, turn, outcome, error_class, None, None)
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandFailure {
+    pub command: String,
+    pub kind: String,
+}
+
+impl CommandFailure {
+    fn valid(&self) -> bool {
+        matches!(
+            self.command.as_str(),
+            "attach_listener_status"
+                | "local_mode_provider_inventory"
+                | "chat_current_thread"
+                | "chat_thread_open"
+                | "chat_answer_permission"
+                | "subscription_probe_progress"
+                | "subscription_probe_observed"
+                | "subscription_probe_update"
+                | "workspace_read_text"
+                | "workspace_save_text"
+                | "workspace_folders"
+                | "workspace_file_action"
+                | "model_router_settings"
+                | "model_router_update_account"
+                | "model_router_save_routes"
+                | "model_router_test_route"
+                | "project_create"
+                | "project_list"
+                | "project_rename"
+                | "memory_profile_read"
+                | "memory_profile_save"
+                | "agent_save"
+                | "agent_list"
+                | "agent_delete"
+                | "artifact_from_file"
+                | "artifact_read"
+                | "artifact_edit"
+                | "artifact_list"
+                | "browser_view"
+                | "browser_command"
+                | "terminal_start"
+                | "terminal_write"
+                | "terminal_read"
+                | "terminal_close"
+                | "extend_command"
+        ) && matches!(
+            self.kind.as_str(),
+            "busy" | "unavailable" | "unauthorized" | "timeout" | "rejected"
+        )
+    }
+}
+
+pub fn record_command(
+    root: &Path,
+    stage: &str,
+    turn: Option<usize>,
+    outcome: &str,
+    error_class: &str,
+    command: Option<&CommandFailure>,
+) -> Result<(), &'static str> {
+    record_progress_with_detail(
+        root,
+        stage,
+        turn,
+        outcome,
+        error_class,
+        command.map(FailureDetail::Command),
+        None,
+    )
+}
+
 pub fn record_model_save(
     root: &Path,
     provider: &str,
@@ -110,6 +182,41 @@ fn record_progress(
     failure: Option<&TransportFailure>,
     os_error: Option<i32>,
 ) -> Result<(), &'static str> {
+    record_progress_with_detail(
+        root,
+        stage,
+        turn,
+        outcome,
+        error_class,
+        failure.map(FailureDetail::Transport),
+        os_error,
+    )
+}
+
+enum FailureDetail<'a> {
+    Transport(&'a TransportFailure),
+    Command(&'a CommandFailure),
+}
+
+fn record_progress_with_detail(
+    root: &Path,
+    stage: &str,
+    turn: Option<usize>,
+    outcome: &str,
+    error_class: &str,
+    detail: Option<FailureDetail<'_>>,
+    os_error: Option<i32>,
+) -> Result<(), &'static str> {
+    let (failure, command) = match detail {
+        Some(FailureDetail::Transport(failure)) => (Some(failure), None),
+        Some(FailureDetail::Command(command)) => (None, Some(command)),
+        None => (None, None),
+    };
+    if command
+        .is_some_and(|command| !command.valid() || error_class == "none" || stage == "transport")
+    {
+        return Err("The probe command failure is invalid.");
+    }
     if !matches!(
         stage,
         "composer"
@@ -203,6 +310,10 @@ fn record_progress(
         "phase": phase, "stage": stage, "turn": turn, "requested": requested,
         "transport": outcome, "error_class": error_class,
     });
+    if let Some(command) = command {
+        row["command"] = command.command.clone().into();
+        row["command_error_class"] = command.kind.clone().into();
+    }
     if stage == "model-save" {
         row["model_save_rejected"] = match outcome {
             "complete" => false.into(),
@@ -586,6 +697,82 @@ pub fn event_error(event: &serde_json::Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_progress_keeps_only_allowed_names_and_classes() {
+        let directory =
+            std::env::temp_dir().join(format!("subscription-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(
+            directory.join("subscription-probe.json"),
+            r#"{"phase":"chat","models":[{"id":"one"},{"id":"two"},{"id":"three"}]}"#,
+        )
+        .unwrap();
+        for command in ["chat_current_thread", "chat_thread_open"] {
+            for kind in ["busy", "unavailable", "unauthorized", "timeout", "rejected"] {
+                record_command(
+                    &directory,
+                    "reply",
+                    Some(2),
+                    "pending",
+                    "command-failed",
+                    Some(&CommandFailure {
+                        command: command.into(),
+                        kind: kind.into(),
+                    }),
+                )
+                .unwrap();
+            }
+        }
+        let path = directory.join("subscription-probe-progress.jsonl");
+        let before = std::fs::read_to_string(&path).unwrap();
+        for (command, kind) in [
+            ("PRIVATE", "busy"),
+            ("chat_thread_open", "PRIVATE"),
+            ("", "rejected"),
+            ("chat_thread_open\nPRIVATE", "busy"),
+        ] {
+            assert!(record_command(
+                &directory,
+                "reply",
+                Some(2),
+                "pending",
+                "command-failed",
+                Some(&CommandFailure {
+                    command: command.into(),
+                    kind: kind.into()
+                }),
+            )
+            .is_err());
+        }
+        for (stage, error_class) in [("transport", "command-failed"), ("reply", "none")] {
+            assert!(record_command(
+                &directory,
+                stage,
+                Some(2),
+                "pending",
+                error_class,
+                Some(&CommandFailure {
+                    command: "chat_thread_open".into(),
+                    kind: "busy".into()
+                }),
+            )
+            .is_err());
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let rows = before
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 10);
+        assert_eq!(rows[0]["command"], "chat_current_thread");
+        assert_eq!(rows[0]["command_error_class"], "busy");
+        assert_eq!(rows[5]["command"], "chat_thread_open");
+        assert_eq!(rows[5]["turn"], 2);
+        assert_eq!(rows[5]["requested"], "three");
+        assert!(!before.contains("PRIVATE"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     fn assert_artifact(failure: &TransportFailure, kind: &str, host: Option<&str>) {
         let directory =
