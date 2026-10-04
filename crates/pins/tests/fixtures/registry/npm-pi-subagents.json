@@ -1,0 +1,11 @@
+{
+  "name": "pi-subagents",
+  "version": "0.75.0",
+  "peerDependencies": {
+    "typebox": "*",
+    "@earendil-works/pi-ai": ">=0.86.1",
+    "@earendil-works/pi-tui": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

@@ -4,9 +4,25 @@ version = "0.0.1"
 edition = "2021"
 build = "build.rs"
 
+[features]
+# The `muniment-pins` binary that checks, bumps and tests the pins. The library needs none of it.
+cli = ["dep:serde", "dep:serde_json", "dep:sha2", "dep:toml", "dep:ureq"]
+
+[[bin]]
+name = "muniment-pins"
+required-features = ["cli"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+sha2 = { version = "0.10", optional = true }
+toml = { version = "1", optional = true }
+ureq = { version = "2", default-features = false, features = ["json", "tls"], optional = true }
+
 [build-dependencies]
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 
 [dev-dependencies]
+serde_json = "1"
 toml = "1"

@@ -1,0 +1,10 @@
+{
+  "name": "pi-claude-bridge",
+  "version": "0.9.1",
+  "peerDependencies": {
+    "typebox": "*",
+    "@earendil-works/pi-ai": ">=0.86.1",
+    "@earendil-works/pi-tui": ">=0.86.1",
+    "@earendil-works/pi-coding-agent": ">=0.86.1"
+  }
+}

@@ -51,6 +51,9 @@ pub struct ClaudeCode {
     pub version: &'static str,
 }
 
+#[cfg(feature = "cli")]
+pub mod update;
+
 include!(concat!(env!("OUT_DIR"), "/pins.rs"));
 
 const fn same(left: &str, right: &str) -> bool {

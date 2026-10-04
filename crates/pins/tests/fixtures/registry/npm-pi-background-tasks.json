@@ -1,0 +1,10 @@
+{
+  "name": "pi-background-tasks",
+  "version": "2.6.9",
+  "peerDependencies": {
+    "typebox": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-tui": "^0.81.1 || ^0.82.1 || ^0.83.0 || ^0.84.0",
+    "@earendil-works/pi-coding-agent": "^0.81.1 || ^0.82.1 || ^0.83.0 || ^0.84.0"
+  }
+}

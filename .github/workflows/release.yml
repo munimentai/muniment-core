@@ -28,4 +28,4 @@ jobs:
       - name: Tag and publish the next version
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 -B scripts/release.py --revision "$GITHUB_SHA" --publish --asset pins/pins.toml
+        run: python3 -B scripts/release.py --revision "$GITHUB_SHA" --publish --asset pins/pins.toml --asset pins/packages.bun.lock

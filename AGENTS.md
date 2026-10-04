@@ -30,9 +30,10 @@ exceptions. A new edge fails the check. A removed edge needs its exception remov
 `pins/pins.toml` is the one source for the Pi release, its platform assets with
 size and SHA-256, the Pi extension packages, and the Claude Code version.
 `pins/packages.bun.lock` locks the packages. The `muniment-pins` build script
-compiles the file into constants, so a malformed file fails the build. Change a
-pin only in `pins/pins.toml`, then update the expected values in
-`crates/pins/tests/pins.rs`.
+compiles the file into constants, so a malformed file fails the build. Change
+pins with `muniment-pins bump`, which rewrites both files, and run
+`muniment-pins compat` before you commit. The daily `pins-update` workflow does
+both and opens a pull request.
 
 ## Verification loop
 

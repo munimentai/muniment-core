@@ -3,124 +3,60 @@ use muniment_pins::{
     PINS_TOML,
 };
 
-/// The values the desktop compiled in before the pins moved to `pins.toml`.
-const PREVIOUS_ASSETS: [(&str, &str, &str, u64, &str, &str); 10] = [
-    (
-        "0.87.1",
-        "linux-x86_64",
-        "pi-linux-x64.tar.gz",
-        42_120_827,
-        "80d78dd62d50049a006b981d994c61255bcc10e730b0c278d4ea0a755909764c",
-        "pi/pi",
-    ),
-    (
-        "0.87.1",
-        "linux-aarch64",
-        "pi-linux-arm64.tar.gz",
-        42_217_308,
-        "364b4a9f8491450b27a4857d4e3c780dbaf696790821c176a873e860cbbc3b89",
-        "pi/pi",
-    ),
-    (
-        "0.87.1",
-        "macos-aarch64",
-        "pi-darwin-arm64.tar.gz",
-        30_563_988,
-        "4f8d288b78c9768d3a4ac6f61f06cd34394b82ac17d5b42d1e44a437add401b7",
-        "pi/pi",
-    ),
-    (
-        "0.87.1",
-        "macos-x86_64",
-        "pi-darwin-x64.tar.gz",
-        33_033_993,
-        "01d8ee28d7114fec4f4eeedbb7561f790853040e9bfbdeebe79437ab66ea51f5",
-        "pi/pi",
-    ),
-    (
-        "0.87.1",
-        "windows-x86_64",
-        "pi-windows-x64.zip",
-        44_615_504,
-        "aab2ba67baf8ff97a52d05b62d88e9e65a840c6ea8fa1029a28d62d210d4e5fc",
-        "pi/pi.exe",
-    ),
-    (
-        "0.85.1",
-        "linux-x86_64",
-        "pi-linux-x64.tar.gz",
-        42_560_927,
-        "494e498f47d74d21f40b3386f6a5e921a3d49531a169cab55bbdaca0ea1fe25a",
-        "pi/pi",
-    ),
-    (
-        "0.85.1",
-        "linux-aarch64",
-        "pi-linux-arm64.tar.gz",
-        42_628_180,
-        "042d20ae885ee4f3b102815f3280b962c377b2e9fb44de4037908cc530eae4d4",
-        "pi/pi",
-    ),
-    (
-        "0.85.1",
-        "macos-aarch64",
-        "pi-darwin-arm64.tar.gz",
-        31_035_676,
-        "d5f70e3c0cf7398eac239fd0261ee074d98b7ba7f6b43fe3617f052ed5b79d06",
-        "pi/pi",
-    ),
-    (
-        "0.85.1",
-        "macos-x86_64",
-        "pi-darwin-x64.tar.gz",
-        33_544_584,
-        "adb918b845625f184d8bea408d55eacaf21aa87238793c0f5b4f3b9737bce62b",
-        "pi/pi",
-    ),
-    (
-        "0.85.1",
-        "windows-x86_64",
-        "pi-windows-x64.zip",
-        45_009_021,
-        "002fa95b90d521245b9985d8f168caebc237ad56e7e30b319807dee1b2e17e1c",
-        "pi/pi.exe",
-    ),
+/// Each supported platform, its release archive, and the executable inside it.
+const PLATFORMS: [(&str, &str, &str); 5] = [
+    ("linux-x86_64", "pi-linux-x64.tar.gz", "pi/pi"),
+    ("linux-aarch64", "pi-linux-arm64.tar.gz", "pi/pi"),
+    ("macos-aarch64", "pi-darwin-arm64.tar.gz", "pi/pi"),
+    ("macos-x86_64", "pi-darwin-x64.tar.gz", "pi/pi"),
+    ("windows-x86_64", "pi-windows-x64.zip", "pi/pi.exe"),
 ];
 
+fn release(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split('.').map(|part| part.parse::<u64>().ok());
+    let version = (parts.next()??, parts.next()??, parts.next()??);
+    parts.next().is_none().then_some(version)
+}
+
 #[test]
-fn pins_match_the_previously_compiled_values() {
-    assert_eq!(PI.version, "0.87.1");
-    assert_eq!(PI.rollback_version, "0.85.1");
+fn pins_name_a_current_and_older_rollback_release_for_every_platform() {
+    let current = release(PI.version).expect("pi.version is a release version");
+    let rollback = release(PI.rollback_version).expect("pi.rollback_version is a release version");
+    assert!(rollback < current);
     assert_eq!(
         PI.release_base,
-        "https://github.com/earendil-works/pi/releases/download/v0.87.1"
+        format!(
+            "https://github.com/earendil-works/pi/releases/download/v{}",
+            PI.version
+        )
     );
+    let mut expected = Vec::new();
+    for version in [PI.version, PI.rollback_version] {
+        for (platform, archive, executable) in PLATFORMS {
+            expected.push((version, platform, archive, executable));
+        }
+    }
     let assets: Vec<_> = PI
         .assets
         .iter()
-        .map(|a| {
-            (
-                a.version,
-                a.platform,
-                a.archive,
-                a.size,
-                a.sha256,
-                a.executable,
-            )
-        })
+        .map(|a| (a.version, a.platform, a.archive, a.executable))
         .collect();
-    assert_eq!(assets, PREVIOUS_ASSETS);
+    assert_eq!(assets, expected);
+    let names: Vec<_> = package_pairs().iter().map(|(name, _)| *name).collect();
     assert_eq!(
-        package_pairs(),
+        names,
         [
-            ("pi-web-access", "0.31.0"),
-            ("pi-subagents", "0.71.0"),
-            ("pi-background-tasks", "2.5.0"),
-            ("pi-mcp-adapter", "2.37.0"),
-            ("pi-claude-bridge", "0.8.0"),
+            "pi-web-access",
+            "pi-subagents",
+            "pi-background-tasks",
+            "pi-mcp-adapter",
+            "pi-claude-bridge",
         ]
     );
-    assert_eq!(CLAUDE_CODE.version, "2.1.282");
+    for (_, version) in package_pairs() {
+        assert!(release(version).is_some(), "{version}");
+    }
+    assert!(release(CLAUDE_CODE.version).is_some());
 }
 
 #[test]
@@ -172,13 +108,7 @@ fn the_compiled_constants_match_the_embedded_file() {
 
 #[test]
 fn lookups_find_current_and_rollback_assets() {
-    for platform in [
-        "linux-x86_64",
-        "linux-aarch64",
-        "macos-aarch64",
-        "macos-x86_64",
-        "windows-x86_64",
-    ] {
+    for (platform, _, _) in PLATFORMS {
         let current = pi_asset(PI.version, platform);
         let rollback = pi_asset(PI.rollback_version, platform);
         assert_eq!((current.version, current.platform), (PI.version, platform));

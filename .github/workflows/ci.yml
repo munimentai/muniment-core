@@ -36,7 +36,7 @@ jobs:
             target
           key: clippy-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: clippy-${{ runner.os }}-
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked --features muniment-pins/cli -- -D warnings
 
   test:
     strategy:
@@ -57,7 +57,7 @@ jobs:
           key: test-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: test-${{ runner.os }}-
       # Stub child processes starve under default test parallelism.
-      - run: cargo test --workspace --locked --features muniment-core/network-tests -- --test-threads=1
+      - run: cargo test --workspace --locked --features muniment-core/network-tests,muniment-pins/cli -- --test-threads=1
       - if: runner.os == 'Linux'
         run: python3 -B scripts/test_release.py
 

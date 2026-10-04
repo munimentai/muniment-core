@@ -31,6 +31,32 @@ platform with its size and SHA-256, the Pi extension packages, and the Claude
 Code version. `pins/packages.bun.lock` locks the packages. Platform names use
 `<target_os>-<target_arch>`, for example `macos-aarch64`.
 
+The `muniment-pins` binary keeps the pins current:
+
+```sh
+cargo run -p muniment-pins --features cli -- check
+cargo run -p muniment-pins --features cli -- bump --pi latest --packages --claude-code latest
+cargo run -p muniment-pins --features cli -- compat --report compat.json
+```
+
+`check` prints each pin beside its newest release as JSON. `bump` downloads
+every platform archive of the new Pi release and of its rollback, records their
+sizes and SHA-256 digests, and resolves `pins/packages.bun.lock` with the new
+Pi's Bun. `--package NAME@VERSION` pins one package. `compat` runs the
+compatibility suite on the host platform:
+
+- the pinned Pi in JSON and RPC modes against a fake OpenAI-compatible stream
+  server (`scripts/pins/compat/`),
+- a load check for every pinned package and for the tools the system prompt names,
+- muniment-core's sidecar, launch and RPC frame tests against the real Pi,
+- the router against a fake Anthropic upstream with the pinned Claude Code identity,
+- one `pi-claude-bridge` turn through the pinned Claude Code CLI against a fake
+  Anthropic endpoint.
+
+The `pins-update` workflow runs daily. It bumps every pin that passes the suite,
+opens a pull request that merges itself after CI, and opens an issue for each
+pin that fails.
+
 ## Consumers
 
 The desktop depends on a release tag:
