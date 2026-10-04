@@ -6,7 +6,7 @@ static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
 // Keep room for /muniment/attach-v1.sock beneath a 49-byte macOS temp directory.
 pub(crate) fn socket_temp_path() -> PathBuf {
     let sequence = NEXT_PATH
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)
         })
         .expect("The test socket path counter overflowed.");

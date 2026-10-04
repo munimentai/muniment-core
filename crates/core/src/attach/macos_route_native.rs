@@ -600,7 +600,8 @@ int main(int argc, char **argv) {
                 ])
                 .args([
                     "--requirements",
-                    "designated => identifier \"ai.muniment.route-test\"",
+                    // A leading `=` makes codesign read the text, not a file path.
+                    "=designated => identifier \"ai.muniment.route-test\"",
                 ])
                 .arg(&app));
         };
@@ -693,10 +694,11 @@ int main(int argc, char **argv) {
         use std::io::Read;
 
         let (client, mut server, directory) = connected_pair();
-        drop(client);
+        // Darwin rejects socket options once the peer has closed.
         server
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .unwrap();
+        drop(client);
         assert_eq!(server.read(&mut [0]).unwrap(), 0);
         let reader = NativeMacosAttachRouteReader::new(&server);
         assert_eq!(reader.peer_process(), Err(MacosPeerReadError));
