@@ -8,7 +8,7 @@ import subprocess
 import sys
 
 ADR = Path("docs/decisions/0030-public-core-boundary.md")
-MANIFEST = "src-tauri/Cargo.toml"
+MANIFEST = "Cargo.toml"
 CORE = "muniment-core"
 STAY_FEATURE = "desktop-integration"
 
@@ -16,69 +16,51 @@ STAY_FEATURE = "desktop-integration"
 # Remove an entry when its caller stops using that staying module.
 SOURCE_EXCEPTIONS = {
     # Attach needs port-owned process readers and session contracts.
-    ("src-tauri/core/src/attach/connection_route.rs", "browser_control"),
-    ("src-tauri/core/src/attach/desktop_client_admission.rs", "browser_control"),
-    ("src-tauri/core/src/attach/desktop_service.rs", "auth"),
-    ("src-tauri/core/src/attach/desktop_service.rs", "chat_grant"),
-    ("src-tauri/core/src/attach/linux.rs", "browser_control"),
-    ("src-tauri/core/src/attach/mod.rs", "auth"),
-    ("src-tauri/core/src/attach/peer_authority.rs", "browser_control"),
-    ("src-tauri/core/src/attach/presenter_admission.rs", "browser_control"),
-    ("src-tauri/core/src/attach/thread_service.rs", "auth"),
+    ("crates/core/src/attach/connection_route.rs", "browser_control"),
+    ("crates/core/src/attach/desktop_client_admission.rs", "browser_control"),
+    ("crates/core/src/attach/desktop_service.rs", "auth"),
+    ("crates/core/src/attach/desktop_service.rs", "chat_grant"),
+    ("crates/core/src/attach/linux.rs", "browser_control"),
+    ("crates/core/src/attach/mod.rs", "auth"),
+    ("crates/core/src/attach/peer_authority.rs", "browser_control"),
+    ("crates/core/src/attach/presenter_admission.rs", "browser_control"),
+    ("crates/core/src/attach/thread_service.rs", "auth"),
     # Run callers need local launch values separate from cloud grants and tokens.
-    ("src-tauri/core/src/chat_coordinate.rs", "chat_grant"),
-    ("src-tauri/core/src/chat_resume.rs", "auth"),
-    ("src-tauri/core/src/chat_resume.rs", "chat_grant"),
-    ("src-tauri/core/src/pi_launch.rs", "chat_grant"),
-    ("src-tauri/core/src/run_start.rs", "auth"),
-    ("src-tauri/core/src/run_start.rs", "chat_grant"),
+    ("crates/core/src/chat_coordinate.rs", "chat_grant"),
+    ("crates/core/src/chat_resume.rs", "auth"),
+    ("crates/core/src/chat_resume.rs", "chat_grant"),
+    ("crates/core/src/pi_launch.rs", "chat_grant"),
+    ("crates/core/src/run_start.rs", "auth"),
+    ("crates/core/src/run_start.rs", "chat_grant"),
     # Keep all contract tests until port-owned contracts separate these callers.
-    ("src-tauri/core/tests/api_base_url.rs", "auth"),
-    ("src-tauri/core/tests/attach_connection_route.rs", "browser_control"),
-    ("src-tauri/core/tests/attach_desktop_client_admission.rs", "browser_control"),
-    ("src-tauri/core/tests/attach_desktop_client_session.rs", "auth"),
-    ("src-tauri/core/tests/attach_linux_session.rs", "browser_control"),
-    ("src-tauri/core/tests/attach_migration_authority.rs", "browser_control"),
-    ("src-tauri/core/tests/attach_presenter_admission.rs", "browser_control"),
-    ("src-tauri/core/tests/auth_entitlement_snapshot.rs", "auth"),
-    ("src-tauri/core/tests/browser_control_linux_identity.rs", "browser_control"),
-    ("src-tauri/core/tests/browser_control_linux_transport.rs", "browser_control"),
-    ("src-tauri/core/tests/browser_control_windows_identity.rs", "browser_control"),
-    ("src-tauri/core/tests/native_authorization.rs", "auth"),
-    ("src-tauri/core/tests/native_devices.rs", "auth"),
-    ("src-tauri/core/tests/native_registration.rs", "auth"),
-    ("src-tauri/core/tests/native_revocation.rs", "auth"),
-    ("src-tauri/core/tests/native_session.rs", "auth"),
-    ("src-tauri/core/tests/native_sign_in.rs", "auth"),
-    ("src-tauri/core/tests/native_token.rs", "auth"),
-    ("src-tauri/core/tests/oidc_flow.rs", "auth"),
-    ("src-tauri/core/tests/pi_launch.rs", "chat_grant"),
-    ("src-tauri/core/tests/pi_sidecar.rs", "chat_grant"),
-    # The runtime needs the same port-owned session and launch contracts.
-    ("src-tauri/runtime/src/attach_boundaries.rs", "auth"),
-    ("src-tauri/runtime/src/attach_boundaries.rs", "chat_grant"),
-    ("src-tauri/runtime/src/attach_listener.rs", "browser_control"),
-    ("src-tauri/runtime/src/attach_state.rs", "auth"),
-    ("src-tauri/runtime/src/service/run.rs", "auth"),
-    ("src-tauri/runtime/src/service/run.rs", "chat_grant"),
-    ("src-tauri/runtime/src/service/session.rs", "auth"),
-    ("src-tauri/runtime/tests/attach_boundaries.rs", "auth"),
-    ("src-tauri/runtime/tests/attach_desktop_client.rs", "auth"),
-    ("src-tauri/runtime/tests/attach_service.rs", "auth"),
-    ("src-tauri/runtime/tests/common/mod.rs", "auth"),
-    ("src-tauri/runtime/tests/common/mod.rs", "chat_grant"),
-    ("src-tauri/runtime/tests/devices.rs", "auth"),
-    ("src-tauri/runtime/tests/entitlement.rs", "auth"),
-    ("src-tauri/runtime/tests/grant.rs", "chat_grant"),
-    ("src-tauri/runtime/tests/permission.rs", "auth"),
-    ("src-tauri/runtime/tests/run.rs", "auth"),
-    ("src-tauri/runtime/tests/run_boundaries.rs", "auth"),
-    ("src-tauri/runtime/tests/session.rs", "auth"),
-    ("src-tauri/runtime/tests/session_status.rs", "auth"),
-    ("src-tauri/runtime/tests/sign_in.rs", "auth"),
-    ("src-tauri/runtime/tests/sign_out.rs", "auth"),
-    ("src-tauri/runtime/tests/sink.rs", "chat_grant"),
-    ("src-tauri/runtime/tests/steer.rs", "auth"),
+    ("crates/core/tests/api_base_url.rs", "auth"),
+    ("crates/core/tests/attach_connection_route.rs", "browser_control"),
+    ("crates/core/tests/attach_desktop_client_admission.rs", "browser_control"),
+    ("crates/core/tests/attach_desktop_client_session.rs", "auth"),
+    ("crates/core/tests/attach_linux_session.rs", "browser_control"),
+    ("crates/core/tests/attach_migration_authority.rs", "browser_control"),
+    ("crates/core/tests/attach_presenter_admission.rs", "browser_control"),
+    ("crates/core/tests/auth_entitlement_snapshot.rs", "auth"),
+    ("crates/core/tests/browser_control_linux_identity.rs", "browser_control"),
+    ("crates/core/tests/browser_control_linux_transport.rs", "browser_control"),
+    ("crates/core/tests/browser_control_windows_identity.rs", "browser_control"),
+    ("crates/core/tests/native_authorization.rs", "auth"),
+    ("crates/core/tests/native_devices.rs", "auth"),
+    ("crates/core/tests/native_registration.rs", "auth"),
+    ("crates/core/tests/native_revocation.rs", "auth"),
+    ("crates/core/tests/native_session.rs", "auth"),
+    ("crates/core/tests/native_sign_in.rs", "auth"),
+    ("crates/core/tests/native_token.rs", "auth"),
+    ("crates/core/tests/oidc_flow.rs", "auth"),
+    ("crates/core/tests/pi_launch.rs", "chat_grant"),
+    ("crates/core/tests/pi_sidecar.rs", "chat_grant"),
+}
+
+
+# Each reviewed include names one file. The pins include holds only constants
+# that the pins build script generates from pins/pins.toml.
+INCLUDE_EXCEPTIONS = {
+    "crates/pins/src/lib.rs",
 }
 
 
@@ -177,7 +159,7 @@ def source_edges(packages, staying_modules):
                 f"A root glob can hide a staying module in {caller}.")
             require(not re.search(r"\b(?:crate|muniment_core|self)\s+as\s+(?!muniment_core\b)\w+", code),
                     f"A root alias can hide a staying module in {caller}.")
-            require(not re.search(r"\binclude\s*!", code),
+            require(caller in INCLUDE_EXCEPTIONS or not re.search(r"\binclude\s*!", code),
                     f"A source include needs a boundary review in {caller}.")
             for source in re.findall(r'#\[path\s*=\s*"([^"]+)"\]', text):
                 for name in {Path(part).stem for part in Path(source).parts} & staying_modules:
@@ -207,20 +189,18 @@ def check_tree(text, staying_crates, package):
         if fields[0].split()[0] == CORE:
             require(len(fields) == 2, "Cargo omitted the core feature list.")
             features = set(fields[1].strip().split(",")) - {""}
-            # The runtime enables core defaults. Only this named edge may do so.
             allowed = {"keyring"}
-            if package in (CORE, "muniment-runtime"):
+            if package == CORE:
                 allowed.add(STAY_FEATURE)
-            if package == "muniment-runtime":
-                # The installed runtime needs TLS for native-auth cloud calls.
-                allowed.update({"default", "tls"})
             require(features <= allowed,
                     f"{package} enables unexpected core features: {sorted(features - allowed)}")
 
 
 def check_inventory(tables, packages, lib):
-    declared = tables["Port"]["crate"] | tables["Stay"]["crate"]
-    require(declared == set(packages), "The ADR must classify every workspace crate exactly once.")
+    require(tables["Port"]["crate"] == set(packages),
+            "The ADR must list every workspace crate as a port crate.")
+    require(not tables["Stay"]["crate"] & set(packages),
+            "A staying crate must not be a workspace crate.")
     modules = set()
     depth = 0
     tokens = re.findall(r"\b\w+\b|[{}]", rust_code(lib))
@@ -229,6 +209,14 @@ def check_inventory(tables, packages, lib):
             require(index + 1 < len(tokens), "A core module needs a name.")
             modules.add(tokens[index + 1])
         depth += (token == "{") - (token == "}")
+    # A root re-export of a workspace crate, or of one of its modules, keeps
+    # the module path that callers use.
+    crates = "|".join(re.escape(name.replace("-", "_")) for name in packages)
+    for match in re.finditer(
+            rf"^pub use (?:{crates})(?:::(\w+))?(?: as (\w+))?;", lib, re.M):
+        name = match[2] or match[1]
+        require(name, "A crate re-export needs a module name.")
+        modules.add(name)
     declared = tables["Port"]["module"] | tables["Stay"]["module"]
     require(declared == modules, "The ADR must classify every core module exactly once.")
     for module in tables["Stay"]["module"]:
@@ -248,7 +236,7 @@ def main():
         "--locked", "--no-deps", "--format-version", "1"], text=True))
     packages = {p["name"]: p for p in metadata["packages"]
                 if p["id"] in metadata["workspace_members"]}
-    check_inventory(tables, packages, Path("src-tauri/core/src/lib.rs").read_text())
+    check_inventory(tables, packages, Path("crates/core/src/lib.rs").read_text())
     port = [packages[name] for name in sorted(tables["Port"]["crate"])]
     check_edges(source_edges(port, tables["Stay"]["module"]))
     commands = []
@@ -269,7 +257,7 @@ def main():
             command += ["--", "--test-threads=1"]
         commands.append(command)
     print(f"Core boundary allows {len(SOURCE_EXCEPTIONS)} named source edges.", flush=True)
-    print("Core tests enable desktop-integration. The runtime enables core defaults.", flush=True)
+    print("Core tests enable desktop-integration.", flush=True)
     for command in commands:
         subprocess.run(command, check=True)
     print("Core boundary checks passed with the named exceptions.")

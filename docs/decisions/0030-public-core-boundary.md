@@ -4,14 +4,14 @@
 
 ## Decision
 
-The port set belongs in `munimentai/muniment` under FSL, with its tests.
-This boundary moves no source files.
-A staying module may depend on the port set.
+The port set lives in `munimentai/muniment-core` under FSL, with its tests.
+The desktop (`munimentai/muniment`) and the factory consume it.
 Nothing in the port set may depend on a staying module, `muniment-desktop`, or `tauri`.
 The exceptions below block a clean port until their follow-ups remove those edges.
 
 The tables cover every workspace crate and every top-level `muniment-core` module, including platform-gated and private modules.
 Module rows name the module below `muniment-core`.
+A module that `muniment-core` re-exports from another workspace crate keeps its row.
 
 ## Port
 
@@ -19,10 +19,10 @@ Module rows name the module below `muniment-core`.
 | --- | --- | --- |
 | crate | muniment-core | It holds the local runtime logic and storage contracts. |
 | crate | muniment-attach | It defines the reader and companion protocol without the shell. |
+| crate | muniment-atomic-file | It publishes local files atomically. |
 | crate | muniment-code-diff | It defines portable code-diff values and fixtures. |
-| crate | muniment-cli | It gives the local runtime a shell-free client. |
-| crate | muniment-acp | It adapts ACP agents to the runtime. |
-| crate | muniment-runtime | It owns the user-level runtime service. |
+| crate | muniment-pins | It pins Pi, its extension packages, and the Claude Code version. |
+| crate | muniment-router | It selects provider accounts and routes model requests. |
 | module | agent_templates | It imports bounded public agent templates. |
 | module | agents | It stores persistent agents and their conversations. |
 | module | memory_files | It manages user profiles and recoverable memory files. |
@@ -106,8 +106,6 @@ Module rows name the module below `muniment-core`.
 | module | browser_control | It implements browser-control identity and transport. |
 | module | chat_grant | It implements cloud grants and receipts, including the shared local grant value. |
 
-The `browser-control/` extension and the remote-control design study also stay in this repository.
-Neither is a workspace crate or a top-level core module.
 The reader interface stays small and hand-guarded through the attach protocol and journal projections.
 The boundary does not authorize wider reader access or a protocol change.
 
@@ -115,34 +113,30 @@ The boundary does not authorize wider reader access or a protocol change.
 
 `scripts/check-core-boundary.sh` reads both tables and rejects missing, duplicate, or unknown inventory entries.
 It checks every port crate with Cargo's all-target dependency tree, including build and test dependencies.
-It rejects the shell, Tauri packages, and other staying crates without exceptions.
+It rejects the shell, Tauri packages, and other staying crates.
 It tests each port crate without root default features.
 The core test enables `keyring` to include prompt and thread-history tests.
-CI runs this check in the smoke job, including pushes to `main` and changes to this record.
+CI runs this check on every push and pull request.
 
 `desktop-integration` fences the three staying modules and remains a default feature for desktop callers.
 A core build with only `keyring` cannot compile because the port modules still import staying contracts.
 The check explicitly enables `desktop-integration` for the core test as a bounded exception.
-The runtime also enables core default features through its dependency declaration.
-These two feature edges remain exceptions until callers use port-owned contracts.
-The check reports these exceptions rather than claiming a shell-free build also excludes staying modules.
-
-The runtime enables `tls` for HTTPS cloud calls, including native certificates and environment proxies.
+The check reports this exception rather than claiming a shell-free build also excludes staying modules.
 
 The named source edges in `scripts/check-core-boundary.py` form the follow-up list, including test callers.
 Each entry names one source file and one staying module.
 The check rejects new edges and stale entries, so a removed edge requires removal of its exception.
 There are no wildcard exceptions.
 
-1. Extract port-owned session, device, and entitlement values from `auth` for attach and runtime callers.
+1. Extract port-owned session, device, and entitlement values from `auth` for attach callers.
 2. Separate cloud grants and receipts from the local launch value in `chat_grant`.
 3. Extract process readers from `browser_control` for attach identity checks.
 4. Separate staying contract tests from port tests without dropping their coverage.
-5. Remove the runtime default-feature edge and the check's explicit `desktop-integration` feature edge.
+5. Move the staying modules to `munimentai/muniment` and remove the `desktop-integration` feature edge.
 
 The module scan covers all Rust source and test files in port crates, regardless of host platform.
 It reserves staying module identifiers outside staying source files.
 It rejects root glob imports, alternate root aliases, and source includes that could hide an edge.
-A source include needs a boundary review before the port set can use it.
+A source include needs a boundary review. The reviewed includes are named in the check.
 Cargo compilation checks the enabled code paths as well.
-Linux tests do not prove Windows compilation, which remains a desktop CI preflight check.
+Linux and macOS tests do not prove Windows compilation, so CI checks the workspace on Windows.
