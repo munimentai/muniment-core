@@ -76,7 +76,7 @@ jobs:
           key: windows-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: windows-${{ runner.os }}-
       - run: cargo check --workspace --all-targets --locked
-      - run: cargo test --locked --package muniment-atomic-file --package muniment-pins
+      - run: cargo test --locked --package muniment-atomic-file --package muniment-pins --package muniment-attach --features muniment-attach/client
       # The Windows-only core paths: known folders, the runtime task, attach pipes and ACLs.
       - run: >-
           cargo test --locked --package muniment-core
