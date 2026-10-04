@@ -1,6 +1,6 @@
 #![cfg(target_os = "macos")]
 
-#[path = "../../test_support/socket_path.rs"]
+#[path = "../../../test_support/socket_path.rs"]
 mod socket_path;
 use socket_path::socket_temp_path;
 

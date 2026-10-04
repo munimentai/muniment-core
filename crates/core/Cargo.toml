@@ -60,7 +60,6 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 quircs = "0.10"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 resvg = { version = "0.45", default-features = false }
-syn = { version = "2", features = ["full", "visit"] }
 # Tests need to author AES-encrypted entries to exercise the encrypted-entry
 # rejection; the library itself only ever reads and needs no crypto stack.
 zip = { version = "2", default-features = false, features = ["deflate", "aes-crypto"] }

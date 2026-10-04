@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/core", "crates/attach", "crates/code-diff"]
+resolver = "2"

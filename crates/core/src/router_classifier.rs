@@ -404,7 +404,7 @@ mod tests {
             "linux-x86_64"
         };
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../third-party/sherpa-onnx-v1.13.2")
+            .join("../../third-party/sherpa-onnx-v1.13.2")
             .join(platform)
             .join(bundled_library_file_name());
         OnnxRuntimeLibrary::open(&path).unwrap()

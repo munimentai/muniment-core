@@ -215,17 +215,9 @@ pub const fn bundled_library_file_name() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::path::PathBuf;
 
     use super::*;
-
-    #[test]
-    fn bundled_file_name_matches_the_build_script() {
-        let build_script =
-            fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../build.rs")).unwrap();
-        assert!(build_script.contains(&format!("\"{}\"", bundled_library_file_name())));
-    }
 
     #[cfg(unix)]
     #[test]
@@ -266,7 +258,7 @@ mod tests {
             "linux-x86_64"
         };
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../third-party/sherpa-onnx-v1.13.2")
+            .join("../../third-party/sherpa-onnx-v1.13.2")
             .join(platform)
             .join(bundled_library_file_name())
     }

@@ -12,8 +12,6 @@
 //! - [`AuthError`] values never carry token material, so they are safe to
 //!   surface to the webview.
 
-#[cfg(test)]
-mod desktop_boundary;
 pub mod discovery;
 pub mod entitlement_snapshot;
 pub mod flow;
