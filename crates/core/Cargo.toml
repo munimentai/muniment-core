@@ -36,6 +36,7 @@ quick-xml = "0.41"
 qrcode = "0.14"
 muniment-attach = { path = "../attach", features = ["client"] }
 muniment-code-diff = { path = "../code-diff" }
+muniment-pins = { path = "../pins" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 flate2 = "1"
 fs2 = "0.4"

@@ -60,7 +60,10 @@ pub fn prepare(account: &Account, request: &Value, model: &str) -> Result<Reques
                 "anthropic-beta",
                 "claude-code-20250219,oauth-2025-04-20".into(),
             ));
-            headers.push(("user-agent", "claude-cli/2.1.282".into()));
+            headers.push((
+                "user-agent",
+                format!("claude-cli/{}", muniment_pins::CLAUDE_CODE.version),
+            ));
             headers.push(("x-app", "cli".into()));
         }
         if matches!(account.credential, Credential::ApiKey { .. }) {
@@ -514,7 +517,8 @@ mod tests {
         assert!(oauth
             .headers
             .iter()
-            .any(|(name, value)| *name == "user-agent" && value == "claude-cli/2.1.282"));
+            .any(|(name, value)| *name == "user-agent"
+                && *value == format!("claude-cli/{}", muniment_pins::CLAUDE_CODE.version)));
         account.credential = Credential::ApiKey {
             key: "test-key".into(),
         };

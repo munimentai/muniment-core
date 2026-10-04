@@ -1,0 +1,110 @@
+# Pinned runtime dependencies shared by the desktop and the factory.
+# The muniment-pins crate compiles this file into typed constants.
+
+[pi]
+version = "0.87.1"
+rollback_version = "0.85.1"
+release_base = "https://github.com/earendil-works/pi/releases/download/v0.87.1"
+
+[[pi.assets]]
+version = "0.87.1"
+platform = "linux-x86_64"
+archive = "pi-linux-x64.tar.gz"
+size = 42120827
+sha256 = "80d78dd62d50049a006b981d994c61255bcc10e730b0c278d4ea0a755909764c"
+executable = "pi/pi"
+
+[[pi.assets]]
+version = "0.87.1"
+platform = "linux-aarch64"
+archive = "pi-linux-arm64.tar.gz"
+size = 42217308
+sha256 = "364b4a9f8491450b27a4857d4e3c780dbaf696790821c176a873e860cbbc3b89"
+executable = "pi/pi"
+
+[[pi.assets]]
+version = "0.87.1"
+platform = "macos-aarch64"
+archive = "pi-darwin-arm64.tar.gz"
+size = 30563988
+sha256 = "4f8d288b78c9768d3a4ac6f61f06cd34394b82ac17d5b42d1e44a437add401b7"
+executable = "pi/pi"
+
+[[pi.assets]]
+version = "0.87.1"
+platform = "macos-x86_64"
+archive = "pi-darwin-x64.tar.gz"
+size = 33033993
+sha256 = "01d8ee28d7114fec4f4eeedbb7561f790853040e9bfbdeebe79437ab66ea51f5"
+executable = "pi/pi"
+
+[[pi.assets]]
+version = "0.87.1"
+platform = "windows-x86_64"
+archive = "pi-windows-x64.zip"
+size = 44615504
+sha256 = "aab2ba67baf8ff97a52d05b62d88e9e65a840c6ea8fa1029a28d62d210d4e5fc"
+executable = "pi/pi.exe"
+
+[[pi.assets]]
+version = "0.85.1"
+platform = "linux-x86_64"
+archive = "pi-linux-x64.tar.gz"
+size = 42560927
+sha256 = "494e498f47d74d21f40b3386f6a5e921a3d49531a169cab55bbdaca0ea1fe25a"
+executable = "pi/pi"
+
+[[pi.assets]]
+version = "0.85.1"
+platform = "linux-aarch64"
+archive = "pi-linux-arm64.tar.gz"
+size = 42628180
+sha256 = "042d20ae885ee4f3b102815f3280b962c377b2e9fb44de4037908cc530eae4d4"
+executable = "pi/pi"
+
+[[pi.assets]]
+version = "0.85.1"
+platform = "macos-aarch64"
+archive = "pi-darwin-arm64.tar.gz"
+size = 31035676
+sha256 = "d5f70e3c0cf7398eac239fd0261ee074d98b7ba7f6b43fe3617f052ed5b79d06"
+executable = "pi/pi"
+
+[[pi.assets]]
+version = "0.85.1"
+platform = "macos-x86_64"
+archive = "pi-darwin-x64.tar.gz"
+size = 33544584
+sha256 = "adb918b845625f184d8bea408d55eacaf21aa87238793c0f5b4f3b9737bce62b"
+executable = "pi/pi"
+
+[[pi.assets]]
+version = "0.85.1"
+platform = "windows-x86_64"
+archive = "pi-windows-x64.zip"
+size = 45009021
+sha256 = "002fa95b90d521245b9985d8f168caebc237ad56e7e30b319807dee1b2e17e1c"
+executable = "pi/pi.exe"
+
+[[packages]]
+name = "pi-web-access"
+version = "0.31.0"
+
+[[packages]]
+name = "pi-subagents"
+version = "0.71.0"
+
+[[packages]]
+name = "pi-background-tasks"
+version = "2.5.0"
+
+[[packages]]
+name = "pi-mcp-adapter"
+version = "2.37.0"
+
+[[packages]]
+name = "pi-claude-bridge"
+version = "0.8.0"
+
+[claude_code]
+version = "2.1.282"

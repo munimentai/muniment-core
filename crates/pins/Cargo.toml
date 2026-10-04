@@ -1,0 +1,12 @@
+[package]
+name = "muniment-pins"
+version = "0.0.1"
+edition = "2021"
+build = "build.rs"
+
+[build-dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+
+[dev-dependencies]
+toml = "1"

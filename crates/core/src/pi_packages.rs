@@ -13,20 +13,15 @@ use fs2::FileExt;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
-pub const PI_PACKAGES: [(&str, &str); 5] = [
-    ("pi-web-access", "0.31.0"),
-    ("pi-subagents", "0.71.0"),
-    ("pi-background-tasks", "2.5.0"),
-    ("pi-mcp-adapter", "2.37.0"),
-    ("pi-claude-bridge", "0.8.0"),
-];
+pub const PI_PACKAGES: [(&str, &str); muniment_pins::PACKAGE_COUNT] =
+    muniment_pins::package_pairs();
 
-/// The Bun lockfile for exactly `PI_PACKAGES`. It records every transitive
-/// version and its integrity hash, and the install is frozen to it, so no
-/// dependency resolves at install time. Regenerate it with the pinned Pi
-/// executable's Bun from the manifest `package_manifest` writes:
-/// `BUN_BE_BUN=1 pi install --lockfile-only --omit=peer --ignore-scripts`.
-pub const PI_PACKAGES_LOCK: &str = include_str!("pi_packages.bun.lock");
+/// The Bun lockfile for exactly `PI_PACKAGES`, kept at `pins/packages.bun.lock`.
+/// It records every transitive version and its integrity hash, and the install
+/// is frozen to it, so no dependency resolves at install time. Regenerate it
+/// with the pinned Pi executable's Bun from the manifest `package_manifest`
+/// writes: `BUN_BE_BUN=1 pi install --lockfile-only --omit=peer --ignore-scripts`.
+pub const PI_PACKAGES_LOCK: &str = muniment_pins::PACKAGES_LOCK;
 
 /// The manifest the lockfile was resolved from. A frozen install fails when
 /// its dependencies differ from the lockfile's.
