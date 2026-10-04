@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::attach::{RuntimeActivityGuard, RuntimeActivityRegistry};
-use crate::chat_grant::{fetch_receipt, ChatGrant};
+use crate::chat_launch::ChatGrant;
 use crate::chat_resume::ResumeContext;
 use crate::code_diff_effect::apply_code_diff_approval;
 use crate::code_diff_journal::{load_applied_code_diffs, CodeDiffPermissionAnswer};
@@ -441,7 +441,7 @@ pub fn coordinate(
     *runtime = None;
     let startup_timeout = {
         diagnostics.startup_stage("grant_renewal");
-        if let Err(error) = crate::chat_grant::renew_grant_if_needed(&mut grant, || {
+        if let Err(error) = crate::chat_launch::renew_grant_if_needed(&mut grant, || {
             app.renew_chat_grant(&access_token)
         }) {
             let message = error.into_message();
@@ -977,7 +977,7 @@ pub fn coordinate(
                 &run_id,
                 &mut seq,
                 &mut open_effects,
-                &crate::chat_grant::grant_error_message(error.clone()),
+                &crate::chat_launch::grant_error_message(error.clone()),
                 subject.as_deref(),
             );
             break;
@@ -1144,7 +1144,7 @@ pub fn coordinate(
                 let receipt = if grant.is_local() {
                     Ok(local_receipt(run_started.elapsed(), &ledger))
                 } else {
-                    fetch_receipt(&grant.receipt_url, &access_token, &run_id)
+                    app.fetch_receipt(&grant, &access_token, &run_id)
                 };
                 match receipt {
                     Ok(receipt) => {
@@ -1424,7 +1424,7 @@ fn answer_gateway_boundary(
     transport: &PiRpcTransport,
     grant: &mut ChatGrant,
     access_token: &mut String,
-    failure: &mut Option<crate::chat_grant::FetchGrantError>,
+    failure: &mut Option<crate::chat_launch::FetchGrantError>,
     event: &PiChatEvent,
 ) -> bool {
     let PiChatEvent::ExtensionUiRequest(request) = event else {
@@ -1436,13 +1436,13 @@ fn answer_gateway_boundary(
             return false;
         }
         let answer = ExtensionUiAnswer::Editor(
-            json!({"error": crate::chat_grant::grant_error_message(error.clone())}).to_string(),
+            json!({"error": crate::chat_launch::grant_error_message(error.clone())}).to_string(),
         );
         let _ = adapter.answer_extension_ui(transport, request, answer);
         return true;
     }
     let Some((answer, error)) =
-        crate::chat_grant::answer_grant_request(boundaries, grant, access_token, request)
+        crate::chat_launch::answer_grant_request(boundaries, grant, access_token, request)
     else {
         return false;
     };

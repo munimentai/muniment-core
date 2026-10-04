@@ -3,10 +3,10 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
+use crate::account::TokenSet;
 use crate::attach::RuntimeActivityRegistry;
-use crate::auth::TokenSet;
 use crate::chat_coordinate::coordinate;
-use crate::chat_grant::ChatGrant;
+use crate::chat_launch::ChatGrant;
 use crate::journal::reducer::{reduce, RunState, RunStatus};
 use crate::journal::EventEnvelope;
 use crate::memory_index::ModelMemoryCapability;

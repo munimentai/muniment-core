@@ -77,6 +77,18 @@ jobs:
           restore-keys: windows-${{ runner.os }}-
       - run: cargo check --workspace --all-targets --locked
       - run: cargo test --locked --package muniment-atomic-file --package muniment-pins
+      # The Windows-only core paths: known folders, the runtime task, attach pipes and ACLs.
+      - run: >-
+          cargo test --locked --package muniment-core
+          --test windows_known_folders --test windows_sid --test windows_task_service
+          --test attach_windows_listener --test attach_windows_instance_lock
+          --test attach_windows_connect --test attach_windows_credential
+          --test attach_windows_stream --test attach_windows_peer_native
+          --test attach_windows_route_native --test attach_windows_session
+      - run: >-
+          cargo test --locked --package muniment-core --lib --
+          windows_task_service windows_user_diagnostics agents::tests memory_files::tests
+          pi_settings::tests
 
   boundary:
     runs-on: ubuntu-latest

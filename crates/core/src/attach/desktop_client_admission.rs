@@ -9,7 +9,7 @@ use muniment_attach::ProtocolError;
 use super::desktop_admission::{admit_desktop_client_over_stream, write_protocol_error};
 use super::linux::{CompanionProvenance, PeerCredentials};
 use super::{verify_accepted_desktop_peer, Approval, DesktopClientAdmissionError};
-use crate::browser_control::LinuxProcReader;
+use crate::process_reader::LinuxProcReader;
 
 /// Authority and provenance carried by an admitted desktop client session.
 #[derive(Clone, Debug, Eq, PartialEq)]

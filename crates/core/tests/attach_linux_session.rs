@@ -21,11 +21,11 @@ use muniment_core::attach::{
     MAX_JSON_DEPTH, MAX_RUN_STREAM_WINDOW_BYTES, MAX_RUN_STREAM_WINDOW_EVENTS,
     MAX_RUN_STREAM_WINDOW_TEXT_BYTES,
 };
-use muniment_core::browser_control::{LinuxProcReader, ProcReadError};
 use muniment_core::journal::{
     EventEnvelope, EventPayload, Provenance, ReceiptCapabilityProjection, ReceiptProjection,
     RunEventProjection, RunJournal,
 };
+use muniment_core::process_reader::{LinuxProcReader, ProcReadError};
 use serde_json::json;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};

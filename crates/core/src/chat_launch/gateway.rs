@@ -1,6 +1,6 @@
 //! The core exchanges grants at each gateway request boundary.
 
-use crate::chat_grant::{renew_grant_if_needed, ChatGrant, FetchGrantError};
+use crate::chat_launch::{renew_grant_if_needed, ChatGrant, FetchGrantError};
 use crate::pi_launch::PiLaunchBoundaries;
 use crate::sidecar::pi_chat::{ExtensionUiAnswer, ExtensionUiDialog, ExtensionUiRequest};
 use serde::Deserialize;

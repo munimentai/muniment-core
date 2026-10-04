@@ -10,7 +10,7 @@ use muniment_attach::{decode_frame, Hello};
 
 use super::linux::PeerCredentials;
 use super::verify_accepted_desktop_peer;
-use crate::browser_control::LinuxProcReader;
+use crate::process_reader::LinuxProcReader;
 
 const ROUTE_PEEK_CAP: usize = 4 * 1024;
 

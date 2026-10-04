@@ -50,7 +50,7 @@ use super::{
     encode_frame, AuthorizationClock, AuthorizationTokenGenerator, Operation, Protocol,
     ProtocolError, Response, Success,
 };
-use crate::browser_control::LinuxProcReader;
+use crate::process_reader::LinuxProcReader;
 
 const ATTACH_DIRECTORY: &[u8] = b"muniment\0";
 const ENDPOINT_NAME: &str = "attach-v1.sock";
@@ -457,7 +457,7 @@ impl<'a> AttachTransport<'a> {
         // same image when the hello arrives.
         credentials.accept_image = u32::try_from(credentials.pid)
             .ok()
-            .and_then(|pid| super::peer_image(pid, &crate::browser_control::ProcReader));
+            .and_then(|pid| super::peer_image(pid, &crate::process_reader::ProcReader));
         Ok((stream, credentials))
     }
 

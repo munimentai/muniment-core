@@ -13,7 +13,7 @@ use muniment_attach::{
 use super::deadline_io::{is_timeout, read_exact_before, write_all_before};
 use super::linux::PeerCredentials;
 use super::verify_accepted_desktop_peer;
-use crate::browser_control::LinuxProcReader;
+use crate::process_reader::LinuxProcReader;
 
 const DESKTOP_PROTOCOL: VersionRange = VersionRange { min: 1, max: 1 };
 

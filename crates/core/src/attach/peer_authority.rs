@@ -1,7 +1,7 @@
 //! Linux attach peer verification.
 
 use super::linux::PeerCredentials;
-use crate::browser_control::{LinuxProcReader, ProcReader};
+use crate::process_reader::{LinuxProcReader, ProcReader};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::os::unix::ffi::OsStrExt;

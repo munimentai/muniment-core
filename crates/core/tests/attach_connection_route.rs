@@ -12,7 +12,7 @@ use muniment_core::attach::{
     encode_frame, name_attach_connection_route, peer_image, AttachConnectionRoute, Client, Hello,
     Id, Protocol, VersionRange,
 };
-use muniment_core::browser_control::{LinuxProcReader, ProcReadError};
+use muniment_core::process_reader::{LinuxProcReader, ProcReadError};
 
 struct FakeProcReader {
     executable: Option<PathBuf>,

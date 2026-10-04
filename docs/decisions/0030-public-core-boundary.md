@@ -6,8 +6,8 @@
 
 The port set lives in `munimentai/muniment-core` under FSL, with its tests.
 The desktop (`munimentai/muniment`) and the factory consume it.
-Nothing in the port set may depend on a staying module, `muniment-desktop`, or `tauri`.
-The exceptions below block a clean port until their follow-ups remove those edges.
+Nothing in the port set may depend on a staying module, a staying crate, or `tauri`.
+The staying modules live in the desktop's `muniment-desktop-integration` crate.
 
 The tables cover every workspace crate and every top-level `muniment-core` module, including platform-gated and private modules.
 Module rows name the module below `muniment-core`.
@@ -23,6 +23,7 @@ A module that `muniment-core` re-exports from another workspace crate keeps its 
 | crate | muniment-code-diff | It defines portable code-diff values and fixtures. |
 | crate | muniment-pins | It pins Pi, its extension packages, and the Claude Code version. |
 | crate | muniment-router | It selects provider accounts and routes model requests. |
+| module | account | It defines the session, device, pairing, and entitlement values attach carries. |
 | module | agent_templates | It imports bounded public agent templates. |
 | module | agents | It stores persistent agents and their conversations. |
 | module | memory_files | It manages user profiles and recoverable memory files. |
@@ -40,6 +41,7 @@ A module that `muniment-core` re-exports from another workspace crate keeps its 
 | module | attachment | It stores run attachments in CAS. |
 | module | cas | It owns content-addressed storage. |
 | module | chat_coordinate | It coordinates runs and permission policy. |
+| module | chat_launch | It defines the launch value a run starts Pi with and answers gateway requests. |
 | module | chat_profile | It opens profile storage without a window. |
 | module | chat_prompt | It protects prompts through the system keyring. |
 | module | chat_resume | It resumes journaled runs. |
@@ -74,6 +76,7 @@ A module that `muniment-core` re-exports from another workspace crate keeps its 
 | module | pi_launch | It configures Pi launches. |
 | module | pi_packages | It installs Pi extension packages. |
 | module | pi_settings | It writes Pi runtime settings. |
+| module | process_reader | It reads Linux process identities for attach peer checks. |
 | module | provider_models | It discovers and caches models from configured providers. |
 | module | record | It owns the company record: the SQLite graph, the catalogue and the write path. |
 | module | retention_record | It records retention choices. |
@@ -102,40 +105,36 @@ A module that `muniment-core` re-exports from another workspace crate keeps its 
 | Kind | Name | Why |
 | --- | --- | --- |
 | crate | muniment-desktop | It owns the Tauri shell and entitlement projection UI. |
+| crate | muniment-desktop-integration | It holds the desktop-only modules below. |
 | module | auth | It implements cloud-native auth and entitlement contracts. |
 | module | browser_control | It implements browser-control identity and transport. |
-| module | chat_grant | It implements cloud grants and receipts, including the shared local grant value. |
+| module | chat_grant | It issues cloud grants and fetches cloud receipts. |
 
 The reader interface stays small and hand-guarded through the attach protocol and journal projections.
 The boundary does not authorize wider reader access or a protocol change.
 
-## Check and follow-ups
+## Host contracts
+
+The host supplies desktop behavior through port-owned values and traits.
+`account` holds the values that sign-in, device, pairing, and entitlement calls answer.
+`RunAttachBoundaries` carries those calls, and the core only serializes their answers.
+`chat_launch::ChatGrant` is the launch value. `ChatGrant::local` serves local mode.
+`PiLaunchBoundaries` issues replacement cloud grants, inspects the cloud session, and fetches cloud receipts.
+Its defaults answer that the cloud is unavailable, so a host without cloud accounts runs locally.
+`process_reader` reads Linux process identities for attach peers and for the desktop's browser control.
+
+## Check
 
 `scripts/check-core-boundary.sh` reads both tables and rejects missing, duplicate, or unknown inventory entries.
+It rejects a staying module declared in `muniment-core` and a core default feature.
 It checks every port crate with Cargo's all-target dependency tree, including build and test dependencies.
 It rejects the shell, Tauri packages, and other staying crates.
-It tests each port crate without root default features.
+It tests each port crate without default features.
 The core test enables `keyring` to include prompt and thread-history tests.
 CI runs this check on every push and pull request.
 
-`desktop-integration` fences the three staying modules and remains a default feature for desktop callers.
-A core build with only `keyring` cannot compile because the port modules still import staying contracts.
-The check explicitly enables `desktop-integration` for the core test as a bounded exception.
-The check reports this exception rather than claiming a shell-free build also excludes staying modules.
-
-The named source edges in `scripts/check-core-boundary.py` form the follow-up list, including test callers.
-Each entry names one source file and one staying module.
-The check rejects new edges and stale entries, so a removed edge requires removal of its exception.
-There are no wildcard exceptions.
-
-1. Extract port-owned session, device, and entitlement values from `auth` for attach callers.
-2. Separate cloud grants and receipts from the local launch value in `chat_grant`.
-3. Extract process readers from `browser_control` for attach identity checks.
-4. Separate staying contract tests from port tests without dropping their coverage.
-5. Move the staying modules to `munimentai/muniment` and remove the `desktop-integration` feature edge.
-
 The module scan covers all Rust source and test files in port crates, regardless of host platform.
-It reserves staying module identifiers outside staying source files.
+It reserves staying module identifiers in every port source file, and no file has an exception.
 It rejects root glob imports, alternate root aliases, and source includes that could hide an edge.
 A source include needs a boundary review. The reviewed includes are named in the check.
 Cargo compilation checks the enabled code paths as well.

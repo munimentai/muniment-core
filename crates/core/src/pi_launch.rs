@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use crate::chat_grant::ChatGrant;
+use crate::chat_launch::{ChatGrant, FetchGrantError, FetchReceiptError};
+use crate::sidecar::pi_chat::Receipt;
 use crate::sidecar::pi_install::{resolve_current_for, PiArtifactDescriptor, PI_SELECTED_ARTIFACT};
 use crate::sidecar::{pi_sidecar_config, PiSessionLocator, SidecarConfig};
 
@@ -79,30 +80,27 @@ const LOCAL_MODE_ENV_REMOVE: &[&str] = &[
 ];
 
 pub trait PiLaunchBoundaries {
-    fn renew_chat_grant(
-        &self,
-        access_token: &str,
-    ) -> Result<ChatGrant, crate::chat_grant::FetchGrantError> {
-        #[cfg(feature = "keyring")]
-        return crate::chat_grant::renew_native_grant(access_token);
-        #[cfg(not(feature = "keyring"))]
-        {
-            let _ = access_token;
-            Err(crate::chat_grant::FetchGrantError::Unavailable)
-        }
+    /// Issues a replacement cloud grant. Only a host with cloud accounts has one.
+    fn renew_chat_grant(&self, access_token: &str) -> Result<ChatGrant, FetchGrantError> {
+        let _ = access_token;
+        Err(FetchGrantError::Unavailable)
     }
 
-    fn inspect_chat_session(
+    /// Inspects the cloud session and answers the bearer to continue with.
+    fn inspect_chat_session(&self, access_token: &str) -> Result<String, FetchGrantError> {
+        let _ = access_token;
+        Err(FetchGrantError::Unavailable)
+    }
+
+    /// Fetches the receipt for a finished run on a cloud grant.
+    fn fetch_receipt(
         &self,
+        grant: &ChatGrant,
         access_token: &str,
-    ) -> Result<String, crate::chat_grant::FetchGrantError> {
-        #[cfg(feature = "keyring")]
-        return crate::chat_grant::inspect_native_chat_session(access_token);
-        #[cfg(not(feature = "keyring"))]
-        {
-            let _ = access_token;
-            Err(crate::chat_grant::FetchGrantError::Unavailable)
-        }
+        run_id: &str,
+    ) -> Result<Receipt, FetchReceiptError> {
+        let _ = (grant, access_token, run_id);
+        Err(FetchReceiptError)
     }
 
     fn pi_install_root(&self) -> Result<PathBuf, PiLaunchError> {

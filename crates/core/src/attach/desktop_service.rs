@@ -708,7 +708,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
     }
 
     #[cfg(any(unix, target_os = "windows"))]
-    fn session_status(&mut self) -> Result<crate::auth::AuthStatus, ProtocolError> {
+    fn session_status(&mut self) -> Result<crate::account::AuthStatus, ProtocolError> {
         self.boundaries.session_status()
     }
 
@@ -723,7 +723,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         request_id: &Id,
         idempotency_key: &Id,
         companion: CompanionProvenance,
-    ) -> Result<crate::auth::AuthStatus, ProtocolError> {
+    ) -> Result<crate::account::AuthStatus, ProtocolError> {
         let canonical_input = json!({});
         let ledger_request = AttachRequest {
             protocol: Protocol,
@@ -761,7 +761,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         request_id: &Id,
         idempotency_key: &Id,
         companion: CompanionProvenance,
-    ) -> Result<crate::auth::AuthStatus, ProtocolError> {
+    ) -> Result<crate::account::AuthStatus, ProtocolError> {
         let canonical_input = json!({});
         let ledger_request = AttachRequest {
             protocol: Protocol,
@@ -794,12 +794,12 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
     }
 
     #[cfg(any(unix, target_os = "windows"))]
-    fn list_devices(&mut self) -> Result<crate::auth::NativeDeviceList, ProtocolError> {
+    fn list_devices(&mut self) -> Result<crate::account::NativeDeviceList, ProtocolError> {
         self.boundaries.list_devices()
     }
 
     #[cfg(any(unix, target_os = "windows"))]
-    fn pairing_status(&mut self) -> Result<crate::auth::PairingStatusView, ProtocolError> {
+    fn pairing_status(&mut self) -> Result<crate::account::PairingStatusView, ProtocolError> {
         self.boundaries.pairing_status()
     }
 
@@ -809,7 +809,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         request_id: &Id,
         idempotency_key: &Id,
         companion: CompanionProvenance,
-    ) -> Result<crate::auth::PairingChallengeView, ProtocolError> {
+    ) -> Result<crate::account::PairingChallengeView, ProtocolError> {
         let canonical_input = json!({});
         let ledger_request = AttachRequest {
             protocol: Protocol,
@@ -848,7 +848,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         request_id: &Id,
         idempotency_key: &Id,
         companion: CompanionProvenance,
-    ) -> Result<crate::auth::PairingRevokeView, ProtocolError> {
+    ) -> Result<crate::account::PairingRevokeView, ProtocolError> {
         let canonical_input = json!({ "pair_id": pair_id });
         let ledger_request = AttachRequest {
             protocol: Protocol,
@@ -1704,6 +1704,8 @@ mod tests {
     use std::sync::Mutex;
 
     #[cfg(target_os = "linux")]
+    use crate::account::TokenSet;
+    #[cfg(target_os = "linux")]
     use crate::attach::desktop_service_message::RunStreamPage;
     #[cfg(target_os = "linux")]
     use crate::attach::thread_service::ThreadListService;
@@ -1718,9 +1720,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     use crate::attach::{RuntimeActivityGuard, RuntimeActivityRegistry};
     #[cfg(target_os = "linux")]
-    use crate::auth::TokenSet;
-    #[cfg(target_os = "linux")]
-    use crate::chat_grant::ChatGrant;
+    use crate::chat_launch::ChatGrant;
     #[cfg(target_os = "linux")]
     use crate::chat_view::{chat_attachments, ChatAttachment, SelectedFile};
     #[cfg(target_os = "linux")]
@@ -1774,7 +1774,7 @@ mod tests {
                 _: &Id,
                 _: &Id,
                 _: CompanionProvenance,
-            ) -> Result<crate::auth::AuthStatus, ProtocolError> {
+            ) -> Result<crate::account::AuthStatus, ProtocolError> {
                 assert!(matches!(self.0, "ok" | "failure"));
                 std::thread::sleep(REQUEST_TIMEOUT + Duration::from_millis(10));
                 if self.0 == "failure" {
@@ -1782,7 +1782,7 @@ mod tests {
                         "The browser sign-in timed out.",
                     ))
                 } else {
-                    Ok(crate::auth::AuthStatus {
+                    Ok(crate::account::AuthStatus {
                         signed_in: true,
                         subject: Some("secret-subject".into()),
                         expires_at: Some(1900),
@@ -4709,9 +4709,9 @@ mod tests {
 #[cfg(all(test, unix))]
 mod approval_subject_tests {
     use super::*;
+    use crate::account::TokenSet;
     use crate::attach::{ErrorCode, RuntimeActivityGuard, LOCAL_APPROVAL_SUBJECT};
-    use crate::auth::TokenSet;
-    use crate::chat_grant::ChatGrant;
+    use crate::chat_launch::ChatGrant;
     use crate::chat_view::{ChatAttachment, SelectedFile};
     use crate::journal::reducer::ChatProjector;
     use crate::run_start::{ActiveRun, RunStartError, RunStartLaunch};

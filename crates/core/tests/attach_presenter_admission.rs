@@ -12,7 +12,7 @@ use muniment_core::attach::{
     ErrorCode, ErrorEnvelope, Hello, Id, PeerAuthorizedGrant, Protocol, VersionRange, Welcome,
     MAX_FRAME_LENGTH,
 };
-use muniment_core::browser_control::{LinuxProcReader, ProcReadError};
+use muniment_core::process_reader::{LinuxProcReader, ProcReadError};
 
 struct FakeProcReader {
     executable: PathBuf,

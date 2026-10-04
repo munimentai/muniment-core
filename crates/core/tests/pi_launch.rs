@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use muniment_core::chat_grant::{ChatGrant, FetchGrantError};
+use muniment_core::chat_launch::{ChatGrant, FetchGrantError};
 
 #[path = "pi_launch/acquisition_coordinate.rs"]
 mod acquisition_coordinate;
@@ -31,7 +31,7 @@ mod stdin_deadline {
     use muniment_core::attach::RuntimeActivityRegistry;
     use muniment_core::cas::LocalCas;
     use muniment_core::chat_coordinate::coordinate;
-    use muniment_core::chat_grant::ChatGrant;
+    use muniment_core::chat_launch::ChatGrant;
     use muniment_core::journal::RunJournal;
     use muniment_core::memory_runtime::ApplicationMemoryRuntime;
     use muniment_core::pi_launch::{PiLaunchBoundaries, PiLaunchError};

@@ -116,7 +116,7 @@ pub trait ThreadListService {
         Err(ProtocolError::unsupported_operation())
     }
 
-    fn session_status(&mut self) -> Result<crate::auth::AuthStatus, ProtocolError> {
+    fn session_status(&mut self) -> Result<crate::account::AuthStatus, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
 
@@ -124,11 +124,11 @@ pub trait ThreadListService {
         Err(ProtocolError::unsupported_operation())
     }
 
-    fn list_devices(&mut self) -> Result<crate::auth::NativeDeviceList, ProtocolError> {
+    fn list_devices(&mut self) -> Result<crate::account::NativeDeviceList, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
 
-    fn pairing_status(&mut self) -> Result<crate::auth::PairingStatusView, ProtocolError> {
+    fn pairing_status(&mut self) -> Result<crate::account::PairingStatusView, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
 
@@ -137,7 +137,7 @@ pub trait ThreadListService {
         _request_id: &super::Id,
         _idempotency_key: &super::Id,
         _provenance: CompanionProvenance,
-    ) -> Result<crate::auth::PairingChallengeView, ProtocolError> {
+    ) -> Result<crate::account::PairingChallengeView, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
 
@@ -147,7 +147,7 @@ pub trait ThreadListService {
         _request_id: &super::Id,
         _idempotency_key: &super::Id,
         _provenance: CompanionProvenance,
-    ) -> Result<crate::auth::PairingRevokeView, ProtocolError> {
+    ) -> Result<crate::account::PairingRevokeView, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
 
@@ -317,7 +317,7 @@ pub trait ThreadListService {
         _request_id: &super::Id,
         _idempotency_key: &super::Id,
         _provenance: CompanionProvenance,
-    ) -> Result<crate::auth::AuthStatus, ProtocolError> {
+    ) -> Result<crate::account::AuthStatus, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
 
@@ -326,7 +326,7 @@ pub trait ThreadListService {
         _request_id: &super::Id,
         _idempotency_key: &super::Id,
         _provenance: CompanionProvenance,
-    ) -> Result<crate::auth::AuthStatus, ProtocolError> {
+    ) -> Result<crate::account::AuthStatus, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
 

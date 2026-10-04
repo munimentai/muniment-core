@@ -6,6 +6,7 @@ use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::account::TokenSet;
 #[cfg(target_os = "linux")]
 use crate::attach::desktop_service_message::MigrationControlRequest;
 #[cfg(any(unix, target_os = "windows"))]
@@ -18,8 +19,7 @@ use crate::attach::ProtocolError;
 use crate::attach::RuntimeActivityGuard;
 #[cfg(any(unix, target_os = "windows"))]
 use crate::attach::{EntitlementSnapshotResult, Id};
-use crate::auth::TokenSet;
-use crate::chat_grant::ChatGrant;
+use crate::chat_launch::ChatGrant;
 use crate::chat_view::{ChatAttachment, SelectedFile};
 use crate::journal::reducer::ChatProjector;
 use crate::journal::Provenance;
@@ -133,7 +133,7 @@ pub trait RunAttachBoundaries {
         ))
     }
     #[cfg(any(unix, target_os = "windows"))]
-    fn session_status(&self) -> Result<crate::auth::AuthStatus, ProtocolError> {
+    fn session_status(&self) -> Result<crate::account::AuthStatus, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
     #[cfg(any(unix, target_os = "windows"))]
@@ -141,11 +141,17 @@ pub trait RunAttachBoundaries {
         Err(ProtocolError::unsupported_operation())
     }
     #[cfg(any(unix, target_os = "windows"))]
-    fn sign_in(&self, _provenance: Provenance) -> Result<crate::auth::AuthStatus, ProtocolError> {
+    fn sign_in(
+        &self,
+        _provenance: Provenance,
+    ) -> Result<crate::account::AuthStatus, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
     #[cfg(any(unix, target_os = "windows"))]
-    fn sign_out(&self, _provenance: Provenance) -> Result<crate::auth::AuthStatus, ProtocolError> {
+    fn sign_out(
+        &self,
+        _provenance: Provenance,
+    ) -> Result<crate::account::AuthStatus, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
     /// The subject a companion approval binds to now: `LOCAL_APPROVAL_SUBJECT` in
@@ -154,18 +160,18 @@ pub trait RunAttachBoundaries {
         None
     }
     #[cfg(any(unix, target_os = "windows"))]
-    fn list_devices(&self) -> Result<crate::auth::NativeDeviceList, ProtocolError> {
+    fn list_devices(&self) -> Result<crate::account::NativeDeviceList, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
     #[cfg(any(unix, target_os = "windows"))]
-    fn pairing_status(&self) -> Result<crate::auth::PairingStatusView, ProtocolError> {
+    fn pairing_status(&self) -> Result<crate::account::PairingStatusView, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
     #[cfg(any(unix, target_os = "windows"))]
     fn create_pairing_challenge(
         &self,
         _provenance: Provenance,
-    ) -> Result<crate::auth::PairingChallengeView, ProtocolError> {
+    ) -> Result<crate::account::PairingChallengeView, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
     #[cfg(any(unix, target_os = "windows"))]
@@ -173,7 +179,7 @@ pub trait RunAttachBoundaries {
         &self,
         _pair_id: uuid::Uuid,
         _provenance: Provenance,
-    ) -> Result<crate::auth::PairingRevokeView, ProtocolError> {
+    ) -> Result<crate::account::PairingRevokeView, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
     #[cfg(any(unix, target_os = "windows"))]

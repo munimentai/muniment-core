@@ -10,51 +10,10 @@ import sys
 ADR = Path("docs/decisions/0030-public-core-boundary.md")
 MANIFEST = "Cargo.toml"
 CORE = "muniment-core"
-STAY_FEATURE = "desktop-integration"
 
-# Each source exception names a caller that needs a port-owned contract.
-# Remove an entry when its caller stops using that staying module.
-SOURCE_EXCEPTIONS = {
-    # Attach needs port-owned process readers and session contracts.
-    ("crates/core/src/attach/connection_route.rs", "browser_control"),
-    ("crates/core/src/attach/desktop_client_admission.rs", "browser_control"),
-    ("crates/core/src/attach/desktop_service.rs", "auth"),
-    ("crates/core/src/attach/desktop_service.rs", "chat_grant"),
-    ("crates/core/src/attach/linux.rs", "browser_control"),
-    ("crates/core/src/attach/mod.rs", "auth"),
-    ("crates/core/src/attach/peer_authority.rs", "browser_control"),
-    ("crates/core/src/attach/presenter_admission.rs", "browser_control"),
-    ("crates/core/src/attach/thread_service.rs", "auth"),
-    # Run callers need local launch values separate from cloud grants and tokens.
-    ("crates/core/src/chat_coordinate.rs", "chat_grant"),
-    ("crates/core/src/chat_resume.rs", "auth"),
-    ("crates/core/src/chat_resume.rs", "chat_grant"),
-    ("crates/core/src/pi_launch.rs", "chat_grant"),
-    ("crates/core/src/run_start.rs", "auth"),
-    ("crates/core/src/run_start.rs", "chat_grant"),
-    # Keep all contract tests until port-owned contracts separate these callers.
-    ("crates/core/tests/api_base_url.rs", "auth"),
-    ("crates/core/tests/attach_connection_route.rs", "browser_control"),
-    ("crates/core/tests/attach_desktop_client_admission.rs", "browser_control"),
-    ("crates/core/tests/attach_desktop_client_session.rs", "auth"),
-    ("crates/core/tests/attach_linux_session.rs", "browser_control"),
-    ("crates/core/tests/attach_migration_authority.rs", "browser_control"),
-    ("crates/core/tests/attach_presenter_admission.rs", "browser_control"),
-    ("crates/core/tests/auth_entitlement_snapshot.rs", "auth"),
-    ("crates/core/tests/browser_control_linux_identity.rs", "browser_control"),
-    ("crates/core/tests/browser_control_linux_transport.rs", "browser_control"),
-    ("crates/core/tests/browser_control_windows_identity.rs", "browser_control"),
-    ("crates/core/tests/native_authorization.rs", "auth"),
-    ("crates/core/tests/native_devices.rs", "auth"),
-    ("crates/core/tests/native_registration.rs", "auth"),
-    ("crates/core/tests/native_revocation.rs", "auth"),
-    ("crates/core/tests/native_session.rs", "auth"),
-    ("crates/core/tests/native_sign_in.rs", "auth"),
-    ("crates/core/tests/native_token.rs", "auth"),
-    ("crates/core/tests/oidc_flow.rs", "auth"),
-    ("crates/core/tests/pi_launch.rs", "chat_grant"),
-    ("crates/core/tests/pi_sidecar.rs", "chat_grant"),
-}
+# No port crate names a desktop-only module, so no source edge has an exception.
+# The check rejects any edge to a desktop-only module.
+SOURCE_EXCEPTIONS = frozenset()
 
 
 # Each reviewed include names one file. The pins include holds only constants
@@ -138,16 +97,8 @@ def source_edges(packages, staying_modules):
     for package in packages:
         root = Path(package["manifest_path"]).parent
         for path in sorted(root.rglob("*.rs")):
-            relative = path.relative_to(root)
-            parts = relative.parts
-            if (package["name"] == CORE and parts[0] == "src" and len(parts) > 1
-                    and parts[1].removesuffix(".rs") in staying_modules):
-                continue
             text = path.read_text()
             code = rust_code(text)
-            if package["name"] == CORE and relative.as_posix() == "src/lib.rs":
-                for name in staying_modules:
-                    code = re.sub(rf"pub mod {name}\s*;", "", code)
             # Reserve these identifiers even in grouped imports and aliases.
             # This conservative rule also checks inactive platform code.
             names = set(re.findall(r"\b[a-zA-Z_][a-zA-Z_0-9]*\b", code))
@@ -172,7 +123,7 @@ def check_edges(edges):
     stale = SOURCE_EXCEPTIONS - edges
     require(not new and not stale,
             "The source boundary changed.\n"
-            + "".join(f"{path} imports {module} without an exception.\n" for path, module in sorted(new))
+            + "".join(f"{path} names the desktop-only module {module}.\n" for path, module in sorted(new))
             + "".join(f"Remove the stale exception: {path} -> {module}.\n" for path, module in sorted(stale)))
 
 
@@ -190,8 +141,6 @@ def check_tree(text, staying_crates, package):
             require(len(fields) == 2, "Cargo omitted the core feature list.")
             features = set(fields[1].strip().split(",")) - {""}
             allowed = {"keyring"}
-            if package == CORE:
-                allowed.add(STAY_FEATURE)
             require(features <= allowed,
                     f"{package} enables unexpected core features: {sorted(features - allowed)}")
 
@@ -217,15 +166,12 @@ def check_inventory(tables, packages, lib):
         name = match[2] or match[1]
         require(name, "A crate re-export needs a module name.")
         modules.add(name)
-    declared = tables["Port"]["module"] | tables["Stay"]["module"]
-    require(declared == modules, "The ADR must classify every core module exactly once.")
-    for module in tables["Stay"]["module"]:
-        require(re.search(
-            rf'#\[cfg\(feature = "{STAY_FEATURE}"\)\]\s*(?:#\[[^\n]+\]\s*)*pub mod {module};', lib),
-            f"The staying module {module} needs the {STAY_FEATURE} gate.")
-    require(packages[CORE]["features"]["default"] == [STAY_FEATURE]
-            and packages[CORE]["features"][STAY_FEATURE] == [],
-            "The core default feature exception must enable only desktop-integration.")
+    staying = tables["Stay"]["module"] & modules
+    require(not staying, f"Desktop-only modules must not be core modules: {sorted(staying)}")
+    require(tables["Port"]["module"] == modules,
+            "The ADR must list every core module as a port module.")
+    require(not packages[CORE]["features"].get("default"),
+            "The core crate must have no default features.")
 
 
 def main():
@@ -245,8 +191,8 @@ def main():
         args = ["--manifest-path", MANIFEST, "--package", name,
                 "--locked", "--no-default-features"]
         if name == CORE:
-            # Named exception: port callers still need the three staying contracts.
-            args += ["--features", f"keyring,{STAY_FEATURE}"]
+            # Include the prompt and thread-history tests.
+            args += ["--features", "keyring"]
         tree = subprocess.check_output([
             "cargo", "tree", *args, "--target", "all", "--edges", "normal,build,dev",
             "--prefix", "none", "--format", "{p}|{f}"], text=True)
@@ -256,11 +202,10 @@ def main():
             # Match the core CI lane so stub child processes get CPU time.
             command += ["--", "--test-threads=1"]
         commands.append(command)
-    print(f"Core boundary allows {len(SOURCE_EXCEPTIONS)} named source edges.", flush=True)
-    print("Core tests enable desktop-integration.", flush=True)
+    print("Core boundary allows no desktop-only module.", flush=True)
     for command in commands:
         subprocess.run(command, check=True)
-    print("Core boundary checks passed with the named exceptions.")
+    print("Core boundary checks passed.")
 
 
 if __name__ == "__main__":
