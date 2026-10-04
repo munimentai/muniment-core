@@ -19,6 +19,11 @@ pub const DAYS_KEPT: usize = 30;
 /// The first cooldown after a refusal, and the ceiling repeated refusals reach.
 pub const FIRST_COOLDOWN_MS: i64 = 15_000;
 pub const MAX_COOLDOWN_MS: i64 = 15 * 60 * 1000;
+/// The half-life of the recent-turn count the balancer compares. A turn this
+/// old counts half as much as a turn served now.
+pub const RECENT_HALF_LIFE_MS: i64 = 10 * 60 * 1000;
+/// The longest cooldown an upstream's own reset time may set.
+pub const MAX_RETRY_AFTER_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// One day of one account's work.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,12 +56,34 @@ pub struct AccountUsage {
     /// `YYYY-MM-DD` to that day's work, newest day last, [`DAYS_KEPT`] at most.
     #[serde(default)]
     pub days: BTreeMap<String, DayUsage>,
+    /// Turns served lately in thousandths, as of `recent_at_ms`, decayed with
+    /// [`RECENT_HALF_LIFE_MS`]. The balancer compares this count instead of
+    /// the lifetime one, so an account that joins a long-lived pool takes its
+    /// share rather than every turn until its lifetime count catches up.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub recent_milli: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_at_ms: Option<i64>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl AccountUsage {
     /// Whether the balancer may send a turn to this account at `now_ms`.
     pub fn available(&self, now_ms: i64) -> bool {
         self.cooldown_until_ms.is_none_or(|until| now_ms >= until)
+    }
+
+    /// The decayed count of turns served lately, as of `now_ms`.
+    pub fn recent(&self, now_ms: i64) -> f64 {
+        let count = self.recent_milli as f64 / 1000.0;
+        let Some(at) = self.recent_at_ms else {
+            return count;
+        };
+        let age = now_ms.saturating_sub(at).max(0) as f64;
+        count * 0.5_f64.powf(age / RECENT_HALF_LIFE_MS as f64)
     }
 }
 
@@ -103,6 +130,8 @@ impl Ledger {
     ) {
         let usage = self.accounts.entry(id.to_owned()).or_default();
         usage.requests += 1;
+        usage.recent_milli = ((usage.recent(now_ms) + 1.0) * 1000.0).round() as u64;
+        usage.recent_at_ms = Some(now_ms);
         usage.input_tokens += input_tokens;
         usage.output_tokens += output_tokens;
         usage.last_used_ms = Some(now_ms);
@@ -152,6 +181,31 @@ pub fn cooldown_ms(strikes: u32) -> i64 {
 /// balancer should pass it over: rate limits, auth failures and quota.
 pub fn status_cools(status: u16) -> bool {
     matches!(status, 401 | 402 | 403 | 429) || status >= 500
+}
+
+/// The moment a `retry-after` value lets the account back in: a count of
+/// seconds or an HTTP date. A date in the past answers `now_ms`, and no value
+/// reaches past [`MAX_RETRY_AFTER_MS`] from now.
+pub fn retry_after_ms(value: &str, now_ms: i64) -> Option<i64> {
+    let value = value.trim();
+    let until = if let Ok(seconds) = value.parse::<u64>() {
+        now_ms.saturating_add(seconds.min(i64::MAX as u64 / 1000) as i64 * 1000)
+    } else {
+        http_date_ms(value)?
+    };
+    Some(until.clamp(now_ms, now_ms.saturating_add(MAX_RETRY_AFTER_MS)))
+}
+
+/// Unix milliseconds of an HTTP date in any of the three forms RFC 9110 lets
+/// a recipient read.
+fn http_date_ms(value: &str) -> Option<i64> {
+    if let Ok(moment) = chrono::DateTime::parse_from_rfc2822(value) {
+        return Some(moment.timestamp_millis());
+    }
+    ["%A, %d-%b-%y %H:%M:%S GMT", "%a %b %e %H:%M:%S %Y"]
+        .iter()
+        .find_map(|format| chrono::NaiveDateTime::parse_from_str(value, format).ok())
+        .map(|moment| moment.and_utc().timestamp_millis())
 }
 
 fn clip(message: &str) -> String {
@@ -314,5 +368,56 @@ mod tests {
                 .count(),
             240
         );
+    }
+
+    #[test]
+    fn the_recent_count_decays_with_its_half_life() {
+        let mut ledger = Ledger::default();
+        ledger.record_success("a1", "2026-09-17", 0, 1, 1);
+        ledger.record_success("a1", "2026-09-17", 0, 1, 1);
+        let usage = ledger.account("a1").unwrap();
+        assert_eq!(usage.recent(0), 2.0);
+        assert!((usage.recent(RECENT_HALF_LIFE_MS) - 1.0).abs() < 1e-9);
+        assert!(usage.recent(RECENT_HALF_LIFE_MS * 20) < 1e-5);
+        ledger.record_success("a1", "2026-09-17", RECENT_HALF_LIFE_MS, 1, 1);
+        assert_eq!(
+            ledger.account("a1").unwrap().recent(RECENT_HALF_LIFE_MS),
+            2.0
+        );
+        assert_eq!(ledger.account("a1").unwrap().requests, 3);
+        // An old ledger without the count reads as nothing served lately.
+        let old: AccountUsage =
+            serde_json::from_str(r#"{"requests":9,"input_tokens":0,"output_tokens":0,"errors":0}"#)
+                .unwrap();
+        assert_eq!(old.recent(1_000), 0.0);
+    }
+
+    #[test]
+    fn retry_after_reads_seconds_and_http_dates() {
+        let now = 1_445_412_480_000; // Wed, 21 Oct 2015 07:28:00 GMT
+        assert_eq!(retry_after_ms("120", now), Some(now + 120_000));
+        assert_eq!(
+            retry_after_ms("Wed, 21 Oct 2015 07:30:00 GMT", now),
+            Some(now + 120_000)
+        );
+        assert_eq!(
+            retry_after_ms("Wednesday, 21-Oct-15 07:29:00 GMT", now),
+            Some(now + 60_000)
+        );
+        assert_eq!(
+            retry_after_ms("Wed Oct 21 07:28:30 2015", now),
+            Some(now + 30_000)
+        );
+        // A date already past lets the account straight back in.
+        assert_eq!(
+            retry_after_ms("Wed, 21 Oct 2015 07:00:00 GMT", now),
+            Some(now)
+        );
+        assert_eq!(
+            retry_after_ms("99999999", now),
+            Some(now + MAX_RETRY_AFTER_MS)
+        );
+        assert_eq!(retry_after_ms("soon", now), None);
+        assert_eq!(retry_after_ms("-5", now), None);
     }
 }

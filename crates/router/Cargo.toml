@@ -10,19 +10,32 @@ edition = "2021"
 [features]
 # HTTPS uses the OS certificate verifier.
 tls = ["ureq/tls", "ureq/proxy-from-env", "dep:rustls", "dep:rustls-platform-verifier"]
+# The `muniment-router` server binary: the Postgres store, OpenBao secrets,
+# run tokens and metrics. The desktop never enables it.
+server = ["tls", "dep:hmac", "dep:postgres", "dep:signal-hook"]
+
+[[bin]]
+name = "muniment-router"
+required-features = ["server"]
+
+[[bin]]
+name = "muniment-router-shadow"
 
 [dependencies]
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 getrandom = "0.3"
+hmac = { version = "0.12", optional = true }
 muniment-atomic-file = { path = "../atomic-file" }
 muniment-pins = { path = "../pins" }
+postgres = { version = "0.19", optional = true }
 rusqlite = { version = "0.32", features = ["bundled", "hooks", "limits"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 rustls-platform-verifier = { version = "0.7", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.10"
+signal-hook = { version = "0.3", default-features = false, optional = true }
 toml = "1"
 ureq = { version = "2", default-features = false, features = ["json"] }
 url = "2"

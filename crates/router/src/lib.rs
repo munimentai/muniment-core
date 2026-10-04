@@ -26,6 +26,7 @@ mod progress;
 pub mod provider_models;
 pub mod quota;
 pub mod server;
+pub mod store;
 pub mod subscription_probe;
 pub mod transport;
 pub mod usage;

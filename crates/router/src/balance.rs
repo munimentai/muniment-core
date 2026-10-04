@@ -5,9 +5,16 @@
 //! furthest below its weight goes next. A pool of equal weights alternates. A
 //! pool with one account at weight 3 and one at weight 1 sends three turns to
 //! the first for every one to the second.
+//!
+//! The served share is the decayed recent count, not the lifetime one, so an
+//! account added to a long-lived pool takes its share of new turns instead of
+//! every turn until its lifetime count draws level.
 
 use super::config::{Account, RouterConfig};
 use super::usage::Ledger;
+
+/// Shares closer than this are equal.
+const TIE: f64 = 0.01;
 
 /// Why no account could take a turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,24 +110,24 @@ pub fn pick_with_active<'a>(
     }
     // The share each account has served against the share its weight claims.
     // The lowest ratio goes next, and configured order breaks a tie, so a
-    // fresh pool starts at its first account and then alternates.
-    let served: Vec<u64> = ready
-        .iter()
-        .map(|account| {
-            ledger
-                .account(&account.id)
-                .map(|usage| usage.requests)
-                .unwrap_or(0)
-                .saturating_add(u64::from(*active.get(&account.id).unwrap_or(&0)))
-        })
-        .collect();
+    // fresh pool starts at its first account and then alternates. Shares
+    // within a hundredth of a turn tie, so decay between two turns served a
+    // moment apart never reorders them.
+    let share = |account: &Account| {
+        let served = ledger
+            .account(&account.id)
+            .map(|usage| usage.recent(now_ms))
+            .unwrap_or(0.0)
+            + f64::from(*active.get(&account.id).unwrap_or(&0));
+        served / f64::from(account.weight)
+    };
     let mut best = 0;
-    for index in 1..ready.len() {
-        // served[i] / weight[i] < served[best] / weight[best], without division.
-        let left = served[index] as u128 * ready[best].weight as u128;
-        let right = served[best] as u128 * ready[index].weight as u128;
-        if left < right {
+    let mut lowest = share(ready[0]);
+    for (index, account) in ready.iter().enumerate().skip(1) {
+        let candidate = share(account);
+        if candidate < lowest - TIE {
             best = index;
+            lowest = candidate;
         }
     }
     Ok(ready[best])
@@ -279,5 +286,34 @@ mod tests {
         );
         assert_eq!(ledger.account("a1").unwrap().requests, 4);
         assert_eq!(ledger.account("a2").unwrap().requests, 4);
+    }
+
+    #[test]
+    fn an_account_added_to_a_long_lived_pool_takes_its_share_not_every_turn() {
+        use crate::usage::RECENT_HALF_LIFE_MS;
+        let mut config = config(vec![account("a1", "openai", 1)]);
+        let mut ledger = Ledger::default();
+        // A thousand turns over the past day.
+        let now = 24 * 60 * 60 * 1000;
+        for turn in 0..1000 {
+            ledger.record_success("a1", "2026-09-17", turn * 86_400, 1, 1);
+        }
+        config.accounts.push(account("a2", "openai", 1));
+        let mut picked = Vec::new();
+        for turn in 0..40 {
+            let at = now + turn * 1_000;
+            let id = pick(&config, &ledger, "openai", "gpt", at)
+                .unwrap()
+                .id
+                .clone();
+            ledger.record_success(&id, "2026-09-18", at, 1, 1);
+            picked.push(id);
+        }
+        let old = picked.iter().filter(|id| *id == "a1").count();
+        // Lifetime counts would send all forty to a2. The recent count lets
+        // a2 catch up within a few turns and then the pool alternates.
+        assert!(old >= 15, "a1 served {old} of 40");
+        assert!(picked[..2].iter().all(|id| id == "a2"));
+        assert!(ledger.account("a1").unwrap().recent(now) < RECENT_HALF_LIFE_MS as f64);
     }
 }

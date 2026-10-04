@@ -489,6 +489,8 @@ fn candidates(
             a.id.clone(),
             usage::AccountUsage {
                 requests: served,
+                // Undecayed: the shadow balances on its whole job history.
+                recent_milli: served.saturating_mul(1000),
                 ..Default::default()
             },
         );

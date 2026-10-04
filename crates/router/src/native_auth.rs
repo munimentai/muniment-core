@@ -782,29 +782,6 @@ fn inference_refresh(
     })
 }
 
-struct RefreshWriteLock(std::path::PathBuf);
-impl Drop for RefreshWriteLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir(&self.0);
-    }
-}
-fn refresh_write_lock(agent: &std::path::Path) -> Result<RefreshWriteLock, String> {
-    let path = agent.join(format!("{}.lock", super::config::CONFIG_FILE));
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        match std::fs::create_dir(&path) {
-            Ok(()) => return Ok(RefreshWriteLock(path)),
-            Err(error)
-                if error.kind() == std::io::ErrorKind::AlreadyExists
-                    && std::time::Instant::now() < deadline =>
-            {
-                std::thread::sleep(Duration::from_millis(20))
-            }
-            Err(_) => return Err("Cannot lock account settings for token refresh.".into()),
-        }
-    }
-}
-
 /// Serializes token rotation across concurrent turns and merges only that credential.
 /// Always reload after the network call so unrelated settings survive a refresh.
 pub fn refresh_account(
@@ -813,9 +790,23 @@ pub fn refresh_account(
     now_ms: i64,
     timeout: Duration,
 ) -> Result<super::config::Account, String> {
+    refresh_account_in(&super::store::Backend::files(agent), id, now_ms, timeout)
+}
+
+/// [`refresh_account`] against any backend. The refreshed credential goes back
+/// to the backend's secret source, so a refresh survives a restart, unless
+/// another holder rotated the credential first, in which case theirs wins.
+pub fn refresh_account_in(
+    backend: &super::store::Backend,
+    id: &str,
+    now_ms: i64,
+    timeout: Duration,
+) -> Result<super::config::Account, String> {
     static REFRESH: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _held = REFRESH.lock().unwrap_or_else(|error| error.into_inner());
-    let mut config = super::config::load(agent).map_err(|_| "Cannot read account settings.")?;
+    let config = backend
+        .config()
+        .map_err(|_| "Cannot read account settings.")?;
     let mut account = config
         .accounts
         .iter()
@@ -824,19 +815,8 @@ pub fn refresh_account(
         .ok_or("The account was removed.")?;
     if let Some(result) = refresh_if_expiring(&account.credential, now_ms, timeout) {
         let original = account.credential.clone();
-        account.credential = result?;
-        let _file_lock = refresh_write_lock(agent)?;
-        config = super::config::load(agent).map_err(|_| "Cannot read account settings.")?;
-        let entry = config
-            .accounts
-            .iter_mut()
-            .find(|entry| entry.id == id)
-            .ok_or("The account was removed.")?;
-        if entry.credential != original {
-            return Ok(entry.clone());
-        }
-        entry.credential = account.credential.clone();
-        super::config::save(agent, &config).map_err(|_| "Cannot save the refreshed account.")?;
+        let fresh = result?;
+        account.credential = backend.secrets.swap(id, &original, &fresh)?;
     }
     Ok(account)
 }

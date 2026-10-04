@@ -29,6 +29,10 @@ pub struct Settings {
     pub minimum_residence: u32,
     pub failure_threshold: u32,
     pub horizon: u32,
+    /// Measured success rates by `family/model`, set per turn by a host that
+    /// records outcomes. A measured rate replaces a configured one.
+    #[serde(skip)]
+    pub measured: BTreeMap<String, f64>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -41,6 +45,7 @@ impl Default for Settings {
             minimum_residence: 3,
             failure_threshold: 2,
             horizon: 3,
+            measured: BTreeMap::new(),
         }
     }
 }
@@ -137,10 +142,24 @@ impl Model {
 }
 pub fn model(config: &RouterConfig, route: &Route) -> Option<Model> {
     let key = format!("{}/{}", route.family, route.model);
-    if let Some(model) = config.policy.models.get(&key) {
+    let mut model = described(config, route, &key)?;
+    if let Some(rate) = config
+        .policy
+        .measured
+        .get(&key)
+        .filter(|rate| rate.is_finite() && (0.0..=1.0).contains(*rate))
+    {
+        model.success_rate = Some(*rate);
+    }
+    Some(model)
+}
+
+/// The model as configuration, discovery or the catalog describe it.
+fn described(config: &RouterConfig, route: &Route, key: &str) -> Option<Model> {
+    if let Some(model) = config.policy.models.get(key) {
         return model.valid().then(|| model.clone());
     }
-    if let Some(model) = config.routing_models.get(&key) {
+    if let Some(model) = config.routing_models.get(key) {
         return model.valid().then(|| model.clone());
     }
     let entry = model_catalog::entry(&route.family, &route.model)?;
@@ -563,6 +582,11 @@ impl Sessions {
             .unwrap_or_default()
     }
     pub fn save(&mut self, agent: &Path, now: i64) -> std::io::Result<()> {
+        self.prune(now);
+        super::config::write_private(&agent.join(FILE), &serde_json::to_vec(self)?)
+    }
+    /// Drops sessions past their lifetime, then the oldest past the limit.
+    pub fn prune(&mut self, now: i64) {
         self.entries
             .retain(|_, s| now.saturating_sub(s.updated_ms) < TTL);
         while self.entries.len() > LIMIT {
@@ -574,7 +598,6 @@ impl Sessions {
                 .unwrap();
             self.entries.remove(&oldest);
         }
-        super::config::write_private(&agent.join(FILE), &serde_json::to_vec(self)?)
     }
 }
 /// Bounded classifier context includes the goal and recent observations, rather
@@ -672,4 +695,68 @@ fn unreported_tools_do_not_block_a_direct_chat_but_explicit_denial_does() {
     assert!(!features.fits(&model));
     model.tools = true;
     assert!(features.fits(&model));
+}
+
+#[test]
+fn measured_success_gates_the_cost_path_at_a_task_boundary() {
+    use super::config::{Account, Credential};
+    let account = |family: &str| Account {
+        id: family.into(),
+        family: family.into(),
+        label: family.into(),
+        credential: Credential::ApiKey { key: "sk".into() },
+        base_url: None,
+        models: Vec::new(),
+        enabled: true,
+        weight: 1,
+    };
+    let mut config = RouterConfig {
+        enabled: true,
+        accounts: vec![account("openai"), account("anthropic")],
+        ..RouterConfig::default()
+    };
+    let routes = super::options(&config);
+    let features = Features::read(&json!({"messages":[{"role":"user","content":"Fix the test"}]}));
+    let choose_deep = |config: &RouterConfig| {
+        choose(
+            config,
+            &routes,
+            Proposal {
+                route: "openai/gpt-5.6-sol",
+                confident: true,
+            },
+            &Session::default(),
+            &features,
+            true,
+            0,
+        )
+        .unwrap()
+        .0
+        .key
+    };
+    // With no measurement the cheapest deep model takes the task.
+    assert_eq!(choose_deep(&config), "openai/gpt-5.6-sol");
+    // A measured rate under the floor takes it out of the running, and the
+    // next cheapest capable model takes the task.
+    config
+        .policy
+        .measured
+        .insert("openai/gpt-5.6-sol".into(), 0.5);
+    assert_eq!(choose_deep(&config), "anthropic/claude-opus-5");
+    let route = routes
+        .iter()
+        .find(|route| route.key == "openai/gpt-5.6-sol")
+        .unwrap();
+    assert_eq!(model(&config, route).unwrap().success_rate, Some(0.5));
+    // A measured rate replaces a configured one.
+    config.policy.models.insert(
+        "openai/gpt-5.6-sol".into(),
+        Model {
+            success_rate: Some(0.99),
+            ..model(&RouterConfig::default(), route).unwrap()
+        },
+    );
+    assert_eq!(model(&config, route).unwrap().success_rate, Some(0.5));
+    config.policy.measured.clear();
+    assert_eq!(model(&config, route).unwrap().success_rate, Some(0.99));
 }

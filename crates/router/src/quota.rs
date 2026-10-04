@@ -900,6 +900,78 @@ pub fn probe(account: &Account, now_ms: i64, timeout: Duration) -> Option<Quota>
     }
 }
 
+/// What the `anthropic-ratelimit-unified-*` headers of one answer say: the
+/// windows the subscription meters, and whether it refused the account.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnifiedLimit {
+    /// The upstream refused this account until `reset_ms`.
+    pub rejected: bool,
+    /// Unix milliseconds the refusal lifts, when the upstream says.
+    pub reset_ms: Option<i64>,
+    pub windows: Vec<Window>,
+}
+
+/// Reads the unified rate-limit headers Anthropic sends with a subscription
+/// answer. `header` looks one header up by its lowercase name. Answers none
+/// when the answer carries no unified header.
+pub fn parse_anthropic_unified(header: impl Fn(&str) -> Option<String>) -> Option<UnifiedLimit> {
+    const PREFIX: &str = "anthropic-ratelimit-unified-";
+    let get = |name: &str| {
+        header(&format!("{PREFIX}{name}"))
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
+    // A reset is Unix seconds, or an RFC 3339 instant from older answers.
+    let reset = |name: &str| {
+        let value = get(name)?;
+        value
+            .parse::<f64>()
+            .ok()
+            .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+            .map(|seconds| (seconds * 1000.0) as i64)
+            .or_else(|| rfc3339_ms(Some(&Value::String(value))))
+    };
+    let mut windows = Vec::new();
+    for (name, kind) in [("5h", WindowKind::FiveHour), ("7d", WindowKind::Weekly)] {
+        let status = get(&format!("{name}-status"));
+        let utilization = get(&format!("{name}-utilization"))
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0);
+        if status.is_none() && utilization.is_none() {
+            continue;
+        }
+        let limit_reached = status.as_deref() == Some("rejected");
+        windows.push(Window {
+            kind,
+            scope: String::new(),
+            // The header carries a fraction of the window.
+            used_percent: utilization
+                .map(|fraction| (fraction * 100.0).min(100.0))
+                .unwrap_or(if limit_reached { 100.0 } else { 0.0 }),
+            resets_at_ms: reset(&format!("{name}-reset")),
+            limit_reached,
+        });
+    }
+    let status = get("status");
+    if status.is_none() && windows.is_empty() {
+        return None;
+    }
+    let rejected =
+        status.as_deref() == Some("rejected") || windows.iter().any(|window| window.limit_reached);
+    let reset_ms = reset("reset").or_else(|| {
+        windows
+            .iter()
+            .filter(|window| window.limit_reached)
+            .filter_map(|window| window.resets_at_ms)
+            .max()
+    });
+    Some(UnifiedLimit {
+        rejected,
+        reset_ms,
+        windows,
+    })
+}
+
 /// Every account's last probe, keyed by account id.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct QuotaStore {
@@ -1226,5 +1298,54 @@ mod tests {
         assert_eq!(load(&agent), store);
         fs::write(quota_path(&agent), b"nope").unwrap();
         assert_eq!(load(&agent), QuotaStore::default());
+    }
+
+    #[test]
+    fn unified_rate_limit_headers_become_windows_and_a_reset() {
+        let headers = [
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-reset", "1789003600"),
+            ("anthropic-ratelimit-unified-5h-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-utilization", "1.02"),
+            ("anthropic-ratelimit-unified-5h-reset", "1789003600"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.41"),
+            ("anthropic-ratelimit-unified-7d-reset", "1789400000"),
+        ];
+        let lookup = |name: &str| {
+            headers
+                .iter()
+                .find(|(known, _)| *known == name)
+                .map(|(_, value)| value.to_string())
+        };
+        let limit = parse_anthropic_unified(lookup).unwrap();
+        assert!(limit.rejected);
+        assert_eq!(limit.reset_ms, Some(1_789_003_600_000));
+        assert_eq!(limit.windows.len(), 2);
+        assert_eq!(limit.windows[0].kind, WindowKind::FiveHour);
+        assert_eq!(limit.windows[0].used_percent, 100.0);
+        assert!(limit.windows[0].limit_reached);
+        assert_eq!(limit.windows[1].kind, WindowKind::Weekly);
+        assert!((limit.windows[1].used_percent - 41.0).abs() < 1e-9);
+        assert_eq!(limit.windows[1].resets_at_ms, Some(1_789_400_000_000));
+        assert!(!limit.windows[1].limit_reached);
+
+        // A warning is not a refusal, and the reset falls back to the
+        // refused window's own.
+        let allowed = parse_anthropic_unified(|name| {
+            (name == "anthropic-ratelimit-unified-status").then(|| "allowed_warning".into())
+        })
+        .unwrap();
+        assert!(!allowed.rejected);
+        assert_eq!(allowed.reset_ms, None);
+        let window_only = parse_anthropic_unified(|name| match name {
+            "anthropic-ratelimit-unified-7d-status" => Some("rejected".into()),
+            "anthropic-ratelimit-unified-7d-reset" => Some("2026-09-20T00:00:00Z".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert!(window_only.rejected);
+        assert_eq!(window_only.reset_ms, Some(1_789_862_400_000));
+        assert_eq!(parse_anthropic_unified(|_| None), None);
     }
 }

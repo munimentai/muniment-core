@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::config::{self, RouterConfig};
+use super::store::Backend;
 use super::usage::{self, Ledger};
 use super::{balance, plan, served_models, wire, ResolveError};
 use super::{native_auth, transport};
@@ -114,18 +115,68 @@ impl Drop for Handle {
     }
 }
 
-/// What the router keeps between turns: where its files are, and the counters
-/// it has not yet written down.
-struct State {
+/// What the router keeps between turns: where its records are, and the
+/// counters it has not yet written down.
+pub(crate) struct State {
     sessions: Mutex<super::policy::Sessions>,
     active_sessions: Mutex<std::collections::HashSet<String>>,
     progress: super::progress::Progress,
-    agent: PathBuf,
+    pub(crate) backend: Backend,
+    /// The desktop agent directory, where the subscription probe writes its
+    /// receipts. A server host has none.
+    agent: Option<PathBuf>,
     ledger: Mutex<Ledger>,
     /// The turns in flight, counted up while an upstream call is open.
-    active: Active,
+    pub(crate) active: Active,
     /// The clock, so a test can hold time still.
-    now_ms: fn() -> i64,
+    pub(crate) now_ms: fn() -> i64,
+}
+
+/// What a host learns about a turn and may refuse, beyond what the desktop
+/// router does. The desktop runs with [`NoHooks`].
+pub(crate) trait Hooks {
+    /// Measured success rates by `family/model` for this turn's scope.
+    fn success_rates(&self) -> BTreeMap<String, f64> {
+        BTreeMap::new()
+    }
+    /// The route policy chose for the turn, and why.
+    fn decided(&self, _route: &config::Route, _reason: &str) {}
+    /// Called before each upstream attempt with the attempt's uncached cost
+    /// estimate. An error answers the client with that status and body and
+    /// ends the turn.
+    fn admit(
+        &self,
+        _route: &config::Route,
+        _account: &config::Account,
+        _estimate_usd: f64,
+    ) -> Result<(), (u16, Value)> {
+        Ok(())
+    }
+    /// Called once for every admitted attempt, however it ended.
+    fn settle(&self, _attempt: &Attempt) {}
+}
+
+/// The desktop's hooks: no refusal and nothing recorded.
+pub(crate) struct NoHooks;
+impl Hooks for NoHooks {}
+
+/// How one admitted upstream attempt ended.
+#[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
+pub(crate) struct Attempt {
+    pub route: config::Route,
+    pub account: String,
+    pub estimate_usd: f64,
+    /// What the attempt cost: the priced tokens of a completed answer, the
+    /// estimate for an answer that broke off after output began, and zero for
+    /// an attempt that produced nothing.
+    pub cost_usd: f64,
+    pub tokens: Option<wire::Tokens>,
+    /// Whether any answer reached the client.
+    pub served: bool,
+    /// The upstream status of a refused attempt.
+    pub status: Option<u16>,
+    pub elapsed_ms: u64,
 }
 
 /// One turn's place in the in-flight count. It clears when the turn ends,
@@ -206,8 +257,8 @@ impl State {
             if let Ok(account) =
                 balance::pick(&config, &self.ledger(), family, model, (self.now_ms)())
             {
-                if let Err(error) = native_auth::refresh_account(
-                    &self.agent,
+                if let Err(error) = native_auth::refresh_account_in(
+                    &self.backend,
                     &account.id,
                     (self.now_ms)(),
                     REFRESH_TIMEOUT,
@@ -298,7 +349,7 @@ impl State {
         // Respect known account-wide exhaustion until its reset. Unknown or
         // stale windows do not disable an account indefinitely.
         let mut exhausted = std::collections::BTreeSet::new();
-        for (id, quota) in super::quota::load(&self.agent).accounts {
+        for (id, quota) in self.backend.store.load_quotas().accounts {
             let reset = quota
                 .windows
                 .iter()
@@ -401,11 +452,17 @@ impl State {
                 }
             }
         }
-        // A warm scope wins equal-load ties. Served shares and reservations still
-        // distribute requests across like accounts serving this model.
+        // The account that served this thread last holds its prompt cache, so
+        // it keeps the thread while it is healthy and under quota. Accounts
+        // that share its verified cache scope share that preference. Served
+        // shares and reservations distribute everything else.
         deliveries.sort_by_key(|(account, _)| {
             super::policy::scope(config, &account.id) != session.cache_scope
         });
+        let warm = deliveries
+            .iter()
+            .any(|(account, _)| account.id == session.account)
+            .then_some(session.account.as_str());
         let mut pool = config.clone();
         pool.accounts = deliveries
             .iter()
@@ -416,7 +473,7 @@ impl State {
                 a
             })
             .collect();
-        let (picked, guard) = self.reserve_preferred(&pool, "openai", "delivery", None)?;
+        let (picked, guard) = self.reserve_preferred(&pool, "openai", "delivery", warm)?;
         let (account, route) = deliveries
             .into_iter()
             .find(|(a, _)| a.id == picked.id)
@@ -424,8 +481,21 @@ impl State {
         Ok((account, route, guard))
     }
 
-    fn config(&self) -> RouterConfig {
-        config::load(&self.agent).unwrap_or_default()
+    pub(crate) fn new(backend: Backend, agent: Option<PathBuf>, clock: fn() -> i64) -> Self {
+        Self {
+            sessions: Mutex::new(backend.store.load_sessions()),
+            active_sessions: Default::default(),
+            progress: Default::default(),
+            ledger: Mutex::new(backend.store.load_ledger()),
+            backend,
+            agent,
+            active: Arc::new(Mutex::new(BTreeMap::new())),
+            now_ms: clock,
+        }
+    }
+
+    pub(crate) fn config(&self) -> RouterConfig {
+        self.backend.config().unwrap_or_default()
     }
 
     fn record_success(&self, account: &str, tokens: wire::Tokens) {
@@ -433,7 +503,7 @@ impl State {
         if let Ok(mut ledger) = self.ledger.lock() {
             ledger.record_success(account, &day(now), now, tokens.input, tokens.output);
             ledger.record_cache(account, tokens);
-            let _ = usage::save(&self.agent, &ledger);
+            let _ = self.backend.store.save_ledger(&ledger, account);
         }
     }
 
@@ -441,11 +511,41 @@ impl State {
         let now = (self.now_ms)();
         if let Ok(mut ledger) = self.ledger.lock() {
             ledger.record_error(account, &day(now), now, message, cools);
-            let _ = usage::save(&self.agent, &ledger);
+            let _ = self.backend.store.save_ledger(&ledger, account);
         }
     }
 
-    fn ledger(&self) -> Ledger {
+    /// Keeps the account out of the pool until `until_ms`, when that is later
+    /// than the cooldown it already has.
+    fn hold_until(&self, account: &str, until_ms: i64) {
+        let mut ledger = self
+            .ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = ledger.accounts.get_mut(account) {
+            entry.cooldown_until_ms = Some(entry.cooldown_until_ms.unwrap_or(0).max(until_ms));
+        }
+        let _ = self.backend.store.save_ledger(&ledger, account);
+    }
+
+    /// Writes the subscription probe's transport receipt, on the desktop only.
+    fn probe(&self, model: &str, outcome: &str, error_class: &str) {
+        if let Some(agent) = &self.agent {
+            super::subscription_probe::transport(agent, model, outcome, error_class);
+        }
+    }
+
+    fn save_session(&self, id: &str, session: &super::policy::Session) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.entries.insert(id.into(), session.clone());
+            let _ = self
+                .backend
+                .store
+                .save_sessions(&mut sessions, id, (self.now_ms)());
+        }
+    }
+
+    pub(crate) fn ledger(&self) -> Ledger {
         self.ledger
             .lock()
             .map(|ledger| ledger.clone())
@@ -483,16 +583,12 @@ fn start_with_clock(agent: PathBuf, clock: fn() -> i64) -> io::Result<Handle> {
         token: token(),
     };
     write_endpoint(&agent, &endpoint)?;
-    let active: Active = Arc::new(Mutex::new(BTreeMap::new()));
-    let state = Arc::new(State {
-        sessions: Mutex::new(super::policy::Sessions::load(&agent)),
-        active_sessions: Default::default(),
-        progress: Default::default(),
-        ledger: Mutex::new(usage::load(&agent)),
-        agent,
-        active: Arc::clone(&active),
-        now_ms: clock,
-    });
+    let state = Arc::new(State::new(
+        Backend::files(&agent),
+        Some(agent.clone()),
+        clock,
+    ));
+    let active = Arc::clone(&state.active);
     let stop = Arc::new(AtomicBool::new(false));
     let accept_stop = Arc::clone(&stop);
     let accept_token = endpoint.token.clone();
@@ -524,14 +620,14 @@ fn start_with_clock(agent: PathBuf, clock: fn() -> i64) -> io::Result<Handle> {
 }
 
 /// One request's head: the method, the target and the headers.
-struct Head {
-    method: String,
-    target: String,
-    headers: Vec<(String, String)>,
+pub(crate) struct Head {
+    pub(crate) method: String,
+    pub(crate) target: String,
+    pub(crate) headers: Vec<(String, String)>,
 }
 
 impl Head {
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
             .find(|(known, _)| known == name)
@@ -539,12 +635,12 @@ impl Head {
     }
 
     /// The path with any query string removed.
-    fn path(&self) -> &str {
+    pub(crate) fn path(&self) -> &str {
         self.target.split('?').next().unwrap_or(&self.target)
     }
 }
 
-fn read_head(reader: &mut BufReader<TcpStream>) -> Option<Head> {
+pub(crate) fn read_head(reader: &mut BufReader<TcpStream>) -> Option<Head> {
     let mut line = String::new();
     let mut read = 0;
     reader.read_line(&mut line).ok()?;
@@ -577,7 +673,7 @@ fn read_head(reader: &mut BufReader<TcpStream>) -> Option<Head> {
     })
 }
 
-fn read_body(reader: &mut BufReader<TcpStream>, head: &Head) -> Option<Vec<u8>> {
+pub(crate) fn read_body(reader: &mut BufReader<TcpStream>, head: &Head) -> Option<Vec<u8>> {
     let length: usize = head.header("content-length")?.parse().ok()?;
     if length > BODY_LIMIT {
         return None;
@@ -587,7 +683,7 @@ fn read_body(reader: &mut BufReader<TcpStream>, head: &Head) -> Option<Vec<u8>> 
     Some(body)
 }
 
-fn respond(stream: &mut TcpStream, status: u16, reason: &str, body: &Value) {
+pub(crate) fn respond(stream: &mut dyn Write, status: u16, reason: &str, body: &Value) {
     let payload = body.to_string();
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
@@ -683,6 +779,7 @@ fn serve(stream: TcpStream, state: &State, token: &str) {
             complete(
                 &mut stream,
                 state,
+                &NoHooks,
                 &request,
                 progress.as_deref(),
                 head.header("x-muniment-thread"),
@@ -703,7 +800,7 @@ fn serve(stream: TcpStream, state: &State, token: &str) {
 }
 
 /// Compares two secrets without leaking their length through timing.
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
     }
@@ -724,9 +821,10 @@ impl Drop for SessionGuard<'_> {
     }
 }
 #[allow(clippy::too_many_arguments)]
-fn complete(
-    stream: &mut TcpStream,
+pub(crate) fn complete(
+    stream: &mut dyn Write,
     state: &State,
+    hooks: &dyn Hooks,
     request: &Value,
     progress: Option<&str>,
     thread: Option<&str>,
@@ -768,7 +866,8 @@ fn complete(
     state
         .progress
         .stage(progress, "choosing-model", (state.now_ms)());
-    let config = state.classifier_config();
+    let mut config = state.classifier_config();
+    config.policy.measured = hooks.success_rates();
     if session.cache_scope != super::policy::scope(&config, &session.account) {
         session.tokens.cache_read = 0;
     }
@@ -844,6 +943,29 @@ fn complete(
         .elapsed()
         .as_millis()
         .min(u64::MAX as u128) as u64;
+    let decision: String = policy_reason.unwrap_or_else(|| {
+        match plan.reason {
+            super::classify::Reason::Classified => "Classifier selected the model",
+            super::classify::Reason::NotClassified if requested != config::AUTO_MODEL => {
+                "User selected the model"
+            }
+            super::classify::Reason::NotClassified => "Fallback used without classification",
+            super::classify::Reason::LowConfidence => {
+                "Fallback used because classifier confidence was low"
+            }
+            super::classify::Reason::Failed => "Fallback used because the classifier failed",
+        }
+        .into()
+    });
+    hooks.decided(
+        &config::Route {
+            key: plan.route.clone(),
+            description: String::new(),
+            family: plan.family.clone(),
+            model: plan.model.clone(),
+        },
+        &decision,
+    );
     let (_, exclusions) = route_availability(&config, &state.ledger(), (state.now_ms)());
     let mut refusals: Vec<String> = Vec::new();
     let mut routes = super::options(&config);
@@ -877,12 +999,7 @@ fn complete(
                     Ok(account) => account,
                     Err(error) => {
                         if matches!(error, balance::PickError::UsageLimit) {
-                            super::subscription_probe::transport(
-                                &state.agent,
-                                &route.model,
-                                "failed",
-                                "quota",
-                            );
+                            state.probe(&route.model, "failed", "quota");
                         }
                         refusals.push(format!(
                             "{}/{}: {}",
@@ -914,8 +1031,8 @@ fn complete(
             // A token inside a minute of dying is traded for a fresh one first, and
             // the pool keeps the fresh one, so this turn and the ones behind it go
             // out on a live token. A refused refresh is the account refused.
-            let account = match native_auth::refresh_account(
-                &state.agent,
+            let account = match native_auth::refresh_account_in(
+                &state.backend,
                 &account.id,
                 (state.now_ms)(),
                 REFRESH_TIMEOUT,
@@ -934,24 +1051,52 @@ fn complete(
                     break;
                 }
             };
+            let price = super::policy::model(&config, &route);
+            let estimate_usd = price
+                .as_ref()
+                .map(|model| {
+                    model.cost(wire::Tokens {
+                        input: features.input,
+                        output: features.output,
+                        ..wire::Tokens::default()
+                    })
+                })
+                .unwrap_or(0.0);
+            if let Err((status, body)) = hooks.admit(&route, &account, estimate_usd) {
+                respond(stream, status, "Router", &body);
+                return;
+            }
+            let attempt_started = std::time::Instant::now();
+            let settle = |tokens: Option<wire::Tokens>, served: bool, status: Option<u16>| {
+                let cost_usd = match (served, tokens) {
+                    (true, Some(tokens)) => price.as_ref().map(|m| m.cost(tokens)).unwrap_or(0.0),
+                    (true, None) => estimate_usd,
+                    (false, _) => 0.0,
+                };
+                hooks.settle(&Attempt {
+                    route: route.clone(),
+                    account: account.id.clone(),
+                    estimate_usd,
+                    cost_usd,
+                    tokens,
+                    served,
+                    status,
+                    elapsed_ms: attempt_started.elapsed().as_millis() as u64,
+                });
+            };
             let mut upstream = super::subscription_probe::TransportRequest::new(
                 crate::http::agent_builder()
                     .timeout_connect(CONNECT_TIMEOUT)
                     .timeout_read(READ_TIMEOUT),
                 &prepared.url,
             );
-            super::subscription_probe::transport(&state.agent, &route.model, "pending", "none");
+            state.probe(&route.model, "pending", "none");
             let call = upstream
                 .send_json(&prepared.headers, &prepared.body)
                 .map_err(|error| *error);
             match call {
                 Ok(response) => {
-                    super::subscription_probe::transport(
-                        &state.agent,
-                        &route.model,
-                        "accepted",
-                        "none",
-                    );
+                    state.probe(&route.model, "accepted", "none");
                     state.progress.stage(progress, "thinking", (state.now_ms)());
                     let response_id = wire::evidenced_response_id(
                         &route.family,
@@ -960,28 +1105,7 @@ fn complete(
                         wire::RoutingEvidence {
                             account: account.label.clone(),
                             selected_model: format!("{}/{}", plan.family, plan.model),
-                            decision: policy_reason.clone().unwrap_or_else(|| {
-                                match plan.reason {
-                                    super::classify::Reason::Classified => {
-                                        "Classifier selected the model"
-                                    }
-                                    super::classify::Reason::NotClassified
-                                        if requested != config::AUTO_MODEL =>
-                                    {
-                                        "User selected the model"
-                                    }
-                                    super::classify::Reason::NotClassified => {
-                                        "Fallback used without classification"
-                                    }
-                                    super::classify::Reason::LowConfidence => {
-                                        "Fallback used because classifier confidence was low"
-                                    }
-                                    super::classify::Reason::Failed => {
-                                        "Fallback used because the classifier failed"
-                                    }
-                                }
-                                .into()
-                            }),
+                            decision: decision.clone(),
                             confidence: matches!(
                                 plan.reason,
                                 super::classify::Reason::Classified
@@ -996,8 +1120,8 @@ fn complete(
                             fallback_causes: refusals.clone(),
                         },
                     );
-                    if prepared.protocol != transport::Protocol::Chat {
-                        let result = relay_native(
+                    let result = if prepared.protocol != transport::Protocol::Chat {
+                        relay_native(
                             stream,
                             state,
                             &account.id,
@@ -1008,38 +1132,8 @@ fn complete(
                                 response_id: &response_id,
                                 purpose,
                             },
-                        );
-                        match result {
-                            Ok(tokens) => {
-                                if let (Some(id), Some(tokens)) = (thread, tokens) {
-                                    session.cache_scope =
-                                        super::policy::scope(&config, &account.id);
-                                    session.finish(
-                                        &route,
-                                        &account.id,
-                                        &features,
-                                        super::policy::Completion {
-                                            tokens,
-                                            finished_ms: (state.now_ms)(),
-                                            elapsed_ms: started.elapsed().as_millis() as u64,
-                                        },
-                                        super::policy::model(&config, &route).as_ref(),
-                                    );
-                                    session.remember_cache(&config, &route);
-                                    if let Ok(mut sessions) = state.sessions.lock() {
-                                        sessions.entries.insert(id.into(), session.clone());
-                                        let _ = sessions.save(&state.agent, (state.now_ms)());
-                                    }
-                                }
-                                return;
-                            }
-                            Err(message) => {
-                                last_failure = (502, message);
-                                continue;
-                            }
-                        }
-                    }
-                    let result = if wire::streams(request) {
+                        )
+                    } else if wire::streams(request) {
                         relay_stream(
                             stream,
                             state,
@@ -1053,6 +1147,7 @@ fn complete(
                     };
                     match result {
                         Ok(tokens) => {
+                            settle(tokens, true, None);
                             if let (Some(id), Some(tokens)) = (thread, tokens) {
                                 session.cache_scope = super::policy::scope(&config, &account.id);
                                 session.finish(
@@ -1064,29 +1159,33 @@ fn complete(
                                         finished_ms: (state.now_ms)(),
                                         elapsed_ms: started.elapsed().as_millis() as u64,
                                     },
-                                    super::policy::model(&config, &route).as_ref(),
+                                    price.as_ref(),
                                 );
                                 session.remember_cache(&config, &route);
-                                if let Ok(mut sessions) = state.sessions.lock() {
-                                    sessions.entries.insert(id.into(), session.clone());
-                                    let _ = sessions.save(&state.agent, (state.now_ms)());
-                                }
+                                state.save_session(id, &session);
                             }
                             return;
                         }
-                        Err(message) => last_failure = (502, message),
+                        Err(message) => {
+                            settle(None, false, None);
+                            last_failure = (502, message);
+                        }
                     }
                 }
                 Err(ureq::Error::Status(status, response)) => {
-                    super::subscription_probe::transport(
-                        &state.agent,
+                    settle(None, false, Some(status));
+                    state.probe(
                         &route.model,
                         "failed",
                         super::subscription_probe::http_error(status),
                     );
+                    let now = (state.now_ms)();
                     let retry_after = response
                         .header("retry-after")
-                        .and_then(|s| s.parse::<u64>().ok());
+                        .and_then(|value| usage::retry_after_ms(value, now));
+                    let unified = super::quota::parse_anthropic_unified(|name| {
+                        response.header(name).map(str::to_owned)
+                    });
                     let limit_headers = [
                         "retry-after",
                         "anthropic-ratelimit-unified-status",
@@ -1113,18 +1212,32 @@ fn complete(
                         ),
                         cools,
                     );
-                    if let Some(seconds) = retry_after {
-                        let mut ledger = state
-                            .ledger
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if let Some(entry) = ledger.accounts.get_mut(&account.id) {
-                            let until =
-                                (state.now_ms)().saturating_add(seconds.min(86400) as i64 * 1000);
-                            entry.cooldown_until_ms =
-                                Some(entry.cooldown_until_ms.unwrap_or(0).max(until));
+                    // The upstream's own reset outranks the doubling cooldown
+                    // when it reaches further.
+                    let refused_until = unified
+                        .as_ref()
+                        .filter(|limit| limit.rejected)
+                        .and_then(|limit| limit.reset_ms)
+                        .map(|reset| reset.clamp(now, now + usage::MAX_RETRY_AFTER_MS));
+                    if let Some(until) = retry_after.into_iter().chain(refused_until).max() {
+                        state.hold_until(&account.id, until);
+                    }
+                    if let Some(limit) = unified.filter(|limit| !limit.windows.is_empty()) {
+                        let mut quota = state
+                            .backend
+                            .store
+                            .load_quotas()
+                            .accounts
+                            .remove(&account.id)
+                            .unwrap_or_default();
+                        for window in limit.windows {
+                            quota.windows.retain(|known| {
+                                known.kind != window.kind || known.scope != window.scope
+                            });
+                            quota.windows.push(window);
                         }
-                        let _ = usage::save(&state.agent, &ledger);
+                        quota.observed_at_ms = now;
+                        let _ = state.backend.store.save_quota(&account.id, &quota);
                     }
                     last_failure = (status, detail);
                     refusals.push(format!("{} answered {status}.", account.label));
@@ -1135,12 +1248,15 @@ fn complete(
                     }
                 }
                 Err(ureq::Error::Transport(error)) => {
-                    super::subscription_probe::transport_failed(
-                        &state.agent,
-                        &route.model,
-                        &upstream,
-                        &error,
-                    );
+                    settle(None, false, None);
+                    if let Some(agent) = &state.agent {
+                        super::subscription_probe::transport_failed(
+                            agent,
+                            &route.model,
+                            &upstream,
+                            &error,
+                        );
+                    }
                     state.record_error(&account.id, &error.to_string(), true);
                     refusals.push(format!("{} did not answer.", account.label));
                 }
@@ -1172,7 +1288,7 @@ struct NativeRequest<'a> {
 /// Native providers stream even when the caller wants one complete answer.
 /// Once a delta is delivered, errors end this turn and never replay it.
 fn relay_native(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     state: &State,
     account: &str,
     response: ureq::Response,
@@ -1252,7 +1368,7 @@ fn relay_native(
     if !decoder.finished || failure.is_some() {
         let message =
             failure.unwrap_or_else(|| "The provider stream ended before completion.".into());
-        super::subscription_probe::transport(&state.agent, model, "failed", failure_class);
+        state.probe(model, "failed", failure_class);
         state.record_error(account, &message, false);
         if started {
             let _ = write_event(stream, &wire::error_body(&message, "provider_error"));
@@ -1261,7 +1377,7 @@ fn relay_native(
         }
         return Ok(None);
     }
-    super::subscription_probe::transport(&state.agent, model, "complete", "none");
+    state.probe(model, "complete", "none");
     record_subscription_probe(state, account, model, &decoder, purpose);
     state.record_success(account, decoder.tokens);
     if streaming {
@@ -1292,7 +1408,10 @@ fn record_subscription_probe(
     if std::env::var("MUNIMENT_SUBSCRIPTION_PROBE").as_deref() != Ok("1") {
         return;
     }
-    let Ok(config) = config::load(&state.agent) else {
+    let Some(agent) = &state.agent else {
+        return;
+    };
+    let Ok(config) = config::load(agent) else {
         return;
     };
     let subscription = config.account(account).is_some_and(|account| {
@@ -1330,19 +1449,19 @@ fn record_subscription_probe(
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    if let Ok(mut file) = options.open(state.agent.join("subscription-probe-transports.jsonl")) {
+    if let Ok(mut file) = options.open(agent.join("subscription-probe-transports.jsonl")) {
         let _ = writeln!(file, "{receipt}");
     }
 }
 
-fn write_event(stream: &mut TcpStream, value: &Value) -> io::Result<()> {
+fn write_event(stream: &mut dyn Write, value: &Value) -> io::Result<()> {
     write!(stream, "data: {value}\n\n")?;
     stream.flush()
 }
 
 /// One whole answer: forward the body and count what it says it spent.
 fn relay_once(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     state: &State,
     account: &str,
     response: ureq::Response,
@@ -1373,7 +1492,7 @@ fn relay_once(
 /// frame the router asked for off the client's wire unless `keep_usage` says
 /// the client asked for it too.
 fn relay_stream(
-    stream: &mut TcpStream,
+    stream: &mut dyn Write,
     state: &State,
     account: &str,
     response: ureq::Response,
@@ -1444,6 +1563,10 @@ mod tests {
     /// The clock every server test reads, so a day bucket never drifts.
     fn fixed_clock() -> i64 {
         1_789_000_000_000
+    }
+
+    fn state_in(agent: PathBuf) -> State {
+        State::new(Backend::files(&agent), Some(agent), fixed_clock)
     }
 
     fn agent_dir() -> PathBuf {
@@ -1867,15 +1990,7 @@ mod tests {
             r#"{"phase":"chat","models":[{"id":"test-model"}]}"#,
         )
         .unwrap();
-        let state = State {
-            sessions: Default::default(),
-            active_sessions: Default::default(),
-            progress: Default::default(),
-            agent,
-            ledger: Mutex::new(Ledger::default()),
-            active: Arc::new(Mutex::new(BTreeMap::new())),
-            now_ms: fixed_clock,
-        };
+        let state = state_in(agent);
         for (event, expected) in [
             (
                 json!({"type":"error","error":{"type":"authentication_error","message":"PRIVATE TOKEN"}}),
@@ -1982,15 +2097,7 @@ mod tests {
     #[test]
     fn known_exhaustion_reports_usage_limit_until_reset() {
         use crate::quota::{self, Quota, QuotaStore, Window, WindowKind};
-        let state = State {
-            sessions: Default::default(),
-            active_sessions: Default::default(),
-            progress: Default::default(),
-            agent: agent_dir(),
-            ledger: Mutex::new(Ledger::default()),
-            active: Arc::new(Mutex::new(BTreeMap::new())),
-            now_ms: fixed_clock,
-        };
+        let state = state_in(agent_dir());
         let mut quotas = QuotaStore::default();
         quotas.accounts.insert(
             "a".into(),
@@ -2005,7 +2112,7 @@ mod tests {
                 ..Quota::default()
             },
         );
-        quota::save(&state.agent, &quotas).unwrap();
+        quota::save(state.agent.as_ref().unwrap(), &quotas).unwrap();
         let saved = config(vec![account("a", "http://unused")]);
         assert!(matches!(
             state.reserve(&saved, "openai", "gpt-5.6-mini"),
@@ -2024,23 +2131,15 @@ mod tests {
             "b"
         );
         quotas.accounts.get_mut("a").unwrap().windows[0].resets_at_ms = Some(fixed_clock() - 1);
-        quota::save(&state.agent, &quotas).unwrap();
+        quota::save(state.agent.as_ref().unwrap(), &quotas).unwrap();
         assert!(state.reserve(&saved, "openai", "gpt-5.6-mini").is_ok());
-        std::fs::remove_dir_all(&state.agent).unwrap();
+        std::fs::remove_dir_all(state.agent.as_ref().unwrap()).unwrap();
     }
 
     #[test]
     fn reservations_distribute_concurrent_turns_and_release_on_drop() {
         let agent = agent_dir();
-        let state = State {
-            sessions: Default::default(),
-            active_sessions: Default::default(),
-            progress: Default::default(),
-            agent,
-            ledger: Mutex::new(Ledger::default()),
-            active: Arc::new(Mutex::new(BTreeMap::new())),
-            now_ms: fixed_clock,
-        };
+        let state = state_in(agent);
         let saved = config(vec![
             account("a", "http://unused"),
             account("b", "http://unused"),
@@ -2061,15 +2160,7 @@ mod tests {
     }
 
     fn check_subscription_pool(provider: &str) {
-        let state = State {
-            sessions: Default::default(),
-            active_sessions: Default::default(),
-            progress: Default::default(),
-            agent: agent_dir(),
-            ledger: Mutex::new(Ledger::default()),
-            active: Arc::new(Mutex::new(BTreeMap::new())),
-            now_ms: fixed_clock,
-        };
+        let state = state_in(agent_dir());
         let mut first = account("subscription-a", "http://native");
         first.credential = Credential::from_pi_auth(
             provider,
@@ -2099,15 +2190,23 @@ mod tests {
             ..Default::default()
         };
         let features = super::super::policy::Features::read(&turn("auto", false));
+        // A thread stays on the account that holds its prompt cache, even
+        // while that account has other turns in flight.
         let (a, _, ga) = state
             .reserve_delivery(&saved, &route, &session, &features)
             .unwrap();
-        let (b, _, gb) = state
+        let (again, _, gagain) = state
             .reserve_delivery(&saved, &route, &session, &features)
             .unwrap();
         assert_eq!(a.id, "subscription-a");
+        assert_eq!(again.id, "subscription-a");
+        // A thread with no account yet takes the least-loaded one.
+        let fresh = super::super::policy::Session::default();
+        let (b, _, gb) = state
+            .reserve_delivery(&saved, &route, &fresh, &features)
+            .unwrap();
         assert_eq!(b.id, "subscription-b");
-        drop((ga, gb));
+        drop((ga, gagain, gb));
         // An explicit shared namespace cannot cross a service or credential type.
         for id in ["subscription-a", "subscription-b", "api", "gateway"] {
             saved
@@ -2125,6 +2224,123 @@ mod tests {
         assert!(state
             .reserve_delivery(&saved, &route, &session, &features)
             .is_err());
+    }
+
+    #[test]
+    fn cache_affinity_yields_when_the_warm_account_cools_or_runs_out() {
+        use crate::quota::{Quota, Window, WindowKind};
+        let state = state_in(agent_dir());
+        let saved = config(vec![
+            account("a", "http://unused"),
+            account("b", "http://unused"),
+        ]);
+        let route = saved.routes[0].clone();
+        let features = super::super::policy::Features::read(&turn("auto", false));
+        let session = super::super::policy::Session {
+            account: "b".into(),
+            cache_scope: super::super::policy::scope(&saved, "b"),
+            ..Default::default()
+        };
+        // b has served more, and the thread still stays on it.
+        for _ in 0..5 {
+            state.record_success("b", wire::Tokens::default());
+        }
+        let pick = |session: &super::super::policy::Session| {
+            state
+                .reserve_delivery(&saved, &route, session, &features)
+                .unwrap()
+                .0
+                .id
+        };
+        assert_eq!(pick(&session), "b");
+        // A cooling account loses the thread.
+        state.record_error("b", "429", true);
+        assert_eq!(pick(&session), "a");
+        state.record_success("b", wire::Tokens::default());
+        assert_eq!(pick(&session), "b");
+        // So does an account whose allowance is known to be spent.
+        state
+            .backend
+            .store
+            .save_quota(
+                "b",
+                &Quota {
+                    windows: vec![Window {
+                        kind: WindowKind::FiveHour,
+                        scope: String::new(),
+                        used_percent: 100.0,
+                        resets_at_ms: Some(fixed_clock() + 60_000),
+                        limit_reached: true,
+                    }],
+                    observed_at_ms: fixed_clock(),
+                    ..Quota::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(pick(&session), "a");
+        std::fs::remove_dir_all(state.agent.as_ref().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_retry_after_date_and_a_unified_reset_hold_the_account() {
+        let agent = agent_dir();
+        let reset = fixed_clock() / 1000 + 3_600;
+        let date = chrono::DateTime::from_timestamp_millis(fixed_clock() + 120_000)
+            .unwrap()
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for headers in [
+                format!("retry-after: {date}\r\n"),
+                format!(
+                    "anthropic-ratelimit-unified-status: rejected\r\nanthropic-ratelimit-unified-reset: {reset}\r\nanthropic-ratelimit-unified-5h-status: rejected\r\nanthropic-ratelimit-unified-5h-utilization: 1.0\r\nanthropic-ratelimit-unified-5h-reset: {reset}\r\n"
+                ),
+            ] {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buffer = [0_u8; 65536];
+                let _ = stream.read(&mut buffer);
+                let body = "{\"error\":\"limited\"}";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 429 X\r\n{headers}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/v1");
+        config::save(
+            &agent,
+            &config(vec![account("a1", &url), account("a2", &url)]),
+        )
+        .unwrap();
+        let handle = start_with_clock(agent.clone(), fixed_clock).unwrap();
+        let (status, _) = call(
+            handle.endpoint(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&turn("fast", false)),
+            &handle.endpoint().token,
+        );
+        assert_eq!(status, 429);
+        let ledger = usage::load(&agent);
+        assert_eq!(
+            ledger.account("a1").unwrap().cooldown_until_ms,
+            Some(fixed_clock() + 120_000)
+        );
+        assert_eq!(
+            ledger.account("a2").unwrap().cooldown_until_ms,
+            Some(reset * 1000)
+        );
+        let quota = crate::quota::load(&agent);
+        let window = &quota.accounts["a2"].windows[0];
+        assert!(window.limit_reached);
+        assert_eq!(window.resets_at_ms, Some(reset * 1000));
+        drop(handle);
+        std::fs::remove_dir_all(agent).unwrap();
     }
 
     #[test]
