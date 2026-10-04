@@ -134,7 +134,8 @@ The core test enables `keyring` to include prompt and thread-history tests.
 CI runs this check on every push and pull request.
 
 The module scan covers all Rust source and test files in port crates, regardless of host platform.
-It reserves staying module identifiers in every port source file, and no file has an exception.
+It finds staying module names in module declarations, paths, and grouped imports in every port source file.
+No file has an exception. A field or a local variable with such a name is not a module path.
 It rejects root glob imports, alternate root aliases, and source includes that could hide an edge.
 A source include needs a boundary review. The reviewed includes are named in the check.
 Cargo compilation checks the enabled code paths as well.

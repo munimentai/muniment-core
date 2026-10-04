@@ -99,12 +99,18 @@ def source_edges(packages, staying_modules):
         for path in sorted(root.rglob("*.rs")):
             text = path.read_text()
             code = rust_code(text)
-            # Reserve these identifiers even in grouped imports and aliases.
-            # This conservative rule also checks inactive platform code.
-            names = set(re.findall(r"\b[a-zA-Z_][a-zA-Z_0-9]*\b", code))
+            # A staying module name is an edge wherever it names a module: a
+            # module declaration, a path segment, or a member of a grouped
+            # import. This also checks inactive platform code. A field or a
+            # local variable with the same name is not a module path.
             caller = path.relative_to(Path.cwd()).as_posix()
-            for name in names & staying_modules:
-                edges.add((caller, name))
+            groups = " ".join(re.findall(r"::\s*\{([^;]*)", code))
+            for name in staying_modules:
+                if (re.search(rf"\bmod\s+(?:r#)?{name}\b", code)
+                        or re.search(rf"(?:\b|r#){name}\s*::", code)
+                        or re.search(rf"::\s*(?:r#)?{name}\b", code)
+                        or re.search(rf"\b{name}\b", groups)):
+                    edges.add((caller, name))
             require(not re.search(
                 r"\b(?:crate|muniment_core)\s*::\s*(?:\{[^;]*?)?\*", code),
                 f"A root glob can hide a staying module in {caller}.")
