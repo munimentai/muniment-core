@@ -26,6 +26,11 @@ pub trait MacosAttachRouteReader {
     /// the desktop binary after it connects never matches.
     fn peer_code_matches(&self, expected_desktop_executable: &Path) -> bool;
 
+    /// Returns payload-free results from the code check for this connection.
+    fn code_check_diagnostic(&self) -> serde_json::Value {
+        serde_json::Value::Null
+    }
+
     /// Records a payload-free diagnostic when the peer cannot use desktop routes.
     fn log_companion_fallback(
         &self,

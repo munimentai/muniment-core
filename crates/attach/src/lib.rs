@@ -34,6 +34,8 @@ mod chat_event_supervisor;
 mod client;
 #[cfg(all(feature = "client", target_os = "linux"))]
 mod linux_connect_diagnostic;
+#[cfg(all(feature = "client", unix, any(test, not(target_os = "linux"))))]
+mod macos_connect_diagnostic;
 #[cfg(all(feature = "client", target_os = "linux"))]
 pub use linux_connect_diagnostic::LinuxConnectDiagnostic;
 #[cfg(feature = "client")]
