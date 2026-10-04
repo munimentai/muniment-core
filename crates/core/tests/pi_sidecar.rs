@@ -11,7 +11,7 @@ use muniment_core::sidecar::pi_install::{
 };
 use muniment_core::sidecar::{pi_sidecar_config, PiRpcWiring, SidecarStatus, SidecarSupervisor};
 
-use muniment_core::chat_grant::ChatGrant;
+use muniment_core::chat_launch::ChatGrant;
 use muniment_core::pi_launch::{
     pi_launch_config_for_executable, PiLaunchBoundaries, PiLaunchError,
 };

@@ -6,6 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
+use muniment_core::account::{
+    AuthStatus, EntitlementSnapshotView, NativeDeviceList, NativeSessionRole,
+};
 use muniment_core::attach::linux::{
     serve_desktop_client_session, AttachSessionError, CompanionProvenance,
     EntitlementSnapshotResult, RunMessageAccepted, RunMessageRequest, RunPermissionAnswerAccepted,
@@ -17,9 +20,6 @@ use muniment_core::attach::{
     decode_frame, encode_frame, CompanionRecord, DesktopClientSession, DrainState, Envelope,
     ErrorCode, EventName, Id, Operation, Protocol, ProtocolError, Request, WorkspaceOnboardRequest,
     WorkspaceOnboarded,
-};
-use muniment_core::auth::{
-    AuthStatus, EntitlementSnapshotView, NativeDeviceList, NativeSessionRole,
 };
 use muniment_core::journal::MAX_THREAD_TITLE_CHARS;
 use muniment_core::journal::{CommitSubscription, JournalCommitHint, RunEventProjection};

@@ -3,21 +3,17 @@ name = "muniment-core"
 version = "0.0.1"
 edition = "2021"
 
-# Pure backend logic (sidecar lifecycle, RPC framing, OIDC auth engine).
+# Pure backend logic (sidecar lifecycle, RPC framing, run journal).
 # Deliberately free of Tauri and GUI dependencies so `cargo test` compiles
-# and runs on the shared CI runner without the GUI toolchain a desktop-ci
-# build VM provides. TLS is feature-gated for the same reason: the auth
-# tests speak plain HTTP to an in-process mock IdP, so the standalone crate
-# never compiles a TLS stack; the desktop crate enables `tls` to reach the
-# real HTTPS control plane.
+# and runs on the shared CI runner without a GUI toolchain. TLS is
+# feature-gated for the same reason: the tests speak plain HTTP to
+# in-process stubs, so the standalone crate never compiles a TLS stack;
+# hosts enable `tls` to reach HTTPS endpoints.
 
 [features]
-# ADR 0030 fences staying contracts until port callers use separate values.
-default = ["desktop-integration"]
-desktop-integration = []
 # Desktop and runtime HTTPS use the OS certificate verifier.
 tls = ["ureq/tls", "ureq/proxy-from-env", "muniment-router/tls"]
-keyring = ["dep:keyring", "dep:security-framework"]
+keyring = ["dep:keyring"]
 network-tests = ["tls"]
 
 [dependencies]
@@ -25,7 +21,6 @@ base64 = "0.22"
 cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
 dirs = "6"
-ed25519-dalek = "2"
 getrandom = "0.3"
 hmac = "0.12"
 hound = "3"
@@ -33,7 +28,6 @@ image = { version = "0.25", default-features = false, features = ["gif", "jpeg",
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native"], optional = true }
 libloading = "0.7"
 quick-xml = "0.41"
-qrcode = "0.14"
 muniment-attach = { path = "../attach", features = ["client"] }
 muniment-code-diff = { path = "../code-diff" }
 muniment-atomic-file = { path = "../atomic-file" }
@@ -46,7 +40,6 @@ rusqlite = { version = "0.32", features = ["bundled", "hooks", "limits"] }
 same-file = "1.0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
-sha1 = "0.10"
 sha2 = "0.10"
 sherpa-onnx = { version = "=1.13.2", default-features = false, features = ["shared"] }
 sherpa-onnx-sys = { version = "=1.13.2", default-features = false, features = ["shared"] }
@@ -58,8 +51,6 @@ uuid = { version = "1", features = ["serde", "v4", "v7"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
-quircs = "0.10"
-resvg = { version = "0.45", default-features = false }
 # Tests need to author AES-encrypted entries to exercise the encrypted-entry
 # rejection; the library itself only ever reads and needs no crypto stack.
 zip = { version = "2", default-features = false, features = ["deflate", "aes-crypto"] }
@@ -69,7 +60,6 @@ libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
-security-framework = { version = "3", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.61", features = ["Win32_System_Com", "Win32_System_Ole", "Win32_System_TaskScheduler", "Win32_System_Variant"] }

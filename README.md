@@ -19,8 +19,9 @@ routing and runtime pins match in both.
 along with `provider_models`, `endpoint_models`, `http` and `atomic_file`, so
 existing `muniment_core::...` paths keep working.
 
-The modules `auth`, `chat_grant` and `browser_control` are desktop-only. They
-compile only with the `desktop-integration` feature, which is on by default.
+Desktop-only code (cloud sign-in, cloud chat grants and browser control) lives in
+the desktop. The host supplies it through the `account` and `chat_launch` values
+and the `PiLaunchBoundaries` and `RunAttachBoundaries` traits.
 `docs/decisions/0030-public-core-boundary.md` lists every module and crate and
 `scripts/check-core-boundary.sh` enforces the boundary.
 

@@ -7,12 +7,14 @@ use super::{ChatGrant, FetchGrantError};
 use muniment_core::attach::RuntimeActivityRegistry;
 use muniment_core::cas::LocalCas;
 use muniment_core::chat_coordinate::coordinate;
+use muniment_core::chat_launch::FetchReceiptError;
 use muniment_core::journal::RunJournal;
 use muniment_core::memory_runtime::ApplicationMemoryRuntime;
 use muniment_core::pi_launch::{PiLaunchBoundaries, PiLaunchError};
 use muniment_core::run_events::{ChatEvent, ChatEventSink, ChatStorage};
 use muniment_core::run_preparation::{prepare_new_run_with_session_thread, SessionThreadStart};
 use muniment_core::session_thread::SessionThread;
+use muniment_core::sidecar::pi_chat::Receipt;
 use muniment_core::sidecar::pi_install::{PiArtifactDescriptor, PI_ARTIFACT};
 use serde_json::json;
 
@@ -50,6 +52,20 @@ impl PiLaunchBoundaries for Boundary {
     }
     fn renew_chat_grant(&self, _: &str) -> Result<ChatGrant, FetchGrantError> {
         Err(FetchGrantError::Unavailable)
+    }
+    fn fetch_receipt(
+        &self,
+        grant: &ChatGrant,
+        _: &str,
+        _: &str,
+    ) -> Result<Receipt, FetchReceiptError> {
+        // Reach the receipt endpoint the way a host does, so the test sees any fetch.
+        let address = grant
+            .receipt_url
+            .trim_start_matches("http://")
+            .trim_end_matches("/receipt");
+        let _ = std::net::TcpStream::connect(address);
+        Err(FetchReceiptError)
     }
 }
 

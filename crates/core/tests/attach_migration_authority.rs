@@ -4,7 +4,7 @@ use muniment_core::attach::{
     verify_approval_presenter_peer_with_reader, verify_migration_control_peer_with_reader,
     AuthorizedApprovalPresenter, PeerAuthorityError,
 };
-use muniment_core::browser_control::{LinuxProcReader, ProcReadError};
+use muniment_core::process_reader::{LinuxProcReader, ProcReadError};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fs;

@@ -12,13 +12,12 @@ that tests and checks read.
 
 ## Boundary
 
-No crate may depend on Tauri, on `muniment-desktop`, or on a desktop-only module.
-The desktop-only modules `auth`, `chat_grant` and `browser_control` sit inside
-`muniment-core` behind the `desktop-integration` feature. That feature is the
-only fenced edge, and it stays a default feature so the desktop builds unchanged.
-New code must not import those modules. `scripts/check-core-boundary.sh` checks
-the inventory in `docs/decisions/0030-public-core-boundary.md` and the named
-exceptions. A new edge fails the check. A removed edge needs its exception removed.
+No crate may depend on Tauri, on a desktop crate, or on a desktop-only module.
+The desktop-only modules `auth`, `chat_grant` and `browser_control` live in the
+desktop. No source file here may name them, and no file has an exception. The
+host supplies desktop behavior through port-owned values and traits.
+`scripts/check-core-boundary.sh` checks the inventory in
+`docs/decisions/0030-public-core-boundary.md` and every source edge.
 
 `muniment-router` and `muniment-pins` never depend on `muniment-core`.
 `muniment-core` re-exports them at the module paths callers use, such as

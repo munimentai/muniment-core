@@ -4,21 +4,16 @@
 //! here run on the shared CI runner, which has no display stack. The Pi
 //! sidecar process manager and its RPC transport build on these pieces.
 
+pub mod account;
 pub mod active_run;
 pub mod asr;
 pub mod assistant_text;
 pub use muniment_atomic_file as atomic_file;
 pub mod attach;
 pub mod attachment;
-#[cfg(feature = "desktop-integration")]
-pub mod auth;
-#[cfg(feature = "desktop-integration")]
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-pub mod browser_control;
 pub mod cas;
 pub mod chat_coordinate;
-#[cfg(feature = "desktop-integration")]
-pub mod chat_grant;
+pub mod chat_launch;
 pub mod chat_profile;
 #[cfg(feature = "keyring")]
 pub mod chat_prompt;
@@ -58,6 +53,8 @@ pub mod pi_execution;
 pub mod pi_launch;
 pub mod pi_packages;
 pub mod pi_settings;
+#[cfg(target_os = "linux")]
+pub mod process_reader;
 pub mod record;
 pub mod retention_record;
 pub mod router_classifier;

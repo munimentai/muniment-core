@@ -14,7 +14,7 @@ use muniment_core::attach::{
     Protocol, VersionRange, Welcome, CAPABILITY_IDLE_LIFETIME, MAX_CAPABILITY_LIFETIME,
     MAX_FRAME_LENGTH,
 };
-use muniment_core::browser_control::{LinuxProcReader, ProcReadError};
+use muniment_core::process_reader::{LinuxProcReader, ProcReadError};
 
 struct FakeProcReader {
     executable: PathBuf,

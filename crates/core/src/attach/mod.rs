@@ -152,7 +152,7 @@ pub use workspace_context::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntitlementSnapshotResult {
-    pub snapshot: crate::auth::EntitlementSnapshotView,
+    pub snapshot: crate::account::EntitlementSnapshotView,
     pub changed_snapshot_version: Option<u64>,
 }
 
