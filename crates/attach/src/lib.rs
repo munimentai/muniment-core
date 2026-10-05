@@ -38,6 +38,8 @@ mod linux_connect_diagnostic;
 mod macos_connect_diagnostic;
 #[cfg(all(feature = "client", target_os = "linux"))]
 pub use linux_connect_diagnostic::LinuxConnectDiagnostic;
+#[cfg(all(feature = "client", unix, any(test, not(target_os = "linux"))))]
+pub use macos_connect_diagnostic::{macos_admissions_since, MacosConnectDiagnostic};
 #[cfg(feature = "client")]
 mod client_stream;
 #[cfg(feature = "client")]

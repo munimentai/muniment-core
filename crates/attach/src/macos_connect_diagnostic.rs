@@ -1,7 +1,7 @@
 use crate::client::{interruptible_connect_result, ClientError, InterruptibleConnectState};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -10,8 +10,39 @@ enum Failure {
     Handshake(ClientError),
 }
 
+type AdmissionHistory = std::collections::VecDeque<(Instant, serde_json::Value)>;
+
+fn admission_history() -> &'static Mutex<AdmissionHistory> {
+    static HISTORY: OnceLock<Mutex<AdmissionHistory>> = OnceLock::new();
+    HISTORY.get_or_init(Mutex::default)
+}
+
+/// Returns recent admissions for this endpoint and startup attempt.
+pub fn macos_admissions_since(endpoint: &Path, since: Instant) -> Vec<serde_json::Value> {
+    admission_history()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .filter(|(observed, entry)| {
+            *observed >= since && entry["endpoint"] == endpoint.to_string_lossy().as_ref()
+        })
+        .map(|(_, entry)| entry.clone())
+        .collect()
+}
+
+fn record_admission(envelope: &serde_json::Value) {
+    let mut history = admission_history()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    // Bound memory when an endpoint stays unavailable.
+    if history.len() == 128 {
+        history.pop_front();
+    }
+    history.push_back((Instant::now(), envelope.clone()));
+}
+
 #[derive(Default)]
-pub(crate) struct MacosConnectDiagnostic {
+pub struct MacosConnectDiagnostic {
     last: Option<Failure>,
     pub(crate) failure: Option<serde_json::Value>,
 }
@@ -32,7 +63,7 @@ impl MacosConnectDiagnostic {
         client
     }
 
-    pub(crate) fn connect<S: InterruptibleConnectState, T>(
+    pub fn connect<S: InterruptibleConnectState, T>(
         &mut self,
         endpoint: &Path,
         route: &str,
@@ -53,24 +84,30 @@ impl MacosConnectDiagnostic {
             }
             Err(error) => Err(Failure::Connect(error.kind(), error.raw_os_error())),
         };
+        let mut envelope = serde_json::json!({
+            "event": "macos_attach_admission",
+            "observer": "desktop",
+            "peer_pid": std::process::id(),
+            "endpoint": endpoint,
+            "requested_route": route,
+            "elapsed_ms": started.elapsed().as_millis(),
+            "connect_elapsed_ms": connect_elapsed.as_millis(),
+            // The supervisor stop bounds connect. The I/O bound starts at the handshake.
+            "connect_bound": "supervisor_stop",
+        });
         match result {
             Ok(client) => {
+                envelope["phase"] = "admitted".into();
+                envelope["handshake_elapsed_ms"] =
+                    serde_json::json!(handshake_started.elapsed().as_millis());
+                envelope["io_bound_ms"] = serde_json::json!(bound.as_millis());
+                record_admission(&envelope);
+                eprintln!("muniment-desktop: {envelope}");
                 self.last = None;
                 self.failure = None;
                 Some(client)
             }
             Err(failure) => {
-                let mut envelope = serde_json::json!({
-                    "event": "macos_attach_admission",
-                    "observer": "desktop",
-                    "peer_pid": std::process::id(),
-                    "endpoint": endpoint,
-                    "requested_route": route,
-                    "elapsed_ms": started.elapsed().as_millis(),
-                    "connect_elapsed_ms": connect_elapsed.as_millis(),
-                    // The supervisor stop bounds connect. The I/O bound starts at the handshake.
-                    "connect_bound": "supervisor_stop",
-                });
                 match failure {
                     Failure::Connect(kind, os_error) => {
                         envelope["phase"] = "connect".into();
@@ -95,6 +132,7 @@ impl MacosConnectDiagnostic {
                         envelope["io_bound_ms"] = serde_json::json!(bound.as_millis());
                     }
                 }
+                record_admission(&envelope);
                 if self.last != Some(failure) {
                     eprintln!("muniment-desktop: {envelope}");
                 }
@@ -205,6 +243,7 @@ mod tests {
         let stop = DesktopClientStopHandle::new();
         let mut diagnostic = MacosConnectDiagnostic::default();
         let bound = Duration::from_millis(50);
+        let started = Instant::now();
         assert!(diagnostic
             .connect::<_, ()>(
                 &endpoint,
@@ -243,6 +282,18 @@ mod tests {
         drop(listener.accept().unwrap());
         assert!(diagnostic.failure.is_none());
         assert!(diagnostic.last.is_none());
+        let admissions = macos_admissions_since(&endpoint, started);
+        assert_eq!(admissions.len(), 4);
+        assert_eq!(admissions[0]["phase"], "connect");
+        assert_eq!(admissions[1]["error"], "Timeout");
+        assert_eq!(admissions[2]["error"], "ConnectionClosed");
+        assert_eq!(admissions[3]["phase"], "admitted");
+        for admission in admissions {
+            assert!(admission["elapsed_ms"].is_number());
+            assert_eq!(admission["requested_route"], "desktop-client");
+        }
+        assert!(macos_admissions_since(&endpoint, Instant::now()).is_empty());
+        assert!(macos_admissions_since(Path::new("another-endpoint"), started).is_empty());
         drop(listener);
         assert!(diagnostic
             .connect::<_, ()>(
