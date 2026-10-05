@@ -14,7 +14,7 @@ use crate::config::Classifier;
 use crate::policy::Mode;
 use crate::store::SuccessWindow;
 
-use super::openbao;
+use super::{langfuse, openbao};
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -33,6 +33,15 @@ struct File {
     success: SuccessFile,
     openbao: OpenBaoFile,
     classifier: ClassifierFile,
+    langfuse: LangfuseFile,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct LangfuseFile {
+    host: Option<String>,
+    public_key: Option<String>,
+    secret_key: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -91,6 +100,8 @@ pub struct Settings {
     pub success: SuccessWindow,
     pub openbao: Option<openbao::Settings>,
     pub classifier: Classifier,
+    /// Langfuse ingestion, on when the host and both keys are set.
+    pub langfuse: Option<langfuse::Settings>,
 }
 
 /// The environment variable for one setting.
@@ -99,6 +110,12 @@ pub fn variable(name: &str) -> String {
         "MUNIMENT_ROUTER_{}",
         name.to_ascii_uppercase().replace('.', "_")
     )
+}
+
+/// A deploy may fill an unset secret with a value that starts with
+/// `PLACEHOLDER`. Such a value counts as unset.
+fn placeholder(value: &str) -> bool {
+    value.starts_with("PLACEHOLDER")
 }
 
 fn mode(text: &str) -> Result<Mode, String> {
@@ -215,6 +232,18 @@ impl Settings {
                 })
             }
         };
+        let langfuse = match (
+            get("langfuse.host", file.langfuse.host),
+            get("langfuse.public_key", file.langfuse.public_key).filter(|v| !placeholder(v)),
+            get("langfuse.secret_key", file.langfuse.secret_key).filter(|v| !placeholder(v)),
+        ) {
+            (Some(host), Some(public_key), Some(secret_key)) => Some(langfuse::Settings {
+                host,
+                public_key,
+                secret_key,
+            }),
+            _ => None,
+        };
         let classifier = match get("classifier.kind", file.classifier.kind).as_deref() {
             None | Some("none") => Classifier::None,
             Some("typesafe") => Classifier::Typesafe {
@@ -271,6 +300,7 @@ impl Settings {
             },
             openbao,
             classifier,
+            langfuse,
         })
     }
 }
@@ -340,6 +370,7 @@ half_life_days = 2
             matches!(bao.method, openbao::Auth::AppRole { ref mount, .. } if mount == "approle")
         );
         assert!(matches!(settings.classifier, Classifier::Pooled { .. }));
+        assert_eq!(settings.langfuse, None);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -377,6 +408,51 @@ half_life_days = 2
         assert_eq!(
             variable("openbao.role_id"),
             "MUNIMENT_ROUTER_OPENBAO_ROLE_ID"
+        );
+    }
+
+    #[test]
+    fn langfuse_needs_a_host_and_two_real_keys() {
+        let load = |pairs: &[(&str, &str)]| {
+            let pairs: Vec<(String, String)> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            Settings::load(None, move |name| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.clone())
+            })
+            .unwrap()
+            .langfuse
+        };
+        let host = ("MUNIMENT_ROUTER_LANGFUSE_HOST", "http://langfuse:3000");
+        let public = ("MUNIMENT_ROUTER_LANGFUSE_PUBLIC_KEY", "pk-lf-1");
+        let secret = ("MUNIMENT_ROUTER_LANGFUSE_SECRET_KEY", "sk-lf-1");
+        assert_eq!(
+            load(&[host, public, secret]),
+            Some(langfuse::Settings {
+                host: "http://langfuse:3000".into(),
+                public_key: "pk-lf-1".into(),
+                secret_key: "sk-lf-1".into(),
+            })
+        );
+        assert_eq!(load(&[public, secret]), None);
+        assert_eq!(
+            load(&[host, public, ("MUNIMENT_ROUTER_LANGFUSE_SECRET_KEY", "")]),
+            None
+        );
+        assert_eq!(
+            load(&[
+                host,
+                (
+                    "MUNIMENT_ROUTER_LANGFUSE_PUBLIC_KEY",
+                    "PLACEHOLDER_LANGFUSE"
+                ),
+                secret
+            ]),
+            None
         );
     }
 }

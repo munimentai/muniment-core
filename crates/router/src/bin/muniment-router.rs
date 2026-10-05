@@ -156,6 +156,10 @@ fn serve(settings: Settings) -> Result<(), String> {
             signing_key,
             success: settings.success,
             metrics: settings.metrics,
+            langfuse: settings
+                .langfuse
+                .clone()
+                .map(factory::langfuse::Langfuse::start),
         },
     )
     .map_err(|error| format!("{}: {error}", settings.listen))?;

@@ -120,11 +120,16 @@ fn options(min_samples: f64) -> Options {
             min_samples,
         },
         metrics: true,
+        langfuse: None,
     }
 }
 
 /// A server on a file store holding `accounts`.
 fn fixture(accounts: Vec<Account>, min_samples: f64) -> Fixture {
+    fixture_with(accounts, options(min_samples))
+}
+
+fn fixture_with(accounts: Vec<Account>, options: Options) -> Fixture {
     let dir = std::env::temp_dir().join(format!("muniment-factory-{}", uuid::Uuid::now_v7()));
     std::fs::create_dir_all(&dir).unwrap();
     crate::config::save(
@@ -136,7 +141,7 @@ fn fixture(accounts: Vec<Account>, min_samples: f64) -> Fixture {
         },
     )
     .unwrap();
-    let handle = start("127.0.0.1:0", Backend::files(&dir), options(min_samples)).unwrap();
+    let handle = start("127.0.0.1:0", Backend::files(&dir), options).unwrap();
     Fixture { dir, handle }
 }
 
@@ -431,6 +436,83 @@ fn a_run_reports_the_status_and_type_of_its_last_failed_request() {
     let closed: Value = serde_json::from_str(&closed).unwrap();
     assert_eq!(closed["last_status"], 402);
     assert_eq!(closed["last_error_type"], "budget_exhausted");
+}
+
+#[test]
+fn each_turn_becomes_one_langfuse_generation_in_its_trace() {
+    let (host, seen) = langfuse::tests::ingestion(207);
+    let langfuse = langfuse::Langfuse::start(langfuse::Settings {
+        host,
+        public_key: "pk-lf-1".into(),
+        secret_key: "sk-lf-1".into(),
+    });
+    // The answer costs $0.20 + $0.12 on gpt-5.6-luna.
+    let (url, _seen) = upstream(vec![
+        completion("one", 1_000_000, 100_000),
+        Answer::Json(429, json!({"error": {"message": "slow down"}}).to_string()),
+    ]);
+    let mut options = options(5.0);
+    options.langfuse = Some(langfuse.clone());
+    let fixture = fixture_with(vec![account("a1", &url, &["gpt-5.6-luna"])], options);
+    let address = fixture.handle.address();
+    let token = create_run(address, "r1", "implementer", 5.0);
+    let send = |headers: &[(&str, &str)]| {
+        call(
+            address,
+            "POST",
+            "/v1/chat/completions",
+            &token,
+            Some(&turn("auto", false)),
+            headers,
+        )
+        .0
+    };
+    assert_eq!(send(&[("x-muniment-trace", "trace-abc")]), 200);
+    assert_eq!(send(&[]), 429);
+    assert!(langfuse.flush(Duration::from_secs(5)));
+    let events: Vec<Value> = seen
+        .try_iter()
+        .flat_map(|(auth, body)| {
+            assert_eq!(auth, "Basic cGstbGYtMTpzay1sZi0x");
+            body["batch"].as_array().unwrap().clone()
+        })
+        .collect();
+    let generations: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["type"] == "generation-create")
+        .map(|event| &event["body"])
+        .collect();
+    assert_eq!(generations.len(), 2, "{events:?}");
+    let served = generations[0];
+    assert_eq!(served["traceId"], "trace-abc");
+    assert_eq!(served["model"], "openai/gpt-5.6-luna");
+    assert_eq!(served["usageDetails"]["input"], 1_000_000);
+    assert_eq!(served["usageDetails"]["output"], 100_000);
+    assert!((served["costDetails"]["total"].as_f64().unwrap() - 0.32).abs() < 1e-9);
+    assert_eq!(served["metadata"]["run_id"], "r1");
+    assert_eq!(served["metadata"]["task_id"], "task-1");
+    assert_eq!(served["metadata"]["role"], "implementer");
+    assert_eq!(served["level"], "DEFAULT");
+    let start =
+        chrono::DateTime::parse_from_rfc3339(served["startTime"].as_str().unwrap()).unwrap();
+    let end = chrono::DateTime::parse_from_rfc3339(served["endTime"].as_str().unwrap()).unwrap();
+    assert!(start <= end);
+    assert_eq!(
+        served["metadata"]["latency_ms"],
+        (end - start).num_milliseconds()
+    );
+    // A turn with no trace header goes to the task's own trace.
+    let failed = generations[1];
+    let task_trace = langfuse::task_trace_id("task-1");
+    assert_eq!(failed["traceId"], task_trace.as_str());
+    assert_eq!(failed["level"], "ERROR");
+    assert_eq!(failed["statusMessage"], "429 rate_limited");
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "trace-create"
+                && event["body"]["id"] == task_trace.as_str())
+    );
 }
 
 #[test]

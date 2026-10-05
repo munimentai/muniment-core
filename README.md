@@ -113,6 +113,7 @@ Settings come from a TOML file (`--config` or `MUNIMENT_ROUTER_CONFIG`), and a
 | `quota_probe_interval_s` | `900` | Subscription quota probes. `0` turns them off. |
 | `drain_timeout_s` | `100` | How long SIGTERM waits for open streams. |
 | `metrics` | `true` | Serve `/metrics`. |
+| `langfuse.host`, `.public_key`, `.secret_key` | | Langfuse ingestion. Off unless all three are set. A key that starts with `PLACEHOLDER` counts as unset. |
 
 Endpoints: `POST /v1/runs`, `GET` and `DELETE /v1/runs/{run_id}` and
 `POST /v1/outcomes` take the admin token. A run's usage carries `last_status`,
@@ -120,7 +121,11 @@ the status of the run's most recent failed request, and `last_error_type`:
 `budget_exhausted`, `routing_constraints`, `routing_budget`,
 `upstream_unavailable`, `rate_limited`, `auth`, or null. `POST /v1/chat/completions` and
 `GET /v1/models` take a run token and read the `x-muniment-task` and
-`x-muniment-validation-failures` headers. A run's turn reserves its uncached
+`x-muniment-validation-failures` headers. With Langfuse on, each chat
+completion becomes one generation with its model, usage, cost, latency, run id,
+task id and role. It joins the trace that the `x-muniment-trace` header names,
+or the task's own trace when the header is absent. A background thread posts
+the generations in batches, so Langfuse never delays a turn. A run's turn reserves its uncached
 cost estimate before it goes upstream and settles the priced cost after. Once
 spend reaches the budget the router answers 402 with
 `{"error":{"type":"budget_exhausted",…}}`. Routing constraints run before

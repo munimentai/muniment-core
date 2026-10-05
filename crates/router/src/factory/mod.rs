@@ -10,6 +10,7 @@
 //! model, role and repository, and policy reads it at task boundaries.
 
 pub mod accounts;
+pub mod langfuse;
 pub mod metrics;
 pub mod openbao;
 pub mod postgres;
@@ -68,6 +69,8 @@ pub struct Options {
     pub signing_key: SigningKey,
     pub success: SuccessWindow,
     pub metrics: bool,
+    /// Where each chat completion goes as a Langfuse generation.
+    pub langfuse: Option<langfuse::Langfuse>,
 }
 
 /// Budget held by turns in flight, per run, and what this process has seen
@@ -169,6 +172,9 @@ impl Handle {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(20));
+        }
+        if let Some(langfuse) = &self.server.options.langfuse {
+            langfuse.flush(until.saturating_duration_since(Instant::now()));
         }
         true
     }
@@ -455,8 +461,13 @@ fn handle(
                     return;
                 }
             };
-            chat(head, reader, out, server, &run);
+            let started = chrono::Utc::now();
+            let attempts = chat(head, reader, out, server, &run);
             record_failure(server, &run, out);
+            if let Some(langfuse) = &server.options.langfuse {
+                let trace = langfuse::trace_header(head.header("x-muniment-trace"));
+                trace_generation(langfuse, &run, trace, started, &attempts, out);
+            }
         }
         _ => server::respond(
             out,
@@ -467,14 +478,14 @@ fn handle(
     }
 }
 
-/// Routes one run-token turn.
+/// Routes one run-token turn. Answers every upstream attempt it made.
 fn chat(
     head: &server::Head,
     reader: &mut BufReader<TcpStream>,
     out: &mut Recorder<'_>,
     server: &Server,
     run: &RunRecord,
-) {
+) -> Vec<Attempt> {
     let budget = server.budgets.get(&run.run_id).unwrap_or_default();
     if budget.spent + budget.reserved >= budget.budget {
         server.metrics.add(
@@ -483,7 +494,7 @@ fn chat(
             1.0,
         );
         server::respond(out, 402, "Payment Required", &exhausted(run, budget));
-        return;
+        return Vec::new();
     }
     let request = match server::read_body(reader, head)
         .ok_or_else(|| {
@@ -499,13 +510,14 @@ fn chat(
         Ok(request) => request,
         Err(answer) => {
             server::respond(out, 400, "Bad Request", &answer);
-            return;
+            return Vec::new();
         }
     };
     let hooks = RunHooks {
         server,
         run,
         held: Mutex::new(0.0),
+        attempts: Mutex::new(Vec::new()),
     };
     let thread = head
         .header("x-muniment-thread")
@@ -524,6 +536,72 @@ fn chat(
             .and_then(|value| value.trim().parse::<u32>().ok()),
         head.header("x-muniment-request-purpose"),
     );
+    hooks
+        .attempts
+        .into_inner()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Sends one turn to Langfuse as a generation in `trace`, or in the task's
+/// own trace when the request named none.
+fn trace_generation(
+    langfuse: &langfuse::Langfuse,
+    run: &RunRecord,
+    trace: Option<String>,
+    started: chrono::DateTime<chrono::Utc>,
+    attempts: &[Attempt],
+    out: &Recorder<'_>,
+) {
+    let ended = chrono::Utc::now();
+    let trace_id = match trace {
+        Some(trace) => trace,
+        None => {
+            let trace = langfuse::task_trace_id(&run.task_id);
+            langfuse.send(langfuse::event(
+                "trace-create",
+                json!({"id": trace, "metadata": {"task_id": run.task_id, "repo": run.repo}}),
+            ));
+            trace
+        }
+    };
+    let time =
+        |at: chrono::DateTime<chrono::Utc>| at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let served = attempts.iter().rev().find(|attempt| attempt.served);
+    let last = served.or(attempts.last());
+    let failure = out.failure();
+    let mut body = json!({
+        "id": uuid::Uuid::new_v4().to_string(),
+        "traceId": trace_id,
+        "name": format!("{} chat completion", run.role),
+        "startTime": time(started),
+        "endTime": time(ended),
+        "model": last.map(|attempt| format!("{}/{}", attempt.route.family, attempt.route.model)),
+        "costDetails": {"total": attempts.iter().map(|attempt| attempt.cost_usd).sum::<f64>()},
+        "metadata": {
+            "run_id": run.run_id,
+            "task_id": run.task_id,
+            "repo": run.repo,
+            "role": run.role,
+            "account": last.map(|attempt| attempt.account.clone()),
+            "attempts": attempts.len(),
+            "latency_ms": (ended - started).num_milliseconds(),
+            "status": out.status,
+        },
+        "level": if failure.is_some() { "ERROR" } else { "DEFAULT" },
+    });
+    if let Some(tokens) = served.and_then(|attempt| attempt.tokens) {
+        body["usageDetails"] = json!({
+            "input": tokens.input,
+            "output": tokens.output,
+            "cache_read_input_tokens": tokens.cache_read,
+            "cache_creation_input_tokens": tokens.cache_write,
+        });
+    }
+    if let Some((status, kind)) = failure {
+        let kind = failure_type(status, kind.as_deref()).or(kind.as_deref());
+        body["statusMessage"] = json!(format!("{status} {}", kind.unwrap_or("error")));
+    }
+    langfuse.send(langfuse::event("generation-create", body));
 }
 
 /// The failure type a run reports for an answer of `status` whose body named
@@ -847,6 +925,8 @@ struct RunHooks<'a> {
     run: &'a RunRecord,
     /// What the attempt in flight holds of the budget.
     held: Mutex<f64>,
+    /// Every upstream attempt of the turn, in order.
+    attempts: Mutex<Vec<Attempt>>,
 }
 
 impl Hooks for RunHooks<'_> {
@@ -927,6 +1007,10 @@ impl Hooks for RunHooks<'_> {
     }
 
     fn settle(&self, attempt: &Attempt) {
+        self.attempts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(attempt.clone());
         let held = std::mem::take(&mut *self.held.lock().unwrap_or_else(|e| e.into_inner()));
         self.server
             .budgets
