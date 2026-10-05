@@ -68,6 +68,11 @@ const FAMILIES: &[(&str, &str, &str)] = &[
         "Requests refused for an exhausted run budget, by role.",
     ),
     (
+        "muniment_router_run_errors_total",
+        "counter",
+        "Run requests answered with an error, by error type and status.",
+    ),
+    (
         "muniment_router_cooldowns_total",
         "counter",
         "Upstream refusals that cooled an account, by account.",

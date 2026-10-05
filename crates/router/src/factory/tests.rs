@@ -436,6 +436,14 @@ fn a_run_reports_the_status_and_type_of_its_last_failed_request() {
     let closed: Value = serde_json::from_str(&closed).unwrap();
     assert_eq!(closed["last_status"], 402);
     assert_eq!(closed["last_error_type"], "budget_exhausted");
+    let (_, metrics) = call(address, "GET", "/metrics", "", None, &[]);
+    assert!(
+        metrics.contains(
+            "muniment_router_run_errors_total{type=\"budget_exhausted\",status=\"402\"} 1"
+        ),
+        "{metrics}"
+    );
+    assert!(metrics.contains("muniment_router_run_errors_total{type=\"other\",status=\"404\"} 1"));
 }
 
 #[test]

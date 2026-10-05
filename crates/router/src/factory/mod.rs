@@ -630,6 +630,14 @@ fn record_failure(server: &Server, run: &RunRecord, out: &Recorder<'_>) {
         status,
         error_type: failure_type(status, kind.as_deref()).map(str::to_owned),
     };
+    server.metrics.add(
+        "muniment_router_run_errors_total",
+        &[
+            ("type", failure.error_type.as_deref().unwrap_or("other")),
+            ("status", &status.to_string()),
+        ],
+        1.0,
+    );
     if let Err(error) = server
         .state
         .backend
