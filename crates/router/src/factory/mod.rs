@@ -621,14 +621,25 @@ fn failure_type(status: u16, kind: Option<&str>) -> Option<&'static str> {
     }
 }
 
-/// Keeps the run's failed answer, if this one failed, for `GET /v1/runs/{id}`.
+/// Keeps the outcome of the run's most recent request for `GET /v1/runs/{id}`:
+/// the failure when the answer failed, and nothing once a later answer did not.
 fn record_failure(server: &Server, run: &RunRecord, out: &Recorder<'_>) {
+    let store = &server.state.backend.store;
     let Some((status, kind)) = out.failure() else {
+        if out.status.is_some() && run.last_failure.is_some() {
+            if let Err(error) = store.record_run_failure(&run.run_id, None) {
+                eprintln!(
+                    "muniment-router: run {} failure not cleared: {error}",
+                    run.run_id
+                );
+            }
+        }
         return;
     };
     let failure = RunFailure {
         status,
         error_type: failure_type(status, kind.as_deref()).map(str::to_owned),
+        at_ms: (server.state.now_ms)(),
     };
     server.metrics.add(
         "muniment_router_run_errors_total",
@@ -638,12 +649,7 @@ fn record_failure(server: &Server, run: &RunRecord, out: &Recorder<'_>) {
         ],
         1.0,
     );
-    if let Err(error) = server
-        .state
-        .backend
-        .store
-        .record_run_failure(&run.run_id, &failure)
-    {
+    if let Err(error) = store.record_run_failure(&run.run_id, Some(&failure)) {
         eprintln!(
             "muniment-router: run {} failure not saved: {error}",
             run.run_id
@@ -827,6 +833,10 @@ fn usage_body(run: &RunRecord, budget: Option<Budget>) -> Value {
         "revoked": run.revoked_ms.is_some(),
         "last_status": run.last_failure.as_ref().map(|failure| failure.status),
         "last_error_type": run.last_failure.as_ref().and_then(|failure| failure.error_type.as_deref()),
+        "last_status_at": run.last_failure.as_ref().and_then(|failure| {
+            chrono::DateTime::from_timestamp_millis(failure.at_ms)
+                .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        }),
     })
 }
 

@@ -35,8 +35,8 @@ pub struct RunRecord {
     pub revoked_ms: Option<i64>,
     #[serde(default)]
     pub usage: RunUsage,
-    /// The most recent request of the run that the router answered with an
-    /// error status.
+    /// The run's most recent request, when the router answered it with an
+    /// error status. A later answered request clears it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_failure: Option<RunFailure>,
 }
@@ -50,6 +50,8 @@ pub struct RunFailure {
     /// `upstream_unavailable`, `rate_limited` or `auth`, or none when the
     /// failure is none of those.
     pub error_type: Option<String>,
+    /// When the router answered it, in milliseconds since the epoch.
+    pub at_ms: i64,
 }
 
 /// What a run has spent so far.
@@ -219,8 +221,9 @@ pub trait RouterStore: Send + Sync {
     fn run(&self, run_id: &str) -> io::Result<Option<RunRecord>>;
     fn add_run_usage(&self, run_id: &str, charge: &RunCharge) -> io::Result<()>;
     fn revoke_run(&self, run_id: &str, now_ms: i64) -> io::Result<()>;
-    /// Keeps `failure` as the run's most recent failed request.
-    fn record_run_failure(&self, run_id: &str, failure: &RunFailure) -> io::Result<()>;
+    /// Keeps `failure` as the outcome of the run's most recent request. None
+    /// clears it after a request the router answered without an error.
+    fn record_run_failure(&self, run_id: &str, failure: Option<&RunFailure>) -> io::Result<()>;
 
     /// Keeps one gate outcome as reported.
     fn record_outcome(&self, run_id: &str, gate: &str, passed: bool, now_ms: i64)
@@ -393,9 +396,9 @@ impl MemoryRuns {
         Ok(())
     }
 
-    pub fn record_run_failure(&self, run_id: &str, failure: &RunFailure) -> io::Result<()> {
+    pub fn record_run_failure(&self, run_id: &str, failure: Option<&RunFailure>) -> io::Result<()> {
         if let Some(run) = lock(&self.runs).get_mut(run_id) {
-            run.last_failure = Some(failure.clone());
+            run.last_failure = failure.cloned();
         }
         Ok(())
     }
@@ -532,7 +535,7 @@ impl RouterStore for FileStore {
         self.runs.revoke_run(run_id, now_ms)
     }
 
-    fn record_run_failure(&self, run_id: &str, failure: &RunFailure) -> io::Result<()> {
+    fn record_run_failure(&self, run_id: &str, failure: Option<&RunFailure>) -> io::Result<()> {
         self.runs.record_run_failure(run_id, failure)
     }
 

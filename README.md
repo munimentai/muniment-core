@@ -117,9 +117,11 @@ Settings come from a TOML file (`--config` or `MUNIMENT_ROUTER_CONFIG`), and a
 
 Endpoints: `POST /v1/runs`, `GET` and `DELETE /v1/runs/{run_id}` and
 `POST /v1/outcomes` take the admin token. A run's usage carries `last_status`,
-the status of the run's most recent failed request, and `last_error_type`:
-`budget_exhausted`, `routing_constraints`, `routing_budget`,
-`upstream_unavailable`, `rate_limited`, `auth`, or null. `POST /v1/chat/completions` and
+`last_error_type` and `last_status_at` for the run's most recent request when
+the router answered it with an error: the status, one of `budget_exhausted`,
+`routing_constraints`, `routing_budget`, `upstream_unavailable`,
+`rate_limited` or `auth` (or null), and the RFC 3339 time. A later request
+the router answers without an error sets all three back to null. `POST /v1/chat/completions` and
 `GET /v1/models` take a run token and read the `x-muniment-task` and
 `x-muniment-validation-failures` headers. With Langfuse on, each chat
 completion becomes one generation with its model, usage, cost, latency, run id,

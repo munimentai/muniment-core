@@ -101,6 +101,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
         2,
         "ALTER TABLE runs ADD COLUMN last_status integer, ADD COLUMN last_error_type text;",
     ),
+    (3, "ALTER TABLE runs ADD COLUMN last_status_ms bigint;"),
 ];
 
 /// The routing settings row: everything in the router configuration that is
@@ -476,7 +477,7 @@ impl RouterStore for PgStore {
             client.query_opt(
                 "SELECT run_id, task_id, repo, role, budget_usd, created_ms, expires_ms, revoked_ms,
                         spent_usd, input_tokens, output_tokens, cache_read_tokens, requests, models,
-                        last_status, last_error_type
+                        last_status, last_error_type, last_status_ms
                  FROM runs WHERE run_id = $1",
                 &[&run_id],
             )
@@ -505,6 +506,7 @@ impl RouterStore for PgStore {
                 last_failure: row.get::<_, Option<i32>>(14).map(|status| RunFailure {
                     status: status.clamp(0, i32::from(u16::MAX)) as u16,
                     error_type: row.get(15),
+                    at_ms: row.get::<_, Option<i64>>(16).unwrap_or(0),
                 }),
             }
         }))
@@ -549,11 +551,15 @@ impl RouterStore for PgStore {
         .map(|_| ())
     }
 
-    fn record_run_failure(&self, run_id: &str, failure: &RunFailure) -> io::Result<()> {
+    fn record_run_failure(&self, run_id: &str, failure: Option<&RunFailure>) -> io::Result<()> {
+        let status = failure.map(|failure| i32::from(failure.status));
+        let error_type = failure.and_then(|failure| failure.error_type.clone());
+        let at_ms = failure.map(|failure| failure.at_ms);
         self.with(|client| {
             client.execute(
-                "UPDATE runs SET last_status = $2, last_error_type = $3 WHERE run_id = $1",
-                &[&run_id, &i32::from(failure.status), &failure.error_type],
+                "UPDATE runs SET last_status = $2, last_error_type = $3, last_status_ms = $4
+                 WHERE run_id = $1",
+                &[&run_id, &status, &error_type, &at_ms],
             )
         })
         .map(|_| ())
@@ -880,20 +886,20 @@ pub(crate) mod tests {
         assert!(store.run("nope").unwrap().is_none());
         assert_eq!(store.run("r1").unwrap().unwrap().last_failure, None);
         for failure in [
-            RunFailure {
+            Some(RunFailure {
                 status: 429,
                 error_type: Some("rate_limited".into()),
-            },
-            RunFailure {
+                at_ms: 70,
+            }),
+            Some(RunFailure {
                 status: 400,
                 error_type: None,
-            },
+                at_ms: 80,
+            }),
+            None,
         ] {
-            store.record_run_failure("r1", &failure).unwrap();
-            assert_eq!(
-                store.run("r1").unwrap().unwrap().last_failure,
-                Some(failure)
-            );
+            store.record_run_failure("r1", failure.as_ref()).unwrap();
+            assert_eq!(store.run("r1").unwrap().unwrap().last_failure, failure);
         }
 
         store.record_outcome("r1", "unit_tests", true, 70).unwrap();

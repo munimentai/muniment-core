@@ -369,7 +369,7 @@ fn a_budget_is_reserved_settled_and_then_refused_with_402() {
 }
 
 #[test]
-fn a_run_reports_the_status_and_type_of_its_last_failed_request() {
+fn a_run_reports_the_status_type_and_time_of_its_last_request_when_it_failed() {
     let (url, _seen) = upstream(vec![Answer::Json(
         429,
         json!({"error": {"message": "slow down"}}).to_string(),
@@ -380,6 +380,7 @@ fn a_run_reports_the_status_and_type_of_its_last_failed_request() {
     let usage = run_usage(address, "r1");
     assert_eq!(usage["last_status"], Value::Null);
     assert_eq!(usage["last_error_type"], Value::Null);
+    assert_eq!(usage["last_status_at"], Value::Null);
     let send = |token: &str, body: &Value| {
         call(
             address,
@@ -395,6 +396,9 @@ fn a_run_reports_the_status_and_type_of_its_last_failed_request() {
     let usage = run_usage(address, "r1");
     assert_eq!(usage["last_status"], 429);
     assert_eq!(usage["last_error_type"], "rate_limited");
+    let at =
+        chrono::DateTime::parse_from_rfc3339(usage["last_status_at"].as_str().unwrap()).unwrap();
+    assert!((chrono::Utc::now() - at.to_utc()).num_seconds().abs() < 60);
     // gpt-5.6-luna's estimate for 8,192 output tokens is about $0.0098.
     let token = create_run(address, "r2", "implementer", 0.005);
     assert_eq!(send(&token, &turn("auto", false)).0, 422);
@@ -425,9 +429,12 @@ fn a_run_reports_the_status_and_type_of_its_last_failed_request() {
     let usage = run_usage(address, "r3");
     assert_eq!(usage["last_status"], 404);
     assert_eq!(usage["last_error_type"], Value::Null);
-    // A served turn leaves the last failure in place.
+    // A served turn clears the failure.
     assert_eq!(send(&turn("auto", false)).0, 200);
-    assert_eq!(run_usage(address, "r3")["last_status"], 404);
+    let usage = run_usage(address, "r3");
+    assert_eq!(usage["last_status"], Value::Null);
+    assert_eq!(usage["last_error_type"], Value::Null);
+    assert_eq!(usage["last_status_at"], Value::Null);
     assert_eq!(send(&turn("auto", false)).0, 200);
     let (status, body) = send(&turn("auto", false));
     assert_eq!(status, 402, "{body}");
