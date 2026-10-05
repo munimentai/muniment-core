@@ -18,13 +18,16 @@ use serde_json::Value;
 use crate::config::{Account, Classifier, Credential, Route, RouterConfig};
 use crate::policy::{self, Sessions};
 use crate::quota::{Quota, QuotaStore};
-use crate::store::{success_scopes, RouterStore, RunCharge, RunRecord, RunUsage, SuccessStat};
+use crate::store::{
+    success_scopes, RouterStore, RunCharge, RunFailure, RunRecord, RunUsage, SuccessStat,
+};
 use crate::usage::Ledger;
 
 /// Every migration, in order. A migration never changes once released.
-const MIGRATIONS: &[(i32, &str)] = &[(
-    1,
-    "CREATE TABLE accounts (
+const MIGRATIONS: &[(i32, &str)] = &[
+    (
+        1,
+        "CREATE TABLE accounts (
         id text PRIMARY KEY,
         position bigserial NOT NULL,
         family text NOT NULL,
@@ -93,7 +96,12 @@ const MIGRATIONS: &[(i32, &str)] = &[(
         updated_ms bigint NOT NULL,
         PRIMARY KEY (model, role, repo)
     );",
-)];
+    ),
+    (
+        2,
+        "ALTER TABLE runs ADD COLUMN last_status integer, ADD COLUMN last_error_type text;",
+    ),
+];
 
 /// The routing settings row: everything in the router configuration that is
 /// neither an account nor the classifier, which the server's own settings name.
@@ -467,7 +475,8 @@ impl RouterStore for PgStore {
         let row = self.with(|client| {
             client.query_opt(
                 "SELECT run_id, task_id, repo, role, budget_usd, created_ms, expires_ms, revoked_ms,
-                        spent_usd, input_tokens, output_tokens, cache_read_tokens, requests, models
+                        spent_usd, input_tokens, output_tokens, cache_read_tokens, requests, models,
+                        last_status, last_error_type
                  FROM runs WHERE run_id = $1",
                 &[&run_id],
             )
@@ -493,6 +502,10 @@ impl RouterStore for PgStore {
                     requests: count(12),
                     models,
                 },
+                last_failure: row.get::<_, Option<i32>>(14).map(|status| RunFailure {
+                    status: status.clamp(0, i32::from(u16::MAX)) as u16,
+                    error_type: row.get(15),
+                }),
             }
         }))
     }
@@ -531,6 +544,16 @@ impl RouterStore for PgStore {
             client.execute(
                 "UPDATE runs SET revoked_ms = COALESCE(revoked_ms, $2) WHERE run_id = $1",
                 &[&run_id, &now_ms],
+            )
+        })
+        .map(|_| ())
+    }
+
+    fn record_run_failure(&self, run_id: &str, failure: &RunFailure) -> io::Result<()> {
+        self.with(|client| {
+            client.execute(
+                "UPDATE runs SET last_status = $2, last_error_type = $3 WHERE run_id = $1",
+                &[&run_id, &i32::from(failure.status), &failure.error_type],
             )
         })
         .map(|_| ())
@@ -814,6 +837,7 @@ pub(crate) mod tests {
             expires_ms: 1_000,
             revoked_ms: None,
             usage: RunUsage::default(),
+            last_failure: None,
         };
         store.create_run(&run).unwrap();
         assert_eq!(
@@ -854,6 +878,23 @@ pub(crate) mod tests {
         store.revoke_run("r1", 60).unwrap();
         assert_eq!(store.run("r1").unwrap().unwrap().revoked_ms, Some(50));
         assert!(store.run("nope").unwrap().is_none());
+        assert_eq!(store.run("r1").unwrap().unwrap().last_failure, None);
+        for failure in [
+            RunFailure {
+                status: 429,
+                error_type: Some("rate_limited".into()),
+            },
+            RunFailure {
+                status: 400,
+                error_type: None,
+            },
+        ] {
+            store.record_run_failure("r1", &failure).unwrap();
+            assert_eq!(
+                store.run("r1").unwrap().unwrap().last_failure,
+                Some(failure)
+            );
+        }
 
         store.record_outcome("r1", "unit_tests", true, 70).unwrap();
         for (role, repo) in success_scopes("implementer", "factory/app") {

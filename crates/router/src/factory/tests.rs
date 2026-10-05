@@ -364,6 +364,101 @@ fn a_budget_is_reserved_settled_and_then_refused_with_402() {
 }
 
 #[test]
+fn a_run_reports_the_status_and_type_of_its_last_failed_request() {
+    let (url, _seen) = upstream(vec![Answer::Json(
+        429,
+        json!({"error": {"message": "slow down"}}).to_string(),
+    )]);
+    let fixture = fixture(vec![account("a1", &url, &["gpt-5.6-luna"])], 5.0);
+    let address = fixture.handle.address();
+    let token = create_run(address, "r1", "implementer", 0.5);
+    let usage = run_usage(address, "r1");
+    assert_eq!(usage["last_status"], Value::Null);
+    assert_eq!(usage["last_error_type"], Value::Null);
+    let send = |token: &str, body: &Value| {
+        call(
+            address,
+            "POST",
+            "/v1/chat/completions",
+            token,
+            Some(body),
+            &[],
+        )
+    };
+    let (status, body) = send(&token, &turn("auto", false));
+    assert_eq!(status, 429, "{body}");
+    let usage = run_usage(address, "r1");
+    assert_eq!(usage["last_status"], 429);
+    assert_eq!(usage["last_error_type"], "rate_limited");
+    // gpt-5.6-luna's estimate for 8,192 output tokens is about $0.0098.
+    let token = create_run(address, "r2", "implementer", 0.005);
+    assert_eq!(send(&token, &turn("auto", false)).0, 422);
+    assert_eq!(
+        run_usage(address, "r2")["last_error_type"],
+        "routing_constraints"
+    );
+
+    // Each answer below costs $0.20 + $0.12, so the second spends the budget.
+    let (url, _seen) = upstream(vec![
+        completion("one", 1_000_000, 100_000),
+        completion("two", 1_000_000, 100_000),
+    ]);
+    let fixture = self::fixture(vec![account("a1", &url, &["gpt-5.6-luna"])], 5.0);
+    let address = fixture.handle.address();
+    let token = create_run(address, "r3", "implementer", 0.5);
+    let send = |body: &Value| {
+        call(
+            address,
+            "POST",
+            "/v1/chat/completions",
+            &token,
+            Some(body),
+            &[],
+        )
+    };
+    assert_eq!(send(&turn("no-such-model", false)).0, 404);
+    let usage = run_usage(address, "r3");
+    assert_eq!(usage["last_status"], 404);
+    assert_eq!(usage["last_error_type"], Value::Null);
+    // A served turn leaves the last failure in place.
+    assert_eq!(send(&turn("auto", false)).0, 200);
+    assert_eq!(run_usage(address, "r3")["last_status"], 404);
+    assert_eq!(send(&turn("auto", false)).0, 200);
+    let (status, body) = send(&turn("auto", false));
+    assert_eq!(status, 402, "{body}");
+    let (status, closed) = call(address, "DELETE", "/v1/runs/r3", ADMIN, None, &[]);
+    assert_eq!(status, 200);
+    let closed: Value = serde_json::from_str(&closed).unwrap();
+    assert_eq!(closed["last_status"], 402);
+    assert_eq!(closed["last_error_type"], "budget_exhausted");
+}
+
+#[test]
+fn failure_types_follow_the_error_type_then_the_status() {
+    for (status, kind, expected) in [
+        (402, Some("budget_exhausted"), Some("budget_exhausted")),
+        (
+            422,
+            Some("routing_constraints"),
+            Some("routing_constraints"),
+        ),
+        (422, Some("routing_capability"), Some("routing_constraints")),
+        (422, Some("routing_budget"), Some("routing_budget")),
+        (503, Some("routing_budget"), Some("routing_budget")),
+        (503, Some("router_error"), Some("upstream_unavailable")),
+        (502, None, Some("upstream_unavailable")),
+        (402, Some("router_error"), Some("upstream_unavailable")),
+        (429, Some("router_error"), Some("rate_limited")),
+        (401, Some("router_error"), Some("auth")),
+        (403, None, Some("auth")),
+        (400, Some("router_error"), None),
+        (409, Some("router_busy"), None),
+    ] {
+        assert_eq!(failure_type(status, kind), expected, "{status} {kind:?}");
+    }
+}
+
+#[test]
 fn a_run_budget_constrains_routing_before_any_upstream_call() {
     let (url, seen) = upstream(vec![completion("one", 10, 2)]);
     let fixture = fixture(vec![account("a1", &url, &["gpt-5.6-luna"])], 5.0);
@@ -415,6 +510,7 @@ fn a_reservation_holds_at_most_what_remains() {
             spent_usd: 0.25,
             ..store::RunUsage::default()
         },
+        last_failure: None,
     });
     assert_eq!(budgets.reserve("r", 0.5), Some(0.5));
     // Two turns in flight: the second holds only what the first left.

@@ -115,7 +115,10 @@ Settings come from a TOML file (`--config` or `MUNIMENT_ROUTER_CONFIG`), and a
 | `metrics` | `true` | Serve `/metrics`. |
 
 Endpoints: `POST /v1/runs`, `GET` and `DELETE /v1/runs/{run_id}` and
-`POST /v1/outcomes` take the admin token. `POST /v1/chat/completions` and
+`POST /v1/outcomes` take the admin token. A run's usage carries `last_status`,
+the status of the run's most recent failed request, and `last_error_type`:
+`budget_exhausted`, `routing_constraints`, `routing_budget`,
+`upstream_unavailable`, `rate_limited`, `auth`, or null. `POST /v1/chat/completions` and
 `GET /v1/models` take a run token and read the `x-muniment-task` and
 `x-muniment-validation-failures` headers. A run's turn reserves its uncached
 cost estimate before it goes upstream and settles the priced cost after. Once

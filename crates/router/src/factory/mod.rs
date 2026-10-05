@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 
 use crate::config::{Account, Route};
 use crate::server::{self, Attempt, Hooks, State};
-use crate::store::{self, Backend, RunCharge, RunRecord, SuccessWindow};
+use crate::store::{self, Backend, RunCharge, RunFailure, RunRecord, SuccessWindow};
 use crate::{model_catalog, native_auth, quota, served_models, usage, wire};
 
 use metrics::Metrics;
@@ -37,6 +37,8 @@ use token::{Claims, SigningKey};
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
 const LONGEST_RUN_S: u64 = 7 * 24 * 60 * 60;
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(12);
+/// How much of an error answer the server keeps to read its error type.
+const ERROR_CAPTURE: usize = 16 * 1024;
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -250,10 +252,25 @@ fn start_with_clock(
     })
 }
 
-/// Records the status line of whatever the router writes back.
+/// Records the status line of whatever the router writes back, and the start
+/// of an error answer.
 struct Recorder<'a> {
     inner: &'a mut TcpStream,
     status: Option<u16>,
+    error: Vec<u8>,
+}
+
+impl Recorder<'_> {
+    /// The status and the `error.type` of an answer of 400 or above.
+    fn failure(&self) -> Option<(u16, Option<String>)> {
+        let status = self.status.filter(|status| *status >= 400)?;
+        let text = String::from_utf8_lossy(&self.error);
+        let kind = text
+            .split_once("\r\n\r\n")
+            .and_then(|(_, body)| serde_json::from_str::<Value>(body).ok())
+            .and_then(|body| body["error"]["type"].as_str().map(str::to_owned));
+        Some((status, kind))
+    }
 }
 
 impl Write for Recorder<'_> {
@@ -265,7 +282,12 @@ impl Write for Recorder<'_> {
                 .and_then(|rest| rest.get(..3))
                 .and_then(|code| code.parse().ok());
         }
-        self.inner.write(bytes)
+        let written = self.inner.write(bytes)?;
+        if self.status.is_some_and(|status| status >= 400) {
+            let room = ERROR_CAPTURE.saturating_sub(self.error.len());
+            self.error.extend_from_slice(&bytes[..written.min(room)]);
+        }
+        Ok(written)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -286,6 +308,7 @@ fn serve(stream: TcpStream, server: &Server) {
     let mut out = Recorder {
         inner: &mut stream,
         status: None,
+        error: Vec::new(),
     };
     let Some(head) = server::read_head(&mut reader) else {
         server::respond(
@@ -432,45 +455,8 @@ fn handle(
                     return;
                 }
             };
-            let budget = server.budgets.get(&run.run_id).unwrap_or_default();
-            if budget.spent + budget.reserved >= budget.budget {
-                server.metrics.add(
-                    "muniment_router_budget_rejections_total",
-                    &[("role", &run.role)],
-                    1.0,
-                );
-                server::respond(out, 402, "Payment Required", &exhausted(&run, budget));
-                return;
-            }
-            let request = match body(reader) {
-                Ok(request) => request,
-                Err(answer) => {
-                    server::respond(out, 400, "Bad Request", &answer);
-                    return;
-                }
-            };
-            let hooks = RunHooks {
-                server,
-                run: &run,
-                held: Mutex::new(0.0),
-            };
-            let thread = head
-                .header("x-muniment-thread")
-                .filter(|id| id.len() == 64 && id.bytes().all(|c| c.is_ascii_hexdigit()))
-                .map(str::to_owned)
-                .unwrap_or_else(|| crate::policy::digest(&format!("run:{}", run.run_id)));
-            server::complete(
-                out,
-                &server.state,
-                &hooks,
-                &request,
-                None,
-                Some(&thread),
-                head.header("x-muniment-task").unwrap_or(&run.task_id),
-                head.header("x-muniment-validation-failures")
-                    .and_then(|value| value.trim().parse::<u32>().ok()),
-                head.header("x-muniment-request-purpose"),
-            );
+            chat(head, reader, out, server, &run);
+            record_failure(server, &run, out);
         }
         _ => server::respond(
             out,
@@ -478,6 +464,104 @@ fn handle(
             "Not Found",
             &error("The router does not serve this route.", "router_error"),
         ),
+    }
+}
+
+/// Routes one run-token turn.
+fn chat(
+    head: &server::Head,
+    reader: &mut BufReader<TcpStream>,
+    out: &mut Recorder<'_>,
+    server: &Server,
+    run: &RunRecord,
+) {
+    let budget = server.budgets.get(&run.run_id).unwrap_or_default();
+    if budget.spent + budget.reserved >= budget.budget {
+        server.metrics.add(
+            "muniment_router_budget_rejections_total",
+            &[("role", &run.role)],
+            1.0,
+        );
+        server::respond(out, 402, "Payment Required", &exhausted(run, budget));
+        return;
+    }
+    let request = match server::read_body(reader, head)
+        .ok_or_else(|| {
+            error(
+                "The router could not read the request body.",
+                "router_error",
+            )
+        })
+        .and_then(|bytes| {
+            serde_json::from_slice(&bytes)
+                .map_err(|_| error("The request body is not JSON.", "router_error"))
+        }) {
+        Ok(request) => request,
+        Err(answer) => {
+            server::respond(out, 400, "Bad Request", &answer);
+            return;
+        }
+    };
+    let hooks = RunHooks {
+        server,
+        run,
+        held: Mutex::new(0.0),
+    };
+    let thread = head
+        .header("x-muniment-thread")
+        .filter(|id| id.len() == 64 && id.bytes().all(|c| c.is_ascii_hexdigit()))
+        .map(str::to_owned)
+        .unwrap_or_else(|| crate::policy::digest(&format!("run:{}", run.run_id)));
+    server::complete(
+        out,
+        &server.state,
+        &hooks,
+        &request,
+        None,
+        Some(&thread),
+        head.header("x-muniment-task").unwrap_or(&run.task_id),
+        head.header("x-muniment-validation-failures")
+            .and_then(|value| value.trim().parse::<u32>().ok()),
+        head.header("x-muniment-request-purpose"),
+    );
+}
+
+/// The failure type a run reports for an answer of `status` whose body named
+/// the error type `kind`.
+fn failure_type(status: u16, kind: Option<&str>) -> Option<&'static str> {
+    match kind {
+        Some("budget_exhausted") => return Some("budget_exhausted"),
+        Some("routing_constraints" | "routing_capability") => return Some("routing_constraints"),
+        Some("routing_budget") => return Some("routing_budget"),
+        _ => {}
+    }
+    match status {
+        401 | 403 => Some("auth"),
+        429 => Some("rate_limited"),
+        402 | 500..=599 => Some("upstream_unavailable"),
+        _ => None,
+    }
+}
+
+/// Keeps the run's failed answer, if this one failed, for `GET /v1/runs/{id}`.
+fn record_failure(server: &Server, run: &RunRecord, out: &Recorder<'_>) {
+    let Some((status, kind)) = out.failure() else {
+        return;
+    };
+    let failure = RunFailure {
+        status,
+        error_type: failure_type(status, kind.as_deref()).map(str::to_owned),
+    };
+    if let Err(error) = server
+        .state
+        .backend
+        .store
+        .record_run_failure(&run.run_id, &failure)
+    {
+        eprintln!(
+            "muniment-router: run {} failure not saved: {error}",
+            run.run_id
+        );
     }
 }
 
@@ -582,6 +666,7 @@ fn create_run(server: &Server, body: Value) -> (u16, Value) {
         expires_ms: now + new.expires_in_s as i64 * 1000,
         revoked_ms: None,
         usage: store::RunUsage::default(),
+        last_failure: None,
     };
     let store = &server.state.backend.store;
     match store.create_run(&record) {
@@ -654,6 +739,8 @@ fn usage_body(run: &RunRecord, budget: Option<Budget>) -> Value {
         "models": run.usage.models,
         "expires_ms": run.expires_ms,
         "revoked": run.revoked_ms.is_some(),
+        "last_status": run.last_failure.as_ref().map(|failure| failure.status),
+        "last_error_type": run.last_failure.as_ref().and_then(|failure| failure.error_type.as_deref()),
     })
 }
 
