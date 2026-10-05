@@ -584,7 +584,7 @@ fn trace_generation(
             "role": run.role,
             "account": last.map(|attempt| attempt.account.clone()),
             "attempts": attempts.len(),
-            "latency_ms": (ended - started).num_milliseconds(),
+            "latency_ms": ended.timestamp_millis() - started.timestamp_millis(),
             "status": out.status,
         },
         "level": if failure.is_some() { "ERROR" } else { "DEFAULT" },
