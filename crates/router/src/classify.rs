@@ -30,6 +30,95 @@ pub const TIMEOUT: Duration = Duration::from_secs(8);
 /// The longest slice of the turn the classifier sees.
 pub const STATE_LIMIT: usize = 8_000;
 
+/// Thresholds belong to the exact endpoint/model, not to the catalog as a whole.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Profile {
+    pub minimum: f64,
+    pub score: Score,
+}
+impl Default for Profile {
+    fn default() -> Self {
+        Self {
+            minimum: 0.6,
+            score: Score::Native,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Score {
+    #[default]
+    Native,
+    Probability,
+}
+pub fn profile_key(classifier: &Classifier) -> String {
+    let location = match classifier {
+        Classifier::Endpoint { base_url, .. } => base_url.as_str(),
+        Classifier::Typesafe { base_url, .. } => base_url.as_deref().unwrap_or(TYPESAFE_URL),
+        Classifier::Pooled { family, .. } => family.as_str(),
+        Classifier::None => "none",
+    };
+    super::policy::digest(&format!(
+        "{}|{}|{}",
+        classifier.kind(),
+        location,
+        classifier.model()
+    ))
+}
+pub fn profile(config: &RouterConfig) -> Profile {
+    config
+        .policy
+        .classifier_profiles
+        .get(&profile_key(&config.classifier))
+        .cloned()
+        .unwrap_or(Profile {
+            minimum: config.min_confidence,
+            ..Default::default()
+        })
+}
+fn parse_profile(answer: &Value, options: &[Route], profile: &Profile) -> Option<(String, f64)> {
+    let row = answer.get("answers")?.get(QUESTION)?;
+    if row.get("type").is_some_and(|t| t != "choice")
+        || row["abstain"] == true
+        || row.get("status").is_some_and(|s| s != "ok")
+    {
+        return None;
+    }
+    let key = row["choice"].as_str()?;
+    if !options.iter().any(|o| o.key == key) {
+        return None;
+    }
+    let probability = if let Some(values) = row.get("probabilities") {
+        let values = values.as_object()?;
+        if values.len() != options.len() {
+            return None;
+        }
+        let mut total = 0.0;
+        let mut maximum = 0.0_f64;
+        for option in options {
+            let p = values.get(&option.key)?.as_f64()?;
+            if !p.is_finite() || !(0.0..=1.0).contains(&p) {
+                return None;
+            }
+            total += p;
+            maximum = maximum.max(p);
+        }
+        let selected = values.get(key)?.as_f64()?;
+        if (total - 1.0).abs() > 0.02 || selected + 0.0001 < maximum {
+            return None;
+        }
+        Some(selected)
+    } else {
+        None
+    };
+    let score = match profile.score {
+        Score::Native => row["confidence"].as_f64()?,
+        Score::Probability => probability?,
+    };
+    (score.is_finite() && (0.0..=1.0).contains(&score)).then(|| (key.into(), score))
+}
+
 /// Why a turn took the route it took.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
@@ -204,7 +293,9 @@ pub fn decide_for(
                 timeout,
             );
             Asked {
-                answer: response.as_ref().and_then(parse),
+                answer: response
+                    .as_ref()
+                    .and_then(|answer| parse_profile(answer, options, &profile(config))),
                 spent_on: None,
                 spent: response.as_ref().and_then(super::wire::tokens),
             }
@@ -232,7 +323,8 @@ pub fn select(
     let Some(route) = options.iter().find(|option| option.key == key) else {
         return Some(Decision::plain(fallback, confidence, Reason::Failed));
     };
-    if confidence < config.min_confidence {
+    let threshold = profile(config).minimum;
+    if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) || confidence < threshold {
         return Some(Decision::plain(fallback, confidence, Reason::LowConfidence));
     }
     Some(Decision::plain(
@@ -251,6 +343,15 @@ fn classifier_usage(
             format!("{family}/{model}"),
             super::model_catalog::entry(family, model).map(|entry| (entry.price, entry.output)),
         ),
+        Classifier::Endpoint {
+            model, base_url, ..
+        } if matches!(model.as_str(), "jev-latest" | "jev-preview" | "jev-1.13.0")
+            && url::Url::parse(base_url)
+                .ok()
+                .is_some_and(|u| u.host_str() == Some("api.typesafe.ai")) =>
+        {
+            (format!("typesafe/{model}"), Some((0.042, 0.0)))
+        }
         Classifier::Typesafe { model, .. } => (
             format!("typesafe/{model}"),
             matches!(model.as_str(), "jev-latest" | "jev-preview" | "jev-1.13.0")
@@ -310,12 +411,16 @@ fn ask_pool(call: PoolCall<'_>, state: &str, now_ms: i64, timeout: Duration) -> 
     let body = json!({
         "model": model,
         "temperature": 0,
+        "max_tokens": 128,
         "messages": [
             { "role": "system", "content": format!("{POOLED_SYSTEM}\n\nThe options:\n{listed}") },
             { "role": "user", "content": clip(state) },
         ],
     });
-    let agent = crate::http::agent_builder().timeout(timeout).build();
+    let agent = crate::http::agent_builder()
+        .redirects(0)
+        .timeout(timeout)
+        .build();
     let Ok(prepared) = super::transport::prepare(account, &body, model) else {
         return empty;
     };
@@ -400,7 +505,10 @@ fn classifier_response(value: Value) -> Value {
 /// One classifier call. Nothing here fails a turn: an unreachable classifier,
 /// a refusal and a body that is not JSON all read as no answer.
 fn ask(url: &str, bearer: Option<&str>, body: &Value, timeout: Duration) -> Option<Value> {
-    let agent = crate::http::agent_builder().timeout(timeout).build();
+    let agent = crate::http::agent_builder()
+        .redirects(0)
+        .timeout(timeout)
+        .build();
     let mut request = agent.post(url).set("content-type", "application/json");
     if let Some(bearer) = bearer {
         request = request.set("authorization", &format!("Bearer {bearer}"));
@@ -415,6 +523,22 @@ fn ask(url: &str, bearer: Option<&str>, body: &Value, timeout: Duration) -> Opti
 
 /// Whether the classifier answers at all, for the Test button in Settings.
 pub fn check(classifier: &Classifier, timeout: Duration) -> Result<(), String> {
+    check_profile(classifier, &Profile::default(), timeout)
+}
+pub fn check_profile(
+    classifier: &Classifier,
+    profile: &Profile,
+    timeout: Duration,
+) -> Result<(), String> {
+    let options: Vec<Route> = ["fast", "deep"]
+        .into_iter()
+        .map(|key| Route {
+            key: key.into(),
+            family: String::new(),
+            model: String::new(),
+            description: String::new(),
+        })
+        .collect();
     let Some((url, bearer)) = endpoint(classifier) else {
         return Err("No classifier is configured.".into());
     };
@@ -427,7 +551,10 @@ pub fn check(classifier: &Classifier, timeout: Duration) -> Result<(), String> {
             "criteria": { "fast": "A short question", "deep": "A long reasoning task" },
         }},
     });
-    let agent = crate::http::agent_builder().timeout(timeout).build();
+    let agent = crate::http::agent_builder()
+        .redirects(0)
+        .timeout(timeout)
+        .build();
     let mut request = agent.post(&url).set("content-type", "application/json");
     if let Some(bearer) = bearer {
         request = request.set("authorization", &format!("Bearer {bearer}"));
@@ -435,8 +562,8 @@ pub fn check(classifier: &Classifier, timeout: Duration) -> Result<(), String> {
     match request.send_json(classifier_body(&url, &probe)) {
         Ok(response) => match response.into_json::<Value>() {
             Ok(value)
-                if parse(&classifier_response(value.clone()))
-                    .is_some_and(|(choice, _)| matches!(choice.as_str(), "fast" | "deep")) =>
+                if parse_profile(&classifier_response(value.clone()), &options, profile)
+                    .is_some() =>
             {
                 Ok(())
             }
@@ -803,5 +930,57 @@ mod connection_wire_tests {
             answer
         );
         assert_eq!(classifier_response(answer.clone()), answer);
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    fn options() -> Vec<Route> {
+        ["a", "b"]
+            .into_iter()
+            .map(|key| Route {
+                key: key.into(),
+                family: "test".into(),
+                model: key.into(),
+                description: String::new(),
+            })
+            .collect()
+    }
+    #[test]
+    fn rejects_abstentions_foreign_options_and_inconsistent_probabilities() {
+        let options = options();
+        let p = Profile::default();
+        for row in [
+            json!({"choice":"a","confidence":0.9,"abstain":true}),
+            json!({"choice":"foreign","confidence":0.9}),
+            json!({"choice":"a","confidence":0.9,"probabilities":{"a":0.2,"b":0.8}}),
+            json!({"choice":"a","confidence":0.9,"probabilities":{"a":0.9}}),
+        ] {
+            assert!(parse_profile(&json!({"answers":{"route":row}}), &options, &p).is_none());
+        }
+    }
+    #[test]
+    fn native_confidence_and_option_probability_are_distinct() {
+        let a = json!({"answers":{"route":{"choice":"a","confidence":0.4,"probabilities":{"a":0.8,"b":0.2}}}});
+        assert_eq!(
+            parse_profile(&a, &options(), &Profile::default())
+                .unwrap()
+                .1,
+            0.4
+        );
+        assert_eq!(
+            parse_profile(
+                &a,
+                &options(),
+                &Profile {
+                    score: Score::Probability,
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .1,
+            0.8
+        );
     }
 }

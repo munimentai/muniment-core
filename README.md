@@ -120,8 +120,12 @@ Endpoints: `POST /v1/runs`, `GET` and `DELETE /v1/runs/{run_id}` and
 `x-muniment-validation-failures` headers. A run's turn reserves its uncached
 cost estimate before it goes upstream and settles the priced cost after. Once
 spend reaches the budget the router answers 402 with
-`{"error":{"type":"budget_exhausted",…}}`. `GET /healthz` and `GET /metrics`
-take no token.
+`{"error":{"type":"budget_exhausted",…}}`. Routing constraints run before
+any classifier sees text. The run's remaining budget replaces the configured
+`policy.task_budget_usd`, and a turn that no eligible model's estimate fits
+answers 422 with `{"error":{"type":"routing_constraints",…}}`. The desktop
+keeps `policy.offline_only` (loopback endpoints only) and its own
+`policy.task_budget_usd`. `GET /healthz` and `GET /metrics` take no token.
 
 `muniment-router accounts list|add-key|login|import-pi-auth|set-weight|disable|enable|remove|probe`
 manages the pool in the configured store and secret source. `muniment-router

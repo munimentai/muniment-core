@@ -394,6 +394,7 @@ pub struct TransportRequest {
     agent: ureq::Agent,
     url: String,
     proxy_host: Option<Option<String>>,
+    loopback: bool,
 }
 
 impl TransportRequest {
@@ -445,7 +446,14 @@ impl TransportRequest {
             agent: builder.build(),
             url: url.into(),
             proxy_host,
+            loopback: false,
         }
+    }
+
+    /// Refuses a redirect that leaves the machine when `loopback` is set.
+    pub fn loopback_only(mut self, loopback: bool) -> Self {
+        self.loopback = loopback;
+        self
     }
 
     pub fn send_json(
@@ -491,6 +499,12 @@ impl TransportRequest {
                 .map_err(ureq::Error::from)?
                 .join(location)
                 .map_err(ureq::Error::from)?;
+            if self.loopback && !crate::constraints::loopback(next.as_str()) {
+                return Err(ureq::Error::from(std::io::Error::other(
+                    "The provider redirected off this machine.",
+                ))
+                .into());
+            }
             match response.status() {
                 301..=303 => method = "GET",
                 307 | 308 if method == "GET" => {}
@@ -828,6 +842,7 @@ mod tests {
                 .build(),
             url: url.into(),
             proxy_host: None,
+            loopback: false,
         }
     }
 
@@ -1041,6 +1056,14 @@ mod tests {
         let mut request = direct_request(ureq::AgentBuilder::new(), &url);
         assert!(request.send_json(&[], &serde_json::json!({})).is_err());
         assert_eq!(server.join().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn a_loopback_only_request_never_follows_a_redirect_off_the_machine() {
+        let (url, server) = http_server(vec![redirect(302, "https://example.com/next")]);
+        let mut request = direct_request(ureq::AgentBuilder::new(), &url).loopback_only(true);
+        assert!(request.send_json(&[], &serde_json::json!({})).is_err());
+        assert_eq!(server.join().unwrap().len(), 1);
     }
 
     #[test]

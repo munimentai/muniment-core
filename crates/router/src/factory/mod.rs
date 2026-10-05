@@ -782,6 +782,24 @@ impl Hooks for RunHooks<'_> {
             .unwrap_or_default()
     }
 
+    fn budget(&self) -> Result<Option<f64>, (u16, Value)> {
+        let budget = self
+            .server
+            .budgets
+            .get(&self.run.run_id)
+            .unwrap_or_default();
+        let left = budget.budget - budget.spent - budget.reserved;
+        if left > 0.0 {
+            return Ok(Some(left));
+        }
+        self.server.metrics.add(
+            "muniment_router_budget_rejections_total",
+            &[("role", &self.run.role)],
+            1.0,
+        );
+        Err((402, exhausted(self.run, budget)))
+    }
+
     fn decided(&self, route: &Route, reason: &str) {
         self.server.metrics.add(
             "muniment_router_routing_decisions_total",

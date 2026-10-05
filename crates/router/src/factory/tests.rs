@@ -364,6 +364,42 @@ fn a_budget_is_reserved_settled_and_then_refused_with_402() {
 }
 
 #[test]
+fn a_run_budget_constrains_routing_before_any_upstream_call() {
+    let (url, seen) = upstream(vec![completion("one", 10, 2)]);
+    let fixture = fixture(vec![account("a1", &url, &["gpt-5.6-luna"])], 5.0);
+    let address = fixture.handle.address();
+    // gpt-5.6-luna's estimate for 8,192 output tokens is about $0.0098.
+    let token = create_run(address, "r1", "implementer", 0.005);
+    let (status, body) = call(
+        address,
+        "POST",
+        "/v1/chat/completions",
+        &token,
+        Some(&turn("auto", false)),
+        &[],
+    );
+    assert_eq!(status, 422, "{body}");
+    assert!(body.contains("routing_constraints"));
+    assert!(seen.try_recv().is_err());
+    // A turn whose estimate fits what the run has left goes out.
+    let mut small = turn("auto", false);
+    small["max_tokens"] = json!(100);
+    let (status, body) = call(
+        address,
+        "POST",
+        "/v1/chat/completions",
+        &token,
+        Some(&small),
+        &[],
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        seen.recv_timeout(Duration::from_secs(5)).unwrap()["model"],
+        "gpt-5.6-luna"
+    );
+}
+
+#[test]
 fn a_reservation_holds_at_most_what_remains() {
     let budgets = Budgets::default();
     budgets.seed(&RunRecord {
