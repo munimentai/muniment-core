@@ -64,10 +64,17 @@ class FakePins:
         return self.outcomes.get(frozenset(self.current), PASS)
 
 
+OK = {"passed": True, "output": ""}
+
+
 class Recorder:
     def __init__(self, issues=()):
         self.issues = list(issues)
         self.calls = []
+        self.landed = []
+
+    def land(self, text):
+        self.landed.append(text)
 
     def open_issues(self):
         return self.issues
@@ -80,9 +87,6 @@ class Recorder:
 
     def close(self, number, text):
         self.calls.append(("close", number))
-
-    def pull_request(self, title, text):
-        self.calls.append(("pr", title))
 
 
 class SelectTest(unittest.TestCase):
@@ -135,28 +139,28 @@ class PublishTest(unittest.TestCase):
 
     def test_issues_are_deduplicated_by_title(self):
         github = Recorder([{"number": 7, "title": "Pin update blocked: Pi 1.0.2"}])
-        commits = []
-        actions = update.publish(self.result(blocked=[1]), PASS, github, commits.append)
-        self.assertEqual(commits, ["fix: update Claude Code to 2.1.289"])
+        actions = update.publish(self.result(blocked=[1]), OK, github)
+        self.assertEqual(github.landed[0].splitlines()[0], "fix: update Claude Code to 2.1.289")
         self.assertIn(("comment", 7), github.calls)
         self.assertNotIn(("create", "Pin update blocked: Pi 1.0.2"), github.calls)
-        self.assertIn(("pr", "fix: update Claude Code to 2.1.289"), actions)
+        self.assertIn(("land", "fix: update Claude Code to 2.1.289"), actions)
 
     def test_a_new_blocked_pin_opens_an_issue(self):
         github = Recorder()
-        update.publish(self.result(blocked=[1]), PASS, github, lambda title: None)
+        update.publish(self.result(blocked=[1]), OK, github)
         self.assertIn(("create", "Pin update blocked: Pi 1.0.2"), github.calls)
 
     def test_a_shipped_pin_closes_its_old_blocked_issue(self):
         github = Recorder([{"number": 3, "title": "Pin update blocked: Claude Code 2.1.285"}])
-        update.publish(self.result(), PASS, github, lambda title: None)
+        update.publish(self.result(), OK, github)
         self.assertIn(("close", 3), github.calls)
 
-    def test_a_macos_failure_blocks_the_pull_request(self):
+    def test_a_failed_check_lands_nothing(self):
         github = Recorder()
-        commits = []
-        update.publish(self.result(), fail("darwin archive"), github, commits.append)
-        self.assertEqual(commits, [])
+        checked = update.verification(None, True, "https://example.test/run/1")
+        self.assertFalse(checked["passed"])
+        update.publish(self.result(), checked, github)
+        self.assertEqual(github.landed, [])
         self.assertEqual(github.calls, [("create", "Pin update blocked: Claude Code 2.1.289")])
 
     def test_candidates_list_only_newer_pins(self):

@@ -32,7 +32,8 @@ size and SHA-256, the Pi extension packages, and the Claude Code version.
 compiles the file into constants, so a malformed file fails the build. Change
 pins with `muniment-pins bump`, which rewrites both files, and run
 `muniment-pins compat` before you commit. The daily `pins-update` workflow does
-both and opens a pull request.
+both, runs the CI checks on Linux and macOS, then pushes to `main` and tags
+the release itself.
 
 ## Verification loop
 

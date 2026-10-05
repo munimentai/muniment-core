@@ -7,10 +7,11 @@ the ones that pass, and records the others as blocked. The kept pins also pass
 the workspace tests. The result goes to `update.json`, and the bumped files stay
 in the working tree.
 
-`publish` reads `update.json` and the macOS compat report. It opens or updates
-the `pins/update` pull request with auto-merge, opens or comments on one
-`Pin update blocked: <component> <version>` issue per blocked pin, and closes
-blocked issues for pins that now pass.
+`publish` reads `update.json`, the macOS compat report, and the outcome of the
+workspace checks. When everything passed it commits the bump on the newest
+main, pushes it, and tags the release with `scripts/release.py`. It opens or
+comments on one `Pin update blocked: <component> <version>` issue per blocked
+pin, and closes blocked issues for pins that now pass.
 """
 
 import argparse
@@ -21,7 +22,13 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-BRANCH = "pins/update"
+PUSH_ATTEMPTS = 3
+# The checks rerun on the bump after a rebase onto a newer main.
+FAST_CHECKS = [
+    ["cargo", "fmt", "--all", "--check"],
+    ["cargo", "test", "--locked", "-p", "muniment-pins", "--features", "cli"],
+    ["cargo", "check", "--workspace", "--all-targets", "--locked", "--features", "muniment-pins/cli"],
+]
 PIN_FILES = ["pins/pins.toml", "pins/packages.bun.lock"]
 BLOCKED = "Pin update blocked: "
 OUTPUT_TAIL = 20000
@@ -157,18 +164,16 @@ def select(pins, workspace_tests=True, tests=None):
     return result
 
 
-def body(result):
-    lines = ["Daily pin update from `scripts/pins/update.py`.", "", "| Pin | From | To |", "| --- | --- | --- |"]
-    lines += [f"| {c['component']} | {c['from']} | {c['to']} |" for c in result["changes"]]
-    lines += ["", "`muniment-pins compat` passed on Linux and macOS, and the workspace tests passed on Linux."]
-    if result["blocked"]:
-        lines += ["", "Blocked pins stay at their current versions:", ""]
-        lines += [f"- {b['component']} {b['version']}" for b in result["blocked"]]
+def message(result):
+    """The commit message: the conventional title, then the pins it moves."""
+    lines = [result["title"], ""]
+    lines += [f"- {c['component']} {c['from']} -> {c['to']}" for c in result["changes"]]
+    lines += ["", "muniment-pins compat passed on Linux and macOS, and so did the workspace checks."]
     return "\n".join(lines) + "\n"
 
 
 class GitHub:
-    """The `gh` calls `publish` makes. Tests replace it with a recorder."""
+    """The git and `gh` calls `publish` makes. Tests replace it with a recorder."""
 
     def open_issues(self):
         out = run(["gh", "issue", "list", "--state", "open", "--search", f'"{BLOCKED}" in:title',
@@ -184,39 +189,48 @@ class GitHub:
     def close(self, number, text):
         run(["gh", "issue", "close", str(number), "--comment", text])
 
-    def pull_request(self, title, text):
-        run(["git", "push", "--force", "origin", f"HEAD:refs/heads/{BRANCH}"])
-        found = json.loads(run(["gh", "pr", "list", "--head", BRANCH, "--state", "open",
-                                "--json", "number"]).stdout)
-        if found:
-            number = str(found[0]["number"])
-            run(["gh", "pr", "edit", number, "--title", title, "--body", text])
+    def land(self, text):
+        """Commits the bump on the newest main, pushes it, and tags the release."""
+        run(["git", "add", *PIN_FILES])
+        run(["git", "commit", "-m", text])
+        base = run(["git", "rev-parse", "HEAD~1"]).stdout.strip()
+        for _ in range(PUSH_ATTEMPTS):
+            run(["git", "fetch", "origin", "main"])
+            if run(["git", "rev-parse", "origin/main"]).stdout.strip() != base:
+                run(["git", "rebase", "origin/main"])
+                for check in FAST_CHECKS:
+                    run(check, capture=False)
+                base = run(["git", "rev-parse", "HEAD~1"]).stdout.strip()
+            if run(["git", "push", "origin", "HEAD:main"], check=False).returncode == 0:
+                break
         else:
-            run(["gh", "pr", "create", "--base", "main", "--head", BRANCH, "--title", title, "--body", text])
-            number = BRANCH
-        merged = run(["gh", "pr", "merge", number, "--auto", "--squash"], check=False)
-        if merged.returncode != 0:
-            print("Auto-merge is unavailable. The pull request waits for a manual merge.", file=sys.stderr)
+            raise SystemExit(f"main moved {PUSH_ATTEMPTS} times during the push")
+        # A push with the workflow token starts no release workflow, so the release runs here.
+        run(["python3", "-B", "scripts/release.py", "--revision", "HEAD", "--publish",
+             "--asset", "pins/pins.toml", "--asset", "pins/packages.bun.lock"], capture=False)
 
 
-def publish(result, darwin, github, commit):
-    """Opens the pull request and files issues. Returns the issue and PR actions taken."""
+def publish(result, verification, github):
+    """Lands the bump when every check passed and files the blocked-pin issues.
+
+    `verification` is `{"passed": bool, "output": str}` for the checks that ran
+    after `select`: macOS compat and the workspace checks.
+    """
     blocked = list(result["blocked"])
     changes = result["changes"]
-    if changes and darwin is not None and not darwin.get("passed"):
-        output = "### macOS compat\n\n" + failure_text(darwin)
+    if changes and not verification["passed"]:
+        # One issue names the leading pin. Its body lists every pin in the failed set.
         by_component = {c["component"]: c["to"] for c in changes}
-        for component in result["passed"]:
-            version = by_component.get(component)
-            if version:
-                blocked.append({"component": component, "version": version,
-                                "title": issue_title(component, version), "output": output})
+        kept = [(c, by_component[c]) for c in result["passed"] if c in by_component]
+        component, version = kept[0]
+        pins_list = ", ".join(f"{c} {v}" for c, v in kept)
+        blocked.append({"component": component, "version": version, "title": issue_title(component, version),
+                        "output": f"The checks failed with {pins_list}.\n\n{verification['output']}"})
         changes = []
     actions = []
     if changes:
-        commit(result["title"])
-        github.pull_request(result["title"], body(result))
-        actions.append(("pr", result["title"]))
+        github.land(message(result))
+        actions.append(("land", result["title"]))
     existing = github.open_issues()
     for item in blocked:
         text = (f"The pin update to {item['component']} {item['version']} failed. "
@@ -237,9 +251,20 @@ def publish(result, darwin, github, commit):
     return actions
 
 
-def commit(title):
-    run(["git", "add", *PIN_FILES])
-    run(["git", "commit", "-m", title])
+def verification(darwin_path, checks_passed, run_url):
+    darwin = None
+    if darwin_path and Path(darwin_path).exists():
+        darwin = json.loads(Path(darwin_path).read_text())
+    parts = []
+    if darwin is None:
+        parts.append("The macOS job produced no compat report.")
+    elif not darwin.get("passed"):
+        parts.append("### macOS compat\n\n" + failure_text(darwin))
+    if not checks_passed:
+        parts.append("The workspace checks failed.")
+    if parts and run_url:
+        parts.append(f"Run: {run_url}")
+    return {"passed": not parts, "output": "\n\n".join(parts)}
 
 
 def main():
@@ -253,6 +278,9 @@ def main():
     publisher = sub.add_parser("publish")
     publisher.add_argument("--result", default="update.json")
     publisher.add_argument("--darwin", help="the macOS compat report")
+    publisher.add_argument("--checks", choices=["success", "failure"], default="failure",
+                           help="the outcome of the workspace checks on Linux and macOS")
+    publisher.add_argument("--run-url", default="")
     args = parser.parse_args()
     if args.command == "select":
         result = select(Pins(args.bin, args.cache), workspace_tests=not args.skip_workspace_tests)
@@ -264,13 +292,9 @@ def main():
                 out.write(f"blocked={'true' if result['blocked'] else 'false'}\n")
     else:
         result = json.loads(Path(args.result).read_text())
-        darwin = json.loads(Path(args.darwin).read_text()) if args.darwin and Path(args.darwin).exists() else None
-        if result["changes"] and darwin is None:
-            darwin = {"passed": False, "steps": [{"name": "macOS compat", "passed": False,
-                                                  "output": "The macOS job produced no report."}]}
-        for action in publish(result, darwin, GitHub(), commit):
+        checked = verification(args.darwin, args.checks == "success", args.run_url)
+        for action in publish(result, checked, GitHub()):
             print(*action)
-
 
 if __name__ == "__main__":
     main()

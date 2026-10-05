@@ -54,9 +54,12 @@ compatibility suite on the host platform:
 - one `pi-claude-bridge` turn through the pinned Claude Code CLI against a fake
   Anthropic endpoint.
 
-The `pins-update` workflow runs daily. It bumps every pin that passes the suite,
-opens a pull request that merges itself after CI, and opens an issue for each
-pin that fails.
+The `pins-update` workflow runs daily. It bumps every pin that passes the suite
+on Linux, then runs the suite and the workspace tests on macOS and the CI checks
+on Linux against the bumped tree. When all of them pass, it rebases the bump
+onto `main`, pushes it with a `feat:` or `fix:` message, and tags the release
+with `pins.toml` and `packages.bun.lock` attached. A pin that fails gets one
+`Pin update blocked: <component> <version>` issue and stays at its version.
 
 ## Consumers
 
