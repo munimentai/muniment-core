@@ -626,6 +626,7 @@ fn failure_type(status: u16, kind: Option<&str>) -> Option<&'static str> {
         Some("budget_exhausted") => return Some("budget_exhausted"),
         Some("routing_constraints" | "routing_capability") => return Some("routing_constraints"),
         Some("routing_budget") => return Some("routing_budget"),
+        Some("context_length_exceeded") => return Some("context_length_exceeded"),
         _ => {}
     }
     match status {

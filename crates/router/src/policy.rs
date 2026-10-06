@@ -213,6 +213,12 @@ pub struct Features {
     pub evidence: String,
     pub failed: bool,
 }
+/// Estimated tokens in `text`: a third of its ASCII bytes plus one per other
+/// character.
+fn estimate(text: &str) -> u64 {
+    let ascii = text.bytes().filter(u8::is_ascii).count() as u64;
+    ascii.div_ceil(3) + text.chars().filter(|c| !c.is_ascii()).count() as u64
+}
 pub fn digest(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
@@ -255,13 +261,14 @@ impl Features {
             .chain(messages.iter().map(|m| digest(&m.to_string())))
             .take(4096)
             .collect();
-        // UTF-8 bytes plus framing is a conservative bound for text tokenization.
+        // Three ASCII bytes per token and one token per other character, plus
+        // framing, bound tokenization above for code, JSON, prose and CJK text.
         // Image tokens are unknown, so automatic routing requires explicit metadata.
         let input = messages
             .iter()
-            .map(|m| m.to_string().len() as u64 + 16)
+            .map(|m| estimate(&m.to_string()) + 16)
             .sum::<u64>()
-            .saturating_add(request["tools"].to_string().len() as u64);
+            .saturating_add(estimate(&request["tools"].to_string()));
         Self {
             input,
             output: request["max_completion_tokens"]
@@ -644,6 +651,16 @@ pub fn choose(
             "Kept model because no eligible escalation exists".into(),
         ));
     }
+    // No preferred path took the turn, yet an eligible model can still serve it.
+    if let Some((r, _)) = eligible
+        .iter()
+        .max_by_key(|(_, m)| (m.capability, m.context))
+    {
+        return Ok((
+            (*r).clone(),
+            "Used the most capable eligible model with the most context".into(),
+        ));
+    }
     Err("No model has known capabilities and enough context for this request. Select a compatible model or configure its routing metadata.".into())
 }
 #[derive(Default, Serialize, Deserialize)]
@@ -894,4 +911,94 @@ fn budget_reservations_survive_missing_usage_and_settle_with_usage() {
         Some(&price),
     );
     assert!((s.estimated_cost - 0.103).abs() < 1e-10);
+}
+
+#[test]
+fn the_input_estimate_counts_a_third_of_ascii_bytes_and_each_other_character() {
+    let request = |text: &str| json!({"messages":[{"role":"user","content":text}]});
+    let framing = |text: &str| {
+        let message = request(text)["messages"][0].to_string();
+        estimate(&message) + 16
+    };
+    let ascii = "fn main() { println!(\"hi\"); }\n".repeat(3000);
+    let read = Features::read(&request(&ascii));
+    assert_eq!(read.input, framing(&ascii) + estimate("null"));
+    let bytes = request(&ascii)["messages"][0].to_string().len() as u64;
+    // A third of the byte count the estimate replaces.
+    assert!(read.input * 3 < bytes + 64);
+    assert!(read.input * 3 >= bytes);
+    // Each CJK character counts as one token, not three bytes.
+    let cjk = "路由器".repeat(1000);
+    assert_eq!(estimate(&cjk), 3000);
+    assert_eq!(cjk.len(), 9000);
+    assert!(Features::read(&request(&cjk)).input >= 3000);
+}
+
+#[test]
+fn an_eligible_model_serves_when_no_preferred_path_takes_the_turn() {
+    use super::config::{Account, Credential};
+    let account = |family: &str, model: &str| Account {
+        id: family.into(),
+        family: family.into(),
+        label: family.into(),
+        credential: Credential::ApiKey { key: "sk".into() },
+        base_url: None,
+        models: vec![model.into()],
+        enabled: true,
+        weight: 1,
+    };
+    let mut config = RouterConfig {
+        enabled: true,
+        accounts: vec![
+            account("anthropic", "claude-haiku-4-5"),
+            account("openai", "gpt-5.6-luna"),
+        ],
+        ..RouterConfig::default()
+    };
+    config
+        .policy
+        .measured
+        .insert("openai/gpt-5.6-luna".into(), 0.83);
+    let routes = super::options(&config);
+    // About 250K tokens: too many for Haiku's 200K, within Luna's 400K.
+    let features =
+        Features::read(&json!({"messages":[{"role":"user","content":"abc".repeat(250_000)}]}));
+    let session = Session {
+        route: "anthropic/claude-haiku-4-5".into(),
+        failures: 2,
+        ..Default::default()
+    };
+    let (route, reason) = choose(
+        &config,
+        &routes,
+        Proposal {
+            route: "anthropic/claude-haiku-4-5",
+            confident: false,
+        },
+        &session,
+        &features,
+        false,
+        0,
+    )
+    .unwrap();
+    assert_eq!(route.key, "openai/gpt-5.6-luna");
+    assert_eq!(
+        reason,
+        "Used the most capable eligible model with the most context"
+    );
+    let huge =
+        Features::read(&json!({"messages":[{"role":"user","content":"abc".repeat(500_000)}]}));
+    assert!(choose(
+        &config,
+        &routes,
+        Proposal {
+            route: "anthropic/claude-haiku-4-5",
+            confident: false,
+        },
+        &session,
+        &huge,
+        false,
+        0,
+    )
+    .is_err());
 }

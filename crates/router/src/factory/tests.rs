@@ -541,6 +541,11 @@ fn failure_types_follow_the_error_type_then_the_status() {
         ),
         (422, Some("routing_capability"), Some("routing_constraints")),
         (422, Some("routing_budget"), Some("routing_budget")),
+        (
+            400,
+            Some("context_length_exceeded"),
+            Some("context_length_exceeded"),
+        ),
         (503, Some("routing_budget"), Some("routing_budget")),
         (503, Some("router_error"), Some("upstream_unavailable")),
         (502, None, Some("upstream_unavailable")),
@@ -588,6 +593,39 @@ fn a_run_budget_constrains_routing_before_any_upstream_call() {
     assert_eq!(
         seen.recv_timeout(Duration::from_secs(5)).unwrap()["model"],
         "gpt-5.6-luna"
+    );
+}
+
+#[test]
+fn a_request_too_large_for_every_route_answers_a_context_overflow() {
+    let (url, seen) = upstream(vec![completion("one", 10, 2)]);
+    let fixture = fixture(vec![account("a1", &url, &["gpt-5.6-luna"])], 5.0);
+    let address = fixture.handle.address();
+    let token = create_run(address, "r1", "implementer", 5.0);
+    // About 500K tokens against gpt-5.6-luna's 400K context.
+    let mut large = turn("auto", false);
+    large["messages"][0]["content"] = json!("abc".repeat(500_000));
+    let (status, body) = call(
+        address,
+        "POST",
+        "/v1/chat/completions",
+        &token,
+        Some(&large),
+        &[],
+    );
+    assert_eq!(status, 400, "{body}");
+    let error = &serde_json::from_str::<Value>(&body).unwrap()["error"];
+    assert_eq!(error["type"], "context_length_exceeded");
+    // Pi's overflow pattern is /maximum context length is \d+ tokens/i.
+    let message = error["message"].as_str().unwrap();
+    let (_, rest) = message.split_once("maximum context length is ").unwrap();
+    let (number, rest) = rest.split_once(' ').unwrap();
+    assert_eq!(number, "400000");
+    assert!(rest.starts_with("tokens"), "{message}");
+    assert!(seen.try_recv().is_err());
+    assert_eq!(
+        run_usage(address, "r1")["last_error_type"],
+        "context_length_exceeded"
     );
 }
 

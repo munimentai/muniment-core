@@ -833,6 +833,27 @@ pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
+/// The largest context among the routes that would take this request at no
+/// input size, when every one of them is too small for it.
+fn overflow(
+    original: &config::RouterConfig,
+    session: &super::policy::Session,
+    features: &super::policy::Features,
+    automatic: bool,
+) -> Option<u64> {
+    let sizeless = super::policy::Features {
+        input: 0,
+        ..features.clone()
+    };
+    let fitting = super::constraints::filter(original, session, &sizeless, automatic);
+    let largest = super::options(&fitting)
+        .iter()
+        .filter_map(|route| super::policy::model(original, route))
+        .map(|model| model.context)
+        .max()?;
+    (features.input.saturating_add(features.output) > largest).then_some(largest)
+}
+
 /// Classify once, try the selected pool, then eligible fallback models.
 /// Once response output starts, never replay the request on another model.
 struct SessionGuard<'a>(&'a Mutex<std::collections::HashSet<String>>, String);
@@ -921,6 +942,27 @@ pub(crate) fn complete(
         requested == config::AUTO_MODEL,
     );
     if !super::options(&original).is_empty() && super::options(&config).is_empty() {
+        if let Some(largest) = overflow(
+            &original,
+            &session,
+            &features,
+            requested == config::AUTO_MODEL,
+        ) {
+            // Pi compacts and retries on this error type and message.
+            respond(
+                stream,
+                400,
+                "Bad Request",
+                &wire::error_body(
+                    &format!(
+                        "This request needs about {} tokens, and the maximum context length is {largest} tokens across the routable models.",
+                        features.input.saturating_add(features.output)
+                    ),
+                    "context_length_exceeded",
+                ),
+            );
+            return;
+        }
         respond(
             stream,
             422,
