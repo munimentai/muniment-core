@@ -37,6 +37,12 @@ const READ_TIMEOUT: Duration = Duration::from_secs(600);
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
 /// How long a token refresh may take before the turn moves on.
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(12);
+/// How long a request waits for its thread's request in flight before it gets
+/// 409. It stays under Pi's five-minute idle timeout, because the waiting client
+/// receives no bytes.
+const LEASE_WAIT: Duration = Duration::from_secs(240);
+/// How often a waiting request checks that its client is still connected.
+const CLIENT_POLL: Duration = Duration::from_secs(1);
 
 /// The port and token Pi reaches the router on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,7 +126,7 @@ impl Drop for Handle {
 pub(crate) struct State {
     sessions: Mutex<super::policy::Sessions>,
     contexts: super::context::Contexts,
-    active_sessions: Mutex<std::collections::HashSet<String>>,
+    active_sessions: Leases,
     progress: super::progress::Progress,
     pub(crate) backend: Backend,
     /// The desktop agent directory, where the subscription probe writes its
@@ -801,6 +807,7 @@ fn serve(stream: TcpStream, state: &State, token: &str) {
                 .start(head.header("x-muniment-routing-id"), (state.now_ms)());
             complete(
                 &mut stream,
+                Some(reader.get_ref()),
                 state,
                 &NoHooks,
                 &request,
@@ -854,19 +861,138 @@ fn overflow(
     (features.input.saturating_add(features.output) > largest).then_some(largest)
 }
 
+/// The threads with a request in flight. A request for a busy thread waits for
+/// the lease instead of failing, because the holder may only be finishing its
+/// bookkeeping after the client already read the whole answer.
+#[derive(Default)]
+pub(crate) struct Leases {
+    busy: Mutex<std::collections::HashSet<String>>,
+    released: std::sync::Condvar,
+}
+
+/// Why a request did not get its thread's lease.
+#[derive(Debug, PartialEq, Eq)]
+enum LeaseRefusal {
+    /// The holder kept the thread for the whole wait.
+    Busy,
+    /// The waiting client closed its connection.
+    Gone,
+}
+
+impl Leases {
+    /// Takes the lease of thread `id`, waiting up to `wait` for the request that
+    /// holds it. `gone` reports that the waiting client left.
+    fn acquire(
+        &self,
+        id: &str,
+        wait: Duration,
+        gone: &dyn Fn() -> bool,
+    ) -> Result<SessionGuard<'_>, LeaseRefusal> {
+        let deadline = std::time::Instant::now() + wait;
+        let mut busy = self
+            .busy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if busy.insert(id.into()) {
+                return Ok(SessionGuard(self, id.into()));
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(LeaseRefusal::Busy);
+            }
+            if gone() {
+                return Err(LeaseRefusal::Gone);
+            }
+            busy = self
+                .released
+                .wait_timeout(busy, left.min(CLIENT_POLL))
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+    }
+}
+
 /// Classify once, try the selected pool, then eligible fallback models.
 /// Once response output starts, never replay the request on another model.
-struct SessionGuard<'a>(&'a Mutex<std::collections::HashSet<String>>, String);
+struct SessionGuard<'a>(&'a Leases, String);
 impl Drop for SessionGuard<'_> {
     fn drop(&mut self) {
-        if let Ok(mut active) = self.0.lock() {
-            active.remove(&self.1);
+        let mut busy = self
+            .0
+            .busy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        busy.remove(&self.1);
+        self.0.released.notify_all();
+    }
+}
+
+/// Whether the client closed its connection. The router reads the request body
+/// whole before it routes, so a live client has nothing more for the socket to
+/// read, and a peek that sees the end of the stream means the client left.
+fn client_gone(client: Option<&TcpStream>) -> bool {
+    let Some(client) = client else {
+        return false;
+    };
+    if client
+        .set_read_timeout(Some(Duration::from_millis(1)))
+        .is_err()
+    {
+        return true;
+    }
+    let mut byte = [0u8; 1];
+    match client.peek(&mut byte) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(error) => !matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+        ),
+    }
+}
+
+/// An upstream request with its answer.
+type Sent = (
+    super::subscription_probe::TransportRequest,
+    Result<ureq::Response, ureq::Error>,
+);
+
+/// Sends the upstream request and waits for its answer while the client stays
+/// connected. With a client to watch, the call runs on its own thread, and the
+/// answer is None once the client leaves first: the turn ends and releases its
+/// thread, and the abandoned call finishes on its own.
+fn send_watching(
+    mut upstream: super::subscription_probe::TransportRequest,
+    headers: Vec<(&'static str, String)>,
+    body: Value,
+    client: Option<&TcpStream>,
+) -> Option<Sent> {
+    if client.is_none() {
+        let result = upstream.send_json(&headers, &body).map_err(|error| *error);
+        return Some((upstream, result));
+    }
+    let (sender, answer) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = upstream.send_json(&headers, &body).map_err(|error| *error);
+        let _ = sender.send((upstream, result));
+    });
+    loop {
+        match answer.recv_timeout(CLIENT_POLL) {
+            Ok(result) => return Some(result),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if client_gone(client) {
+                    return None;
+                }
+            }
         }
     }
 }
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn complete(
     stream: &mut dyn Write,
+    client: Option<&TcpStream>,
     state: &State,
     hooks: &dyn Hooks,
     request: &Value,
@@ -878,23 +1004,25 @@ pub(crate) fn complete(
 ) {
     let thread = thread.filter(|id| id.len() == 64 && id.bytes().all(|c| c.is_ascii_hexdigit()));
     let _lease = if let Some(id) = thread {
-        let mut active = state
+        match state
             .active_sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !active.insert(id.into()) {
-            respond(
-                stream,
-                409,
-                "Conflict",
-                &wire::error_body(
-                    "This thread already has a request in flight.",
-                    "router_busy",
-                ),
-            );
-            return;
+            .acquire(id, LEASE_WAIT, &|| client_gone(client))
+        {
+            Ok(guard) => Some(guard),
+            Err(LeaseRefusal::Gone) => return,
+            Err(LeaseRefusal::Busy) => {
+                respond(
+                    stream,
+                    409,
+                    "Conflict",
+                    &wire::error_body(
+                        "This thread already has a request in flight.",
+                        "router_busy",
+                    ),
+                );
+                return;
+            }
         }
-        Some(SessionGuard(&state.active_sessions, id.into()))
     } else {
         None
     };
@@ -1263,7 +1391,7 @@ pub(crate) fn complete(
                     elapsed_ms: attempt_started.elapsed().as_millis() as u64,
                 });
             };
-            let mut upstream = super::subscription_probe::TransportRequest::new(
+            let upstream = super::subscription_probe::TransportRequest::new(
                 crate::http::agent_builder()
                     .timeout_connect(CONNECT_TIMEOUT)
                     .timeout_read(READ_TIMEOUT),
@@ -1271,9 +1399,16 @@ pub(crate) fn complete(
             )
             .loopback_only(offline);
             state.probe(&route.model, "pending", "none");
-            let call = upstream
-                .send_json(&prepared.headers, &prepared.body)
-                .map_err(|error| *error);
+            let Some((upstream, call)) = send_watching(
+                upstream,
+                prepared.headers.clone(),
+                prepared.body.clone(),
+                client,
+            ) else {
+                // The client left before the answer started. Nothing reads a reply.
+                settle(None, false, None);
+                return;
+            };
             match call {
                 Ok(response) => {
                     state.probe(&route.model, "accepted", "none");
@@ -1742,6 +1877,85 @@ mod tests {
     use super::*;
     use crate::config::{Account, Credential, Route, RouterConfig};
     use serde_json::json;
+
+    #[test]
+    fn a_busy_thread_waits_for_its_lease_instead_of_failing() {
+        let leases = Leases::default();
+        let alive = || false;
+        let held = leases.acquire("t", Duration::ZERO, &alive).unwrap();
+        assert_eq!(
+            leases.acquire("t", Duration::ZERO, &alive).err(),
+            Some(LeaseRefusal::Busy)
+        );
+        // Another thread is not held up.
+        drop(leases.acquire("u", Duration::ZERO, &alive).unwrap());
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                drop(held);
+            });
+            let started = std::time::Instant::now();
+            assert!(leases.acquire("t", Duration::from_secs(5), &alive).is_ok());
+            assert!(started.elapsed() < Duration::from_secs(2));
+        });
+    }
+
+    #[test]
+    fn a_waiting_client_that_leaves_gives_up_its_place() {
+        let leases = Leases::default();
+        let _held = leases.acquire("t", Duration::ZERO, &|| false).unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            leases.acquire("t", Duration::from_secs(30), &|| true).err(),
+            Some(LeaseRefusal::Gone)
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A connected pair: the client's socket and the router's side of it.
+    fn connection() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (served, _) = listener.accept().unwrap();
+        (client, served)
+    }
+
+    #[test]
+    fn a_closed_client_connection_reads_as_gone() {
+        let (client, served) = connection();
+        assert!(!client_gone(Some(&served)));
+        assert!(!client_gone(None));
+        drop(client);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !client_gone(Some(&served)) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_client_that_leaves_ends_the_wait_for_a_silent_upstream() {
+        // The upstream accepts and never answers, as a model that has not started.
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            upstream.local_addr().unwrap()
+        );
+        let hold = std::thread::spawn(move || upstream.accept().map(|(socket, _)| socket));
+        let (client, served) = connection();
+        let request = super::super::subscription_probe::TransportRequest::new(
+            crate::http::agent_builder().timeout_read(Duration::from_secs(60)),
+            &url,
+        );
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(client);
+        });
+        let started = std::time::Instant::now();
+        assert!(send_watching(request, Vec::new(), json!({}), Some(&served)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(10));
+        drop(hold);
+    }
 
     /// The clock every server test reads, so a day bucket never drifts.
     fn fixed_clock() -> i64 {

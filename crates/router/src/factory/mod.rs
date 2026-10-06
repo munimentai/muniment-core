@@ -541,6 +541,7 @@ fn chat(
         .unwrap_or_else(|| crate::policy::digest(&format!("run:{}", run.run_id)));
     server::complete(
         out,
+        Some(reader.get_ref()),
         &server.state,
         &hooks,
         &request,
