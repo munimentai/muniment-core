@@ -102,6 +102,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
         "ALTER TABLE runs ADD COLUMN last_status integer, ADD COLUMN last_error_type text;",
     ),
     (3, "ALTER TABLE runs ADD COLUMN last_status_ms bigint;"),
+    (4, "ALTER TABLE runs ALTER COLUMN budget_usd DROP NOT NULL;"),
 ];
 
 /// The routing settings row: everything in the router configuration that is
@@ -838,7 +839,7 @@ pub(crate) mod tests {
             task_id: "t1".into(),
             repo: "factory/app".into(),
             role: "implementer".into(),
-            budget_usd: 2.0,
+            budget_usd: Some(2.0),
             created_ms: 1,
             expires_ms: 1_000,
             revoked_ms: None,
@@ -850,6 +851,13 @@ pub(crate) mod tests {
             store.create_run(&run).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
+        let open = RunRecord {
+            run_id: "open".into(),
+            budget_usd: None,
+            ..run.clone()
+        };
+        store.create_run(&open).unwrap();
+        assert_eq!(store.run("open").unwrap().unwrap().budget_usd, None);
         let charge = RunCharge {
             cost_usd: 0.25,
             tokens: Tokens {

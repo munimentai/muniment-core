@@ -20,7 +20,8 @@ pub struct Claims {
     pub task_id: String,
     pub repo: String,
     pub role: String,
-    pub budget_usd: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_usd: Option<f64>,
     /// Unix milliseconds the token stops serving.
     pub expires_ms: i64,
     /// A random value, so two tokens for one run differ.
@@ -123,7 +124,7 @@ mod tests {
             task_id: "task-1".into(),
             repo: "factory/app".into(),
             role: "implementer".into(),
-            budget_usd: 2.5,
+            budget_usd: Some(2.5),
             expires_ms,
             nonce: nonce(),
         }
@@ -150,7 +151,7 @@ mod tests {
         let (_, body) = signed.split_once('.').unwrap();
         let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let mut altered: Claims = serde_json::from_slice(&engine.decode(body).unwrap()).unwrap();
-        altered.budget_usd = 1_000.0;
+        altered.budget_usd = Some(1_000.0);
         let forged = format!(
             "mrt1.{}.{signature}",
             engine.encode(serde_json::to_vec(&altered).unwrap())

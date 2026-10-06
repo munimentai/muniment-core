@@ -278,7 +278,7 @@ fn run_tokens_are_issued_bound_and_revoked() {
         task_id: "t1".into(),
         repo: "factory/app".into(),
         role: "planner".into(),
-        budget_usd: 1.0,
+        budget_usd: Some(1.0),
         expires_ms: i64::MAX,
         nonce: token::nonce(),
     });
@@ -592,6 +592,54 @@ fn a_run_budget_constrains_routing_before_any_upstream_call() {
 }
 
 #[test]
+fn a_run_without_a_budget_is_never_refused_on_spend() {
+    let (url, seen) = upstream(vec![
+        completion("one", 1_000_000, 100_000),
+        completion("two", 1_000_000, 100_000),
+        completion("three", 1_000_000, 100_000),
+    ]);
+    let fixture = fixture(vec![account("a1", &url, &["gpt-5.6-luna"])], 5.0);
+    let address = fixture.handle.address();
+    let new_run = json!({"run_id": "r1", "task_id": "task-1", "repo": "factory/app", "role": "implementer", "expires_in_s": 3600});
+    let (status, body) = call(address, "POST", "/v1/runs", ADMIN, Some(&new_run), &[]);
+    assert_eq!(status, 200, "{body}");
+    let token = serde_json::from_str::<Value>(&body).unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for _ in 0..3 {
+        let (status, body) = call(
+            address,
+            "POST",
+            "/v1/chat/completions",
+            &token,
+            Some(&turn("auto", false)),
+            &[],
+        );
+        assert_eq!(status, 200, "{body}");
+    }
+    assert_eq!(seen.try_iter().count(), 3);
+    let usage = run_usage(address, "r1");
+    assert!(usage["budget_usd"].is_null());
+    assert!((usage["spent_usd"].as_f64().unwrap() - 0.96).abs() < 1e-9);
+    assert_eq!(usage["reserved_usd"], 0.0);
+    assert!(usage["last_error_type"].is_null());
+    // A retried create without a budget gets a token for the same run.
+    assert_eq!(
+        call(address, "POST", "/v1/runs", ADMIN, Some(&new_run), &[]).0,
+        200
+    );
+    let mut budgeted = new_run.clone();
+    budgeted["budget_usd"] = json!(1.0);
+    assert_eq!(
+        call(address, "POST", "/v1/runs", ADMIN, Some(&budgeted), &[]).0,
+        409
+    );
+    let (_, metrics) = call(address, "GET", "/metrics", "", None, &[]);
+    assert!(!metrics.contains("muniment_router_budget_rejections_total"));
+}
+
+#[test]
 fn a_reservation_holds_at_most_what_remains() {
     let budgets = Budgets::default();
     budgets.seed(&RunRecord {
@@ -599,7 +647,7 @@ fn a_reservation_holds_at_most_what_remains() {
         task_id: "t".into(),
         repo: "p".into(),
         role: "planner".into(),
-        budget_usd: 1.0,
+        budget_usd: Some(1.0),
         created_ms: 0,
         expires_ms: i64::MAX,
         revoked_ms: None,
@@ -621,6 +669,21 @@ fn a_reservation_holds_at_most_what_remains() {
     assert!((budget.spent - 0.6).abs() < 1e-9);
     assert_eq!(budget.reserved, 0.0);
     assert_eq!(budgets.reserve("unknown", 1.0), None);
+    budgets.seed(&RunRecord {
+        run_id: "open".into(),
+        task_id: "t".into(),
+        repo: "p".into(),
+        role: "planner".into(),
+        budget_usd: None,
+        created_ms: 0,
+        expires_ms: i64::MAX,
+        revoked_ms: None,
+        usage: store::RunUsage::default(),
+        last_failure: None,
+    });
+    assert_eq!(budgets.reserve("open", 1_000.0), Some(1_000.0));
+    budgets.settle("open", 1_000.0, 5.0);
+    assert!(!budgets.get("open").unwrap().exhausted());
 }
 
 #[test]

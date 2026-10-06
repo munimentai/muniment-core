@@ -100,6 +100,9 @@ fn backend(settings: &Settings) -> Result<Backend, String> {
             config.classifier = classifier.clone();
         }
         config.policy.mode = mode;
+        // A run's own budget, when it has one, is the only spend limit here.
+        // The desktop's task budget never applies to a run.
+        config.policy.task_budget_usd = None;
     }));
     Ok(backend)
 }

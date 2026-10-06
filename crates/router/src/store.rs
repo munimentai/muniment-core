@@ -28,7 +28,9 @@ pub struct RunRecord {
     pub task_id: String,
     pub repo: String,
     pub role: String,
-    pub budget_usd: f64,
+    /// What the run may spend. A run without one is never refused on spend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_usd: Option<f64>,
     pub created_ms: i64,
     pub expires_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]

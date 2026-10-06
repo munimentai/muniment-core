@@ -3,11 +3,12 @@
 //!
 //! The server answers the factory's API. An admin token creates a run and
 //! gets back a signed run token bound to the run's task, repository, role,
-//! budget and expiry. Every model call carries a run token. The server
-//! reserves the call's uncached cost estimate before it goes upstream,
-//! settles the priced cost after, and answers 402 `budget_exhausted` once a
-//! run has spent its budget. Gate outcomes feed a decayed success rate per
-//! model, role and repository, and policy reads it at task boundaries.
+//! optional budget and expiry. Every model call carries a run token. The
+//! server reserves the call's uncached cost estimate before it goes upstream
+//! and settles the priced cost after. A run with a budget gets 402
+//! `budget_exhausted` once it has spent it. A run without one is never
+//! refused on spend. Gate outcomes feed a decayed success rate per model,
+//! role and repository, and policy reads it at task boundaries.
 
 pub mod accounts;
 pub mod langfuse;
@@ -80,11 +81,24 @@ struct Budgets(Mutex<HashMap<String, Budget>>);
 
 #[derive(Clone, Copy, Default)]
 struct Budget {
-    budget: f64,
+    /// `None` for a run without a budget.
+    budget: Option<f64>,
     spent: f64,
     reserved: f64,
     expires_ms: i64,
     revoked: bool,
+}
+
+impl Budget {
+    /// What the run has left, or `None` for a run without a budget.
+    fn remaining(&self) -> Option<f64> {
+        self.budget
+            .map(|budget| budget - self.spent - self.reserved)
+    }
+
+    fn exhausted(&self) -> bool {
+        self.remaining().is_some_and(|left| left <= 0.0)
+    }
 }
 
 impl Budgets {
@@ -108,11 +122,12 @@ impl Budgets {
         self.lock().get(run_id).copied()
     }
 
-    /// Reserves up to `estimate` of what remains. `None` means nothing remains.
+    /// Reserves up to `estimate` of what remains, or all of it for a run
+    /// without a budget. `None` means nothing remains.
     fn reserve(&self, run_id: &str, estimate: f64) -> Option<f64> {
         let mut budgets = self.lock();
         let entry = budgets.get_mut(run_id)?;
-        let remaining = entry.budget - entry.spent - entry.reserved;
+        let remaining = entry.remaining().unwrap_or(f64::INFINITY);
         if remaining <= 0.0 {
             return None;
         }
@@ -487,7 +502,7 @@ fn chat(
     run: &RunRecord,
 ) -> Vec<Attempt> {
     let budget = server.budgets.get(&run.run_id).unwrap_or_default();
-    if budget.spent + budget.reserved >= budget.budget {
+    if budget.exhausted() {
         server.metrics.add(
             "muniment_router_budget_rejections_total",
             &[("role", &run.role)],
@@ -719,7 +734,8 @@ struct NewRun {
     task_id: String,
     repo: String,
     role: String,
-    budget_usd: f64,
+    #[serde(default)]
+    budget_usd: Option<f64>,
     expires_in_s: u64,
 }
 
@@ -728,7 +744,7 @@ fn create_run(server: &Server, body: Value) -> (u16, Value) {
         return (
             400,
             error(
-                "The run needs run_id, task_id, repo, role, budget_usd and expires_in_s.",
+                "The run needs run_id, task_id, repo, role and expires_in_s.",
                 "invalid_request",
             ),
         );
@@ -739,7 +755,9 @@ fn create_run(server: &Server, body: Value) -> (u16, Value) {
     if ![&new.run_id, &new.task_id, &new.repo, &new.role]
         .iter()
         .all(|text| text_ok(text))
-        || !(new.budget_usd.is_finite() && new.budget_usd > 0.0)
+        || !new
+            .budget_usd
+            .is_none_or(|budget| budget.is_finite() && budget > 0.0)
         || !(1..=LONGEST_RUN_S).contains(&new.expires_in_s)
     {
         return (
@@ -973,7 +991,9 @@ impl Hooks for RunHooks<'_> {
             .budgets
             .get(&self.run.run_id)
             .unwrap_or_default();
-        let left = budget.budget - budget.spent - budget.reserved;
+        let Some(left) = budget.remaining() else {
+            return Ok(None);
+        };
         if left > 0.0 {
             return Ok(Some(left));
         }

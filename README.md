@@ -127,14 +127,16 @@ the router answers without an error sets all three back to null. `POST /v1/chat/
 completion becomes one generation with its model, usage, cost, latency, run id,
 task id and role. It joins the trace that the `x-muniment-trace` header names,
 or the task's own trace when the header is absent. A background thread posts
-the generations in batches, so Langfuse never delays a turn. A run's turn reserves its uncached
-cost estimate before it goes upstream and settles the priced cost after. Once
-spend reaches the budget the router answers 402 with
-`{"error":{"type":"budget_exhausted",…}}`. Routing constraints run before
-any classifier sees text. The run's remaining budget replaces the configured
-`policy.task_budget_usd`, and a turn that no eligible model's estimate fits
-answers 422 with `{"error":{"type":"routing_constraints",…}}`. The desktop
-keeps `policy.offline_only` (loopback endpoints only) and its own
+the generations in batches, so Langfuse never delays a turn. `budget_usd` on
+`POST /v1/runs` is optional. A run's turn reserves its uncached cost estimate
+before it goes upstream and settles the priced cost after, and the run's usage
+records the spend either way. A run without `budget_usd` is never refused on
+spend. A run with one gets 402 with
+`{"error":{"type":"budget_exhausted",…}}` once spend reaches it, and a turn
+that no eligible model's estimate fits answers 422 with
+`{"error":{"type":"routing_constraints",…}}`. Routing constraints run before
+any classifier sees text. The server ignores `policy.task_budget_usd`. The
+desktop keeps `policy.offline_only` (loopback endpoints only) and its own
 `policy.task_budget_usd`. `GET /healthz` and `GET /metrics` take no token.
 
 `muniment-router accounts list|add-key|login|import-pi-auth|set-weight|disable|enable|remove|probe`
