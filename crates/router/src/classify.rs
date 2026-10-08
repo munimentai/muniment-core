@@ -494,12 +494,19 @@ fn classifier_body(url: &str, body: &Value) -> Value {
     }
 }
 
+/// The answers out of a Workers AI envelope. Cloudflare's own models, such as
+/// Clef, put them under `result`. A third-party model, such as Jev, puts them
+/// under a completed run record: `result.state` and `result.result`.
 fn classifier_response(value: Value) -> Value {
-    value
-        .get("result")
-        .filter(|result| result.is_object())
-        .cloned()
-        .unwrap_or(value)
+    let Some(result) = value.get("result").filter(|result| result.is_object()) else {
+        return value;
+    };
+    if result.get("answers").is_none() && result.get("state") == Some(&json!("Completed")) {
+        if let Some(run) = result.get("result").filter(|run| run.is_object()) {
+            return run.clone();
+        }
+    }
+    result.clone()
 }
 
 /// One classifier call. Nothing here fails a turn: an unreachable classifier,
@@ -909,6 +916,24 @@ mod tests {
 #[cfg(test)]
 mod connection_wire_tests {
     use super::*;
+    #[test]
+    fn cloudflare_answers_read_from_both_envelopes() {
+        let answers = json!({ "answers": { "route": { "choice": "fast" } } });
+        // Clef answers under `result`.
+        assert_eq!(
+            classifier_response(json!({ "success": true, "result": answers.clone() })),
+            answers
+        );
+        // Jev answers under a completed run record.
+        assert_eq!(
+            classifier_response(
+                json!({ "success": true, "result": { "state": "Completed", "result": answers.clone() } })
+            ),
+            answers
+        );
+        assert_eq!(classifier_response(answers.clone()), answers);
+    }
+
     #[test]
     fn cloudflare_wraps_only_its_own_endpoint() {
         let body = json!({"model":"typesafe/jev", "state":"sample", "questions":{"route":{"type":"choice"}}});

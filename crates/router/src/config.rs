@@ -356,6 +356,10 @@ pub struct RouterConfig {
     pub classifier: Classifier,
     #[serde(default)]
     pub routes: Vec<Route>,
+    /// The `family/model` keys the user keeps out of the running. They stay in
+    /// `all_options`, so Settings can list them and turn them back on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden: Vec<String>,
     /// The route a turn takes when no classifier answers or confidence is low.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<String>,
@@ -698,6 +702,7 @@ mod tests {
             policy: Default::default(),
             discovered_models: Default::default(),
             enabled: true,
+            hidden: vec!["openai/gpt-5.5".into()],
             accounts: vec![key_account("a1", "openai"), key_account("a2", "openai")],
             classifier: Classifier::Typesafe {
                 api_key: "apikey_1".into(),

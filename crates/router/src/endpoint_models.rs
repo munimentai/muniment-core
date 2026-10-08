@@ -33,11 +33,20 @@ fn names(list: Option<&Value>, field: &str) -> Vec<String> {
 /// The JSON body, `Ok(None)` for an HTTP error or a body that is not JSON,
 /// and `Err` when the host never answered: no route, a refused connection or
 /// a timeout.
-fn fetch(agent: &ureq::Agent, url: &str) -> Result<Option<Value>, ()> {
-    match agent.get(url).call() {
+fn fetch(agent: &ureq::Agent, url: &str, key: Option<&str>) -> Result<Option<Value>, ()> {
+    match authorized(agent.get(url), key).call() {
         Ok(response) => Ok(response.into_json::<Value>().ok()),
         Err(ureq::Error::Status(..)) => Ok(None),
         Err(ureq::Error::Transport(_)) => Err(()),
+    }
+}
+
+/// A server behind a key, such as an Ollama server on another host, answers
+/// only a request that carries it.
+fn authorized(request: ureq::Request, key: Option<&str>) -> ureq::Request {
+    match key {
+        Some(key) => request.set("Authorization", &format!("Bearer {key}")),
+        None => request,
     }
 }
 
@@ -54,6 +63,7 @@ fn chat_models(
     origin: &mut url::Url,
     models: Vec<String>,
     deadline: Instant,
+    key: Option<&str>,
 ) -> Vec<String> {
     origin.set_path("/api/show");
     let url = origin.as_str();
@@ -71,8 +81,7 @@ fn chat_models(
                 if remaining.is_zero() {
                     break;
                 }
-                if let Ok(response) = agent
-                    .post(url)
+                if let Ok(response) = authorized(agent.post(url), key)
                     .timeout(remaining)
                     .send_json(serde_json::json!({"model": model}))
                 {
@@ -97,6 +106,16 @@ fn chat_models(
 /// Chat models the endpoint serves. `None` means discovery failed; an empty
 /// list means the server answered but has no chat models.
 pub fn discover_models(base_url: &str, timeout: Duration) -> Option<Vec<String>> {
+    discover_models_with_key(base_url, None, timeout)
+}
+
+/// Chat models an endpoint behind a key serves. A blank key sends none.
+pub fn discover_models_with_key(
+    base_url: &str,
+    key: Option<&str>,
+    timeout: Duration,
+) -> Option<Vec<String>> {
+    let key = key.map(str::trim).filter(|key| !key.is_empty());
     let mut origin = url::Url::parse(base_url).ok()?;
     if !matches!(origin.scheme(), "http" | "https") || origin.host().is_none() {
         return None;
@@ -106,13 +125,14 @@ pub fn discover_models(base_url: &str, timeout: Duration) -> Option<Vec<String>>
     origin.set_path("/api/tags");
     origin.set_query(None);
     origin.set_fragment(None);
-    match fetch(&agent, origin.as_str()) {
+    match fetch(&agent, origin.as_str(), key) {
         Ok(Some(tags)) if tags.get("models").is_some_and(Value::is_array) => {
             return Some(chat_models(
                 &agent,
                 &mut origin,
                 parse_ollama_tags(&tags),
                 deadline,
+                key,
             ));
         }
         Ok(_) => {}
@@ -124,7 +144,7 @@ pub fn discover_models(base_url: &str, timeout: Duration) -> Option<Vec<String>>
     }
     let agent = crate::http::agent_builder().timeout(remaining).build();
     let models_url = format!("{}/models", base_url.trim_end_matches('/'));
-    fetch(&agent, &models_url)
+    fetch(&agent, &models_url, key)
         .ok()
         .flatten()
         .filter(|value| value.get("data").is_some_and(Value::is_array))
@@ -198,6 +218,56 @@ mod tests {
             }
         });
         assert_eq!(discover_models(&url, Duration::from_secs(3)), Some(vec![]));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_server_behind_a_key_lists_its_models_only_with_the_key() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        // Answers each request with its models when it carries the key, else 401.
+        fn serve(listener: std::net::TcpListener, requests: usize) {
+            for _ in 0..requests {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(&stream);
+                let (mut line, mut route, mut keyed, mut length) =
+                    (String::new(), String::new(), false, 0);
+                reader.read_line(&mut route).unwrap();
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    keyed |= lower.trim() == "authorization: bearer secret";
+                    if let Some(value) = lower.strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                reader.read_exact(&mut vec![0; length]).unwrap();
+                let body = match (keyed, route.starts_with("GET /api/tags")) {
+                    (false, _) => None,
+                    (true, true) => Some(r#"{"models":[{"name":"jev-small"}]}"#),
+                    (true, false) => Some(r#"{"capabilities":["completion"]}"#),
+                };
+                let (status, body) = body.map_or(("401 Unauthorized", ""), |b| ("200 OK", b));
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || serve(listener, 4));
+        // Without the key, the tags and the models list both refuse.
+        assert_eq!(discover_models(&url, Duration::from_secs(3)), None);
+        assert_eq!(
+            discover_models_with_key(&url, Some(" secret "), Duration::from_secs(3)),
+            Some(vec!["jev-small".to_owned()])
+        );
         server.join().unwrap();
     }
 
