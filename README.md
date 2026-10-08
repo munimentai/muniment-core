@@ -64,8 +64,8 @@ on Linux against the bumped tree. When all of them pass, it rebases the bump
 onto `main`, pushes it with a `feat:` or `fix:` message, and tags the release
 with `pins.toml` and `packages.bun.lock` attached. A pin that fails gets one
 `Pin update blocked: <component> <version>` Forgejo issue and stays at its version.
-Manually dispatching `pins-update.yml` defaults `dry_run` to on, which runs every check
-but does not push, tag, or file anything.
+Manually dispatching `pins-update.yml` defaults `dry_run` to on, so it performs every check
+without pushing, tagging, or filing anything.
 
 ## Consumers
 
