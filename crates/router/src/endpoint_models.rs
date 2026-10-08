@@ -103,6 +103,39 @@ fn chat_models(
         .collect()
 }
 
+/// What an endpoint serves, by kind. A decision model answers typed
+/// questions on the server's System One route and never a chat turn.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EndpointModels {
+    pub chat: Vec<String>,
+    pub decisions: Vec<String>,
+}
+
+/// llama.cpp 0.6.0 and later list `decisions` in a decision model's
+/// `architecture.output_modalities`. A model that also lists `text` chats too.
+fn split_openai_models(value: &Value) -> EndpointModels {
+    let mut models = EndpointModels::default();
+    let ids = parse_openai_models(value);
+    let entries = value.get("data").and_then(Value::as_array);
+    for id in ids {
+        let modalities = entries
+            .into_iter()
+            .flatten()
+            .find(|entry| entry.get("id").and_then(Value::as_str).map(str::trim) == Some(&id))
+            .and_then(|entry| entry.pointer("/architecture/output_modalities"))
+            .and_then(Value::as_array);
+        let reports = |kind: &str| modalities.is_some_and(|list| list.iter().any(|v| v == kind));
+        if reports("decisions") {
+            models.decisions.push(id.clone());
+            if !reports("text") {
+                continue;
+            }
+        }
+        models.chat.push(id);
+    }
+    models
+}
+
 /// Chat models the endpoint serves. `None` means discovery failed; an empty
 /// list means the server answered but has no chat models.
 pub fn discover_models(base_url: &str, timeout: Duration) -> Option<Vec<String>> {
@@ -115,6 +148,15 @@ pub fn discover_models_with_key(
     key: Option<&str>,
     timeout: Duration,
 ) -> Option<Vec<String>> {
+    discover_endpoint_models(base_url, key, timeout).map(|models| models.chat)
+}
+
+/// The chat and decision models an endpoint behind a key serves.
+pub fn discover_endpoint_models(
+    base_url: &str,
+    key: Option<&str>,
+    timeout: Duration,
+) -> Option<EndpointModels> {
     let key = key.map(str::trim).filter(|key| !key.is_empty());
     let mut origin = url::Url::parse(base_url).ok()?;
     if !matches!(origin.scheme(), "http" | "https") || origin.host().is_none() {
@@ -127,13 +169,10 @@ pub fn discover_models_with_key(
     origin.set_fragment(None);
     match fetch(&agent, origin.as_str(), key) {
         Ok(Some(tags)) if tags.get("models").is_some_and(Value::is_array) => {
-            return Some(chat_models(
-                &agent,
-                &mut origin,
-                parse_ollama_tags(&tags),
-                deadline,
-                key,
-            ));
+            return Some(EndpointModels {
+                chat: chat_models(&agent, &mut origin, parse_ollama_tags(&tags), deadline, key),
+                decisions: Vec::new(),
+            });
         }
         Ok(_) => {}
         Err(()) => return None,
@@ -148,13 +187,25 @@ pub fn discover_models_with_key(
         .ok()
         .flatten()
         .filter(|value| value.get("data").is_some_and(Value::is_array))
-        .map(|value| parse_openai_models(&value))
+        .map(|value| split_openai_models(&value))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn decision_models_are_told_from_chat_models_by_what_the_server_reports() {
+        let models = split_openai_models(&json!({"data": [
+            {"id": "qwen3", "architecture": {"output_modalities": ["text"]}},
+            {"id": "kev-4b", "architecture": {"output_modalities": ["decisions"]}},
+            {"id": "both", "architecture": {"output_modalities": ["text", "decisions"]}},
+            {"id": "older"},
+        ]}));
+        assert_eq!(models.chat, ["qwen3", "both", "older"]);
+        assert_eq!(models.decisions, ["kev-4b", "both"]);
+    }
 
     #[test]
     fn only_explicit_embedding_only_models_are_excluded() {

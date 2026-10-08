@@ -1097,6 +1097,28 @@ mod tests {
     }
 
     #[test]
+    fn a_codemode_script_reports_each_tool_it_calls_as_its_own_activity() {
+        // Pi runs a script's tool calls through the same pipeline as the
+        // model's own calls, under an id that names the script's call.
+        let started = parse_frame(
+            &json!({"type":"tool_execution_start","toolCallId":"call_1/1",
+            "parentToolCallId":"call_1","toolName":"mcp__record__sql","args":{"query":"select 1"}}),
+        )
+        .unwrap();
+        assert!(
+            matches!(started, PiChatEvent::ToolStarted { ref tool_call_id, ref tool_name, .. }
+            if tool_call_id == "call_1/1" && tool_name == "mcp__record__sql")
+        );
+        let finished = parse_frame(&json!({"type":"tool_execution_end","toolCallId":"call_1/1",
+            "parentToolCallId":"call_1","toolName":"mcp__record__sql","isError":false}))
+        .unwrap();
+        assert!(
+            matches!(finished, PiChatEvent::ToolFinished { ref tool_call_id, failed: false, .. }
+            if tool_call_id == "call_1/1")
+        );
+    }
+
+    #[test]
     fn completion_waits_for_post_reply_compaction_and_overflow_retry() {
         let (sender, adapter) = bounded_adapter(Duration::from_secs(1));
         let next = || {

@@ -10,6 +10,8 @@ const CLOUD_PROVIDER_EXTENSION: &str = include_str!("muniment_cloud_provider.mjs
 /// or the product. Written beside the session logs and loaded on every launch.
 pub const IDENTITY_EXTENSION: &str = include_str!("assistant_identity.mjs");
 pub const IDENTITY_EXTENSION_FILE: &str = "assistant-identity.mjs";
+pub const DECISIONS_EXTENSION: &str = include_str!("decisions_extension.mjs");
+pub const DECISIONS_EXTENSION_FILE: &str = "decisions.mjs";
 /// An extension tool whose name carries the harness never reaches the model.
 pub const EXCLUDED_TOOLS: &str = "bg_run_pi_attested";
 
@@ -25,7 +27,8 @@ Tools:
 - web_search, fetch_content: search the web and fetch a page. For get_search_content, copy the exact responseId from the tool result. Never invent a placeholder such as $(prev).
 - subagent: hand a bounded task to a child agent and get its result. When subagent is not in your tools, call subagents_enable first.
 - bg_run, bg_status, bg_logs, bg_kill: start a long command in the background and read its progress and result.
-- mcp: discover and call the user's MCP servers. The `record` server is the company record: `sql` reads it through one read-only query over the `v_<kind>` views, `edges_open`, `entity_identities` and `recent_events`, and `propose` then `commit` change it. Read before you write. A commit is the only change that exists.
+- mcp__record__sql, mcp__record__propose, mcp__record__commit: the company record. `sql` reads it through one read-only query over the `v_<kind>` views, `edges_open`, `entity_identities` and `recent_events`, and `propose` then `commit` change it. Read before you write. A commit is the only change that exists. The user's other MCP servers are listed by name, and codemode scripts call their tools.
+- codemode: run a JavaScript script that calls these tools, in parallel when the calls are independent, and returns only what you need. Its `models` runs classifier models, which answer typed choice, yes-or-no and score questions about JSON state faster and cheaper than a chat model. The user's connected ones are under the provider `decisions`. Use it to sort, filter or triage many items in one call.
 
 Rules:
 - `bash` reads its `timeout` in SECONDS, never milliseconds, and applies NO timeout at all when you omit it. Pass one on every call: 60 for a quick command, up to 600 for a build or a test suite. Send anything longer to `bg_run`.
@@ -599,6 +602,13 @@ pub fn pi_launch_config_for_executable(
         identity.to_string_lossy().into_owned(),
         "--exclude-tools".into(),
         EXCLUDED_TOOLS.into(),
+    ]);
+    // The decision models connected in Settings, for codemode scripts.
+    let decisions = session_root.join(DECISIONS_EXTENSION_FILE);
+    install_extension(&decisions, DECISIONS_EXTENSION, "decisions_extension_write")?;
+    config.args.extend([
+        "--extension".into(),
+        decisions.to_string_lossy().into_owned(),
     ]);
     let progress = session_root.join("muniment-routing-progress.mjs");
     install_extension(

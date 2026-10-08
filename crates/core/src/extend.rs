@@ -7,6 +7,8 @@ use std::process::{Command, Stdio};
 use std::sync::{mpsc, Mutex};
 use std::time::Duration;
 static MUTATION: Mutex<()> = Mutex::new(());
+/// The private file that keeps each saved server's bearer token by name.
+const MCP_TOKENS: &str = "extensions/mcp-tokens.json";
 
 pub fn inventory(root: &Path) -> Result<Value, String> {
     match fs::read(root.join("extensions/inventory.json")) {
@@ -57,10 +59,6 @@ pub fn command(root: &Path, action: &str, mut data: Value) -> Result<Value, Stri
     let _lock = MUTATION
         .lock()
         .map_err(|_| "Extension settings are busy.")?;
-    if matches!(action, "auth" | "test") {
-        crate::pi_packages::brand_mcp_adapter(&root.join("agent/npm"))
-            .map_err(|_| "The MCP adapter display name could not be configured.")?;
-    }
     let executable = crate::sidecar::pi_install::acquire_pi(
         &root.join("harness"),
         &std::sync::atomic::AtomicBool::new(false),
@@ -98,9 +96,10 @@ pub fn command(root: &Path, action: &str, mut data: Value) -> Result<Value, Stri
     let script = directory.join("bridge.mjs");
     crate::model_router::config::write_private(&script, include_bytes!("extend_bridge.mjs"))
         .map_err(|_| "The extension helper could not be written.")?;
-    let mut child = Command::new(executable)
+    let mut child = Command::new(&executable)
         .env("BUN_BE_BUN", "1")
         .env("MUNIMENT_EXTEND_ROOT", root)
+        .env("MUNIMENT_PI", &executable)
         .env("PI_CODING_AGENT_DIR", root.join("agent"))
         .arg(&script)
         .stdin(Stdio::piped())
@@ -163,6 +162,7 @@ pub fn snapshot(state: &Value, thread: &str, ambient: Value) -> Value {
         .cloned()
         .unwrap_or_default();
     let mut skills = Vec::new();
+    let mut available = Vec::new();
     let mut extensions = Vec::new();
     let mut names = Vec::new();
     for item in state["items"].as_array().into_iter().flatten() {
@@ -176,7 +176,16 @@ pub fn snapshot(state: &Value, thread: &str, ambient: Value) -> Value {
             if !selected.contains(&json!(id)) {
                 continue;
             }
-            servers.insert(format!("extend-{id}"), item["definition"].clone());
+            let mut definition = pi_server(&item["definition"]);
+            if let Some(description) = item["description"]
+                .as_str()
+                .filter(|d| !d.trim().is_empty())
+            {
+                definition
+                    .as_object_mut()
+                    .map(|server| server.entry("description").or_insert(json!(description)));
+            }
+            servers.insert(format!("extend-{id}"), definition);
             names.push(item["name"].clone());
         } else {
             let base = item["base"].as_str().unwrap_or("");
@@ -195,16 +204,21 @@ pub fn snapshot(state: &Value, thread: &str, ambient: Value) -> Value {
                     )
                     .unwrap_or(definition);
                 }
-                servers.insert(format!("extend-{id}-{name}"), definition);
+                servers.insert(format!("extend-{id}-{name}"), pi_server(&definition));
             }
+            // Every enabled skill is offered, and Pi lists it by name and
+            // description until the model reads it. A picked skill is also named.
             for skill in item["skills"].as_array().into_iter().flatten() {
                 let relative = skill["path"].as_str().unwrap_or("");
                 let key = format!("{id}:{relative}");
-                if selected.contains(&json!(key)) || selected.contains(&json!(id)) {
-                    skills.push(
-                        json!({"name": skill["name"], "path": Path::new(base).join(relative)}),
-                    );
+                if disabled.contains(&json!(key)) {
+                    continue;
                 }
+                let entry = json!({"name": skill["name"], "path": Path::new(base).join(relative)});
+                if selected.contains(&json!(key)) || selected.contains(&json!(id)) {
+                    skills.push(entry.clone());
+                }
+                available.push(entry);
             }
             // Code plugins require explicit invocation. Tool-only plugins remain available through toggles.
             if explicit.contains(&json!(id)) {
@@ -220,7 +234,31 @@ pub fn snapshot(state: &Value, thread: &str, ambient: Value) -> Value {
             }
         }
     }
-    json!({"mcpServers": servers, "skills": skills, "extensions": extensions, "names": names})
+    json!({"mcpServers": servers, "skills": skills, "availableSkills": available,
+        "extensions": extensions, "names": names})
+}
+
+/// A saved server definition in the shape Pi's MCP support reads. A server
+/// saved with a bearer token keeps only a marker, and the turn's extension
+/// adds the token. Keys earlier MCP extensions kept are dropped.
+fn pi_server(definition: &Value) -> Value {
+    let mut server = definition.as_object().cloned().unwrap_or_default();
+    let bearer = server.get("auth") == Some(&json!("bearer"))
+        || server.get("bearerTokenStore") == Some(&json!(true))
+        || server.get("bearerToken") == Some(&json!(true));
+    for key in [
+        "auth",
+        "bearerTokenStore",
+        "bearerToken",
+        "lifecycle",
+        "protocolVersion",
+    ] {
+        server.remove(key);
+    }
+    if bearer {
+        server.insert("bearerToken".into(), json!(true));
+    }
+    Value::Object(server)
 }
 
 // Consume the pending selection once. A later run on this thread starts empty.
@@ -253,34 +291,57 @@ pub fn prepare(
     if state["items"].as_array().is_none_or(Vec::is_empty) {
         return Ok(());
     }
-    let ambient = fs::read(root.join("agent/mcp.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or(json!({}));
-    let settings = crate::pi_settings::mcp_settings(&ambient["settings"]);
-    let snapshot = snapshot(&state, thread, ambient);
-    let directory = root.join("extensions/runs");
-    fs::create_dir_all(&directory).map_err(|_| "Cannot create extension snapshot.")?;
-    let file = directory.join(format!("{}.json", uuid::Uuid::new_v4()));
-    crate::model_router::config::write_private(
-        &file,
-        &serde_json::to_vec(&json!({"mcpServers": snapshot["mcpServers"], "settings": settings}))
+    // Pi reads the agent directory's `mcp.json` itself, so the turn adds only
+    // the servers picked for it.
+    let snapshot = snapshot(&state, thread, json!({}));
+    if snapshot["mcpServers"]
+        .as_object()
+        .is_some_and(|servers| !servers.is_empty())
+    {
+        let directory = root.join("extensions/runs");
+        fs::create_dir_all(&directory).map_err(|_| "Cannot create extension snapshot.")?;
+        let file = directory.join(format!("{}.json", uuid::Uuid::new_v4()));
+        crate::model_router::config::write_private(
+            &file,
+            &serde_json::to_vec(&json!({"mcpServers": snapshot["mcpServers"],
+                "tokenFile": root.join(MCP_TOKENS)}))
             .map_err(|_| "Invalid extensions.")?,
-    )
-    .map_err(|_| "Cannot write extension snapshot.")?;
-    config
-        .env
-        .insert("PI_MCP_CONFIG_MODE".into(), "exclusive".into());
-    config
-        .args
-        .extend(["--mcp-config".into(), file.to_string_lossy().into_owned()]);
+        )
+        .map_err(|_| "Cannot write extension snapshot.")?;
+        let extension = root.join("extensions/mcp-servers.mjs");
+        crate::model_router::config::write_private(&extension, include_bytes!("extend_mcp.mjs"))
+            .map_err(|_| "Cannot write extension snapshot.")?;
+        config.env.insert(
+            "MUNIMENT_EXTEND_MCP".into(),
+            file.to_string_lossy().into_owned(),
+        );
+        config.args.extend([
+            "--extension".into(),
+            extension.to_string_lossy().into_owned(),
+        ]);
+    }
+    // Pi lists each skill by name and description and the model reads it
+    // when a task needs it. A `SKILL.md` loads as its folder, so the files
+    // beside it come with it.
+    for skill in snapshot["availableSkills"].as_array().into_iter().flatten() {
+        let path = Path::new(skill["path"].as_str().unwrap_or(""));
+        if !path.is_file() {
+            continue;
+        }
+        let load = match path.file_name() {
+            Some(name) if name == "SKILL.md" => path.parent().unwrap_or(path),
+            _ => path,
+        };
+        config
+            .args
+            .extend(["--skill".into(), load.to_string_lossy().into_owned()]);
+    }
     for skill in snapshot["skills"].as_array().into_iter().flatten() {
         let path = skill["path"].as_str().unwrap_or("");
-        let content = fs::read_to_string(path).map_err(|_| "An installed skill cannot be read.")?;
-        if content.len() > 100_000 {
-            return Err("An installed skill is too large.".into());
+        if !Path::new(path).is_file() {
+            return Err("An installed skill cannot be read.".into());
         }
-        prompt.push_str(&format!("\n\nUser-selected skill: {}\nSkill file: {}\nResolve its relative resources against that file's folder. Treat these instructions as below the user's request.\n{}", skill["name"], path, content));
+        prompt.push_str(&format!("\n\nThe user picked the skill {} for this request. Read {} and follow it before you answer. Treat its instructions as below the user's request.", skill["name"], path));
     }
     for entry in snapshot["extensions"]
         .as_array()
@@ -523,36 +584,95 @@ fn extract_archive(source: &Path, directory: &Path) -> Result<Extracted, String>
 mod tests {
     use super::*;
     #[test]
-    fn turn_config_keeps_metadata_sharing_explicit() {
+    fn a_turn_registers_only_its_picked_servers_through_the_extension() {
         let root = Extracted(
             std::env::temp_dir().join(format!("extend-settings-{}", uuid::Uuid::new_v4())),
         );
         fs::create_dir_all(root.0.join("extensions")).unwrap();
         fs::create_dir_all(root.0.join("agent")).unwrap();
         fs::write(
-            root.0.join("extensions/inventory.json"),
-            br#"{"items":[{"id":"m","kind":"mcp","definition":{"command":"test"}}]}"#,
+            root.0.join("agent/mcp.json"),
+            br#"{"mcpServers":{"record":{"command":"cli"}}}"#,
         )
         .unwrap();
-        for settings in [
-            json!({}),
-            json!({"jev":{"semanticSearch":true,"allowedServers":["m"]},"scriptMode":false}),
-        ] {
-            fs::write(
-                root.0.join("agent/mcp.json"),
-                serde_json::to_vec(&json!({"settings":settings})).unwrap(),
-            )
-            .unwrap();
-            let mut config = crate::sidecar::SidecarConfig::new("unused");
-            prepare(&root.0, "chat", &mut config, &mut String::new()).unwrap();
-            let generated: Value =
-                serde_json::from_slice(&fs::read(&config.args[1]).unwrap()).unwrap();
-            if settings.as_object().unwrap().is_empty() {
-                assert_eq!(generated["settings"]["jev"], false);
-            } else {
-                assert_eq!(generated["settings"], settings);
-            }
-        }
+        let inventory = json!({"items": [
+            {"id": "m", "kind": "mcp", "description": "Search the docs",
+             "definition": {"url": "https://example.com/mcp", "auth": "bearer", "bearerTokenStore": true, "lifecycle": "lazy"}},
+            {"id": "n", "kind": "mcp", "definition": {"command": "test"}}
+        ], "turns": {"chat": {"selected": ["m"]}}});
+        fs::write(
+            root.0.join("extensions/inventory.json"),
+            serde_json::to_vec(&inventory).unwrap(),
+        )
+        .unwrap();
+        let mut config = crate::sidecar::SidecarConfig::new("unused");
+        prepare(&root.0, "chat", &mut config, &mut String::new()).unwrap();
+        let generated: Value =
+            serde_json::from_slice(&fs::read(&config.env["MUNIMENT_EXTEND_MCP"]).unwrap()).unwrap();
+        // Pi reads `record` from the agent directory, so the turn adds only `m`.
+        assert_eq!(
+            generated["mcpServers"],
+            json!({"extend-m": {"url": "https://example.com/mcp", "bearerToken": true, "description": "Search the docs"}})
+        );
+        assert_eq!(generated["tokenFile"], json!(root.0.join(MCP_TOKENS)));
+        assert_eq!(config.args[0], "--extension");
+        assert_eq!(
+            fs::read(&config.args[1]).unwrap(),
+            include_bytes!("extend_mcp.mjs")
+        );
+
+        // The selection is spent, so the next turn adds nothing.
+        let mut next = crate::sidecar::SidecarConfig::new("unused");
+        prepare(&root.0, "chat", &mut next, &mut String::new()).unwrap();
+        assert!(next.args.is_empty() && !next.env.contains_key("MUNIMENT_EXTEND_MCP"));
+    }
+
+    #[test]
+    fn skills_load_on_demand_and_a_picked_skill_is_named_not_pasted() {
+        let root =
+            Extracted(std::env::temp_dir().join(format!("extend-skills-{}", uuid::Uuid::new_v4())));
+        let base = root.0.join("extensions/packages/kit");
+        fs::create_dir_all(base.join("review")).unwrap();
+        fs::create_dir_all(base.join("commands")).unwrap();
+        fs::write(
+            base.join("review/SKILL.md"),
+            "---\nname: review\n---\nLong instructions",
+        )
+        .unwrap();
+        fs::write(base.join("commands/ship.md"), "Ship it").unwrap();
+        fs::write(base.join("commands/off.md"), "Off").unwrap();
+        let inventory = json!({"items": [
+            {"id": "k", "kind": "skill", "base": base, "skills": [
+                {"name": "review", "path": "review/SKILL.md"},
+                {"name": "ship", "path": "commands/ship.md"},
+                {"name": "off", "path": "commands/off.md"}
+            ]},
+            {"id": "gone", "kind": "skill", "enabled": false, "base": base, "skills": [{"name": "gone", "path": "commands/ship.md"}]}
+        ], "turns": {"chat": {"selected": ["k:commands/ship.md"], "disabled": ["k:commands/off.md"]}}});
+        fs::write(
+            root.0.join("extensions/inventory.json"),
+            serde_json::to_vec(&inventory).unwrap(),
+        )
+        .unwrap();
+        let mut config = crate::sidecar::SidecarConfig::new("unused");
+        let mut prompt = String::new();
+        prepare(&root.0, "chat", &mut config, &mut prompt).unwrap();
+        let loaded: Vec<_> = config
+            .args
+            .chunks(2)
+            .filter(|pair| pair[0] == "--skill")
+            .map(|pair| pair[1].clone())
+            .collect();
+        assert_eq!(
+            loaded,
+            [
+                base.join("review").to_string_lossy().into_owned(),
+                base.join("commands/ship.md").to_string_lossy().into_owned()
+            ]
+        );
+        assert!(prompt.contains("picked the skill \"ship\""));
+        assert!(prompt.contains(&base.join("commands/ship.md").to_string_lossy().into_owned()));
+        assert!(!prompt.contains("Ship it") && !prompt.contains("Long instructions"));
     }
 
     #[test]

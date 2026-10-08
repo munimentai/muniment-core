@@ -147,6 +147,7 @@ fn a_full_bump_moves_the_current_release_to_rollback() {
         pi: Some("latest".into()),
         all_packages: true,
         packages: vec![("pi-mcp-adapter".into(), "4.0.0".into())],
+        remove: Vec::new(),
         claude_code: Some("latest".into()),
     };
     let plan = plan(&pins, &request, &Recorded::registry()).unwrap();
@@ -186,6 +187,34 @@ fn an_empty_request_changes_nothing_and_unknown_packages_fail() {
     };
     let error = plan(&pins, &request, &Recorded::registry()).unwrap_err();
     assert!(error.contains("left-pad"), "{error}");
+}
+
+#[test]
+fn a_removed_package_leaves_the_pins_and_relocks() {
+    let pins = current();
+    let request = BumpRequest {
+        remove: vec!["pi-mcp-adapter".into()],
+        ..BumpRequest::default()
+    };
+    let plan = plan(&pins, &request, &Recorded::registry()).unwrap();
+    assert!(plan.packages_changed && !plan.pi_changed);
+    assert!(!plan
+        .pins
+        .packages
+        .iter()
+        .any(|package| package.name == "pi-mcp-adapter"));
+    assert_eq!(plan.pins.packages.len(), pins.packages.len() - 1);
+    assert_eq!(plan.changes[0].to, "removed");
+    assert_eq!(title(&plan.changes).unwrap(), "feat: remove pi-mcp-adapter");
+    let unknown = BumpRequest {
+        remove: vec!["left-pad".into()],
+        ..BumpRequest::default()
+    };
+    assert!(plan_error(&pins, &unknown).contains("left-pad"));
+}
+
+fn plan_error(pins: &muniment_pins::update::PinsFile, request: &BumpRequest) -> String {
+    plan(pins, request, &Recorded::registry()).unwrap_err()
 }
 
 #[test]

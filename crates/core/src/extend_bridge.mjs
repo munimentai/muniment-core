@@ -1,16 +1,20 @@
-// Runs with the verified harness's embedded Bun. Package code is loaded only by install/auth/test actions.
+// Runs with the verified harness's embedded Bun. Package code is loaded only by install actions.
+// Sign-in and connection tests run the harness's own MCP commands.
 import fs from 'node:fs/promises'
 import { serviceFavicon } from './extend_favicon.mjs'
 import path from 'node:path'
-import { pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
 import { randomUUID, createHash } from 'node:crypto'
 const root = process.env.MUNIMENT_EXTEND_ROOT
 const agent = path.join(root, 'agent')
 const directory = path.join(root, 'extensions')
 const stateFile = path.join(directory, 'inventory.json')
-const adapter = path.join(agent, 'npm/node_modules/pi-mcp-adapter')
-const loadAdapter = name => import(pathToFileURL(path.join(adapter, name)).href)
+// Bearer tokens by server name, kept private beside the inventory. The turn's
+// extension reads them, so a token never enters a config file Pi reads.
+const tokenFile = path.join(directory, 'mcp-tokens.json')
+// Sign-in and tests run in a trusted folder of their own, whose project config
+// names only the server at hand.
+const checks = path.join(directory, 'mcp-check')
 let input = ''
 for await (const chunk of process.stdin) input += chunk
 const request = JSON.parse(input)
@@ -36,6 +40,80 @@ function run(command, args, cwd, timeout = 120000) {
     child.on('exit', code => { clearTimeout(timer); code === 0 ? resolve(output.trim()) : reject(new Error(`${command} failed. Check the source and local tools.`)) })
   })
 }
+async function readTokens() {
+  try { return JSON.parse(await fs.readFile(tokenFile, 'utf8')) }
+  catch (error) { if (error.code === 'ENOENT') return {}; throw error }
+}
+async function writeTokens(tokens) {
+  const temp = `${tokenFile}.${randomUUID()}`
+  await fs.writeFile(temp, JSON.stringify(tokens), { mode: 0o600 })
+  await fs.rename(temp, tokenFile)
+}
+// The harness's MCP command with its exit code and output, which a failed connection also prints.
+function runPi(args, cwd, timeout, env = {}) {
+  return new Promise((resolve, reject) => {
+    const { BUN_BE_BUN, ...inherited } = process.env
+    const child = spawn(process.env.MUNIMENT_PI, args, { cwd, shell: false, env: { ...inherited, ...env, PI_CODING_AGENT_DIR: agent, PI_OFFLINE: '1' }, stdio: ['ignore', 'pipe', 'pipe'] })
+    let output = ''
+    child.stdout.on('data', chunk => { if (output.length < 1000000) output += chunk })
+    child.stderr.resume()
+    const timer = setTimeout(() => { child.kill(); reject(new Error('The operation timed out.')) }, timeout)
+    child.on('error', error => { clearTimeout(timer); reject(error) })
+    child.on('exit', code => { clearTimeout(timer); resolve({ code, output }) })
+  })
+}
+// Pi reads a project's mcp.json only in a folder the user trusts, and the
+// staging folder is the runtime's own.
+async function trustChecks() {
+  await fs.mkdir(checks, { recursive: true, mode: 0o700 })
+  const key = await fs.realpath(checks)
+  const file = path.join(agent, 'trust.json')
+  let trust = {}
+  try { trust = JSON.parse(await fs.readFile(file, 'utf8')) } catch (error) { if (error.code !== 'ENOENT') throw error }
+  if (trust[key] === true) return
+  trust[key] = true
+  const temp = `${file}.${randomUUID()}`
+  await fs.writeFile(temp, `${JSON.stringify(trust, null, 2)}\n`, { mode: 0o600 })
+  await fs.rename(temp, file)
+}
+// A saved definition in the shape Pi reads, with its bearer token in the
+// environment of the one command that needs it.
+function piServer(definition, token) {
+  const { auth, bearerTokenStore, bearerToken, lifecycle, protocolVersion, ...server } = definition
+  if (token) server.headers = { ...server.headers, Authorization: '${MUNIMENT_MCP_TOKEN}' }
+  return server
+}
+// Signs in when asked, then connects once and reports the server's state.
+async function checkServer(name, definition, signIn) {
+  await trustChecks()
+  const folder = path.join(checks, randomUUID())
+  await fs.mkdir(path.join(folder, '.pi'), { recursive: true, mode: 0o700 })
+  try {
+    const token = (await readTokens())[name]
+    await fs.writeFile(path.join(folder, '.pi/mcp.json'), JSON.stringify({ mcpServers: { [name]: piServer(definition, token) } }), { mode: 0o600 })
+    const env = token ? { MUNIMENT_MCP_TOKEN: `Bearer ${token}` } : {}
+    if (signIn) {
+      const login = await runPi(['mcp', 'login', name, '--timeout', '120'], folder, 125000, env)
+      if (login.code !== 0) throw safe('Sign-in did not finish. Try again, and approve access in the browser.')
+    }
+    const { output } = await runPi(['mcp', 'list', '--json'], folder, 30000, env)
+    const report = JSON.parse(output).servers.find(server => server.name === name)
+    if (report?.state === 'needs-auth') throw safe('This server needs sign-in. Use Sign in, then test again.')
+    if (report?.state !== 'connected') throw safe('Connection failed. Check the URL, credentials, and server requirements.')
+    return { status: report.state, tools: report.tools.map(tool => ({ name: tool })), resources: report.resources ?? 0 }
+  } finally { await fs.rm(folder, { recursive: true, force: true }) }
+}
+// Signs out in the staging folder, where the server's name and URL match the saved sign-in.
+async function signOut(name, definition) {
+  await trustChecks()
+  const folder = path.join(checks, randomUUID())
+  await fs.mkdir(path.join(folder, '.pi'), { recursive: true, mode: 0o700 })
+  try {
+    await fs.writeFile(path.join(folder, '.pi/mcp.json'), JSON.stringify({ mcpServers: { [name]: piServer(definition) } }), { mode: 0o600 })
+    await runPi(['mcp', 'logout', name], folder, 30000)
+  } finally { await fs.rm(folder, { recursive: true, force: true }) }
+}
+function safe(message) { return Object.assign(new Error(message), { safe: true }) }
 function safeRelative(value) {
   if (!value || path.isAbsolute(value) || value.split(/[\\/]/).includes('..')) throw new Error('Choose a relative path inside the package.')
   return value
@@ -109,11 +187,12 @@ function validateServer(definition) {
     if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password) throw new Error('Use an HTTP or HTTPS server URL without credentials.')
   } else if (typeof definition.command !== 'string' || !definition.command.trim()) throw new Error('Enter a server URL or command.')
   if (definition.args && (!Array.isArray(definition.args) || definition.args.some(a => typeof a !== 'string'))) throw new Error('Server arguments must be a list of text values.')
-  // Secrets are references. Bearer tokens use the adapter's OS credential store.
+  // Secrets are references. Bearer tokens live in the private token file.
   for (const value of Object.values(definition.headers || {})) if (!/^\$\{[A-Z_][A-Z0-9_]*\}$/.test(value)) throw new Error('Use an environment variable reference for headers, or the token field.')
   for (const value of Object.values(definition.env || {})) if (!/^\$\{[A-Z_][A-Z0-9_]*\}$/.test(value)) throw new Error('Use environment variable references for server secrets.')
   if (definition.oauth?.clientSecret) throw new Error('Use an environment variable for OAuth client credentials.')
-  return { ...definition, lifecycle: 'lazy' }
+  const { lifecycle, protocolVersion, ...server } = definition
+  return server
 }
 const state = await read()
 let result
@@ -129,10 +208,10 @@ try {
     if (data.fetchIcon && definition.url) entry.icon = await serviceFavicon(definition.url) || entry.icon
     if (data.token) {
       if (!definition.url) throw new Error('Tokens require a remote server URL.')
-      const { saveBearerTokenForUrl } = await loadAdapter('mcp-bearer-store.ts')
-      saveBearerTokenForUrl(`extend-${id}`, data.token, definition.url)
-      entry.definition.auth = 'bearer'; entry.definition.bearerTokenStore = true
-    }
+      const tokens = await readTokens(); tokens[`extend-${id}`] = data.token; await writeTokens(tokens)
+      delete entry.definition.auth; delete entry.definition.bearerTokenStore
+      entry.definition.bearerToken = true
+    } else if (old?.definition?.bearerToken && old.definition.url === definition.url) entry.definition.bearerToken = true
     state.items = [...state.items.filter(i => i.id !== id), entry]; await write(state); result = state
   } else if (action === 'preview') {
     const snapshot = await sourceSnapshot(data.source)
@@ -158,6 +237,12 @@ try {
     const old = state.items.find(i => i.id === data.replaceId)
     const entry = { ...preview, ...scanned, skills: chosen, id: old?.id || preview.id, enabled: true, previous: old ? { ...old, previous: undefined } : undefined }
     state.items = [...state.items.filter(i => i.id !== entry.id), entry]; await write(state); result = state
+  } else if (action === 'exposure') {
+    // Scripts find a server's tools when needed. The tool list carries them every turn.
+    const item = state.items.find(i => i.id === data.id && i.kind === 'mcp'); if (!item) throw new Error('Server not found.')
+    if (!['codemode', 'direct'].includes(data.exposure)) throw new Error('Choose how chats reach the tools.')
+    if (data.exposure === 'codemode') delete item.definition.exposure; else item.definition.exposure = data.exposure
+    await write(state); result = state
   } else if (action === 'toggle') {
     const item = state.items.find(i => i.id === data.id); if (!item) throw new Error('Extension not found.')
     item.enabled = !!data.enabled; await write(state); result = state
@@ -167,8 +252,9 @@ try {
   } else if (action === 'remove') {
     const item = state.items.find(i => i.id === data.id)
     if (item?.kind === 'mcp' && item.definition.url) {
-      const { removeAuth } = await loadAdapter('mcp-auth-flow.ts'); await removeAuth(`extend-${item.id}`)
-      const { removeBearerToken } = await loadAdapter('mcp-bearer-store.ts'); removeBearerToken(`extend-${item.id}`)
+      const name = `extend-${item.id}`
+      await signOut(name, item.definition).catch(() => {})
+      const tokens = await readTokens(); if (name in tokens) { delete tokens[name]; await writeTokens(tokens) }
     }
     state.items = state.items.filter(i => i.id !== data.id); await write(state); result = state
   } else if (action === 'turn') {
@@ -183,23 +269,14 @@ try {
     if (!definition) throw new Error('Server not found.')
     validateServer(definition)
     const name = member ? `extend-${item.id}-${member}` : `extend-${item.id}`
-    if (action === 'auth') {
-      const { authenticate } = await loadAdapter('mcp-auth-flow.ts')
-      await authenticate(name, definition.url, { ...definition, auth: 'oauth' }, { signal: AbortSignal.timeout(120000) })
-      definition.auth = 'oauth'; await write(state)
-    }
-    const { McpServerManager } = await loadAdapter('server-manager.ts')
-    const manager = new McpServerManager(directory)
-    try {
-      const connection = await manager.connect(name, definition, AbortSignal.timeout(20000))
-      result = { status: connection.status, tools: connection.tools.map(t => ({ name: t.name, description: t.description })), resources: connection.resources.length }
-      item.lastCheck = { status: result.status, tools: result.tools.length }; await write(state)
-    } finally { await manager.close(name) }
+    if (action === 'auth' && !definition.url) throw safe('Only a remote server signs in.')
+    result = await checkServer(name, definition, action === 'auth')
+    item.lastCheck = { status: result.status, tools: result.tools.length }; await write(state)
   } else throw new Error('Unknown extension action.')
   process.stdout.write(`\nMUNIMENT_EXTEND_RESULT=${JSON.stringify({ ok: true, result })}\n`)
 } catch (error) {
   // Provider errors can contain tokens and headers. Keep them off the UI/log wire.
-  const message = ['auth', 'test'].includes(action) ? 'Connection failed. Check the URL, credentials, and server requirements.' : String(error.message).slice(0, 500)
+  const message = error.safe ? error.message : ['auth', 'test'].includes(action) ? 'Connection failed. Check the URL, credentials, and server requirements.' : String(error.message).slice(0, 500)
   process.stdout.write(`\nMUNIMENT_EXTEND_RESULT=${JSON.stringify({ ok: false, error: message })}\n`)
   process.exitCode = 1
 }
