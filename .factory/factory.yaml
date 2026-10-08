@@ -33,7 +33,10 @@ risk_paths:
 # The image's toolchain has no rustfmt or clippy, and its RUSTUP_HOME and
 # CARGO_HOME are read-only. Setup copies the toolchain under HOME, adds both
 # components, and fetches the locked crates into a CARGO_HOME under HOME, so
-# every gate sets both variables.
+# every gate sets both variables. The sherpa-onnx build script downloads its
+# libraries with bundled TLS roots, which reject the sandbox egress proxy, so
+# setup fetches the archive with curl and points the build script at it
+# through that CARGO_HOME's config.
 gates:
   build:
     commands:
@@ -69,8 +72,7 @@ sandbox:
   cpus: 4
   memory_mib: 8192
   # crates.io for the locked crates, GitHub release downloads for the
-  # sherpa-onnx libraries the core build script fetches, and the Rust dist
-  # server for rustfmt and clippy.
+  # sherpa-onnx libraries, and the Rust dist server for rustfmt and clippy.
   egress:
     - "index.crates.io:443"
     - "static.crates.io:443"
@@ -82,6 +84,11 @@ sandbox:
     - "rm -rf $HOME/.rustup && cp -R /opt/rust/rustup $HOME/.rustup"
     - "for n in 1 2 3; do RUSTUP_HOME=$HOME/.rustup rustup component add rustfmt clippy && exit 0; sleep 20; done; exit 1"
     - "for n in 1 2 3; do RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo cargo fetch --locked && exit 0; sleep 20; done; exit 1"
+    - >-
+      v=$(grep -A1 '^name = "sherpa-onnx-sys"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p') &&
+      f=sherpa-onnx-v$v-linux-x64-shared-lib.tar.bz2 && mkdir -p $HOME/sherpa-onnx &&
+      curl -fsSL --retry 3 -o $HOME/sherpa-onnx/$f https://github.com/k2-fsa/sherpa-onnx/releases/download/v$v/$f &&
+      printf '[env]\nSHERPA_ONNX_ARCHIVE_DIR = "%s/sherpa-onnx"\n' "$HOME" >> $HOME/.cargo/config.toml
 
 # A releasing merge publishes through CI on main, so verify builds the merge.
 verify:
