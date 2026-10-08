@@ -25,10 +25,6 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   CARGO_TARGET_DIR: /root/.cache/muniment-core/pins
-  # The job token belongs to Forgejo. muniment-pins sends either variable to
-  # the GitHub API, so both stay empty, and it calls the API without a token.
-  GITHUB_TOKEN: ""
-  GH_TOKEN: ""
   # The macOS VM checks out the bumped tree from this branch.
   CHECK_BRANCH: pins-update-check
 
@@ -69,9 +65,12 @@ jobs:
       - run: bash .forgejo/rust-toolchain.sh rustfmt clippy
       - run: python3 -B scripts/pins/test_update.py
       - run: cargo build --release --locked -p muniment-pins --features cli
-      # Check, bump, and keep every pin that passes compat and the workspace tests on Linux.
+      # Check, bump, and keep every pin that passes compat and the workspace
+      # tests on Linux. The runner puts the Forgejo job token in the
+      # environment, and muniment-pins would send it to the GitHub API, so it
+      # runs without one and calls the API anonymously.
       - id: select
-        run: python3 -B scripts/pins/update.py select --bin "$CARGO_TARGET_DIR/release/muniment-pins" --out update.json
+        run: env -u GITHUB_TOKEN -u GH_TOKEN python3 -B scripts/pins/update.py select --bin "$CARGO_TARGET_DIR/release/muniment-pins" --out update.json
 
       # The checks CI runs on Linux, against the bumped tree.
       - id: checks

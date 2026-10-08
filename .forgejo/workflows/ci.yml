@@ -5,16 +5,14 @@ name: CI
 # GH_RELEASE_TOKEN publishes the GitHub release. A dispatch runs every check
 # and prints the release plan without publishing.
 on:
+  # Branches only: a tag names a commit that CI already checked.
   push:
+    branches: ["**"]
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  # The job token belongs to Forgejo. muniment-pins sends either variable to
-  # the GitHub API, so both stay empty.
-  GITHUB_TOKEN: ""
-  GH_TOKEN: ""
 
 # The .102 jobs name `homelab`, because the .106 image-smoke runner also
 # carries `self-hosted`.
@@ -30,8 +28,10 @@ jobs:
       - run: cargo fmt --all --check
       - run: scripts/check-core-boundary.sh
       - run: cargo clippy --workspace --all-targets --locked --features muniment-pins/cli -- -D warnings
-      # Stub child processes starve under default test parallelism.
-      - run: cargo test --workspace --locked --features muniment-core/network-tests,muniment-pins/cli -- --test-threads=1
+      # Stub child processes starve under default test parallelism. The runner
+      # puts the Forgejo job token in the environment, and muniment-pins would
+      # send it to the GitHub API, so the network tests run without it.
+      - run: env -u GITHUB_TOKEN -u GH_TOKEN cargo test --workspace --locked --features muniment-core/network-tests,muniment-pins/cli -- --test-threads=1
       - run: python3 -B scripts/test_release.py
       - run: python3 -B scripts/pins/test_update.py
 
