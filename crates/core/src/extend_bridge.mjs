@@ -84,12 +84,12 @@ function piServer(definition, token) {
   return server
 }
 // Signs in when asked, then connects once and reports the server's state.
-async function checkServer(name, definition, signIn) {
+async function checkServer(name, definition, signIn, tokenKey = name) {
   await trustChecks()
   const folder = path.join(checks, randomUUID())
   await fs.mkdir(path.join(folder, '.pi'), { recursive: true, mode: 0o700 })
   try {
-    const token = (await readTokens())[name]
+    const token = (await readTokens())[tokenKey]
     await fs.writeFile(path.join(folder, '.pi/mcp.json'), JSON.stringify({ mcpServers: { [name]: piServer(definition, token) } }), { mode: 0o600 })
     const env = token ? { MUNIMENT_MCP_TOKEN: `Bearer ${token}` } : {}
     if (signIn) {
@@ -252,9 +252,9 @@ try {
   } else if (action === 'remove') {
     const item = state.items.find(i => i.id === data.id)
     if (item?.kind === 'mcp' && item.definition.url) {
-      const name = `extend-${item.id}`
-      await signOut(name, item.definition).catch(() => {})
-      const tokens = await readTokens(); if (name in tokens) { delete tokens[name]; await writeTokens(tokens) }
+      const key = `extend-${item.id}`
+      await signOut(data.serverName || key, item.definition).catch(() => {})
+      const tokens = await readTokens(); if (key in tokens) { delete tokens[key]; await writeTokens(tokens) }
     }
     state.items = state.items.filter(i => i.id !== data.id); await write(state); result = state
   } else if (action === 'turn') {
@@ -268,9 +268,10 @@ try {
     const definition = member ? item?.servers?.[member] : item?.definition
     if (!definition) throw new Error('Server not found.')
     validateServer(definition)
-    const name = member ? `extend-${item.id}-${member}` : `extend-${item.id}`
+    // Tokens stay under the item's id. Pi signs in under the name chats use.
+    const key = member ? `extend-${item.id}-${member}` : `extend-${item.id}`
     if (action === 'auth' && !definition.url) throw safe('Only a remote server signs in.')
-    result = await checkServer(name, definition, action === 'auth')
+    result = await checkServer(member ? key : data.serverName || key, definition, action === 'auth', key)
     item.lastCheck = { status: result.status, tools: result.tools.length }; await write(state)
   } else throw new Error('Unknown extension action.')
   process.stdout.write(`\nMUNIMENT_EXTEND_RESULT=${JSON.stringify({ ok: true, result })}\n`)

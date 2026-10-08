@@ -13,8 +13,10 @@ export default function (pi) {
   for (const [name, definition] of Object.entries(snapshot.mcpServers ?? {})) {
     const { bearerToken, ...config } = definition
     if (bearerToken) {
-      if (typeof tokens[name] !== 'string') continue
-      config.headers = { ...config.headers, Authorization: `Bearer ${tokens[name]}` }
+      // The marker names the token's key, which stays the item's id.
+      const token = tokens[typeof bearerToken === 'string' ? bearerToken : name]
+      if (typeof token !== 'string') continue
+      config.headers = { ...config.headers, Authorization: `Bearer ${token}` }
     }
     pi.registerMcpServer(name, config)
   }

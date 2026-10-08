@@ -14,6 +14,8 @@ use super::family::{family, Family};
 
 /// The router's record in the agent directory.
 pub const CONFIG_FILE: &str = "muniment-router.json";
+/// The record of decision-model assistance, beside the router record.
+pub const ASSIST_FILE: &str = "muniment-assist.json";
 /// The Pi provider id the router answers as.
 pub const ROUTER_PROVIDER: &str = "muniment-router";
 /// The model id that stands for "let the classifier pick".
@@ -451,6 +453,44 @@ pub fn save(agent: &Path, config: &RouterConfig) -> io::Result<()> {
     let path = config_path(agent);
     let bytes = serde_json::to_vec_pretty(config)?;
     write_private(&path, &bytes)
+}
+
+/// Decision-model assistance: a decision model picks the MCP servers and skills
+/// each message uses. It runs apart from model routing, and may use another
+/// decision model.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Assist {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The decision model that answers. None uses the model routing one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier: Option<Classifier>,
+}
+
+impl Assist {
+    /// The decision model assistance asks, when it is on and ready.
+    pub fn decision_model(&self, config: &RouterConfig) -> Option<Classifier> {
+        let classifier = self.classifier.as_ref().unwrap_or(&config.classifier);
+        (self.enabled && classifier.ready()).then(|| classifier.clone())
+    }
+}
+
+pub fn load_assist(agent: &Path) -> io::Result<Assist> {
+    match fs::read(agent.join(ASSIST_FILE)) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Assist::default()),
+        Err(error) => Err(error),
+    }
+}
+
+/// The record can hold a key, so it is written `0600` like the router record.
+pub fn save_assist(agent: &Path, assist: &Assist) -> io::Result<()> {
+    fs::create_dir_all(agent)?;
+    write_private(
+        &agent.join(ASSIST_FILE),
+        &serde_json::to_vec_pretty(assist)?,
+    )
 }
 
 /// Writes `bytes` to `path` through a `0600` temporary and one atomic replace.

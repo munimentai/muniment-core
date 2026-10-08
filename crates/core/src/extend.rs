@@ -53,8 +53,33 @@ pub fn command(root: &Path, action: &str, mut data: Value) -> Result<Value, Stri
     if action == "route" {
         return route(root, &data);
     }
+    // The helper signs in, tests and signs out under the name chats use.
+    if matches!(action, "auth" | "test" | "remove") {
+        let state = inventory(root)?;
+        let id = data["id"].as_str().unwrap_or("").to_owned();
+        let (item, member) = id.split_once(':').unwrap_or((&id, ""));
+        if let Some(entry) = state["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|entry| entry["id"] == item)
+        {
+            let name = if member.is_empty() {
+                entry["name"].as_str().unwrap_or("")
+            } else {
+                member
+            };
+            if member.is_empty() == (entry["kind"] == "mcp") {
+                data["serverName"] = json!(server_name(&state, &id, name));
+            }
+        }
+    }
     if action == "read" {
-        return inventory(root);
+        let mut state = inventory(root)?;
+        if let Some(name) = assist_name(&root.join("agent")) {
+            state["assist"] = json!({ "name": name });
+        }
+        return Ok(state);
     }
     let _lock = MUTATION
         .lock()
@@ -185,7 +210,14 @@ pub fn snapshot(state: &Value, thread: &str, ambient: Value) -> Value {
                     .as_object_mut()
                     .map(|server| server.entry("description").or_insert(json!(description)));
             }
-            servers.insert(format!("extend-{id}"), definition);
+            // A saved token stays under the item's id, whatever Pi calls the server.
+            if definition["bearerToken"] == true {
+                definition["bearerToken"] = json!(format!("extend-{id}"));
+            }
+            servers.insert(
+                server_name(state, id, item["name"].as_str().unwrap_or("")),
+                definition,
+            );
             names.push(item["name"].clone());
         } else {
             let base = item["base"].as_str().unwrap_or("");
@@ -204,7 +236,11 @@ pub fn snapshot(state: &Value, thread: &str, ambient: Value) -> Value {
                     )
                     .unwrap_or(definition);
                 }
-                servers.insert(format!("extend-{id}-{name}"), pi_server(&definition));
+                let mut definition = pi_server(&definition);
+                if definition["bearerToken"] == true {
+                    definition["bearerToken"] = json!(format!("extend-{id}-{name}"));
+                }
+                servers.insert(server_name(state, &server_id, name), definition);
             }
             // Every enabled skill is offered, and Pi lists it by name and
             // description until the model reads it. A picked skill is also named.
@@ -241,6 +277,64 @@ pub fn snapshot(state: &Value, thread: &str, ambient: Value) -> Value {
 /// A saved server definition in the shape Pi's MCP support reads. A server
 /// saved with a bearer token keeps only a marker, and the turn's extension
 /// adds the token. Keys earlier MCP extensions kept are dropped.
+/// The name Pi gives an MCP server. Pi names its tools `mcp__<name>__<tool>`
+/// in the model's tool list and in the chat, so it is the server's own name in
+/// the characters Pi allows: a saved server's name, such as `Context7`, or the
+/// name a plugin gives its server. `id` is the item's id, or `<item>:<server>`
+/// for a plugin's server. A name another server shares, an empty name or the
+/// record server's name adds the start of the item's id.
+pub fn server_name(state: &Value, id: &str, name: &str) -> String {
+    fn plain(name: &str) -> String {
+        let mut out = String::new();
+        for c in name.trim().chars() {
+            let c = if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '-'
+            };
+            if !(c == '-' && (out.is_empty() || out.ends_with('-'))) {
+                out.push(c);
+            }
+        }
+        out.truncate(24);
+        out.trim_end_matches('-').to_owned()
+    }
+    // Pi treats names that differ only in case, `-` or `_` as one server.
+    fn key(name: &str) -> String {
+        name.to_lowercase().replace('-', "_")
+    }
+    let name = plain(name);
+    let item = id.split(':').next().unwrap_or(id);
+    let mut others = Vec::new();
+    for entry in state["items"].as_array().into_iter().flatten() {
+        let entry_id = entry["id"].as_str().unwrap_or("");
+        if entry["kind"] == "mcp" {
+            others.push((
+                entry_id.to_owned(),
+                entry["name"].as_str().unwrap_or("").to_owned(),
+            ));
+        }
+        for member in entry["servers"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(member, _)| member)
+        {
+            others.push((format!("{entry_id}:{member}"), member.clone()));
+        }
+    }
+    let shared = others
+        .iter()
+        .any(|(other, other_name)| other != id && key(&plain(other_name)) == key(&name));
+    if name.is_empty() {
+        return format!("extend-{}", id.replace(':', "-"));
+    }
+    if shared || key(&name) == crate::pi_settings::MCP_SERVER_NAME {
+        return format!("{name}-{}", item.chars().take(8).collect::<String>());
+    }
+    name
+}
+
 fn pi_server(definition: &Value) -> Value {
     let mut server = definition.as_object().cloned().unwrap_or_default();
     let bearer = server.get("auth") == Some(&json!("bearer"))
@@ -354,6 +448,27 @@ pub fn prepare(
     Ok(())
 }
 
+/// The short name of the decision model that assists, such as "Clef Flash" for
+/// the connection "Clef Flash · Ollama", while assistance is on and ready.
+fn assist_name(agent: &Path) -> Option<String> {
+    use crate::model_router::config;
+    let router = config::load(agent).ok()?;
+    let classifier = config::load_assist(agent).ok()?.decision_model(&router)?;
+    let saved = serde_json::to_value(&classifier).ok()?;
+    let connections: Value = fs::read(agent.join("classifier-connections.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    let name = connections
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["classifier"] == saved)
+        .and_then(|entry| entry["name"].as_str())
+        .unwrap_or(classifier.model());
+    Some(name.split(" · ").next().unwrap_or(name).trim().to_owned())
+}
+
 fn route(root: &Path, data: &Value) -> Result<Value, String> {
     use crate::model_router::{classify, config, usage};
     let state = inventory(root)?;
@@ -366,6 +481,13 @@ fn route(root: &Path, data: &Value) -> Result<Value, String> {
     let disabled = rules["disabled"].as_array().cloned().unwrap_or_default();
     let agent = root.join("agent");
     let mut router = config::load(&agent).map_err(|_| "The classifier settings cannot be read.")?;
+    // Assistance asks its own decision model, and only while it is on.
+    let assist =
+        config::load_assist(&agent).map_err(|_| "The classifier settings cannot be read.")?;
+    let Some(classifier) = assist.decision_model(&router) else {
+        return Ok(json!({"selected": []}));
+    };
+    router.classifier = classifier;
     let mut options = vec![config::Route {
         key: "none".into(),
         description: "No additional skill or plugin is useful. Answer with the current tools."
@@ -612,7 +734,7 @@ mod tests {
         // Pi reads `record` from the agent directory, so the turn adds only `m`.
         assert_eq!(
             generated["mcpServers"],
-            json!({"extend-m": {"url": "https://example.com/mcp", "bearerToken": true, "description": "Search the docs"}})
+            json!({"extend-m": {"url": "https://example.com/mcp", "bearerToken": "extend-m", "description": "Search the docs"}})
         );
         assert_eq!(generated["tokenFile"], json!(root.0.join(MCP_TOKENS)));
         assert_eq!(config.args[0], "--extension");
@@ -754,7 +876,39 @@ mod tests {
         assert_eq!(servers.len(), 3);
         assert!(servers.contains_key("extend-provider"));
         assert!(servers.contains_key("extend-relay"));
-        assert!(servers.contains_key("extend-plugin-relay"));
+        assert!(servers.contains_key("relay"));
+    }
+
+    #[test]
+    fn servers_take_their_item_names_and_keep_tokens_under_the_id() {
+        let state = json!({"items":[
+          {"id":"a3d717fb-548e","kind":"mcp","name":"Context7","definition":{"url":"https://mcp.context7.com/mcp","bearerToken":true}},
+          {"id":"b1","kind":"mcp","name":"Hugging Face","definition":{"url":"https://hf.co/mcp"}},
+          {"id":"c2c2c2c2c2","kind":"mcp","name":"hugging_face","definition":{"url":"https://other.example/mcp"}},
+          {"id":"d4","kind":"mcp","name":"Record","definition":{"url":"https://record.example/mcp"}},
+          {"id":"e5","kind":"mcp","name":"  ","definition":{"url":"https://blank.example/mcp"}},
+          {"id":"f6f6f6f6f6","kind":"plugin","servers":{"github":{"url":"https://gh.example/mcp"},"context7":{"url":"https://c7.example/mcp"}}}
+        ],"turns":{"chat":{"selected":["a3d717fb-548e","b1","c2c2c2c2c2","d4","e5","f6f6f6f6f6"]}}});
+        let result = snapshot(&state, "chat", json!({}));
+        let servers = result["mcpServers"].as_object().unwrap();
+        let mut names: Vec<_> = servers.keys().cloned().collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "Context7-a3d717fb",
+                "Hugging-Face-b1",
+                "Record-d4",
+                "context7-f6f6f6f6",
+                "extend-e5",
+                "github",
+                "hugging_face-c2c2c2c2"
+            ]
+        );
+        assert_eq!(
+            servers["Context7-a3d717fb"]["bearerToken"],
+            "extend-a3d717fb-548e"
+        );
     }
 
     #[test]
