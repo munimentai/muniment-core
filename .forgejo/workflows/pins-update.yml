@@ -115,10 +115,10 @@ jobs:
           git push --force origin "$commit:refs/heads/$CHECK_BRANCH"
           log="$RUNNER_TEMP/darwin.log"
           REF="$CHECK_BRANCH" SOURCE_SHA="$commit" bash .forgejo/desktop-ci.sh macos \
-            "export CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS=-Clink-arg=-Wl,-adhoc_codesign && status=0 && { cargo run --release --locked -p muniment-pins --features cli -- compat --report darwin.json || status=1; } &&
+            "export CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS=-Clink-arg=-Wl,-adhoc_codesign && compat_rc=0 && { cargo run --release --locked -p muniment-pins --features cli -- compat --report darwin.json || compat_rc=1; } &&
             echo MUNIMENT_DARWIN_REPORT_BEGIN && { cat darwin.json || true; } && echo && echo MUNIMENT_DARWIN_REPORT_END &&
             cargo test --workspace --locked --features muniment-core/network-tests,muniment-pins/cli -- --test-threads=1 &&
-            exit \$status" | tee "$log"
+            exit \$compat_rc" | tee "$log"
           python3 - "$log" <<'EOF'
           import pathlib, sys
           text = pathlib.Path(sys.argv[1]).read_text(errors="replace")
