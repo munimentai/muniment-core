@@ -1,0 +1,163 @@
+name: CI
+
+# Every push runs the checks. On main, the release job then tags the next
+# version on Forgejo, the push mirror carries the tag to GitHub, and
+# GH_RELEASE_TOKEN publishes the GitHub release. A dispatch runs every check
+# and prints the release plan without publishing.
+on:
+  push:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # The job token belongs to Forgejo. muniment-pins sends either variable to
+  # the GitHub API, so both stay empty.
+  GITHUB_TOKEN: ""
+  GH_TOKEN: ""
+
+jobs:
+  checks:
+    runs-on: self-hosted
+    timeout-minutes: 120
+    env:
+      CARGO_TARGET_DIR: /root/.cache/muniment-core/checks
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash .forgejo/rust-toolchain.sh rustfmt clippy
+      - run: cargo fmt --all --check
+      - run: scripts/check-core-boundary.sh
+      - run: cargo clippy --workspace --all-targets --locked --features muniment-pins/cli -- -D warnings
+      # Stub child processes starve under default test parallelism.
+      - run: cargo test --workspace --locked --features muniment-core/network-tests,muniment-pins/cli -- --test-threads=1
+      - run: python3 -B scripts/test_release.py
+      - run: python3 -B scripts/pins/test_update.py
+
+  router-server:
+    runs-on: self-hosted
+    timeout-minutes: 90
+    env:
+      CARGO_TARGET_DIR: /root/.cache/muniment-core/router-server
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash .forgejo/rust-toolchain.sh clippy
+      # OpenBao integration runs only when MUNIMENT_ROUTER_TEST_OPENBAO_ADDR is
+      # set. The OpenBao client tests run against a stand-in server always.
+      - name: Start Postgres
+        run: echo "MUNIMENT_ROUTER_TEST_DATABASE_URL=$(bash .forgejo/postgres.sh start)" >> "$GITHUB_ENV"
+      - run: cargo clippy -p muniment-router --all-targets --features server --locked -- -D warnings
+      - run: cargo test -p muniment-router --features server --locked -- --test-threads=1
+      - name: Stop Postgres
+        if: always()
+        run: bash .forgejo/postgres.sh stop
+
+  # The image-smoke runner on .106 has the host Docker daemon.
+  router-image:
+    runs-on: [self-hosted, image-smoke]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f deploy/router/Containerfile -t "muniment-router:ci-${{ github.run_id }}" .
+      - if: always()
+        run: docker image rm "muniment-router:ci-${{ github.run_id }}" || true
+
+  # The workspace tests on a pve01 macOS VM. The VM is x86_64, whose linker
+  # signs nothing unless asked, and the attach tests check the test binary's
+  # own code signature. The flag gives each binary the ad-hoc signature that
+  # Apple Silicon links in by default.
+  macos:
+    runs-on: self-hosted
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test on macOS through desktop-ci
+        env:
+          REF: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
+          REPO_TOKEN: ${{ github.token }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+          DESKTOP_CI_KNOWN_HOSTS: ${{ vars.DESKTOP_CI_KNOWN_HOSTS }}
+          BUILD_TIMEOUT: "5400"
+        run: >-
+          bash .forgejo/desktop-ci.sh macos
+          "export CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS=-Clink-arg=-Wl,-adhoc_codesign &&
+          cargo test --workspace --locked --features muniment-core/network-tests,muniment-pins/cli -- --test-threads=1"
+
+  # The Windows-only core paths on a pve01 Windows VM: known folders, the
+  # runtime task, attach pipes and ACLs.
+  windows:
+    runs-on: self-hosted
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check and test on Windows through desktop-ci
+        env:
+          REF: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
+          REPO_TOKEN: ${{ github.token }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+          DESKTOP_CI_KNOWN_HOSTS: ${{ vars.DESKTOP_CI_KNOWN_HOSTS }}
+          BUILD_TIMEOUT: "5400"
+        run: >-
+          bash .forgejo/desktop-ci.sh windows
+          "cargo check --workspace --all-targets --locked &&
+          cargo test --locked --package muniment-atomic-file --package muniment-pins --package muniment-attach --features muniment-attach/client &&
+          cargo test --locked --package muniment-core
+          --test windows_known_folders --test windows_sid --test windows_task_service
+          --test attach_windows_listener --test attach_windows_instance_lock
+          --test attach_windows_connect --test attach_windows_credential
+          --test attach_windows_stream --test attach_windows_peer_native
+          --test attach_windows_route_native --test attach_windows_session &&
+          cargo test --locked --package muniment-core --lib --
+          windows_task_service windows_user_diagnostics agents::tests memory_files::tests
+          pi_settings::tests"
+
+  # Tags and publishes the next version after every check of a main push
+  # passed. It shares the pins update's group, so tags stay in order.
+  release:
+    needs: [checks, router-server, router-image, macos, windows]
+    if: github.ref == 'refs/heads/main'
+    runs-on: self-hosted
+    timeout-minutes: 30
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    steps:
+      # A branch workflow can ask for any secret, so the first step admits
+      # only main of this repository before a later step reads one.
+      - name: Admit only main of factory/muniment-core
+        env:
+          REPOSITORY: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          case "$REPOSITORY|$REF|$EVENT|$ACTOR" in
+            "factory/muniment-core|refs/heads/main|push|mikeydiamonds") ;;
+            "factory/muniment-core|refs/heads/main|push|factory-bot") ;;
+            "factory/muniment-core|refs/heads/main|workflow_dispatch|mikeydiamonds") ;;
+            *)
+              echo '::error::The release runs only for a push to main or an owner dispatch of main in factory/muniment-core.' >&2
+              exit 1
+              ;;
+          esac
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tag and publish the next version
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+          GH_HOST: github.com
+        run: python3 -B scripts/release.py --revision "$GITHUB_SHA" --publish --asset pins/pins.toml --asset pins/packages.bun.lock
+      - name: Plan the next version
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+          GH_HOST: github.com
+        run: |
+          python3 -B scripts/release.py --revision "$GITHUB_SHA"
+          echo "The release token can publish to $(gh api repos/munimentai/muniment-core --jq 'select(.permissions.push) | .full_name')."
+          echo "The newest GitHub release is $(gh release view --repo munimentai/muniment-core --json tagName --jq .tagName)."

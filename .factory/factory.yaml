@@ -1,0 +1,94 @@
+# The AI factory's contract for muniment-core. The factory reads it from the
+# default branch, and only a human commit changes anything under .factory/.
+version: 1
+# Forgejo holds the code, pull requests, issues and CI. GitHub is a push mirror
+# and hosts the releases.
+forge: forgejo
+default_branch: main
+language: rust
+
+# The agent rules are the owner's. CI, the release and the pins update live in
+# .forgejo/.
+protected:
+  - "AGENTS.md"
+  - "CLAUDE.md"
+  - ".forgejo/**"
+  - ".factory/**"
+
+# A releasing merge ships to the desktop, the router and the sandbox image. The
+# pins, the release tooling, the router image and the public boundary decide
+# what they get.
+risk_paths:
+  - "pins/**"
+  - "scripts/release.py"
+  - "scripts/pins/**"
+  - "scripts/check-core-boundary.*"
+  - "deploy/**"
+  - "docs/decisions/**"
+  - "crates/pins/**"
+  - "crates/router/src/server.rs"
+  - "crates/router/src/store.rs"
+  - "Cargo.toml"
+
+# The image's toolchain has no rustfmt or clippy, and its RUSTUP_HOME and
+# CARGO_HOME are read-only. Setup copies the toolchain under HOME, adds both
+# components, and fetches the locked crates into a CARGO_HOME under HOME, so
+# every gate sets both variables.
+gates:
+  build:
+    commands:
+      - "RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo cargo build --workspace --all-targets --locked --features muniment-pins/cli"
+    timeout_s: 2400
+  lint:
+    commands:
+      - "RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo cargo fmt --all --check"
+      - "RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo cargo clippy --workspace --all-targets --locked --features muniment-pins/cli -- -D warnings"
+      - "RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo cargo clippy -p muniment-router --all-targets --features server --locked -- -D warnings"
+      - "RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo scripts/check-core-boundary.sh"
+    timeout_s: 2400
+  # The workspace tests without the network tests, which download Pi, and
+  # without the router's Postgres tests. CI runs both, the macOS tests, the
+  # Windows checks and the router image build on every push.
+  unit_tests:
+    commands:
+      - "RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo cargo test --workspace --locked --features muniment-pins/cli -- --test-threads=1"
+      - "python3 -B scripts/test_release.py"
+      - "python3 -B scripts/pins/test_update.py"
+    timeout_s: 3600
+  ci:
+    provider: forgejo
+    # Empty: every reported check counts. The macOS and Windows jobs wait for
+    # a pve01 desktop-ci VM slot, which the desktop shares.
+    required: []
+    timeout_s: 14400
+
+budgets:
+  concurrent_runs: 2
+
+sandbox:
+  cpus: 4
+  memory_mib: 8192
+  # crates.io for the locked crates, GitHub release downloads for the
+  # sherpa-onnx libraries the core build script fetches, and the Rust dist
+  # server for rustfmt and clippy.
+  egress:
+    - "index.crates.io:443"
+    - "static.crates.io:443"
+    - "github.com:443"
+    - "objects.githubusercontent.com:443"
+    - "release-assets.githubusercontent.com:443"
+    - "static.rust-lang.org:443"
+  setup:
+    - "rm -rf $HOME/.rustup && cp -R /opt/rust/rustup $HOME/.rustup"
+    - "for n in 1 2 3; do RUSTUP_HOME=$HOME/.rustup rustup component add rustfmt clippy && exit 0; sleep 20; done; exit 1"
+    - "for n in 1 2 3; do RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo cargo fetch --locked && exit 0; sleep 20; done; exit 1"
+
+# A releasing merge publishes through CI on main, so verify builds the merge.
+verify:
+  commands:
+    - "RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo cargo build --workspace --locked"
+  timeout_s: 2400
+
+# The owner files every task: no automatic cleanup task.
+cleanup:
+  enabled: false

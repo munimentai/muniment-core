@@ -1,0 +1,157 @@
+name: Pins update
+
+# Bumps the pins that pass the compatibility suite, checks the bumped tree on
+# Linux and on a pve01 macOS VM, then pushes the bump to main and tags the
+# release itself. Pushes made with the job token start no other workflow, so
+# this workflow runs every check that CI and the release would run. Blocked
+# pins get Forgejo issues. A dry run runs every check and stops before the
+# push, the release and the issues.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run every check and stop before the push, the release and the issues"
+        type: boolean
+        default: true
+
+# One update at a time, so two runs never push the same bump.
+concurrency:
+  group: pins-update
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_TARGET_DIR: /root/.cache/muniment-core/pins
+  # The job token belongs to Forgejo. muniment-pins sends either variable to
+  # the GitHub API, so both stay empty, and it calls the API without a token.
+  GITHUB_TOKEN: ""
+  GH_TOKEN: ""
+  # The macOS VM checks out the bumped tree from this branch.
+  CHECK_BRANCH: pins-update-check
+
+jobs:
+  update:
+    runs-on: self-hosted
+    timeout-minutes: 360
+    # It shares the release job's group, so tags stay in order.
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    steps:
+      # A branch workflow can ask for any secret, so the first step admits
+      # only main of this repository before a later step reads one.
+      - name: Admit only main of factory/muniment-core
+        env:
+          REPOSITORY: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          case "$REPOSITORY|$REF|$EVENT|$ACTOR" in
+            "factory/muniment-core|refs/heads/main|schedule|"*) ;;
+            "factory/muniment-core|refs/heads/main|workflow_dispatch|mikeydiamonds") ;;
+            *)
+              echo '::error::The pins update runs only on schedule or from an owner dispatch of main in factory/muniment-core.' >&2
+              exit 1
+              ;;
+          esac
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: bash .forgejo/rust-toolchain.sh rustfmt clippy
+      - run: python3 -B scripts/pins/test_update.py
+      - run: cargo build --release --locked -p muniment-pins --features cli
+      # Check, bump, and keep every pin that passes compat and the workspace tests on Linux.
+      - id: select
+        run: python3 -B scripts/pins/update.py select --bin "$CARGO_TARGET_DIR/release/muniment-pins" --out update.json
+
+      # The checks CI runs on Linux, against the bumped tree.
+      - id: checks
+        if: steps.select.outputs.changed == 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          trap 'bash .forgejo/postgres.sh stop' EXIT
+          export MUNIMENT_ROUTER_TEST_DATABASE_URL=$(bash .forgejo/postgres.sh start)
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --locked --features muniment-pins/cli -- -D warnings
+          cargo clippy -p muniment-router --all-targets --features server --locked -- -D warnings
+          cargo test -p muniment-router --features server --locked -- --test-threads=1
+          scripts/check-core-boundary.sh
+          python3 -B scripts/test_release.py
+
+      # The macOS compat suite and the workspace tests on macOS. The VM checks
+      # out a commit of the bumped tree on CHECK_BRANCH, and the report comes
+      # back between two marker lines of the log. The rustflags give each
+      # binary an ad-hoc signature, as in the CI macOS job.
+      - id: darwin
+        if: steps.select.outputs.changed == 'true'
+        continue-on-error: true
+        env:
+          REPO_TOKEN: ${{ github.token }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+          DESKTOP_CI_KNOWN_HOSTS: ${{ vars.DESKTOP_CI_KNOWN_HOSTS }}
+          BUILD_TIMEOUT: "7200"
+        run: |
+          set -euo pipefail
+          index="$RUNNER_TEMP/pins-index"
+          GIT_INDEX_FILE="$index" git read-tree HEAD
+          GIT_INDEX_FILE="$index" git add pins
+          tree=$(GIT_INDEX_FILE="$index" git write-tree)
+          commit=$(git -c user.name=forgejo-actions -c user.email=forgejo-actions@noreply.localhost \
+            commit-tree "$tree" -p HEAD -m "chore: check the pins update on macOS")
+          git push --force origin "$commit:refs/heads/$CHECK_BRANCH"
+          log="$RUNNER_TEMP/darwin.log"
+          REF="$CHECK_BRANCH" SOURCE_SHA="$commit" bash .forgejo/desktop-ci.sh macos \
+            "export CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS=-Clink-arg=-Wl,-adhoc_codesign && status=0 && { cargo run --release --locked -p muniment-pins --features cli -- compat --report darwin.json || status=1; } &&
+            echo MUNIMENT_DARWIN_REPORT_BEGIN && { cat darwin.json || true; } && echo && echo MUNIMENT_DARWIN_REPORT_END &&
+            cargo test --workspace --locked --features muniment-core/network-tests,muniment-pins/cli -- --test-threads=1 &&
+            exit \$status" | tee "$log"
+          python3 - "$log" <<'EOF'
+          import pathlib, sys
+          text = pathlib.Path(sys.argv[1]).read_text(errors="replace")
+          start = text.rfind("MUNIMENT_DARWIN_REPORT_BEGIN")
+          end = text.find("MUNIMENT_DARWIN_REPORT_END", start)
+          if start >= 0 and end > start:
+              report = text[start + len("MUNIMENT_DARWIN_REPORT_BEGIN"):end].strip()
+              if report:
+                  pathlib.Path("darwin.json").write_text(report + "\n")
+          EOF
+
+      - name: Remove the macOS check branch
+        if: always() && steps.darwin.outcome != 'skipped'
+        run: git push origin --delete "$CHECK_BRANCH" || true
+
+      # Lands the bump and tags the release when every check passed, and files
+      # the blocked-pin issues.
+      - name: Land the bump, tag the release, and file issues
+        if: (steps.select.outputs.changed == 'true' || steps.select.outputs.blocked == 'true') && !inputs.dry_run
+        env:
+          GH_RELEASE_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+          FORGEJO_TOKEN: ${{ github.token }}
+          FORGEJO_API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+          CHECKS: ${{ steps.checks.outcome == 'success' && steps.darwin.outcome == 'success' && 'success' || 'failure' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
+        run: |
+          git config user.name "forgejo-actions"
+          git config user.email "forgejo-actions@noreply.localhost"
+          python3 -B scripts/pins/update.py publish --result update.json --darwin darwin.json \
+            --checks "$CHECKS" --run-url "$RUN_URL"
+
+      - name: Report the dry run
+        if: inputs.dry_run
+        env:
+          CHANGED: ${{ steps.select.outputs.changed }}
+          BLOCKED: ${{ steps.select.outputs.blocked }}
+          CHECKS: ${{ steps.checks.outcome }}
+          DARWIN: ${{ steps.darwin.outcome }}
+        run: |
+          echo "Dry run: changed=$CHANGED blocked=$BLOCKED Linux checks=$CHECKS macOS=$DARWIN. Nothing was pushed, tagged or filed."
+          cat update.json

@@ -10,8 +10,10 @@ in the working tree.
 `publish` reads `update.json`, the macOS compat report, and the outcome of the
 workspace checks. When everything passed it commits the bump on the newest
 main, pushes it, and tags the release with `scripts/release.py`. It opens or
-comments on one `Pin update blocked: <component> <version>` issue per blocked
-pin, and closes blocked issues for pins that now pass.
+comments on one `Pin update blocked: <component> <version>` Forgejo issue per
+blocked pin, and closes blocked issues for pins that now pass. It calls the
+issue API at `FORGEJO_API` with `FORGEJO_TOKEN`. Only the release command gets
+`GH_RELEASE_TOKEN`, as `GH_TOKEN`.
 """
 
 import argparse
@@ -19,6 +21,7 @@ import json
 import os
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -32,6 +35,7 @@ FAST_CHECKS = [
 PIN_FILES = ["pins/pins.toml", "pins/packages.bun.lock"]
 BLOCKED = "Pin update blocked: "
 OUTPUT_TAIL = 20000
+ISSUE_PAGE = 50
 WORKSPACE_TESTS = ["cargo", "test", "--workspace", "--locked",
                    "--features", "muniment-core/network-tests,muniment-pins/cli",
                    "--", "--test-threads=1"]
@@ -172,22 +176,41 @@ def message(result):
     return "\n".join(lines) + "\n"
 
 
-class GitHub:
-    """The git and `gh` calls `publish` makes. Tests replace it with a recorder."""
+class Forgejo:
+    """The git calls and Forgejo issue calls `publish` makes. Tests replace it with a recorder."""
+
+    def __init__(self, api, token, release_token):
+        self.api = api.rstrip("/")
+        self.token = token
+        self.release_token = release_token
+
+    def call(self, method, path, body=None):
+        data = json.dumps(body).encode() if body is not None else None
+        request = urllib.request.Request(f"{self.api}{path}", data=data, method=method)
+        request.add_header("Authorization", f"token {self.token}")
+        request.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(request, timeout=60) as response:
+            text = response.read()
+        return json.loads(text) if text else None
 
     def open_issues(self):
-        out = run(["gh", "issue", "list", "--state", "open", "--search", f'"{BLOCKED}" in:title',
-                   "--limit", "200", "--json", "number,title"]).stdout
-        return json.loads(out)
+        issues = []
+        for page in range(1, 100):
+            batch = self.call("GET", f"/issues?state=open&type=issues&limit={ISSUE_PAGE}&page={page}")
+            issues += [{"number": i["number"], "title": i["title"]} for i in batch if i["title"].startswith(BLOCKED)]
+            if len(batch) < ISSUE_PAGE:
+                break
+        return issues
 
     def create_issue(self, title, text):
-        run(["gh", "issue", "create", "--title", title, "--body", text])
+        self.call("POST", "/issues", {"title": title, "body": text})
 
     def comment(self, number, text):
-        run(["gh", "issue", "comment", str(number), "--body", text])
+        self.call("POST", f"/issues/{number}/comments", {"body": text})
 
     def close(self, number, text):
-        run(["gh", "issue", "close", str(number), "--comment", text])
+        self.comment(number, text)
+        self.call("PATCH", f"/issues/{number}", {"state": "closed"})
 
     def land(self, text):
         """Commits the bump on the newest main, pushes it, and tags the release."""
@@ -205,12 +228,13 @@ class GitHub:
                 break
         else:
             raise SystemExit(f"main moved {PUSH_ATTEMPTS} times during the push")
-        # A push with the workflow token starts no release workflow, so the release runs here.
+        # A push with the job token starts no workflow, so the release runs here.
+        env = {**os.environ, "GH_TOKEN": self.release_token, "GH_HOST": "github.com"}
         run(["python3", "-B", "scripts/release.py", "--revision", "HEAD", "--publish",
-             "--asset", "pins/pins.toml", "--asset", "pins/packages.bun.lock"], capture=False)
+             "--asset", "pins/pins.toml", "--asset", "pins/packages.bun.lock"], capture=False, env=env)
 
 
-def publish(result, verification, github):
+def publish(result, verification, forge):
     """Lands the bump when every check passed and files the blocked-pin issues.
 
     `verification` is `{"passed": bool, "output": str}` for the checks that ran
@@ -229,24 +253,24 @@ def publish(result, verification, github):
         changes = []
     actions = []
     if changes:
-        github.land(message(result))
+        forge.land(message(result))
         actions.append(("land", result["title"]))
-    existing = github.open_issues()
+    existing = forge.open_issues()
     for item in blocked:
         text = (f"The pin update to {item['component']} {item['version']} failed. "
                 f"The current pins stay in place.\n\n{item['output']}")
         match = next((issue for issue in existing if issue["title"] == item["title"]), None)
         if match:
-            github.comment(match["number"], text)
+            forge.comment(match["number"], text)
             actions.append(("comment", match["number"]))
         else:
-            github.create_issue(item["title"], text)
+            forge.create_issue(item["title"], text)
             actions.append(("issue", item["title"]))
     shipped = {c["component"]: c["to"] for c in changes}
     for issue in existing:
         for component, version in shipped.items():
             if issue["title"].startswith(f"{BLOCKED}{component} "):
-                github.close(issue["number"], f"{component} {version} passes the compatibility suite.")
+                forge.close(issue["number"], f"{component} {version} passes the compatibility suite.")
                 actions.append(("close", issue["number"]))
     return actions
 
@@ -291,9 +315,12 @@ def main():
                 out.write(f"changed={'true' if result['changes'] else 'false'}\n")
                 out.write(f"blocked={'true' if result['blocked'] else 'false'}\n")
     else:
+        # Removed from the environment first, so no command but the release sees it.
+        release_token = os.environ.pop("GH_RELEASE_TOKEN", "")
+        forgejo = Forgejo(os.environ["FORGEJO_API"], os.environ["FORGEJO_TOKEN"], release_token)
         result = json.loads(Path(args.result).read_text())
         checked = verification(args.darwin, args.checks == "success", args.run_url)
-        for action in publish(result, checked, GitHub()):
+        for action in publish(result, checked, forgejo):
             print(*action)
 
 if __name__ == "__main__":

@@ -4,6 +4,10 @@
 `feat:` is minor, `fix:` and `perf:` are patch, a `!` before the colon or a
 `BREAKING CHANGE:` trailer is major, and every other commit cuts no release.
 Without `--publish` the script prints the plan and changes nothing.
+
+`--publish` pushes the tag to `origin`, the Forgejo record, waits until the
+push mirror carries it to the GitHub repository, and creates the GitHub release
+there with `gh`, which reads its token from `GH_TOKEN`.
 """
 
 import argparse
@@ -11,12 +15,16 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 TAG = re.compile(r"v(\d+)\.(\d+)\.(\d+)")
 SUBJECT = re.compile(r"(?P<type>[a-z]+)(?:\([^)]*\))?(?P<bang>!)?: \S")
 BREAKING = re.compile(r"^BREAKING[ -]CHANGE: ", re.M)
 LEVELS = {"feat": 2, "fix": 1, "perf": 1}
 RECORD, FIELD = "\x1e", "\x1f"
+GITHUB_REPOSITORY = "munimentai/muniment-core"
+MIRROR_POLLS = 60
+MIRROR_WAIT_S = 10
 
 
 def git(*args):
@@ -55,11 +63,29 @@ def commits(base, revision):
             yield short, subject, body
 
 
+def mirrored(url, tag, revision, ls_remote=None):
+    """True when the repository at `url` has `tag` on `revision`."""
+    ls_remote = ls_remote or (lambda u, ref: git("ls-remote", u, ref))
+    lines = ls_remote(url, f"refs/tags/{tag}").splitlines()
+    return any(line.split()[:1] == [revision] for line in lines)
+
+
+def wait_for_mirror(url, tag, revision, ls_remote=None, sleep=time.sleep, polls=MIRROR_POLLS):
+    for attempt in range(polls):
+        if mirrored(url, tag, revision, ls_remote):
+            return
+        if attempt + 1 < polls:
+            sleep(MIRROR_WAIT_S)
+    raise SystemExit(f"The push mirror did not carry {tag} to {url}.")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--revision", default="HEAD")
     parser.add_argument("--publish", action="store_true",
                         help="push the tag and create the GitHub release")
+    parser.add_argument("--github-repo", default=GITHUB_REPOSITORY,
+                        help="the GitHub push mirror that hosts the release")
     parser.add_argument("--asset", action="append", default=[],
                         help="a file to attach to the release")
     args = parser.parse_args()
@@ -82,10 +108,11 @@ def main():
     revision = git("rev-parse", args.revision).strip()
     subprocess.run(["git", "tag", tag, revision], check=True)
     subprocess.run(["git", "push", "origin", f"refs/tags/{tag}"], check=True)
+    wait_for_mirror(f"https://github.com/{args.github_repo}", tag, revision)
     with tempfile.NamedTemporaryFile("w", suffix=".md") as file:
         file.write(f"Changes since {base}:\n\n{notes}")
         file.flush()
-        subprocess.run(["gh", "release", "create", tag, "--title", tag,
+        subprocess.run(["gh", "release", "create", tag, "--repo", args.github_repo, "--title", tag,
                         "--notes-file", file.name, "--verify-tag", *args.asset],
                        check=True)
 

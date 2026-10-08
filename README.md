@@ -4,6 +4,10 @@ The shared Rust core of Muniment. The Muniment desktop and the Muniment AI
 software factory build on the same crates, so local runtime behavior, model
 routing and runtime pins match in both.
 
+This GitHub repository is a read-only mirror of the private Forgejo repository
+where development, issues and CI happen. It hosts the releases. It takes no
+issues or pull requests.
+
 ## Crates
 
 | Crate | Path | What it is |
@@ -59,7 +63,7 @@ on Linux, then runs the suite and the workspace tests on macOS and the CI checks
 on Linux against the bumped tree. When all of them pass, it rebases the bump
 onto `main`, pushes it with a `feat:` or `fix:` message, and tags the release
 with `pins.toml` and `packages.bun.lock` attached. A pin that fails gets one
-`Pin update blocked: <component> <version>` issue and stays at its version.
+`Pin update blocked: <component> <version>` Forgejo issue and stays at its version.
 
 ## Consumers
 

@@ -10,6 +10,11 @@
 `README.md` describes each crate. `docs/decisions/` holds the decision records
 that tests and checks read.
 
+Forgejo `factory/muniment-core` is the record: code, issues, pull requests and
+Actions CI in `.forgejo/workflows/`. It push-mirrors to the public GitHub
+`munimentai/muniment-core`, which hosts the releases. Only the mirror pushes code to
+GitHub, and no work goes to GitHub issues.
+
 ## Boundary
 
 No crate may depend on Tauri, on a desktop crate, or on a desktop-only module.

@@ -40,5 +40,30 @@ class Level(unittest.TestCase):
         self.assertEqual(release.bump((1, 2, 3), 1), (1, 2, 4))
 
 
+class Mirror(unittest.TestCase):
+    SHA = "a" * 40
+
+    def test_a_tag_on_the_revision_is_mirrored(self):
+        listing = lambda url, ref: f"{self.SHA}\t{ref}\n"
+        self.assertTrue(release.mirrored("https://example", "v1.2.3", self.SHA, listing))
+
+    def test_a_missing_or_moved_tag_is_not_mirrored(self):
+        self.assertFalse(release.mirrored("https://example", "v1.2.3", self.SHA, lambda url, ref: ""))
+        moved = lambda url, ref: f"{'b' * 40}\t{ref}\n"
+        self.assertFalse(release.mirrored("https://example", "v1.2.3", self.SHA, moved))
+
+    def test_the_wait_polls_until_the_tag_arrives(self):
+        answers = iter(["", "", f"{self.SHA}\trefs/tags/v1.2.3\n"])
+        sleeps = []
+        release.wait_for_mirror("https://example", "v1.2.3", self.SHA,
+                                lambda url, ref: next(answers), sleeps.append)
+        self.assertEqual(len(sleeps), 2)
+
+    def test_the_wait_gives_up(self):
+        with self.assertRaises(SystemExit):
+            release.wait_for_mirror("https://example", "v1.2.3", self.SHA,
+                                    lambda url, ref: "", lambda seconds: None, polls=3)
+
+
 if __name__ == "__main__":
     unittest.main()
