@@ -34,7 +34,9 @@ env:
 
 jobs:
   update:
-    runs-on: self-hosted
+    # `homelab` keeps the job off the .106 image-smoke runner, which also
+    # carries `self-hosted`.
+    runs-on: [self-hosted, homelab]
     timeout-minutes: 360
     # It shares the release job's group, so tags stay in order.
     concurrency:

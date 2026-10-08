@@ -16,9 +16,11 @@ env:
   GITHUB_TOKEN: ""
   GH_TOKEN: ""
 
+# The .102 jobs name `homelab`, because the .106 image-smoke runner also
+# carries `self-hosted`.
 jobs:
   checks:
-    runs-on: self-hosted
+    runs-on: [self-hosted, homelab]
     timeout-minutes: 120
     env:
       CARGO_TARGET_DIR: /root/.cache/muniment-core/checks
@@ -34,7 +36,7 @@ jobs:
       - run: python3 -B scripts/pins/test_update.py
 
   router-server:
-    runs-on: self-hosted
+    runs-on: [self-hosted, homelab]
     timeout-minutes: 90
     env:
       CARGO_TARGET_DIR: /root/.cache/muniment-core/router-server
@@ -66,7 +68,7 @@ jobs:
   # own code signature. The flag gives each binary the ad-hoc signature that
   # Apple Silicon links in by default.
   macos:
-    runs-on: self-hosted
+    runs-on: [self-hosted, homelab]
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
@@ -87,7 +89,7 @@ jobs:
   # The Windows-only core paths on a pve01 Windows VM: known folders, the
   # runtime task, attach pipes and ACLs.
   windows:
-    runs-on: self-hosted
+    runs-on: [self-hosted, homelab]
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
@@ -119,7 +121,7 @@ jobs:
   release:
     needs: [checks, router-server, router-image, macos, windows]
     if: github.ref == 'refs/heads/main'
-    runs-on: self-hosted
+    runs-on: [self-hosted, homelab]
     timeout-minutes: 30
     concurrency:
       group: release
