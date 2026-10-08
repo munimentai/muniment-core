@@ -68,8 +68,12 @@ jobs:
       # Check, bump, and keep every pin that passes compat and the workspace
       # tests on Linux. The runner puts the Forgejo job token in the
       # environment, and muniment-pins would send it to the GitHub API, so it
-      # runs without one and calls the API anonymously.
+      # runs without one and calls the API anonymously. Jobs run as root, and
+      # Claude Code refuses --dangerously-skip-permissions as root unless
+      # IS_SANDBOX marks a sandbox, which the runner container is.
       - id: select
+        env:
+          IS_SANDBOX: "1"
         run: env -u GITHUB_TOKEN -u GH_TOKEN python3 -B scripts/pins/update.py select --bin "$CARGO_TARGET_DIR/release/muniment-pins" --out update.json
 
       # The checks CI runs on Linux, against the bumped tree.
