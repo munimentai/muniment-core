@@ -48,7 +48,9 @@ gates:
       - "RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo cargo fmt --all --check"
       - "RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo cargo clippy --workspace --all-targets --locked --features muniment-pins/cli -- -D warnings"
       - "RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo cargo clippy -p muniment-router --all-targets --features server --locked -- -D warnings"
-      - "RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo scripts/check-core-boundary.sh"
+      # The boundary check runs the port tests. One test thread keeps the
+      # router's timing tests stable on the sandbox's four CPUs.
+      - "RUST_TEST_THREADS=1 RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo scripts/check-core-boundary.sh"
     timeout_s: 2400
   # The workspace tests without the network tests, which download Pi, and
   # without the router's Postgres tests. CI runs both, the macOS tests, the
