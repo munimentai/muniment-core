@@ -27,8 +27,11 @@ export function workspace(t) {
   return root
 }
 
+// IS_SANDBOX passes through, because Claude Code refuses
+// --dangerously-skip-permissions as root without it, and CI runners run as root.
 export function piEnv(root, extra = {}) {
-  return { PATH: process.env.PATH, HOME: root, USERPROFILE: root, TMPDIR: root, PI_CODING_AGENT_DIR: root, PI_OFFLINE: '1', ...extra }
+  const sandbox = process.env.IS_SANDBOX ? { IS_SANDBOX: process.env.IS_SANDBOX } : {}
+  return { PATH: process.env.PATH, HOME: root, USERPROFILE: root, TMPDIR: root, PI_CODING_AGENT_DIR: root, PI_OFFLINE: '1', ...sandbox, ...extra }
 }
 
 export function writeModels(root, baseUrl, models = MODELS) {
