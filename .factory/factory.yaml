@@ -36,7 +36,8 @@ risk_paths:
 # every gate sets both variables. The sherpa-onnx build script downloads its
 # libraries with bundled TLS roots, which reject the sandbox egress proxy, so
 # setup fetches the archive with curl and points the build script at it
-# through that CARGO_HOME's config.
+# through that CARGO_HOME's config. The sandbox's writable layer holds 4 GiB,
+# so the same config drops debug info and incremental builds.
 gates:
   build:
     commands:
@@ -87,8 +88,10 @@ sandbox:
     - >-
       v=$(grep -A1 '^name = "sherpa-onnx-sys"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p') &&
       f=sherpa-onnx-v$v-linux-x64-shared-lib.tar.bz2 && mkdir -p $HOME/sherpa-onnx &&
-      curl -fsSL --retry 3 -o $HOME/sherpa-onnx/$f https://github.com/k2-fsa/sherpa-onnx/releases/download/v$v/$f &&
-      printf '[env]\nSHERPA_ONNX_ARCHIVE_DIR = "%s/sherpa-onnx"\n' "$HOME" >> $HOME/.cargo/config.toml
+      curl -fsSL --retry 3 -o $HOME/sherpa-onnx/$f https://github.com/k2-fsa/sherpa-onnx/releases/download/v$v/$f
+    - >-
+      printf '[build]\nincremental = false\n[profile.dev]\ndebug = 0\n[env]\nSHERPA_ONNX_ARCHIVE_DIR = "%s/sherpa-onnx"\n' "$HOME"
+      >> $HOME/.cargo/config.toml
 
 # A releasing merge publishes through CI on main, so verify builds the merge.
 verify:
