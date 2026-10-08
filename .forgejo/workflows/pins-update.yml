@@ -94,7 +94,9 @@ jobs:
       # The macOS compat suite and the workspace tests on macOS. The VM checks
       # out a commit of the bumped tree on CHECK_BRANCH, and the report comes
       # back between two marker lines of the log. The rustflags give each
-      # binary an ad-hoc signature, as in the CI macOS job.
+      # binary an ad-hoc signature, as in the CI macOS job. The VM's python3 is
+      # Apple's 3.9, which lacks tomllib, so a shim puts Homebrew's
+      # python3.12 first on PATH for the Pi wire test.
       - id: darwin
         if: steps.select.outputs.changed == 'true'
         continue-on-error: true
@@ -115,7 +117,8 @@ jobs:
           git push --force origin "$commit:refs/heads/$CHECK_BRANCH"
           log="$RUNNER_TEMP/darwin.log"
           REF="$CHECK_BRANCH" SOURCE_SHA="$commit" bash .forgejo/desktop-ci.sh macos \
-            "export CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS=-Clink-arg=-Wl,-adhoc_codesign && compat_rc=0 && { cargo run --release --locked -p muniment-pins --features cli -- compat --report darwin.json || compat_rc=1; } &&
+            "mkdir -p \$HOME/dci-bin && ln -sf /usr/local/bin/python3.12 \$HOME/dci-bin/python3 && export PATH=\$HOME/dci-bin:\$PATH &&
+            export CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS=-Clink-arg=-Wl,-adhoc_codesign && compat_rc=0 && { cargo run --release --locked -p muniment-pins --features cli -- compat --report darwin.json || compat_rc=1; } &&
             echo MUNIMENT_DARWIN_REPORT_BEGIN && { cat darwin.json || true; } && echo && echo MUNIMENT_DARWIN_REPORT_END &&
             cargo test --workspace --locked --features muniment-core/network-tests,muniment-pins/cli -- --test-threads=1 &&
             exit \$compat_rc" | tee "$log"
