@@ -3088,6 +3088,8 @@ mod tests {
             base_url: url.clone(),
             model: "test".into(),
             api_key: None,
+            max_options: None,
+            limits: Default::default(),
         };
         config::save(&agent, &c).unwrap();
         let handle = start_with_clock(agent.clone(), fixed_clock).unwrap();

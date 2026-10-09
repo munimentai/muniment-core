@@ -274,6 +274,12 @@ pub enum Classifier {
         model: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base_url: Option<String>,
+        /// Overrides the option limit the core learned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_options: Option<u32>,
+        /// What the core learned about this connection.
+        #[serde(default, skip_serializing_if = "Limits::is_empty")]
+        limits: Limits,
     },
     /// A small model on one of the router's own accounts, asked for the same
     /// choice as one JSON answer. It spends the account, not a second bill.
@@ -285,7 +291,31 @@ pub enum Classifier {
         api_key: Option<String>,
         #[serde(default = "typesafe_model")]
         model: String,
+        /// Overrides the option limit the core learned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_options: Option<u32>,
+        /// What the core learned about this connection.
+        #[serde(default, skip_serializing_if = "Limits::is_empty")]
+        limits: Limits,
     },
+}
+
+/// The limits the core learned about a decision connection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Limits {
+    /// The most options one question may carry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<u32>,
+    /// The most questions one request may carry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<u32>,
+}
+
+impl Limits {
+    /// Whether nothing has been learned.
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 fn typesafe_model() -> String {
@@ -312,6 +342,32 @@ impl Classifier {
                 super::family::family(family).is_some() && !model.trim().is_empty()
             }
             Self::Endpoint { base_url, .. } => !base_url.trim().is_empty(),
+        }
+    }
+
+    /// The most options one question may carry: the configured override, else
+    /// the learned limit.
+    pub fn option_limit(&self) -> Option<u32> {
+        match self {
+            Self::Typesafe {
+                max_options,
+                limits,
+                ..
+            }
+            | Self::Endpoint {
+                max_options,
+                limits,
+                ..
+            } => max_options.or(limits.options),
+            Self::None | Self::Pooled { .. } => None,
+        }
+    }
+
+    /// The most questions one request may carry, when learned.
+    pub fn question_limit(&self) -> Option<u32> {
+        match self {
+            Self::Typesafe { limits, .. } | Self::Endpoint { limits, .. } => limits.questions,
+            Self::None | Self::Pooled { .. } => None,
         }
     }
 
@@ -748,6 +804,8 @@ mod tests {
                 api_key: "apikey_1".into(),
                 model: "jev-latest".into(),
                 base_url: None,
+                max_options: None,
+                limits: Default::default(),
             },
             routes: vec![
                 Route {
@@ -810,18 +868,24 @@ mod tests {
             api_key: "  ".into(),
             model: "jev-latest".into(),
             base_url: None,
+            max_options: None,
+            limits: Default::default(),
         };
         assert!(!blank.ready());
         let keyed = Classifier::Typesafe {
             api_key: "apikey_1".into(),
             model: "jev-latest".into(),
             base_url: None,
+            max_options: None,
+            limits: Default::default(),
         };
         assert!(keyed.ready());
         assert!(!Classifier::Endpoint {
             base_url: " ".into(),
             api_key: None,
             model: "m".into(),
+            max_options: None,
+            limits: Default::default(),
         }
         .ready());
         assert!(!Classifier::Pooled {
@@ -829,6 +893,47 @@ mod tests {
             model: "m".into(),
         }
         .ready());
+    }
+
+    #[test]
+    fn max_options_overrides_the_learned_option_limit() {
+        let mut classifier = Classifier::Endpoint {
+            base_url: "http://x".into(),
+            api_key: None,
+            model: "m".into(),
+            max_options: None,
+            limits: Default::default(),
+        };
+        assert_eq!(classifier.option_limit(), None);
+        assert_eq!(classifier.question_limit(), None);
+        if let Classifier::Endpoint { limits, .. } = &mut classifier {
+            limits.options = Some(8);
+            limits.questions = Some(3);
+        }
+        assert_eq!(classifier.option_limit(), Some(8));
+        assert_eq!(classifier.question_limit(), Some(3));
+        if let Classifier::Endpoint { max_options, .. } = &mut classifier {
+            *max_options = Some(4);
+        }
+        assert_eq!(classifier.option_limit(), Some(4));
+        assert_eq!(Classifier::None.option_limit(), None);
+    }
+
+    #[test]
+    fn limits_serialise_only_when_set_and_old_records_load() {
+        let text = r#"{"kind":"typesafe","api_key":"k","model":"m"}"#;
+        let old: Classifier = serde_json::from_str(text).unwrap();
+        assert_eq!(old.option_limit(), None);
+        let text = serde_json::to_string(&old).unwrap();
+        assert!(!text.contains("max_options") && !text.contains("limits"));
+        let text = r#"{"kind":"endpoint","base_url":"u","max_options":5,
+            "limits":{"options":9,"questions":2}}"#;
+        let set: Classifier = serde_json::from_str(text).unwrap();
+        assert_eq!(set.option_limit(), Some(5));
+        assert_eq!(set.question_limit(), Some(2));
+        let saved = serde_json::to_string(&set).unwrap();
+        let back: Classifier = serde_json::from_str(&saved).unwrap();
+        assert_eq!(back, set);
     }
 
     #[test]
