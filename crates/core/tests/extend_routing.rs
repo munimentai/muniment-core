@@ -24,18 +24,25 @@ fn fixture(automatic: bool) -> Fixture {
  ],"turns":{"chat":{"automatic":automatic,"selected":[],"disabled":["disabled"]}}})).unwrap()).unwrap();
     root
 }
+fn unreachable() -> config::RouterConfig {
+    config::RouterConfig {
+        classifier: config::Classifier::Endpoint {
+            base_url: "http://127.0.0.1:1".into(),
+            api_key: None,
+            model: "clef-flash:latest".into(),
+        },
+        ..Default::default()
+    }
+}
 #[test]
 fn manual_mode_never_contacts_the_classifier() {
     let root = fixture(false);
-    config::save(
+    config::save(&root.0.join("agent"), &unreachable()).unwrap();
+    config::save_assist(
         &root.0.join("agent"),
-        &config::RouterConfig {
-            classifier: config::Classifier::Endpoint {
-                base_url: "http://127.0.0.1:1".into(),
-                api_key: None,
-                model: "test".into(),
-            },
-            ..Default::default()
+        &config::Assist {
+            enabled: true,
+            classifier: None,
         },
     )
     .unwrap();
@@ -90,15 +97,18 @@ fn classifier_only_sees_eligible_metadata_and_keeps_manual_selection_separate() 
             json!({"answers":{"route":{"choice":"review:SKILL.md","confidence":0.99}}}).to_string();
         write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
     });
-    config::save(
+    // Routing keeps a decision model that cannot answer, so the pick can come
+    // only from the one assistance names.
+    config::save(&root.0.join("agent"), &unreachable()).unwrap();
+    config::save_assist(
         &root.0.join("agent"),
-        &config::RouterConfig {
-            classifier: config::Classifier::Endpoint {
+        &config::Assist {
+            enabled: true,
+            classifier: Some(config::Classifier::Endpoint {
                 base_url: url,
                 api_key: None,
                 model: "test".into(),
-            },
-            ..Default::default()
+            }),
         },
     )
     .unwrap();
@@ -113,4 +123,44 @@ fn classifier_only_sees_eligible_metadata_and_keeps_manual_selection_separate() 
     let state = extend::inventory(&root.0).unwrap();
     assert_eq!(state["turns"]["chat"]["selected"], json!([]));
     assert_eq!(state["turns"]["chat"]["disabled"], json!(["disabled"]));
+}
+#[test]
+fn assistance_off_picks_nothing_and_names_no_decision_model() {
+    let root = fixture(true);
+    let agent = root.0.join("agent");
+    config::save(&agent, &unreachable()).unwrap();
+    let route = || {
+        extend::command(
+            &root.0,
+            "route",
+            json!({"threadId":"chat","prompt":"Review code"}),
+        )
+        .unwrap()
+    };
+    assert_eq!(route(), json!({"selected":[]}));
+    assert!(extend::command(&root.0, "read", json!({}))
+        .unwrap()
+        .get("assist")
+        .is_none());
+    fs::write(
+        agent.join("classifier-connections.json"),
+        serde_json::to_vec(
+            &json!([{"id":"c","name":"Clef Flash · Ollama","catalog_id":"clef",
+            "classifier": serde_json::to_value(&unreachable().classifier).unwrap()}]),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    config::save_assist(
+        &agent,
+        &config::Assist {
+            enabled: true,
+            classifier: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        extend::command(&root.0, "read", json!({})).unwrap()["assist"],
+        json!({"name":"Clef Flash"})
+    );
 }

@@ -91,7 +91,22 @@ impl ResolveError {
 /// its models are in the running at once. A user route replaces the entry for
 /// its model, taking that entry's place under its own name and words, so one
 /// model is never two options.
+/// The models in the running: every model an enabled account serves, less the
+/// ones the user keeps out. The classifier chooses among these, and the
+/// fallback is one of them.
 pub fn options(config: &RouterConfig) -> Vec<Route> {
+    all_options(config)
+        .into_iter()
+        .filter(|option| {
+            !config
+                .hidden
+                .contains(&format!("{}/{}", option.family, option.model))
+        })
+        .collect()
+}
+
+/// Every model an enabled account serves, the hidden ones too.
+pub fn all_options(config: &RouterConfig) -> Vec<Route> {
     let mut options: Vec<Route> = Vec::new();
     for account in config
         .accounts
@@ -332,6 +347,7 @@ mod tests {
             policy: Default::default(),
             discovered_models: Default::default(),
             enabled: true,
+            hidden: Vec::new(),
             accounts: vec![
                 account("o1", "openai"),
                 account("o2", "openai"),
@@ -406,6 +422,18 @@ mod tests {
         config.accounts[1].weight = 0;
         assert!(options(&config).is_empty());
         assert!(served_models(&config).is_empty());
+    }
+
+    #[test]
+    fn a_hidden_model_leaves_the_running_and_stays_listed() {
+        let mut config = pooled();
+        let all = options(&config);
+        let first = all[0].clone();
+        config.hidden = vec![format!("{}/{}", first.family, first.model)];
+        let running = options(&config);
+        assert_eq!(running.len(), all.len() - 1);
+        assert!(running.iter().all(|option| option.key != first.key));
+        assert_eq!(all_options(&config), all);
     }
 
     #[test]

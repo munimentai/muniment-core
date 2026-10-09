@@ -1245,6 +1245,9 @@ pub fn coordinate(
                 ) {
                     continue;
                 }
+                if coordinate_browser(&app, &adapter, &transport, &cancelled, &event) {
+                    continue;
+                }
                 if coordinate_memory_search(
                     &app,
                     &memory_runtime,
@@ -1448,6 +1451,38 @@ fn answer_gateway_boundary(
     };
     *failure = error;
     let _ = adapter.answer_extension_ui(transport, request, answer);
+    true
+}
+
+/// Answers the `browser` tool in a host that has a browser. The loop runs
+/// while Pi waits for the answer, and a cancelled run stops it between steps.
+fn coordinate_browser(
+    boundaries: &impl PiLaunchBoundaries,
+    adapter: &PiRunAdapter,
+    transport: &PiRpcTransport,
+    cancelled: &AtomicBool,
+    event: &PiChatEvent,
+) -> bool {
+    let PiChatEvent::ExtensionUiRequest(request) = event else {
+        return false;
+    };
+    let ExtensionUiDialog::Editor { title, prefill } = &request.dialog else {
+        return false;
+    };
+    if title != "muniment:browser" {
+        return false;
+    }
+    // A host without a browser, such as the background runtime, lets the
+    // request become a gate that the app answers from its Browser tab.
+    let Some(host) = boundaries.browser_host() else {
+        return false;
+    };
+    let value = crate::browser_agent::answer(host.as_ref(), prefill.as_deref(), cancelled);
+    let _ = adapter.answer_extension_ui(
+        transport,
+        request,
+        ExtensionUiAnswer::Editor(value.to_string()),
+    );
     true
 }
 

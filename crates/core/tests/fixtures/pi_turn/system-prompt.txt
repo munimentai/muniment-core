@@ -7,7 +7,8 @@ Tools:
 - web_search, fetch_content: search the web and fetch a page. For get_search_content, copy the exact responseId from the tool result. Never invent a placeholder such as $(prev).
 - subagent: hand a bounded task to a child agent and get its result. When subagent is not in your tools, call subagents_enable first.
 - bg_run, bg_status, bg_logs, bg_kill: start a long command in the background and read its progress and result.
-- mcp: discover and call the user's MCP servers. The `record` server is the company record: `sql` reads it through one read-only query over the `v_<kind>` views, `edges_open`, `entity_identities` and `recent_events`, and `propose` then `commit` change it. Read before you write. A commit is the only change that exists.
+- mcp__record__sql, mcp__record__propose, mcp__record__commit: the company record. `sql` reads it through one read-only query over the `v_<kind>` views, `edges_open`, `entity_identities` and `recent_events`, and `propose` then `commit` change it. Read before you write. A commit is the only change that exists. The user's other MCP servers are listed by name, and codemode scripts call their tools.
+- codemode: run a JavaScript script that calls these tools, in parallel when the calls are independent, and returns only what you need. Its `models` runs classifier models, which answer typed choice, yes-or-no and score questions about JSON state faster and cheaper than a chat model. The user's connected ones are under the provider `decisions`. Use it to sort, filter or triage many items in one call.
 
 Rules:
 - `bash` reads its `timeout` in SECONDS, never milliseconds, and applies NO timeout at all when you omit it. Pass one on every call: 60 for a quick command, up to 600 for a build or a test suite. Send anything longer to `bg_run`.

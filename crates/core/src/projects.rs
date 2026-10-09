@@ -74,19 +74,23 @@ pub fn list(profile: &Path) -> Result<Catalog, String> {
     let _guard = WRITE.lock().map_err(|_| "The project catalog is busy.")?;
     let mut catalog = read(profile)?;
     let root = root(profile)?;
-    let known = catalog
-        .projects
-        .iter()
-        .map(|(id, title)| {
-            crate::workspace_names::resolve(
-                profile,
-                &root,
-                id,
-                Some(title),
-                Some(&root.join(title)),
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    // A project whose folder is gone, such as one on a drive that is not
+    // mounted, drops out of the list and stays in the catalog, so it returns
+    // with its folder. One missing folder never hides the other projects.
+    let mut known = Vec::new();
+    let mut missing = Vec::new();
+    for (id, title) in &catalog.projects {
+        match crate::workspace_names::resolve(
+            profile,
+            &root,
+            id,
+            Some(title),
+            Some(&root.join(title)),
+        ) {
+            Ok(folder) => known.push(folder),
+            Err(_) => missing.push(id.clone()),
+        }
+    }
     let mut changed = false;
     for entry in fs::read_dir(&root).map_err(|_| "The projects folder cannot be read.")? {
         let entry = entry.map_err(|_| "A project folder cannot be read.")?;
@@ -111,6 +115,10 @@ pub fn list(profile: &Path) -> Result<Catalog, String> {
     if changed {
         save(profile, &catalog)?;
     }
+    catalog.projects.retain(|id, _| !missing.contains(id));
+    catalog
+        .threads
+        .retain(|_, project| !missing.contains(project));
     Ok(catalog)
 }
 pub fn create(profile: &Path, value: &str) -> Result<String, String> {
@@ -422,6 +430,28 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .starts_with("agreements-"));
+    }
+    #[test]
+    fn a_missing_project_folder_drops_out_of_the_list_and_keeps_its_place() {
+        let fixture = Fixture::new();
+        let profile = fixture.profile();
+        let kept = create(&profile, "Contracts").unwrap();
+        let gone = create(&profile, "Audit").unwrap();
+        assign(&profile, "thread-kept", &kept).unwrap();
+        assign(&profile, "thread-gone", &gone).unwrap();
+        // Listing records each folder's name, so the missing one is a mapped folder.
+        list(&profile).unwrap();
+        let folder_of_gone = folder(&profile, &gone).unwrap();
+        fs::rename(&folder_of_gone, fixture.0.join("away")).unwrap();
+        let listed = list(&profile).unwrap();
+        assert_eq!(listed.projects.keys().collect::<Vec<_>>(), vec![&kept]);
+        assert_eq!(
+            listed.threads.keys().collect::<Vec<_>>(),
+            vec!["thread-kept"]
+        );
+        assert!(read(&profile).unwrap().projects.contains_key(&gone));
+        fs::rename(fixture.0.join("away"), &folder_of_gone).unwrap();
+        assert!(list(&profile).unwrap().projects.contains_key(&gone));
     }
     #[test]
     fn discovers_existing_folders_and_rejects_collisions_and_escapes() {

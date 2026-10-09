@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 const USAGE: &str = "usage:
   muniment-pins check
-  muniment-pins bump [--pi VERSION|latest] [--packages] [--package NAME@VERSION]... [--claude-code VERSION|latest]
+  muniment-pins bump [--pi VERSION|latest] [--packages] [--package NAME@VERSION]... [--remove NAME]... [--claude-code VERSION|latest]
   muniment-pins compat [--archive PATH] [--report PATH] [--skip-cargo]
 common options: --root DIR (the muniment-core checkout), --cache DIR (downloads and work files)";
 
@@ -105,6 +105,7 @@ fn bump_request(args: &[String]) -> Result<BumpRequest> {
             "--pi" => request.pi = Some(value()?),
             "--claude-code" => request.claude_code = Some(value()?),
             "--packages" => request.all_packages = true,
+            "--remove" => request.remove.push(value()?),
             "--package" => {
                 let spec = value()?;
                 let (name, version) = spec

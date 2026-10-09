@@ -9,11 +9,16 @@ import {
   PROVIDER, ready, run, workspace, writeModels,
 } from './harness.mjs'
 
-/** The tool names the system prompt in `crates/core/src/pi_launch.rs` promises the model. */
+/**
+ * The tool names the system prompt in `crates/core/src/pi_launch.rs` promises the model. The
+ * record server registers its `mcp__record__` tools once a session connects to it, so the
+ * record server's own tests cover those.
+ */
 function promisedTools() {
   const source = readFileSync(join(env.root, 'crates/core/src/pi_launch.rs'), 'utf8')
   const tools = source.split('\nTools:\n')[1].split('\n\nRules:')[0]
   return tools.split('\n').flatMap(line => line.replace(/^- /, '').split(':')[0].split(',').map(name => name.trim()))
+    .filter(name => !name.startsWith('mcp__record__'))
 }
 
 async function load(t, extensions) {
@@ -47,7 +52,8 @@ for (const { name, version } of pins?.packages ?? []) {
 }
 
 test('the tools the system prompt names are registered', { skip: !ready, timeout: 120000 }, async t => {
-  const registered = await load(t, allExtensions())
+  // `--no-extensions` also turns off Pi's built-in extensions, and codemode is one.
+  const registered = await load(t, [...allExtensions(), '--extension', 'builtin:codemode'])
   const names = new Set(registered.tools.map(tool => tool.name))
   const missing = promisedTools().filter(name => !names.has(name))
   assert.deepEqual(missing, [], `registered tools: ${[...names].join(', ')}`)
