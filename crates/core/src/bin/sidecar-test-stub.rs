@@ -796,14 +796,6 @@ fn bun_install(args: Vec<String>) {
             "pi-background-tasks/src/core/attested-pi-run.ts",
             "parts[0] === '.pi'",
         ),
-        (
-            "pi-mcp-adapter/agent-dir.ts",
-            "export function getAppName(): string {\n  const name = readPiConfig()?.name\n  return typeof name === \"string\" && name.trim() ? name.trim() : \"pi\"\n}",
-        ),
-        (
-            "pi-mcp-adapter/host-html-template.ts",
-            "You can close this page and return to Pi.",
-        ),
     ];
     for (relative, source) in sources {
         let path = modules.join(relative);

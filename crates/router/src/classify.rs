@@ -352,6 +352,12 @@ fn classifier_usage(
         {
             (format!("typesafe/{model}"), Some((0.042, 0.0)))
         }
+        // The Decisions API bills input tokens only.
+        Classifier::Endpoint {
+            model, base_url, ..
+        } if model == "gpt-6-luna" && openai_decisions(base_url) => {
+            (format!("openai/{model}"), Some((0.10, 0.0)))
+        }
         Classifier::Typesafe { model, .. } => (
             format!("typesafe/{model}"),
             matches!(model.as_str(), "jev-latest" | "jev-preview" | "jev-1.13.0")
@@ -478,8 +484,40 @@ pub fn parse_pooled_answer(content: &str) -> Option<(String, f64)> {
     Some((choice, confidence))
 }
 
+/// OpenAI's Decisions API, which only an OpenAI API key reaches.
+pub const OPENAI_DECISIONS_URL: &str = "https://api.openai.com/v1/decisions";
+
+fn openai_decisions(url: &str) -> bool {
+    url::Url::parse(url).ok().is_some_and(|url| {
+        url.host_str() == Some("api.openai.com") && url.path().ends_with("/decisions")
+    })
+}
+
 // Workers AI wraps the same decision request in its model/input envelope.
+// OpenAI's Decisions API takes the state as text and the questions as a list
+// of named `choice` questions whose choices carry their descriptions.
 fn classifier_body(url: &str, body: &Value) -> Value {
+    if openai_decisions(url) {
+        let input = match &body["state"] {
+            Value::String(text) => text.clone(),
+            state => state.to_string(),
+        };
+        let questions: Vec<Value> = body["questions"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(name, question)| {
+                let choices: Vec<Value> = question["criteria"]
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .map(|(value, description)| json!({"value": value, "description": description}))
+                    .collect();
+                json!({"type": "choice", "name": name, "instructions": question["instructions"], "choices": choices})
+            })
+            .collect();
+        return json!({"model": body["model"], "input": input, "questions": questions});
+    }
     let cloudflare = url::Url::parse(url).ok().is_some_and(|url| {
         url.host_str() == Some("api.cloudflare.com") && url.path().ends_with("/ai/run")
     });
@@ -494,12 +532,54 @@ fn classifier_body(url: &str, body: &Value) -> Value {
     }
 }
 
+/// The answers out of a Workers AI envelope. Cloudflare's own models, such as
+/// Clef, put them under `result`. A third-party model, such as Jev, puts them
+/// under a completed run record: `result.state` and `result.result`.
 fn classifier_response(value: Value) -> Value {
+    if value.get("answers").is_some_and(Value::is_array) {
+        return decisions_response(value);
+    }
+    let Some(result) = value.get("result").filter(|result| result.is_object()) else {
+        return value;
+    };
+    if result.get("answers").is_none() && result.get("state") == Some(&json!("Completed")) {
+        if let Some(run) = result.get("result").filter(|run| run.is_object()) {
+            return run.clone();
+        }
+    }
+    result.clone()
+}
+
+/// OpenAI's Decisions answers, a list of named answers whose probabilities
+/// are a list of `{value, probability}`, in System One's answers-by-name
+/// shape. A refusal reads as an abstention.
+fn decisions_response(mut value: Value) -> Value {
+    let mut answers = serde_json::Map::new();
+    for answer in value["answers"].as_array().into_iter().flatten() {
+        let Some(name) = answer["name"].as_str() else {
+            continue;
+        };
+        let row = if answer["type"] == "choice" {
+            let probabilities: serde_json::Map<String, Value> = answer["probabilities"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| {
+                    Some((
+                        entry["value"].as_str()?.to_owned(),
+                        entry["probability"].clone(),
+                    ))
+                })
+                .collect();
+            json!({"type": "choice", "choice": answer["choice"], "confidence": answer["confidence"],
+                "probabilities": probabilities})
+        } else {
+            json!({"type": answer["type"], "abstain": true})
+        };
+        answers.insert(name.to_owned(), row);
+    }
+    value["answers"] = Value::Object(answers);
     value
-        .get("result")
-        .filter(|result| result.is_object())
-        .cloned()
-        .unwrap_or(value)
 }
 
 /// One classifier call. Nothing here fails a turn: an unreachable classifier,
@@ -519,6 +599,26 @@ fn ask(url: &str, bearer: Option<&str>, body: &Value, timeout: Duration) -> Opti
         .into_json::<Value>()
         .ok()
         .map(classifier_response)
+}
+
+/// Asks a decision model several `choice` questions about one state in one
+/// request, and answers System One's answers by question name. Only a System
+/// One route, Workers AI or OpenAI's Decisions API answers. A pooled chat
+/// model does not.
+pub fn ask_choices(
+    classifier: &Classifier,
+    state: &Value,
+    questions: &Value,
+    timeout: Duration,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let (url, bearer) = endpoint(classifier).ok_or("Connect a decision model in Settings.")?;
+    let body = json!({"state": state, "model": classifier.model(), "questions": questions});
+    let answer =
+        ask(&url, bearer.as_deref(), &body, timeout).ok_or("The decision model did not answer.")?;
+    match answer.get("answers") {
+        Some(Value::Object(answers)) => Ok(answers.clone()),
+        _ => Err("The decision model sent no answers.".into()),
+    }
 }
 
 /// Whether the classifier answers at all, for the Test button in Settings.
@@ -910,6 +1010,24 @@ mod tests {
 mod connection_wire_tests {
     use super::*;
     #[test]
+    fn cloudflare_answers_read_from_both_envelopes() {
+        let answers = json!({ "answers": { "route": { "choice": "fast" } } });
+        // Clef answers under `result`.
+        assert_eq!(
+            classifier_response(json!({ "success": true, "result": answers.clone() })),
+            answers
+        );
+        // Jev answers under a completed run record.
+        assert_eq!(
+            classifier_response(
+                json!({ "success": true, "result": { "state": "Completed", "result": answers.clone() } })
+            ),
+            answers
+        );
+        assert_eq!(classifier_response(answers.clone()), answers);
+    }
+
+    #[test]
     fn cloudflare_wraps_only_its_own_endpoint() {
         let body = json!({"model":"typesafe/jev", "state":"sample", "questions":{"route":{"type":"choice"}}});
         let wrapped = classifier_body(
@@ -930,6 +1048,58 @@ mod connection_wire_tests {
             answer
         );
         assert_eq!(classifier_response(answer.clone()), answer);
+    }
+
+    #[test]
+    fn openai_decisions_take_named_choices_and_answer_as_a_choice() {
+        let route = |key: &str| Route {
+            key: key.into(),
+            description: format!("The {key} model"),
+            family: "openai".into(),
+            model: key.into(),
+        };
+        let config = RouterConfig {
+            classifier: Classifier::Endpoint {
+                model: "gpt-6-luna".into(),
+                base_url: OPENAI_DECISIONS_URL.into(),
+                api_key: Some("key".into()),
+            },
+            routes: vec![route("fast"), route("deep")],
+            ..RouterConfig::default()
+        };
+        let body = classifier_body(
+            OPENAI_DECISIONS_URL,
+            &question(&config, &config.routes, "Fix the typo."),
+        );
+        assert_eq!(body["model"], "gpt-6-luna");
+        assert_eq!(body["input"], "Fix the typo.");
+        assert_eq!(body["questions"][0]["type"], "choice");
+        assert_eq!(body["questions"][0]["name"], QUESTION);
+        assert_eq!(body["questions"][0]["choices"].as_array().unwrap().len(), 2);
+        let answer = classifier_response(json!({
+            "answers": [{"name": "route", "type": "choice", "choice": "fast", "confidence": 0.8,
+                "probabilities": [{"value": "fast", "probability": 0.9}, {"value": "deep", "probability": 0.1}]}],
+            "usage": {"input_tokens": 40, "output_tokens": 0},
+        }));
+        assert_eq!(
+            parse_profile(&answer, &config.routes, &Profile::default()),
+            Some(("fast".into(), 0.8))
+        );
+        let refused =
+            classifier_response(json!({"answers": [{"name": "route", "type": "refusal"}]}));
+        assert_eq!(
+            parse_profile(&refused, &config.routes, &Profile::default()),
+            None
+        );
+        let usage = classifier_usage(
+            &config.classifier,
+            Some(Tokens {
+                input: 1_000_000,
+                ..Default::default()
+            }),
+        );
+        assert_eq!(usage.model, "openai/gpt-6-luna");
+        assert_eq!(usage.cost, Some(0.10));
     }
 }
 

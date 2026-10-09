@@ -311,7 +311,7 @@ export default function (pi) {
             "fetch_content",
             "subagent",
             "bg_run",
-            "mcp",
+            "codemode",
         ] {
             assert!(
                 tools.iter().any(|tool| tool == name),
@@ -333,7 +333,7 @@ export default function (pi) {
         settings["packages"].as_array().unwrap().len(),
         muniment_core::pi_packages::PI_PACKAGES.len()
     );
-    assert_eq!(settings["defaultTools"].as_array().unwrap().len(), 8);
+    assert_eq!(settings["defaultTools"].as_array().unwrap().len(), 9);
 }
 
 /// Opt-in because release/CI jobs must acquire the pinned executable rather

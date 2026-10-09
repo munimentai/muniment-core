@@ -157,8 +157,11 @@ pub fn store_web_search_defaults(agent: &Path) -> io::Result<()> {
 /// The system prompt names it, and the prompt names no product, so the entry
 /// is the record and not the app.
 pub const MCP_SERVER_NAME: &str = "record";
-/// The revision the record server speaks, and the one the adapter pins.
-pub const MCP_PROTOCOL_VERSION: &str = "2026-07-28";
+/// What the record server offers, in the sentence Pi lists it under. Its
+/// tools reach the model directly, and the user's servers run through
+/// codemode scripts.
+pub const MCP_SERVER_DESCRIPTION: &str =
+    "The company record: read it with one SQL query, then propose and commit each change.";
 
 /// The record server ships beside the runtime as `muniment-cli`. A checkout
 /// that runs the runtime from its target directory has none, and then Pi
@@ -174,17 +177,8 @@ pub fn cli_executable_beside_runtime() -> Option<PathBuf> {
     cli.is_file().then_some(cli)
 }
 
-// Adapter upgrades must not enable an external metadata service without a user setting.
-pub(crate) fn mcp_settings(value: &Value) -> Value {
-    let mut settings = value.as_object().cloned().unwrap_or_default();
-    settings
-        .entry("jev".to_owned())
-        .or_insert(Value::Bool(false));
-    Value::Object(settings)
-}
-
-/// Writes the `muniment` entry into the agent directory's `mcp.json`, the
-/// adapter's Pi-global file, and keeps every other server the user added.
+/// Writes the `record` entry into the agent directory's `mcp.json`, the file
+/// Pi's MCP support reads, and keeps every other server the user added.
 pub fn store_mcp_server(agent_directory: &Path, cli_executable: &Path) -> io::Result<()> {
     let path = agent_directory.join("mcp.json");
     let mut root: Map<String, Value> = match fs::read(&path) {
@@ -195,8 +189,10 @@ pub fn store_mcp_server(agent_directory: &Path, cli_executable: &Path) -> io::Re
         Err(error) if error.kind() == io::ErrorKind::NotFound => Map::new(),
         Err(error) => return Err(error),
     };
-    let settings = mcp_settings(root.get("settings").unwrap_or(&Value::Null));
-    root.insert("settings".to_owned(), settings);
+    // Settings an earlier MCP extension kept here mean nothing to Pi.
+    if root.get("settings") == Some(&json!({"jev": false})) {
+        root.remove("settings");
+    }
     let servers = root
         .entry("mcpServers".to_owned())
         .or_insert_with(|| Value::Object(Map::new()));
@@ -209,8 +205,8 @@ pub fn store_mcp_server(agent_directory: &Path, cli_executable: &Path) -> io::Re
             json!({
                 "command": cli_executable.to_string_lossy(),
                 "args": ["mcp"],
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "lifecycle": "lazy",
+                "exposure": "direct",
+                "description": MCP_SERVER_DESCRIPTION,
             }),
         );
     }
@@ -394,7 +390,17 @@ pub fn merge_pi_settings(settings: &mut Map<String, Value>, _artifact: PiArtifac
             crate::pi_packages::PI_PACKAGES.map(|(name, version)| format!("npm:{name}@{version}"))
         ),
     );
+    // An MCP extension that runs in place of Pi's own added `-builtin:mcp` to
+    // the user's extensions. Pi's MCP support is the runtime's, so it goes.
+    if let Some(extensions) = settings.get_mut("extensions").and_then(Value::as_array_mut) {
+        extensions.retain(|entry| entry != "-builtin:mcp");
+        if extensions.is_empty() {
+            settings.remove("extensions");
+        }
+    }
     // v0.87.1: packages/coding-agent/src/core/tools/index.ts:96-105, allToolNames.
+    // `codemode` runs scripts that call these tools and Pi's classifier and
+    // image models. Pi turns it on only for an MCP server otherwise.
     settings.insert(
         "defaultTools".into(),
         json!([
@@ -405,7 +411,8 @@ pub fn merge_pi_settings(settings: &mut Map<String, Value>, _artifact: PiArtifac
             "write",
             "grep",
             "find",
-            "ls"
+            "ls",
+            "codemode"
         ]),
     );
 }
@@ -597,8 +604,11 @@ mod tests {
         let path = root.join("agent/settings.json");
         store_pi_settings(&path, PI_ARTIFACT).unwrap();
         let rendered: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(rendered["packages"].as_array().unwrap().len(), 5);
-        assert_eq!(rendered["defaultTools"].as_array().unwrap().len(), 8);
+        assert_eq!(
+            rendered["packages"].as_array().unwrap().len(),
+            crate::pi_packages::PI_PACKAGES.len()
+        );
+        assert_eq!(rendered["defaultTools"].as_array().unwrap().len(), 9);
         fs::write(
             &path,
             br#"{"defaultProvider":"ollama","foreign":{"nested":42}}"#,
@@ -639,7 +649,10 @@ mod tests {
         let settings: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(settings["defaultProvider"], "ollama");
         assert_eq!(settings["foreign"], 42);
-        assert_eq!(settings["packages"].as_array().unwrap().len(), 5);
+        assert_eq!(
+            settings["packages"].as_array().unwrap().len(),
+            crate::pi_packages::PI_PACKAGES.len()
+        );
         assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
         fs::remove_dir_all(root).unwrap();
     }
@@ -717,7 +730,7 @@ mod tests {
         fs::create_dir_all(&agent).unwrap();
         fs::write(
             agent.join("mcp.json"),
-            br#"{"mcpServers":{"github":{"command":"gh-mcp"}},"foreign":1}"#,
+            br#"{"mcpServers":{"github":{"command":"gh-mcp"}},"foreign":1,"settings":{"jev":false}}"#,
         )
         .unwrap();
         let cli = root.join("muniment-cli");
@@ -725,12 +738,14 @@ mod tests {
         let written: Value =
             serde_json::from_slice(&fs::read(agent.join("mcp.json")).unwrap()).unwrap();
         assert_eq!(written["foreign"], 1);
-        assert_eq!(written["settings"]["jev"], false);
+        assert!(written.get("settings").is_none());
         assert_eq!(written["mcpServers"]["github"]["command"], "gh-mcp");
         let entry = &written["mcpServers"][MCP_SERVER_NAME];
         assert_eq!(entry["command"], cli.to_string_lossy().as_ref());
         assert_eq!(entry["args"], json!(["mcp"]));
-        assert_eq!(entry["protocolVersion"], MCP_PROTOCOL_VERSION);
+        assert_eq!(entry["exposure"], "direct");
+        assert_eq!(entry["description"], MCP_SERVER_DESCRIPTION);
+        assert!(entry.get("protocolVersion").is_none());
 
         store_mcp_server(&agent, &cli).unwrap();
         let again: Value =
@@ -746,16 +761,6 @@ mod tests {
     }
 
     #[test]
-    fn mcp_settings_preserve_explicit_metadata_sharing_and_other_settings() {
-        let configured = json!({"jev": {"semanticSearch": true, "allowedServers": ["github"]}, "scriptMode": false});
-        assert_eq!(mcp_settings(&configured), configured);
-        assert_eq!(
-            mcp_settings(&json!({"scriptMode": false})),
-            json!({"scriptMode": false, "jev": false})
-        );
-    }
-
-    #[test]
     fn renders_exact_packages_and_full_registry() {
         let mut settings = Map::new();
         merge_pi_settings(&mut settings, PI_ARTIFACT);
@@ -768,7 +773,7 @@ mod tests {
             serde_json::from_str::<Value>(&rendered).unwrap(),
             json!({
                 "packages": packages,
-                "defaultTools": ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"]
+                "defaultTools": ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls", "codemode"]
             })
         );
     }
@@ -790,7 +795,22 @@ mod tests {
         let merged = settings.clone();
         merge_pi_settings(&mut settings, PI_ARTIFACT);
         assert_eq!(settings, merged);
-        assert_eq!(settings["packages"].as_array().unwrap().len(), 5);
-        assert_eq!(settings["defaultTools"].as_array().unwrap().len(), 8);
+        let mut adapted = json!({"extensions": ["-builtin:mcp"]})
+            .as_object()
+            .unwrap()
+            .clone();
+        merge_pi_settings(&mut adapted, PI_ARTIFACT);
+        assert!(adapted.get("extensions").is_none());
+        let mut kept = json!({"extensions": ["-builtin:mcp", "./mine.ts"]})
+            .as_object()
+            .unwrap()
+            .clone();
+        merge_pi_settings(&mut kept, PI_ARTIFACT);
+        assert_eq!(kept["extensions"], json!(["./mine.ts"]));
+        assert_eq!(
+            settings["packages"].as_array().unwrap().len(),
+            crate::pi_packages::PI_PACKAGES.len()
+        );
+        assert_eq!(settings["defaultTools"].as_array().unwrap().len(), 9);
     }
 }

@@ -11,6 +11,7 @@ pub mod assistant_text;
 pub use muniment_atomic_file as atomic_file;
 pub mod attach;
 pub mod attachment;
+pub mod browser_agent;
 pub mod cas;
 pub mod chat_coordinate;
 pub mod chat_launch;

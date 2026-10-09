@@ -49,7 +49,6 @@ fn pins_name_a_current_and_older_rollback_release_for_every_platform() {
             "pi-web-access",
             "pi-subagents",
             "pi-background-tasks",
-            "pi-mcp-adapter",
             "pi-claude-bridge",
         ]
     );

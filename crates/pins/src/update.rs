@@ -360,6 +360,8 @@ pub struct BumpRequest {
     pub all_packages: bool,
     /// Explicit `(name, version)` targets. They win over `all_packages`.
     pub packages: Vec<(String, String)>,
+    /// Packages to drop from the pins and the lockfile.
+    pub remove: Vec<String>,
     pub claude_code: Option<String>,
 }
 
@@ -426,10 +428,26 @@ pub fn plan(current: &PinsFile, request: &BumpRequest, http: &dyn Http) -> Resul
             packages_changed = true;
         }
     }
-    for (name, _) in &request.packages {
+    for name in request
+        .packages
+        .iter()
+        .map(|(name, _)| name)
+        .chain(&request.remove)
+    {
         if !current.packages.iter().any(|package| package.name == *name) {
             return Err(format!("{name} is not a pinned package"));
         }
+    }
+    for name in &request.remove {
+        if let Some(package) = current
+            .packages
+            .iter()
+            .find(|package| package.name == *name)
+        {
+            change(name, &package.version, "removed");
+        }
+        pins.packages.retain(|package| package.name != *name);
+        packages_changed = true;
     }
     if let Some(target) = &request.claude_code {
         let target = if target == "latest" {
@@ -463,17 +481,32 @@ pub fn title(changes: &[Change]) -> Option<String> {
     if changes.is_empty() {
         return None;
     }
+    let removed = |change: &&Change| change.to == "removed";
     let feature = changes.iter().any(|change| {
-        change.component != "Claude Code" && is_feature_change(&change.from, &change.to)
+        removed(&change)
+            || (change.component != "Claude Code" && is_feature_change(&change.from, &change.to))
     });
-    let list: Vec<_> = changes
+    let updates: Vec<_> = changes
         .iter()
+        .filter(|change| !removed(change))
         .map(|change| format!("{} to {}", change.component, change.to))
         .collect();
+    let removals: Vec<_> = changes
+        .iter()
+        .filter(removed)
+        .map(|change| change.component.clone())
+        .collect();
+    let mut parts = Vec::new();
+    if !updates.is_empty() {
+        parts.push(format!("update {}", updates.join(", ")));
+    }
+    if !removals.is_empty() {
+        parts.push(format!("remove {}", removals.join(", ")));
+    }
     Some(format!(
-        "{}: update {}",
+        "{}: {}",
         if feature { "feat" } else { "fix" },
-        list.join(", ")
+        parts.join(", ")
     ))
 }
 

@@ -11,7 +11,8 @@ mod acquisition_coordinate;
 mod gateway_coordinate;
 use muniment_core::pi_launch::{
     pi_launch_config, pi_launch_config_for_executable, PiLaunchBoundaries, PiLaunchError,
-    EXCLUDED_TOOLS, IDENTITY_EXTENSION, IDENTITY_EXTENSION_FILE, SYSTEM_PROMPT,
+    DECISIONS_EXTENSION, DECISIONS_EXTENSION_FILE, EXCLUDED_TOOLS, IDENTITY_EXTENSION,
+    IDENTITY_EXTENSION_FILE, SYSTEM_PROMPT,
 };
 use muniment_core::sidecar::{
     validate_pi_session, PiRpcWiring, SidecarConfig, SidecarStatus, SidecarSupervisor,
@@ -397,8 +398,11 @@ fn every_launch_renders_the_selected_track_before_spawn() {
                     serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
                 assert_eq!(settings["defaultProvider"], "ollama");
                 assert_eq!(settings["foreign"], true);
-                assert_eq!(settings["packages"].as_array().unwrap().len(), 5);
-                assert_eq!(settings["defaultTools"].as_array().unwrap().len(), 8);
+                assert_eq!(
+                    settings["packages"].as_array().unwrap().len(),
+                    muniment_core::pi_packages::PI_PACKAGES.len()
+                );
+                assert_eq!(settings["defaultTools"].as_array().unwrap().len(), 9);
                 assert_eq!(
                     config.startup_timeout,
                     Duration::from_secs(if grant.is_local() { 120 } else { 30 })
@@ -523,8 +527,8 @@ fn cloud_extension_failure_keeps_the_cause_and_local_mode_skips_the_write() {
         matches!(error, PiLaunchError::RejectedConfig { step: "cloud_extension_write", ref cause }
         if cause.contains("os error"))
     );
-    // The blocked cloud provider and the two extensions every launch writes.
-    assert_eq!(fs::read_dir(&root).unwrap().count(), 3);
+    // The blocked cloud provider and the three extensions every launch writes.
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 4);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -651,6 +655,7 @@ fn the_system_prompt_states_purpose_and_tools_and_names_no_harness_or_product() 
         "bg_status",
         "bg_logs",
         "mcp",
+        "codemode",
     ] {
         assert!(SYSTEM_PROMPT.contains(tool), "{tool}");
     }
@@ -780,6 +785,7 @@ fn omits_an_absent_extension_file() {
         extensions(&config),
         [
             identity.to_str().unwrap(),
+            root.join(DECISIONS_EXTENSION_FILE).to_str().unwrap(),
             root.join("muniment-routing-progress.mjs").to_str().unwrap(),
             root.join("muniment-cloud-provider.mjs").to_str().unwrap()
         ]
@@ -791,10 +797,15 @@ fn omits_an_absent_extension_file() {
         extensions(&local),
         [
             identity.to_str().unwrap(),
+            root.join(DECISIONS_EXTENSION_FILE).to_str().unwrap(),
             root.join("muniment-routing-progress.mjs").to_str().unwrap()
         ]
     );
     assert_eq!(fs::read_to_string(&identity).unwrap(), IDENTITY_EXTENSION);
+    assert_eq!(
+        fs::read_to_string(root.join(DECISIONS_EXTENSION_FILE)).unwrap(),
+        DECISIONS_EXTENSION
+    );
     for config in [&config, &local] {
         assert!(config
             .args
@@ -993,4 +1004,24 @@ fn composer_selection_overrides_the_model_on_new_and_reopened_local_threads() {
         }
     }
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn the_decisions_extension_shares_each_connection_in_its_own_shape() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/decisions");
+    let extension = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/decisions_extension.mjs");
+    let agent = std::env::temp_dir().join(format!("muniment-decisions-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&agent).unwrap();
+    let output = std::process::Command::new("node")
+        .arg(fixtures.join("check.mjs"))
+        .arg(&extension)
+        .arg(&agent)
+        .output()
+        .expect("Node.js must be available to run the decisions extension");
+    fs::remove_dir_all(agent).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

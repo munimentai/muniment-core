@@ -39,6 +39,7 @@ A module that `muniment-core` re-exports from another workspace crate keeps its 
 | module | atomic_file | It publishes local files atomically. |
 | module | attach | It serves and secures runtime connections. |
 | module | attachment | It stores run attachments in CAS. |
+| module | browser_agent | It runs the browser loop a decision model drives. |
 | module | cas | It owns content-addressed storage. |
 | module | chat_coordinate | It coordinates runs and permission policy. |
 | module | chat_launch | It defines the launch value a run starts Pi with and answers gateway requests. |
@@ -121,6 +122,7 @@ The host supplies desktop behavior through port-owned values and traits.
 `chat_launch::ChatGrant` is the launch value. `ChatGrant::local` serves local mode.
 `PiLaunchBoundaries` issues replacement cloud grants, inspects the cloud session, and fetches cloud receipts.
 Its defaults answer that the cloud is unavailable, so a host without cloud accounts runs locally.
+`PiLaunchBoundaries::browser_host` answers the host's browser for the `browser` tool. Its default answers none.
 `process_reader` reads Linux process identities for attach peers and for the desktop's browser control.
 
 ## Check
