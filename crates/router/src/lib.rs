@@ -485,6 +485,8 @@ mod tests {
             api_key: "apikey_1".into(),
             model: "jev-latest".into(),
             base_url: None,
+            max_options: None,
+            limits: Default::default(),
         };
         assert!(classifies(&config, &running));
         assert!(!classifies(&config, &running[..1]));

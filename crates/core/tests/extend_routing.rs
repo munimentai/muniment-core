@@ -30,6 +30,8 @@ fn unreachable() -> config::RouterConfig {
             base_url: "http://127.0.0.1:1".into(),
             api_key: None,
             model: "clef-flash:latest".into(),
+            max_options: None,
+            limits: Default::default(),
         },
         ..Default::default()
     }
@@ -108,6 +110,8 @@ fn classifier_only_sees_eligible_metadata_and_keeps_manual_selection_separate() 
                 base_url: url,
                 api_key: None,
                 model: "test".into(),
+                max_options: None,
+                limits: Default::default(),
             }),
         },
     )

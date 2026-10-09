@@ -252,6 +252,8 @@ impl Settings {
                 model: get("classifier.model", file.classifier.model)
                     .unwrap_or_else(|| "jev-latest".into()),
                 base_url: get("classifier.base_url", file.classifier.base_url),
+                max_options: None,
+                limits: Default::default(),
             },
             Some("endpoint") => Classifier::Endpoint {
                 base_url: get("classifier.base_url", file.classifier.base_url)
@@ -259,6 +261,8 @@ impl Settings {
                 api_key: get("classifier.api_key", file.classifier.api_key),
                 model: get("classifier.model", file.classifier.model)
                     .unwrap_or_else(|| "jev-latest".into()),
+                max_options: None,
+                limits: Default::default(),
             },
             Some("pooled") => Classifier::Pooled {
                 family: get("classifier.family", file.classifier.family)

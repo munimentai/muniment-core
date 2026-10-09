@@ -167,6 +167,8 @@ mod tests {
             base_url: "https://example.com/classify".into(),
             api_key: None,
             model: "jev-latest".into(),
+            max_options: None,
+            limits: Default::default(),
         };
         let safe = filter(&c, &Session::default(), &f, true);
         assert!(!safe.accounts[0].enabled);
@@ -197,6 +199,8 @@ mod tests {
             base_url: "https://example.com/classify".into(),
             api_key: None,
             model: "jev-latest".into(),
+            max_options: None,
+            limits: Default::default(),
         };
         c.policy.task_budget_usd = Some(0.0);
         // The run has room for the remote model, whatever the task budget says.

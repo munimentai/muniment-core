@@ -727,6 +727,8 @@ mod tests {
             api_key: "apikey_1".into(),
             model: "jev-latest".into(),
             base_url,
+            max_options: None,
+            limits: Default::default(),
         }
     }
 
@@ -1063,6 +1065,8 @@ mod connection_wire_tests {
                 model: "gpt-6-luna".into(),
                 base_url: OPENAI_DECISIONS_URL.into(),
                 api_key: Some("key".into()),
+                max_options: None,
+                limits: Default::default(),
             },
             routes: vec![route("fast"), route("deep")],
             ..RouterConfig::default()
