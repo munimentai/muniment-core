@@ -1117,7 +1117,10 @@ mod tests {
     #[test]
     fn each_provider_error_teaches_its_maximum() {
         for (message, expected) in [
-            (r#"{"error":"criteria must contain 2\u201326 candidates"}"#, 26),
+            (
+                r#"{"error":"criteria must contain 2\u201326 candidates"}"#,
+                26,
+            ),
             (r#"{"error":"Must have at most 255 choices"}"#, 255),
             (r#"{"errors":[{"message":"at most 255 items"}]}"#, 255),
         ] {
