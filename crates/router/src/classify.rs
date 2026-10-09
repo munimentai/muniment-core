@@ -15,7 +15,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use super::balance;
-use super::config::{Classifier, Route, RouterConfig};
+use super::config::{Classifier, Limits, Route, RouterConfig};
 use super::usage::Ledger;
 use super::wire::Tokens;
 
@@ -678,6 +678,110 @@ pub fn check_profile(
     }
 }
 
+/// How many options (and questions) a probe carries. A provider that accepts
+/// it has a limit of at least this many.
+const PROBE_SIZE: u32 = 256;
+
+/// What a probe request came back with.
+enum Probed {
+    /// The provider accepted the request.
+    Accepted,
+    /// The provider refused the request with this body.
+    Refused(String),
+    /// No answer, or a refusal that carries no body to read.
+    Silent,
+}
+
+/// Sends one probe body and reports how the provider took it.
+fn probe(url: &str, bearer: Option<&str>, body: &Value, timeout: Duration) -> Probed {
+    let agent = crate::http::agent_builder()
+        .redirects(0)
+        .timeout(timeout)
+        .build();
+    let mut request = agent.post(url).set("content-type", "application/json");
+    if let Some(bearer) = bearer {
+        request = request.set("authorization", &format!("Bearer {bearer}"));
+    }
+    match request.send_json(classifier_body(url, body)) {
+        Ok(_) => Probed::Accepted,
+        Err(ureq::Error::Status(_, response)) => response
+            .into_string()
+            .map_or(Probed::Silent, Probed::Refused),
+        Err(ureq::Error::Transport(_)) => Probed::Silent,
+    }
+}
+
+/// The largest count a rejection message allows. It reads a range such as
+/// "must contain 2–26 candidates" (en dash or hyphen) and a bound such as
+/// "at most 255 choices". A message that names neither gives no limit.
+pub fn parse_maximum(message: &str) -> Option<u32> {
+    // A JSON body may carry the en dash as an escape.
+    let text = message.to_lowercase().replace("\\u2013", "\u{2013}");
+    let number = |from: &str| -> Option<(u32, usize)> {
+        let from = from.trim_start();
+        let digits = from.chars().take_while(char::is_ascii_digit).count();
+        Some((from.get(..digits)?.parse().ok()?, from.len() - digits))
+    };
+    let maximum = if let Some(at) = text.find("at most ") {
+        number(&text[at + "at most ".len()..])?.0
+    } else {
+        let at = text.find("must contain ")?;
+        let (_, rest) = number(&text[at + "must contain ".len()..])?;
+        let rest = &text[text.len() - rest..];
+        let rest = rest.trim_start().strip_prefix(['\u{2013}', '-'])?;
+        number(rest)?.0
+    };
+    (maximum > 0).then_some(maximum)
+}
+
+/// The count a probe teaches: the maximum its rejection names, or the probe
+/// size when the provider accepted it.
+fn learned(probed: Probed) -> Option<u32> {
+    match probed {
+        Probed::Accepted => Some(PROBE_SIZE),
+        Probed::Refused(message) => parse_maximum(&message),
+        Probed::Silent => None,
+    }
+}
+
+/// Learns the limits of a decision connection by asking for more than it may
+/// allow. One `choice` question with 256 options teaches the options per
+/// question. When `metadata` already states the questions per request, that
+/// value stands; otherwise one request with 256 questions teaches it. An
+/// accepted probe records 256 as a floor, and a refusal that names no maximum
+/// teaches nothing.
+pub fn learn(classifier: &Classifier, metadata: &Limits, timeout: Duration) -> Limits {
+    let Some((url, bearer)) = endpoint(classifier) else {
+        return Limits::default();
+    };
+    let ask = |questions: Value| {
+        probe(
+            &url,
+            bearer.as_deref(),
+            &json!({
+                "state": "A short question about the weather.",
+                "model": classifier.model(),
+                "questions": questions,
+            }),
+            timeout,
+        )
+    };
+    let question = |count: u32| {
+        let criteria: serde_json::Map<String, Value> = (0..count)
+            .map(|index| (format!("option-{index}"), json!("A candidate")))
+            .collect();
+        json!({ "type": "choice", "instructions": INSTRUCTIONS, "criteria": criteria })
+    };
+    let options = learned(ask(json!({ QUESTION: question(PROBE_SIZE) })));
+    let questions = metadata.questions.or_else(|| {
+        let many: serde_json::Map<String, Value> = (0..PROBE_SIZE)
+            .map(|index| (format!("{QUESTION}-{index}"), question(2)))
+            .collect();
+        learned(ask(Value::Object(many)))
+    });
+    Limits { options, questions }
+}
+
 /// The last `STATE_LIMIT` bytes of the turn, on a character boundary. The tail
 /// carries the request; the head is history the classifier does not need.
 fn clip(state: &str) -> String {
@@ -943,6 +1047,134 @@ mod tests {
         assert_eq!(decision.reason, Reason::Failed);
         assert_eq!(decision.spent_on, None);
         assert_eq!(decision.spent, Tokens::default());
+    }
+
+    /// A server that answers every request with one status and body, and
+    /// counts the requests it served.
+    fn serve(status: u16, body: &str) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = count.clone();
+        let body = body.to_owned();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut head = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).to_string();
+                let length: usize = header(&head, "content-length")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
+                let mut request_body = vec![0_u8; length];
+                let _ = stream.read_exact(&mut request_body);
+                served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}/v1/systemone"), count)
+    }
+
+    fn learned_from(status: u16, body: &str, metadata: Limits) -> (Limits, usize) {
+        let (url, count) = serve(status, body);
+        let limits = learn(&typesafe(Some(url)), &metadata, TIMEOUT);
+        (limits, count.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    #[test]
+    fn a_rejection_message_names_the_maximum() {
+        // Ollama, with an en dash and with a hyphen.
+        assert_eq!(
+            parse_maximum("criteria must contain 2\u{2013}26 candidates"),
+            Some(26)
+        );
+        assert_eq!(
+            parse_maximum("criteria must contain 2-26 candidates"),
+            Some(26)
+        );
+        // TypeSafe and Cloudflare.
+        assert_eq!(parse_maximum("Must have at most 255 choices"), Some(255));
+        assert_eq!(
+            parse_maximum(r#"{"errors":[{"message":"too big: at most 255 items"}]}"#),
+            Some(255)
+        );
+        assert_eq!(parse_maximum("something went wrong"), None);
+        assert_eq!(parse_maximum("criteria must contain 2 candidates"), None);
+        assert_eq!(parse_maximum(""), None);
+    }
+
+    #[test]
+    fn each_provider_error_teaches_its_maximum() {
+        for (message, expected) in [
+            (
+                r#"{"error":"criteria must contain 2\u201326 candidates"}"#,
+                26,
+            ),
+            (r#"{"error":"Must have at most 255 choices"}"#, 255),
+            (r#"{"errors":[{"message":"at most 255 items"}]}"#, 255),
+        ] {
+            let limits = learned_from(
+                400,
+                message,
+                Limits {
+                    options: None,
+                    questions: Some(1),
+                },
+            )
+            .0;
+            assert_eq!(limits.options, Some(expected), "{message}");
+        }
+    }
+
+    #[test]
+    fn an_accepted_probe_records_the_floor() {
+        let (limits, requests) = learned_from(200, "{}", Limits::default());
+        assert_eq!(limits.options, Some(256));
+        assert_eq!(limits.questions, Some(256));
+        assert_eq!(requests, 2);
+    }
+
+    #[test]
+    fn a_message_with_no_maximum_yields_no_limit() {
+        let (limits, _) = learned_from(400, r#"{"error":"bad request"}"#, Limits::default());
+        assert_eq!(limits, Limits::default());
+        let (limits, _) = learned_from(401, "", Limits::default());
+        assert_eq!(limits, Limits::default());
+    }
+
+    #[test]
+    fn the_question_probe_is_skipped_when_metadata_states_the_limit() {
+        let metadata = Limits {
+            options: None,
+            questions: Some(8),
+        };
+        let (limits, requests) = learned_from(400, "at most 255 choices", metadata);
+        assert_eq!(limits.options, Some(255));
+        assert_eq!(limits.questions, Some(8));
+        assert_eq!(requests, 1);
+        // Without metadata the second probe runs and reads its own message.
+        let (limits, requests) = learned_from(400, "at most 255 items", Limits::default());
+        assert_eq!(limits.questions, Some(255));
+        assert_eq!(requests, 2);
+    }
+
+    #[test]
+    fn a_classifier_with_no_endpoint_learns_nothing() {
+        assert_eq!(
+            learn(&Classifier::None, &Limits::default(), TIMEOUT),
+            Limits::default()
+        );
     }
 
     struct Mock {
