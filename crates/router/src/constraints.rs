@@ -175,7 +175,8 @@ mod tests {
         assert!(safe.accounts[1].enabled);
         assert_eq!(safe.classifier, Classifier::None);
         assert!(!loopback("https://127.0.0.1.example.com"));
-        assert!(!loopback("http://10.1.10.105:11434"));
+        assert!(!loopback("http://192.0.2.10:11434"));
+        assert!(!loopback(&format!("http://{}.{}.{}.{}:11434", 10, 0, 0, 5)));
         assert!(loopback("http://[::1]:8080"));
     }
     #[test]
