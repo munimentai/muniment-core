@@ -1590,6 +1590,8 @@ mod request_tests {
         let questions = questions();
         let (port, received) = stub(200, &system_one_reply().to_string());
         let classifier = Classifier::Typesafe {
+            max_options: None,
+            limits: Default::default(),
             api_key: "apikey_1".into(),
             model: "jev-latest".into(),
             base_url: Some(format!("http://127.0.0.1:{port}/v1/systemone")),
@@ -1613,6 +1615,8 @@ mod request_tests {
         let questions = questions();
         let (port, received) = stub(200, &system_one_reply().to_string());
         let classifier = Classifier::Endpoint {
+            max_options: None,
+            limits: Default::default(),
             model: "jev-latest".into(),
             base_url: format!("http://127.0.0.1:{port}/custom/decide"),
             api_key: Some("endpoint-key".into()),
@@ -1630,6 +1634,8 @@ mod request_tests {
     #[test]
     fn the_cloudflare_request_is_what_the_stub_receives() {
         let classifier = Classifier::Endpoint {
+            max_options: None,
+            limits: Default::default(),
             model: "typesafe/jev".into(),
             base_url: "http://api.cloudflare.com:1/client/v4/accounts/abc/ai/run".into(),
             api_key: Some("cf-token".into()),
@@ -1644,6 +1650,8 @@ mod request_tests {
         let questions = questions();
         let (port, received) = stub(200, &reply.to_string());
         let classifier = Classifier::Endpoint {
+            max_options: None,
+            limits: Default::default(),
             model: "typesafe/jev".into(),
             base_url: format!("http://api.cloudflare.com:{port}/client/v4/accounts/abc/ai/run"),
             api_key: Some("cf-token".into()),
@@ -1665,6 +1673,8 @@ mod request_tests {
         let questions = questions();
         let (port, received) = stub(200, &reply.to_string());
         let classifier = Classifier::Endpoint {
+            max_options: None,
+            limits: Default::default(),
             model: "gpt-6-luna".into(),
             base_url: format!("http://api.openai.com:{port}/v1/decisions"),
             api_key: Some("sk-test".into()),
@@ -1691,6 +1701,8 @@ mod request_tests {
 
     fn built(url: String) -> Request {
         let classifier = Classifier::Endpoint {
+            max_options: None,
+            limits: Default::default(),
             model: "jev-latest".into(),
             base_url: url,
             api_key: None,
