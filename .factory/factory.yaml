@@ -61,6 +61,15 @@ gates:
       - "python3 -B scripts/test_release.py"
       - "python3 -B scripts/pins/test_update.py"
     timeout_s: 3600
+  # Set explicitly, so a change of the contract defaults leaves these gates as they are.
+  complexity:
+    enabled: false
+  dependencies:
+    enabled: false
+  mutation:
+    enabled: false
+  acceptance:
+    enabled: false
   ci:
     provider: forgejo
     # Empty: every reported check counts. The macOS and Windows jobs wait for
