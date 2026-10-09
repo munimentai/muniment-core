@@ -601,6 +601,26 @@ fn ask(url: &str, bearer: Option<&str>, body: &Value, timeout: Duration) -> Opti
         .map(classifier_response)
 }
 
+/// Asks a decision model several `choice` questions about one state in one
+/// request, and answers System One's answers by question name. Only a System
+/// One route, Workers AI or OpenAI's Decisions API answers. A pooled chat
+/// model does not.
+pub fn ask_choices(
+    classifier: &Classifier,
+    state: &Value,
+    questions: &Value,
+    timeout: Duration,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let (url, bearer) = endpoint(classifier).ok_or("Connect a decision model in Settings.")?;
+    let body = json!({"state": state, "model": classifier.model(), "questions": questions});
+    let answer =
+        ask(&url, bearer.as_deref(), &body, timeout).ok_or("The decision model did not answer.")?;
+    match answer.get("answers") {
+        Some(Value::Object(answers)) => Ok(answers.clone()),
+        _ => Err("The decision model sent no answers.".into()),
+    }
+}
+
 /// Whether the classifier answers at all, for the Test button in Settings.
 pub fn check(classifier: &Classifier, timeout: Duration) -> Result<(), String> {
     check_profile(classifier, &Profile::default(), timeout)

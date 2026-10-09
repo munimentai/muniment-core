@@ -106,6 +106,12 @@ pub trait PiLaunchBoundaries {
         Err(FetchReceiptError)
     }
 
+    /// The page a chat may drive through the `browser` tool. Only a host with
+    /// a browser has one.
+    fn browser_host(&self) -> Option<Box<dyn crate::browser_agent::BrowserHost>> {
+        None
+    }
+
     fn pi_install_root(&self) -> Result<PathBuf, PiLaunchError> {
         if let Some(root) = std::env::var_os("MUNIMENT_PI_ROOT") {
             return if root.is_empty() {
