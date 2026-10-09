@@ -279,19 +279,12 @@ pub fn decide_for(
             timeout,
         ),
         _ => {
-            let Some((url, bearer)) = endpoint(&config.classifier) else {
+            let mut body = question(config, options, state);
+            body["questions"][QUESTION]["instructions"] = json!(instructions);
+            let Some(request) = build_request(&config.classifier, &body) else {
                 return Some(Decision::plain(fallback, 0.0, Reason::NotClassified));
             };
-            let response = ask(
-                &url,
-                bearer.as_deref(),
-                &{
-                    let mut request = question(config, options, state);
-                    request["questions"][QUESTION]["instructions"] = json!(instructions);
-                    request
-                },
-                timeout,
-            );
+            let response = ask(&request, timeout);
             Asked {
                 answer: response
                     .as_ref()
@@ -582,23 +575,132 @@ fn decisions_response(mut value: Value) -> Value {
     value
 }
 
-/// One classifier call. Nothing here fails a turn: an unreachable classifier,
-/// a refusal and a body that is not JSON all read as no answer.
-fn ask(url: &str, bearer: Option<&str>, body: &Value, timeout: Duration) -> Option<Value> {
-    let agent = crate::http::agent_builder()
+/// The exact request one classifier call sends: where, under which bearer,
+/// and with which JSON body.
+#[derive(Clone, PartialEq)]
+pub struct Request {
+    pub url: String,
+    pub bearer: Option<String>,
+    pub body: Value,
+}
+
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Request")
+            .field("url", &self.url)
+            .field("bearer", &self.bearer.as_ref().map(|_| "<redacted>"))
+            .field("body", &self.body)
+            .finish()
+    }
+}
+
+/// The request for a System One body (`state`, `model`, `questions`), shaped
+/// for the classifier's endpoint. `None` when the classifier has no endpoint.
+pub fn build_request(classifier: &Classifier, body: &Value) -> Option<Request> {
+    let (url, bearer) = endpoint(classifier)?;
+    let body = classifier_body(&url, body);
+    Some(Request { url, bearer, body })
+}
+
+/// The request for asking `questions` about `state`.
+pub fn request(classifier: &Classifier, state: &Value, questions: &Value) -> Option<Request> {
+    build_request(
+        classifier,
+        &json!({"state": state, "model": classifier.model(), "questions": questions}),
+    )
+}
+
+/// What one classifier call came back with, and how it went.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sent {
+    /// The answer in System One's shape, once any envelope is unwrapped.
+    pub answer: Option<Value>,
+    /// The answers by question name, when the answer carries them.
+    pub answers: Option<serde_json::Map<String, Value>>,
+    /// The HTTP status, when the classifier replied at all.
+    pub status: Option<u16>,
+    /// Why the call produced no answers: a non-2xx status, a body that is not
+    /// JSON, an answer without answers, or a transport failure.
+    pub error: Option<String>,
+    pub latency: Duration,
+    /// The usage the answer reports.
+    pub usage: Option<Tokens>,
+}
+
+fn agent(timeout: Duration) -> ureq::Agent {
+    crate::http::agent_builder()
         .redirects(0)
         .timeout(timeout)
-        .build();
-    let mut request = agent.post(url).set("content-type", "application/json");
-    if let Some(bearer) = bearer {
-        request = request.set("authorization", &format!("Bearer {bearer}"));
+        .build()
+}
+
+/// Sends a request and reports the answers with the status or error text, the
+/// latency and the reported usage.
+pub fn send(request: &Request, timeout: Duration) -> Sent {
+    send_on(&agent(timeout), request)
+}
+
+fn send_on(agent: &ureq::Agent, request: &Request) -> Sent {
+    let started = std::time::Instant::now();
+    let mut call = agent
+        .post(&request.url)
+        .set("content-type", "application/json");
+    if let Some(bearer) = &request.bearer {
+        call = call.set("authorization", &format!("Bearer {bearer}"));
     }
-    request
-        .send_json(classifier_body(url, body))
-        .ok()?
-        .into_json::<Value>()
-        .ok()
-        .map(classifier_response)
+    let mut sent = Sent {
+        answer: None,
+        answers: None,
+        status: None,
+        error: None,
+        latency: Duration::ZERO,
+        usage: None,
+    };
+    match call.send_json(&request.body) {
+        Ok(response) => {
+            let status = response.status();
+            sent.status = Some(status);
+            if !(200..300).contains(&status) {
+                sent.error = Some(format!("The decision model answered {status}."));
+            } else {
+                match response.into_json::<Value>() {
+                    Ok(value) => {
+                        let answer = classifier_response(value);
+                        sent.usage = super::wire::tokens(&answer);
+                        match answer.get("answers") {
+                            Some(Value::Object(answers)) => sent.answers = Some(answers.clone()),
+                            _ => sent.error = Some("The decision model sent no answers.".into()),
+                        }
+                        sent.answer = Some(answer);
+                    }
+                    Err(_) => {
+                        sent.error = Some(
+                            "The decision model answered with something that is not JSON.".into(),
+                        );
+                    }
+                }
+            }
+        }
+        Err(ureq::Error::Status(status, _)) => {
+            sent.status = Some(status);
+            sent.error = Some(format!("The decision model answered {status}."));
+        }
+        Err(ureq::Error::Transport(error)) => {
+            sent.error = Some(format!(
+                "The decision model did not answer: {:?} {}",
+                error.kind(),
+                error.message().unwrap_or_default()
+            ));
+        }
+    }
+    sent.latency = started.elapsed();
+    sent
+}
+
+/// One classifier call. Nothing here fails a turn: an unreachable classifier,
+/// a refusal and a body that is not JSON all read as no answer.
+fn ask(request: &Request, timeout: Duration) -> Option<Value> {
+    send(request, timeout).answer
 }
 
 /// Asks a decision model several `choice` questions about one state in one
@@ -611,14 +713,23 @@ pub fn ask_choices(
     questions: &Value,
     timeout: Duration,
 ) -> Result<serde_json::Map<String, Value>, String> {
-    let (url, bearer) = endpoint(classifier).ok_or("Connect a decision model in Settings.")?;
-    let body = json!({"state": state, "model": classifier.model(), "questions": questions});
-    let answer =
-        ask(&url, bearer.as_deref(), &body, timeout).ok_or("The decision model did not answer.")?;
-    match answer.get("answers") {
-        Some(Value::Object(answers)) => Ok(answers.clone()),
-        _ => Err("The decision model sent no answers.".into()),
+    ask_choices_on(&agent(timeout), classifier, state, questions)
+}
+
+fn ask_choices_on(
+    agent: &ureq::Agent,
+    classifier: &Classifier,
+    state: &Value,
+    questions: &Value,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let request =
+        request(classifier, state, questions).ok_or("Connect a decision model in Settings.")?;
+    let sent = send_on(agent, &request);
+    if sent.answer.is_none() {
+        return Err("The decision model did not answer.".into());
     }
+    sent.answers
+        .ok_or_else(|| "The decision model sent no answers.".into())
 }
 
 /// Whether the classifier answers at all, for the Test button in Settings.
@@ -639,9 +750,6 @@ pub fn check_profile(
             description: String::new(),
         })
         .collect();
-    let Some((url, bearer)) = endpoint(classifier) else {
-        return Err("No classifier is configured.".into());
-    };
     let probe = json!({
         "state": "A short question about the weather.",
         "model": classifier.model(),
@@ -651,15 +759,16 @@ pub fn check_profile(
             "criteria": { "fast": "A short question", "deep": "A long reasoning task" },
         }},
     });
-    let agent = crate::http::agent_builder()
-        .redirects(0)
-        .timeout(timeout)
-        .build();
-    let mut request = agent.post(&url).set("content-type", "application/json");
-    if let Some(bearer) = bearer {
+    let Some(prepared) = build_request(classifier, &probe) else {
+        return Err("No classifier is configured.".into());
+    };
+    let mut request = agent(timeout)
+        .post(&prepared.url)
+        .set("content-type", "application/json");
+    if let Some(bearer) = &prepared.bearer {
         request = request.set("authorization", &format!("Bearer {bearer}"));
     }
-    match request.send_json(classifier_body(&url, &probe)) {
+    match request.send_json(&prepared.body) {
         Ok(response) => match response.into_json::<Value>() {
             Ok(value)
                 if parse_profile(&classifier_response(value.clone()), &options, profile)
@@ -1388,5 +1497,288 @@ mod profile_tests {
             .1,
             0.8
         );
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener};
+
+    /// One stub that answers one request, and reports the path and body it got.
+    fn stub(
+        status: u16,
+        payload: &str,
+    ) -> (
+        u16,
+        std::sync::mpsc::Receiver<(String, Option<String>, String)>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let payload = payload.to_owned();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut head = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(1) => head.push(byte[0]),
+                    _ => break,
+                }
+            }
+            let head = String::from_utf8_lossy(&head).to_string();
+            let value = |name: &str| {
+                head.lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with(&format!("{name}:")))
+                    .map(|line| line[name.len() + 1..].trim().to_owned())
+            };
+            let length: usize = value("content-length")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            let mut body = vec![0_u8; length];
+            let _ = stream.read_exact(&mut body);
+            let path = head
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or_default()
+                .to_owned();
+            let _ = sender.send((
+                path,
+                value("authorization"),
+                String::from_utf8_lossy(&body).to_string(),
+            ));
+            let response = format!(
+                "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+        (port, receiver)
+    }
+
+    /// An agent that reaches the stub whatever host the URL names, so a URL
+    /// with a Cloudflare or OpenAI host still lands on the stub.
+    fn redirected(port: u16) -> ureq::Agent {
+        crate::http::agent_builder()
+            .redirects(0)
+            .timeout(TIMEOUT)
+            .resolver(move |_: &str| Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))]))
+            .build()
+    }
+
+    fn questions() -> Value {
+        json!({ QUESTION: {
+            "type": "choice",
+            "instructions": INSTRUCTIONS,
+            "criteria": { "fast": "A short question", "deep": "A long reasoning task" },
+        }})
+    }
+
+    fn system_one_reply() -> Value {
+        json!({"answers": {"route": {"type": "choice", "choice": "fast", "confidence": 0.9}}})
+    }
+
+    #[test]
+    fn the_typesafe_request_is_what_the_stub_receives() {
+        let state = json!("Fix the typo.");
+        let questions = questions();
+        let (port, received) = stub(200, &system_one_reply().to_string());
+        let classifier = Classifier::Typesafe {
+            api_key: "apikey_1".into(),
+            model: "jev-latest".into(),
+            base_url: Some(format!("http://127.0.0.1:{port}/v1/systemone")),
+        };
+        let built = request(&classifier, &state, &questions).unwrap();
+        assert_eq!(built.bearer.as_deref(), Some("apikey_1"));
+        assert_eq!(
+            built.body,
+            json!({"state": state, "model": "jev-latest", "questions": questions})
+        );
+        ask_choices(&classifier, &state, &questions, TIMEOUT).unwrap();
+        let (path, authorization, body) = received.recv().unwrap();
+        assert_eq!(path, "/v1/systemone");
+        assert_eq!(authorization.as_deref(), Some("Bearer apikey_1"));
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), built.body);
+    }
+
+    #[test]
+    fn the_endpoint_request_is_what_the_stub_receives() {
+        let state = json!("Fix the typo.");
+        let questions = questions();
+        let (port, received) = stub(200, &system_one_reply().to_string());
+        let classifier = Classifier::Endpoint {
+            model: "jev-latest".into(),
+            base_url: format!("http://127.0.0.1:{port}/custom/decide"),
+            api_key: Some("endpoint-key".into()),
+        };
+        let built = request(&classifier, &state, &questions).unwrap();
+        assert_eq!(built.bearer.as_deref(), Some("endpoint-key"));
+        ask_choices(&classifier, &state, &questions, TIMEOUT).unwrap();
+        let (path, authorization, body) = received.recv().unwrap();
+        assert_eq!(path, "/custom/decide");
+        assert_eq!(authorization.as_deref(), Some("Bearer endpoint-key"));
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), built.body);
+        assert_eq!(built.body["state"], "Fix the typo.");
+    }
+
+    #[test]
+    fn the_cloudflare_request_is_what_the_stub_receives() {
+        let classifier = Classifier::Endpoint {
+            model: "typesafe/jev".into(),
+            base_url: "http://api.cloudflare.com:1/client/v4/accounts/abc/ai/run".into(),
+            api_key: Some("cf-token".into()),
+        };
+        let built = request(&classifier, &json!("Fix the typo."), &questions()).unwrap();
+        assert_eq!(built.body["model"], "typesafe/jev");
+        assert_eq!(built.body["input"]["state"], "Fix the typo.");
+        assert!(built.body["input"].get("model").is_none());
+        // The stub answers under Workers AI's `result` envelope.
+        let reply = json!({"success": true, "result": system_one_reply()});
+        let state = json!("Fix the typo.");
+        let questions = questions();
+        let (port, received) = stub(200, &reply.to_string());
+        let classifier = Classifier::Endpoint {
+            model: "typesafe/jev".into(),
+            base_url: format!("http://api.cloudflare.com:{port}/client/v4/accounts/abc/ai/run"),
+            api_key: Some("cf-token".into()),
+        };
+        let built = request(&classifier, &state, &questions).unwrap();
+        let answers = ask_choices_on(&redirected(port), &classifier, &state, &questions).unwrap();
+        assert_eq!(answers["route"]["choice"], "fast");
+        let (path, authorization, body) = received.recv().unwrap();
+        assert_eq!(path, "/client/v4/accounts/abc/ai/run");
+        assert_eq!(authorization.as_deref(), Some("Bearer cf-token"));
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), built.body);
+    }
+
+    #[test]
+    fn the_openai_decisions_request_is_what_the_stub_receives() {
+        let reply = json!({"answers": [{"name": "route", "type": "choice", "choice": "fast",
+            "confidence": 0.9, "probabilities": [{"value": "fast", "probability": 1.0}]}]});
+        let state = json!("Fix the typo.");
+        let questions = questions();
+        let (port, received) = stub(200, &reply.to_string());
+        let classifier = Classifier::Endpoint {
+            model: "gpt-6-luna".into(),
+            base_url: format!("http://api.openai.com:{port}/v1/decisions"),
+            api_key: Some("sk-test".into()),
+        };
+        let built = request(&classifier, &state, &questions).unwrap();
+        assert_eq!(built.body["input"], "Fix the typo.");
+        assert_eq!(built.body["questions"][0]["name"], QUESTION);
+        let answers = ask_choices_on(&redirected(port), &classifier, &state, &questions).unwrap();
+        assert_eq!(answers["route"]["choice"], "fast");
+        let (path, authorization, body) = received.recv().unwrap();
+        assert_eq!(path, "/v1/decisions");
+        assert_eq!(authorization.as_deref(), Some("Bearer sk-test"));
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), built.body);
+    }
+
+    #[test]
+    fn a_classifier_with_no_endpoint_builds_no_request() {
+        assert!(request(&Classifier::None, &json!("x"), &questions()).is_none());
+        assert_eq!(
+            ask_choices(&Classifier::None, &json!("x"), &questions(), TIMEOUT),
+            Err("Connect a decision model in Settings.".into())
+        );
+    }
+
+    fn built(url: String) -> Request {
+        let classifier = Classifier::Endpoint {
+            model: "jev-latest".into(),
+            base_url: url,
+            api_key: None,
+        };
+        request(&classifier, &json!("x"), &questions()).unwrap()
+    }
+
+    #[test]
+    fn a_send_reports_the_answers_the_status_the_latency_and_the_usage() {
+        let (port, _) = stub(
+            200,
+            &json!({"answers": {"route": {"choice": "fast", "confidence": 0.9}},
+                "usage": {"input_tokens": 312, "output_tokens": 48}})
+            .to_string(),
+        );
+        let sent = send(&built(format!("http://127.0.0.1:{port}/v1")), TIMEOUT);
+        assert_eq!(sent.status, Some(200));
+        assert_eq!(sent.error, None);
+        assert_eq!(sent.answers.unwrap()["route"]["choice"], "fast");
+        assert_eq!(
+            sent.usage,
+            Some(Tokens {
+                input: 312,
+                output: 48,
+                ..Default::default()
+            })
+        );
+        assert!(sent.latency > Duration::ZERO);
+    }
+
+    #[test]
+    fn a_send_names_a_non_2xx_status() {
+        let (port, _) = stub(503, "{\"error\":\"busy\"}");
+        let sent = send(&built(format!("http://127.0.0.1:{port}/v1")), TIMEOUT);
+        assert_eq!(sent.status, Some(503));
+        assert_eq!(
+            sent.error.as_deref(),
+            Some("The decision model answered 503.")
+        );
+        assert!(sent.answer.is_none() && sent.answers.is_none());
+    }
+
+    #[test]
+    fn a_send_names_a_body_that_is_not_json() {
+        let (port, _) = stub(200, "<html>nope</html>");
+        let sent = send(&built(format!("http://127.0.0.1:{port}/v1")), TIMEOUT);
+        assert_eq!(sent.status, Some(200));
+        assert_eq!(
+            sent.error.as_deref(),
+            Some("The decision model answered with something that is not JSON.")
+        );
+        assert!(sent.answer.is_none() && sent.usage.is_none());
+    }
+
+    #[test]
+    fn a_send_names_an_answer_without_answers_and_keeps_its_usage() {
+        let (port, _) = stub(200, &json!({"usage": {"input_tokens": 5}}).to_string());
+        let sent = send(&built(format!("http://127.0.0.1:{port}/v1")), TIMEOUT);
+        assert_eq!(
+            sent.error.as_deref(),
+            Some("The decision model sent no answers.")
+        );
+        assert_eq!(sent.usage.map(|usage| usage.input), Some(5));
+    }
+
+    #[test]
+    fn a_send_names_a_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Accepts the connection and never answers.
+        let held = std::thread::spawn(move || {
+            let accepted = listener.accept();
+            std::thread::sleep(Duration::from_millis(800));
+            drop(accepted);
+        });
+        let sent = send(
+            &built(format!("http://127.0.0.1:{port}/v1")),
+            Duration::from_millis(200),
+        );
+        assert_eq!(sent.status, None);
+        assert!(
+            sent.error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("The decision model did not answer")),
+            "{:?}",
+            sent.error
+        );
+        assert!(sent.answer.is_none());
+        held.join().unwrap();
     }
 }
