@@ -762,28 +762,16 @@ pub fn check_profile(
     let Some(prepared) = build_request(classifier, &probe) else {
         return Err("No classifier is configured.".into());
     };
-    let mut request = agent(timeout)
-        .post(&prepared.url)
-        .set("content-type", "application/json");
-    if let Some(bearer) = &prepared.bearer {
-        request = request.set("authorization", &format!("Bearer {bearer}"));
-    }
-    match request.send_json(&prepared.body) {
-        Ok(response) => match response.into_json::<Value>() {
-            Ok(value)
-                if parse_profile(&classifier_response(value.clone()), &options, profile)
-                    .is_some() =>
-            {
-                Ok(())
-            }
-            Ok(_) => Err("The classifier answered without a choice.".into()),
-            Err(_) => Err("The classifier answered with something that is not JSON.".into()),
-        },
-        Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => {
-            Err("The classifier refused the key.".into())
+    let sent = send(&prepared, timeout);
+    match (sent.status, sent.answer) {
+        (Some(401 | 403), _) => Err("The classifier refused the key.".into()),
+        (Some(status), _) if !(200..300).contains(&status) => {
+            Err(format!("The classifier answered {status}."))
         }
-        Err(ureq::Error::Status(status, _)) => Err(format!("The classifier answered {status}.")),
-        Err(ureq::Error::Transport(_)) => Err("The classifier did not answer.".into()),
+        (None, _) => Err("The classifier did not answer.".into()),
+        (Some(_), None) => Err("The classifier answered with something that is not JSON.".into()),
+        (Some(_), Some(answer)) if parse_profile(&answer, &options, profile).is_some() => Ok(()),
+        (Some(_), Some(_)) => Err("The classifier answered without a choice.".into()),
     }
 }
 
@@ -1633,17 +1621,6 @@ mod request_tests {
 
     #[test]
     fn the_cloudflare_request_is_what_the_stub_receives() {
-        let classifier = Classifier::Endpoint {
-            max_options: None,
-            limits: Default::default(),
-            model: "typesafe/jev".into(),
-            base_url: "http://api.cloudflare.com:1/client/v4/accounts/abc/ai/run".into(),
-            api_key: Some("cf-token".into()),
-        };
-        let built = request(&classifier, &json!("Fix the typo."), &questions()).unwrap();
-        assert_eq!(built.body["model"], "typesafe/jev");
-        assert_eq!(built.body["input"]["state"], "Fix the typo.");
-        assert!(built.body["input"].get("model").is_none());
         // The stub answers under Workers AI's `result` envelope.
         let reply = json!({"success": true, "result": system_one_reply()});
         let state = json!("Fix the typo.");
@@ -1657,6 +1634,9 @@ mod request_tests {
             api_key: Some("cf-token".into()),
         };
         let built = request(&classifier, &state, &questions).unwrap();
+        assert_eq!(built.body["model"], "typesafe/jev");
+        assert_eq!(built.body["input"]["state"], "Fix the typo.");
+        assert!(built.body["input"].get("model").is_none());
         let answers = ask_choices_on(&redirected(port), &classifier, &state, &questions).unwrap();
         assert_eq!(answers["route"]["choice"], "fast");
         let (path, authorization, body) = received.recv().unwrap();
