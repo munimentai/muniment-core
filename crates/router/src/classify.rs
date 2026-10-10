@@ -641,6 +641,12 @@ pub fn send(request: &Request, timeout: Duration) -> Sent {
 }
 
 fn send_on(agent: &ureq::Agent, request: &Request) -> Sent {
+    send_raw(agent, request).0
+}
+
+/// One call, and the body of a refusal when the provider sent one.
+fn send_raw(agent: &ureq::Agent, request: &Request) -> (Sent, Option<String>) {
+    let mut refusal = None;
     let started = std::time::Instant::now();
     let mut call = agent
         .post(&request.url)
@@ -681,9 +687,10 @@ fn send_on(agent: &ureq::Agent, request: &Request) -> Sent {
                 }
             }
         }
-        Err(ureq::Error::Status(status, _)) => {
+        Err(ureq::Error::Status(status, response)) => {
             sent.status = Some(status);
             sent.error = Some(format!("The decision model answered {status}."));
+            refusal = response.into_string().ok();
         }
         Err(ureq::Error::Transport(error)) => {
             sent.error = Some(format!(
@@ -694,7 +701,7 @@ fn send_on(agent: &ureq::Agent, request: &Request) -> Sent {
         }
     }
     sent.latency = started.elapsed();
-    sent
+    (sent, refusal)
 }
 
 /// One classifier call. Nothing here fails a turn: an unreachable classifier,
@@ -703,10 +710,16 @@ fn ask(request: &Request, timeout: Duration) -> Option<Value> {
     send(request, timeout).answer
 }
 
-/// Asks a decision model several `choice` questions about one state in one
-/// request, and answers System One's answers by question name. Only a System
-/// One route, Workers AI or OpenAI's Decisions API answers. A pooled chat
-/// model does not.
+/// Asks a decision model several `choice` questions about one state, and
+/// answers System One's answers by question name. Only a System One route,
+/// Workers AI or OpenAI's Decisions API answers. A pooled chat model does not.
+///
+/// A question with more options than the connection takes splits into several
+/// questions named `{name}_1`, `{name}_2` and on. More questions than one
+/// request takes go out as several requests, and their answers merge. When a
+/// provider refuses a request with a limit message, the call learns the limit,
+/// splits to it and sends again once. The learned limit is kept in process, by
+/// endpoint and model, so the next call splits first.
 pub fn ask_choices(
     classifier: &Classifier,
     state: &Value,
@@ -716,20 +729,212 @@ pub fn ask_choices(
     ask_choices_on(&agent(timeout), classifier, state, questions)
 }
 
+type Answers = serde_json::Map<String, Value>;
+
+/// Why a set of requests produced no answers.
+enum Failure {
+    /// The provider refused a request with a message that names a maximum.
+    Limit(String),
+    Failed(String),
+}
+
+type LearnedLimits = std::sync::Mutex<std::collections::HashMap<(String, String), Limits>>;
+
+/// Limits learned from refusals in this process, by endpoint and model.
+fn learned_limits() -> &'static LearnedLimits {
+    static LEARNED: std::sync::LazyLock<LearnedLimits> = std::sync::LazyLock::new(Default::default);
+    &LEARNED
+}
+
+fn limits_key(classifier: &Classifier) -> Option<(String, String)> {
+    Some((endpoint(classifier)?.0, classifier.model().to_owned()))
+}
+
+/// The option override the connection states.
+fn option_override(classifier: &Classifier) -> Option<u32> {
+    match classifier {
+        Classifier::Typesafe { max_options, .. } | Classifier::Endpoint { max_options, .. } => {
+            *max_options
+        }
+        Classifier::None | Classifier::Pooled { .. } => None,
+    }
+}
+
+/// The limits a call splits to. The connection's `max_options` wins over any
+/// learned option limit. Otherwise a limit learned from a refusal wins over
+/// the one stored with the connection.
+fn limits_for(classifier: &Classifier) -> Limits {
+    let learned = limits_key(classifier)
+        .and_then(|key| learned_limits().lock().ok()?.get(&key).cloned())
+        .unwrap_or_default();
+    Limits {
+        options: option_override(classifier)
+            .or(learned.options)
+            .or(classifier.option_limit()),
+        questions: learned.questions.or(classifier.question_limit()),
+    }
+}
+
+fn remember(classifier: &Classifier, limits: &Limits) {
+    if let (Some(key), Ok(mut learned)) = (limits_key(classifier), learned_limits().lock()) {
+        learned.insert(key, limits.clone());
+    }
+}
+
+/// One question as several, each holding at most `limit` options. Questions
+/// fill to the limit in order. A last question left with one option takes one
+/// from the one before, because a provider needs at least two. A question that
+/// fits stays as it is.
+fn split_question(name: &str, question: &Value, limit: Option<u32>) -> Vec<(String, Value)> {
+    let limit = limit.filter(|limit| *limit >= 2).map(|limit| limit as usize);
+    let criteria = question.get("criteria").and_then(Value::as_object);
+    let (Some(limit), Some(criteria)) = (limit, criteria) else {
+        return vec![(name.to_owned(), question.clone())];
+    };
+    if criteria.len() <= limit {
+        return vec![(name.to_owned(), question.clone())];
+    }
+    let mut sizes = vec![limit; criteria.len() / limit];
+    match criteria.len() % limit {
+        0 => {}
+        1 if limit > 2 => {
+            if let Some(last) = sizes.last_mut() {
+                *last -= 1;
+            }
+            sizes.push(2);
+        }
+        rest => sizes.push(rest),
+    }
+    let mut options = criteria.iter();
+    sizes
+        .into_iter()
+        .enumerate()
+        .map(|(index, take)| {
+            let chunk: serde_json::Map<String, Value> = options
+                .by_ref()
+                .take(take)
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            let mut part = question.clone();
+            part["criteria"] = Value::Object(chunk);
+            (format!("{name}_{}", index + 1), part)
+        })
+        .collect()
+}
+
+/// The question sets, one per request, that `questions` becomes under `limits`.
+fn plan(questions: &Value, limits: &Limits) -> Vec<Value> {
+    let Some(map) = questions.as_object().filter(|map| !map.is_empty()) else {
+        return vec![questions.clone()];
+    };
+    let split: Vec<(String, Value)> = map
+        .iter()
+        .flat_map(|(name, question)| split_question(name, question, limits.options))
+        .collect();
+    let per_request = limits
+        .questions
+        .filter(|count| *count > 0)
+        .map_or(split.len(), |count| count as usize);
+    split
+        .chunks(per_request)
+        .map(|chunk| Value::Object(chunk.iter().cloned().collect()))
+        .collect()
+}
+
+/// The limits a refusal teaches, when they change how `questions` splits. A
+/// message that names questions, or a request whose options all fit, teaches
+/// the questions per request. Otherwise it teaches the options per question,
+/// unless the connection states them.
+fn taught(
+    message: &str,
+    classifier: &Classifier,
+    questions: &Value,
+    current: &Limits,
+) -> Option<Limits> {
+    let maximum = parse_maximum(message)?;
+    let sent: usize = plan(questions, current)
+        .iter()
+        .map(|group| group.as_object().map_or(0, serde_json::Map::len))
+        .sum();
+    let widest = questions
+        .as_object()
+        .into_iter()
+        .flat_map(serde_json::Map::values)
+        .filter_map(|question| question.get("criteria")?.as_object().map(serde_json::Map::len))
+        .max()
+        .unwrap_or(0);
+    let wide = widest > maximum as usize && option_override(classifier).is_none();
+    let many = sent > maximum as usize;
+    let about_questions = message.to_lowercase().contains("question");
+    let next = if wide && !(about_questions && many) {
+        Limits {
+            options: Some(maximum),
+            ..current.clone()
+        }
+    } else if many {
+        Limits {
+            questions: Some(maximum),
+            ..current.clone()
+        }
+    } else {
+        return None;
+    };
+    (plan(questions, &next) != plan(questions, current)).then_some(next)
+}
+
+/// Sends each planned request and merges the answers.
+fn send_plan(
+    agent: &ureq::Agent,
+    classifier: &Classifier,
+    state: &Value,
+    groups: &[Value],
+) -> Result<Answers, Failure> {
+    let mut merged = Answers::new();
+    for group in groups {
+        let request = request(classifier, state, group)
+            .ok_or_else(|| Failure::Failed("Connect a decision model in Settings.".into()))?;
+        let (sent, refusal) = send_raw(agent, &request);
+        if let Some(body) = refusal.filter(|body| parse_maximum(body).is_some()) {
+            return Err(Failure::Limit(body));
+        }
+        if sent.answer.is_none() {
+            return Err(Failure::Failed("The decision model did not answer.".into()));
+        }
+        let answers = sent
+            .answers
+            .ok_or_else(|| Failure::Failed("The decision model sent no answers.".into()))?;
+        merged.extend(answers);
+    }
+    Ok(merged)
+}
+
 fn ask_choices_on(
     agent: &ureq::Agent,
     classifier: &Classifier,
     state: &Value,
     questions: &Value,
-) -> Result<serde_json::Map<String, Value>, String> {
-    let request =
-        request(classifier, state, questions).ok_or("Connect a decision model in Settings.")?;
-    let sent = send_on(agent, &request);
-    if sent.answer.is_none() {
-        return Err("The decision model did not answer.".into());
+) -> Result<Answers, String> {
+    if endpoint(classifier).is_none() {
+        return Err("Connect a decision model in Settings.".into());
     }
-    sent.answers
-        .ok_or_else(|| "The decision model sent no answers.".into())
+    let mut limits = limits_for(classifier);
+    let mut retried = false;
+    loop {
+        let groups = plan(questions, &limits);
+        match send_plan(agent, classifier, state, &groups) {
+            Ok(answers) => return Ok(answers),
+            Err(Failure::Limit(message)) if !retried => {
+                let Some(next) = taught(&message, classifier, questions, &limits) else {
+                    return Err("The decision model did not answer.".into());
+                };
+                remember(classifier, &next);
+                limits = next;
+                retried = true;
+            }
+            Err(Failure::Limit(_)) => return Err("The decision model did not answer.".into()),
+            Err(Failure::Failed(message)) => return Err(message),
+        }
+    }
 }
 
 /// Whether the classifier answers at all, for the Test button in Settings.
@@ -2090,5 +2295,212 @@ mod request_tests {
         );
         assert!(sent.answer.is_none());
         held.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    /// A server that refuses any request with a question of more than `limit`
+    /// options or more than `per_request` questions, and otherwise answers
+    /// every question with its first option. It records each request body.
+    fn limited(limit: usize, per_request: usize) -> (String, Arc<Mutex<Vec<Value>>>) {
+        refusing(limit, limit, per_request)
+    }
+
+    /// The same server, whose option refusal names `claimed` as the maximum.
+    fn refusing(
+        limit: usize,
+        claimed: usize,
+        per_request: usize,
+    ) -> (String, Arc<Mutex<Vec<Value>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut head = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).to_lowercase();
+                let length: usize = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse().ok())
+                    .unwrap_or(0);
+                let mut body = vec![0_u8; length];
+                let _ = stream.read_exact(&mut body);
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                log.lock().unwrap().push(body.clone());
+                let questions = body["questions"].as_object().unwrap();
+                let too_wide = questions
+                    .values()
+                    .any(|question| question["criteria"].as_object().unwrap().len() > limit);
+                let (status, payload) = if too_wide {
+                    (
+                        400,
+                        json!({"error": format!("criteria must contain 2\u{2013}{claimed} candidates")}),
+                    )
+                } else if questions.len() > per_request {
+                    (400, json!({"error": format!("at most {per_request} questions")}))
+                } else {
+                    let answers: serde_json::Map<String, Value> = questions
+                        .iter()
+                        .map(|(name, question)| {
+                            let first = question["criteria"].as_object().unwrap().keys().next();
+                            (
+                                name.clone(),
+                                json!({"type": "choice", "choice": first, "confidence": 0.9}),
+                            )
+                        })
+                        .collect();
+                    (200, json!({ "answers": answers }))
+                };
+                let payload = payload.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}/v1/systemone"), seen)
+    }
+
+    fn connection(url: String, max_options: Option<u32>, limits: Limits) -> Classifier {
+        Classifier::Endpoint {
+            base_url: url,
+            api_key: None,
+            model: "jev-latest".into(),
+            max_options,
+            limits,
+        }
+    }
+
+    fn wide(options: usize) -> Value {
+        let criteria: serde_json::Map<String, Value> = (0..options)
+            .map(|index| (format!("option-{index:03}"), json!("A candidate")))
+            .collect();
+        json!({ "route": { "type": "choice", "instructions": "Pick", "criteria": criteria } })
+    }
+
+    fn sizes(body: &Value) -> Vec<usize> {
+        body["questions"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|question| question["criteria"].as_object().unwrap().len())
+            .collect()
+    }
+
+    #[test]
+    fn a_limit_rejection_splits_at_the_limit_and_retries_once() {
+        let (url, seen) = limited(26, 100);
+        let classifier = connection(url, None, Limits::default());
+        let answers = ask_choices(&classifier, &json!("x"), &wide(60), TIMEOUT).unwrap();
+        assert_eq!(answers.len(), 3);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(sizes(&seen[0]), vec![60]);
+        assert_eq!(sizes(&seen[1]), vec![26, 26, 8]);
+        let names: Vec<&String> = seen[1]["questions"].as_object().unwrap().keys().collect();
+        assert_eq!(names, ["route_1", "route_2", "route_3"]);
+    }
+
+    #[test]
+    fn the_next_call_splits_first_with_no_failed_call() {
+        let (url, seen) = limited(26, 100);
+        let classifier = connection(url, None, Limits::default());
+        ask_choices(&classifier, &json!("x"), &wide(40), TIMEOUT).unwrap();
+        seen.lock().unwrap().clear();
+        ask_choices(&classifier, &json!("x"), &wide(40), TIMEOUT).unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(sizes(&seen[0]), vec![26, 14]);
+    }
+
+    #[test]
+    fn a_question_that_fits_is_sent_whole() {
+        let (url, seen) = limited(26, 100);
+        let classifier = connection(url, None, Limits::default());
+        let answers = ask_choices(&classifier, &json!("x"), &wide(10), TIMEOUT).unwrap();
+        assert!(answers.contains_key("route"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_last_part_never_holds_one_option() {
+        let split = split_question("route", &wide(27)["route"], Some(26));
+        let counts: Vec<usize> = split
+            .iter()
+            .map(|(_, part)| part["criteria"].as_object().unwrap().len())
+            .collect();
+        assert_eq!(counts, vec![25, 2]);
+    }
+
+    #[test]
+    fn more_questions_than_a_request_takes_send_several_requests() {
+        let (url, seen) = limited(26, 100);
+        let limits = Limits {
+            options: Some(26),
+            questions: Some(2),
+        };
+        let classifier = connection(url, None, limits);
+        let answers = ask_choices(&classifier, &json!("x"), &wide(60), TIMEOUT).unwrap();
+        assert_eq!(answers.len(), 3);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(sizes(&seen[0]), vec![26, 26]);
+        assert_eq!(sizes(&seen[1]), vec![8]);
+    }
+
+    #[test]
+    fn a_question_limit_rejection_splits_into_requests_and_retries_once() {
+        let (url, seen) = limited(255, 2);
+        let classifier = connection(url, None, Limits::default());
+        let questions = json!({
+            "a": wide(3)["route"], "b": wide(3)["route"], "c": wide(3)["route"],
+        });
+        let answers = ask_choices(&classifier, &json!("x"), &questions, TIMEOUT).unwrap();
+        assert_eq!(answers.len(), 3);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(sizes(&seen[0]), vec![3, 3, 3]);
+        assert_eq!(sizes(&seen[1]), vec![3, 3]);
+        assert_eq!(sizes(&seen[2]), vec![3]);
+    }
+
+    #[test]
+    fn max_options_on_the_connection_overrides_the_learned_limit() {
+        let (url, seen) = limited(26, 100);
+        let classifier = connection(url, Some(10), Limits::default());
+        ask_choices(&classifier, &json!("x"), &wide(25), TIMEOUT).unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(sizes(&seen[0]), vec![10, 10, 5]);
+    }
+
+    #[test]
+    fn a_second_rejection_is_not_retried() {
+        // The provider takes 10 options but its message says 26.
+        let (url, seen) = refusing(10, 26, 100);
+        let classifier = connection(url, None, Limits::default());
+        let error = ask_choices(&classifier, &json!("x"), &wide(40), TIMEOUT).unwrap_err();
+        assert_eq!(error, "The decision model did not answer.");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(sizes(&seen[1]), vec![26, 14]);
     }
 }
