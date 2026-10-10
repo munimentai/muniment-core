@@ -5,7 +5,7 @@ mod unix_tests {
     use std::net::Shutdown;
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use muniment_core::attach::desktop_service_message::{
         CompanionProvenance, ThreadCreateAccepted,
@@ -388,6 +388,9 @@ mod unix_tests {
     #[test]
     fn presenter_route_rejects_a_second_presenter() {
         let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         client.write_all(&hello_frame("desktop")).unwrap();
         let coordinator = ApprovalCoordinator::default();
         let _presenter = coordinator.claim_presenter(|_| false).unwrap();
@@ -425,6 +428,9 @@ mod unix_tests {
     #[test]
     fn presenter_route_grants_a_peer_grant_without_workspace_authority() {
         let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         client.write_all(&hello_frame("desktop")).unwrap();
         let coordinator = ApprovalCoordinator::default();
         let session_coordinator = coordinator.clone();
@@ -455,6 +461,15 @@ mod unix_tests {
         assert_eq!(grant.capability.len(), 64);
         assert!(grant.expires_at > 0 && grant.expires_at <= 8 * 60 * 60);
         assert!(grant.idle_timeout_seconds > 0 && grant.idle_timeout_seconds <= 15 * 60);
+        // Grant receipt precedes server-side presenter registration.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !coordinator.is_presenter_claimed() {
+            assert!(
+                Instant::now() < deadline,
+                "presenter did not claim the slot within two seconds of grant receipt"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(coordinator.claim_presenter(|_| true).is_none());
 
         drop(client);

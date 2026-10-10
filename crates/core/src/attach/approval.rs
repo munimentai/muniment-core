@@ -116,6 +116,15 @@ impl ApprovalCoordinator {
         }
     }
 
+    /// Whether an exclusive presenter guard currently owns the slot.
+    /// A callback installed by registration alone does not claim the slot.
+    pub fn is_presenter_claimed(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .presenter_claimed
+    }
+
     pub fn claim_presenter<F>(&self, presenter: F) -> Option<PresenterGuard>
     where
         F: Fn(&ApprovalRequest) -> bool + Send + Sync + 'static,
@@ -357,6 +366,51 @@ mod tests {
             drop(guard);
             assert!(!waiting.join().unwrap());
         }
+    }
+
+    #[test]
+    fn presenter_claim_probes_are_read_only_across_ownership_states() {
+        let coordinator = ApprovalCoordinator::default();
+        for _ in 0..3 {
+            assert!(!coordinator.is_presenter_claimed());
+        }
+        coordinator.register_presenter(|_| panic!("a probe must not invoke the presenter"));
+        for _ in 0..3 {
+            assert!(!coordinator.is_presenter_claimed());
+        }
+        let guard = coordinator
+            .claim_presenter(|_| panic!("a probe must not invoke the presenter"))
+            .unwrap();
+        for _ in 0..3 {
+            assert!(coordinator.is_presenter_claimed());
+            assert!(coordinator.claim_presenter(|_| true).is_none());
+        }
+        {
+            let state = coordinator.state.lock().unwrap();
+            assert!(state.pending.is_empty());
+            assert_eq!(state.next_id, 0);
+            assert!(!state.presenter_refusal_logged);
+        }
+        drop(guard);
+        for _ in 0..3 {
+            assert!(!coordinator.is_presenter_claimed());
+        }
+        assert!(coordinator.claim_presenter(|_| true).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn presenter_claim_probes_preserve_refusal_diagnostics() {
+        let coordinator = ApprovalCoordinator::default();
+        let _guard = coordinator.claim_presenter(|_| true).unwrap();
+        for _ in 0..3 {
+            assert!(coordinator.is_presenter_claimed());
+        }
+        assert!(coordinator.presenter_refusal_diagnostic().is_some());
+        for _ in 0..3 {
+            assert!(coordinator.is_presenter_claimed());
+        }
+        assert!(coordinator.presenter_refusal_diagnostic().is_none());
     }
 
     #[test]
