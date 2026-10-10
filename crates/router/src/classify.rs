@@ -2638,6 +2638,40 @@ mod split_tests {
     }
 
     #[test]
+    fn split_questions_cover_every_option_without_exceeding_the_limit() {
+        for limit in 2..=26_u32 {
+            for count in 0..=3 * limit as usize + 1 {
+                let original = wide(count);
+                let question = &original["route"];
+                let groups = split_question(QUESTION, question, Some(limit));
+                let mut combined = serde_json::Map::new();
+                for (index, (name, part)) in groups.iter().enumerate() {
+                    let criteria = part["criteria"].as_object().unwrap();
+                    assert!(
+                        criteria.len() <= limit as usize,
+                        "{count} options, limit {limit}"
+                    );
+                    assert_eq!(part["type"], question["type"]);
+                    assert_eq!(part["instructions"], question["instructions"]);
+                    let expected_name = if count <= limit as usize {
+                        QUESTION.to_owned()
+                    } else {
+                        format!("{QUESTION}_{}", index + 1)
+                    };
+                    assert_eq!(name, &expected_name);
+                    for (key, value) in criteria {
+                        assert!(combined.insert(key.clone(), value.clone()).is_none());
+                    }
+                }
+                assert_eq!(&combined, question["criteria"].as_object().unwrap());
+                if count <= limit as usize {
+                    assert_eq!(groups.len(), 1);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_last_part_never_holds_one_option() {
         let split = split_question("route", &wide(27)["route"], Some(26));
         let counts: Vec<usize> = split
