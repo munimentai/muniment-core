@@ -1447,9 +1447,7 @@ mod tests {
         crate::http::agent_builder()
             .redirects(0)
             .timeout(TIMEOUT)
-            .resolver(move |_: &str| {
-                Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))])
-            })
+            .resolver(move |_: &str| Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))]))
             .build()
     }
 
