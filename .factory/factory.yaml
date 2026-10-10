@@ -83,6 +83,7 @@ budgets:
   concurrent_runs: 2
 
 sandbox:
+  lane: core
   cpus: 4
   memory_mib: 8192
   # crates.io for the locked crates, GitHub release downloads for the
