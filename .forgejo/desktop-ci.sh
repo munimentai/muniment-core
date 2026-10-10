@@ -9,7 +9,8 @@
 # The runner carries DESKTOP_CI_SSH_KEY. The command may not hold a single
 # quote, and a Windows command may not hold a double quote or a dollar sign.
 #
-# Environment: REF, SOURCE_SHA, REPO_TOKEN, SERVER_URL, REPOSITORY,
+# Environment: DESKTOP_CI_HOST, the SSH destination of the desktop-ci host as
+# user@address; REF, SOURCE_SHA, REPO_TOKEN, SERVER_URL, REPOSITORY,
 # DESKTOP_CI_KNOWN_HOSTS, and BUILD_TIMEOUT in seconds (default 3600).
 set -uo pipefail
 
@@ -21,6 +22,11 @@ case "$platform" in
   macos|windows|linux) ;;
   *) printf 'unknown desktop-ci platform: %s\n' "$platform" >&2; exit 2 ;;
 esac
+host=${DESKTOP_CI_HOST:-}
+if [ -z "$host" ]; then
+  echo 'set the DESKTOP_CI_HOST variable to the desktop-ci host as user@address' >&2
+  exit 2
+fi
 case "$REF" in
   ''|*[!A-Za-z0-9._/-]*) printf 'unsafe ref for desktop-ci: %s\n' "$REF" >&2; exit 2 ;;
 esac
@@ -52,7 +58,7 @@ attempt=1
 while true; do
   ssh -i "$key" -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts" \
       -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=8 \
-      desktopci@10.1.10.10 "$remote" <<<"$guest_env"
+      "$host" "$remote" <<<"$guest_env"
   status=$?
   if { [ "$status" -ne 3 ] && [ "$status" -ne 255 ]; } || [ "$attempt" -ge 2 ]; then
     exit "$status"
