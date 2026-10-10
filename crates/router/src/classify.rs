@@ -786,7 +786,9 @@ fn remember(classifier: &Classifier, limits: &Limits) {
 /// from the one before, because a provider needs at least two. A question that
 /// fits stays as it is.
 fn split_question(name: &str, question: &Value, limit: Option<u32>) -> Vec<(String, Value)> {
-    let limit = limit.filter(|limit| *limit >= 2).map(|limit| limit as usize);
+    let limit = limit
+        .filter(|limit| *limit >= 2)
+        .map(|limit| limit as usize);
     let criteria = question.get("criteria").and_then(Value::as_object);
     let (Some(limit), Some(criteria)) = (limit, criteria) else {
         return vec![(name.to_owned(), question.clone())];
@@ -860,7 +862,12 @@ fn taught(
         .as_object()
         .into_iter()
         .flat_map(serde_json::Map::values)
-        .filter_map(|question| question.get("criteria")?.as_object().map(serde_json::Map::len))
+        .filter_map(|question| {
+            question
+                .get("criteria")?
+                .as_object()
+                .map(serde_json::Map::len)
+        })
         .max()
         .unwrap_or(0);
     let wide = widest > maximum as usize && option_override(classifier).is_none();
@@ -2353,7 +2360,10 @@ mod split_tests {
                         json!({"error": format!("criteria must contain 2\u{2013}{claimed} candidates")}),
                     )
                 } else if questions.len() > per_request {
-                    (400, json!({"error": format!("at most {per_request} questions")}))
+                    (
+                        400,
+                        json!({"error": format!("at most {per_request} questions")}),
+                    )
                 } else {
                     let answers: serde_json::Map<String, Value> = questions
                         .iter()
