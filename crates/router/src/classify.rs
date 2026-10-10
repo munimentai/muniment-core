@@ -4,8 +4,11 @@
 //! the balancer still spreads it across the pool. With one, the turn's last
 //! user message goes to the classifier as one `choice` question whose options
 //! are every model the pools serve, each carrying the statement that says what
-//! work it wins. A confidence under the configured floor takes the fallback
-//! instead, so a guess never silently picks the expensive model.
+//! work it wins. A running set wider than the connection's option limit
+//! splits into several questions, `route_1`, `route_2` and on, in one request,
+//! and the most probable answer across them wins. A confidence under the
+//! configured floor takes the fallback instead, so a guess never silently
+//! picks the expensive model.
 //!
 //! The classifier is a network call to a service the user names, so it sends
 //! the turn's text off the machine. Settings says so, and the default is off.
@@ -78,7 +81,18 @@ pub fn profile(config: &RouterConfig) -> Profile {
         })
 }
 fn parse_profile(answer: &Value, options: &[Route], profile: &Profile) -> Option<(String, f64)> {
-    let row = answer.get("answers")?.get(QUESTION)?;
+    parse_named(answer, QUESTION, options, profile)
+}
+
+/// The choice and score one named question answered, under the profile's
+/// checks against the options that question carried.
+fn parse_named(
+    answer: &Value,
+    name: &str,
+    options: &[Route],
+    profile: &Profile,
+) -> Option<(String, f64)> {
+    let row = answer.get("answers")?.get(name)?;
     if row.get("type").is_some_and(|t| t != "choice")
         || row["abstain"] == true
         || row.get("status").is_some_and(|s| s != "ok")
@@ -281,6 +295,12 @@ pub fn decide_for(
         _ => {
             let mut body = question(config, options, state);
             body["questions"][QUESTION]["instructions"] = json!(instructions);
+            let groups = split_question(
+                QUESTION,
+                &body["questions"][QUESTION],
+                limits_for(&config.classifier).options,
+            );
+            body["questions"] = Value::Object(groups.iter().cloned().collect());
             let Some(request) = build_request(&config.classifier, &body) else {
                 return Some(Decision::plain(fallback, 0.0, Reason::NotClassified));
             };
@@ -288,7 +308,7 @@ pub fn decide_for(
             Asked {
                 answer: response
                     .as_ref()
-                    .and_then(|answer| parse_profile(answer, options, &profile(config))),
+                    .and_then(|answer| best_answer(answer, &groups, options, &profile(config))),
                 spent_on: None,
                 spent: response.as_ref().and_then(super::wire::tokens),
             }
@@ -299,6 +319,32 @@ pub fn decide_for(
     decision.spent = asked.spent.unwrap_or_default();
     decision.classifier = Some(classifier_usage(&config.classifier, asked.spent));
     Some(decision)
+}
+
+/// The most probable option across the routing questions one request asked.
+/// Each question is parsed and checked against its own options. A question
+/// that answers nothing usable drops out, and no usable question is no answer.
+fn best_answer(
+    answer: &Value,
+    groups: &[(String, Value)],
+    options: &[Route],
+    profile: &Profile,
+) -> Option<(String, f64)> {
+    groups
+        .iter()
+        .filter_map(|(name, question)| {
+            let criteria = question.get("criteria")?.as_object()?;
+            let group: Vec<Route> = options
+                .iter()
+                .filter(|option| criteria.contains_key(&option.key))
+                .cloned()
+                .collect();
+            parse_named(answer, name, &group, profile)
+        })
+        .fold(None, |best: Option<(String, f64)>, next| match best {
+            Some(best) if best.1 >= next.1 => Some(best),
+            _ => Some(next),
+        })
 }
 
 /// Apply the desktop confidence and eligibility rules to an external observation.
@@ -1804,6 +1850,147 @@ mod tests {
         );
     }
 
+    /// A server that answers one request with `body` and hands back the
+    /// JSON body it received.
+    fn capture(body: Value) -> (String, std::sync::mpsc::Receiver<Value>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (sender, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut head = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(1) => head.push(byte[0]),
+                    _ => break,
+                }
+            }
+            let head = String::from_utf8_lossy(&head).to_string();
+            let length: usize = header(&head, "content-length")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            let mut request_body = vec![0_u8; length];
+            let _ = stream.read_exact(&mut request_body);
+            let _ = sender.send(serde_json::from_slice(&request_body).unwrap_or(Value::Null));
+            let payload = body.to_string();
+            let response = format!(
+                "HTTP/1.1 200 X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+        (format!("http://127.0.0.1:{port}/v1/systemone"), received)
+    }
+
+    /// A configuration whose running set holds `count` models, `m01` on, on a
+    /// TypeSafe connection at `url` that takes at most `max_options` options.
+    fn many(count: usize, url: String, max_options: Option<u32>) -> RouterConfig {
+        let mut config = routed(Classifier::Typesafe {
+            api_key: "apikey_1".into(),
+            model: "jev-latest".into(),
+            base_url: Some(url),
+            max_options,
+            limits: Default::default(),
+        });
+        config.routes = (1..=count)
+            .map(|index| Route {
+                key: format!("m{index:02}"),
+                description: format!("Model {index}"),
+                family: "openai".into(),
+                model: format!("model-{index}"),
+            })
+            .collect();
+        config.fallback = Some("m01".into());
+        config
+    }
+
+    fn criteria(question: &Value) -> Vec<String> {
+        question["criteria"]
+            .as_object()
+            .map(|criteria| criteria.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_running_set_over_the_option_limit_splits_and_takes_the_most_probable() {
+        let (url, received) = capture(json!({ "answers": {
+            "route_1": { "choice": "m03", "confidence": 0.7 },
+            "route_2": { "choice": "m28", "confidence": 0.9 },
+        }}));
+        let config = many(30, url, Some(26));
+        let decision = decided(&config, "prove it", TIMEOUT).unwrap();
+        assert_eq!(decision.route.key, "m28");
+        assert_eq!(decision.reason, Reason::Classified);
+        assert_eq!(decision.confidence, 0.9);
+
+        let body = received.recv().unwrap();
+        let questions = body["questions"].as_object().unwrap();
+        assert_eq!(
+            questions.keys().cloned().collect::<Vec<_>>(),
+            vec!["route_1".to_owned(), "route_2".to_owned()]
+        );
+        let first = criteria(&questions["route_1"]);
+        let second = criteria(&questions["route_2"]);
+        assert_eq!(first.len(), 26);
+        assert_eq!(second.len(), 4);
+        assert!(second.contains(&"m28".to_owned()));
+        assert_eq!(questions["route_2"]["type"], "choice");
+        assert_eq!(questions["route_2"]["instructions"], INSTRUCTIONS);
+    }
+
+    #[test]
+    fn a_split_answer_naming_an_option_outside_its_question_drops_out() {
+        // `m28` belongs to the second question, so the first cannot pick it.
+        let (url, _received) = capture(json!({ "answers": {
+            "route_1": { "choice": "m28", "confidence": 0.99 },
+            "route_2": { "choice": "m27", "confidence": 0.8 },
+        }}));
+        let config = many(30, url, Some(26));
+        let decision = decided(&config, "prove it", TIMEOUT).unwrap();
+        assert_eq!(decision.route.key, "m27");
+        assert_eq!(decision.reason, Reason::Classified);
+    }
+
+    #[test]
+    fn a_weak_winner_across_split_questions_takes_the_fallback() {
+        let (url, _received) = capture(json!({ "answers": {
+            "route_1": { "choice": "m03", "confidence": 0.3 },
+            "route_2": { "choice": "m28", "confidence": 0.4 },
+        }}));
+        let config = many(30, url, Some(26));
+        let decision = decided(&config, "prove it", TIMEOUT).unwrap();
+        assert_eq!(decision.route.key, "m01");
+        assert_eq!(decision.reason, Reason::LowConfidence);
+        assert_eq!(decision.confidence, 0.4);
+
+        let (url, _received) = capture(json!({ "answers": {} }));
+        let config = many(30, url, Some(26));
+        let decision = decided(&config, "prove it", TIMEOUT).unwrap();
+        assert_eq!(decision.route.key, "m01");
+        assert_eq!(decision.reason, Reason::Failed);
+    }
+
+    #[test]
+    fn a_running_set_that_fits_sends_one_question_named_route() {
+        for (count, limit) in [(26, Some(26)), (10, Some(26)), (30, None)] {
+            let (url, received) = capture(json!({ "answers": {
+                "route": { "choice": "m05", "confidence": 0.9 },
+            }}));
+            let config = many(count, url, limit);
+            let decision = decided(&config, "prove it", TIMEOUT).unwrap();
+            assert_eq!(decision.route.key, "m05", "{count} {limit:?}");
+            assert_eq!(decision.reason, Reason::Classified);
+            let body = received.recv().unwrap();
+            let questions = body["questions"].as_object().unwrap();
+            assert_eq!(questions.len(), 1);
+            assert_eq!(criteria(&questions[QUESTION]).len(), count);
+        }
+    }
+
     struct Mock {
         url: String,
         authorization: std::sync::mpsc::Receiver<Option<String>>,
@@ -2448,6 +2635,40 @@ mod split_tests {
         let answers = ask_choices(&classifier, &json!("x"), &wide(10), TIMEOUT).unwrap();
         assert!(answers.contains_key("route"));
         assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn split_questions_cover_every_option_without_exceeding_the_limit() {
+        for limit in 2..=26_u32 {
+            for count in 0..=3 * limit as usize + 1 {
+                let original = wide(count);
+                let question = &original["route"];
+                let groups = split_question(QUESTION, question, Some(limit));
+                let mut combined = serde_json::Map::new();
+                for (index, (name, part)) in groups.iter().enumerate() {
+                    let criteria = part["criteria"].as_object().unwrap();
+                    assert!(
+                        criteria.len() <= limit as usize,
+                        "{count} options, limit {limit}"
+                    );
+                    assert_eq!(part["type"], question["type"]);
+                    assert_eq!(part["instructions"], question["instructions"]);
+                    let expected_name = if count <= limit as usize {
+                        QUESTION.to_owned()
+                    } else {
+                        format!("{QUESTION}_{}", index + 1)
+                    };
+                    assert_eq!(name, &expected_name);
+                    for (key, value) in criteria {
+                        assert!(combined.insert(key.clone(), value.clone()).is_none());
+                    }
+                }
+                assert_eq!(&combined, question["criteria"].as_object().unwrap());
+                if count <= limit as usize {
+                    assert_eq!(groups.len(), 1);
+                }
+            }
+        }
     }
 
     #[test]
