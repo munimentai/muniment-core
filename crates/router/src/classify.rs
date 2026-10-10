@@ -790,11 +790,7 @@ enum Probed {
 }
 
 /// Sends one probe body and reports how the provider took it.
-fn probe(url: &str, bearer: Option<&str>, body: &Value, timeout: Duration) -> Probed {
-    let agent = crate::http::agent_builder()
-        .redirects(0)
-        .timeout(timeout)
-        .build();
+fn probe(agent: &ureq::Agent, url: &str, bearer: Option<&str>, body: &Value) -> Probed {
     let mut request = agent.post(url).set("content-type", "application/json");
     if let Some(bearer) = bearer {
         request = request.set("authorization", &format!("Bearer {bearer}"));
@@ -841,18 +837,150 @@ fn learned(probed: Probed) -> Option<u32> {
     }
 }
 
-/// Learns the limits of a decision connection by asking for more than it may
-/// allow. One `choice` question with 256 options teaches the options per
-/// question. When `metadata` already states the questions per request, that
-/// value stands; otherwise one request with 256 questions teaches it. An
-/// accepted probe records 256 as a floor, and a refusal that names no maximum
-/// teaches nothing.
+/// The largest count a text states as a range from 2, such as "2 to 255
+/// options". Text without that range gives no limit.
+fn parse_range(text: &str) -> Option<u32> {
+    let mut rest = text;
+    while let Some(at) = rest.find("2 to ") {
+        rest = &rest[at + "2 to ".len()..];
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        if let Some(maximum) = rest[..digits].parse::<u32>().ok().filter(|n| *n > 0) {
+            return Some(maximum);
+        }
+    }
+    None
+}
+
+/// The first "2 to N" range in any string of a JSON value.
+fn range_in(value: &Value) -> Option<u32> {
+    match value {
+        Value::String(text) => parse_range(text),
+        Value::Array(items) => items.iter().find_map(range_in),
+        Value::Object(map) => map.values().find_map(range_in),
+        _ => None,
+    }
+}
+
+/// The `questions` property of a published input schema, wherever it nests.
+fn questions_schema(value: &Value) -> Option<&Value> {
+    match value {
+        Value::Object(map) => map
+            .get("questions")
+            .filter(|node| node.is_object())
+            .or_else(|| map.values().find_map(questions_schema)),
+        Value::Array(items) => items.iter().find_map(questions_schema),
+        _ => None,
+    }
+}
+
+/// The limits a Workers AI model schema states: `maxProperties` on the
+/// questions, and the "2 to N" text that describes the options.
+fn schema_limits(schema: &Value) -> Limits {
+    Limits {
+        options: range_in(questions_schema(schema).unwrap_or(schema)),
+        questions: questions_schema(schema)
+            .and_then(|node| node.get("maxProperties"))
+            .and_then(Value::as_u64)
+            .and_then(|count| u32::try_from(count).ok())
+            .filter(|count| *count > 0),
+    }
+}
+
+/// The JSON a GET returns, or `None` when the request fails, is refused or
+/// answers something that is not JSON.
+fn get_json(agent: &ureq::Agent, url: &str, bearer: Option<&str>) -> Option<Value> {
+    let mut request = agent.get(url);
+    if let Some(bearer) = bearer {
+        request = request.set("authorization", &format!("Bearer {bearer}"));
+    }
+    request.call().ok()?.into_json().ok()
+}
+
+/// The Workers AI model schema URL for a run URL, with the model in the query.
+fn schema_url(url: &str, model: &str) -> Option<String> {
+    let mut parsed = url::Url::parse(url).ok()?;
+    if parsed.host_str() != Some("api.cloudflare.com") {
+        return None;
+    }
+    let path = parsed.path().strip_suffix("/ai/run")?.to_owned();
+    parsed.set_path(&format!("{path}/ai/models/schema"));
+    parsed.set_query(None);
+    parsed.query_pairs_mut().append_pair("model", model);
+    Some(parsed.into())
+}
+
+/// Ollama's `/api/show` URL for an endpoint URL.
+fn show_url(url: &str) -> Option<String> {
+    let mut parsed = url::Url::parse(url).ok()?;
+    parsed.set_path("/api/show");
+    parsed.set_query(None);
+    Some(parsed.into())
+}
+
+/// The limits the provider publishes for the classifier's model. Workers AI
+/// states them in the model schema. Ollama's `/api/show` lists the `decision`
+/// capability, which states no count unless an entry carries a "2 to N"
+/// range. Metadata that is missing or unreadable states nothing.
+fn published(
+    agent: &ureq::Agent,
+    classifier: &Classifier,
+    url: &str,
+    bearer: Option<&str>,
+) -> Limits {
+    if let Some(schema) = schema_url(url, classifier.model()) {
+        return get_json(agent, &schema, bearer)
+            .map(|schema| schema_limits(&schema))
+            .unwrap_or_default();
+    }
+    if !matches!(classifier, Classifier::Endpoint { .. }) || openai_decisions(url) {
+        return Limits::default();
+    }
+    let Some(show) = show_url(url) else {
+        return Limits::default();
+    };
+    let mut request = agent.post(&show);
+    if let Some(bearer) = bearer {
+        request = request.set("authorization", &format!("Bearer {bearer}"));
+    }
+    let Some(shown) = request
+        .send_json(json!({"model": classifier.model()}))
+        .ok()
+        .and_then(|response| response.into_json::<Value>().ok())
+    else {
+        return Limits::default();
+    };
+    let decision = shown
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .filter(|capabilities| capabilities.iter().any(|name| name == "decision"));
+    Limits {
+        options: decision.and_then(|capabilities| capabilities.iter().find_map(range_in)),
+        questions: None,
+    }
+}
+
+/// Learns the limits of a decision connection. A question limit that
+/// `metadata` states stands and skips its probe. A limit that the provider's
+/// published model metadata states also skips its probe. Otherwise one `choice` question with 256 options teaches the options per
+/// question, and one request with 256 questions teaches the questions per
+/// request. An accepted probe records 256 as a floor, and a refusal that names
+/// no maximum teaches nothing.
 pub fn learn(classifier: &Classifier, metadata: &Limits, timeout: Duration) -> Limits {
+    learn_on(&agent(timeout), classifier, metadata)
+}
+
+fn learn_on(agent: &ureq::Agent, classifier: &Classifier, metadata: &Limits) -> Limits {
     let Some((url, bearer)) = endpoint(classifier) else {
         return Limits::default();
     };
+    let published = if metadata.questions.is_some() {
+        Limits::default()
+    } else {
+        published(agent, classifier, &url, bearer.as_deref())
+    };
     let ask = |questions: Value| {
         probe(
+            agent,
             &url,
             bearer.as_deref(),
             &json!({
@@ -860,7 +988,6 @@ pub fn learn(classifier: &Classifier, metadata: &Limits, timeout: Duration) -> L
                 "model": classifier.model(),
                 "questions": questions,
             }),
-            timeout,
         )
     };
     let question = |count: u32| {
@@ -869,8 +996,10 @@ pub fn learn(classifier: &Classifier, metadata: &Limits, timeout: Duration) -> L
             .collect();
         json!({ "type": "choice", "instructions": INSTRUCTIONS, "criteria": criteria })
     };
-    let options = learned(ask(json!({ QUESTION: question(PROBE_SIZE) })));
-    let questions = metadata.questions.or_else(|| {
+    let options = published
+        .options
+        .or_else(|| learned(ask(json!({ QUESTION: question(PROBE_SIZE) }))));
+    let questions = metadata.questions.or(published.questions).or_else(|| {
         let many: serde_json::Map<String, Value> = (0..PROBE_SIZE)
             .map(|index| (format!("{QUESTION}-{index}"), question(2)))
             .collect();
@@ -1264,6 +1393,195 @@ mod tests {
         let (limits, requests) = learned_from(400, "at most 255 items", Limits::default());
         assert_eq!(limits.questions, Some(255));
         assert_eq!(requests, 2);
+    }
+
+    /// A server that answers by request path, and records `METHOD path` for
+    /// every request. An unknown path answers 404.
+    fn route_server(
+        routes: Vec<(&'static str, u16, String)>,
+    ) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut head = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).to_string();
+                let length: usize = header(&head, "content-length")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
+                let mut request_body = vec![0_u8; length];
+                let _ = stream.read_exact(&mut request_body);
+                let mut line = head.lines().next().unwrap_or_default().split_whitespace();
+                let method = line.next().unwrap_or_default();
+                let target = line.next().unwrap_or_default();
+                log.lock().unwrap().push(format!("{method} {target}"));
+                let path = target.split('?').next().unwrap_or_default();
+                let (status, body) = routes
+                    .iter()
+                    .find(|(route, ..)| *route == path)
+                    .map_or((404, String::new()), |(_, status, body)| {
+                        (*status, body.clone())
+                    });
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (port, seen)
+    }
+
+    fn redirected_agent(port: u16) -> ureq::Agent {
+        crate::http::agent_builder()
+            .redirects(0)
+            .timeout(TIMEOUT)
+            .resolver(move |_: &str| Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))]))
+            .build()
+    }
+
+    fn cloudflare() -> Classifier {
+        Classifier::Endpoint {
+            base_url: "http://api.cloudflare.com/client/v4/accounts/abc/ai/run".into(),
+            api_key: Some("cf-token".into()),
+            model: "typesafe/jev".into(),
+            max_options: None,
+            limits: Limits::default(),
+        }
+    }
+
+    #[test]
+    fn a_published_cloudflare_schema_sets_the_limits_without_a_question_probe() {
+        let schema = json!({"result": {"input": {"properties": {"questions": {
+            "maxProperties": 64,
+            "description": "Each choice question takes 2 to 255 options.",
+        }}}}});
+        let (port, seen) = route_server(vec![(
+            "/client/v4/accounts/abc/ai/models/schema",
+            200,
+            schema.to_string(),
+        )]);
+        let limits = learn_on(&redirected_agent(port), &cloudflare(), &Limits::default());
+        assert_eq!(limits.questions, Some(64));
+        assert_eq!(limits.options, Some(255));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["GET /client/v4/accounts/abc/ai/models/schema?model=typesafe%2Fjev"]
+        );
+    }
+
+    #[test]
+    fn a_schema_that_states_only_the_questions_still_probes_the_options() {
+        let schema = json!({"questions": {"maxProperties": 64}});
+        let (port, seen) = route_server(vec![
+            (
+                "/client/v4/accounts/abc/ai/models/schema",
+                200,
+                schema.to_string(),
+            ),
+            (
+                "/client/v4/accounts/abc/ai/run",
+                400,
+                "at most 200 choices".into(),
+            ),
+        ]);
+        let limits = learn_on(&redirected_agent(port), &cloudflare(), &Limits::default());
+        assert_eq!(limits.questions, Some(64));
+        assert_eq!(limits.options, Some(200));
+        let posts = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.starts_with("POST"))
+            .count();
+        assert_eq!(posts, 1);
+    }
+
+    #[test]
+    fn an_unreadable_schema_falls_through_to_the_probe() {
+        for (status, body) in [(200, "not json"), (500, ""), (404, "{}"), (200, "{}")] {
+            let (port, seen) = route_server(vec![
+                (
+                    "/client/v4/accounts/abc/ai/models/schema",
+                    status,
+                    body.into(),
+                ),
+                (
+                    "/client/v4/accounts/abc/ai/run",
+                    400,
+                    "at most 255 choices".into(),
+                ),
+            ]);
+            let limits = learn_on(&redirected_agent(port), &cloudflare(), &Limits::default());
+            assert_eq!(limits.options, Some(255), "{status} {body}");
+            assert_eq!(limits.questions, Some(255), "{status} {body}");
+            let posts = seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.starts_with("POST"))
+                .count();
+            assert_eq!(posts, 2, "{status} {body}");
+        }
+    }
+
+    #[test]
+    fn the_decision_capability_alone_still_falls_through_to_the_probe() {
+        let shown = json!({"capabilities": ["completion", "decision"]});
+        let (port, seen) = route_server(vec![
+            ("/api/show", 200, shown.to_string()),
+            (
+                "/v1/systemone",
+                400,
+                "criteria must contain 2-26 candidates".into(),
+            ),
+        ]);
+        let classifier = Classifier::Endpoint {
+            base_url: format!("http://127.0.0.1:{port}/v1/systemone"),
+            api_key: None,
+            model: "kev".into(),
+            max_options: None,
+            limits: Limits::default(),
+        };
+        let limits = learn(&classifier, &Limits::default(), TIMEOUT);
+        assert_eq!(limits.options, Some(26));
+        assert_eq!(limits.questions, Some(26));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0], "POST /api/show");
+        let probes = seen
+            .iter()
+            .filter(|request| *request == "POST /v1/systemone")
+            .count();
+        assert_eq!(probes, 2);
+    }
+
+    #[test]
+    fn a_missing_show_endpoint_falls_through_to_the_probe() {
+        let (port, _) = route_server(vec![(
+            "/v1/systemone",
+            400,
+            "criteria must contain 2-26 candidates".into(),
+        )]);
+        let classifier = Classifier::Endpoint {
+            base_url: format!("http://127.0.0.1:{port}/v1/systemone"),
+            api_key: None,
+            model: "kev".into(),
+            max_options: None,
+            limits: Limits::default(),
+        };
+        let limits = learn(&classifier, &Limits::default(), TIMEOUT);
+        assert_eq!(limits.options, Some(26));
     }
 
     #[test]
