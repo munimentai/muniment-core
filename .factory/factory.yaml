@@ -37,7 +37,9 @@ risk_paths:
 # libraries with bundled TLS roots, which reject the sandbox egress proxy, so
 # setup fetches the archive with curl and points the build script at it
 # through that CARGO_HOME's config. The sandbox's writable layer holds 4 GiB,
-# so the same config drops debug info and incremental builds.
+# so the same config drops debug info and incremental builds. Each setup step
+# skips what is already in place, so setup also runs on an image that ships
+# its result.
 gates:
   build:
     commands:
@@ -93,14 +95,19 @@ sandbox:
     - "release-assets.githubusercontent.com:443"
     - "static.rust-lang.org:443"
   setup:
-    - "rm -rf $HOME/.rustup && cp -R /opt/rust/rustup $HOME/.rustup"
-    - "for n in 1 2 3; do RUSTUP_HOME=$HOME/.rustup rustup component add rustfmt clippy && exit 0; sleep 20; done; exit 1"
+    - "test -f $HOME/.rustup/.copied || { rm -rf $HOME/.rustup && cp -R /opt/rust/rustup $HOME/.rustup && touch $HOME/.rustup/.copied; }"
+    - >-
+      if RUSTUP_HOME=$HOME/.rustup cargo fmt --version >/dev/null 2>&1 &&
+      RUSTUP_HOME=$HOME/.rustup cargo clippy --version >/dev/null 2>&1; then exit 0; fi;
+      for n in 1 2 3; do RUSTUP_HOME=$HOME/.rustup rustup component add rustfmt clippy && exit 0; sleep 20; done; exit 1
     - "for n in 1 2 3; do RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo cargo fetch --locked && exit 0; sleep 20; done; exit 1"
     - >-
       v=$(grep -A1 '^name = "sherpa-onnx-sys"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p') &&
       f=sherpa-onnx-v$v-linux-x64-shared-lib.tar.bz2 && mkdir -p $HOME/sherpa-onnx &&
-      curl -fsSL --retry 3 -o $HOME/sherpa-onnx/$f https://github.com/k2-fsa/sherpa-onnx/releases/download/v$v/$f
+      { test -s $HOME/sherpa-onnx/$f ||
+      curl -fsSL --retry 3 -o $HOME/sherpa-onnx/$f https://github.com/k2-fsa/sherpa-onnx/releases/download/v$v/$f; }
     - >-
+      grep -qs SHERPA_ONNX_ARCHIVE_DIR $HOME/.cargo/config.toml ||
       printf '[build]\nincremental = false\n[profile.dev]\ndebug = 0\n[env]\nSHERPA_ONNX_ARCHIVE_DIR = "%s/sherpa-onnx"\n' "$HOME"
       >> $HOME/.cargo/config.toml
 
