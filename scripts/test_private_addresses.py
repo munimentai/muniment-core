@@ -78,6 +78,18 @@ class PrivateAddressCheck(unittest.TestCase):
                 result = self.run_check(name, addr)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_check_files_hold_no_literal_host(self):
+        files = [SCRIPT, Path(__file__).resolve()]
+        repo = self.root
+        for path in files:
+            dest = repo / path.name
+            dest.write_bytes(path.read_bytes())
+            self.git("add", "-f", path.name)
+        result = subprocess.run(
+            [str(SCRIPT), str(repo)], capture_output=True, text=True
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_reports_offending_line(self):
         addr = dotted(10, 1, 10, 10)
         result = self.run_check("g.txt", "ok\nbad " + addr + "\n")
