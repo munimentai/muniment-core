@@ -60,10 +60,6 @@ const FAILURES: usize = 3;
 pub const CONSEQUENTIAL: f64 = 0.3;
 /// Steps in one call before the loop hands back.
 pub const MAX_STEPS: usize = 20;
-/// Targets in one question. Ollama's System One route takes 2 to 26 options,
-/// so a question holds 25 targets and a `none` option, and a longer list
-/// splits into several questions in the same request.
-pub const GROUP: usize = 25;
 /// How long one decision may take.
 pub const TIMEOUT: Duration = Duration::from_secs(15);
 const PAGE_TEXT: usize = 3_000;
@@ -125,7 +121,13 @@ pub fn answer(host: &dyn BrowserHost, arguments: Option<&str>, cancelled: &Atomi
             .map_err(|_| "Invalid browser arguments.")?;
         let model = decision_model()?;
         let decide = |state: &Value, questions: &Value| ask(&model, state, questions);
-        Ok::<_, String>(run(host, &decide, &request, cancelled))
+        Ok::<_, String>(run(
+            host,
+            &decide,
+            &request,
+            cancelled,
+            model.option_limit(),
+        ))
     })();
     result.unwrap_or_else(|error| json!({"error": error}))
 }
@@ -139,6 +141,7 @@ pub fn run(
     decide: &Decide<'_>,
     request: &Request,
     cancelled: &AtomicBool,
+    option_limit: Option<u32>,
 ) -> Value {
     let goal = request.goal.trim();
     if goal.is_empty() {
@@ -188,12 +191,12 @@ pub fn run(
             Ok(page) => page,
             Err(error) => return json!({"status": "error", "error": error, "actions": history}),
         };
-        let (state, asked) = questions(goal, &page, &history);
+        let (state, asked) = questions(goal, &page, &history, option_limit);
         let answers = match decide(&state, &asked) {
             Ok(answers) => answers,
             Err(error) => return json!({"status": "error", "error": error, "actions": history}),
         };
-        let decision = match step(&page, &answers) {
+        let decision = match step(&page, &answers, option_limit) {
             Ok(decision) => decision,
             Err(error) => return json!({"status": "error", "error": error, "actions": history}),
         };
@@ -283,14 +286,23 @@ pub enum Decision {
 
 /// The `(state, questions)` JSON one step asks. The same pair `run` passes to
 /// its decide callback for this goal, page and history.
-pub fn questions(goal: &str, page: &Value, history: &[Value]) -> (Value, Value) {
-    Space::of(page).ask(goal, page, history)
+pub fn questions(
+    goal: &str,
+    page: &Value,
+    history: &[Value],
+    option_limit: Option<u32>,
+) -> (Value, Value) {
+    Space::of(page).ask(goal, page, history, option_limit)
 }
 
 /// The decision those answers reach for this page. An answer that names a
 /// target the questions did not offer is an error, the same one `run` returns.
-pub fn step(page: &Value, answers: &Map<String, Value>) -> Result<Decision, String> {
-    Space::of(page).step(answers)
+pub fn step(
+    page: &Value,
+    answers: &Map<String, Value>,
+    option_limit: Option<u32>,
+) -> Result<Decision, String> {
+    Space::of(page).step(answers, option_limit)
 }
 
 /// The same questions as `questions`, with every target of a kind in one
@@ -464,13 +476,21 @@ impl Space {
         operations
     }
 
-    fn ask(&self, goal: &str, page: &Value, history: &[Value]) -> (Value, Value) {
-        self.questions(goal, page, history, groups)
+    fn ask(
+        &self,
+        goal: &str,
+        page: &Value,
+        history: &[Value],
+        option_limit: Option<u32>,
+    ) -> (Value, Value) {
+        self.questions(goal, page, history, &|base, keys| {
+            groups(base, keys, option_limit)
+        })
     }
 
     /// One question per target kind, holding every key plus `none`.
     fn ask_ungrouped(&self, goal: &str, page: &Value, history: &[Value]) -> (Value, Value) {
-        self.questions(goal, page, history, whole)
+        self.questions(goal, page, history, &whole)
     }
 
     fn questions(
@@ -478,7 +498,7 @@ impl Space {
         goal: &str,
         page: &Value,
         history: &[Value],
-        split: Split,
+        split: &Split<'_>,
     ) -> (Value, Value) {
         let instructions = |rule: &str| format!("Goal: {goal}\n\n{rule}");
         let mut questions = Map::new();
@@ -521,7 +541,11 @@ impl Space {
         })
     }
 
-    fn step(&self, answers: &Map<String, Value>) -> Result<Decision, String> {
+    fn step(
+        &self,
+        answers: &Map<String, Value>,
+        option_limit: Option<u32>,
+    ) -> Result<Decision, String> {
         let operations = self.operations();
         let (operation, probability) = choice(answers, "operation", operations.keys())?;
         // Done and blocked hand the turn back, so they need no threshold.
@@ -538,8 +562,10 @@ impl Space {
                 let mut doubt = Value::Array(Vec::new());
                 // The same split the questions used, so a grouped answer and an
                 // ungrouped one both name a question this page offered.
-                let split = split_of(answers, base);
-                for (index, (name, group)) in split(base, keys).into_iter().enumerate() {
+                for (index, (name, group)) in split_of(answers, base, keys, option_limit)
+                    .into_iter()
+                    .enumerate()
+                {
                     let offered: Vec<String> =
                         group.iter().cloned().chain(["none".to_owned()]).collect();
                     let (key, probability) = choice(answers, &name, offered.iter())?;
@@ -572,7 +598,7 @@ impl Space {
             "CLICK" => match target("click_target", &self.click)? {
                 Err(choices) => Decision::Unsure { choices },
                 Ok((id, index)) => {
-                    let risk = risk_questions(&self.click, answers)
+                    let risk = risk_questions(&self.click, answers, option_limit)
                         .get(index)
                         .and_then(|(name, _)| answers.get(name))
                         .and_then(|answer| answer["probabilities"][&id].as_f64())
@@ -611,11 +637,20 @@ impl Space {
 }
 
 /// How a target list becomes question names. `groups` and `whole` are both this.
-type Split = for<'a> fn(&'a str, &'a [String]) -> Vec<(String, &'a [String])>;
+type Split<'s> = dyn for<'a> Fn(&str, &'a [String]) -> Vec<(String, &'a [String])> + 's;
 
-/// A target list split into questions of `GROUP` elements. One group keeps the base name.
-pub fn groups<'a>(base: &str, keys: &'a [String]) -> Vec<(String, &'a [String])> {
-    split(base, keys, keys.chunks(GROUP).collect())
+/// A target list split by the connection's option limit, reserving one for `none`.
+/// With no known limit, one question holds the whole list.
+pub fn groups<'a>(
+    base: &str,
+    keys: &'a [String],
+    option_limit: Option<u32>,
+) -> Vec<(String, &'a [String])> {
+    let size = option_limit
+        .map(|limit| limit.saturating_sub(1) as usize)
+        .unwrap_or(keys.len())
+        .max(1);
+    split(base, keys, keys.chunks(size).collect())
 }
 
 /// The same list as one question under `base`, holding every key. The strengths
@@ -651,11 +686,16 @@ fn split<'a>(
 
 /// The split those answers were built with: a base-name answer is the whole
 /// list, and numbered names are the groups.
-fn split_of(answers: &Map<String, Value>, base: &str) -> Split {
+fn split_of<'a>(
+    answers: &Map<String, Value>,
+    base: &str,
+    keys: &'a [String],
+    option_limit: Option<u32>,
+) -> Vec<(String, &'a [String])> {
     if answers.contains_key(base) {
-        whole
+        whole(base, keys)
     } else {
-        groups
+        groups(base, keys, option_limit)
     }
 }
 
@@ -663,8 +703,9 @@ fn split_of(answers: &Map<String, Value>, base: &str) -> Split {
 fn risk_questions<'a>(
     keys: &'a [String],
     answers: &Map<String, Value>,
+    option_limit: Option<u32>,
 ) -> Vec<(String, &'a [String])> {
-    split_of(answers, "consequential")("consequential", keys)
+    split_of(answers, "consequential", keys, option_limit)
 }
 
 /// A choice answer's option and that option's probability. The option must be
@@ -777,7 +818,7 @@ mod tests {
 
     #[test]
     fn one_request_asks_the_operation_every_target_and_the_risk() {
-        let (state, questions) = questions("Fly to Paris", &form(), &[]);
+        let (state, questions) = questions("Fly to Paris", &form(), &[], None);
         let names: Vec<_> = questions.as_object().unwrap().keys().cloned().collect();
         assert_eq!(
             names,
@@ -838,7 +879,13 @@ mod tests {
             }
             Ok(answers)
         };
-        let result = run(&page, &decide, &request("Search"), &AtomicBool::new(false));
+        let result = run(
+            &page,
+            &decide,
+            &request("Search"),
+            &AtomicBool::new(false),
+            None,
+        );
         assert_eq!(result["status"], "done");
         assert_eq!(
             page.actions.borrow()[0],
@@ -869,6 +916,7 @@ mod tests {
             &decide,
             &request("Fly to Paris"),
             &AtomicBool::new(false),
+            None,
         );
         assert_eq!(result["status"], "needs_text");
         assert_eq!(result["element"]["id"], "1");
@@ -881,7 +929,13 @@ mod tests {
             answers.insert("consequential".into(), answer("3", 0.8));
             Ok(answers)
         };
-        let result = run(&page, &risky, &request("Buy it"), &AtomicBool::new(false));
+        let result = run(
+            &page,
+            &risky,
+            &request("Buy it"),
+            &AtomicBool::new(false),
+            None,
+        );
         assert_eq!(result["status"], "needs_confirmation");
         assert!(page.actions.borrow().is_empty());
 
@@ -892,7 +946,7 @@ mod tests {
             value: "Paris".into(),
         });
         let stop = AtomicBool::new(true);
-        let result = run(&page, &risky, &confirmed, &stop);
+        let result = run(&page, &risky, &confirmed, &stop, None);
         assert_eq!(result["status"], "stopped");
         assert_eq!(
             *page.actions.borrow(),
@@ -917,7 +971,7 @@ mod tests {
             element: String::new(),
             value: String::new(),
         });
-        let result = run(&page, &done, &empty, &AtomicBool::new(false));
+        let result = run(&page, &done, &empty, &AtomicBool::new(false), None);
         assert_eq!(result["status"], "done");
         assert!(page.actions.borrow().is_empty());
     }
@@ -939,6 +993,7 @@ mod tests {
             &doubtful,
             &request("Search"),
             &AtomicBool::new(false),
+            None,
         );
         assert_eq!(result["status"], "unsure");
         assert_eq!(result["choices"][0]["option"], "CLICK");
@@ -949,23 +1004,33 @@ mod tests {
             answers.insert("click_target".into(), answer("button.buy", 0.9));
             Ok(answers)
         };
-        let result = run(&page, &foreign, &request("Search"), &AtomicBool::new(false));
+        let result = run(
+            &page,
+            &foreign,
+            &request("Search"),
+            &AtomicBool::new(false),
+            None,
+        );
         assert_eq!(result["status"], "error");
         assert!(page.actions.borrow().is_empty());
     }
 
     #[test]
-    fn every_question_holds_two_to_twenty_six_options_and_the_best_group_wins() {
+    fn every_question_respects_the_connection_limit_and_the_best_group_wins() {
+        let option_limit = 26;
         let mut elements: Vec<Value> = (1..=60)
             .map(|n| json!({"id": n.to_string(), "role": "link", "name": format!("Link {n}"), "operations": ["click"]}))
             .collect();
         elements.push(json!({"id": "61", "role": "textbox", "name": "Search", "value": "", "operations": ["fill"]}));
         let page =
             json!({"url": "https://example.org/", "title": "", "text": "", "elements": elements});
-        let (_, questions) = questions("Open link 30", &page, &[]);
+        let (_, questions) = questions("Open link 30", &page, &[], Some(option_limit));
         for (name, question) in questions.as_object().unwrap() {
             let options = question["criteria"].as_object().unwrap().len();
-            assert!((2..=26).contains(&options), "{name} has {options}");
+            assert!(
+                (2..=option_limit as usize).contains(&options),
+                "{name} has {options}"
+            );
         }
         for name in [
             "click_target_1",
@@ -982,7 +1047,7 @@ mod tests {
         answers.insert("click_target_2".into(), answer("30", 0.9));
         answers.insert("click_target_3".into(), answer("55", 0.65));
         answers.insert("consequential_2".into(), answer("none", 0.9));
-        match step(&page, &answers).unwrap() {
+        match step(&page, &answers, Some(option_limit)).unwrap() {
             Decision::Act { action } => {
                 assert_eq!(action, json!({"action": "click", "element": "30"}))
             }
@@ -991,11 +1056,100 @@ mod tests {
         answers.insert("click_target_2".into(), answer("none", 0.9));
         answers.insert("click_target_3".into(), answer("55", 0.35));
         assert!(matches!(
-            step(&page, &answers).unwrap(),
+            step(&page, &answers, Some(option_limit)).unwrap(),
             Decision::Unsure { .. }
         ));
         answers.insert("operation".into(), answer("DONE", 0.4));
-        assert!(matches!(step(&page, &answers).unwrap(), Decision::Done));
+        assert!(matches!(
+            step(&page, &answers, Some(option_limit)).unwrap(),
+            Decision::Done
+        ));
+    }
+
+    #[test]
+    fn groups_reserve_none_at_the_connection_boundary() {
+        for limit in [8, 26, 255] {
+            let capacity = limit as usize - 1;
+            let keys: Vec<String> = (1..=capacity + 1).map(|n| n.to_string()).collect();
+            let grouped = groups("click_target", &keys, Some(limit));
+            assert_eq!(grouped.len(), 2);
+            assert_eq!(grouped[0].0, "click_target_1");
+            assert_eq!(grouped[0].1, &keys[..capacity]);
+            assert_eq!(grouped[1].0, "click_target_2");
+            assert_eq!(grouped[1].1, &keys[capacity..]);
+
+            let single = groups("click_target", &keys[..capacity], Some(limit));
+            assert_eq!(single, vec![("click_target".to_owned(), &keys[..capacity])]);
+            assert_eq!(
+                groups("click_target", &keys, None),
+                vec![("click_target".to_owned(), keys.as_slice())]
+            );
+            assert!(groups("click_target", &[], Some(limit)).is_empty());
+        }
+        assert!(groups("click_target", &[], None).is_empty());
+    }
+
+    #[test]
+    fn a_large_page_uses_the_connection_limit_or_the_whole_list() {
+        let elements: Vec<Value> = (1..=140)
+            .map(|n| json!({"id": n.to_string(), "role": "link", "name": format!("Link {n}"), "operations": ["click"]}))
+            .collect();
+        let page = json!({"elements": elements});
+        for (limit, count) in [(Some(255), 1), (Some(26), 6), (None, 1)] {
+            let (_, asked) = questions("Open link 140", &page, &[], limit);
+            for base in ["click_target", "consequential"] {
+                let targets: Vec<_> = asked
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .filter(|(name, _)| name.starts_with(base))
+                    .collect();
+                assert_eq!(targets.len(), count);
+                let mut total = 0;
+                for (_, question) in targets {
+                    let criteria = question["criteria"].as_object().unwrap();
+                    assert!(criteria.contains_key("none"));
+                    assert!((2..=limit.unwrap_or(141) as usize).contains(&criteria.len()));
+                    total += criteria.len() - 1;
+                }
+                assert_eq!(total, 140);
+            }
+            let host = host(vec![page.clone()]);
+            let decide = |_: &Value, questions: &Value| {
+                assert_eq!(questions, &asked);
+                Err("stop after the questions".into())
+            };
+            let result = run(
+                &host,
+                &decide,
+                &request("Open link 140"),
+                &AtomicBool::new(false),
+                limit,
+            );
+            assert_eq!(result["status"], "error");
+            let mut answers = Map::new();
+            answers.insert("operation".into(), answer("CLICK", 0.9));
+            for (name, question) in asked.as_object().unwrap() {
+                if name.starts_with("click_target") {
+                    let key = if question["criteria"].get("140").is_some() {
+                        "140"
+                    } else {
+                        "none"
+                    };
+                    answers.insert(name.clone(), answer(key, 0.9));
+                }
+                if name.starts_with("consequential") {
+                    answers.insert(
+                        name.clone(),
+                        json!({"choice": "none", "confidence": 0.9,
+                        "probabilities": {"140": 0.8, "none": 0.2}}),
+                    );
+                }
+            }
+            assert!(
+                matches!(step(&page, &answers, limit).unwrap(), Decision::Confirm { element } if element["id"] == "140")
+            );
+        }
     }
 
     #[test]
@@ -1009,12 +1163,12 @@ mod tests {
         };
         let mut opening = request("Fly to Paris");
         opening.url = Some("https://example.org/".into());
-        let result = run(&host, &decide, &opening, &AtomicBool::new(false));
+        let result = run(&host, &decide, &opening, &AtomicBool::new(false), None);
         assert_eq!(result["status"], "error");
         let (asked_state, asked) = seen.borrow_mut().take().unwrap();
         // The navigate the request performed is the history the first step sees.
         let history: Vec<Value> = host.actions.borrow().clone();
-        let (state, questions) = questions("Fly to Paris", &page, &history);
+        let (state, questions) = questions("Fly to Paris", &page, &history, None);
         assert_eq!(asked_state, state);
         assert_eq!(asked, questions);
         assert_eq!(
@@ -1025,7 +1179,7 @@ mod tests {
         let mut answers = Map::new();
         answers.insert("operation".into(), answer("CLICK", 0.9));
         answers.insert("click_target".into(), answer("button.buy", 0.9));
-        let error = step(&page, &answers).unwrap_err();
+        let error = step(&page, &answers, None).unwrap_err();
         assert_eq!(
             error,
             "The decision model gave no valid answer to click_target."
@@ -1047,7 +1201,7 @@ mod tests {
         let page = json!({"url": "https://example.org/", "title": "Many", "text": "Links", "elements": elements});
         let history = [json!({"action": "wait"})];
         let (state, whole_questions) = questions_ungrouped("Open link 30", &page, &history);
-        let (grouped_state, grouped) = questions("Open link 30", &page, &history);
+        let (grouped_state, grouped) = questions("Open link 30", &page, &history, Some(26));
         assert_eq!(state, grouped_state);
         assert_eq!(state["recent_actions"], json!(history));
         let questions = &whole_questions;
@@ -1095,6 +1249,6 @@ mod tests {
         let (name, chunk) = whole("click_target", &keys).into_iter().next().unwrap();
         assert_eq!(name, "click_target");
         assert_eq!(chunk.len(), 30);
-        assert_eq!(groups("click_target", &keys).len(), 2);
+        assert_eq!(groups("click_target", &keys, Some(26)).len(), 2);
     }
 }
