@@ -8,6 +8,7 @@ pub mod family;
 pub mod http;
 pub mod local_servers;
 pub mod model_catalog;
+pub mod pi_models;
 pub mod provider_models;
 pub mod registry;
 pub mod window;
