@@ -315,7 +315,7 @@ impl PiLaunchBoundaries for Boundaries {
         Some("ollama/llama3.2:3b".into())
     }
 
-    fn working_directory(&self) -> Option<PathBuf> {
+    fn home_directory(&self) -> Option<PathBuf> {
         self.session_root
             .as_ref()
             .ok()
@@ -622,6 +622,9 @@ fn passes_the_system_prompt_with_the_launch_facts_for_every_launch() {
                 }
                 let home = root.join("Documents").join("Home");
                 assert!(prompt.contains(&format!("- The working directory is {}.", home.display())));
+                assert!(prompt.contains(&format!("- The user's Home is {}.", home.display())));
+                assert!(prompt
+                    .contains("Generated files belong in the working directory the facts name"));
                 assert_eq!(config.working_directory.as_deref(), Some(home.as_path()));
                 assert!(!config
                     .args
@@ -941,6 +944,10 @@ fn project_launch_uses_the_folder_after_rename_and_rejects_a_missing_folder() {
             .args
             .iter()
             .any(|arg| arg.contains("Create generated files inside this working directory.")));
+        assert!(config.args.iter().any(|arg| arg.contains(&format!(
+            "- The user's Home is {}.",
+            root.join("muniment").display()
+        ))));
     }
     fs::remove_dir(muniment_core::projects::folder(&profile, &project).unwrap()).unwrap();
     assert!(

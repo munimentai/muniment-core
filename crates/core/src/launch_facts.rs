@@ -1,7 +1,7 @@
 //! What a run tells the model about where it is running. The prompt itself is
 //! a constant. These facts change with every launch: the model that answers,
 //! the models that answered earlier in the thread, the host and its shell,
-//! and the working directory. Each user message also opens with the time it
+//! the working directory, and the user's Home. Each user message also opens with the time it
 //! was sent, so the model reads the clock from the message and not from its
 //! training data.
 
@@ -38,8 +38,11 @@ pub struct LaunchFacts {
     /// Models that wrote earlier replies in this thread, once each, in order,
     /// without the one answering now.
     pub earlier_models: Vec<String>,
-    /// The folder the agent works in: the user's Home.
+    /// The folder the agent works in: the thread's project, agent or session
+    /// folder, else the user's Home.
     pub working_directory: Option<PathBuf>,
+    /// The user's Home, the folder the app shows as Home.
+    pub home: Option<PathBuf>,
 }
 
 impl LaunchFacts {
@@ -73,6 +76,12 @@ impl LaunchFacts {
                 "- No working directory is configured. Read or write only at a path the user names."
                     .to_owned(),
             ),
+        }
+        if let Some(home) = &self.home {
+            lines.push(format!(
+                "- The user's Home is {}. It is the folder the app shows as Home, and a request about Home means this folder. Its agents/, projects/, sessions/ and memory/ folders hold agent folders, project folders, thread folders, and the profile and durable facts.",
+                home.display()
+            ));
         }
         lines.push(
             "- Each user message opens with a line that says when it was sent: a timestamp with its offset and zone."
@@ -128,8 +137,8 @@ pub fn read_local_default_model(agent_directory: &Path) -> Option<String> {
     local_default_model(&settings)
 }
 
-/// The agent's working directory: the configured Home, else the default Home
-/// for this user, else nothing.
+/// The user's Home: the configured Home, else the default Home for this user,
+/// else nothing.
 pub fn working_directory(config_directory: &Path) -> Option<PathBuf> {
     if let Ok(Some(home)) = crate::home::configured_home(config_directory) {
         return Some(home);
@@ -212,6 +221,7 @@ mod tests {
             model: Some("xai/grok-4.6".into()),
             earlier_models: vec!["openai/gpt-5.5".into()],
             working_directory: Some(PathBuf::from("/Users/a/Documents/Muniment")),
+            home: Some(PathBuf::from("/Users/a/Documents/Muniment")),
         };
         let block = facts.render();
         assert!(block.starts_with("Facts:\n"));
@@ -221,6 +231,7 @@ mod tests {
             "The host runs {PLATFORM}. Shell commands run in {SHELL}."
         )));
         assert!(block.contains("The working directory is /Users/a/Documents/Muniment."));
+        assert!(block.contains("The user's Home is /Users/a/Documents/Muniment."));
         assert!(block.contains("opens with a line that says when it was sent"));
         let prompt = system_prompt_with_facts("You are the assistant.", &facts);
         assert!(prompt.starts_with("You are the assistant.\n\nFacts:"));
@@ -233,6 +244,36 @@ mod tests {
         assert!(block.contains("say that you do not know rather than name one"));
         assert!(!block.contains("Earlier replies"));
         assert!(block.contains("No working directory is configured."));
+        assert!(!block.contains("Home"));
+    }
+
+    #[test]
+    fn a_project_thread_names_its_folder_and_the_home() {
+        let facts = LaunchFacts {
+            working_directory: Some(PathBuf::from("/Users/a/Muniment/projects/Drafts")),
+            home: Some(PathBuf::from("/Users/a/Muniment")),
+            ..LaunchFacts::default()
+        };
+        let block = facts.render();
+        assert!(block.contains("- The working directory is /Users/a/Muniment/projects/Drafts."));
+        assert!(block.contains(
+            "- The user's Home is /Users/a/Muniment. It is the folder the app shows as Home"
+        ));
+        assert!(block.contains("Its agents/, projects/, sessions/ and memory/ folders"));
+        let working = block.find("The working directory is").unwrap();
+        let home = block.find("The user's Home is").unwrap();
+        assert!(working < home);
+    }
+
+    #[test]
+    fn an_unknown_home_leaves_the_home_line_out() {
+        let facts = LaunchFacts {
+            working_directory: Some(PathBuf::from("/Users/a/Muniment/projects/Drafts")),
+            ..LaunchFacts::default()
+        };
+        let block = facts.render();
+        assert!(block.contains("The working directory is /Users/a/Muniment/projects/Drafts."));
+        assert!(!block.contains("The user's Home"));
     }
 
     #[test]
