@@ -164,7 +164,7 @@ mod tests {
             let page =
                 crate::owned_threads::chat_thread_summaries_page(&mut journal, owner, 20, None)
                     .unwrap();
-            assert_eq!(page.summaries.len(), 1);
+            assert!(page.summaries.is_empty());
             #[cfg(feature = "keyring")]
             {
                 let history = crate::thread_history::chat_thread_open_page(

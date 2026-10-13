@@ -62,7 +62,14 @@ pub fn chat_thread_summaries_page(
     };
     journal
         .scan_thread_summaries(None, cursor, scan, |journal, thread_id| {
-            subject_owns_first_run(journal, thread_id, subject)
+            // A created thread with no run holds no message, so the list
+            // leaves it out. The shell shows the open fresh thread itself.
+            let has_run = !journal
+                .thread_run_ids(thread_id, 1, None)
+                .map_err(|error| ThreadOwnershipError::ThreadRunsUnavailable(format!("{error:?}")))?
+                .run_ids
+                .is_empty();
+            Ok(has_run && subject_owns_first_run(journal, thread_id, subject)?)
         })
         .map_err(scan_error)
 }
@@ -169,6 +176,43 @@ mod tests {
         assert_eq!(page.summaries.len(), 1);
         assert_eq!(
             subject_owns_first_run(&mut journal, &page.summaries[0].thread_id, Some("owner")),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn leaves_out_a_created_thread_that_never_received_a_message() {
+        let path = journal_file();
+        let mut journal =
+            RunJournal::open_with_busy_timeout(&path, Duration::from_secs(60)).unwrap();
+        append_thread(
+            &mut journal,
+            "01900000-0000-7000-8000-000000000001",
+            "owner",
+            "2026-08-05T00:00:00Z".into(),
+        );
+        let mut provenance = Provenance {
+            source: "test".into(),
+            source_version: "1".into(),
+            actor_id: Some("owner".into()),
+            device_id: None,
+            rpc_request_id: None,
+            capability_versions: None,
+            extra: BTreeMap::new(),
+        };
+        provenance
+            .extra
+            .insert("attach_profile".into(), "desktop-owner".into());
+        let empty = journal
+            .create_thread("workspace", "2026-08-05T00:00:01Z", provenance)
+            .unwrap();
+
+        let page = chat_thread_summaries_page(&mut journal, Some("owner"), 20, None).unwrap();
+
+        assert_eq!(page.summaries.len(), 1);
+        assert_ne!(page.summaries[0].thread_id, empty);
+        assert_eq!(
+            subject_owns_first_run(&mut journal, &empty, Some("owner")),
             Ok(true)
         );
     }
