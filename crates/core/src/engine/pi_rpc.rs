@@ -49,17 +49,20 @@ pub struct PiOpen<'a> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PiRpcEngine {
     session_root: Option<PathBuf>,
-    agent_directory: Option<PathBuf>,
+    pub(super) agent_directory: Option<PathBuf>,
+    /// The root the pinned Pi installs under.
+    pub(super) harness_root: Option<PathBuf>,
 }
 
 impl PiRpcEngine {
-    /// An adapter for the session root given and the agent directory under
-    /// the state root, the one Pi reads at launch.
+    /// An adapter for the session root given, and the agent directory and Pi
+    /// install root under the state root, the ones Pi reads at launch.
     pub fn new(session_root: Option<PathBuf>) -> Self {
+        let state = crate::state_root::state_directory();
         Self {
             session_root,
-            agent_directory: crate::state_root::state_directory()
-                .map(|state| crate::state_root::agent_directory(&state)),
+            agent_directory: state.as_deref().map(crate::state_root::agent_directory),
+            harness_root: state.map(|state| state.join(crate::state_root::HARNESS_DIRECTORY_NAME)),
         }
     }
 
