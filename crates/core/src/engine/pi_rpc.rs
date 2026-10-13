@@ -94,6 +94,76 @@ impl PiRpcEngine {
         read_object(&path).map_err(|_| READ_SETTINGS_ERROR.to_string())
     }
 
+    /// The context usage in Pi's `get_session_stats` and `get_state` answers.
+    fn usage_from(&self, stats: &Value, state: &Value) -> Result<ContextUsage, String> {
+        let usage = stats.get("contextUsage");
+        let count = |value: Option<&Value>| {
+            value
+                .and_then(Value::as_f64)
+                .filter(|count| count.is_finite())
+                .map(|count| count.max(0.0) as u64)
+        };
+        let provider = state
+            .pointer("/model/provider")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let model = state
+            .pointer("/model/id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        // Pi reports no window before a model's first reply and while a turn
+        // runs. The model knowledge in core answers for the active model then.
+        let reported = count(usage.and_then(|usage| usage.get("contextWindow")))
+            .or_else(|| count(state.pointer("/model/contextWindow")))
+            .filter(|window| *window > 0);
+        let looked_up = || {
+            let agent = self.agent_directory.as_deref()?;
+            let (provider, model) = provider.as_deref().zip(model.as_deref())?;
+            crate::models::window::window(agent, provider, model).map(|window| window.context)
+        };
+        let context_window = reported.or_else(looked_up).filter(|window| *window > 0);
+        let mut tokens = count(usage.and_then(|usage| usage.get("tokens")));
+        let mut percent = usage
+            .and_then(|usage| usage.get("percent"))
+            .and_then(Value::as_f64)
+            .filter(|percent| percent.is_finite());
+        let mut estimated = false;
+        if tokens.is_none() {
+            let session = stats
+                .get("sessionFile")
+                .and_then(Value::as_str)
+                .and_then(|file| Path::new(file).file_name())
+                .and_then(|name| name.to_str());
+            if let Some(after) = session
+                .and_then(super::last_compaction)
+                .and_then(|outcome| outcome.estimated_tokens_after)
+            {
+                tokens = Some(after);
+                percent = context_window.map(|window| after as f64 * 100.0 / window as f64);
+                estimated = true;
+            }
+        }
+        if percent.is_none() {
+            percent = tokens
+                .zip(context_window)
+                .map(|(tokens, window)| tokens as f64 * 100.0 / window as f64);
+        }
+        let active = provider.as_deref().zip(model.as_deref());
+        let settings = compaction_settings_for(&self.read_settings()?, active);
+        Ok(ContextUsage {
+            tokens,
+            context_window,
+            percent,
+            estimated,
+            window_known: context_window.is_some()
+                && active.is_none_or(|(provider, model)| self.window_known(provider, model)),
+            provider,
+            model,
+            auto_compact: settings.enabled,
+            compact_at: context_window.map(|window| window.saturating_sub(settings.reserve_tokens)),
+        })
+    }
+
     /// Answers whether the model's window is a known value. A model that
     /// `models.json` defines without a `contextWindow` runs on Pi's default
     /// window. Any other model is in Pi's built-in catalog.
@@ -327,59 +397,7 @@ impl AgentEngine for PiRpcEngine {
     fn context_usage(&self, conversation: &Arc<PiRpcTransport>) -> Result<ContextUsage, String> {
         let stats = read(conversation, "get_session_stats")?;
         let state = read(conversation, "get_state")?;
-        let usage = stats.get("contextUsage");
-        let count = |value: Option<&Value>| {
-            value
-                .and_then(Value::as_f64)
-                .filter(|count| count.is_finite())
-                .map(|count| count.max(0.0) as u64)
-        };
-        let provider = state
-            .pointer("/model/provider")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let model = state
-            .pointer("/model/id")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let context_window = count(usage.and_then(|usage| usage.get("contextWindow")))
-            .or_else(|| count(state.pointer("/model/contextWindow")))
-            .filter(|window| *window > 0);
-        let mut tokens = count(usage.and_then(|usage| usage.get("tokens")));
-        let mut percent = usage
-            .and_then(|usage| usage.get("percent"))
-            .and_then(Value::as_f64)
-            .filter(|percent| percent.is_finite());
-        let mut estimated = false;
-        if tokens.is_none() {
-            let session = stats
-                .get("sessionFile")
-                .and_then(Value::as_str)
-                .and_then(|file| Path::new(file).file_name())
-                .and_then(|name| name.to_str());
-            if let Some(after) = session
-                .and_then(super::last_compaction)
-                .and_then(|outcome| outcome.estimated_tokens_after)
-            {
-                tokens = Some(after);
-                percent = context_window.map(|window| after as f64 * 100.0 / window as f64);
-                estimated = true;
-            }
-        }
-        let active = provider.as_deref().zip(model.as_deref());
-        let settings = compaction_settings_for(&self.read_settings()?, active);
-        Ok(ContextUsage {
-            tokens,
-            context_window,
-            percent,
-            estimated,
-            window_known: context_window.is_some()
-                && active.is_none_or(|(provider, model)| self.window_known(provider, model)),
-            provider,
-            model,
-            auto_compact: settings.enabled,
-            compact_at: context_window.map(|window| window.saturating_sub(settings.reserve_tokens)),
-        })
+        self.usage_from(&stats, &state)
     }
 
     fn configure(
@@ -538,6 +556,30 @@ mod tests {
             compaction_settings_for(settings, Some(("local", "big"))).keep_recent_tokens,
             20000
         );
+    }
+
+    #[test]
+    fn a_window_pi_does_not_report_comes_from_the_model_knowledge() {
+        let agent = agent();
+        std::fs::write(
+            agent.join("models.json"),
+            json!({"providers": {"muniment-router": {"models": [{"id": "openai/sized", "contextWindow": 272000}]}}}).to_string(),
+        )
+        .unwrap();
+        let engine = PiRpcEngine::new(None).with_agent_directory(&agent);
+        let stats =
+            json!({"contextUsage": {"tokens": 68000, "contextWindow": null, "percent": null}});
+        let state = json!({"model": {"provider": "muniment-router", "id": "openai/sized"}});
+        let usage = engine.usage_from(&stats, &state).unwrap();
+        assert_eq!(usage.context_window, Some(272000));
+        assert!(usage.window_known);
+        assert_eq!(usage.percent, Some(25.0));
+        // A model nothing knows keeps an unknown window.
+        let state = json!({"model": {"provider": "local", "id": "nameless"}});
+        let usage = engine.usage_from(&stats, &state).unwrap();
+        assert_eq!(usage.context_window, None);
+        assert!(!usage.window_known);
+        std::fs::remove_dir_all(agent).unwrap();
     }
 
     #[test]
