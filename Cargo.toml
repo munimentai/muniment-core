@@ -7,5 +7,6 @@ members = [
     "crates/models",
     "crates/pins",
     "crates/router",
+    "crates/runtime",
 ]
 resolver = "2"

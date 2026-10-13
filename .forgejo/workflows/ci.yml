@@ -117,6 +117,7 @@ jobs:
           --test attach_windows_connect --test attach_windows_credential
           --test attach_windows_stream --test attach_windows_peer_native
           --test attach_windows_route_native --test attach_windows_session &&
+          cargo test --locked --package muniment-runtime-core --lib --test windows_attach_acceptor &&
           cargo test --locked --package muniment-core --lib --
           windows_task_service windows_user_diagnostics agents::tests memory_files::tests
           pi_settings::tests"
