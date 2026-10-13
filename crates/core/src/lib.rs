@@ -27,6 +27,7 @@ pub mod code_diff_journal;
 pub mod code_diff_observe;
 pub mod code_diff_staging;
 pub mod creations;
+pub mod engine;
 pub use muniment_router::endpoint_models;
 pub mod extend;
 pub mod harness_scan;

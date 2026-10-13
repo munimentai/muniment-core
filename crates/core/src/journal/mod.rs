@@ -1413,6 +1413,37 @@ impl RunJournal {
         .transpose()
     }
 
+    /// The latest `runtime.pi_session.bound` event of any run in a thread.
+    /// A deleted thread has none.
+    pub fn thread_session_binding(
+        &mut self,
+        thread_id: &str,
+    ) -> Result<Option<EventEnvelope>, JournalError> {
+        let coordination = self.coordination.clone();
+        let _operation = coordination
+            .as_ref()
+            .map(|state| state.operation.lock().unwrap());
+        self.refresh_after_compaction()?;
+        let raw: Option<String> = self.connection.as_ref()
+            .expect("journal connection is always present outside compaction")
+            .query_row(
+                "SELECT e.envelope_json FROM run_threads runs \
+                 JOIN events e ON e.run_id=runs.run_id \
+                 WHERE runs.thread_id=?1 AND e.event_type='runtime.pi_session.bound' \
+                 AND NOT EXISTS(SELECT 1 FROM thread_events deleted \
+                    WHERE deleted.thread_id=runs.thread_id AND deleted.event_type='thread.deleted') \
+                 ORDER BY runs.thread_run_ordinal DESC,e.run_seq DESC LIMIT 1",
+                [thread_id],
+                |row| row.get(0),
+            ).optional()?;
+        raw.map(|raw| {
+            serde_json::from_str(&raw).map_err(|error| {
+                JournalError::Corrupt(format!("invalid stored envelope JSON: {error}"))
+            })
+        })
+        .transpose()
+    }
+
     /// The receipt models of a thread's first `limit` runs other than
     /// `excluded_run_id`, in run order, from the receipt projection. A run
     /// without a valid receipt or without a model adds nothing, and a deleted

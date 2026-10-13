@@ -1,14 +1,11 @@
+use serde::Deserialize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::sync::Mutex;
-use std::time::Duration;
 
-use serde::Deserialize;
-
+use crate::engine::{AgentEngine, PiRpcEngine};
 use crate::permission_gate::{ChatPermissionAnswer, PendingPermissionAnswer};
 use crate::run_start::ActiveRun;
-
-const QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -64,17 +61,15 @@ pub fn queue_message(
     } else {
         crate::launch_facts::stamp_message(&request.message)
     };
-    let result = match request.delivery {
-        ChatDelivery::Steer => adapter.steer(&transport, &message, QUEUE_TIMEOUT),
-        ChatDelivery::FollowUp => adapter.follow_up(&transport, &message, QUEUE_TIMEOUT),
-    };
-    result.map_err(|error| {
-        if error == "Pi queued message must not be empty" {
-            "Enter a message before sending.".to_string()
-        } else {
-            "The message could not be queued. Try again.".to_string()
-        }
-    })
+    PiRpcEngine::default()
+        .steer(&transport, &adapter, request.delivery, &message)
+        .map_err(|error| {
+            if error == "Pi queued message must not be empty" {
+                "Enter a message before sending.".to_string()
+            } else {
+                "The message could not be queued. Try again.".to_string()
+            }
+        })
 }
 
 pub fn cancel_active_run(

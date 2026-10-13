@@ -14,6 +14,9 @@ use crate::chat_launch::ChatGrant;
 use crate::chat_resume::ResumeContext;
 use crate::code_diff_effect::apply_code_diff_approval;
 use crate::code_diff_journal::{load_applied_code_diffs, CodeDiffPermissionAnswer};
+use crate::engine::{
+    AgentEngine, CompactionOutcome, OpenError, OpenStage, PiOpen, PiRpcEngine, Submission,
+};
 use crate::journal::pi_translation::{model_stream_delta_payload, tool_journal_entry};
 use crate::journal::reducer::ChatProjector;
 use crate::journal::split_model_stream_delta;
@@ -25,7 +28,6 @@ use crate::permission_gate::{
 };
 use crate::pi_execution::{
     coordinate_prepared_prompt, prepared_pi_prompt, PiRuntime, PreparedPromptError, ResumeAttempt,
-    RPC_TIMEOUT,
 };
 use crate::pi_launch::{pi_launch_config, PiLaunchBoundaries, PiLaunchError};
 use crate::run_events::{
@@ -36,7 +38,7 @@ use crate::sidecar::pi_chat::{
     ExtensionUiAnswer, ExtensionUiDialog, ExtensionUiRequest, PiChatEvent, PiRunAdapter,
     FIRST_EVENT_TIMEOUT_REASON,
 };
-use crate::sidecar::{PiRpcTransport, PiRpcWiring, SidecarStatus, SidecarSupervisor};
+use crate::sidecar::{PiRpcTransport, SidecarStatus};
 use serde_json::{json, Value};
 
 /// Pairs one coordinate-loop state value with the runtime activity mark that
@@ -324,6 +326,118 @@ pub fn coordinate(
     memory_runtime: Arc<ApplicationMemoryRuntime>,
     run_id: String,
     prompt: String,
+    access_token: String,
+    subject: Option<String>,
+    grant: ChatGrant,
+    cancelled: Arc<AtomicBool>,
+    active_transport: Arc<Mutex<Option<Arc<PiRpcTransport>>>>,
+    active_adapter: Arc<Mutex<Option<Arc<PiRunAdapter>>>>,
+    permission_answers: Arc<Mutex<VecDeque<PendingPermissionAnswer>>>,
+    resume: Option<ResumeContext>,
+    resume_result: Option<std::sync::mpsc::Sender<Result<(), String>>>,
+    prepared: Option<(u64, ChatProjector)>,
+) {
+    coordinate_work(
+        app,
+        journal,
+        runtime,
+        runtime_activity,
+        memory_runtime,
+        run_id,
+        prompt,
+        None,
+        access_token,
+        subject,
+        grant,
+        cancelled,
+        active_transport,
+        active_adapter,
+        permission_answers,
+        resume,
+        resume_result,
+        prepared,
+    )
+}
+
+/// Compacts a thread's conversation as one run. The run opens the thread's
+/// saved conversation like a reply, journals the compaction's activity and
+/// ends when the engine answers. `outcome` receives the token counts, or the
+/// reason the compaction did not finish.
+#[allow(clippy::too_many_arguments)]
+pub fn coordinate_compaction(
+    app: impl ChatEventSink + PiLaunchBoundaries,
+    journal: SharedStorage,
+    runtime: Arc<Mutex<Option<PiRuntime>>>,
+    runtime_activity: RuntimeActivityRegistry,
+    memory_runtime: Arc<ApplicationMemoryRuntime>,
+    run_id: String,
+    instructions: Option<String>,
+    access_token: String,
+    subject: Option<String>,
+    grant: ChatGrant,
+    cancelled: Arc<AtomicBool>,
+    active_transport: Arc<Mutex<Option<Arc<PiRpcTransport>>>>,
+    active_adapter: Arc<Mutex<Option<Arc<PiRunAdapter>>>>,
+    permission_answers: Arc<Mutex<VecDeque<PendingPermissionAnswer>>>,
+    prepared: Option<(u64, ChatProjector)>,
+    outcome: std::sync::mpsc::Sender<Result<CompactionOutcome, String>>,
+) {
+    coordinate_work(
+        app,
+        journal,
+        runtime,
+        runtime_activity,
+        memory_runtime,
+        run_id,
+        String::new(),
+        Some(CompactionAttempt {
+            instructions,
+            outcome: Some(outcome),
+        }),
+        access_token,
+        subject,
+        grant,
+        cancelled,
+        active_transport,
+        active_adapter,
+        permission_answers,
+        None,
+        None,
+        prepared,
+    )
+}
+
+/// The manual compaction one run performs. Every early return reports that
+/// the compaction did not finish.
+struct CompactionAttempt {
+    instructions: Option<String>,
+    outcome: Option<std::sync::mpsc::Sender<Result<CompactionOutcome, String>>>,
+}
+
+impl CompactionAttempt {
+    fn finish(&mut self, result: Result<CompactionOutcome, String>) {
+        if let Some(outcome) = self.outcome.take() {
+            let _ = outcome.send(result);
+        }
+    }
+}
+
+impl Drop for CompactionAttempt {
+    fn drop(&mut self) {
+        self.finish(Err("Context compaction did not finish. Try again.".into()));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn coordinate_work(
+    app: impl ChatEventSink + PiLaunchBoundaries,
+    journal: SharedStorage,
+    runtime: Arc<Mutex<Option<PiRuntime>>>,
+    runtime_activity: RuntimeActivityRegistry,
+    memory_runtime: Arc<ApplicationMemoryRuntime>,
+    run_id: String,
+    prompt: String,
+    mut compaction: Option<CompactionAttempt>,
     mut access_token: String,
     subject: Option<String>,
     mut grant: ChatGrant,
@@ -335,6 +449,7 @@ pub fn coordinate(
     resume_result: Option<std::sync::mpsc::Sender<Result<(), String>>>,
     prepared: Option<(u64, ChatProjector)>,
 ) {
+    let engine = PiRpcEngine::new(app.pi_session_root().ok());
     if let Some(token) = grant.native_access_token.take() {
         access_token = token;
     }
@@ -392,7 +507,7 @@ pub fn coordinate(
         return;
     }
     diagnostics.startup_stage("thread_name");
-    if resume.is_none() {
+    if resume.is_none() && compaction.is_none() {
         let fallback = prompt
             .split_whitespace()
             .take(3)
@@ -411,7 +526,7 @@ pub fn coordinate(
     // The model reads the clock from the message, so each one opens with its time.
     let stamped_prompt = crate::launch_facts::stamp_message(&prompt);
     diagnostics.startup_stage("prepared_prompt");
-    let prepared_prompt = if resume.is_some() {
+    let prepared_prompt = if resume.is_some() || compaction.is_some() {
         None
     } else {
         let prepared_prompt = match prepared_pi_prompt(&journal, &run_id, &stamped_prompt) {
@@ -432,6 +547,31 @@ pub fn coordinate(
         };
         Some(prepared_prompt)
     };
+    if compaction.is_some()
+        && !app.pi_session_root().is_ok_and(|root| {
+            matches!(
+                crate::pi_execution::previous_thread_session(
+                    &journal,
+                    &run_id,
+                    subject.as_deref(),
+                    &root
+                ),
+                Ok(Some(_))
+            )
+        })
+    {
+        fail_start(
+            &app,
+            &journal,
+            &mut projector,
+            &run_id,
+            &mut seq,
+            "This thread has no conversation to compact yet.",
+            subject.as_deref(),
+            false,
+        );
+        return;
+    }
     diagnostics.startup_stage("runtime_lock");
     let mut runtime = runtime
         .lock()
@@ -439,7 +579,7 @@ pub fn coordinate(
     // Each run owns its process. Reopen only its own thread's saved conversation.
     diagnostics.startup_stage("runtime_reset");
     *runtime = None;
-    let startup_timeout = {
+    let opening = {
         diagnostics.startup_stage("grant_renewal");
         if let Err(error) = crate::chat_launch::renew_grant_if_needed(&mut grant, || {
             app.renew_chat_grant(&access_token)
@@ -600,15 +740,19 @@ pub fn coordinate(
             }
         };
         let startup_timeout = config.startup_timeout;
-        let wiring = PiRpcWiring::new();
         diagnostics.startup_stage("pi_spawn");
-        let supervisor = match SidecarSupervisor::spawn(
+        let opened = engine.open(PiOpen {
             config,
-            wiring.readiness_probe_with_startup_timeout(startup_timeout, Duration::from_secs(10)),
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                eprintln!("muniment-runtime: run_id={run_id} pi_spawn error={error:?}");
+            cancelled: &cancelled,
+            observe: &mut |stage| match stage {
+                OpenStage::Spawned(supervisor) => diagnostics.spawned(supervisor),
+                OpenStage::Waiting => diagnostics.log_lifecycle(),
+            },
+        });
+        let (process, opened) = match opened {
+            Ok((process, transport)) => (process, Ok(transport)),
+            Err(OpenError::Spawn(error)) => {
+                eprintln!("muniment-runtime: run_id={run_id} pi_spawn error={error}");
                 fail_start(
                     &app,
                     &journal,
@@ -621,18 +765,23 @@ pub fn coordinate(
                 );
                 return;
             }
+            Err(OpenError::Cancelled(process)) => (process, Err(OpenError::Cancelled(()))),
+            Err(OpenError::NotReady(process, status)) => {
+                (process, Err(OpenError::NotReady((), status)))
+            }
+            Err(OpenError::Unavailable(process)) => (process, Err(OpenError::Unavailable(()))),
         };
-        diagnostics.spawned(&supervisor);
-        *runtime = Some(PiRuntime { supervisor, wiring });
-        startup_timeout
+        *runtime = Some(process);
+        (startup_timeout, opened)
     };
+    let (startup_timeout, opened) = opening;
     let runtime = runtime.as_mut().expect("runtime was initialized");
-    let deadline = std::time::Instant::now() + startup_timeout;
-    while runtime.supervisor.status() == SidecarStatus::Starting
-        && std::time::Instant::now() < deadline
-    {
-        diagnostics.log_lifecycle();
-        if cancelled.load(Ordering::SeqCst) {
+    let transport = match opened {
+        Ok(transport) => {
+            eprintln!("muniment-runtime: run_id={run_id} pi_spawn started");
+            transport
+        }
+        Err(OpenError::Cancelled(())) => {
             if resume.is_none() {
                 let _ = append_emit(
                     &app,
@@ -647,51 +796,48 @@ pub fn coordinate(
             }
             return;
         }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    diagnostics.log_lifecycle();
-    let readiness_status = runtime.supervisor.status();
-    if readiness_status != SidecarStatus::Healthy {
-        diagnostics.readiness_failed(readiness_status, startup_timeout);
-        let reason = if grant.is_local() {
-            match diagnostics.stderr_error() {
-                Some(error) => format!("Reply setup failed. {error}"),
-                None => "Reply setup timed out. Try again.".to_owned(),
-            }
-        } else if readiness_status != SidecarStatus::Starting {
-            "Reply setup stopped before it became ready. Try again.".to_owned()
-        } else {
-            format!(
-                "Reply setup did not become ready within {} seconds. Try again.",
-                startup_timeout.as_secs()
-            )
-        };
-        fail_start(
-            &app,
-            &journal,
-            &mut projector,
-            &run_id,
-            &mut seq,
-            &reason,
-            subject.as_deref(),
-            resume.is_some(),
-        );
-        let _ = runtime.supervisor.shutdown();
-        return;
-    }
-    eprintln!("muniment-runtime: run_id={run_id} pi_spawn started");
-    let Some(transport) = runtime.wiring.transport() else {
-        fail_start(
-            &app,
-            &journal,
-            &mut projector,
-            &run_id,
-            &mut seq,
-            "The agent runtime did not become ready.",
-            subject.as_deref(),
-            resume.is_some(),
-        );
-        return;
+        Err(OpenError::NotReady((), readiness_status)) => {
+            diagnostics.readiness_failed(readiness_status, startup_timeout);
+            let reason = if grant.is_local() {
+                match diagnostics.stderr_error() {
+                    Some(error) => format!("Reply setup failed. {error}"),
+                    None => "Reply setup timed out. Try again.".to_owned(),
+                }
+            } else if readiness_status != SidecarStatus::Starting {
+                "Reply setup stopped before it became ready. Try again.".to_owned()
+            } else {
+                format!(
+                    "Reply setup did not become ready within {} seconds. Try again.",
+                    startup_timeout.as_secs()
+                )
+            };
+            fail_start(
+                &app,
+                &journal,
+                &mut projector,
+                &run_id,
+                &mut seq,
+                &reason,
+                subject.as_deref(),
+                resume.is_some(),
+            );
+            engine.stop(runtime);
+            return;
+        }
+        Err(_) => {
+            eprintln!("muniment-runtime: run_id={run_id} pi_spawn started");
+            fail_start(
+                &app,
+                &journal,
+                &mut projector,
+                &run_id,
+                &mut seq,
+                "The agent runtime did not become ready.",
+                subject.as_deref(),
+                resume.is_some(),
+            );
+            return;
+        }
     };
     *active_transport
         .lock()
@@ -713,26 +859,25 @@ pub fn coordinate(
     }
     diagnostics.prompt_submitted = true;
     let mut gateway_failure = None;
-    let (adapter, buffered_events) = if resume.is_some() {
-        let (adapter, _) =
-            match PiRunAdapter::start(run_id.clone(), &transport, &prompt, RPC_TIMEOUT) {
-                Ok(value) => value,
-                Err(error) => {
-                    diagnostics.prompt_failed(&error);
-                    fail_start(
-                        &app,
-                        &journal,
-                        &mut projector,
-                        &run_id,
-                        &mut seq,
-                        "The reply did not start. Try again.",
-                        subject.as_deref(),
-                        true,
-                    );
-                    let _ = runtime.supervisor.shutdown();
-                    return;
-                }
-            };
+    let (adapter, buffered_events) = if let Some(resume) = &resume {
+        let adapter = match engine.resume(&transport, &run_id, &resume.locator, &prompt) {
+            Ok(value) => value,
+            Err(error) => {
+                diagnostics.prompt_failed(&error);
+                fail_start(
+                    &app,
+                    &journal,
+                    &mut projector,
+                    &run_id,
+                    &mut seq,
+                    "The reply did not start. Try again.",
+                    subject.as_deref(),
+                    true,
+                );
+                engine.stop(runtime);
+                return;
+            }
+        };
         let adapter = Arc::new(adapter);
         *active_adapter
             .lock()
@@ -749,11 +894,11 @@ pub fn coordinate(
         )
         .is_err()
         {
-            if adapter
-                .cancel_and_drain(&transport, Duration::from_secs(2))
+            if engine
+                .cancel(&transport, &adapter, Duration::from_secs(2))
                 .is_err()
             {
-                let _ = runtime.supervisor.shutdown();
+                engine.stop(runtime);
             }
             return;
         }
@@ -774,11 +919,79 @@ pub fn coordinate(
         )
         .is_err()
         {
-            if adapter
-                .cancel_and_drain(&transport, Duration::from_secs(2))
+            if engine
+                .cancel(&transport, &adapter, Duration::from_secs(2))
                 .is_err()
             {
-                let _ = runtime.supervisor.shutdown();
+                engine.stop(runtime);
+            }
+            return;
+        }
+        (adapter, Vec::new())
+    } else if let Some(attempt) = &compaction {
+        let started = app
+            .pi_session_root()
+            .ok()
+            .and_then(|root| {
+                crate::pi_execution::previous_thread_session(
+                    &journal,
+                    &run_id,
+                    subject.as_deref(),
+                    &root,
+                )
+                .ok()
+                .flatten()
+            })
+            .ok_or_else(|| "The thread's conversation is unavailable.".to_owned())
+            .and_then(|locator| {
+                engine
+                    .compact(
+                        &transport,
+                        &run_id,
+                        &locator,
+                        attempt.instructions.as_deref(),
+                    )
+                    .map(|adapter| (adapter, locator))
+            });
+        let (adapter, locator) = match started {
+            Ok(started) => started,
+            Err(error) => {
+                diagnostics.prompt_failed(&error);
+                fail_start(
+                    &app,
+                    &journal,
+                    &mut projector,
+                    &run_id,
+                    &mut seq,
+                    "Context compaction did not start. Try again.",
+                    subject.as_deref(),
+                    false,
+                );
+                engine.stop(runtime);
+                return;
+            }
+        };
+        let adapter = Arc::new(adapter);
+        *active_adapter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&adapter));
+        if append_emit(
+            &app,
+            &journal,
+            &mut projector,
+            &run_id,
+            &mut seq,
+            "runtime.pi_session.bound",
+            json!({"run_id": run_id, "locator": locator.as_str()}),
+            subject.as_deref(),
+        )
+        .is_err()
+        {
+            if engine
+                .cancel(&transport, &adapter, Duration::from_secs(2))
+                .is_err()
+            {
+                engine.stop(runtime);
             }
             return;
         }
@@ -793,15 +1006,18 @@ pub fn coordinate(
             subject.as_deref(),
             |emit| {
                 let prepared_prompt = prepared_prompt.expect("new runs prepare a Pi prompt");
-                let (adapter, _) = PiRunAdapter::start_with_images_and_handler(
-                    run_id.clone(),
-                    &transport,
-                    prepared_prompt.message,
-                    prepared_prompt.images,
-                    RPC_TIMEOUT,
-                    |adapter, event| {
-                        answer_thread_title(&journal, adapter, &transport, &run_id, &prompt, event)
-                            || answer_gateway_boundary(
+                let adapter = engine
+                    .submit(
+                        &transport,
+                        &run_id,
+                        Submission {
+                            message: prepared_prompt.message,
+                            images: prepared_prompt.images,
+                        },
+                        &mut |adapter, event| {
+                            answer_thread_title(
+                                &journal, adapter, &transport, &run_id, &prompt, event,
+                            ) || answer_gateway_boundary(
                                 &app,
                                 adapter,
                                 &transport,
@@ -810,12 +1026,12 @@ pub fn coordinate(
                                 &mut gateway_failure,
                                 event,
                             )
-                    },
-                )
-                .map_err(|error| {
-                    diagnostics.prompt_failed(&error);
-                    PreparedPromptError::Start
-                })?;
+                        },
+                    )
+                    .map_err(|error| {
+                        diagnostics.prompt_failed(&error);
+                        PreparedPromptError::Start
+                    })?;
                 let adapter = Arc::new(adapter);
                 *active_adapter
                     .lock()
@@ -823,37 +1039,31 @@ pub fn coordinate(
                     Some(Arc::clone(&adapter));
                 emit(&PiChatEvent::PromptAccepted)?;
                 let mut journal_failed = false;
-                let session_root = app
-                    .pi_session_root()
+                app.pi_session_root()
                     .map_err(|_| PreparedPromptError::SessionRoot)?;
-                let (locator, events) = adapter
-                    .await_session_binding_with_handler(
-                        &transport,
-                        &session_root,
-                        RPC_TIMEOUT,
-                        |event| {
-                            if emit(event).map_err(|_| {
-                                journal_failed = true;
-                                "The reply could not be saved.".to_owned()
-                            })? {
-                                return Ok(true);
-                            }
-                            if answer_thread_title(
-                                &journal, &adapter, &transport, &run_id, &prompt, event,
-                            ) {
-                                return Ok(true);
-                            }
-                            Ok(answer_gateway_boundary(
-                                &app,
-                                &adapter,
-                                &transport,
-                                &mut grant,
-                                &mut access_token,
-                                &mut gateway_failure,
-                                event,
-                            ))
-                        },
-                    )
+                let (locator, events) = engine
+                    .bind(&transport, &adapter, &mut |event| {
+                        if emit(event).map_err(|_| {
+                            journal_failed = true;
+                            "The reply could not be saved.".to_owned()
+                        })? {
+                            return Ok(true);
+                        }
+                        if answer_thread_title(
+                            &journal, &adapter, &transport, &run_id, &prompt, event,
+                        ) {
+                            return Ok(true);
+                        }
+                        Ok(answer_gateway_boundary(
+                            &app,
+                            &adapter,
+                            &transport,
+                            &mut grant,
+                            &mut access_token,
+                            &mut gateway_failure,
+                            event,
+                        ))
+                    })
                     .map_err(|error| {
                         if journal_failed {
                             PreparedPromptError::Journal
@@ -874,11 +1084,11 @@ pub fn coordinate(
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();
                 if adapter.is_some_and(|adapter| {
-                    adapter
-                        .cancel_and_drain(&transport, Duration::from_secs(2))
+                    engine
+                        .cancel(&transport, &adapter, Duration::from_secs(2))
                         .is_err()
                 }) {
-                    let _ = runtime.supervisor.shutdown();
+                    engine.stop(runtime);
                 }
                 if matches!(error, PreparedPromptError::SessionRoot) {
                     fail(
@@ -904,7 +1114,7 @@ pub fn coordinate(
                     FIRST_EVENT_TIMEOUT_REASON,
                     subject.as_deref(),
                 );
-                let _ = runtime.supervisor.shutdown();
+                engine.stop(runtime);
                 return;
             }
             Err(PreparedPromptError::Binding) => {
@@ -912,7 +1122,7 @@ pub fn coordinate(
                 // `await_session_binding` aborts and drains first. Reaping the
                 // supervised child is the final containment boundary if Pi did
                 // not acknowledge cancellation.
-                let _ = runtime.supervisor.shutdown();
+                engine.stop(runtime);
                 fail(
                     &app,
                     &journal,
@@ -935,7 +1145,7 @@ pub fn coordinate(
                     "The reply did not start. Try again.",
                     subject.as_deref(),
                 );
-                let _ = runtime.supervisor.shutdown();
+                engine.stop(runtime);
                 return;
             }
         }
@@ -956,11 +1166,11 @@ pub fn coordinate(
             .as_ref()
             .filter(|_| buffered_events.len() == 0)
         {
-            if adapter
-                .cancel_and_drain(&transport, Duration::from_secs(2))
+            if engine
+                .cancel(&transport, &adapter, Duration::from_secs(2))
                 .is_err()
             {
-                let _ = runtime.supervisor.shutdown();
+                engine.stop(runtime);
             }
             let _ = held_deltas.flush(
                 &app,
@@ -983,11 +1193,11 @@ pub fn coordinate(
             break;
         }
         if cancelled.swap(false, Ordering::SeqCst) {
-            if adapter
-                .cancel_and_drain(&transport, Duration::from_secs(2))
+            if engine
+                .cancel(&transport, &adapter, Duration::from_secs(2))
                 .is_err()
             {
-                let _ = runtime.supervisor.shutdown();
+                engine.stop(runtime);
             }
             diagnostics.outcome = "cancelled";
             let _ = held_deltas.flush(
@@ -1052,7 +1262,7 @@ pub fn coordinate(
                     coordinate_permission_answer(
                         pending,
                         answer,
-                        |request, answer| adapter.answer_extension_ui(&transport, request, answer),
+                        |request, answer| engine.answer(&transport, &adapter, request, answer),
                         |kind, payload| {
                             append_emit(
                                 &app,
@@ -1093,8 +1303,9 @@ pub fn coordinate(
             break 'coordinate;
         }
         let event = buffered_events.next().map(Ok).unwrap_or_else(|| {
-            adapter.next_settled(
+            engine.next_event(
                 &transport,
+                &adapter,
                 held_deltas.wait_bound(Duration::from_millis(100)),
             )
         });
@@ -1139,6 +1350,48 @@ pub fn coordinate(
             }
             Ok(PiChatEvent::Completed | PiChatEvent::Failed | PiChatEvent::UsageLimit)
                 if gateway_failure.is_some() => {}
+            Ok(PiChatEvent::Compacted(result)) => {
+                let Some(attempt) = compaction.as_mut() else {
+                    continue;
+                };
+                match result {
+                    Ok(outcome) => {
+                        diagnostics.outcome = "completed";
+                        diagnostics.failed = append_terminal(
+                            &app,
+                            &journal,
+                            &mut projector,
+                            &run_id,
+                            &mut seq,
+                            &mut open_effects,
+                            "run.completed",
+                            json!({"receipt": local_receipt(run_started.elapsed(), &ledger)}),
+                            subject.as_deref(),
+                        )
+                        .is_err();
+                        attempt.finish(if diagnostics.failed {
+                            Err("The compaction could not be saved.".into())
+                        } else {
+                            Ok(outcome)
+                        });
+                    }
+                    Err(reason) => {
+                        diagnostics.outcome = "failed";
+                        fail_with_open_effects(
+                            &app,
+                            &journal,
+                            &mut projector,
+                            &run_id,
+                            &mut seq,
+                            &mut open_effects,
+                            &reason,
+                            subject.as_deref(),
+                        );
+                        attempt.finish(Err(reason));
+                    }
+                }
+                break;
+            }
             Ok(PiChatEvent::Completed) => {
                 diagnostics.outcome = "completed";
                 let receipt = if grant.is_local() {
@@ -1333,14 +1586,11 @@ pub fn coordinate(
                     FIRST_EVENT_TIMEOUT_REASON,
                     subject.as_deref(),
                 );
-                let _ = runtime.supervisor.shutdown();
+                engine.stop(runtime);
                 break;
             }
             Err(error) if error == "timed out waiting for Pi stream" => {
-                if matches!(
-                    runtime.supervisor.status(),
-                    SidecarStatus::Failed | SidecarStatus::Stopped
-                ) {
+                if engine.stopped(runtime) {
                     fail_with_open_effects(
                         &app,
                         &journal,
@@ -1706,6 +1956,7 @@ mod tests {
     use crate::journal::reducer::{ChatProjection, PermissionRequest, ProjectedRecall};
     use crate::journal::RunJournal;
     use crate::memory_index::MemoryIndexError;
+    use crate::sidecar::{PiRpcWiring, SidecarSupervisor};
     use std::cell::RefCell;
     use std::io;
     use uuid::Uuid;
