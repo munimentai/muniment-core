@@ -3,14 +3,18 @@ name = "muniment-runtime-core"
 version = "0.0.1"
 edition = "2021"
 
-# The platform-neutral runtime: attach serving, runs, schedules and the
-# company record service. The host binary supplies cloud accounts, chat
-# grants, credential storage and its own executables through `RuntimeHost`,
-# and registers the binary with the OS service manager.
+# The platform-neutral runtime: attach serving, runs, schedules, the company
+# record service and the model service with its router. The host binary
+# supplies cloud accounts, chat grants, credential storage, provider OAuth
+# clients and its own executables through `RuntimeHost`, and registers the
+# binary with the OS service manager.
 
 [dependencies]
 muniment-attach = { path = "../attach", features = ["client"] }
 muniment-core = { path = "../core", features = ["keyring"] }
+serde = { version = "1", features = ["derive"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "v7"] }
 
 [dev-dependencies]
 # The journal tests drop tables to build missing-table fixtures.

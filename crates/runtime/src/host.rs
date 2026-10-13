@@ -1,9 +1,10 @@
 //! What the host supplies to the runtime.
 //!
 //! The runtime names no desktop module. Cloud sign-in, chat grants, credential
-//! storage and the paths of the host's own executables reach it through one
-//! [`RuntimeHost`] value. Each default answers that the cloud is unavailable,
-//! so a host without cloud accounts runs locally.
+//! storage, the OAuth clients of provider sign-in, the page a sign-in's
+//! browser lands on and the paths of the host's own executables reach it
+//! through one [`RuntimeHost`] value. Each default answers that the cloud is
+//! unavailable, so a host without cloud accounts runs locally.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use muniment_core::account::{
 use muniment_core::attach::{EntitlementSnapshotResult, ProtocolError, RuntimeActivityRegistry};
 use muniment_core::chat_launch::{ChatGrant, FetchGrantError, FetchReceiptError};
 use muniment_core::keyring::Entry;
+use muniment_core::model_router::native_auth::ProviderClients;
 use muniment_core::sidecar::pi_chat::Receipt;
 
 /// The values and services one runtime process runs with.
@@ -36,11 +38,17 @@ pub struct RuntimeHost {
     /// The version the runtime announces on attach and records in the journal:
     /// the host binary's package version.
     pub runtime_version: &'static str,
+    /// The OAuth clients the router's own sign-ins and refreshes use. A
+    /// provider without one falls back to its environment variables.
+    pub provider_clients: ProviderClients,
+    /// The page a provider sign-in's browser lands on.
+    pub sign_in_page: Arc<SignInPage>,
 }
 
 impl Default for RuntimeHost {
     /// No cloud account, the platform keyring, no desktop peer, no reader
-    /// sidecar, and this crate's version.
+    /// sidecar, this crate's version, no provider clients and a plain
+    /// sign-in page.
     fn default() -> Self {
         Self {
             account: Arc::new(NoCloud),
@@ -49,8 +57,31 @@ impl Default for RuntimeHost {
             expected_desktop_executable: None,
             reader_executable: None,
             runtime_version: env!("CARGO_PKG_VERSION"),
+            provider_clients: ProviderClients::default(),
+            sign_in_page: Arc::new(plain_sign_in_page),
         }
     }
+}
+
+/// Renders the page a provider sign-in's browser lands on: `Some` with the
+/// provider's name after a redirect that carried a code, `None` without one.
+pub type SignInPage = dyn Fn(Option<&str>) -> String + Send + Sync;
+
+/// A sign-in page with no branding.
+pub fn plain_sign_in_page(provider: Option<&str>) -> String {
+    let (heading, body) = match provider {
+        Some(provider) => (
+            "Signed in".to_owned(),
+            format!("{provider} is connected. This window can close."),
+        ),
+        None => (
+            "Sign-in did not finish".to_owned(),
+            "No code reached Muniment from this page. Return and try again.".to_owned(),
+        ),
+    };
+    format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Muniment</title>\n</head>\n<body>\n<h1>{heading}</h1>\n<p>{body}</p>\n</body>\n</html>\n"
+    )
 }
 
 /// The session an account answers.

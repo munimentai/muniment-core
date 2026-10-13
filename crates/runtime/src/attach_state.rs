@@ -16,6 +16,7 @@ use muniment_core::run_start::ActiveRun;
 use muniment_core::session_thread::SessionThread;
 
 use crate::host::RuntimeHost;
+use crate::models::ModelService;
 use crate::service::{open_companion_registry, open_profile_storage_as};
 #[cfg(target_os = "linux")]
 use crate::AttachListenerInputs;
@@ -39,6 +40,7 @@ pub struct RuntimeAttachState {
     approvals: ApprovalCoordinator,
     sign_in_running: Arc<AtomicBool>,
     chat_events: RuntimeChatEventBroadcast,
+    models: Arc<ModelService>,
 }
 
 impl RuntimeAttachState {
@@ -56,6 +58,13 @@ impl RuntimeAttachState {
         let drain_state = DrainState::new();
         let runtime_activity = RuntimeActivityRegistry::with_drain_state(&drain_state);
         let approval = SignedWorkspaceApproval::default();
+        muniment_core::model_router::native_auth::set_provider_clients(
+            host.provider_clients.clone(),
+        );
+        let models = Arc::new(ModelService::new(
+            &profile_directory,
+            Arc::clone(&host.sign_in_page),
+        ));
 
         Ok(Self {
             memory_runtime: Arc::new(ApplicationMemoryRuntime::new(
@@ -77,6 +86,7 @@ impl RuntimeAttachState {
             approvals: ApprovalCoordinator::default(),
             sign_in_running: Arc::new(AtomicBool::new(false)),
             chat_events: RuntimeChatEventBroadcast::new(approval),
+            models,
         })
     }
 
@@ -98,7 +108,13 @@ impl RuntimeAttachState {
             self.approvals.clone(),
             Arc::clone(&self.sign_in_running),
             self.chat_events.clone(),
+            Arc::clone(&self.models),
         )
+    }
+
+    /// Returns the model service shared by every attach connection.
+    pub fn models(&self) -> &Arc<ModelService> {
+        &self.models
     }
 
     /// Composes a service for one companion connection.

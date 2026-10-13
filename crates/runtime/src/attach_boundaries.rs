@@ -67,6 +67,7 @@ use muniment_core::session_thread::SessionThread;
 use muniment_core::sidecar::pi_install::{PiArtifactDescriptor, PI_SELECTED_ARTIFACT};
 
 use crate::host::{LinkOpenError, LinkOpener, RuntimeHost};
+use crate::models::ModelService;
 use crate::service::{self, ConfigureRunError};
 #[cfg(any(unix, target_os = "windows"))]
 use crate::RuntimeChatEventTarget;
@@ -98,6 +99,7 @@ pub struct RuntimeAttachBoundaries {
     pi_artifact: Option<PiArtifactDescriptor>,
     records: Arc<service::RecordRegistry>,
     contexts: ThreadContexts,
+    models: Arc<ModelService>,
 }
 
 impl RuntimeAttachBoundaries {
@@ -115,6 +117,10 @@ impl RuntimeAttachBoundaries {
         session_thread: Arc<SessionThread>,
         companion_registry: CompanionRegistry,
     ) -> Self {
+        let models = Arc::new(ModelService::new(
+            &profile_directory,
+            Arc::clone(&host.sign_in_page),
+        ));
         Self::new_with_sign_in(
             storage,
             active,
@@ -131,6 +137,7 @@ impl RuntimeAttachBoundaries {
             ApprovalCoordinator::default(),
             Arc::new(AtomicBool::new(false)),
             RuntimeChatEventBroadcast::new(approval),
+            models,
         )
     }
 
@@ -150,6 +157,7 @@ impl RuntimeAttachBoundaries {
         #[cfg(any(unix, target_os = "windows"))] approvals: ApprovalCoordinator,
         sign_in_running: Arc<AtomicBool>,
         chat_events: RuntimeChatEventBroadcast,
+        models: Arc<ModelService>,
     ) -> Self {
         let chat_events = chat_events.with_config_directory(config_directory.clone());
         let records = Arc::new(service::RecordRegistry::with_host(
@@ -176,6 +184,7 @@ impl RuntimeAttachBoundaries {
             pi_artifact: None,
             records,
             contexts: ThreadContexts::new(),
+            models,
         }
     }
 
@@ -1494,6 +1503,18 @@ impl RunAttachBoundaries for RuntimeAttachBoundaries {
         &self,
     ) -> Result<muniment_core::run_events::ChatEventSubscription, ProtocolError> {
         Ok(self.chat_events.subscribe())
+    }
+
+    fn models_request(
+        &self,
+        request: muniment_core::attach::ModelRequest,
+        idempotency_key: Option<&muniment_core::attach::Id>,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        self.models.request(request, idempotency_key)
+    }
+
+    fn subscribe_model_events(&self) -> Result<mpsc::Receiver<serde_json::Value>, ProtocolError> {
+        Ok(self.models.subscribe())
     }
 
     fn queue_attach_permission_answer(
