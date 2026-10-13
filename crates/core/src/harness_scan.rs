@@ -4,35 +4,11 @@
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::{ambient_authority, fs::Dir};
 use serde::Serialize;
-use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-pub type Environment = BTreeMap<OsString, OsString>;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Platform {
-    Linux,
-    MacOs,
-    Windows,
-    Other,
-}
-
-impl Platform {
-    pub fn current() -> Self {
-        if cfg!(target_os = "windows") {
-            Self::Windows
-        } else if cfg!(target_os = "macos") {
-            Self::MacOs
-        } else if cfg!(target_os = "linux") {
-            Self::Linux
-        } else {
-            Self::Other
-        }
-    }
-}
+pub use muniment_models::local_servers::{Environment, Platform};
 
 #[derive(Clone, Copy, Debug)]
 pub enum Roots {

@@ -6,5 +6,7 @@
 pub mod endpoint_models;
 pub mod family;
 pub mod http;
+pub mod local_servers;
 pub mod model_catalog;
 pub mod provider_models;
+pub mod registry;
