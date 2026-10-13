@@ -7,6 +7,7 @@
 //! frames, Pi session files and Pi settings files.
 
 mod pi_rpc;
+mod thread_context;
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -19,6 +20,7 @@ use crate::sidecar::pi_chat::{ExtensionUiAnswer, ExtensionUiRequest};
 use crate::sidecar::SidecarStatus;
 
 pub use pi_rpc::{OpenStage, PiOpen, PiRpcEngine};
+pub use thread_context::{CompactionPhase, CompactionState, ThreadContextSnapshot, ThreadContexts};
 
 /// One event of a turn: a reply's text, a tool's activity, a permission
 /// request, a compaction's outcome or the turn's end.
@@ -75,7 +77,6 @@ pub struct CompactionOutcome {
 
 /// The engine-wide compaction settings. They apply when a conversation opens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CompactionSettings {
     pub enabled: bool,
     pub reserve_tokens: u64,

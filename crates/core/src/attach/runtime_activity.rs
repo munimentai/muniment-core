@@ -32,6 +32,7 @@ impl DrainState {
                 | Operation::RunSubmit
                 | Operation::RunResume
                 | Operation::SessionSignIn
+                | Operation::ThreadCompact
         );
         if state.draining && starts_blocking_work {
             return Err(DrainRefusal);

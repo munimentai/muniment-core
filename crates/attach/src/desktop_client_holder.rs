@@ -191,6 +191,38 @@ impl DesktopClientHolder {
         self.with_client(|client| client.delete_company(company_id))
     }
 
+    pub fn thread_context_usage(
+        &self,
+        thread_id: &str,
+    ) -> Result<Value, (ClientError, Option<crate::ProtocolError>)> {
+        Self::pairing_request(self, |client| client.thread_context_usage(thread_id))
+    }
+
+    pub fn compact_thread(
+        &self,
+        thread_id: &str,
+        instructions: Option<&str>,
+    ) -> Result<Value, (ClientError, Option<crate::ProtocolError>)> {
+        Self::pairing_request(self, |client| {
+            client.compact_thread(thread_id, instructions)
+        })
+    }
+
+    pub fn context_settings(&self) -> Result<Value, (ClientError, Option<crate::ProtocolError>)> {
+        Self::pairing_request(self, DesktopClient::context_settings)
+    }
+
+    pub fn save_context_settings(
+        &self,
+        enabled: bool,
+        reserve_tokens: u64,
+        keep_recent_tokens: u64,
+    ) -> Result<Value, (ClientError, Option<crate::ProtocolError>)> {
+        Self::pairing_request(self, |client| {
+            client.save_context_settings(enabled, reserve_tokens, keep_recent_tokens)
+        })
+    }
+
     pub fn record_kinds(&self, body: Value) -> Result<Value, ClientError> {
         self.with_client(|client| client.record_kinds(body.clone()))
     }
@@ -335,6 +367,7 @@ impl DesktopClientHolder {
         self.with_compatible_client(compatible, |client| client.run_follow_up(run_id, text))
     }
 
+    /// Runs one request and keeps the runtime's protocol error with a failure.
     fn pairing_request(
         holder: &Self,
         step: impl FnOnce(&mut DesktopClient) -> Result<Value, ClientError>,

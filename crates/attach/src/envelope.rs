@@ -357,6 +357,14 @@ pub enum Operation {
     PairingStatus,
     #[serde(rename = "pairing.revoke")]
     PairingRevoke,
+    #[serde(rename = "thread.context_usage")]
+    ThreadContextUsage,
+    #[serde(rename = "thread.compact")]
+    ThreadCompact,
+    #[serde(rename = "context.settings")]
+    ContextSettings,
+    #[serde(rename = "context.settings_save")]
+    ContextSettingsSave,
 }
 
 impl Operation {
@@ -386,6 +394,7 @@ impl Operation {
                 | Self::PermissionAnswer
                 | Self::PairingChallenge
                 | Self::PairingRevoke
+                | Self::ThreadCompact
         )
     }
 
@@ -446,6 +455,10 @@ impl Operation {
             Self::PairingChallenge => "pairing.challenge",
             Self::PairingStatus => "pairing.status",
             Self::PairingRevoke => "pairing.revoke",
+            Self::ThreadContextUsage => "thread.context_usage",
+            Self::ThreadCompact => "thread.compact",
+            Self::ContextSettings => "context.settings",
+            Self::ContextSettingsSave => "context.settings_save",
         }
     }
 }
