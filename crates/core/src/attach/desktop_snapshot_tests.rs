@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use std::thread::JoinHandle;
 
 use muniment_attach::{
-    handshake_desktop_client, reconnect_welcome, ClientError, DesktopClient, Id,
+    handshake_desktop_client, reconnect_welcome, ClientError, DesktopClient, Id, ModelAction,
+    ModelRequest, SubscriptionEvent,
 };
 use serde_json::{json, Value};
 
@@ -115,6 +116,7 @@ fn event(seq: u64, kind: &str, payload: Value) -> EventEnvelope {
 struct Service {
     history: Value,
     chat: Option<std::sync::mpsc::Receiver<crate::run_events::ChatEvent>>,
+    models: Option<std::sync::mpsc::Receiver<Value>>,
     stops: usize,
 }
 impl ThreadListService for Service {
@@ -137,6 +139,27 @@ impl ThreadListService for Service {
         self.chat
             .take()
             .map(crate::run_events::ChatEventSubscription::detached)
+            .ok_or_else(ProtocolError::invalid_request)
+    }
+    fn models_request(
+        &mut self,
+        request: ModelRequest,
+        idempotency_key: Option<&Id>,
+    ) -> Result<Value, ProtocolError> {
+        if request.action == ModelAction::SetDefaultModel {
+            return Err(ProtocolError::invalid_request_with_reason(
+                "Choose a provider and a model.",
+            ));
+        }
+        Ok(
+            json!({"action": request.action, "data": request.data, "keyed": idempotency_key.is_some()}),
+        )
+    }
+    fn subscribe_model_events(
+        &mut self,
+    ) -> Result<std::sync::mpsc::Receiver<Value>, ProtocolError> {
+        self.models
+            .take()
             .ok_or_else(ProtocolError::invalid_request)
     }
     fn cancel_run(
@@ -166,6 +189,14 @@ fn connect_with_events(
     history: Value,
     chat: Option<std::sync::mpsc::Receiver<crate::run_events::ChatEvent>>,
 ) -> (DesktopClient, SessionWorker) {
+    connect_with_model_events(history, chat, None)
+}
+
+fn connect_with_model_events(
+    history: Value,
+    chat: Option<std::sync::mpsc::Receiver<crate::run_events::ChatEvent>>,
+    models: Option<std::sync::mpsc::Receiver<Value>>,
+) -> (DesktopClient, SessionWorker) {
     let (client, mut server) = UnixStream::pair().unwrap();
     let worker = std::thread::spawn(move || {
         let mut prefix = [0; 4];
@@ -188,6 +219,7 @@ fn connect_with_events(
         let mut service = Service {
             history,
             chat,
+            models,
             stops: 0,
         };
         let result = serve_desktop_client_requests_with_diagnostics(
@@ -363,4 +395,97 @@ fn chat_snapshot_frames_keep_every_tool_and_the_terminal_phase() {
     let root = profile.root.clone();
     drop(profile);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_models_request_carries_its_key_by_action_and_its_refusal_reason() {
+    let (mut client, worker) = connect(json!({}));
+    assert_eq!(
+        client
+            .models_request(ModelAction::RouterSettings, json!({}))
+            .unwrap(),
+        json!({"action": "router_settings", "data": {}, "keyed": false})
+    );
+    assert_eq!(
+        client
+            .models_request(ModelAction::RouterSetEnabled, json!({"enabled": true}))
+            .unwrap(),
+        json!({"action": "router_set_enabled", "data": {"enabled": true}, "keyed": true})
+    );
+    assert!(client
+        .models_request(ModelAction::SetDefaultModel, json!({}))
+        .is_err());
+    assert_eq!(
+        client.last_request_error().unwrap().to_string(),
+        ProtocolError::invalid_request_with_reason("Choose a provider and a model.").to_string()
+    );
+    // The key follows the action: a mutation needs one and a read refuses one.
+    let mutation = json!({"action": "router_set_enabled", "data": {"enabled": true}});
+    assert!(client
+        .request(Operation::ModelsRequest, None, mutation)
+        .is_err());
+    assert_eq!(
+        client.last_request_error().unwrap().code(),
+        muniment_attach::ErrorCode::IdempotencyKeyRequired
+    );
+    let read = json!({"action": "router_settings", "data": {}});
+    let key = Id::new("018f0000-0000-7000-8000-000000000301").unwrap();
+    assert!(client
+        .request(Operation::ModelsRequest, Some(key), read)
+        .is_err());
+    assert_eq!(
+        client.last_request_error().unwrap().code(),
+        muniment_attach::ErrorCode::IdempotencyKeyForbidden
+    );
+    assert!(client
+        .request(Operation::ModelsRequest, None, json!({"action": "unknown"}))
+        .is_err());
+    assert_eq!(
+        client.last_request_error().unwrap().code(),
+        muniment_attach::ErrorCode::InvalidRequest
+    );
+    drop(client);
+    assert_eq!(worker.join().unwrap().0, Ok(()));
+}
+
+#[test]
+fn the_chat_subscription_carries_sign_in_steps_beside_chat_events() {
+    let (chat_sender, chat) = std::sync::mpsc::channel();
+    let (model_sender, models) = std::sync::mpsc::channel();
+    let (mut client, worker) = connect_with_model_events(json!({}), Some(chat), Some(models));
+    client.subscribe_chat_events().unwrap();
+    let step = json!({"stage": "prompt", "id": "s1", "kind": "select", "title": "Method", "options": [], "provider": "xai"});
+    model_sender.send(step.clone()).unwrap();
+    assert_eq!(
+        client.read_subscription_event().unwrap(),
+        SubscriptionEvent::ModelsLogin(step)
+    );
+    // A closed model service leaves the chat events flowing.
+    drop(model_sender);
+    let event = crate::run_events::ChatEvent {
+        run_id: RUN.into(),
+        thread_id: None,
+        phase: "running".into(),
+        text: "Synthetic reply".into(),
+        prompt_accepted: true,
+        turn_started: true,
+        routing_stage: None,
+        prompt_storage_notice: None,
+        failure_reason: None,
+        receipt: None,
+        tool_activity: vec![],
+        attachments: vec![],
+        recalls: vec![],
+        applied_diffs: vec![],
+        pending_permission: None,
+        delta: None,
+    };
+    let expected = serde_json::to_value(&event).unwrap();
+    chat_sender.send(event).unwrap();
+    assert_eq!(
+        client.read_subscription_event().unwrap(),
+        SubscriptionEvent::Chat(expected)
+    );
+    drop(chat_sender);
+    assert_eq!(worker.join().unwrap().0, Ok(()));
 }

@@ -455,6 +455,25 @@ pub trait RunAttachBoundaries {
     ) -> Result<crate::run_events::ChatEventSubscription, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
+    /// Runs one model service action and answers its result. A mutating
+    /// action carries its idempotency key, and a repeat of the key answers the
+    /// first result.
+    #[cfg(any(unix, target_os = "windows"))]
+    fn models_request(
+        &self,
+        _request: crate::attach::ModelRequest,
+        _idempotency_key: Option<&crate::attach::Id>,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    /// Subscribes to the sign-in steps the model service reports, each the
+    /// `models.login` event body.
+    #[cfg(any(unix, target_os = "windows"))]
+    fn subscribe_model_events(
+        &self,
+    ) -> Result<std::sync::mpsc::Receiver<serde_json::Value>, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
     #[cfg(any(unix, target_os = "windows"))]
     fn queue_attach_permission_answer(
         &self,

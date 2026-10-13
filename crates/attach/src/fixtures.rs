@@ -579,8 +579,13 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         ("thread-compact", Operation::ThreadCompact),
         ("context-settings", Operation::ContextSettings),
         ("context-settings-save", Operation::ContextSettingsSave),
+        ("models-request", Operation::ModelsRequest),
     ];
     for (index, (name, operation)) in operations.into_iter().enumerate() {
+        let body = request_body(operation);
+        let keyed = operation.requires_idempotency_key()
+            || crate::ModelRequest::from_body(&body)
+                .is_some_and(|request| request.action.mutates());
         insert(
             &mut fixtures,
             &format!("request-{name}.json"),
@@ -589,11 +594,8 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
                 request_id: id(100 + index as u128)?,
                 operation,
                 capability: "fixture-capability".into(),
-                idempotency_key: operation
-                    .requires_idempotency_key()
-                    .then(|| id(200 + index as u128))
-                    .transpose()?,
-                body: request_body(operation),
+                idempotency_key: keyed.then(|| id(200 + index as u128)).transpose()?,
+                body,
             },
         )?;
     }
@@ -753,12 +755,16 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
             serde_json::from_value(json!("future.optional")).map_err(io::Error::other)?,
         ),
         ("chat-event", EventName::ChatEvent),
+        ("models-login", EventName::ModelsLogin),
     ];
     for (index, (name, event)) in events.into_iter().enumerate() {
         let body = event_body(&event);
         let event_without_run_cursor = matches!(
             event,
-            EventName::ArtifactChunk | EventName::ArtifactComplete | EventName::ChatEvent
+            EventName::ArtifactChunk
+                | EventName::ArtifactComplete
+                | EventName::ChatEvent
+                | EventName::ModelsLogin
         );
         insert(
             &mut fixtures,
@@ -936,6 +942,10 @@ fn request_body(operation: Operation) -> serde_json::Value {
             "reserve_tokens": 16384,
             "keep_recent_tokens": 20000
         }),
+        Operation::ModelsRequest => json!({
+            "action": "router_set_enabled",
+            "data": {"enabled": true}
+        }),
     }
 }
 
@@ -1035,6 +1045,14 @@ fn event_body(event: &EventName) -> serde_json::Value {
             json!({"capability": "fixture-capability", "reason": "authorization_revoked"})
         }
         EventName::StreamClosed => json!({"code": "cancelled", "resumable": true}),
+        EventName::ModelsLogin => json!({
+            "stage": "prompt",
+            "id": "s1",
+            "kind": "select",
+            "title": "Choose a sign-in method",
+            "options": ["Browser", "Device code"],
+            "provider": "openai-codex"
+        }),
         EventName::Unknown(name) => json!({"name": name.as_str(), "optional": true}),
     }
 }
@@ -1163,6 +1181,7 @@ mod tests {
             Operation::ThreadCompact,
             Operation::ContextSettings,
             Operation::ContextSettingsSave,
+            Operation::ModelsRequest,
         ];
         for operation in operations {
             let name = operation.as_str().replace(['.', '_'], "-");
@@ -1210,12 +1229,13 @@ mod tests {
             "event-stream-closed.json",
             "event-stream-closed-slow-consumer.json",
             "event-unknown.json",
+            "event-models-login.json",
         ] {
             assert!(fixtures.contains_key(name));
         }
         assert_eq!(
             fixtures.len(),
-            103,
+            105,
             "every canonical fixture must be inventoried"
         );
     }

@@ -407,7 +407,8 @@ fn companion_scope(operation: Operation) -> Option<Option<&'static str>> {
         | Operation::ThreadContextUsage
         | Operation::ThreadCompact
         | Operation::ContextSettings
-        | Operation::ContextSettingsSave => None,
+        | Operation::ContextSettingsSave
+        | Operation::ModelsRequest => None,
     }
 }
 
