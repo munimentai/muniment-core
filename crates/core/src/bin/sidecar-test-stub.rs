@@ -230,6 +230,7 @@ fn pi_resume(args: Vec<String>) {
                 })
         })
         .unwrap();
+    let mut compacted = false;
     for line in io::stdin().lock().lines() {
         let request: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
         match request["type"].as_str().unwrap() {
@@ -237,9 +238,59 @@ fn pi_resume(args: Vec<String>) {
                 "{}",
                 serde_json::json!({
                     "type":"response", "command":"get_state", "success":true,
-                    "id":request["id"], "data":{"sessionFile":session_file}
+                    "id":request["id"], "data":{
+                        "sessionFile":session_file,
+                        "model":{"provider":"stub","id":"stub-model","contextWindow":200000}
+                    }
                 })
             ),
+            "get_session_stats" => println!(
+                "{}",
+                serde_json::json!({
+                    "type":"response", "command":"get_session_stats", "success":true,
+                    "id":request["id"], "data":{
+                        "sessionFile":session_file,
+                        "contextUsage":{
+                            "tokens": if compacted { serde_json::Value::Null } else { 60000.into() },
+                            "contextWindow":200000,
+                            "percent": if compacted { serde_json::Value::Null } else { 30.into() }
+                        }
+                    }
+                })
+            ),
+            "compact" => {
+                if let Ok(path) = std::env::var("PI_RESUME_STUB_REQUESTS") {
+                    let mut requests = fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .unwrap();
+                    writeln!(requests, "{request}").unwrap();
+                }
+                let result = serde_json::json!({
+                    "summary":"Keep the goal", "firstKeptEntryId":"entry-1",
+                    "tokensBefore":152400, "estimatedTokensAfter":31900
+                });
+                println!(
+                    "{}",
+                    serde_json::json!({"type":"compaction_start", "reason":"manual"})
+                );
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "type":"compaction_end", "reason":"manual", "result":result,
+                        "aborted":false, "willRetry":false
+                    })
+                );
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "type":"response", "command":"compact", "success":true,
+                        "id":request["id"], "data":result
+                    })
+                );
+                compacted = true;
+            }
             "prompt" => {
                 if let Ok(delay) = std::env::var("PI_RESUME_STUB_PROMPT_DELAY_MS") {
                     thread::sleep(Duration::from_millis(delay.parse().unwrap()));

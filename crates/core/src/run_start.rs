@@ -220,6 +220,37 @@ pub trait RunAttachBoundaries {
     ) -> Result<crate::record::CompanySummary, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
+    /// Answers one thread's context usage, whether a read runs, and its last
+    /// manual compaction. The answer never waits for the engine.
+    #[cfg(any(unix, target_os = "windows"))]
+    fn thread_context_usage(
+        &self,
+        _workspace: &str,
+        _thread_id: &str,
+    ) -> Result<crate::engine::ThreadContextSnapshot, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    /// Starts a manual compaction of one thread as a run and answers the run.
+    #[cfg(any(unix, target_os = "windows"))]
+    fn compact_thread(
+        &self,
+        _workspace: &str,
+        _thread_id: &str,
+        _instructions: Option<&str>,
+    ) -> Result<String, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(any(unix, target_os = "windows"))]
+    fn context_settings(&self) -> Result<crate::engine::CompactionSettings, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(any(unix, target_os = "windows"))]
+    fn save_context_settings(
+        &self,
+        _settings: crate::engine::CompactionSettings,
+    ) -> Result<crate::engine::CompactionSettings, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
     /// Runs one read-only query for the actor named. The body and the answer
     /// are the `record.sql` wire shapes.
     #[cfg(any(unix, target_os = "windows"))]

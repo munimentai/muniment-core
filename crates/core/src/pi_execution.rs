@@ -1,14 +1,20 @@
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::json;
 
 use crate::attachment::{prepare_pi_images, AttachmentDeliveryError};
+use crate::chat_launch::ChatGrant;
+use crate::engine::{AgentEngine, ContextUsage, OpenError, PiOpen, PiRpcEngine};
 use crate::journal::reducer::ChatProjector;
 use crate::journal::{pi_translation::model_stream_delta_payload, split_model_stream_delta};
+use crate::pi_launch::{pi_launch_config, PiLaunchBoundaries, PiLaunchError};
 use crate::run_events::{append_emit, ChatEventSink, SharedStorage};
+use crate::run_start::ActiveRun;
 use crate::sidecar::pi_chat::{PiChatEvent, PiImageContent, PromptCommand};
-use crate::sidecar::{PiRpcWiring, PiSessionLocator, SidecarSupervisor};
+use crate::sidecar::{PiRpcTransport, PiRpcWiring, PiSessionLocator, SidecarSupervisor};
 
 pub const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -24,6 +30,30 @@ pub fn previous_thread_session(
         .journal
         .previous_thread_session_binding(run_id)
         .map_err(|_| "Conversation history could not load.")?;
+    session_from_binding(binding, subject, session_root)
+}
+
+/// The saved conversation a thread's latest run bound, if it has one.
+pub fn thread_session(
+    storage: &SharedStorage,
+    thread_id: &str,
+    subject: Option<&str>,
+    session_root: &std::path::Path,
+) -> Result<Option<PiSessionLocator>, String> {
+    let binding = storage
+        .lock()
+        .map_err(|_| "Conversation history is busy.")?
+        .journal
+        .thread_session_binding(thread_id)
+        .map_err(|_| "Conversation history could not load.")?;
+    session_from_binding(binding, subject, session_root)
+}
+
+fn session_from_binding(
+    binding: Option<crate::journal::EventEnvelope>,
+    subject: Option<&str>,
+    session_root: &std::path::Path,
+) -> Result<Option<PiSessionLocator>, String> {
     let Some(binding) = binding else {
         return Ok(None);
     };
@@ -45,6 +75,115 @@ pub fn previous_thread_session(
 pub struct PiRuntime {
     pub supervisor: SidecarSupervisor,
     pub wiring: PiRpcWiring,
+}
+
+/// Opens a thread's saved conversation for a read, such as its context
+/// usage. The launch is the one a reply in that thread starts with.
+pub fn open_thread_conversation(
+    app: &impl PiLaunchBoundaries,
+    grant: &ChatGrant,
+    locator: &PiSessionLocator,
+) -> Result<(PiRuntime, Arc<PiRpcTransport>), String> {
+    let root = app
+        .pi_install_root()
+        .map_err(|_| "The agent runtime is not installed.".to_string())?;
+    let config = pi_launch_config(app, Some(&root), grant, Some(locator)).map_err(|error| {
+        if matches!(
+            error,
+            PiLaunchError::MissingRoot | PiLaunchError::UnresolvableExecutable
+        ) {
+            "The agent runtime is not installed.".to_string()
+        } else {
+            "The agent runtime is unavailable.".to_string()
+        }
+    })?;
+    let engine = PiRpcEngine::new(app.pi_session_root().ok());
+    match engine.open(PiOpen {
+        config,
+        cancelled: &AtomicBool::new(false),
+        observe: &mut |_| {},
+    }) {
+        Ok(opened) => Ok(opened),
+        Err(OpenError::Spawn(_)) => Err("The agent runtime could not start.".into()),
+        Err(_) => Err("The agent runtime did not become ready.".into()),
+    }
+}
+
+/// Reads a thread's context usage from the process that holds its saved
+/// conversation: the active run's when the run is in this thread, the idle
+/// process the last run left when it holds this conversation, or a process
+/// this read starts. A started process stays in the runtime's slot for the
+/// next read, unless a run in another thread holds the slot. A thread with no
+/// saved conversation answers `None`.
+#[allow(clippy::too_many_arguments)]
+pub fn thread_context_usage(
+    app: &impl PiLaunchBoundaries,
+    storage: &SharedStorage,
+    runtime: &Mutex<Option<PiRuntime>>,
+    active: &Mutex<Option<ActiveRun>>,
+    thread_id: &str,
+    subject: Option<&str>,
+    grant: impl FnOnce() -> Result<ChatGrant, String>,
+) -> Result<Option<ContextUsage>, String> {
+    let session_root = app
+        .pi_session_root()
+        .map_err(|_| "Conversation history is unavailable.".to_string())?;
+    let engine = PiRpcEngine::new(Some(session_root.clone()));
+    let active_transport = {
+        let active = active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        active.as_ref().and_then(|run| {
+            let in_thread = storage
+                .lock()
+                .ok()?
+                .journal
+                .run_thread_id(&run.id)
+                .ok()
+                .flatten()
+                .is_some_and(|thread| thread == thread_id);
+            in_thread
+                .then(|| {
+                    run.transport
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone()
+                })
+                .flatten()
+        })
+    };
+    if let Some(transport) = active_transport {
+        return engine.context_usage(&transport).map(Some);
+    }
+    let Some(locator) = thread_session(storage, thread_id, subject, &session_root)? else {
+        return Ok(None);
+    };
+    let holds = |transport: &PiRpcTransport| {
+        transport
+            .session_locator(&session_root, RPC_TIMEOUT.min(Duration::from_secs(5)))
+            .is_ok_and(|held| held == locator)
+    };
+    match runtime.try_lock() {
+        Ok(mut slot) => {
+            if let Some(transport) = slot
+                .as_ref()
+                .and_then(|process| process.wiring.transport())
+                .filter(|transport| holds(transport))
+            {
+                return engine.context_usage(&transport).map(Some);
+            }
+            *slot = None;
+            let (process, transport) = open_thread_conversation(app, &grant()?, &locator)?;
+            *slot = Some(process);
+            engine.context_usage(&transport).map(Some)
+        }
+        Err(_) => {
+            let (mut process, transport) = open_thread_conversation(app, &grant()?, &locator)?;
+            let usage = engine.context_usage(&transport).map(Some);
+            engine.stop(&mut process);
+            usage
+        }
+    }
 }
 
 pub struct ResumeAttempt {
@@ -287,7 +426,7 @@ mod tests {
             event
         };
         std::fs::write(root.join("conversation.jsonl"), "{}\n").unwrap();
-        {
+        let thread = {
             let mut storage = storage.lock().unwrap();
             let thread = storage
                 .journal
@@ -308,7 +447,20 @@ mod tests {
                 .journal
                 .append_new_run("local", &start(&other))
                 .unwrap();
-        }
+            thread
+        };
+        assert_eq!(
+            thread_session(&storage, &thread, Some("owner"), &root)
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "conversation.jsonl"
+        );
+        assert!(
+            thread_session(&storage, "no-such-thread", Some("owner"), &root)
+                .unwrap()
+                .is_none()
+        );
         assert!(
             previous_thread_session(&storage, &first, Some("owner"), &root)
                 .unwrap()

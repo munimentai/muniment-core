@@ -575,6 +575,10 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         ("pairing-challenge", Operation::PairingChallenge),
         ("pairing-status", Operation::PairingStatus),
         ("pairing-revoke", Operation::PairingRevoke),
+        ("thread-context-usage", Operation::ThreadContextUsage),
+        ("thread-compact", Operation::ThreadCompact),
+        ("context-settings", Operation::ContextSettings),
+        ("context-settings-save", Operation::ContextSettingsSave),
     ];
     for (index, (name, operation)) in operations.into_iter().enumerate() {
         insert(
@@ -921,6 +925,17 @@ fn request_body(operation: Operation) -> serde_json::Value {
             "deadline_ms": 120_000
         }),
         Operation::RetentionRecheck => json!({}),
+        Operation::ThreadContextUsage => json!({"thread_id": "00000000000000000000000000000192"}),
+        Operation::ThreadCompact => json!({
+            "thread_id": "00000000000000000000000000000192",
+            "instructions": "Keep the decisions and the open questions."
+        }),
+        Operation::ContextSettings => json!({}),
+        Operation::ContextSettingsSave => json!({
+            "enabled": true,
+            "reserve_tokens": 16384,
+            "keep_recent_tokens": 20000
+        }),
     }
 }
 
@@ -1144,6 +1159,10 @@ mod tests {
             Operation::PairingChallenge,
             Operation::PairingStatus,
             Operation::PairingRevoke,
+            Operation::ThreadContextUsage,
+            Operation::ThreadCompact,
+            Operation::ContextSettings,
+            Operation::ContextSettingsSave,
         ];
         for operation in operations {
             let name = operation.as_str().replace(['.', '_'], "-");
@@ -1196,7 +1215,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            99,
+            103,
             "every canonical fixture must be inventoried"
         );
     }

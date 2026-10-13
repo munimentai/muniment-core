@@ -56,6 +56,7 @@ A module that `muniment-core` re-exports from another workspace crate keeps its 
 | module | code_diff_observe | It verifies workspace state before writes. |
 | module | code_diff_staging | It stages file operations. |
 | module | endpoint_models | It lists the models an OpenAI-compatible endpoint serves. |
+| module | engine | It defines the one boundary to the agent engine and its Pi RPC adapter. |
 | module | harness_scan | It counts durable assistant memory in user-level roots. |
 | module | home | It owns the local memory filesystem. |
 | module | http | It shares HTTP agent configuration and OS certificate verification. |

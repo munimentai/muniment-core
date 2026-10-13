@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"0000000000000000000000000000009a","operation":"thread.compact","capability":"fixture-capability","idempotency_key":"000000000000000000000000000000fe","body":{"instructions":"Keep the decisions and the open questions.","thread_id":"00000000000000000000000000000192"}}

@@ -409,6 +409,74 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
     }
 
     #[cfg(any(unix, target_os = "windows"))]
+    fn thread_context_usage(
+        &mut self,
+        workspace: &str,
+        thread_id: &str,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        serde_json::to_value(self.boundaries.thread_context_usage(workspace, thread_id)?)
+            .map_err(|_| ProtocolError::persistence_failed())
+    }
+
+    /// Starts one compaction per idempotency key and replays its run on a
+    /// repeat, so a retried request never compacts twice.
+    #[cfg(any(unix, target_os = "windows"))]
+    fn compact_thread(
+        &mut self,
+        workspace: &str,
+        thread_id: &str,
+        instructions: Option<&str>,
+        request_id: &Id,
+        idempotency_key: &Id,
+        provenance: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let body = json!({"thread_id": thread_id, "instructions": instructions});
+        let ledger_request = AttachRequest {
+            protocol: Protocol,
+            request_id: request_id.clone(),
+            operation: Operation::ThreadCompact,
+            capability: String::new(),
+            idempotency_key: Some(idempotency_key.clone()),
+            body: body.clone(),
+        };
+        let outcome = self.idempotency.execute(
+            &provenance.profile,
+            self.client_identity.as_deref().unwrap_or_default(),
+            &ledger_request,
+            &body,
+            || Ok(()),
+            || {
+                let run_id = self
+                    .boundaries
+                    .compact_thread(workspace, thread_id, instructions)?;
+                Ok(CommittedResult {
+                    body: json!({"run_id": run_id, "thread_id": thread_id}),
+                    cursor: None,
+                })
+            },
+        )?;
+        let committed = match outcome {
+            IdempotencyOutcome::Committed(result) | IdempotencyOutcome::Replayed(result) => result,
+        };
+        Ok(committed.body)
+    }
+
+    #[cfg(any(unix, target_os = "windows"))]
+    fn context_settings(&mut self) -> Result<serde_json::Value, ProtocolError> {
+        serde_json::to_value(self.boundaries.context_settings()?)
+            .map_err(|_| ProtocolError::persistence_failed())
+    }
+
+    #[cfg(any(unix, target_os = "windows"))]
+    fn save_context_settings(
+        &mut self,
+        settings: crate::engine::CompactionSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        serde_json::to_value(self.boundaries.save_context_settings(settings)?)
+            .map_err(|_| ProtocolError::persistence_failed())
+    }
+
+    #[cfg(any(unix, target_os = "windows"))]
     fn record_sql(
         &mut self,
         body: serde_json::Value,

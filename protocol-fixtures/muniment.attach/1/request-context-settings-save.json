@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"0000000000000000000000000000009c","operation":"context.settings_save","capability":"fixture-capability","body":{"enabled":true,"keep_recent_tokens":20000,"reserve_tokens":16384}}

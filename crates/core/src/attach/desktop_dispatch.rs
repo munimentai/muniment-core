@@ -1084,6 +1084,86 @@ pub(super) fn dispatch_request<S: ThreadListService>(
     }
     if matches!(
         request.operation,
+        Operation::ThreadContextUsage
+            | Operation::ThreadCompact
+            | Operation::ContextSettings
+            | Operation::ContextSettingsSave
+    ) {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            #[serde(default)]
+            thread_id: Option<String>,
+            #[serde(default)]
+            instructions: Option<String>,
+            #[serde(default)]
+            enabled: Option<bool>,
+            #[serde(default)]
+            reserve_tokens: Option<u64>,
+            #[serde(default)]
+            keep_recent_tokens: Option<u64>,
+        }
+        let body: Body = serde_json::from_value(request.body.clone())
+            .map_err(|_| ProtocolError::invalid_request())?;
+        let thread_id = body
+            .thread_id
+            .as_deref()
+            .filter(|thread| !thread.is_empty() && thread.len() <= MAX_TEXT_LENGTH);
+        let settings = match (body.enabled, body.reserve_tokens, body.keep_recent_tokens) {
+            (Some(enabled), Some(reserve_tokens), Some(keep_recent_tokens)) => {
+                Some(crate::engine::CompactionSettings {
+                    enabled,
+                    reserve_tokens,
+                    keep_recent_tokens,
+                })
+            }
+            (None, None, None) => None,
+            _ => return Err(ProtocolError::invalid_request().into()),
+        };
+        let instructions = body
+            .instructions
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
+        if instructions.is_some_and(|text| text.len() > 8_000) {
+            return Err(ProtocolError::invalid_request().into());
+        }
+        let answer = match (request.operation, thread_id, settings) {
+            (Operation::ThreadContextUsage, Some(thread_id), None)
+                if body.instructions.is_none() =>
+            {
+                service.thread_context_usage(workspace, thread_id)?
+            }
+            (Operation::ThreadCompact, Some(thread_id), None) => {
+                let idempotency_key = request
+                    .idempotency_key
+                    .as_ref()
+                    .ok_or_else(ProtocolError::idempotency_key_required)?;
+                service.compact_thread(
+                    workspace,
+                    thread_id,
+                    instructions,
+                    &request.request_id,
+                    idempotency_key,
+                    provenance,
+                )?
+            }
+            (Operation::ContextSettings, None, None)
+                if body.thread_id.is_none() && body.instructions.is_none() =>
+            {
+                service.context_settings()?
+            }
+            (Operation::ContextSettingsSave, None, Some(settings))
+                if body.thread_id.is_none() && body.instructions.is_none() =>
+            {
+                service.save_context_settings(settings)?
+            }
+            _ => return Err(ProtocolError::invalid_request().into()),
+        };
+        return bounded_response(answer);
+    }
+    if matches!(
+        request.operation,
         Operation::RecordSql
             | Operation::RecordPropose
             | Operation::RecordCommit

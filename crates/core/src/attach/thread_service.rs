@@ -210,6 +210,38 @@ pub trait ThreadListService {
         Err(ProtocolError::unsupported_operation())
     }
 
+    fn thread_context_usage(
+        &mut self,
+        _workspace: &str,
+        _thread_id: &str,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compact_thread(
+        &mut self,
+        _workspace: &str,
+        _thread_id: &str,
+        _instructions: Option<&str>,
+        _request_id: &super::Id,
+        _idempotency_key: &super::Id,
+        _provenance: CompanionProvenance,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn context_settings(&mut self) -> Result<serde_json::Value, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    fn save_context_settings(
+        &mut self,
+        _settings: crate::engine::CompactionSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
     fn record_sql(
         &mut self,
         _body: serde_json::Value,

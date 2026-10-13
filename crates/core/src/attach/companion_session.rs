@@ -403,7 +403,11 @@ fn companion_scope(operation: Operation) -> Option<Option<&'static str>> {
         | Operation::RetentionRecheck
         | Operation::PairingChallenge
         | Operation::PairingStatus
-        | Operation::PairingRevoke => None,
+        | Operation::PairingRevoke
+        | Operation::ThreadContextUsage
+        | Operation::ThreadCompact
+        | Operation::ContextSettings
+        | Operation::ContextSettingsSave => None,
     }
 }
 

@@ -183,6 +183,8 @@ pub enum PiChatEvent {
         output: Option<String>,
     },
     ExtensionUiRequest(ExtensionUiRequest),
+    /// Pi answered a manual compaction: its token counts, or why it refused.
+    Compacted(Result<crate::engine::CompactionOutcome, String>),
     Completed,
     Cancelled,
     Failed,
@@ -311,13 +313,32 @@ pub fn parse_frame(frame: &Value) -> Result<PiChatEvent, &'static str> {
                 frame.get("errorMessage").and_then(Value::as_str).unwrap_or("Context compaction did not finish.").to_owned()
             } else {
                 let tokens = frame.pointer("/result/tokensBefore").and_then(Value::as_u64);
+                let after = frame.pointer("/result/estimatedTokensAfter").and_then(Value::as_u64);
                 let summary = frame.pointer("/result/summary").and_then(Value::as_str).unwrap_or("");
-                format!("Context compacted. Earlier messages remain in the conversation.\n{}\n{summary}", tokens.map(|n| format!("Context before compaction: {n} tokens.")).unwrap_or_default())
+                format!("Context compacted. Earlier messages remain in the conversation.\n{}\n{}{summary}", tokens.map(|n| format!("Context before compaction: {n} tokens.")).unwrap_or_default(), after.map(|n| format!("Context after compaction: about {n} tokens.\n")).unwrap_or_default())
             };
             Ok(PiChatEvent::ToolFinished {
                 tool_call_id: "muniment:context-compaction".into(), failed,
                 output: activity_detail(Some(&Value::String(detail))),
             })
+        }
+        Some("response") if frame.get("command").and_then(Value::as_str) == Some("compact") => {
+            if frame.get("success").and_then(Value::as_bool) == Some(true) {
+                frame
+                    .get("data")
+                    .and_then(compaction_outcome)
+                    .map(|outcome| PiChatEvent::Compacted(Ok(outcome)))
+                    .ok_or("compact response is missing tokensBefore")
+            } else {
+                let error = frame
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Context compaction did not finish.");
+                Ok(PiChatEvent::Compacted(Err(activity_detail(Some(
+                    &Value::String(error.chars().take(500).collect()),
+                ))
+                .unwrap_or_default())))
+            }
         }
         Some("agent_start") => Ok(PiChatEvent::TurnStarted),
         Some("message_end")
@@ -440,6 +461,15 @@ pub fn parse_frame(frame: &Value) -> Result<PiChatEvent, &'static str> {
         Some(_) => Ok(PiChatEvent::Interleaved),
         None => Err("Pi frame is missing type"),
     }
+}
+
+/// Reads the token counts of a compaction result: `tokensBefore` and, when Pi
+/// reports it, `estimatedTokensAfter`.
+fn compaction_outcome(result: &Value) -> Option<crate::engine::CompactionOutcome> {
+    Some(crate::engine::CompactionOutcome {
+        tokens_before: result.get("tokensBefore").and_then(Value::as_u64)?,
+        estimated_tokens_after: result.get("estimatedTokensAfter").and_then(Value::as_u64),
+    })
 }
 
 fn parse_extension_ui_request(frame: &Value) -> Result<PiChatEvent, &'static str> {
@@ -599,6 +629,10 @@ pub struct PiRunAdapter {
     buffered: Mutex<VecDeque<Value>>,
     first_event_deadline: Mutex<Option<Instant>>,
     compaction_id: Mutex<Option<String>>,
+    /// The session file this turn writes, once it is known.
+    session: Mutex<Option<String>>,
+    /// A compaction outcome that waits for the session file to be known.
+    compaction: Mutex<Option<crate::engine::CompactionOutcome>>,
     pending_terminal: Mutex<Option<PiChatEvent>>,
 }
 
@@ -640,6 +674,8 @@ impl PiRunAdapter {
             frames: Mutex::new(transport.subscribe()),
             buffered: Mutex::new(VecDeque::new()),
             compaction_id: Mutex::new(None),
+            session: Mutex::new(None),
+            compaction: Mutex::new(None),
             pending_terminal: Mutex::new(None),
             first_event_deadline: Mutex::new(Some(deadline)),
         };
@@ -708,8 +744,73 @@ impl PiRunAdapter {
         Ok((adapter, accepted))
     }
 
+    /// Starts a manual compaction of the open session. Pi reports it with the
+    /// same `compaction_start` and `compaction_end` events as an automatic
+    /// one, with the reason `manual`, then answers the command.
+    pub fn compact(
+        run_id: impl Into<String>,
+        transport: &PiRpcTransport,
+        instructions: Option<&str>,
+    ) -> Result<Self, String> {
+        let adapter = Self {
+            run_id: run_id.into(),
+            frames: Mutex::new(transport.subscribe()),
+            buffered: Mutex::new(VecDeque::new()),
+            compaction_id: Mutex::new(None),
+            session: Mutex::new(None),
+            compaction: Mutex::new(None),
+            pending_terminal: Mutex::new(None),
+            first_event_deadline: Mutex::new(None),
+        };
+        // A pre-correlated frame reaches the subscribers, so the answer
+        // arrives in order behind the compaction events.
+        let mut command = json!({
+            "id": format!("muniment-compact-{}", uuid::Uuid::now_v7()),
+            "type": "compact",
+        });
+        if let Some(instructions) = instructions.map(str::trim).filter(|text| !text.is_empty()) {
+            command["customInstructions"] = Value::String(instructions.to_owned());
+        }
+        transport.send(command)?;
+        Ok(adapter)
+    }
+
     pub fn run_id(&self) -> &str {
         &self.run_id
+    }
+
+    /// Names the session file this turn writes, so a compaction it reports
+    /// is kept for the session's context usage.
+    pub fn bind_session(&self, locator: &super::PiSessionLocator) {
+        *self
+            .session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(locator.as_str().to_owned());
+        if let Some(outcome) = self
+            .compaction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            crate::engine::record_compaction(locator.as_str(), outcome);
+        }
+    }
+
+    fn observe_compaction(&self, outcome: crate::engine::CompactionOutcome) {
+        match self
+            .session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref()
+        {
+            Some(session) => crate::engine::record_compaction(session, outcome),
+            None => {
+                *self
+                    .compaction
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome)
+            }
+        }
     }
 
     /// Answers a pending extension UI request without waiting for an RPC response.
@@ -749,6 +850,7 @@ impl PiRunAdapter {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let call_timeout = remaining.min(Duration::from_millis(100));
             if let Ok(locator) = transport.session_locator(session_root, call_timeout) {
+                self.bind_session(&locator);
                 return Ok((locator, buffered));
             }
             match self.next(Duration::from_millis(10).min(remaining)) {
@@ -797,7 +899,8 @@ impl PiRunAdapter {
                     PiChatEvent::Completed
                     | PiChatEvent::Cancelled
                     | PiChatEvent::Failed
-                    | PiChatEvent::UsageLimit,
+                    | PiChatEvent::UsageLimit
+                    | PiChatEvent::Compacted(_),
                 ) => return Ok(()),
                 Ok(_) => {}
                 Err(error) => return Err(error),
@@ -862,7 +965,8 @@ impl PiRunAdapter {
                 event @ (PiChatEvent::Completed
                 | PiChatEvent::Failed
                 | PiChatEvent::UsageLimit
-                | PiChatEvent::Cancelled),
+                | PiChatEvent::Cancelled
+                | PiChatEvent::Compacted(_)),
             ) => {
                 *pending = Some(event);
                 Ok(PiChatEvent::Interleaved)
@@ -944,6 +1048,16 @@ impl PiRunAdapter {
             mpsc::RecvTimeoutError::Disconnected => "Pi process stream ended".to_string(),
         })?;
         let mut event = parse_frame(&frame).map_err(str::to_owned)?;
+        let outcome = match (&event, frame.get("type").and_then(Value::as_str)) {
+            (PiChatEvent::Compacted(Ok(outcome)), _) => Some(*outcome),
+            (_, Some("compaction_end" | "auto_compaction_end")) => {
+                frame.get("result").and_then(compaction_outcome)
+            }
+            _ => None,
+        };
+        if let Some(outcome) = outcome {
+            self.observe_compaction(outcome);
+        }
         if frame.get("type").and_then(Value::as_str) == Some("agent_start")
             || (matches!(
                 frame.get("type").and_then(Value::as_str),
@@ -1070,6 +1184,8 @@ mod tests {
             frames: Mutex::new(frames),
             buffered: Mutex::new(VecDeque::new()),
             compaction_id: Mutex::new(None),
+            session: Mutex::new(None),
+            compaction: Mutex::new(None),
             pending_terminal: Mutex::new(None),
             first_event_deadline: Mutex::new(Some(Instant::now() + Duration::from_secs(1))),
         };
@@ -1090,6 +1206,8 @@ mod tests {
                 frames: Mutex::new(frames),
                 buffered: Mutex::new(VecDeque::new()),
                 compaction_id: Mutex::new(None),
+                session: Mutex::new(None),
+                compaction: Mutex::new(None),
                 pending_terminal: Mutex::new(None),
                 first_event_deadline: Mutex::new(Some(Instant::now() + timeout)),
             },
@@ -1196,6 +1314,116 @@ mod tests {
             parse_frame(&json!({"type":"compaction_end","aborted":true,"result":null})).unwrap(),
             PiChatEvent::ToolFinished { failed: true, .. }
         ));
+    }
+
+    #[test]
+    fn a_compaction_detail_names_the_tokens_before_and_the_estimate_after() {
+        let PiChatEvent::ToolFinished { output, failed, .. } = parse_frame(&json!({
+            "type": "compaction_end",
+            "reason": "manual",
+            "result": {"summary": "Keep the goal", "tokensBefore": 152400, "estimatedTokensAfter": 31900}
+        }))
+        .unwrap() else {
+            panic!("compaction end")
+        };
+        assert!(!failed);
+        assert_eq!(
+            output.unwrap(),
+            "Context compacted. Earlier messages remain in the conversation.\nContext before compaction: 152400 tokens.\nContext after compaction: about 31900 tokens.\nKeep the goal"
+        );
+        let PiChatEvent::ToolFinished { output, .. } = parse_frame(&json!({
+            "type": "compaction_end",
+            "result": {"summary": "Keep the goal", "tokensBefore": 152400}
+        }))
+        .unwrap() else {
+            panic!("compaction end")
+        };
+        assert_eq!(
+            output.unwrap(),
+            "Context compacted. Earlier messages remain in the conversation.\nContext before compaction: 152400 tokens.\nKeep the goal"
+        );
+    }
+
+    #[test]
+    fn a_compact_answer_reports_its_counts_or_its_refusal() {
+        assert_eq!(
+            parse_frame(&json!({
+                "type": "response", "command": "compact", "success": true,
+                "data": {"summary": "s", "tokensBefore": 150000, "estimatedTokensAfter": 32000}
+            }))
+            .unwrap(),
+            PiChatEvent::Compacted(Ok(crate::engine::CompactionOutcome {
+                tokens_before: 150000,
+                estimated_tokens_after: Some(32000),
+            }))
+        );
+        assert_eq!(
+            parse_frame(&json!({
+                "type": "response", "command": "compact", "success": false,
+                "error": "Nothing to compact"
+            }))
+            .unwrap(),
+            PiChatEvent::Compacted(Err("Nothing to compact".into()))
+        );
+    }
+
+    #[test]
+    fn a_manual_compaction_ends_after_its_activity_and_keeps_its_estimate() {
+        let (sender, adapter) = bounded_adapter(Duration::from_secs(1));
+        *adapter.first_event_deadline.lock().unwrap() = None;
+        let root =
+            std::env::temp_dir().join(format!("muniment-compaction-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let locator = format!("{}.jsonl", uuid::Uuid::now_v7());
+        std::fs::write(root.join(&locator), "{}\n").unwrap();
+        let (bound, _) = crate::sidecar::validate_pi_session(&root, &locator).unwrap();
+        adapter.bind_session(&bound);
+        std::fs::remove_dir_all(root).unwrap();
+        let next = || {
+            adapter
+                .next_with_settlement(Duration::from_millis(1), || {
+                    Ok(json!({"success":true,"data":{"isStreaming":false,"isCompacting":false}}))
+                })
+                .unwrap()
+        };
+        sender
+            .send(json!({"type":"compaction_start","reason":"manual"}))
+            .unwrap();
+        let PiChatEvent::ToolStarted {
+            input, tool_name, ..
+        } = next()
+        else {
+            panic!("compaction start")
+        };
+        assert_eq!(tool_name, "compact_context");
+        assert_eq!(input.unwrap(), r#"{"reason":"manual"}"#);
+        sender
+            .send(json!({"type":"response","command":"compact","success":true,"data":{"tokensBefore":152400,"estimatedTokensAfter":31900}}))
+            .unwrap();
+        assert_eq!(next(), PiChatEvent::Interleaved);
+        // The open compaction holds the answer until its end arrives.
+        assert_eq!(next(), PiChatEvent::Interleaved);
+        sender
+            .send(json!({"type":"compaction_end","reason":"manual","result":{"summary":"s","tokensBefore":152400,"estimatedTokensAfter":31900}}))
+            .unwrap();
+        assert!(matches!(
+            next(),
+            PiChatEvent::ToolFinished { failed: false, .. }
+        ));
+        assert_eq!(
+            next(),
+            PiChatEvent::Compacted(Ok(crate::engine::CompactionOutcome {
+                tokens_before: 152400,
+                estimated_tokens_after: Some(31900),
+            }))
+        );
+        assert_eq!(
+            crate::engine::last_compaction(&locator),
+            Some(crate::engine::CompactionOutcome {
+                tokens_before: 152400,
+                estimated_tokens_after: Some(31900),
+            })
+        );
     }
 
     #[test]

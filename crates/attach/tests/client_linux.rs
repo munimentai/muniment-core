@@ -791,6 +791,96 @@ fn desktop_recheck_retention_matches_the_fixtures_and_maps_a_protocol_error() {
 }
 
 #[test]
+fn desktop_context_requests_match_the_fixtures_and_keep_the_runtime_reason() {
+    let fixtures = [
+        include_str!(
+            "../../../protocol-fixtures/muniment.attach/1/request-thread-context-usage.json"
+        ),
+        include_str!("../../../protocol-fixtures/muniment.attach/1/request-thread-compact.json"),
+        include_str!("../../../protocol-fixtures/muniment.attach/1/request-context-settings.json"),
+        include_str!(
+            "../../../protocol-fixtures/muniment.attach/1/request-context-settings-save.json"
+        ),
+    ]
+    .map(|fixture| serde_json::from_str::<serde_json::Value>(fixture).unwrap());
+    let answers = [
+        serde_json::json!({"usage": null, "reading": true, "error": null, "compacting": false, "compaction": null}),
+        serde_json::json!({"run_id": "00000000000000000000000000000191", "thread_id": "00000000000000000000000000000192"}),
+        serde_json::json!({"enabled": true, "reserve_tokens": 16384, "keep_recent_tokens": 20000}),
+        serde_json::json!({"enabled": true, "reserve_tokens": 16384, "keep_recent_tokens": 20000}),
+    ];
+    let server_fixtures = fixtures.clone();
+    let server_answers = answers.clone();
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let worker = thread::spawn(move || {
+        complete_desktop_client_handshake(&mut server);
+        for (fixture, answer) in server_fixtures.iter().zip(server_answers) {
+            let request = read_client_value(&mut server);
+            assert_eq!(request["operation"], fixture["operation"]);
+            assert_eq!(request["body"], fixture["body"]);
+            assert_eq!(
+                request.get("idempotency_key").is_some(),
+                fixture.get("idempotency_key").is_some()
+            );
+            let request_id = Id::new(request["request_id"].as_str().unwrap()).unwrap();
+            server
+                .write_all(
+                    &encode_frame(&Response {
+                        protocol: Protocol,
+                        request_id,
+                        ok: Success,
+                        body: answer,
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let request = read_client_value(&mut server);
+        assert_eq!(request["operation"], "thread.compact");
+        server
+            .write_all(
+                &encode_frame(&ErrorEnvelope {
+                    protocol: Protocol,
+                    request_id: Some(Id::new(request["request_id"].as_str().unwrap()).unwrap()),
+                    ok: Failure,
+                    error: ProtocolError::invalid_request_with_reason(
+                        "This thread is replying. Compact it after the reply finishes.",
+                    ),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+    });
+    let mut client = handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap();
+    let thread = fixtures[0]["body"]["thread_id"].as_str().unwrap();
+    assert_eq!(client.thread_context_usage(thread).unwrap(), answers[0]);
+    assert_eq!(
+        client
+            .compact_thread(thread, fixtures[1]["body"]["instructions"].as_str())
+            .unwrap(),
+        answers[1]
+    );
+    assert_eq!(client.context_settings().unwrap(), answers[2]);
+    assert_eq!(
+        client.save_context_settings(true, 16384, 20000).unwrap(),
+        answers[3]
+    );
+    assert_eq!(
+        client.compact_thread("", None),
+        Err(ClientError::UnexpectedMessage)
+    );
+    assert!(client.compact_thread(thread, None).is_err());
+    assert_eq!(
+        client.last_request_error().unwrap().to_string(),
+        ProtocolError::invalid_request_with_reason(
+            "This thread is replying. Compact it after the reply finishes."
+        )
+        .to_string()
+    );
+    worker.join().unwrap();
+}
+
+#[test]
 fn desktop_run_resume_matches_the_fixture_and_maps_a_protocol_error() {
     let response_fixture: serde_json::Value = serde_json::from_str(include_str!(
         "../../../protocol-fixtures/muniment.attach/1/response-run-resume.json"

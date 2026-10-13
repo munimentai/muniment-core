@@ -624,6 +624,68 @@ impl DesktopClient {
         )
     }
 
+    /// Reads one thread's context usage, whether a read runs, and its last
+    /// manual compaction.
+    pub fn thread_context_usage(&mut self, thread_id: &str) -> Result<Value, ClientError> {
+        if thread_id.is_empty() || thread_id.len() > MAX_THREAD_ID_LENGTH {
+            return Err(ClientError::UnexpectedMessage);
+        }
+        self.request_body(
+            Operation::ThreadContextUsage,
+            None,
+            serde_json::json!({"thread_id": thread_id}),
+            &["usage", "reading", "compacting"],
+        )
+    }
+
+    /// Starts a manual compaction of one thread and answers its run.
+    pub fn compact_thread(
+        &mut self,
+        thread_id: &str,
+        instructions: Option<&str>,
+    ) -> Result<Value, ClientError> {
+        if thread_id.is_empty() || thread_id.len() > MAX_THREAD_ID_LENGTH {
+            return Err(ClientError::UnexpectedMessage);
+        }
+        let mut body = serde_json::json!({"thread_id": thread_id});
+        if let Some(instructions) = instructions {
+            body["instructions"] = Value::String(instructions.to_owned());
+        }
+        self.request_body(
+            Operation::ThreadCompact,
+            Some(fresh_request_id()?),
+            body,
+            &["run_id"],
+        )
+    }
+
+    pub fn context_settings(&mut self) -> Result<Value, ClientError> {
+        self.request_body(
+            Operation::ContextSettings,
+            None,
+            serde_json::json!({}),
+            &["enabled", "reserve_tokens", "keep_recent_tokens"],
+        )
+    }
+
+    pub fn save_context_settings(
+        &mut self,
+        enabled: bool,
+        reserve_tokens: u64,
+        keep_recent_tokens: u64,
+    ) -> Result<Value, ClientError> {
+        self.request_body(
+            Operation::ContextSettingsSave,
+            None,
+            serde_json::json!({
+                "enabled": enabled,
+                "reserve_tokens": reserve_tokens,
+                "keep_recent_tokens": keep_recent_tokens,
+            }),
+            &["enabled", "reserve_tokens", "keep_recent_tokens"],
+        )
+    }
+
     pub fn record_sql(&mut self, body: Value) -> Result<Value, ClientError> {
         self.request_body(Operation::RecordSql, None, body, &[])
     }

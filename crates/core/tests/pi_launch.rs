@@ -7,6 +7,8 @@ use muniment_core::chat_launch::{ChatGrant, FetchGrantError};
 
 #[path = "pi_launch/acquisition_coordinate.rs"]
 mod acquisition_coordinate;
+#[path = "pi_launch/compaction_coordinate.rs"]
+mod compaction_coordinate;
 #[path = "pi_launch/gateway_coordinate.rs"]
 mod gateway_coordinate;
 use muniment_core::pi_launch::{
