@@ -24,6 +24,10 @@ jobs:
       CARGO_TARGET_DIR: /root/.cache/muniment-core/checks
     steps:
       - uses: actions/checkout@v4
+      # The memory runtime tests load an ES module extension without a package.json.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - run: bash .forgejo/rust-toolchain.sh rustfmt clippy
       - run: cargo fmt --all --check
       - run: scripts/check-core-boundary.sh
