@@ -1,0 +1,27 @@
+[package]
+name = "muniment-models"
+version = "0.0.1"
+edition = "2021"
+
+# Every fact about providers and models: provider ids, names, sign-in methods
+# and aliases, local server kinds and their ports, model lists, context
+# windows, output limits and prices. It renders that data into Pi's
+# `models.json`. It depends on no other Muniment crate except the pins and the
+# atomic file helper.
+
+[features]
+# HTTPS uses the OS certificate verifier.
+tls = ["ureq/tls", "ureq/proxy-from-env", "dep:rustls", "dep:rustls-platform-verifier"]
+
+[dependencies]
+muniment-atomic-file = { path = "../atomic-file" }
+muniment-pins = { path = "../pins" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-platform-verifier = { version = "0.7", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"
+toml = "1"
+ureq = { version = "2", default-features = false, features = ["json"] }
+url = "2"
+uuid = { version = "1", features = ["serde", "v4", "v7"] }

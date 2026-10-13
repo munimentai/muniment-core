@@ -16,18 +16,13 @@ pub mod classify;
 pub mod config;
 pub mod constraints;
 pub mod context;
-pub mod endpoint_models;
 #[cfg(feature = "server")]
 pub mod factory;
-pub mod family;
 pub mod headless;
-pub mod http;
-pub mod model_catalog;
 pub mod native_auth;
 pub mod pi_provider;
 pub mod policy;
 mod progress;
-pub mod provider_models;
 pub mod quota;
 pub mod server;
 pub mod store;
@@ -35,6 +30,8 @@ pub mod subscription_probe;
 pub mod transport;
 pub mod usage;
 pub mod wire;
+
+pub use muniment_models::{endpoint_models, family, http, model_catalog, provider_models};
 
 use classify::Reason;
 use config::{Route, RouterConfig, AUTO_MODEL};

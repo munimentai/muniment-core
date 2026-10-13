@@ -4,12 +4,12 @@ version = "0.0.1"
 edition = "2021"
 
 # The multi-account model router shared by the desktop and the factory. It
-# depends on no other Muniment crate except the pins and the atomic file
-# helper, so a headless host can embed it without the desktop runtime.
+# depends on no other Muniment crate except the models, the pins and the atomic
+# file helper, so a headless host can embed it without the desktop runtime.
 
 [features]
 # HTTPS uses the OS certificate verifier.
-tls = ["ureq/tls", "ureq/proxy-from-env", "dep:rustls", "dep:rustls-platform-verifier"]
+tls = ["ureq/tls", "ureq/proxy-from-env", "dep:rustls", "dep:rustls-platform-verifier", "muniment-models/tls"]
 # The `muniment-router` server binary: the Postgres store, OpenBao secrets,
 # run tokens and metrics. The desktop never enables it.
 server = ["tls", "dep:hmac", "dep:postgres", "dep:signal-hook"]
@@ -27,6 +27,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 getrandom = "0.3"
 hmac = { version = "0.12", optional = true }
 muniment-atomic-file = { path = "../atomic-file" }
+muniment-models = { path = "../models" }
 muniment-pins = { path = "../pins" }
 postgres = { version = "0.19", features = ["with-serde_json-1"], optional = true }
 rusqlite = { version = "0.32", features = ["bundled", "hooks", "limits"] }

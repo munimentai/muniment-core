@@ -17,7 +17,7 @@ pub const CONFIG_FILE: &str = "muniment-router.json";
 /// The record of decision-model assistance, beside the router record.
 pub const ASSIST_FILE: &str = "muniment-assist.json";
 /// The Pi provider id the router answers as.
-pub const ROUTER_PROVIDER: &str = "muniment-router";
+pub use muniment_models::registry::ROUTER_PROVIDER;
 /// The model id that stands for "let the classifier pick".
 pub const AUTO_MODEL: &str = "auto";
 /// Below this confidence the router takes the fallback route.
