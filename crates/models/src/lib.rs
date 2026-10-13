@@ -10,3 +10,7 @@ pub mod local_servers;
 pub mod model_catalog;
 pub mod provider_models;
 pub mod registry;
+pub mod window;
+
+#[cfg(test)]
+mod test_server;
