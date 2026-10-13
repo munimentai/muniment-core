@@ -10,7 +10,9 @@ mod vad;
 pub mod validation;
 
 pub use pipeline::{DictationPipeline, DictationPipelineError, DictationPipelinePushError};
-pub use recognizer::{OfflineParakeetRecognizer, OfflineRecognitionError};
+pub use recognizer::{
+    OfflineParakeetRecognizer, OfflineRecognitionError, ParakeetDecoding, ParakeetHotwords,
+};
 pub use vad::{
     SileroVoiceActivityDetector, VadDecisionSource, VadError, VAD_FRAME_SIZE, VAD_SAMPLE_RATE,
 };
