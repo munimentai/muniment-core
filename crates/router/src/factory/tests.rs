@@ -95,6 +95,7 @@ fn account(id: &str, url: &str, models: &[&str]) -> Account {
         models: models.iter().map(|m| m.to_string()).collect(),
         enabled: true,
         weight: 1,
+        overflow: false,
     }
 }
 

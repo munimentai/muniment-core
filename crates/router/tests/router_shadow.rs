@@ -293,6 +293,88 @@ fn conflicting_job_session_trace_and_constraints_do_not_reattach() {
     );
 }
 
+/// A reservation for job `index` against the fixture pool at `revision`,
+/// with account `a` a subscription and `b` a key.
+fn mixed(index: usize, revision: u64, a_cooling: bool, b_overflow: bool) -> Request {
+    let mut request = request(index);
+    let (_, snapshot, _) = parts(&mut request);
+    snapshot.revision = revision;
+    snapshot.accounts[0].source = Source::Account;
+    if a_cooling {
+        snapshot.accounts[0].cooldown_until_ms = 4102444800000;
+    }
+    snapshot.accounts[1].overflow = b_overflow;
+    request
+}
+
+#[test]
+fn a_key_takes_a_job_beside_an_account_only_as_overflow_while_the_account_is_unavailable() {
+    let state = State::new();
+    let mut router = state.open();
+    let ids = |response: &Response| {
+        response
+            .eligible
+            .iter()
+            .map(|selection| selection.account.clone())
+            .collect::<Vec<_>>()
+    };
+    // The subscription takes the job and the key is not eligible beside it.
+    let ready = router.handle(mixed(1, 1, false, false)).unwrap();
+    assert_eq!(ready.selected.as_ref().unwrap().account, "a");
+    assert_eq!(ids(&ready), ["a"]);
+    // A cooling subscription leaves a plain key out all the same.
+    assert_eq!(
+        router.handle(mixed(2, 2, true, false)).unwrap_err(),
+        Error::NoEligibleChoice
+    );
+    // An overflow key takes the job while the subscription cools.
+    let spilled = router.handle(mixed(3, 3, true, true)).unwrap();
+    assert_eq!(spilled.selected.as_ref().unwrap().account, "b");
+    assert_eq!(ids(&spilled), ["b"]);
+    // A subscription at its cap counts as spent too.
+    let mut capped = mixed(4, 4, false, true);
+    let (_, snapshot, _) = parts(&mut capped);
+    for cap in snapshot.accounts[0].models.values_mut() {
+        cap.limit = 0;
+    }
+    assert_eq!(
+        router.handle(capped).unwrap().selected.unwrap().account,
+        "b"
+    );
+    // The subscription back with a new cap epoch, new jobs return to it.
+    let mut renewed = mixed(5, 5, false, true);
+    let (_, snapshot, _) = parts(&mut renewed);
+    for cap in snapshot.accounts[0].models.values_mut() {
+        cap.epoch = 2;
+    }
+    let back = router.handle(renewed).unwrap();
+    assert_eq!(back.selected.as_ref().unwrap().account, "a");
+    assert_eq!(ids(&back), ["a"]);
+}
+
+#[test]
+fn keys_alone_balance_as_before_and_old_snapshots_keep_their_digest() {
+    let mut value: Value = serde_json::from_str(FIXTURE).unwrap();
+    let request: Request = serde_json::from_value(value.clone()).unwrap();
+    let mut keys = request.clone();
+    let (_, snapshot, _) = parts(&mut keys);
+    assert!(snapshot
+        .accounts
+        .iter()
+        .all(|account| account.source == Source::Key && !account.overflow));
+    // The new fields stay out of a snapshot that does not set them.
+    let encoded = serde_json::to_value(&*snapshot).unwrap();
+    assert!(encoded["accounts"][0].get("source").is_none());
+    assert!(encoded["accounts"][0].get("overflow").is_none());
+    let state = State::new();
+    let plain = inspect(&mut state.open(), &request);
+    assert_eq!(plain.eligible.len(), 2);
+    // Overflow means nothing while the family has no subscription.
+    value["snapshot"]["accounts"][1]["overflow"] = json!(true);
+    let marked: Request = serde_json::from_value(value).unwrap();
+    assert_eq!(inspect(&mut State::new().open(), &marked).eligible.len(), 2);
+}
+
 #[test]
 fn cooling_or_removed_affinity_blocks_instead_of_switching_accounts() {
     for removed in [false, true] {

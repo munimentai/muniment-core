@@ -3,13 +3,13 @@
 //! Pi reaches an OpenAI-compatible server through one entry in its
 //! `models.json`. The router is one such server, so the router's whole
 //! presence in Pi is that entry: the loopback base URL, the token as the key,
-//! and the models the router serves. Turning the router off removes the entry
+//! and the models the router offers. Turning the router off removes the entry
 //! and nothing else, so Pi goes straight back to its own providers.
 
 use serde_json::{json, Value};
 
 use super::config::{RouterConfig, ROUTER_PROVIDER};
-use super::served_models;
+use super::offered_models;
 use super::server::Endpoint;
 
 /// The `models.json` entry for the router.
@@ -28,7 +28,7 @@ pub fn provider_entry(endpoint: &Endpoint, config: &RouterConfig) -> Value {
             "supportsDeveloperRole": false,
             "supportsReasoningEffort": false
         },
-        "models": served_models(config)
+        "models": offered_models(config)
             .iter()
             .map(|id| {
                 let profile = options.iter().find(|r| &r.key == id).and_then(|r| super::policy::model(config,r));
@@ -95,6 +95,7 @@ mod tests {
                 models: vec!["gpt-5.6-mini".into()],
                 enabled: true,
                 weight: 1,
+                overflow: false,
             }],
             routes: vec![Route {
                 key: "fast".into(),
@@ -109,13 +110,43 @@ mod tests {
 
     #[test]
     fn the_entry_points_pi_at_the_loopback_port_behind_the_token() {
-        let entry = provider_entry(&endpoint(), &routed());
+        let mut config = routed();
+        config.classifier = crate::config::Classifier::Typesafe {
+            api_key: "apikey_1".into(),
+            model: "jev-latest".into(),
+            base_url: None,
+            max_options: None,
+            limits: Default::default(),
+        };
+        let entry = provider_entry(&endpoint(), &config);
         assert_eq!(entry["baseUrl"], "http://127.0.0.1:8421/v1");
         assert_eq!(entry["api"], "openai-completions");
         assert_eq!(entry["apiKey"], "t0ken");
         assert_eq!(entry["models"][0]["id"], "auto");
         assert_eq!(entry["models"][1]["id"], "fast");
         assert_eq!(entry["models"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pi_is_offered_no_automatic_model_without_a_ready_decision_model() {
+        let entry = provider_entry(&endpoint(), &routed());
+        assert_eq!(entry["models"][0]["id"], "fast");
+        assert_eq!(entry["models"].as_array().unwrap().len(), 1);
+        // A decision model with no key is not ready either.
+        let mut config = routed();
+        config.classifier = crate::config::Classifier::Typesafe {
+            api_key: " ".into(),
+            model: "jev-latest".into(),
+            base_url: None,
+            max_options: None,
+            limits: Default::default(),
+        };
+        let entry = provider_entry(&endpoint(), &config);
+        assert!(entry["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|model| model["id"] != "auto"));
     }
 
     #[test]

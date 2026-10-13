@@ -216,6 +216,11 @@ pub struct Account {
     /// The share of the round this account takes. Zero is the same as disabled.
     #[serde(default = "one")]
     pub weight: u32,
+    /// Whether a key may take a turn once every subscription of its family is
+    /// cooling or spent. A key never balances with subscriptions, so without
+    /// this it serves its family only while the family has no subscription.
+    #[serde(default)]
+    pub overflow: bool,
 }
 
 fn yes() -> bool {
@@ -251,6 +256,11 @@ impl Account {
             Credential::Subscription { email, .. } => email.as_deref(),
             Credential::ApiKey { .. } => None,
         }
+    }
+
+    /// Whether this account is a key rather than a subscription.
+    pub fn is_key(&self) -> bool {
+        matches!(self.credential, Credential::ApiKey { .. })
     }
 
     /// Whether this account may answer for `model`.
@@ -589,6 +599,7 @@ mod tests {
             models: Vec::new(),
             enabled: true,
             weight: 1,
+            overflow: false,
         }
     }
 
@@ -980,5 +991,23 @@ mod tests {
         let path = std::env::temp_dir().join(format!("muniment-router-{}", uuid::Uuid::now_v7()));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn an_account_saved_before_overflow_existed_reads_as_no_overflow() {
+        let saved = serde_json::json!({
+            "id": "k1",
+            "family": "openai",
+            "label": "work",
+            "credential": { "type": "api_key", "key": "sk" }
+        });
+        let account: Account = serde_json::from_value(saved).unwrap();
+        assert!(!account.overflow);
+        assert!(account.is_key());
+        let mut on = account.clone();
+        on.overflow = true;
+        let round: Account = serde_json::from_value(serde_json::to_value(&on).unwrap()).unwrap();
+        assert!(round.overflow);
+        assert!(!subscription("s1", "openai-codex", Some("u"), None).is_key());
     }
 }

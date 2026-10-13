@@ -20,13 +20,14 @@ use muniment_core::model_router::model_catalog;
 use muniment_core::model_router::quota;
 use muniment_core::model_router::usage::{self, AccountUsage};
 use muniment_core::model_router::{
-    all_options, classify, options, pi_provider, served_models, server,
+    all_options, classify, offered_models, options, pi_provider, server,
 };
 use muniment_core::serde_json::{self, Value};
 
 use super::connections;
 use super::providers::{
-    lock_pi_auth_file, pi_models_file, read_json_for_update, write_json_for_update,
+    lock_pi_auth_file, pi_models_file, read_json_for_update, replace_default_model,
+    write_json_for_update,
 };
 
 pub(super) const READ_ERROR: &str =
@@ -104,6 +105,9 @@ pub(super) struct AccountView {
     models: Vec<String>,
     enabled: bool,
     weight: u32,
+    /// Whether this key takes turns once every subscription of its family is
+    /// cooling or spent. A key without it never serves beside a subscription.
+    overflow: bool,
     requests: u64,
     input_tokens: u64,
     output_tokens: u64,
@@ -263,6 +267,7 @@ fn account_view(
         models: account.models.clone(),
         enabled: account.enabled,
         weight: account.weight,
+        overflow: account.overflow,
         requests: usage.map(|entry| entry.requests).unwrap_or(0),
         input_tokens: usage.map(|entry| entry.input_tokens).unwrap_or(0),
         output_tokens: usage.map(|entry| entry.output_tokens).unwrap_or(0),
@@ -337,6 +342,7 @@ fn settings_with(
     running: Option<&server::Endpoint>,
     active: &std::collections::BTreeMap<String, u32>,
 ) -> Result<RouterSettings, String> {
+    settle_default(agent, None, false);
     let config = load(agent)?;
     let ledger = usage::load(agent);
     let quotas = quota::load(agent);
@@ -410,7 +416,7 @@ fn settings_with(
         classifier: classifier_view(&config.classifier),
         classifier_connections: connections::views(agent, &config.classifier)?,
         assist: connections::assist_view(agent, &config.classifier)?,
-        served_models: served_models(&config),
+        served_models: offered_models(&config),
     })
 }
 
@@ -421,6 +427,65 @@ pub(super) fn settings(agent: &Path, state: &RouterState) -> Result<RouterSettin
         state.running_endpoint().as_ref(),
         &state.running_active(),
     )
+}
+
+/// The model a router default names when no decision model picks: the most
+/// capable model of one family in the running, by the catalog's order, as the
+/// id the picker uses for it. The family is `family` when it serves, else the
+/// family of the first subscription that can serve, else the first in the
+/// running.
+fn pooled_default(config: &RouterConfig, family: Option<&str>) -> Option<String> {
+    let running = options(config);
+    let subscription = config
+        .accounts
+        .iter()
+        .find(|account| {
+            !account.is_key()
+                && account.enabled
+                && account.weight > 0
+                && account.credential.servable()
+        })
+        .map(|account| account.family.as_str());
+    let first = running.first().map(|option| option.family.as_str());
+    let chosen = [family, subscription, first]
+        .into_iter()
+        .flatten()
+        .find_map(|family| {
+            let catalog = model_catalog::family_models(family);
+            let rank = |model: &str| {
+                catalog
+                    .iter()
+                    .position(|entry| entry.model == model)
+                    .unwrap_or(usize::MAX)
+            };
+            running
+                .iter()
+                .filter(|option| option.family == family)
+                .min_by_key(|option| rank(&option.model))
+                .map(|option| option.key.clone())
+        });
+    chosen
+}
+
+/// Names a pooled model as Pi's default where `auto` would route nothing: a
+/// saved `muniment-router/auto` default while no decision model is ready, and,
+/// with `unset`, a default never saved. The router no longer offers `auto`
+/// then, so a default left on it names a model Pi cannot find.
+pub(super) fn settle_default(agent: &Path, family: Option<&str>, unset: bool) {
+    let Ok(config) = load(agent) else {
+        return;
+    };
+    let ready = config.classifier.ready();
+    if !config.enabled || (ready && !unset) {
+        return;
+    }
+    let Some(model) = pooled_default(&config, family) else {
+        return;
+    };
+    let _ = replace_default_model(agent, config::ROUTER_PROVIDER, &model, |provider, saved| {
+        let auto = provider == Some(config::ROUTER_PROVIDER) && saved == Some(config::AUTO_MODEL);
+        (auto && !ready) || (unset && provider.is_none())
+    });
 }
 
 /// Starts the listener when the record says on, stops it when it says off,
@@ -563,6 +628,7 @@ pub(super) fn add_account(
             .collect(),
         enabled: true,
         weight: 1,
+        overflow: false,
     });
     commit(agent, state, &config)
 }
@@ -577,6 +643,8 @@ pub(super) struct AccountChange {
     enabled: Option<bool>,
     #[serde(default)]
     weight: Option<u32>,
+    #[serde(default)]
+    overflow: Option<bool>,
     #[serde(default)]
     models: Option<Vec<String>>,
 }
@@ -604,6 +672,9 @@ pub(super) fn update_account(
     }
     if let Some(weight) = change.weight {
         account.weight = weight.min(100);
+    }
+    if let Some(overflow) = change.overflow {
+        account.overflow = overflow;
     }
     if let Some(models) = change.models {
         account.models = models
@@ -909,10 +980,12 @@ pub(super) fn import_credential(
         models: Vec::new(),
         enabled: true,
         weight: 1,
+        overflow: false,
     });
     save(agent, &config)?;
     drop(lock);
     apply(agent, state, &config)?;
+    settle_default(agent, Some(family.id), true);
     // The probe names the account and fills its windows. It is a network call,
     // so it runs off the sign-in thread and the screen catches up on reload.
     let probe_agent = agent.to_path_buf();
@@ -1027,6 +1100,7 @@ mod tests {
             models: Vec::new(),
             enabled: true,
             weight: 2,
+            overflow: false,
         }
     }
 
@@ -1107,11 +1181,163 @@ mod tests {
         assert_eq!(view.input_tokens, 300);
         assert_eq!(view.errors, 1);
         assert_eq!(view.weight, 2);
+        assert!(!view.overflow);
         assert!(view.cooldown_until_ms.is_some());
         assert_eq!(view.days.len(), 1);
         assert_eq!(view.days[0].0, "2026-09-17");
         assert_eq!(view.active, 2);
         assert!(!view.allowance_readable);
+    }
+
+    fn subscription(id: &str) -> Account {
+        let mut account = account(id);
+        account.credential = Credential::Subscription {
+            provider: "openai-codex".into(),
+            access: format!("access-{id}"),
+            refresh: None,
+            expires_ms: None,
+            account_id: Some(id.into()),
+            email: None,
+            plan: None,
+            renews_at_ms: None,
+        };
+        account
+    }
+
+    fn agent_with(config: &RouterConfig) -> std::path::PathBuf {
+        let agent =
+            std::env::temp_dir().join(format!("muniment-router-default-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&agent).unwrap();
+        config::save(&agent, config).unwrap();
+        agent
+    }
+
+    fn saved_default(agent: &Path) -> (Option<String>, Option<String>) {
+        let settings: Value = std::fs::read(agent.join("settings.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        let text = |key: &str| settings[key].as_str().map(str::to_owned);
+        (text("defaultProvider"), text("defaultModel"))
+    }
+
+    fn typesafe() -> Classifier {
+        Classifier::Typesafe {
+            api_key: "apikey_1".into(),
+            model: "jev-latest".into(),
+            base_url: None,
+            max_options: None,
+            limits: Default::default(),
+        }
+    }
+
+    fn choose_default(agent: &Path, provider: &str, model: &str) {
+        super::super::providers::set_default_model(agent, provider, model).unwrap();
+    }
+
+    fn router_default(model: &str) -> (Option<String>, Option<String>) {
+        (Some("muniment-router".into()), Some(model.into()))
+    }
+
+    #[test]
+    fn a_saved_automatic_default_becomes_a_pooled_model_while_no_decision_model_is_ready() {
+        let mut config = RouterConfig {
+            enabled: true,
+            accounts: vec![account("k1"), subscription("s1")],
+            ..RouterConfig::default()
+        };
+        let agent = agent_with(&config);
+        choose_default(&agent, "muniment-router", "auto");
+        settle_default(&agent, None, false);
+        // The family's most capable model, as the picker names a router model.
+        assert_eq!(saved_default(&agent), router_default("openai/gpt-6-astra"));
+        // The rewrite happens once: a model the user picks after it stays.
+        choose_default(&agent, "muniment-router", "openai/gpt-5.6-luna");
+        settle_default(&agent, None, false);
+        assert_eq!(saved_default(&agent), router_default("openai/gpt-5.6-luna"));
+        // A ready decision model keeps automatic routing.
+        config.classifier = typesafe();
+        config::save(&agent, &config).unwrap();
+        choose_default(&agent, "muniment-router", "auto");
+        settle_default(&agent, None, false);
+        assert_eq!(saved_default(&agent), router_default("auto"));
+        // Reading the settings rewrites it once the decision model goes, and
+        // the settings offer no automatic model.
+        config.classifier = Classifier::None;
+        config::save(&agent, &config).unwrap();
+        let settings = settings_with(&agent, None, &Default::default()).unwrap();
+        assert_eq!(saved_default(&agent), router_default("openai/gpt-6-astra"));
+        assert!(!settings.served_models.is_empty());
+        assert!(settings.served_models.iter().all(|model| model != "auto"));
+        config.classifier = typesafe();
+        config::save(&agent, &config).unwrap();
+        let settings = settings_with(&agent, None, &Default::default()).unwrap();
+        assert_eq!(settings.served_models[0], "auto");
+        std::fs::remove_dir_all(agent).unwrap();
+    }
+
+    #[test]
+    fn a_sign_in_names_a_pooled_default_and_never_auto() {
+        let mut claude = subscription("c1");
+        claude.family = "anthropic".into();
+        let config = RouterConfig {
+            enabled: true,
+            accounts: vec![account("k1"), claude],
+            ..RouterConfig::default()
+        };
+        let agent = agent_with(&config);
+        // A read never claims a default the user has not saved.
+        settle_default(&agent, None, false);
+        assert_eq!(saved_default(&agent), (None, None));
+        // The sign-in names its own family's model.
+        settle_default(&agent, Some("anthropic"), true);
+        assert_eq!(
+            saved_default(&agent),
+            router_default("anthropic/claude-opus-5")
+        );
+        // A default the user saved stays through the next sign-in.
+        choose_default(&agent, "ollama", "llama3.2:3b");
+        settle_default(&agent, Some("anthropic"), true);
+        assert_eq!(
+            saved_default(&agent),
+            (Some("ollama".into()), Some("llama3.2:3b".into()))
+        );
+        // A sign-in replaces a saved automatic default no decision model serves.
+        choose_default(&agent, "muniment-router", "auto");
+        settle_default(&agent, Some("anthropic"), true);
+        assert_eq!(
+            saved_default(&agent),
+            router_default("anthropic/claude-opus-5")
+        );
+        std::fs::remove_dir_all(agent).unwrap();
+    }
+
+    #[test]
+    fn an_account_change_sets_overflow_and_leaves_it_when_unnamed() {
+        let config = RouterConfig {
+            accounts: vec![account("k1"), subscription("s1")],
+            ..RouterConfig::default()
+        };
+        let agent = agent_with(&config);
+        let state = RouterState::default();
+        let change: AccountChange =
+            serde_json::from_value(serde_json::json!({ "id": "k1", "overflow": true })).unwrap();
+        let settings = update_account(&agent, &state, change).unwrap();
+        assert!(settings.accounts[0].overflow);
+        assert!(!settings.accounts[1].overflow);
+        assert!(config::load(&agent).unwrap().accounts[0].overflow);
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["accounts"][0]["overflow"], true);
+        // A change that names no overflow keeps the saved one.
+        let change: AccountChange =
+            serde_json::from_value(serde_json::json!({ "id": "k1", "weight": 3 })).unwrap();
+        let settings = update_account(&agent, &state, change).unwrap();
+        assert!(settings.accounts[0].overflow);
+        assert_eq!(settings.accounts[0].weight, 3);
+        let change: AccountChange =
+            serde_json::from_value(serde_json::json!({ "id": "k1", "overflow": false })).unwrap();
+        assert!(!update_account(&agent, &state, change).unwrap().accounts[0].overflow);
+        std::fs::remove_dir_all(agent).unwrap();
     }
 
     #[test]

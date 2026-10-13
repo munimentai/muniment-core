@@ -261,6 +261,7 @@ impl RouterStore for PgStore {
                 models: serde_json::from_value(row.get(9)).unwrap_or_default(),
                 enabled: row.get(10),
                 weight: row.get::<_, i32>(11).max(0) as u32,
+                overflow: false,
             })
             .collect();
         let settings = self.routing_settings()?;
@@ -720,6 +721,7 @@ pub(crate) mod tests {
             models: vec!["claude-opus-5".into()],
             enabled: true,
             weight: 2,
+            overflow: false,
         };
         let key = Account {
             id: "k1".into(),
@@ -732,6 +734,7 @@ pub(crate) mod tests {
             models: Vec::new(),
             enabled: false,
             weight: 1,
+            overflow: false,
         };
         store.upsert_account(&subscription).unwrap();
         store.upsert_account(&key).unwrap();

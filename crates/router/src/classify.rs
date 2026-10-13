@@ -1509,6 +1509,7 @@ mod tests {
             models: Vec::new(),
             enabled: true,
             weight: 1,
+            overflow: false,
         });
         let decision = decided(&config, "prove it", TIMEOUT).unwrap();
         assert_eq!(decision.route.key, "deep");
