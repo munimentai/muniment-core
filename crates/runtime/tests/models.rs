@@ -66,8 +66,11 @@ fn the_runtime_starts_the_router_its_record_turns_on_and_stops_it_with_the_sched
     );
     let deadline = Instant::now() + Duration::from_secs(10);
     let endpoint = loop {
+        // The endpoint file comes before models.json names the router.
         if let Some(endpoint) = server::read_endpoint(&agent) {
-            break endpoint;
+            if router_entry(&agent).is_some() {
+                break endpoint;
+            }
         }
         assert!(Instant::now() < deadline, "the router never started");
         std::thread::sleep(Duration::from_millis(20));

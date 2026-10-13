@@ -255,6 +255,8 @@ fn store_provider_key(
         let mut file = options.open(&temporary)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
+        // Windows cannot replace a destination with a source that is still open.
+        drop(file);
         muniment_core::atomic_file::replace(&temporary, auth_file)
     })();
     if result.is_err() {
