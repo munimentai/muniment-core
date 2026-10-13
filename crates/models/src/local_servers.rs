@@ -793,6 +793,32 @@ pub enum ClaudeCode {
     SignedIn,
 }
 
+/// Whether the Copilot CLI executable is on `PATH` or in a usual install
+/// folder. A `.copilot` folder is no evidence: editors that embed the Copilot
+/// runtime create it without the CLI.
+fn copilot_installed(context: &Context) -> bool {
+    let names: &[&str] = if context.platform == Platform::Windows {
+        &["copilot.exe", "copilot.cmd"]
+    } else {
+        &["copilot"]
+    };
+    let mut folders: Vec<PathBuf> = context
+        .var("PATH")
+        .map(|paths| std::env::split_paths(paths).collect())
+        .unwrap_or_default();
+    if context.platform == Platform::Windows {
+        folders.extend(context.dir_var("APPDATA").map(|data| data.join("npm")));
+    } else {
+        folders.push(context.home_path(&[".local", "bin"]));
+        folders.push(context.home_path(&[".npm-global", "bin"]));
+        folders.push(context.system_path(&["opt", "homebrew", "bin"]));
+        folders.push(context.system_path(&["usr", "local", "bin"]));
+    }
+    folders
+        .iter()
+        .any(|folder| names.iter().any(|name| folder.join(name).is_file()))
+}
+
 /// The tools that hold a provider sign-in, in the order the first run lists them.
 pub fn hints(context: &Context, claude_code: ClaudeCode) -> Vec<Hint> {
     let mut hints = Vec::new();
@@ -832,7 +858,7 @@ pub fn hints(context: &Context, claude_code: ClaudeCode) -> Vec<Hint> {
     }) {
         add("google", "Gemini CLI is signed in");
     }
-    if tool_dir("COPILOT_HOME", ".copilot").is_dir() {
+    if copilot_installed(context) {
         add("github-copilot", "Copilot CLI is installed");
     }
     if context.home_path(&[".kimi", "credentials"]).exists() {
@@ -1561,7 +1587,7 @@ mod tests {
         write(&home.join(".codex/auth.json"), "{}");
         write(&home.join(".grok/auth.json"), "{}");
         write(&home.join(".gemini/oauth_creds.json"), "{}");
-        std::fs::create_dir_all(home.join(".copilot")).unwrap();
+        write(&home.join(".local/bin/copilot"), "");
         std::fs::create_dir_all(home.join(".kimi")).unwrap();
         write(&home.join(".local/share/devin/credentials.toml"), "");
         std::fs::create_dir_all(home.join(".config/muse")).unwrap();
@@ -1592,6 +1618,32 @@ mod tests {
                 ("openrouter", "Ori CLI is installed"),
             ]
         );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn copilot_needs_its_executable_not_the_folder_an_editor_creates() {
+        let home = temporary_directory();
+        write(&home.join(".copilot/config.json"), "{}");
+        let empty = Environment::new();
+        let folder_only = context(&home, &empty, Platform::MacOs);
+        assert!(hints(&folder_only, ClaudeCode::Absent).is_empty());
+
+        let bin = home.join("tools");
+        write(&bin.join("copilot"), "");
+        let on_path = environment(&[("PATH", &bin)]);
+        let installed = context(&home, &on_path, Platform::MacOs);
+        let providers: Vec<&str> = hints(&installed, ClaudeCode::Absent)
+            .iter()
+            .map(|hint| hint.provider)
+            .collect();
+        assert_eq!(providers, ["github-copilot"]);
+
+        let windows_bin = home.join("windows-tools");
+        write(&windows_bin.join("copilot.cmd"), "");
+        let windows_path = environment(&[("PATH", &windows_bin)]);
+        let windows = context(&home, &windows_path, Platform::Windows);
+        assert_eq!(hints(&windows, ClaudeCode::Absent).len(), 1);
         std::fs::remove_dir_all(home).unwrap();
     }
 
