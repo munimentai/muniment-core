@@ -1529,4 +1529,59 @@ mod tests {
             assert_eq!(http_error(status), "http");
         }
     }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn shared_agent_rejects_an_untrusted_certificate() {
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+        use std::net::TcpListener;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into(),
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut connection = rustls::ServerConnection::new(Arc::new(config)).unwrap();
+            assert!(connection.complete_io(&mut socket).is_err());
+        });
+        let error = crate::http::agent_builder()
+            .try_proxy_from_env(false)
+            .timeout(Duration::from_secs(5))
+            .build()
+            .get(&format!("https://localhost:{port}/?token=PRIVATE"))
+            .set("Authorization", "Bearer PRIVATE")
+            .call()
+            .unwrap_err()
+            .into_transport()
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            transport_kind(
+                error.kind(),
+                error.message(),
+                std::error::Error::source(&error),
+            ),
+            "tls_certificate"
+        );
+    }
 }

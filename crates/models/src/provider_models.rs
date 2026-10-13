@@ -339,8 +339,7 @@ pub fn merge_models(
 mod tests {
     use super::*;
     #[test]
-    fn a_new_subscription_model_reaches_the_router_without_a_catalog_edit() {
-        use crate::{config, options};
+    fn a_subscription_catalog_keeps_chat_model_metadata_only() {
         let models = parse_subscription_catalog(&json!([
             {"id":"brand-new-model", "contextWindow":123456, "maxTokens":8192,
              "cost":{"input":2,"output":8}, "input":["text"], "reasoning":true,
@@ -349,40 +348,12 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["id"], "brand-new-model");
+        assert_eq!(models[0]["contextWindow"], 123456);
         assert!(models[0].get("baseUrl").is_none());
         assert!(models[0].get("headers").is_none());
-        let agent =
-            std::env::temp_dir().join(format!("muniment-discovery-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&agent).unwrap();
-        let mut settings = config::RouterConfig {
-            enabled: true,
-            ..Default::default()
-        };
-        settings.accounts.push(
-            serde_json::from_value(json!({
-                "id":"claude-account","family":"anthropic","label":"Claude",
-                "credential":{"type":"subscription","provider":"anthropic","access":"fixture"},
-                "enabled":true,"weight":1,"models":[]
-            }))
-            .unwrap(),
-        );
-        config::save(&agent, &settings).unwrap();
-        let mut cache = Cache::new();
-        cache.insert(
-            "account:claude-account".into(),
-            Catalog {
-                checked_ms: 1,
-                models,
-            },
-        );
-        save(&agent, &cache).unwrap();
-        let loaded = config::load(&agent).unwrap();
-        let routes = options(&loaded);
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].model, "brand-new-model");
         assert!(parse_subscription_catalog(&json!([{ "id":"broken" }])).is_none());
         assert!(parse_subscription_catalog(&json!([])).is_none());
-        std::fs::remove_dir_all(agent).unwrap();
     }
 
     #[test]

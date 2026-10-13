@@ -12,7 +12,7 @@ edition = "2021"
 
 [features]
 # Desktop and runtime HTTPS use the OS certificate verifier.
-tls = ["ureq/tls", "ureq/proxy-from-env", "muniment-router/tls"]
+tls = ["ureq/tls", "ureq/proxy-from-env", "muniment-models/tls", "muniment-router/tls"]
 keyring = ["dep:keyring"]
 network-tests = ["tls"]
 
@@ -31,6 +31,7 @@ quick-xml = "0.41"
 muniment-attach = { path = "../attach", features = ["client"] }
 muniment-code-diff = { path = "../code-diff" }
 muniment-atomic-file = { path = "../atomic-file" }
+muniment-models = { path = "../models" }
 muniment-pins = { path = "../pins" }
 muniment-router = { path = "../router" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }

@@ -4,6 +4,7 @@ members = [
     "crates/attach",
     "crates/atomic-file",
     "crates/code-diff",
+    "crates/models",
     "crates/pins",
     "crates/router",
 ]

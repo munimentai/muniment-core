@@ -13,15 +13,18 @@ issues or pull requests.
 | Crate | Path | What it is |
 | --- | --- | --- |
 | `muniment-core` | `crates/core` | Local runtime logic and storage contracts: the run journal, Pi sidecar supervision and install, memory, projects, attach server, on-device speech and voice. |
-| `muniment-router` | `crates/router` | The multi-account model router: account pools, routing policy, the loopback OpenAI-compatible server, provider model discovery, the `muniment-router` server binary (`server` feature) and the `muniment-router-shadow` binary. |
+| `muniment-models` | `crates/models` | Provider and model knowledge as data: the provider registry, local server kinds and their scan, provider and endpoint model discovery, context windows, the model catalog, and Pi's `models.json`. |
+| `muniment-router` | `crates/router` | The multi-account model router: account pools, routing policy, the loopback OpenAI-compatible server, the `muniment-router` server binary (`server` feature) and the `muniment-router-shadow` binary. |
 | `muniment-pins` | `crates/pins` | Typed constants compiled from `pins/pins.toml`, plus the embedded package lockfile. |
 | `muniment-attach` | `crates/attach` | The reader and companion attach protocol and its client. |
 | `muniment-code-diff` | `crates/code-diff` | Portable code-diff values and fixtures. |
 | `muniment-atomic-file` | `crates/atomic-file` | Atomic file replacement, including the Windows retry path. |
 
-`muniment-core` re-exports `muniment-router` as `muniment_core::model_router`,
-along with `provider_models`, `endpoint_models`, `http` and `atomic_file`, so
-existing `muniment_core::...` paths keep working.
+`muniment-core` re-exports `muniment-models` as `muniment_core::models` and
+`muniment-router` as `muniment_core::model_router`, along with
+`provider_models`, `endpoint_models`, `http` and `atomic_file`, so existing
+`muniment_core::...` paths keep working. `muniment-router` re-exports the
+models modules it routes with, such as `muniment_router::family`.
 
 Desktop-only code (cloud sign-in, cloud chat grants and browser control) lives in
 the desktop. The host supplies it through the `account` and `chat_launch` values
@@ -147,7 +150,7 @@ desktop keeps `policy.offline_only` (loopback endpoints only) and its own
 manages the pool in the configured store and secret source. `muniment-router
 catalog check <file>` checks a catalog file.
 
-The catalog (`crates/router/catalog.toml`) is a list of `[[model]]` tables with
+The catalog (`crates/models/catalog.toml`) is a list of `[[model]]` tables with
 `family`, `model`, `name`, `tier` (`deep`, `balanced` or `fast`), `price` and
 `output` in US dollars per million tokens, `context` (`400K`, `1M`),
 `strengths` and `limits`. A file that fails the check keeps the last good

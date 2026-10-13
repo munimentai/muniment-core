@@ -21,12 +21,14 @@ A module that `muniment-core` re-exports from another workspace crate keeps its 
 | crate | muniment-attach | It defines the reader and companion protocol without the shell. |
 | crate | muniment-atomic-file | It publishes local files atomically. |
 | crate | muniment-code-diff | It defines portable code-diff values and fixtures. |
+| crate | muniment-models | It holds provider and model knowledge as data and renders Pi's `models.json`. |
 | crate | muniment-pins | It pins Pi, its extension packages, and the Claude Code version. |
 | crate | muniment-router | It selects provider accounts and routes model requests. |
 | module | account | It defines the session, device, pairing, and entitlement values attach carries. |
 | module | agent_templates | It imports bounded public agent templates. |
 | module | agents | It stores persistent agents and their conversations. |
 | module | memory_files | It manages user profiles and recoverable memory files. |
+| module | models | It holds provider and model knowledge as data and renders Pi's `models.json`. |
 | module | model_router | It selects local provider accounts and routes model requests. |
 | module | projects | It scopes threads and generated files to project folders. |
 | module | extend | It manages local extensions and per-chat capability snapshots. |
