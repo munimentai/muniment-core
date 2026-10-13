@@ -85,16 +85,17 @@ user step. The runtime admits the client by OS peer identity: the socket
 peer's credentials on macOS and Linux and the pipe client's token on
 Windows. This needs no account.
 
-A runtime in a container runs with no account. Without a pairing it admits
-only clients that reach its socket on its host, such as a mounted socket.
-The factory connects this way. OS peer identity does not cross the container
-boundary, so a container on the same machine as a desktop pairs like any
-server.
+The desktop never needs a container. It runs its own runtime on its machine.
 
-Pairing a desktop with a container is optional, and it uses a free MUNICLOUD
-account, like mobile pairing. A headless server has no camera or screen, so
-the container prints a one-time code, and the user enters it in the desktop.
-The pairing binds the desktop to the same account and gives it a device
+A runtime in a container runs with no account, and every client of a
+container pairs, the factory included. OS peer identity does not cross the
+container boundary, so a container admits no client by it, even on the same
+machine as the client.
+
+Pairing with a container is optional, and it uses a free MUNICLOUD account,
+like mobile pairing. A headless server has no camera or screen, so
+the container prints a one-time code, and the user enters it in the client.
+The pairing binds the client to the same account and gives it a device
 credential that the runtime can revoke. A paired connection goes direct over
 TLS when the server is reachable, and through the MUNICLOUD relay otherwise,
 end-to-end encrypted, like the mobile relay leg. One runtime serves one
