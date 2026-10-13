@@ -129,6 +129,9 @@ pub(super) struct ActiveChatSubscription {
     snapshot_chunks: bool,
     subscription_id: super::Id,
     receiver: crate::run_events::ChatEventSubscription,
+    /// The model service's sign-in steps, sent as `models.login` events on
+    /// the same subscription.
+    model_events: Option<std::sync::mpsc::Receiver<serde_json::Value>>,
 }
 
 pub(super) struct DesktopSessionState {
@@ -176,9 +179,13 @@ impl<S: ThreadListService> DesktopSessionService for S {
     ) -> Result<(Vec<Event>, bool), AttachSessionError> {
         state
             .chat_subscription
-            .as_ref()
+            .as_mut()
             .map_or(Ok((Vec::new(), false)), |subscription| {
-                drain_chat_events(subscription, wait)
+                let mut events = drain_model_events(subscription);
+                let (chat, closed) = drain_chat_events(subscription, wait)?;
+                events.extend(chat);
+                events.extend(drain_model_events(subscription));
+                Ok((events, closed))
             })
     }
 
@@ -207,6 +214,27 @@ impl<S: ThreadListService> DesktopSessionService for S {
             events: failure.events,
         })
     }
+}
+
+/// Takes the sign-in steps already queued. A closed model service ends only
+/// its own events, never the chat subscription.
+fn drain_model_events(subscription: &mut ActiveChatSubscription) -> Vec<Event> {
+    let mut events = Vec::new();
+    while let Some(receiver) = subscription.model_events.as_ref() {
+        match receiver.try_recv() {
+            Ok(body) => events.push(Event {
+                protocol: Protocol,
+                subscription_id: subscription.subscription_id.clone(),
+                event: EventName::ModelsLogin,
+                run_id: None,
+                run_seq: None,
+                body,
+            }),
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => subscription.model_events = None,
+        }
+    }
+    events
 }
 
 /// Waits up to `wait` for the first chat event, then takes the events that
@@ -534,6 +562,12 @@ pub(super) fn dispatch_request<S: ThreadListService>(
         });
     }
     request.validate_idempotency_key()?;
+    if request.operation == Operation::ModelsRequest {
+        let model_request = super::ModelRequest::from_body(&request.body)
+            .ok_or_else(ProtocolError::invalid_request)?;
+        let result = service.models_request(model_request, request.idempotency_key.as_ref())?;
+        return bounded_response(serde_json::json!({"result": result}));
+    }
     if request.operation == Operation::ArtifactWindow {
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -757,6 +791,8 @@ pub(super) fn dispatch_request<S: ThreadListService>(
         let body: Body =
             serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
         let receiver = service.subscribe_chat_events()?;
+        // A runtime without a model service still serves chat events.
+        let model_events = service.subscribe_model_events().ok();
         let mut subscription_random = [0u8; 16];
         getrandom::fill(&mut subscription_random)
             .map_err(|_| ProtocolError::persistence_failed())?;
@@ -766,6 +802,7 @@ pub(super) fn dispatch_request<S: ThreadListService>(
             snapshot_chunks: body.snapshot_chunks,
             subscription_id: subscription_id.clone(),
             receiver,
+            model_events,
         });
         return Ok(response_only(serde_json::json!({
             "subscription_id": subscription_id,

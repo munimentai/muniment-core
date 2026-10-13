@@ -91,12 +91,18 @@ impl fmt::Debug for Request {
 }
 
 impl Request {
-    /// Enforces the operation-level idempotency policy from ADR 0009.
+    /// Enforces the operation-level idempotency policy from ADR 0009. A
+    /// `models.request` takes its policy from its action.
     pub fn validate_idempotency_key(&self) -> Result<(), ProtocolError> {
-        match (
-            self.operation.requires_idempotency_key(),
-            self.idempotency_key.is_some(),
-        ) {
+        let required = if self.operation == Operation::ModelsRequest {
+            crate::models::ModelRequest::from_body(&self.body)
+                .ok_or_else(ProtocolError::invalid_request)?
+                .action
+                .mutates()
+        } else {
+            self.operation.requires_idempotency_key()
+        };
+        match (required, self.idempotency_key.is_some()) {
             (true, false) => Err(ProtocolError::idempotency_key_required()),
             (false, true) => Err(ProtocolError::idempotency_key_forbidden()),
             _ => Ok(()),
@@ -365,9 +371,14 @@ pub enum Operation {
     ContextSettings,
     #[serde(rename = "context.settings_save")]
     ContextSettingsSave,
+    #[serde(rename = "models.request")]
+    ModelsRequest,
 }
 
 impl Operation {
+    /// Whether every request of the operation carries an idempotency key. A
+    /// `models.request` carries one when its action mutates, so this answers
+    /// false for it and `Request::validate_idempotency_key` reads the action.
     pub fn requires_idempotency_key(self) -> bool {
         matches!(
             self,
@@ -459,6 +470,7 @@ impl Operation {
             Self::ThreadCompact => "thread.compact",
             Self::ContextSettings => "context.settings",
             Self::ContextSettingsSave => "context.settings_save",
+            Self::ModelsRequest => "models.request",
         }
     }
 }
@@ -483,6 +495,10 @@ pub enum EventName {
     CapabilityRevoked,
     #[serde(rename = "stream.closed")]
     StreamClosed,
+    /// One step of a provider sign-in the model service runs, on the
+    /// chat-event subscription.
+    #[serde(rename = "models.login")]
+    ModelsLogin,
     #[serde(untagged)]
     Unknown(BoundedEventName),
 }

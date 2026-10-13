@@ -9,8 +9,8 @@ use crate::protocol_helpers::{
 };
 use crate::{
     encode_frame, Authorization, Client, DesktopClientAuthorizedGrant, Envelope, EventName, Hello,
-    Id, Operation, Protocol, Request, Response, SnapshotAssembly, VersionRange, Welcome,
-    MAX_TEXT_LENGTH, PROTOCOL,
+    Id, ModelAction, Operation, Protocol, Request, Response, SnapshotAssembly, VersionRange,
+    Welcome, MAX_TEXT_LENGTH, PROTOCOL,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,6 +23,15 @@ const MAX_THREAD_ID_LENGTH: usize = 36;
 const MAX_CURSOR_LENGTH: usize = 1024;
 const MAX_RUN_MESSAGE_TEXT_LENGTH: usize = 32 * 1024;
 const MAX_PERMISSION_GATE_ID_LENGTH: usize = 256;
+
+/// One event of the chat-event subscription.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SubscriptionEvent {
+    /// A run's chat event.
+    Chat(Value),
+    /// One step of a provider sign-in, the `local-mode-login` payload.
+    ModelsLogin(Value),
+}
 
 /// A connection-bound client for the peer-authorized desktop session.
 pub struct DesktopClient {
@@ -500,7 +509,19 @@ impl DesktopClient {
         Ok(result)
     }
 
+    /// Reads the next chat event, passing over the sign-in steps the same
+    /// subscription carries.
     pub fn read_chat_event(&mut self) -> Result<Value, ClientError> {
+        loop {
+            if let SubscriptionEvent::Chat(event) = self.read_subscription_event()? {
+                return Ok(event);
+            }
+        }
+    }
+
+    /// Reads the next event of the chat-event subscription: a chat event, or
+    /// one step of a provider sign-in the model service runs.
+    pub fn read_subscription_event(&mut self) -> Result<SubscriptionEvent, ClientError> {
         let subscription_id = self
             .chat_subscription_id
             .as_ref()
@@ -540,14 +561,20 @@ impl DesktopClient {
                 return Err(ClientError::CapabilityRevoked);
             }
             if &event.subscription_id != subscription_id
-                || event.event != EventName::ChatEvent
+                || !matches!(event.event, EventName::ChatEvent | EventName::ModelsLogin)
                 || event.run_id.is_some()
                 || event.run_seq.is_some()
             {
                 return Err(ClientError::UnexpectedMessage);
             }
+            if event.event == EventName::ModelsLogin {
+                if !event.body.is_object() {
+                    return Err(ClientError::UnexpectedMessage);
+                }
+                return Ok(SubscriptionEvent::ModelsLogin(event.body));
+            }
             if let Some(body) = snapshot.push(event.body).map_err(map_frame_error)? {
-                return Ok(body);
+                return Ok(SubscriptionEvent::Chat(body));
             }
             // The first chunk ends the idle wait. Bound the remaining snapshot I/O.
             read_deadline = read_deadline.min(deadline(self.io_timeout));
@@ -684,6 +711,38 @@ impl DesktopClient {
             }),
             &["enabled", "reserve_tokens", "keep_recent_tokens"],
         )
+    }
+
+    /// Runs one model service action and answers its result. A mutating
+    /// action carries a fresh idempotency key, and the wait is the action's.
+    pub fn models_request(
+        &mut self,
+        action: ModelAction,
+        data: Value,
+    ) -> Result<Value, ClientError> {
+        if !data.is_object() {
+            return Err(ClientError::UnexpectedMessage);
+        }
+        let idempotency_key = if action.mutates() {
+            Some(fresh_request_id()?)
+        } else {
+            None
+        };
+        let body = self
+            .request_before(
+                Operation::ModelsRequest,
+                idempotency_key,
+                serde_json::json!({"action": action, "data": data}),
+                deadline(action.timeout()),
+            )?
+            .body;
+        let mut object = match body {
+            Value::Object(object) => object,
+            _ => return Err(ClientError::UnexpectedMessage),
+        };
+        object
+            .remove("result")
+            .ok_or(ClientError::UnexpectedMessage)
     }
 
     pub fn record_sql(&mut self, body: Value) -> Result<Value, ClientError> {

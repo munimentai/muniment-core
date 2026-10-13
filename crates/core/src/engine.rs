@@ -6,6 +6,7 @@
 //! `pi_execution` and `pi_settings` modules, and only the adapter reads Pi RPC
 //! frames, Pi session files and Pi settings files.
 
+mod pi_cli;
 mod pi_rpc;
 mod thread_context;
 
@@ -19,6 +20,10 @@ use crate::active_run::ChatDelivery;
 use crate::sidecar::pi_chat::{ExtensionUiAnswer, ExtensionUiRequest};
 use crate::sidecar::SidecarStatus;
 
+pub use pi_cli::{
+    is_paste_prompt, parse_model_table, PiModelRow, PiSignIn, PiSignInSteps, SignInPages,
+    SignInStep,
+};
 pub use pi_rpc::{OpenStage, PiOpen, PiRpcEngine};
 pub use thread_context::{CompactionPhase, CompactionState, ThreadContextSnapshot, ThreadContexts};
 

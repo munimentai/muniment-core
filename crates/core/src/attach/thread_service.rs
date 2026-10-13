@@ -576,6 +576,22 @@ pub trait ThreadListService {
     ) -> Result<crate::run_events::ChatEventSubscription, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
+
+    /// Runs one model service action. A mutating action carries its key.
+    fn models_request(
+        &mut self,
+        _request: super::ModelRequest,
+        _idempotency_key: Option<&super::Id>,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
+    /// Subscribes to the sign-in steps the model service reports.
+    fn subscribe_model_events(
+        &mut self,
+    ) -> Result<std::sync::mpsc::Receiver<serde_json::Value>, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
 }
 
 impl<F> ThreadListService for F

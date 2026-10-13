@@ -22,6 +22,7 @@ pub mod host;
 mod macos_attach_loop;
 #[cfg(target_os = "linux")]
 mod migration;
+pub mod models;
 mod reader;
 mod reader_csv;
 mod reader_mapping;

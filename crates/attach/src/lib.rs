@@ -53,6 +53,7 @@ mod desktop_supervisor;
 mod envelope;
 pub mod fixtures;
 mod framing;
+mod models;
 mod negotiation;
 #[cfg(feature = "client")]
 mod presenter_client;
@@ -68,7 +69,7 @@ pub use client::*;
 #[cfg(feature = "client")]
 pub use client_stream::ClientStream;
 #[cfg(feature = "client")]
-pub use desktop_client::{handshake_desktop_client, DesktopClient};
+pub use desktop_client::{handshake_desktop_client, DesktopClient, SubscriptionEvent};
 #[cfg(feature = "client")]
 pub use desktop_client_holder::DesktopClientHolder;
 #[cfg(feature = "client")]
@@ -77,6 +78,7 @@ pub use desktop_client_stop::DesktopClientStopHandle;
 pub use desktop_supervisor::{serve_desktop_client_with, DesktopClientSupervisorStop};
 pub use envelope::*;
 pub use framing::*;
+pub use models::*;
 pub use negotiation::*;
 #[cfg(feature = "client")]
 pub use presenter_client::{

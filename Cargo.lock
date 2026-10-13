@@ -1245,6 +1245,9 @@ dependencies = [
  "muniment-attach",
  "muniment-core",
  "rusqlite",
+ "serde",
+ "url",
+ "uuid",
 ]
 
 [[package]]

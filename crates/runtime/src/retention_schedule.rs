@@ -15,7 +15,9 @@ pub enum RetentionScheduleCommand {
 
 /// Applies the recorded retention choice at start and every `interval`, and
 /// checks agent schedules between, until a stop arrives. `checked` hears each
-/// retention pass.
+/// retention pass. The schedule starts once the runtime owns its endpoint, so
+/// it also starts the model router its record turns on, and stops the router
+/// when it ends.
 pub fn start_retention_schedule(
     state: Arc<RuntimeAttachState>,
     interval: Duration,
@@ -23,6 +25,7 @@ pub fn start_retention_schedule(
     checked: Option<Sender<()>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
+        state.models().restore_router();
         apply_recorded_retention(&state, checked.as_ref());
         let mut retention_checked_at = std::time::Instant::now();
         loop {
@@ -31,7 +34,8 @@ pub fn start_retention_schedule(
             }
             match commands.recv_timeout(interval.min(Duration::from_secs(15))) {
                 Ok(RetentionScheduleCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    break
+                    state.models().stop();
+                    break;
                 }
                 Ok(RetentionScheduleCommand::Recheck) => {
                     apply_recorded_retention(&state, checked.as_ref());

@@ -1733,6 +1733,22 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
     ) -> Result<crate::run_events::ChatEventSubscription, ProtocolError> {
         self.boundaries.subscribe_chat_events()
     }
+
+    #[cfg(any(unix, target_os = "windows"))]
+    fn models_request(
+        &mut self,
+        request: super::ModelRequest,
+        idempotency_key: Option<&Id>,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        self.boundaries.models_request(request, idempotency_key)
+    }
+
+    #[cfg(any(unix, target_os = "windows"))]
+    fn subscribe_model_events(
+        &mut self,
+    ) -> Result<std::sync::mpsc::Receiver<serde_json::Value>, ProtocolError> {
+        self.boundaries.subscribe_model_events()
+    }
 }
 
 fn attach_provenance(

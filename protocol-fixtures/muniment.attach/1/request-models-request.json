@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"0000000000000000000000000000009d","operation":"models.request","capability":"fixture-capability","idempotency_key":"00000000000000000000000000000101","body":{"action":"router_set_enabled","data":{"enabled":true}}}

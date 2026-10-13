@@ -24,7 +24,7 @@ A module that `muniment-core` re-exports from another workspace crate keeps its 
 | crate | muniment-models | It holds provider and model knowledge as data and renders Pi's `models.json`. |
 | crate | muniment-pins | It pins Pi, its extension packages, and the Claude Code version. |
 | crate | muniment-router | It selects provider accounts and routes model requests. |
-| crate | muniment-runtime-core | It runs the platform-neutral runtime: attach serving, runs, schedules and the record service. |
+| crate | muniment-runtime-core | It runs the platform-neutral runtime: attach serving, runs, schedules, the record service and the model service. |
 | module | account | It defines the session, device, pairing, and entitlement values attach carries. |
 | module | agent_templates | It imports bounded public agent templates. |
 | module | agents | It stores persistent agents and their conversations. |
@@ -128,7 +128,7 @@ The host supplies desktop behavior through port-owned values and traits.
 Its defaults answer that the cloud is unavailable, so a host without cloud accounts runs locally.
 `PiLaunchBoundaries::browser_host` answers the host's browser for the `browser` tool. Its default answers none.
 `process_reader` reads Linux process identities for attach peers and for the desktop's browser control.
-`muniment-runtime-core` takes the host's cloud account, chat grants, credential store and executable paths as one `RuntimeHost` value.
+`muniment-runtime-core` takes the host's cloud account, chat grants, credential store, provider OAuth clients, sign-in page and executable paths as one `RuntimeHost` value.
 Its defaults answer that the cloud is unavailable, and the host binary registers the runtime with the OS service manager.
 
 ## Check

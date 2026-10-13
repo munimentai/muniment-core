@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","subscription_id":"00000000000000000000000000000190","event":"models.login","body":{"id":"s1","kind":"select","options":["Browser","Device code"],"provider":"openai-codex","stage":"prompt","title":"Choose a sign-in method"}}

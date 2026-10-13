@@ -1,5 +1,4 @@
-use crate::desktop_client::DesktopClient;
-use serde_json::Value;
+use crate::desktop_client::{DesktopClient, SubscriptionEvent};
 use std::time::Duration;
 
 pub trait ChatEventSupervisorStop {
@@ -13,7 +12,7 @@ pub fn serve_chat_events_with<S>(
     stop: S,
     retry_interval: Duration,
     mut observe: impl FnMut(bool),
-    mut deliver: impl FnMut(Value),
+    mut deliver: impl FnMut(SubscriptionEvent),
 ) where
     S: ChatEventSupervisorStop,
 {
@@ -25,7 +24,7 @@ pub fn serve_chat_events_with<S>(
         if let Some(mut client) = connect() {
             if client.subscribe_chat_events().is_ok() {
                 observe(true);
-                while let Ok(event) = client.read_chat_event() {
+                while let Ok(event) = client.read_subscription_event() {
                     deliver(event);
                 }
                 observe(false);
@@ -40,7 +39,7 @@ pub fn serve_chat_events_with<S>(
 
 #[cfg(test)]
 mod tests {
-    use super::{serve_chat_events_with, ChatEventSupervisorStop};
+    use super::{serve_chat_events_with, ChatEventSupervisorStop, SubscriptionEvent};
     use crate::{
         encode_frame, handshake_desktop_client, reconnect_welcome, ClientStream, Event, EventName,
         Id, Protocol, Response, Success,
@@ -196,7 +195,10 @@ mod tests {
         );
 
         assert_eq!(observed, [true, false]);
-        assert_eq!(delivered, [json!({"message": "hello"})]);
+        assert_eq!(
+            delivered,
+            [SubscriptionEvent::Chat(json!({"message": "hello"}))]
+        );
     }
 
     #[test]
@@ -218,7 +220,13 @@ mod tests {
         );
 
         assert_eq!(observed, [true, false, true, false]);
-        assert_eq!(delivered, [json!({"attempt": 1}), json!({"attempt": 2})]);
+        assert_eq!(
+            delivered,
+            [
+                SubscriptionEvent::Chat(json!({"attempt": 1})),
+                SubscriptionEvent::Chat(json!({"attempt": 2}))
+            ]
+        );
         assert!(clients.is_empty());
     }
 

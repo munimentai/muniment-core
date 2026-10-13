@@ -114,7 +114,8 @@ impl ChatEventSupervisorStop for WindowsChatEventStopHandle {
     }
 }
 
-/// Serves a reconnecting chat-event subscription over the current user's Windows attach endpoint.
+/// Serves a reconnecting chat-event subscription over the current user's Windows attach
+/// endpoint. `deliver` hears each chat event and each provider sign-in step.
 #[cfg(target_os = "windows")]
 pub fn serve_windows_chat_events(
     client_version: &str,
@@ -122,7 +123,7 @@ pub fn serve_windows_chat_events(
     retry_interval: Duration,
     stop: WindowsChatEventStopHandle,
     observe: impl FnMut(bool),
-    deliver: impl FnMut(serde_json::Value),
+    deliver: impl FnMut(muniment_attach::SubscriptionEvent),
 ) {
     let connection_stop = stop.clone();
     muniment_attach::serve_chat_events_with(
