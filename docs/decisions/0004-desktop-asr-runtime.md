@@ -91,6 +91,18 @@ decodes appear incremental, but that is simulated streaming and must not be
 described as token streaming. For each utterance the first transcript is the
 final ASR transcript; Gemma polish begins only after that result.
 
+The recognizer runs one of two decoding modes, fixed when it is created.
+Greedy search is the default and ignores custom vocabulary. Hotwords mode runs
+modified beam search with four active paths, `bpe` modeling units and a hotword
+score of `1.5`, and biases each utterance toward the custom words passed with
+it. The pinned artifact ships no SentencePiece vocabulary, so hotwords mode
+derives `hotwords-bpe.vocab` from the verified `tokens.txt` and writes it into
+the revision directory. That file is not a manifest artifact and carries no
+digest. Each custom word is trimmed and capped at 64 characters, and a set holds
+at most 256 words. A word with a control character, a `/`, or a part that starts
+with `:` is dropped, because the native parser reads those as separators or
+scores.
+
 The 25 supported languages are Bulgarian (`bg`), Croatian (`hr`), Czech (`cs`),
 Danish (`da`), Dutch (`nl`), English (`en`), Estonian (`et`), Finnish (`fi`),
 French (`fr`), German (`de`), Greek (`el`), Hungarian (`hu`), Italian (`it`),

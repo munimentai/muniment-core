@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use muniment_core::asr::validation::{load_manifest, run_cases, MAX_ENDURANCE_DECODE_COUNT};
+use muniment_core::asr::validation::{
+    load_manifest, run_cases, ValidationDecoder, MAX_ENDURANCE_DECODE_COUNT,
+};
 use muniment_core::asr::{
-    AsrRevisionLifecycle, OfflineParakeetRecognizer, PARAKEET_MODEL_MANIFEST,
-    PARAKEET_MODEL_MANIFESTS,
+    AsrRevisionLifecycle, OfflineParakeetRecognizer, ParakeetDecoding, ParakeetHotwords,
+    PARAKEET_MODEL_MANIFEST, PARAKEET_MODEL_MANIFESTS,
 };
 
 fn main() {
@@ -23,17 +25,40 @@ fn run() -> Result<(), String> {
         &PARAKEET_MODEL_MANIFEST,
     )
     .map_err(|error| error.to_string())?;
+    let hotwords = match &arguments.hotwords {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|error| format!("read {}: {error}", path.display()))?;
+            let lines: Vec<&str> = text.lines().collect();
+            let hotwords = ParakeetHotwords::new(&lines);
+            if hotwords.is_empty() {
+                return Err("--hotwords holds no usable entry".into());
+            }
+            Some(hotwords)
+        }
+        None => None,
+    };
+    let decoding = if hotwords.is_some() {
+        ParakeetDecoding::Hotwords
+    } else {
+        ParakeetDecoding::Greedy
+    };
     let load_started = Instant::now();
-    let recognizer = OfflineParakeetRecognizer::from_verified_current(&lifecycle)
-        .map_err(|error| error.to_string())?;
+    let recognizer =
+        OfflineParakeetRecognizer::from_verified_current_with_decoding(&lifecycle, decoding)
+            .map_err(|error| error.to_string())?;
     let load_seconds = load_started.elapsed().as_secs_f64();
+    let decoder = BiasedRecognizer {
+        recognizer,
+        hotwords: hotwords.unwrap_or_default(),
+    };
     let report = run_cases(
         &manifest,
         arguments
             .manifest
             .parent()
             .unwrap_or(std::path::Path::new(".")),
-        &recognizer,
+        &decoder,
         load_seconds,
         PARAKEET_MODEL_MANIFEST.revision,
         &arguments.machine_tier,
@@ -45,12 +70,27 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+/// Decodes every case with the custom vocabulary from `--hotwords`, if any.
+struct BiasedRecognizer {
+    recognizer: OfflineParakeetRecognizer,
+    hotwords: ParakeetHotwords,
+}
+
+impl ValidationDecoder for BiasedRecognizer {
+    fn decode(&self, sample_rate: u32, samples: &[f32]) -> Result<String, String> {
+        self.recognizer
+            .decode_with_hotwords(sample_rate, samples, &self.hotwords)
+            .map_err(|error| error.to_string())
+    }
+}
+
 struct Arguments {
     model_root: PathBuf,
     manifest: PathBuf,
     output: PathBuf,
     machine_tier: String,
     endurance_decode_count: Option<usize>,
+    hotwords: Option<PathBuf>,
 }
 
 impl Arguments {
@@ -60,6 +100,7 @@ impl Arguments {
         let mut output = None;
         let mut machine_tier = None;
         let mut endurance_decode_count = None;
+        let mut hotwords = None;
         let mut arguments = arguments;
         while let Some(flag) = arguments.next() {
             let value = arguments.next().ok_or_else(usage)?;
@@ -67,6 +108,7 @@ impl Arguments {
                 Some("--model-root") if model_root.is_none() => model_root = Some(value.into()),
                 Some("--manifest") if manifest.is_none() => manifest = Some(value.into()),
                 Some("--output") if output.is_none() => output = Some(value.into()),
+                Some("--hotwords") if hotwords.is_none() => hotwords = Some(value.into()),
                 Some("--machine-tier") if machine_tier.is_none() => {
                     machine_tier = value.into_string().ok()
                 }
@@ -92,6 +134,7 @@ impl Arguments {
             output: output.ok_or_else(usage)?,
             machine_tier: machine_tier.ok_or_else(usage)?,
             endurance_decode_count,
+            hotwords,
         };
         if parsed.machine_tier.trim().is_empty() {
             return Err("--machine-tier must not be empty".into());
@@ -104,7 +147,7 @@ impl Arguments {
 }
 
 fn usage() -> String {
-    "usage: parakeet-eval --model-root <ASR lifecycle root> --manifest <corpus.json> --output <report.json> --machine-tier <tier> [--endurance-utterances <1..=100>]".into()
+    "usage: parakeet-eval --model-root <ASR lifecycle root> --manifest <corpus.json> --output <report.json> --machine-tier <tier> [--endurance-utterances <1..=100>] [--hotwords <one entry per line>]".into()
 }
 
 #[cfg(test)]
@@ -158,5 +201,33 @@ mod tests {
         assert!(arguments("101").is_err());
         assert!(arguments("nope").is_err());
         assert_eq!(arguments("100").unwrap().endurance_decode_count, Some(100));
+    }
+
+    #[test]
+    fn reads_an_optional_hotwords_file() {
+        let arguments = |extra: &[&'static str]| {
+            Arguments::parse(
+                [
+                    "--model-root",
+                    "model",
+                    "--manifest",
+                    "corpus.json",
+                    "--output",
+                    "report.json",
+                    "--machine-tier",
+                    "tier",
+                ]
+                .into_iter()
+                .chain(extra.iter().copied())
+                .map(Into::into),
+            )
+        };
+        assert_eq!(arguments(&[]).unwrap().hotwords, None);
+        assert_eq!(
+            arguments(&["--hotwords", "words.txt"]).unwrap().hotwords,
+            Some(PathBuf::from("words.txt"))
+        );
+        assert!(arguments(&["--hotwords"]).is_err());
+        assert!(arguments(&["--hotwords", "a.txt", "--hotwords", "b.txt"]).is_err());
     }
 }
