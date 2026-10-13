@@ -383,34 +383,58 @@ fn blocked_probe_cannot_delay_startup_timeout_or_become_healthy() {
     let mut cfg = config(&["echo"]);
     cfg.startup_timeout = Duration::from_millis(10);
     cfg.restart.max_restarts = 0;
+    // The failure report waits for the stub child to stop, up to one shutdown
+    // grace period, and for its stderr to close, up to another. The child's
+    // launch and exit alone can take hundreds of milliseconds on a busy macOS
+    // host, so the bound covers both periods with a margin. A timeout that
+    // waited on the blocked probe would exceed it.
+    let failure_bound = cfg.startup_timeout + 2 * cfg.shutdown_timeout + Duration::from_secs(1);
     let (release_probe, blocked_probe) = std::sync::mpsc::channel();
     let blocked_probe = Arc::new(std::sync::Mutex::new(blocked_probe));
+    let (probe_returned, returned_probe) = std::sync::mpsc::channel();
+    let probe_returned = std::sync::Mutex::new(probe_returned);
     let probe_started = Arc::new(AtomicUsize::new(0));
     let started = Arc::clone(&probe_started);
     let supervisor = SidecarSupervisor::spawn(cfg, move |_| {
         started.store(1, Ordering::SeqCst);
         blocked_probe.lock().unwrap().recv().unwrap();
+        let _ = probe_returned.lock().unwrap().send(());
         Ok(ProbeOutcome::Ready)
     })
     .unwrap();
+    // Dropped before the supervisor, so a failed assertion opens the gate and
+    // a supervisor that waits on the probe can still stop.
+    let release_probe = ProbeRelease(Some(release_probe));
     let events = supervisor.subscribe();
     assert_eq!(next_event(&events).status, SidecarStatus::Starting);
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + STUB_RESPONSE_DEADLINE;
     while probe_started.load(Ordering::SeqCst) == 0 {
         assert!(Instant::now() < deadline, "probe did not start");
         thread::yield_now();
     }
-    let timeout_started = Instant::now();
-    let failed = next_event(&events);
-    assert!(timeout_started.elapsed() < Duration::from_millis(200));
+    // Only the test opens the gate, so the probe is still blocked when the
+    // failure arrives.
+    let failed = events
+        .recv_timeout(failure_bound)
+        .expect("the startup timeout waited on the blocked probe");
     assert_eq!(failed.status, SidecarStatus::Failed);
     assert!(matches!(
         failed.cause,
         Some(SidecarEventCause::StartupTimeout { timeout, .. })
             if timeout == Duration::from_millis(10)
     ));
-    assert!(events.recv_timeout(Duration::from_millis(25)).is_err());
-    release_probe.send(()).unwrap();
+    assert!(returned_probe.try_recv().is_err());
+    // A Ready answer after the timeout must not report the generation healthy.
+    // The terminal failure closes the event stream, so no event can follow it.
+    drop(release_probe);
+    returned_probe
+        .recv_timeout(STUB_RESPONSE_DEADLINE)
+        .expect("the released probe did not return");
+    assert_eq!(
+        events.recv_timeout(STUB_RESPONSE_DEADLINE),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    );
+    assert_eq!(supervisor.status(), SidecarStatus::Failed);
 }
 
 #[test]
