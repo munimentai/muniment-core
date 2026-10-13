@@ -362,6 +362,56 @@ fn brand_background_task_paths(directory: &Path) -> io::Result<()> {
     Ok(())
 }
 
+// The pinned package can load compiled JavaScript instead of its sources.
+// Brand the compiled paths the same way. A package without a manifest or
+// without compiled extensions keeps its sources only.
+fn brand_compiled_background_tasks(directory: &Path) -> io::Result<()> {
+    let package = directory.join("node_modules/pi-background-tasks");
+    let manifest: serde_json::Value = match fs::read(package.join("package.json")) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let compiled = manifest["pi"]["extensions"]
+        .as_array()
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry
+                    .as_str()
+                    .is_some_and(|entry| entry.starts_with("./dist/"))
+            })
+        });
+    if !compiled {
+        return Ok(());
+    }
+    for (relative, old, new) in [
+        ("dist/src/core/registry.js", "'.pi'", "'.muniment'"),
+        (
+            "dist/src/core/delegate/artifacts.js",
+            "'.pi'",
+            "'.muniment'",
+        ),
+        ("dist/src/core/fusion/artifacts.js", "'.pi'", "'.muniment'"),
+        ("dist/src/extension.js", ".pi/tasks", ".muniment/tasks"),
+        (
+            "dist/src/core/attested-pi-run.js",
+            "parts[0] === '.pi'",
+            "['.pi', '.muniment'].includes(parts[0])",
+        ),
+    ] {
+        let path = package.join(relative);
+        let source = fs::read_to_string(&path)?;
+        if source.contains(old) {
+            crate::model_router::config::write_private(&path, source.replace(old, new).as_bytes())?;
+        } else if !source.contains(new) {
+            return Err(io::Error::other(
+                "The background task storage path is unavailable.",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Acquire packages before RPC starts. The caller supplies the verified executable.
 pub fn prepare_pi_packages(agent_directory: &Path, executable: &Path) -> io::Result<()> {
     let directory = agent_directory.join("npm");
@@ -408,7 +458,8 @@ pub fn prepare_pi_packages(agent_directory: &Path, executable: &Path) -> io::Res
         }
     }
     if fs::read(&marker).is_ok_and(|bytes| bytes == identity) && installed(&directory) {
-        return brand_background_task_paths(&directory);
+        brand_background_task_paths(&directory)?;
+        return brand_compiled_background_tasks(&directory);
     }
     // A failed or interrupted install must retry, even if it wrote the top-level manifests.
     match fs::remove_file(&marker) {
@@ -432,6 +483,7 @@ pub fn prepare_pi_packages(agent_directory: &Path, executable: &Path) -> io::Res
         ));
     }
     brand_background_task_paths(&directory)?;
+    brand_compiled_background_tasks(&directory)?;
     let mut file = fs::File::create(marker)?;
     file.write_all(&identity)?;
     file.sync_all()
@@ -440,6 +492,79 @@ pub fn prepare_pi_packages(agent_directory: &Path, executable: &Path) -> io::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compiled_paths_are_branded_idempotently_without_changing_user_files() {
+        let root =
+            std::env::temp_dir().join(format!("compiled-task-paths-{}", uuid::Uuid::now_v7()));
+        let package = root.join("node_modules/pi-background-tasks");
+        fs::create_dir_all(package.join("dist/src/core/delegate")).unwrap();
+        fs::create_dir_all(package.join("dist/src/core/fusion")).unwrap();
+        assert!(brand_compiled_background_tasks(&root).is_ok());
+        fs::write(
+            package.join("package.json"),
+            r#"{"pi":{"extensions":["./dist/extensions/background-tasks.js"]}}"#,
+        )
+        .unwrap();
+        for (file, source) in [
+            (
+                "core/registry.js",
+                "join(cwd, '.pi', 'tasks'); join('.pi', 'tasks');",
+            ),
+            (
+                "core/delegate/artifacts.js",
+                "join(options.cwd, '.pi', 'delegate', runDirName); join('.pi', 'delegate', runDirName, options.taskId);",
+            ),
+            (
+                "core/fusion/artifacts.js",
+                "join(options.cwd, '.pi', 'fusion', sessionDirName, runId); join('.pi', 'fusion', sessionDirName, runId);",
+            ),
+            ("extension.js", "Output is written to .pi/tasks"),
+            (
+                "core/attested-pi-run.js",
+                "parts[0] === '.pi' && parts[1] === 'tasks'",
+            ),
+        ] {
+            fs::write(package.join("dist/src").join(file), source).unwrap();
+        }
+        fs::create_dir_all(root.join("workspace/.pi")).unwrap();
+        fs::write(root.join("workspace/.pi/keep"), "user data").unwrap();
+        for _ in 0..2 {
+            brand_compiled_background_tasks(&root).unwrap();
+            assert_eq!(
+                fs::read_to_string(package.join("dist/src/core/registry.js")).unwrap(),
+                "join(cwd, '.muniment', 'tasks'); join('.muniment', 'tasks');"
+            );
+            for tool in ["delegate", "fusion"] {
+                let source =
+                    fs::read_to_string(package.join(format!("dist/src/core/{tool}/artifacts.js")))
+                        .unwrap();
+                assert!(!source.contains("'.pi'"));
+                assert_eq!(source.matches("'.muniment'").count(), 2);
+            }
+            assert_eq!(
+                fs::read_to_string(package.join("dist/src/extension.js")).unwrap(),
+                "Output is written to .muniment/tasks"
+            );
+            assert_eq!(
+                fs::read_to_string(package.join("dist/src/core/attested-pi-run.js")).unwrap(),
+                "['.pi', '.muniment'].includes(parts[0]) && parts[1] === 'tasks'"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(root.join("workspace/.pi/keep")).unwrap(),
+            "user data"
+        );
+        fs::write(
+            package.join("dist/src/core/registry.js"),
+            "unexpected layout",
+        )
+        .unwrap();
+        assert!(brand_compiled_background_tasks(&root).is_err());
+        fs::remove_file(package.join("dist/src/core/registry.js")).unwrap();
+        assert!(brand_compiled_background_tasks(&root).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn background_fixture(npm: &Path) {
         let package = npm.join("node_modules/pi-background-tasks/src");
