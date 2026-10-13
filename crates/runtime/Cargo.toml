@@ -1,0 +1,17 @@
+[package]
+name = "muniment-runtime-core"
+version = "0.0.1"
+edition = "2021"
+
+# The platform-neutral runtime: attach serving, runs, schedules and the
+# company record service. The host binary supplies cloud accounts, chat
+# grants, credential storage and its own executables through `RuntimeHost`,
+# and registers the binary with the OS service manager.
+
+[dependencies]
+muniment-attach = { path = "../attach", features = ["client"] }
+muniment-core = { path = "../core", features = ["keyring"] }
+
+[dev-dependencies]
+# The journal tests drop tables to build missing-table fixtures.
+rusqlite = { version = "0.32", features = ["bundled"] }

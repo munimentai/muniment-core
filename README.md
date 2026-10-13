@@ -15,6 +15,7 @@ issues or pull requests.
 | `muniment-core` | `crates/core` | Local runtime logic and storage contracts: the run journal, Pi sidecar supervision and install, memory, projects, attach server, on-device speech and voice. |
 | `muniment-models` | `crates/models` | Provider and model knowledge as data: the provider registry, local server kinds and their scan, provider and endpoint model discovery, context windows, the model catalog, and Pi's `models.json`. |
 | `muniment-router` | `crates/router` | The multi-account model router: account pools, routing policy, the loopback OpenAI-compatible server, the `muniment-router` server binary (`server` feature) and the `muniment-router-shadow` binary. |
+| `muniment-runtime-core` | `crates/runtime` | The platform-neutral runtime: attach serving and its accept loops, runs, retention and agent schedules, the company record and reader service, and `run_runtime`, the entry a host without OS service registration runs. The host supplies cloud accounts, chat grants, credential storage and its executables through `RuntimeHost`. |
 | `muniment-pins` | `crates/pins` | Typed constants compiled from `pins/pins.toml`, plus the embedded package lockfile. |
 | `muniment-attach` | `crates/attach` | The reader and companion attach protocol and its client. |
 | `muniment-code-diff` | `crates/code-diff` | Portable code-diff values and fixtures. |
@@ -27,8 +28,9 @@ issues or pull requests.
 models modules it routes with, such as `muniment_router::family`.
 
 Desktop-only code (cloud sign-in, cloud chat grants and browser control) lives in
-the desktop. The host supplies it through the `account` and `chat_launch` values
-and the `PiLaunchBoundaries` and `RunAttachBoundaries` traits.
+the desktop. The host supplies it through the `account` and `chat_launch` values,
+the `PiLaunchBoundaries` and `RunAttachBoundaries` traits, and the runtime's
+`RuntimeHost` value.
 `docs/decisions/0030-public-core-boundary.md` lists every module and crate and
 `scripts/check-core-boundary.sh` enforces the boundary.
 
