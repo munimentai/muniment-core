@@ -136,6 +136,11 @@ impl ThreadContexts {
         self.with(thread_id, |context| context.snapshot())
     }
 
+    /// Whether a manual compaction of the thread runs.
+    pub fn compacting(&self, thread_id: &str) -> bool {
+        self.with(thread_id, |context| context.snapshot().compacting)
+    }
+
     /// Records the start of a manual compaction. It refuses while another
     /// compaction of the thread runs.
     pub fn begin_compaction(&self, thread_id: &str, run_id: &str) -> Result<(), String> {
@@ -265,6 +270,8 @@ mod tests {
     fn a_compaction_refuses_a_second_start_and_reports_its_outcome() {
         let contexts = ThreadContexts::new();
         contexts.begin_compaction("thread", "run-1").unwrap();
+        assert!(contexts.compacting("thread"));
+        assert!(!contexts.compacting("other"));
         assert_eq!(
             contexts.begin_compaction("thread", "run-2").unwrap_err(),
             "This thread is already compacting."
