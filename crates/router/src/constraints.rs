@@ -128,6 +128,7 @@ mod tests {
                     models: vec!["remote-model".into()],
                     enabled: true,
                     weight: 1,
+                    overflow: false,
                 },
                 Account {
                     id: "local".into(),
@@ -138,6 +139,7 @@ mod tests {
                     models: vec!["local-model".into()],
                     enabled: true,
                     weight: 1,
+                    overflow: false,
                 },
             ],
             ..RouterConfig::default()

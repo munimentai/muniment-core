@@ -87,6 +87,28 @@ pub struct Account {
     pub enabled: bool,
     pub cooldown_until_ms: i64,
     pub models: BTreeMap<String, Cap>,
+    /// `key` or `account`. A key never balances with the accounts of its family.
+    #[serde(default, skip_serializing_if = "Source::is_key")]
+    pub source: Source,
+    /// Whether a key may take a job once every account of its family that
+    /// lists the model is cooling or at its cap.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub overflow: bool,
+}
+
+/// What stands behind an account: an API key or a subscription.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Source {
+    #[default]
+    Key,
+    Account,
+}
+
+impl Source {
+    fn is_key(&self) -> bool {
+        *self == Self::Key
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -472,6 +494,7 @@ fn candidates(
                 .insert(format!("{}/{}", m.family, m.model), metadata);
         }
     }
+    let mut ready: Vec<(&Account, Vec<String>)> = Vec::new();
     for a in &snapshot.accounts {
         let refused: Option<i64> = tx
             .query_row(
@@ -522,6 +545,40 @@ fn candidates(
                 continue;
             }
             models.push(model.clone());
+        }
+        ready.push((a, models));
+    }
+    // A key never balances with the accounts of its family. While an account
+    // of the family lists the model, a key takes the job only as overflow, and
+    // only once no such account can.
+    let subscribed = |family: &str, model: &str| {
+        snapshot.accounts.iter().any(|s| {
+            s.source == Source::Account
+                && s.enabled
+                && s.weight > 0
+                && s.family == family
+                && s.models.contains_key(model)
+        })
+    };
+    let open = |family: &str, model: &str| {
+        ready.iter().any(|(s, models)| {
+            s.source == Source::Account && s.family == family && models.iter().any(|m| m == model)
+        })
+    };
+    for (a, models) in &ready {
+        let models: Vec<String> = models
+            .iter()
+            .filter(|model| {
+                a.source == Source::Account
+                    || pinned.is_some_and(|s| {
+                        s.account == a.id && s.family == a.family && s.model == **model
+                    })
+                    || !subscribed(&a.family, model)
+                    || (a.overflow && !open(&a.family, model))
+            })
+            .cloned()
+            .collect();
+        for model in &models {
             eligible.push(Selection {
                 account: a.id.clone(),
                 family: a.family.clone(),
@@ -535,6 +592,7 @@ fn candidates(
                 family: a.family.clone(),
                 models,
                 weight: a.weight,
+                overflow: false,
                 enabled: true,
                 base_url: None,
                 // A marker satisfies the shared metadata policy. No transport receives it.

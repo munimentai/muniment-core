@@ -1168,6 +1168,7 @@ mod tests {
             models: Vec::new(),
             enabled: true,
             weight: 1,
+            overflow: false,
         };
         assert_eq!(probe(&account, 0, Duration::from_millis(50)), None);
         // A subscription on a provider with no usage route answers nothing too.

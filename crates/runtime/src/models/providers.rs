@@ -692,9 +692,10 @@ fn provider_inventory(agent: &Path, models: &[PiModelRow]) -> Result<ProviderInv
     })
 }
 
-/// The models the router serves and the accounts behind each: every enabled
-/// account of the model's family that can take a turn on it. Empty while the
-/// router is off.
+/// The models the router serves and the accounts behind each: the accounts
+/// that balance together on it, its family's subscriptions while any can serve
+/// it, else its keys. An overflow key never counts. Empty while the router is
+/// off.
 fn router_models(agent: &Path) -> Vec<RouterModel> {
     use muniment_core::model_router::all_options;
     let Ok(config) = muniment_core::model_router::config::load(agent) else {
@@ -707,17 +708,12 @@ fn router_models(agent: &Path) -> Vec<RouterModel> {
     all_options(&config)
         .into_iter()
         .map(|option| {
-            let accounts = config
-                .accounts
-                .iter()
-                .filter(|account| {
-                    account.enabled
-                        && account.weight > 0
-                        && account.credential.servable()
-                        && account.family == option.family
-                        && account.serves(&option.model)
-                })
-                .count() as u32;
+            let accounts = muniment_core::model_router::balance::balanced(
+                &config,
+                &option.family,
+                &option.model,
+            )
+            .len() as u32;
             let context_window = muniment_core::model_router::policy::model(&config, &option)
                 .map(|model| model.context)
                 .filter(|context| *context > 0);
@@ -1212,6 +1208,63 @@ google        gemini-3-pro         1M    64K    yes  yes\n";
         assert_eq!(inventory.default_provider.as_deref(), Some("ollama"));
         assert_eq!(inventory.default_model.as_deref(), Some("llama3.2:3b"));
         assert_eq!(inventory.hidden, vec!["anthropic/claude-haiku-4-5"]);
+        fs::remove_dir_all(agent).unwrap();
+    }
+
+    #[test]
+    fn the_picker_counts_only_the_accounts_that_balance_together() {
+        use muniment_core::model_router::config::{self, Account, Credential, RouterConfig};
+        let account = |id: &str, subscription: bool, overflow: bool| Account {
+            id: id.into(),
+            family: "openai".into(),
+            label: id.into(),
+            credential: if subscription {
+                Credential::Subscription {
+                    provider: "openai-codex".into(),
+                    access: "at".into(),
+                    refresh: None,
+                    expires_ms: None,
+                    account_id: Some(id.into()),
+                    email: None,
+                    plan: None,
+                    renews_at_ms: None,
+                }
+            } else {
+                Credential::ApiKey { key: "sk".into() }
+            },
+            base_url: None,
+            models: Vec::new(),
+            enabled: true,
+            weight: 1,
+            overflow,
+        };
+        let agent = temporary_directory();
+        let mut saved = RouterConfig {
+            enabled: true,
+            accounts: vec![
+                account("k1", false, false),
+                account("k2", false, true),
+                account("k3", false, false),
+                account("s1", true, false),
+                account("s2", true, false),
+            ],
+            ..RouterConfig::default()
+        };
+        let count = |saved: &RouterConfig| {
+            config::save(&agent, saved).unwrap();
+            router_models(&agent)
+                .into_iter()
+                .find(|entry| entry.id == "openai/gpt-6-astra")
+                .unwrap()
+                .accounts
+        };
+        // The subscriptions alone, never a key beside them, overflow or not.
+        assert_eq!(count(&saved), 2);
+        saved.accounts[3].enabled = false;
+        assert_eq!(count(&saved), 1);
+        // No subscription left: every key counts.
+        saved.accounts[4].weight = 0;
+        assert_eq!(count(&saved), 3);
         fs::remove_dir_all(agent).unwrap();
     }
 

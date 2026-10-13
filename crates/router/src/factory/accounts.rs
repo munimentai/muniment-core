@@ -257,6 +257,7 @@ pub fn add_key(
         models,
         enabled: true,
         weight,
+        overflow: false,
     };
     backend.save_account(&account).map_err(|e| e.to_string())?;
     Ok(account.id)
@@ -303,6 +304,7 @@ pub fn import(
         models: Vec::new(),
         enabled: true,
         weight: 1,
+        overflow: false,
     };
     backend.save_account(&account).map_err(|e| e.to_string())?;
     Ok(account.id)

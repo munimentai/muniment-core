@@ -360,21 +360,11 @@ impl State {
         self.reserve_preferred(config, family, model, None)
     }
 
-    fn reserve_preferred(
-        &self,
-        config: &RouterConfig,
-        family: &str,
-        model: &str,
-        preferred: Option<&str>,
-    ) -> Result<(config::Account, InFlight), balance::PickError> {
-        let mut active = self
-            .active
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+    /// The ledger with every account whose allowance is known to be spent held
+    /// cooling until its reset, and the ids of those accounts. Unknown or stale
+    /// windows do not disable an account indefinitely.
+    fn quota_ledger(&self, now: i64) -> (Ledger, std::collections::BTreeSet<String>) {
         let mut ledger = self.ledger();
-        let now = (self.now_ms)();
-        // Respect known account-wide exhaustion until its reset. Unknown or
-        // stale windows do not disable an account indefinitely.
         let mut exhausted = std::collections::BTreeSet::new();
         for (id, quota) in self.backend.store.load_quotas().accounts {
             let reset = quota
@@ -392,6 +382,22 @@ impl State {
                 usage.cooldown_until_ms = Some(usage.cooldown_until_ms.unwrap_or(0).max(reset));
             }
         }
+        (ledger, exhausted)
+    }
+
+    fn reserve_preferred(
+        &self,
+        config: &RouterConfig,
+        family: &str,
+        model: &str,
+        preferred: Option<&str>,
+    ) -> Result<(config::Account, InFlight), balance::PickError> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let now = (self.now_ms)();
+        let (ledger, exhausted) = self.quota_ledger(now);
         let mut preferred_config = config.clone();
         for account in &mut preferred_config.accounts {
             account.enabled &= preferred.is_some_and(|id| {
@@ -405,15 +411,9 @@ impl State {
                 })
                 .map_err(|error| {
                     if matches!(error, balance::PickError::AllCooling { .. })
-                        && config
-                            .pool(family)
+                        && balance::balanced(config, family, model)
                             .into_iter()
-                            .filter(|account| {
-                                account.enabled
-                                    && account.weight > 0
-                                    && account.credential.servable()
-                                    && account.serves(model)
-                            })
+                            .chain(balance::overflow(config, family, model))
                             .all(|account| exhausted.contains(&account.id))
                     {
                         balance::PickError::UsageLimit
@@ -430,6 +430,7 @@ impl State {
         Ok((account, guard))
     }
 
+    #[cfg(test)]
     fn reserve_delivery(
         &self,
         config: &RouterConfig,
@@ -437,24 +438,59 @@ impl State {
         session: &super::policy::Session,
         features: &super::policy::Features,
     ) -> Result<(config::Account, config::Route, InFlight), balance::PickError> {
+        self.reserve_delivery_in(config, config, selected, session, features)
+    }
+
+    /// Reserves an account for one attempt. `configured` is the pool as the
+    /// user set it, and `config` is that pool less the accounts this turn has
+    /// already tried.
+    fn reserve_delivery_in(
+        &self,
+        configured: &RouterConfig,
+        config: &RouterConfig,
+        selected: &config::Route,
+        session: &super::policy::Session,
+        features: &super::policy::Features,
+    ) -> Result<(config::Account, config::Route, InFlight), balance::PickError> {
+        // While the family has a subscription for this model, the turn belongs
+        // to its subscriptions, even after each one has failed this turn. A key
+        // joins only as overflow, and only while every subscription cools.
+        let subscribed = configured.accounts.iter().any(|a| {
+            a.family == selected.family && !a.is_key() && balance::usable(a, &selected.model)
+        });
+        let fits = |a: &config::Account| {
+            a.family == selected.family && a.serves(&selected.model) && !(subscribed && a.is_key())
+        };
         // Keep an established service pool even if one account becomes unavailable.
         // A subscription must not silently spill into an API or gateway pool.
         let anchor = config
             .accounts
             .iter()
-            .find(|a| {
-                a.id == session.account && a.family == selected.family && a.serves(&selected.model)
+            .find(|a| a.id == session.account && fits(a))
+            .or_else(|| {
+                config
+                    .accounts
+                    .iter()
+                    .find(|a| a.enabled && a.weight > 0 && a.credential.servable() && fits(a))
             })
             .or_else(|| {
-                config.accounts.iter().find(|a| {
-                    a.enabled
-                        && a.weight > 0
-                        && a.credential.servable()
-                        && a.family == selected.family
-                        && a.serves(&selected.model)
-                })
+                configured
+                    .accounts
+                    .iter()
+                    .filter(|_| subscribed)
+                    .find(|a| fits(a) && balance::usable(a, &selected.model))
             })
             .ok_or(balance::PickError::NoneServesModel)?;
+        let spill = subscribed && {
+            let (ledger, _) = self.quota_ledger((self.now_ms)());
+            balance::subscriptions_cooling(
+                configured,
+                &ledger,
+                &selected.family,
+                &selected.model,
+                (self.now_ms)(),
+            )
+        };
         let routes = super::options(config);
         let mut deliveries = Vec::new();
         for route in routes
@@ -469,7 +505,11 @@ impl State {
             for account in config.accounts.iter().filter(|a| {
                 a.family == route.family
                     && a.serves(&route.model)
-                    && super::policy::same_service(anchor, a)
+                    && if subscribed && a.is_key() {
+                        spill && a.overflow && a.family == selected.family
+                    } else {
+                        super::policy::same_service(anchor, a)
+                    }
             }) {
                 if !deliveries
                     .iter()
@@ -1233,22 +1273,27 @@ pub(crate) fn complete(
     for route in routes {
         let mut candidates = config.clone();
         loop {
-            let (account, delivered_route, _in_flight) =
-                match state.reserve_delivery(&candidates, &route, &session, &features) {
-                    Ok(account) => account,
-                    Err(error) => {
-                        if matches!(error, balance::PickError::UsageLimit) {
-                            state.probe(&route.model, "failed", "quota");
-                        }
-                        refusals.push(format!(
-                            "{}/{}: {}",
-                            route.family,
-                            route.model,
-                            error.message()
-                        ));
-                        break;
+            let (account, delivered_route, _in_flight) = match state.reserve_delivery_in(
+                &config,
+                &candidates,
+                &route,
+                &session,
+                &features,
+            ) {
+                Ok(account) => account,
+                Err(error) => {
+                    if matches!(error, balance::PickError::UsageLimit) {
+                        state.probe(&route.model, "failed", "quota");
                     }
-                };
+                    refusals.push(format!(
+                        "{}/{}: {}",
+                        route.family,
+                        route.model,
+                        error.message()
+                    ));
+                    break;
+                }
+            };
             let route = delivered_route;
             if attempted
                 || matches!(
@@ -1986,6 +2031,7 @@ mod tests {
             models: vec!["gpt-5.6-mini".to_owned()],
             enabled: true,
             weight: 1,
+            overflow: false,
         }
     }
 
@@ -2638,6 +2684,157 @@ mod tests {
         assert!(state
             .reserve_delivery(&saved, &route, &session, &features)
             .is_err());
+    }
+
+    /// A subscription account of the test family on `url`.
+    fn subscription(id: &str, url: &str) -> Account {
+        let mut account = account(id, url);
+        account.family = "anthropic".into();
+        account.models = vec!["claude-test".into()];
+        account.credential = Credential::Subscription {
+            provider: "anthropic".into(),
+            access: format!("token-{id}"),
+            refresh: None,
+            expires_ms: None,
+            account_id: Some(id.into()),
+            email: None,
+            plan: None,
+            renews_at_ms: None,
+        };
+        account
+    }
+
+    /// A key of the same family as [`subscription`] on `url`.
+    fn family_key(id: &str, url: &str, overflow: bool) -> Account {
+        let mut account = account(id, url);
+        account.family = "anthropic".into();
+        account.models = vec!["claude-test".into()];
+        account.overflow = overflow;
+        account
+    }
+
+    fn anthropic_route() -> config::Route {
+        config::Route {
+            key: "anthropic/claude-test".into(),
+            description: String::new(),
+            family: "anthropic".into(),
+            model: "claude-test".into(),
+        }
+    }
+
+    #[test]
+    fn a_key_joins_a_subscription_thread_only_as_overflow_while_every_subscription_cools() {
+        let state = state_in(agent_dir());
+        let mut saved = config(vec![
+            family_key("plain", "http://unused", false),
+            subscription("s1", "http://unused"),
+            subscription("s2", "http://unused"),
+            family_key("spill", "http://unused", true),
+        ]);
+        saved.routes.clear();
+        let route = anthropic_route();
+        let features = super::super::policy::Features::read(&turn("auto", false));
+        let fresh = super::super::policy::Session::default();
+        let pick = |configured: &RouterConfig,
+                    candidates: &RouterConfig,
+                    session: &super::super::policy::Session| {
+            state
+                .reserve_delivery_in(configured, candidates, &route, session, &features)
+                .map(|(account, _, _)| account.id)
+        };
+        // A fresh thread starts on a subscription although a key is listed first.
+        assert_eq!(pick(&saved, &saved, &fresh).unwrap(), "s1");
+        // Every subscription tried this turn, none cooling: no key takes it.
+        let mut tried = saved.clone();
+        for account in &mut tried.accounts[1..3] {
+            account.enabled = false;
+        }
+        assert!(pick(&saved, &tried, &fresh).is_err());
+        // Every subscription cooling: the overflow key takes it, never the plain one.
+        state.record_error("s1", "429", true);
+        state.record_error("s2", "429", true);
+        assert_eq!(pick(&saved, &saved, &fresh).unwrap(), "spill");
+        assert_eq!(pick(&saved, &tried, &fresh).unwrap(), "spill");
+        // A thread that overflowed returns to a subscription that is ready again.
+        let spilled = super::super::policy::Session {
+            account: "spill".into(),
+            cache_scope: super::super::policy::scope(&saved, "spill"),
+            ..Default::default()
+        };
+        assert_eq!(pick(&saved, &saved, &spilled).unwrap(), "spill");
+        state.record_success("s2", wire::Tokens::default());
+        assert_eq!(pick(&saved, &saved, &spilled).unwrap(), "s2");
+        // Without an overflow key, cooling subscriptions leave the turn unserved.
+        saved.accounts.pop();
+        state.record_error("s2", "429", true);
+        assert!(pick(&saved, &saved, &fresh).is_err());
+        assert!(state.ledger().account("plain").is_none());
+        std::fs::remove_dir_all(state.agent.as_ref().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_fresh_thread_never_spills_from_failed_subscriptions_into_a_key() {
+        let agent = agent_dir();
+        let (limited, seen_limited) = upstream(vec![(429, "limited".into(), false); 2]);
+        let (key, seen_key) = upstream(vec![(200, answer("from the key", 1, 1), false)]);
+        let mut saved = config(vec![
+            subscription("s1", &limited),
+            subscription("s2", &limited),
+            family_key("k1", &key, false),
+        ]);
+        saved.routes.clear();
+        saved.fallback = None;
+        config::save(&agent, &saved).unwrap();
+        let handle = start_with_clock(agent.clone(), fixed_clock).unwrap();
+        let (status, body) = call(
+            handle.endpoint(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&turn("anthropic/claude-test", false)),
+            &handle.endpoint().token,
+        );
+        assert_ne!(status, 200, "{body}");
+        assert!(!body.contains("from the key"));
+        assert_eq!(seen_limited.try_iter().count(), 2);
+        assert_eq!(seen_key.try_iter().count(), 0);
+        assert!(usage::load(&agent).account("k1").is_none());
+    }
+
+    #[test]
+    fn an_overflow_key_serves_a_turn_after_every_subscription_cools() {
+        let agent = agent_dir();
+        let (limited, seen_limited) = upstream(vec![(429, "limited".into(), false); 2]);
+        let reply = [
+            json!({"type":"message_start","message":{"model":"claude-test"}}),
+            json!({"type":"content_block_delta","delta":{"type":"text_delta","text":"from the key"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}),
+            json!({"type":"message_stop"}),
+        ]
+        .iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+        let (key, seen_key) = upstream(vec![(200, reply, true)]);
+        let mut saved = config(vec![
+            family_key("k1", &key, true),
+            subscription("s1", &limited),
+            subscription("s2", &limited),
+        ]);
+        saved.routes.clear();
+        saved.fallback = None;
+        config::save(&agent, &saved).unwrap();
+        let handle = start_with_clock(agent.clone(), fixed_clock).unwrap();
+        let (status, body) = call(
+            handle.endpoint(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&turn("anthropic/claude-test", true)),
+            &handle.endpoint().token,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("from the key"));
+        assert_eq!(seen_limited.try_iter().count(), 2);
+        assert_eq!(seen_key.try_iter().count(), 1);
+        assert_eq!(usage::load(&agent).account("k1").unwrap().requests, 1);
     }
 
     #[test]

@@ -9,6 +9,11 @@
 //! The served share is the decayed recent count, not the lifetime one, so an
 //! account added to a long-lived pool takes its share of new turns instead of
 //! every turn until its lifetime count draws level.
+//!
+//! Keys and subscriptions never balance together. While a family has a
+//! subscription that serves the model, its subscriptions take the turns, and
+//! a key takes one only when it is marked overflow and every subscription is
+//! cooling or spent. A family with no such subscription balances its keys.
 
 use super::config::{Account, RouterConfig};
 use super::usage::Ledger;
@@ -62,6 +67,69 @@ pub fn pick<'a>(
     )
 }
 
+/// Whether an account can take a turn on `model`: on, weighted, servable, and
+/// serving the model. Cooling does not count against it.
+pub fn usable(account: &Account, model: &str) -> bool {
+    account.enabled && account.weight > 0 && account.credential.servable() && account.serves(model)
+}
+
+/// The accounts of `family` that balance together for `model`: its
+/// subscriptions while any of them can serve the model, else its keys. A key
+/// never balances with a subscription, so a subscription's turn never spills
+/// into API billing by rotation.
+pub fn balanced<'a>(config: &'a RouterConfig, family: &str, model: &str) -> Vec<&'a Account> {
+    let usable: Vec<&Account> = config
+        .pool(family)
+        .into_iter()
+        .filter(|account| usable(account, model))
+        .collect();
+    if usable.iter().any(|account| !account.is_key()) {
+        usable
+            .into_iter()
+            .filter(|account| !account.is_key())
+            .collect()
+    } else {
+        usable
+    }
+}
+
+/// The keys that take a turn for `family` and `model` once every subscription
+/// that balances for it is cooling or spent. Empty while the family has no
+/// subscription for the model, because its keys then balance on their own.
+pub fn overflow<'a>(config: &'a RouterConfig, family: &str, model: &str) -> Vec<&'a Account> {
+    let usable: Vec<&Account> = config
+        .pool(family)
+        .into_iter()
+        .filter(|account| usable(account, model))
+        .collect();
+    if !usable.iter().any(|account| !account.is_key()) {
+        return Vec::new();
+    }
+    usable
+        .into_iter()
+        .filter(|account| account.is_key() && account.overflow)
+        .collect()
+}
+
+/// Whether `family` has a subscription for `model` and every one is cooling,
+/// the one state in which an overflow key may take the turn.
+pub fn subscriptions_cooling(
+    config: &RouterConfig,
+    ledger: &Ledger,
+    family: &str,
+    model: &str,
+    now_ms: i64,
+) -> bool {
+    let subscriptions: Vec<&Account> = balanced(config, family, model)
+        .into_iter()
+        .filter(|account| !account.is_key())
+        .collect();
+    !subscriptions.is_empty()
+        && subscriptions
+            .iter()
+            .all(|account| !ledger.available(&account.id, now_ms))
+}
+
 /// Includes reserved turns so concurrent calls share the pool too.
 pub fn pick_with_active<'a>(
     config: &'a RouterConfig,
@@ -75,22 +143,41 @@ pub fn pick_with_active<'a>(
     if pool.is_empty() {
         return Err(PickError::EmptyPool);
     }
-    let live: Vec<&Account> = pool
+    if !pool
         .iter()
-        .copied()
-        .filter(|account| account.enabled && account.weight > 0 && account.credential.servable())
-        .collect();
-    if live.is_empty() {
+        .any(|account| account.enabled && account.weight > 0 && account.credential.servable())
+    {
         return Err(PickError::AllDisabled);
     }
-    let serving: Vec<&Account> = live
-        .iter()
-        .copied()
-        .filter(|account| account.serves(model))
-        .collect();
+    let serving = balanced(config, family, model);
     if serving.is_empty() {
         return Err(PickError::NoneServesModel);
     }
+    match least_loaded(&serving, ledger, now_ms, active) {
+        Err(PickError::AllCooling { ready_at_ms }) => {
+            let spill = overflow(config, family, model);
+            if spill.is_empty() {
+                return Err(PickError::AllCooling { ready_at_ms });
+            }
+            least_loaded(&spill, ledger, now_ms, active).map_err(|error| match error {
+                PickError::AllCooling { ready_at_ms: keys } => PickError::AllCooling {
+                    ready_at_ms: ready_at_ms.min(keys),
+                },
+                other => other,
+            })
+        }
+        picked => picked,
+    }
+}
+
+/// The ready account of `serving` whose served share sits furthest below its
+/// weight, or the earliest moment one returns when every one is cooling.
+fn least_loaded<'a>(
+    serving: &[&'a Account],
+    ledger: &Ledger,
+    now_ms: i64,
+    active: &std::collections::BTreeMap<String, u32>,
+) -> Result<&'a Account, PickError> {
     let ready: Vec<&Account> = serving
         .iter()
         .copied()
@@ -148,7 +235,29 @@ mod tests {
             models: Vec::new(),
             enabled: true,
             weight,
+            overflow: false,
         }
+    }
+
+    fn subscription(id: &str) -> Account {
+        let mut account = account(id, "openai", 1);
+        account.credential = Credential::Subscription {
+            provider: "openai-codex".into(),
+            access: "at".into(),
+            refresh: None,
+            expires_ms: None,
+            account_id: Some(id.into()),
+            email: None,
+            plan: None,
+            renews_at_ms: None,
+        };
+        account
+    }
+
+    fn overflow_key(id: &str) -> Account {
+        let mut account = account(id, "openai", 1);
+        account.overflow = true;
+        account
     }
 
     fn config(accounts: Vec<Account>) -> RouterConfig {
@@ -315,5 +424,140 @@ mod tests {
         assert!(old >= 15, "a1 served {old} of 40");
         assert!(picked[..2].iter().all(|id| id == "a2"));
         assert!(ledger.account("a1").unwrap().recent(now) < RECENT_HALF_LIFE_MS as f64);
+    }
+
+    #[test]
+    fn a_key_never_balances_with_a_subscription_of_its_family() {
+        let config = config(vec![
+            account("k1", "openai", 5),
+            subscription("s1"),
+            subscription("s2"),
+        ]);
+        let mut ledger = Ledger::default();
+        assert_eq!(
+            run(&config, &mut ledger, "gpt", 4),
+            ["s1", "s2", "s1", "s2"]
+        );
+        // Every subscription cooling leaves the turn unserved, not on the key.
+        ledger.record_error("s1", "2026-09-17", 2_000, "429", true);
+        ledger.record_error("s2", "2026-09-17", 2_000, "429", true);
+        assert!(matches!(
+            pick(&config, &ledger, "openai", "gpt", 2_100),
+            Err(PickError::AllCooling { .. })
+        ));
+        assert!(ledger.account("k1").is_none());
+    }
+
+    #[test]
+    fn an_overflow_key_serves_only_while_every_subscription_cools() {
+        let config = config(vec![
+            account("k1", "openai", 1),
+            overflow_key("k2"),
+            subscription("s1"),
+            subscription("s2"),
+        ]);
+        let mut ledger = Ledger::default();
+        assert_eq!(run(&config, &mut ledger, "gpt", 2), ["s1", "s2"]);
+        // One subscription cooling keeps the turn on the other.
+        ledger.record_error("s1", "2026-09-17", 2_000, "429", true);
+        assert_eq!(
+            pick(&config, &ledger, "openai", "gpt", 2_100).unwrap().id,
+            "s2"
+        );
+        // Both cooling moves the turn to the overflow key, never the plain one.
+        ledger.record_error("s2", "2026-09-17", 2_000, "429", true);
+        assert!(subscriptions_cooling(
+            &config, &ledger, "openai", "gpt", 2_100
+        ));
+        assert_eq!(
+            pick(&config, &ledger, "openai", "gpt", 2_100).unwrap().id,
+            "k2"
+        );
+        // An overflow key cooling too reports the earliest return.
+        ledger.record_error("k2", "2026-09-17", 2_050, "429", true);
+        assert_eq!(
+            pick(&config, &ledger, "openai", "gpt", 2_100),
+            Err(PickError::AllCooling {
+                ready_at_ms: 2_000 + super::super::usage::FIRST_COOLDOWN_MS
+            })
+        );
+        // A subscription back from cooling takes the next turn again.
+        let back = 2_000 + super::super::usage::FIRST_COOLDOWN_MS;
+        assert!(!subscriptions_cooling(
+            &config, &ledger, "openai", "gpt", back
+        ));
+        assert_eq!(
+            pick(&config, &ledger, "openai", "gpt", back)
+                .unwrap()
+                .credential
+                .source(),
+            "account"
+        );
+    }
+
+    #[test]
+    fn keys_serve_as_before_when_no_subscription_can() {
+        let mut config = config(vec![
+            account("k1", "openai", 1),
+            overflow_key("k2"),
+            subscription("s1"),
+        ]);
+        let mut ledger = Ledger::default();
+        // A subscription that is off leaves the keys to balance alone.
+        config.accounts[2].enabled = false;
+        assert_eq!(
+            run(&config, &mut ledger, "gpt", 4),
+            ["k1", "k2", "k1", "k2"]
+        );
+        assert!(overflow(&config, "openai", "gpt").is_empty());
+        // So does one that does not serve the model.
+        config.accounts[2].enabled = true;
+        config.accounts[2].models = vec!["gpt-other".into()];
+        assert_eq!(
+            balanced(&config, "openai", "gpt")
+                .iter()
+                .map(|account| account.id.as_str())
+                .collect::<Vec<_>>(),
+            ["k1", "k2"]
+        );
+        assert_eq!(
+            balanced(&config, "openai", "gpt-other")
+                .iter()
+                .map(|account| account.id.as_str())
+                .collect::<Vec<_>>(),
+            ["s1"]
+        );
+        // Another family's subscription never holds a key back.
+        config.accounts[2].models.clear();
+        config.accounts[2].family = "anthropic".into();
+        assert_eq!(balanced(&config, "openai", "gpt").len(), 2);
+    }
+
+    #[test]
+    fn the_balanced_set_counts_subscriptions_while_any_serves_else_keys() {
+        let mut config = config(vec![
+            account("k1", "openai", 1),
+            overflow_key("k2"),
+            subscription("s1"),
+            subscription("s2"),
+        ]);
+        let ids = |config: &RouterConfig| {
+            balanced(config, "openai", "gpt")
+                .iter()
+                .map(|account| account.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&config), ["s1", "s2"]);
+        assert_eq!(
+            overflow(&config, "openai", "gpt")
+                .iter()
+                .map(|account| account.id.as_str())
+                .collect::<Vec<_>>(),
+            ["k2"]
+        );
+        config.accounts[2].weight = 0;
+        assert_eq!(ids(&config), ["s2"]);
+        config.accounts[3].enabled = false;
+        assert_eq!(ids(&config), ["k1", "k2"]);
     }
 }

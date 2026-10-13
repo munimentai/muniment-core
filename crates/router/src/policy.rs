@@ -810,6 +810,7 @@ fn measured_success_gates_the_cost_path_at_a_task_boundary() {
         models: Vec::new(),
         enabled: true,
         weight: 1,
+        overflow: false,
     };
     let mut config = RouterConfig {
         enabled: true,
@@ -946,6 +947,7 @@ fn an_eligible_model_serves_when_no_preferred_path_takes_the_turn() {
         models: vec![model.into()],
         enabled: true,
         weight: 1,
+        overflow: false,
     };
     let mut config = RouterConfig {
         enabled: true,

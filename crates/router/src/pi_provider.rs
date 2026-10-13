@@ -95,6 +95,7 @@ mod tests {
                 models: vec!["gpt-5.6-mini".into()],
                 enabled: true,
                 weight: 1,
+                overflow: false,
             }],
             routes: vec![Route {
                 key: "fast".into(),

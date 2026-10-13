@@ -104,6 +104,9 @@ pub(super) struct AccountView {
     models: Vec<String>,
     enabled: bool,
     weight: u32,
+    /// Whether this key takes turns once every subscription of its family is
+    /// cooling or spent. A key without it never serves beside a subscription.
+    overflow: bool,
     requests: u64,
     input_tokens: u64,
     output_tokens: u64,
@@ -263,6 +266,7 @@ fn account_view(
         models: account.models.clone(),
         enabled: account.enabled,
         weight: account.weight,
+        overflow: account.overflow,
         requests: usage.map(|entry| entry.requests).unwrap_or(0),
         input_tokens: usage.map(|entry| entry.input_tokens).unwrap_or(0),
         output_tokens: usage.map(|entry| entry.output_tokens).unwrap_or(0),
@@ -563,6 +567,7 @@ pub(super) fn add_account(
             .collect(),
         enabled: true,
         weight: 1,
+        overflow: false,
     });
     commit(agent, state, &config)
 }
@@ -577,6 +582,8 @@ pub(super) struct AccountChange {
     enabled: Option<bool>,
     #[serde(default)]
     weight: Option<u32>,
+    #[serde(default)]
+    overflow: Option<bool>,
     #[serde(default)]
     models: Option<Vec<String>>,
 }
@@ -604,6 +611,9 @@ pub(super) fn update_account(
     }
     if let Some(weight) = change.weight {
         account.weight = weight.min(100);
+    }
+    if let Some(overflow) = change.overflow {
+        account.overflow = overflow;
     }
     if let Some(models) = change.models {
         account.models = models
@@ -909,6 +919,7 @@ pub(super) fn import_credential(
         models: Vec::new(),
         enabled: true,
         weight: 1,
+        overflow: false,
     });
     save(agent, &config)?;
     drop(lock);
@@ -1027,6 +1038,7 @@ mod tests {
             models: Vec::new(),
             enabled: true,
             weight: 2,
+            overflow: false,
         }
     }
 
@@ -1107,11 +1119,63 @@ mod tests {
         assert_eq!(view.input_tokens, 300);
         assert_eq!(view.errors, 1);
         assert_eq!(view.weight, 2);
+        assert!(!view.overflow);
         assert!(view.cooldown_until_ms.is_some());
         assert_eq!(view.days.len(), 1);
         assert_eq!(view.days[0].0, "2026-09-17");
         assert_eq!(view.active, 2);
         assert!(!view.allowance_readable);
+    }
+
+    fn subscription(id: &str) -> Account {
+        let mut account = account(id);
+        account.credential = Credential::Subscription {
+            provider: "openai-codex".into(),
+            access: format!("access-{id}"),
+            refresh: None,
+            expires_ms: None,
+            account_id: Some(id.into()),
+            email: None,
+            plan: None,
+            renews_at_ms: None,
+        };
+        account
+    }
+
+    fn agent_with(config: &RouterConfig) -> std::path::PathBuf {
+        let agent =
+            std::env::temp_dir().join(format!("muniment-router-default-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&agent).unwrap();
+        config::save(&agent, config).unwrap();
+        agent
+    }
+
+    #[test]
+    fn an_account_change_sets_overflow_and_leaves_it_when_unnamed() {
+        let config = RouterConfig {
+            accounts: vec![account("k1"), subscription("s1")],
+            ..RouterConfig::default()
+        };
+        let agent = agent_with(&config);
+        let state = RouterState::default();
+        let change: AccountChange =
+            serde_json::from_value(serde_json::json!({ "id": "k1", "overflow": true })).unwrap();
+        let settings = update_account(&agent, &state, change).unwrap();
+        assert!(settings.accounts[0].overflow);
+        assert!(!settings.accounts[1].overflow);
+        assert!(config::load(&agent).unwrap().accounts[0].overflow);
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["accounts"][0]["overflow"], true);
+        // A change that names no overflow keeps the saved one.
+        let change: AccountChange =
+            serde_json::from_value(serde_json::json!({ "id": "k1", "weight": 3 })).unwrap();
+        let settings = update_account(&agent, &state, change).unwrap();
+        assert!(settings.accounts[0].overflow);
+        assert_eq!(settings.accounts[0].weight, 3);
+        let change: AccountChange =
+            serde_json::from_value(serde_json::json!({ "id": "k1", "overflow": false })).unwrap();
+        assert!(!update_account(&agent, &state, change).unwrap().accounts[0].overflow);
+        std::fs::remove_dir_all(agent).unwrap();
     }
 
     #[test]

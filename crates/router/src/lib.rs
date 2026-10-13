@@ -312,6 +312,7 @@ mod tests {
             models: Vec::new(),
             enabled: true,
             weight: 1,
+            overflow: false,
         }
     }
 
