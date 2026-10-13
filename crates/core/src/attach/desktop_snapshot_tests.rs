@@ -32,7 +32,7 @@ impl Profile {
     fn new() -> Self {
         let root = std::env::temp_dir().join(format!("muniment-snapshot-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
-        let mut journal = RunJournal::open(&root.join("runs.sqlite3")).unwrap();
+        let mut journal = RunJournal::open(root.join("runs.sqlite3")).unwrap();
         let thread = journal
             .append_new_run("local", &event(1, "run.started", json!({})))
             .unwrap();
