@@ -42,9 +42,17 @@ pub fn onboard_workspace(
 pub fn open_profile_storage(
     profile_directory: impl AsRef<Path>,
 ) -> Result<SharedStorage, ChatProfileError> {
+    open_profile_storage_as(profile_directory, env!("CARGO_PKG_VERSION"))
+}
+
+/// Opens profile storage and records interrupted runs under the runtime version given.
+pub fn open_profile_storage_as(
+    profile_directory: impl AsRef<Path>,
+    runtime_version: &str,
+) -> Result<SharedStorage, ChatProfileError> {
     let profile = ChatProfile::new(profile_directory.as_ref());
     let (mut journal, cas) = profile.open_storage()?;
-    reconcile_interrupted_runs(&mut journal, &runtime_provenance());
+    reconcile_interrupted_runs(&mut journal, &runtime_provenance(runtime_version));
     Ok(Arc::new(Mutex::new(ChatStorage { journal, cas })))
 }
 

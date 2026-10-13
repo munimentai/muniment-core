@@ -91,6 +91,7 @@ impl RuntimeAttachState {
                         self.agent_storage(),
                         workspace.clone(),
                         "desktop-owner".into(),
+                        self.runtime_version(),
                     )?,
                 };
                 state

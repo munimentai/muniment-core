@@ -16,7 +16,7 @@ use muniment_core::runtime_eprintln as eprintln;
 use muniment_core::sidecar::pi_chat::Receipt;
 use muniment_core::sidecar::pi_install::{PiArtifactDescriptor, PI_SELECTED_ARTIFACT};
 
-use crate::host::{ChatGrantService, NoCloud};
+use crate::host::{ChatGrantService, NoCloud, RuntimeHost};
 
 pub const CHAT_EVENT_SUBSCRIBER_QUEUE_CAPACITY: usize = 256;
 
@@ -228,6 +228,7 @@ pub struct RuntimeChatEventSink {
     profile: ChatProfile,
     target: Mutex<RuntimeChatEventTarget>,
     chat_grants: Arc<dyn ChatGrantService>,
+    runtime_version: &'static str,
     pi_artifact: PiArtifactDescriptor,
     memory_runtime: Arc<ApplicationMemoryRuntime>,
     thread_id: String,
@@ -279,6 +280,7 @@ impl RuntimeChatEventSink {
             profile: ChatProfile::new(profile_directory.as_ref()),
             target: Mutex::new(target),
             chat_grants: Arc::new(NoCloud),
+            runtime_version: env!("CARGO_PKG_VERSION"),
             pi_artifact: PI_SELECTED_ARTIFACT,
             memory_runtime,
             thread_id,
@@ -293,9 +295,11 @@ impl RuntimeChatEventSink {
         self
     }
 
-    /// The cloud chat grants a run renews and fetches receipts with.
-    pub fn with_chat_grants(mut self, chat_grants: Arc<dyn ChatGrantService>) -> Self {
-        self.chat_grants = chat_grants;
+    /// The host whose chat grants a run renews and fetches receipts with,
+    /// and whose runtime version the journal records.
+    pub fn with_host(mut self, host: &RuntimeHost) -> Self {
+        self.chat_grants = Arc::clone(&host.chat_grants);
+        self.runtime_version = host.runtime_version;
         self
     }
 
@@ -313,7 +317,7 @@ impl RuntimeChatEventSink {
 
 impl ChatEventSink for RuntimeChatEventSink {
     fn provenance(&self) -> (&str, &str) {
-        ("muniment-runtime", env!("CARGO_PKG_VERSION"))
+        ("muniment-runtime", self.runtime_version)
     }
 
     fn deliver(&self, mut event: ChatEvent) -> Result<(), ()> {
@@ -432,6 +436,28 @@ mod tests {
             pending_permission: None,
             delta: None,
         }
+    }
+
+    #[test]
+    fn the_journal_records_the_host_runtime_version() {
+        let root = std::env::temp_dir().join("muniment-sink-runtime-version");
+        let memory = Arc::new(ApplicationMemoryRuntime::new(
+            root.clone(),
+            root.join("memory"),
+        ));
+        let sink =
+            RuntimeChatEventSink::with_subscriber(&root, None, Arc::clone(&memory), "t".into());
+        assert_eq!(
+            sink.provenance(),
+            ("muniment-runtime", env!("CARGO_PKG_VERSION"))
+        );
+        let host = RuntimeHost {
+            runtime_version: "9.8.7",
+            ..RuntimeHost::default()
+        };
+        let sink =
+            RuntimeChatEventSink::with_subscriber(&root, None, memory, "t".into()).with_host(&host);
+        assert_eq!(sink.provenance(), ("muniment-runtime", "9.8.7"));
     }
 
     #[test]

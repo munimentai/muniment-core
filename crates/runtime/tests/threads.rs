@@ -66,8 +66,20 @@ fn creates_a_thread_for_a_run_and_rejects_invalid_inputs_without_events() {
     let profile = temporary_profile.profile.clone();
     let storage = open_profile_storage(&profile).unwrap();
 
-    assert!(create_thread(Arc::clone(&storage), String::new(), "profile-a".into(),).is_err());
-    assert!(create_thread(Arc::clone(&storage), "workspace-a".into(), String::new(),).is_err());
+    assert!(create_thread(
+        Arc::clone(&storage),
+        String::new(),
+        "profile-a".into(),
+        env!("CARGO_PKG_VERSION")
+    )
+    .is_err());
+    assert!(create_thread(
+        Arc::clone(&storage),
+        "workspace-a".into(),
+        String::new(),
+        env!("CARGO_PKG_VERSION")
+    )
+    .is_err());
     assert!(
         thread_summaries(Arc::clone(&storage), Some("owner".into()), 10, None)
             .unwrap()
@@ -79,6 +91,7 @@ fn creates_a_thread_for_a_run_and_rejects_invalid_inputs_without_events() {
         Arc::clone(&storage),
         "workspace-a".into(),
         "profile-a".into(),
+        env!("CARGO_PKG_VERSION"),
     )
     .unwrap();
     let run_id = "01900000-0000-7000-8000-000000000000";
@@ -229,10 +242,24 @@ fn thread_operations_report_the_poisoned_storage_lock() {
             Arc::clone(&storage),
             "local".into(),
             "default".into(),
+            env!("CARGO_PKG_VERSION"),
         )
         .unwrap_err(),
-        rename_thread(Arc::clone(&storage), None, "thread".into(), "title".into()).unwrap_err(),
-        delete_thread(Arc::clone(&storage), None, "thread".into()).unwrap_err(),
+        rename_thread(
+            Arc::clone(&storage),
+            None,
+            "thread".into(),
+            "title".into(),
+            env!("CARGO_PKG_VERSION"),
+        )
+        .unwrap_err(),
+        delete_thread(
+            Arc::clone(&storage),
+            None,
+            "thread".into(),
+            env!("CARGO_PKG_VERSION"),
+        )
+        .unwrap_err(),
         muniment_runtime_core::apply_retention(Arc::clone(&storage), 0).unwrap_err(),
         thread_page(
             &profile.profile,
@@ -341,6 +368,7 @@ fn selects_only_an_owned_accessible_thread() {
         Arc::clone(&storage),
         Some("owner".into()),
         thread_id.clone(),
+        env!("CARGO_PKG_VERSION"),
     )
     .unwrap();
     assert!(select_thread(storage, Some("owner".into()), thread_id).is_err());
@@ -359,12 +387,14 @@ fn renames_and_deletes_owned_threads() {
         Some("owner".into()),
         renamed_thread.clone(),
         "New title".into(),
+        env!("CARGO_PKG_VERSION"),
     )
     .unwrap();
     delete_thread(
         Arc::clone(&storage),
         Some("owner".into()),
         deleted_thread.clone(),
+        env!("CARGO_PKG_VERSION"),
     )
     .unwrap();
 
@@ -414,6 +444,7 @@ fn rejects_mutations_by_another_subject_without_appending_events() {
             Some("other".into()),
             thread_id.clone(),
             "New title".into(),
+            env!("CARGO_PKG_VERSION")
         )
         .unwrap_err(),
         "Conversation history journal operation failed: NotOwned"
@@ -423,6 +454,7 @@ fn rejects_mutations_by_another_subject_without_appending_events() {
             Arc::clone(&storage),
             Some("other".into()),
             thread_id.clone(),
+            env!("CARGO_PKG_VERSION")
         )
         .unwrap_err(),
         "Conversation history journal operation failed: NotOwned"

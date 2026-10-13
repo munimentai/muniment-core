@@ -121,6 +121,7 @@ fn check_history_failures(poisoned: bool) {
             run_attach_listener(
                 &profile.root,
                 AttachListenerInputs {
+                    runtime_version: env!("CARGO_PKG_VERSION"),
                     companion_registry: &registry,
                     approval: approval.clone(),
                     approvals: Default::default(),

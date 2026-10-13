@@ -89,8 +89,9 @@ pub fn create_thread(
     storage: SharedStorage,
     workspace: String,
     attach_profile: String,
+    runtime_version: &str,
 ) -> Result<String, String> {
-    let mut provenance = runtime_provenance();
+    let mut provenance = runtime_provenance(runtime_version);
     provenance
         .extra
         .insert("attach_profile".into(), attach_profile.into());
@@ -104,6 +105,7 @@ pub fn rename_thread(
     subject: Option<String>,
     thread_id: String,
     title: String,
+    runtime_version: &str,
 ) -> Result<(), String> {
     let mut storage = storage.lock().map_err(lock_error)?;
     append_thread_rename_now(
@@ -111,7 +113,7 @@ pub fn rename_thread(
         subject.as_deref(),
         &thread_id,
         &title,
-        &runtime_provenance(),
+        &runtime_provenance(runtime_version),
     )
     .map_err(journal_error)
 }
@@ -121,13 +123,14 @@ pub fn delete_thread(
     storage: SharedStorage,
     subject: Option<String>,
     thread_id: String,
+    runtime_version: &str,
 ) -> Result<(), String> {
     let mut storage = storage.lock().map_err(lock_error)?;
     append_thread_delete_now(
         &mut storage.journal,
         subject.as_deref(),
         &thread_id,
-        &runtime_provenance(),
+        &runtime_provenance(runtime_version),
     )
     .map_err(journal_error)
 }

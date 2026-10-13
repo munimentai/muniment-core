@@ -61,12 +61,14 @@ fn remove_state_directory(path: PathBuf) {
 }
 
 #[test]
-fn binds_and_serves_with_the_runtime_version() {
+fn binds_and_serves_with_the_host_runtime_version() {
     let _test_guard = TEST_LOCK.lock().unwrap();
     let state_directory = state_directory();
-    let mut acceptor =
-        WindowsAttachAcceptor::bind(RuntimeHost::default(), &state_directory, Duration::ZERO)
-            .unwrap();
+    let host = RuntimeHost {
+        runtime_version: "9.8.7",
+        ..RuntimeHost::default()
+    };
+    let mut acceptor = WindowsAttachAcceptor::bind(host, &state_directory, Duration::ZERO).unwrap();
 
     let path = load_windows_attach_pipe_path(current_process_user_sid().unwrap().as_str()).unwrap();
     let client = thread::spawn(move || {
@@ -79,7 +81,7 @@ fn binds_and_serves_with_the_runtime_version() {
     assert_eq!(acceptor.serve_next(), WindowsAttachAcceptOutcome::Served);
 
     let welcome = read_welcome(&mut client.join().unwrap());
-    assert_eq!(welcome.desktop_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(welcome.desktop_version, "9.8.7");
 
     drop(acceptor);
     remove_state_directory(state_directory);

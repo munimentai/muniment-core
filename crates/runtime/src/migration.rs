@@ -101,7 +101,13 @@ where
         AttachFilesystem::from_runtime_directory(profile_directory.as_ref().as_os_str())
             .map_err(map_filesystem_error)?;
 
-    if !request_handoff(&filesystem, &nonce, deadline, &stop)? {
+    if !request_handoff(
+        &filesystem,
+        &nonce,
+        listener_inputs.runtime_version,
+        deadline,
+        &stop,
+    )? {
         return Ok(());
     }
 
@@ -144,6 +150,7 @@ where
 fn request_handoff(
     filesystem: &AttachFilesystem,
     nonce: &str,
+    runtime_version: &str,
     deadline: Instant,
     stop: &Receiver<()>,
 ) -> Result<bool, MigrationTakeoverError> {
@@ -158,8 +165,15 @@ fn request_handoff(
             .min(MAX_CONTROL_DEADLINE)
             .as_millis()
             .clamp(1, 60_000) as u64;
-        let outcome = match request_control(stream, nonce, io_timeout, deadline_ms, deadline, stop)?
-        {
+        let outcome = match request_control(
+            stream,
+            nonce,
+            runtime_version,
+            io_timeout,
+            deadline_ms,
+            deadline,
+            stop,
+        )? {
             Some(outcome) => outcome,
             None => return Ok(false),
         };
@@ -226,6 +240,7 @@ fn connect_before(
 fn request_control(
     stream: UnixStream,
     nonce: &str,
+    runtime_version: &str,
     io_timeout: Duration,
     deadline_ms: u64,
     deadline: Instant,
@@ -239,7 +254,7 @@ fn request_control(
         scope.spawn(|| {
             let result = handshake_migration_control_stream(
                 stream,
-                env!("CARGO_PKG_VERSION"),
+                runtime_version,
                 io_timeout.min(MAX_CONTROL_DEADLINE),
             )
             .map_err(|error| control_error_before(error, deadline))

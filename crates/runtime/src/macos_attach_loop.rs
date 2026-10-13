@@ -141,6 +141,7 @@ pub struct SystemMacosAttachBoundary {
     listener: MacosAttachListener,
     stop: Arc<MacosAttachStopEvent>,
     expected_desktop_executable: PathBuf,
+    runtime_version: &'static str,
 }
 
 #[cfg(target_os = "macos")]
@@ -156,6 +157,7 @@ impl MacosAttachAcceptorWithBoundary<SystemMacosAttachBoundary> {
             .expected_desktop_executable
             .clone()
             .ok_or(MacosAttachBindFailure::DesktopExecutableCheckFailed)?;
+        let runtime_version = host.runtime_version;
         Self::bind_with(host, profile_directory, config_directory, move |path| {
             let listener = MacosAttachListener::bind(path)?;
             let stop = Arc::new(MacosAttachStopEvent::new()?);
@@ -163,6 +165,7 @@ impl MacosAttachAcceptorWithBoundary<SystemMacosAttachBoundary> {
                 listener,
                 stop,
                 expected_desktop_executable,
+                runtime_version,
             })
         })
     }
@@ -194,6 +197,7 @@ impl MacosAttachServeBoundary for SystemMacosAttachBoundary {
         match self.listener.accept_until(&self.stop) {
             Ok(MacosAttachWaitOutcome::Connected(stream)) => {
                 let expected_desktop_executable = self.expected_desktop_executable.clone();
+                let runtime_version = self.runtime_version;
                 std::thread::spawn(move || {
                     let mut service = match service_factory() {
                         Ok(service) => service,
@@ -227,7 +231,7 @@ impl MacosAttachServeBoundary for SystemMacosAttachBoundary {
                     let result = serve_macos_attach_session_with_state(
                         stream,
                         &expected_desktop_executable,
-                        env!("CARGO_PKG_VERSION"),
+                        runtime_version,
                         MACOS_ATTACH_HANDSHAKE_TIMEOUT,
                         &mut service,
                         approval.approval(),

@@ -160,7 +160,7 @@ impl WindowsAttachAcceptBoundary for WindowsAttachAcceptor {
                     let deadline = Instant::now() + WINDOWS_ATTACH_SESSION_TIMEOUT;
                     let _ = serve_windows_attach_session_with_state(
                         stream,
-                        env!("CARGO_PKG_VERSION"),
+                        state.runtime_version(),
                         deadline,
                         &mut service,
                         approval.approval(),

@@ -65,7 +65,7 @@ pub struct PromptLaunch {
     permission_answers:
         Arc<Mutex<VecDeque<muniment_core::permission_gate::PendingPermissionAnswer>>>,
     events: RuntimeChatEventTarget,
-    chat_grants: Arc<dyn ChatGrantService>,
+    host: RuntimeHost,
     pi_artifact: Option<PiArtifactDescriptor>,
     prepared: (u64, muniment_core::journal::reducer::ChatProjector),
     /// `Some` makes the run a manual compaction with these instructions.
@@ -227,7 +227,7 @@ fn accept_run(
     )?;
     let setup = (|| {
         let mut notice = None;
-        let mut provenance = runtime_provenance();
+        let mut provenance = runtime_provenance(host.runtime_version);
         if let Some(thread) = thread_id.as_deref() {
             let events = storage
                 .lock()
@@ -261,7 +261,7 @@ fn accept_run(
             Some(provenance),
             thread_id.as_deref(),
             "muniment-runtime",
-            env!("CARGO_PKG_VERSION"),
+            host.runtime_version,
             || {
                 if compaction.is_none() {
                     notice = super::prompt_storage::store_prompt_or_notice(
@@ -290,7 +290,7 @@ fn accept_run(
                         prepared.0,
                         subject.as_deref(),
                         "muniment-runtime",
-                        env!("CARGO_PKG_VERSION"),
+                        host.runtime_version,
                     );
                     return Err(reason);
                 }
@@ -305,7 +305,7 @@ fn accept_run(
                         prepared.0,
                         subject.as_deref(),
                         "muniment-runtime",
-                        env!("CARGO_PKG_VERSION"),
+                        host.runtime_version,
                     );
                     return Err(match result {
                         Err(error) => error.to_string(),
@@ -332,7 +332,7 @@ fn accept_run(
                 prepared.0,
                 subject.as_deref(),
                 "muniment-runtime",
-                env!("CARGO_PKG_VERSION"),
+                host.runtime_version,
             );
             return Err(format!(
                 "Conversation history memory session failed: {error:?}"
@@ -382,7 +382,7 @@ fn accept_run(
         adapter,
         permission_answers,
         events,
-        chat_grants: Arc::clone(&host.chat_grants),
+        host: host.clone(),
         pi_artifact,
         prepared,
         compaction,
@@ -400,7 +400,7 @@ pub fn drive_prompt(launch: PromptLaunch) {
             launch.thread_id,
             launch.grant.workspace.clone(),
         )
-        .with_chat_grants(launch.chat_grants)
+        .with_host(&launch.host)
         .with_pi_artifact(launch.pi_artifact.unwrap_or(PI_SELECTED_ARTIFACT)),
         launch.storage,
         launch.runtime,
@@ -434,7 +434,7 @@ pub fn drive_compaction(launch: PromptLaunch) -> Result<CompactionOutcome, Strin
             launch.thread_id,
             launch.grant.workspace.clone(),
         )
-        .with_chat_grants(launch.chat_grants)
+        .with_host(&launch.host)
         .with_pi_artifact(launch.pi_artifact.unwrap_or(PI_SELECTED_ARTIFACT)),
         launch.storage,
         launch.runtime,
@@ -607,7 +607,7 @@ pub fn resume_run(
             thread_id,
             grant.workspace.clone(),
         )
-        .with_chat_grants(Arc::clone(&host.chat_grants))
+        .with_host(host)
         .with_pi_artifact(pi_artifact.unwrap_or(PI_SELECTED_ARTIFACT)),
         storage,
         runtime,

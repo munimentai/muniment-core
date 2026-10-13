@@ -16,7 +16,7 @@ use muniment_core::run_start::ActiveRun;
 use muniment_core::session_thread::SessionThread;
 
 use crate::host::RuntimeHost;
-use crate::service::{open_companion_registry, open_profile_storage};
+use crate::service::{open_companion_registry, open_profile_storage_as};
 #[cfg(target_os = "linux")]
 use crate::AttachListenerInputs;
 use crate::{compose_attach_service, RuntimeAttachBoundaries, RuntimeChatEventBroadcast};
@@ -50,7 +50,7 @@ impl RuntimeAttachState {
     ) -> Result<Self, ProtocolError> {
         let profile_directory = profile_directory.as_ref().to_path_buf();
         let config_directory = config_directory.as_ref().to_path_buf();
-        let storage = open_profile_storage(&profile_directory)
+        let storage = open_profile_storage_as(&profile_directory, host.runtime_version)
             .map_err(|_| ProtocolError::persistence_failed())?;
         let companion_registry = open_companion_registry(&profile_directory)?;
         let drain_state = DrainState::new();
@@ -123,6 +123,7 @@ impl RuntimeAttachState {
             approval: self.approval.clone(),
             approvals: self.approvals.clone(),
             expected_desktop_executable: self.host.expected_desktop_executable.clone(),
+            runtime_version: self.host.runtime_version,
         }
     }
 
@@ -134,6 +135,11 @@ impl RuntimeAttachState {
     /// Returns the workspace approval shared with attach boundaries.
     pub fn signed_workspace_approval(&self) -> SignedWorkspaceApproval {
         self.approval.clone()
+    }
+
+    /// Returns the version the runtime announces on attach.
+    pub fn runtime_version(&self) -> &'static str {
+        self.host.runtime_version
     }
 
     /// Returns the activity registry an activation reads before a refresh.

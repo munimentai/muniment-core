@@ -22,16 +22,17 @@ pub use threads::{
 #[cfg(any(unix, target_os = "windows"))]
 pub use workspace::open_companion_registry;
 pub use workspace::{
-    ensure_home, list_companions, onboard_workspace, open_profile_storage, revoke_companion,
+    ensure_home, list_companions, onboard_workspace, open_profile_storage, open_profile_storage_as,
+    revoke_companion,
 };
 
 use muniment_core::journal::Provenance;
 use std::collections::BTreeMap;
 
-pub(crate) fn runtime_provenance() -> Provenance {
+pub(crate) fn runtime_provenance(runtime_version: &str) -> Provenance {
     Provenance {
         source: "muniment-runtime".into(),
-        source_version: env!("CARGO_PKG_VERSION").into(),
+        source_version: runtime_version.into(),
         actor_id: None,
         device_id: None,
         rpc_request_id: None,

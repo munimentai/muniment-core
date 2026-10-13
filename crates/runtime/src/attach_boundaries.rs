@@ -397,7 +397,7 @@ impl RunStartBoundaries for RuntimeAttachBoundaries {
             provenance,
             thread_id,
             "muniment-runtime",
-            env!("CARGO_PKG_VERSION"),
+            self.host.runtime_version,
             || {
                 notice = service::prompt_storage::store_prompt_or_notice(
                     run_id,
@@ -477,7 +477,7 @@ impl RunStartBoundaries for RuntimeAttachBoundaries {
             launch.prepared.0,
             launch.tokens.subject.as_deref(),
             "muniment-runtime",
-            env!("CARGO_PKG_VERSION"),
+            self.host.runtime_version,
         )
         .map_err(|error| persistence_error("journal", error))
     }
@@ -512,7 +512,7 @@ impl RunStartBoundaries for RuntimeAttachBoundaries {
         let active = Arc::clone(&self.active);
         let chat_events = self.chat_events.clone();
         let pi_artifact = self.pi_artifact.unwrap_or(PI_SELECTED_ARTIFACT);
-        let chat_grants = Arc::clone(&self.host.chat_grants);
+        let host = self.host.clone();
         let earlier_models = earlier_thread_models(&storage, &thread_id, &launch.run_id);
         let contexts = self.contexts.clone();
         let context_thread = thread_id.clone();
@@ -544,7 +544,7 @@ impl RunStartBoundaries for RuntimeAttachBoundaries {
                     thread_id,
                     launch.grant.workspace.clone(),
                 )
-                .with_chat_grants(chat_grants)
+                .with_host(&host)
                 .with_pi_artifact(pi_artifact)
                 .with_earlier_models(earlier_models)
                 .with_project_context(project_context),
@@ -818,7 +818,7 @@ impl RunAttachBoundaries for RuntimeAttachBoundaries {
             thread_id.to_owned(),
             workspace.clone(),
         )
-        .with_chat_grants(Arc::clone(&self.host.chat_grants))
+        .with_host(&self.host)
         .with_pi_artifact(self.pi_artifact.unwrap_or(PI_SELECTED_ARTIFACT));
         let chat_grants = Arc::clone(&self.host.chat_grants);
         let storage = Arc::clone(&self.storage);
@@ -1284,7 +1284,7 @@ impl RunAttachBoundaries for RuntimeAttachBoundaries {
             .map_err(|error| error.protocol_error())?
             .subject;
         provenance.source = "muniment-runtime".into();
-        provenance.source_version = env!("CARGO_PKG_VERSION").into();
+        provenance.source_version = self.host.runtime_version.into();
         let mut storage = self.storage.lock().map_err(|error| {
             persistence_error("lock", error.to_string()).desktop_protocol_error()
         })?;
@@ -1311,7 +1311,7 @@ impl RunAttachBoundaries for RuntimeAttachBoundaries {
             .map_err(|error| error.protocol_error())?
             .subject;
         provenance.source = "muniment-runtime".into();
-        provenance.source_version = env!("CARGO_PKG_VERSION").into();
+        provenance.source_version = self.host.runtime_version.into();
         let mut storage = self.storage.lock().map_err(|error| {
             persistence_error("lock", error.to_string()).desktop_protocol_error()
         })?;
@@ -1335,7 +1335,7 @@ impl RunAttachBoundaries for RuntimeAttachBoundaries {
             .map_err(|error| error.protocol_error())?
             .subject;
         provenance.source = "muniment-runtime".into();
-        provenance.source_version = env!("CARGO_PKG_VERSION").into();
+        provenance.source_version = self.host.runtime_version.into();
         let mut storage = self.storage.lock().map_err(|error| {
             persistence_error("lock", error.to_string()).desktop_protocol_error()
         })?;

@@ -86,6 +86,7 @@ fn inputs<'a>(
     approvals: &ApprovalCoordinator,
 ) -> AttachListenerInputs<'a> {
     AttachListenerInputs {
+        runtime_version: env!("CARGO_PKG_VERSION"),
         companion_registry: registry,
         approval: approval.clone(),
         approvals: approvals.clone(),

@@ -65,10 +65,10 @@ pub use service::open_companion_registry;
 pub use service::{
     accept_prompt, answer_permission, apply_retention, cancel_run, configure_run, create_company,
     create_thread, delete_company, delete_thread, drive_prompt, ensure_home, list_companies,
-    list_companions, onboard_workspace, open_profile_storage, queue_run_message, rename_company,
-    rename_thread, resume_run, revoke_companion, run_prompt, select_company, select_thread,
-    stream_run, subscribe_run_commits, thread_page, thread_summaries, ConfigureRunError,
-    PromptAcceptance, PromptLaunch, RecordRegistry,
+    list_companions, onboard_workspace, open_profile_storage, open_profile_storage_as,
+    queue_run_message, rename_company, rename_thread, resume_run, revoke_companion, run_prompt,
+    select_company, select_thread, stream_run, subscribe_run_commits, thread_page,
+    thread_summaries, ConfigureRunError, PromptAcceptance, PromptLaunch, RecordRegistry,
 };
 pub use sink::{
     RuntimeChatEventBroadcast, RuntimeChatEventSink, RuntimeChatEventTarget,

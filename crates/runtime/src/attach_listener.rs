@@ -46,6 +46,8 @@ pub struct AttachListenerInputs<'a> {
     pub approval: SignedWorkspaceApproval,
     pub approvals: ApprovalCoordinator,
     pub expected_desktop_executable: Option<PathBuf>,
+    /// The version the listener announces in each handshake.
+    pub runtime_version: &'static str,
 }
 
 /// Owns the profile endpoint and serves companion sessions until `stop` fires.
@@ -97,6 +99,7 @@ where
     let approval = inputs.approval;
     let approvals = inputs.approvals;
     let expected_desktop_executable = inputs.expected_desktop_executable;
+    let runtime_version = inputs.runtime_version;
 
     std::thread::scope(|scope| {
         let stop_finished = finished.clone();
@@ -174,7 +177,7 @@ where
                             credentials,
                             expected_desktop_executable,
                             &ProcReader,
-                            env!("CARGO_PKG_VERSION"),
+                            runtime_version,
                             PRESENTER_ADMISSION_TIMEOUT,
                         ) {
                             Ok(admitted) => admitted,
@@ -202,7 +205,7 @@ where
                             credentials,
                             expected_desktop_executable,
                             &ProcReader,
-                            env!("CARGO_PKG_VERSION"),
+                            runtime_version,
                             approval.approval(),
                             PRESENTER_ADMISSION_TIMEOUT,
                         ) {
@@ -245,7 +248,7 @@ where
                 let result = run_authenticated_session_with_service_approvals_and_registry(
                     stream,
                     credentials,
-                    env!("CARGO_PKG_VERSION"),
+                    runtime_version,
                     &mut service,
                     waiter,
                     &live_connections,

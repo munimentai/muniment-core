@@ -21,7 +21,9 @@ use muniment_core::attach::{
     probe_handoff, ApprovalCoordinator, ApprovalRequest, CompanionRegistry, HandoffProbeError,
     ProtocolError, SignedWorkspaceApproval,
 };
-use muniment_runtime_core::{run_attach_listener, AttachListenerInputs};
+use muniment_runtime_core::{
+    run_attach_listener, AttachListenerInputs, RuntimeAttachState, RuntimeHost,
+};
 
 mod common;
 use common::TemporaryProfile;
@@ -80,6 +82,7 @@ fn handshake(
             run_attach_listener(
                 &profile.root,
                 AttachListenerInputs {
+                    runtime_version: env!("CARGO_PKG_VERSION"),
                     companion_registry: &registry,
                     approval,
                     approvals,
@@ -131,6 +134,7 @@ fn probe(handoff_nonce: Option<String>) -> Result<(), HandoffProbeError> {
             run_attach_listener(
                 &profile.root,
                 AttachListenerInputs {
+                    runtime_version: env!("CARGO_PKG_VERSION"),
                     companion_registry: &registry,
                     approval: SignedWorkspaceApproval::default(),
                     approvals: ApprovalCoordinator::default(),
@@ -230,6 +234,7 @@ fn desktop_client_lists_threads_without_a_presenter() {
             run_attach_listener(
                 &profile.root,
                 AttachListenerInputs {
+                    runtime_version: env!("CARGO_PKG_VERSION"),
                     companion_registry: &registry,
                     approval,
                     approvals: ApprovalCoordinator::default(),
@@ -308,6 +313,7 @@ fn desktop_client_without_a_workspace_receives_an_empty_workspace_grant() {
             run_attach_listener(
                 &profile.root,
                 AttachListenerInputs {
+                    runtime_version: env!("CARGO_PKG_VERSION"),
                     companion_registry: &registry,
                     approval: SignedWorkspaceApproval::default(),
                     approvals: ApprovalCoordinator::default(),
@@ -410,6 +416,7 @@ fn installed_payload_connects_on_first_launch_but_replaced_alias_is_refused() {
                 instance,
                 transport,
                 AttachListenerInputs {
+                    runtime_version: env!("CARGO_PKG_VERSION"),
                     companion_registry: &registry,
                     approval: SignedWorkspaceApproval::default(),
                     approvals: ApprovalCoordinator::default(),
@@ -473,6 +480,7 @@ fn desktop_presenter_answers_an_approval_request() {
             run_attach_listener(
                 &profile.root,
                 AttachListenerInputs {
+                    runtime_version: env!("CARGO_PKG_VERSION"),
                     companion_registry: &registry,
                     approval: SignedWorkspaceApproval::default(),
                     approvals,
@@ -561,6 +569,7 @@ fn companion_pairs_through_the_desktop_presenter() {
                 run_attach_listener(
                     &profile.root,
                     AttachListenerInputs {
+                        runtime_version: env!("CARGO_PKG_VERSION"),
                         companion_registry: &registry,
                         approval,
                         approvals,
@@ -644,4 +653,68 @@ fn companion_pairs_through_the_desktop_presenter() {
         assert_eq!(claimed_version, "1.0.0");
         assert_eq!(workspace, "workspace-a");
     }
+}
+
+#[test]
+fn the_listener_announces_the_host_runtime_version() {
+    let profile = TemporaryProfile::new("attach-listener-version", false);
+    fs::set_permissions(&profile.root, fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = AttachFilesystem::from_runtime_directory(&profile.root)
+        .unwrap()
+        .endpoint_path()
+        .to_owned();
+    let host = RuntimeHost {
+        runtime_version: "9.8.7",
+        ..RuntimeHost::default()
+    };
+    let state =
+        Arc::new(RuntimeAttachState::open(host, &profile.profile, &profile.config).unwrap());
+    let (stop_tx, stop_rx) = mpsc::channel();
+
+    thread::scope(|scope| {
+        let listener = scope.spawn(|| {
+            let service_state = Arc::clone(&state);
+            run_attach_listener(
+                &profile.root,
+                state.attach_listener_inputs(),
+                None,
+                move || service_state.attach_service(),
+                stop_rx,
+            )
+            .unwrap()
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut stream = loop {
+            match UnixStream::connect(&endpoint) {
+                Ok(stream) => break stream,
+                Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                Err(error) => panic!("attach listener did not start: {error}"),
+            }
+        };
+        stream
+            .write_all(
+                &encode_frame(&Hello {
+                    protocol: Protocol,
+                    client: Client {
+                        kind: "editor-extension".into(),
+                        version: "1.0.0".into(),
+                    },
+                    supported: VersionRange { min: 1, max: 1 },
+                    client_nonce: "client-nonce".into(),
+                    authorized_client_id: Id::new("018f0000-0000-7000-8000-000000000126").unwrap(),
+                    authorized_client_credential: None,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let welcome = read_frame_text(&mut stream);
+        assert!(
+            welcome.contains("\"desktop_version\":\"9.8.7\""),
+            "{welcome}"
+        );
+
+        drop(stream);
+        stop_tx.send(()).unwrap();
+        listener.join().unwrap();
+    });
 }

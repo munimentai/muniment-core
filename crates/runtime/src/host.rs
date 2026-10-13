@@ -33,10 +33,14 @@ pub struct RuntimeHost {
     /// `MUNIMENT_READER_BIN` overrides it. `None` leaves network sources
     /// without a reader.
     pub reader_executable: Option<PathBuf>,
+    /// The version the runtime announces on attach and records in the journal:
+    /// the host binary's package version.
+    pub runtime_version: &'static str,
 }
 
 impl Default for RuntimeHost {
-    /// No cloud account, the platform keyring, no desktop peer and no reader sidecar.
+    /// No cloud account, the platform keyring, no desktop peer, no reader
+    /// sidecar, and this crate's version.
     fn default() -> Self {
         Self {
             account: Arc::new(NoCloud),
@@ -44,6 +48,7 @@ impl Default for RuntimeHost {
             credentials: Arc::new(KeyringCredentialStore),
             expected_desktop_executable: None,
             reader_executable: None,
+            runtime_version: env!("CARGO_PKG_VERSION"),
         }
     }
 }
