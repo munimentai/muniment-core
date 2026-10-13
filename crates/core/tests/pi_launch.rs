@@ -948,6 +948,74 @@ fn project_launch_uses_the_folder_after_rename_and_rejects_a_missing_folder() {
 }
 
 #[test]
+fn the_launch_prompt_follows_the_recall_settings_and_keeps_the_profile() {
+    let root = temporary_directory();
+    let profile = root.join("profile");
+    muniment_core::home::confirm_home(&profile, &root.join("muniment")).unwrap();
+    muniment_core::memory_files::profile_save(&profile, "Call me Alex.").unwrap();
+    fs::create_dir_all(profile.join("sessions")).unwrap();
+    let boundaries = Boundaries {
+        session_root: Ok(profile.join("sessions")),
+        extension: None,
+    };
+    let prompt = || {
+        let config =
+            pi_launch_config_for_executable(&boundaries, "pi".into(), &ChatGrant::local(), None)?;
+        Ok::<_, PiLaunchError>(
+            config
+                .args
+                .windows(2)
+                .find(|args| args[0] == "--system-prompt")
+                .map(|args| args[1].clone())
+                .unwrap(),
+        )
+    };
+    let defaults = prompt().unwrap();
+    assert!(defaults.contains("Use memory-search to recall relevant facts."));
+    assert!(defaults.contains("Do not ask for confirmation for routine memory maintenance."));
+    assert!(defaults.contains("Call me Alex."));
+
+    muniment_core::memory_files::recall_settings_save(
+        &profile,
+        muniment_core::memory_files::RecallSettings {
+            learn: false,
+            use_memories: false,
+            ask: false,
+        },
+    )
+    .unwrap();
+    let off = prompt().unwrap();
+    assert!(!off.contains("memory-search"));
+    assert!(!off.contains("memory-save"));
+    assert!(off.contains("Saving memories is off."));
+    assert!(off.contains("Do not claim to remember earlier conversations"));
+    assert!(off.contains("Call me Alex."));
+
+    muniment_core::memory_files::recall_settings_save(
+        &profile,
+        muniment_core::memory_files::RecallSettings {
+            learn: true,
+            use_memories: true,
+            ask: true,
+        },
+    )
+    .unwrap();
+    let ask = prompt().unwrap();
+    assert!(ask.contains("The user approves each memory change."));
+    assert!(!ask.contains("Do not ask for confirmation"));
+
+    fs::write(profile.join("memory-recall.json"), "{").unwrap();
+    assert_eq!(
+        prompt().unwrap_err(),
+        PiLaunchError::RejectedConfig {
+            step: "memory_settings",
+            cause: "Memory settings cannot be read.".into(),
+        }
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn composer_selection_overrides_the_model_on_new_and_reopened_local_threads() {
     struct SelectedModel {
         root: PathBuf,

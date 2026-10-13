@@ -93,6 +93,70 @@ pub fn profile_save(profile: &Path, content: &str) -> Result<(), String> {
     let _file_lock = lock(profile)?;
     write(&home(profile)?, "memory/profile.md", content)
 }
+
+const RECALL_FILE: &str = "memory-recall.json";
+const MAX_RECALL: u64 = 4 * 1024;
+
+/// How chats learn and use durable facts. The profile reaches every chat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecallSettings {
+    pub learn: bool,
+    #[serde(rename = "use")]
+    pub use_memories: bool,
+    pub ask: bool,
+}
+
+impl Default for RecallSettings {
+    fn default() -> Self {
+        Self {
+            learn: true,
+            use_memories: true,
+            ask: false,
+        }
+    }
+}
+
+pub fn recall_settings_stored(profile: &Path) -> Result<Option<RecallSettings>, String> {
+    let path = profile.join(RECALL_FILE);
+    let unreadable = || "Memory settings cannot be read.".to_owned();
+    match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Ok(m) if m.is_file() && m.len() <= MAX_RECALL => {}
+        _ => return Err(unreadable()),
+    }
+    let bytes = fs::read(&path).map_err(|_| unreadable())?;
+    if bytes.len() as u64 > MAX_RECALL {
+        return Err(unreadable());
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|_| unreadable())
+}
+pub fn recall_settings(profile: &Path) -> Result<RecallSettings, String> {
+    Ok(recall_settings_stored(profile)?.unwrap_or_default())
+}
+pub fn recall_settings_save(profile: &Path, settings: RecallSettings) -> Result<(), String> {
+    let _guard = WRITE.lock().map_err(|_| "Memory is busy.")?;
+    let _file_lock = lock(profile)?;
+    let path = profile.join(RECALL_FILE);
+    if path.is_symlink() {
+        return Err("Memory settings cannot be saved.".into());
+    }
+    let temp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        fs::write(
+            &temp,
+            serde_json::to_vec(&settings).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        crate::atomic_file::replace(&temp, &path).map_err(|e| e.to_string())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temp);
+    }
+    result.map_err(|_| "Memory settings cannot be saved.".into())
+}
 fn fact_path(id: &str) -> Result<String, String> {
     uuid::Uuid::parse_str(id).map_err(|_| "The memory identifier is invalid.")?;
     Ok(format!("memory/facts/{id}.md"))
@@ -283,6 +347,78 @@ mod tests {
         profile_save(&profile, original).unwrap();
         assert_eq!(profile_read(&profile).unwrap(), original);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recall_settings_round_trip_with_defaults_for_missing_keys() {
+        let profile = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        assert_eq!(recall_settings_stored(&profile).unwrap(), None);
+        assert_eq!(
+            recall_settings(&profile).unwrap(),
+            RecallSettings {
+                learn: true,
+                use_memories: true,
+                ask: false
+            }
+        );
+        let saved = RecallSettings {
+            learn: false,
+            use_memories: false,
+            ask: true,
+        };
+        recall_settings_save(&profile, saved).unwrap();
+        assert_eq!(recall_settings_stored(&profile).unwrap(), Some(saved));
+        let written: serde_json::Value =
+            serde_json::from_slice(&fs::read(profile.join("memory-recall.json")).unwrap()).unwrap();
+        assert_eq!(
+            written,
+            serde_json::json!({"learn": false, "use": false, "ask": true})
+        );
+        fs::write(profile.join("memory-recall.json"), r#"{"use":false}"#).unwrap();
+        assert_eq!(
+            recall_settings(&profile).unwrap(),
+            RecallSettings {
+                learn: true,
+                use_memories: false,
+                ask: false
+            }
+        );
+        fs::remove_dir_all(profile).unwrap();
+    }
+
+    #[test]
+    fn recall_settings_reject_malformed_oversized_and_linked_files() {
+        let profile = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        fs::create_dir_all(&profile).unwrap();
+        let file = profile.join("memory-recall.json");
+        let unreadable =
+            Err::<Option<RecallSettings>, _>("Memory settings cannot be read.".to_owned());
+        for content in [
+            "{".to_owned(),
+            r#"{"learn":"yes"}"#.to_owned(),
+            format!(r#"{{"learn":true,"pad":"{}"}}"#, "x".repeat(5000)),
+        ] {
+            fs::write(&file, content).unwrap();
+            assert_eq!(recall_settings_stored(&profile), unreadable);
+            assert_eq!(
+                recall_settings(&profile).unwrap_err(),
+                unreadable.clone().unwrap_err()
+            );
+        }
+        fs::remove_file(&file).unwrap();
+        fs::create_dir(&file).unwrap();
+        assert_eq!(recall_settings_stored(&profile), unreadable);
+        fs::remove_dir(&file).unwrap();
+        #[cfg(unix)]
+        {
+            let target = profile.join("target.json");
+            fs::write(&target, "{}").unwrap();
+            std::os::unix::fs::symlink(&target, &file).unwrap();
+            assert_eq!(recall_settings_stored(&profile), unreadable);
+            assert!(recall_settings_save(&profile, RecallSettings::default()).is_err());
+            assert_eq!(fs::read_to_string(&target).unwrap(), "{}");
+        }
+        fs::remove_dir_all(profile).unwrap();
     }
 
     #[test]
