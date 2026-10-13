@@ -581,6 +581,7 @@ pub(super) fn inventory(
     if discovery.join().ok().and_then(Result::ok) == Some(true) || provider_changed {
         models = engine.list_models();
     }
+    super::router::settle_default(agent, None, false);
     let mut inventory = provider_inventory(agent, &models)?;
     adopt_shown_default(agent, &mut inventory);
     Ok(inventory)
@@ -748,15 +749,32 @@ pub(super) fn set_default_model(agent: &Path, provider: &str, model: &str) -> Re
 }
 
 fn save_default_model(agent: &Path, provider: &str, model: &str) -> std::io::Result<()> {
+    replace_default_model(agent, provider, model, |_, _| true).map(|_| ())
+}
+
+/// Saves `provider/model` as the default when `replace` accepts the saved
+/// provider and model, read under the same lock as the write. Answers whether
+/// it saved.
+pub(super) fn replace_default_model(
+    agent: &Path,
+    provider: &str,
+    model: &str,
+    replace: impl FnOnce(Option<&str>, Option<&str>) -> bool,
+) -> std::io::Result<bool> {
     let settings_file = pi_settings_file(&pi_models_file(agent));
     fs::create_dir_all(agent)?;
     let lock = muniment_core::pi_settings::lock_settings(&settings_file)?;
     let mut settings = pi_models::read_json(&settings_file)?;
+    let saved = |key: &str| settings.get(key).and_then(serde_json::Value::as_str);
+    if !replace(saved("defaultProvider"), saved("defaultModel")) {
+        return Ok(false);
+    }
     settings.insert("defaultProvider".into(), provider.into());
     settings.insert("defaultModel".into(), model.into());
     merge_pi_settings(&mut settings, PI_SELECTED_ARTIFACT);
     lock.check()?;
-    pi_models::write_json(&settings_file, &settings)
+    pi_models::write_json(&settings_file, &settings)?;
+    Ok(true)
 }
 
 /// Whether Pi's settings name no default model yet.

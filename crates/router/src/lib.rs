@@ -207,6 +207,17 @@ pub fn served_models(config: &RouterConfig) -> Vec<String> {
     models
 }
 
+/// The models the router offers a picker: what it serves, less `auto` while
+/// no decision model is ready, because `auto` then routes nothing. The router
+/// still answers a turn that names `auto`.
+pub fn offered_models(config: &RouterConfig) -> Vec<String> {
+    let mut models = served_models(config);
+    if !config.classifier.ready() {
+        models.retain(|model| model != AUTO_MODEL);
+    }
+    models
+}
+
 /// Where a turn is bound before any account is picked. One turn makes one
 /// plan, so a failover picks another account without classifying again.
 #[derive(Debug, Clone, PartialEq)]
@@ -458,6 +469,25 @@ mod tests {
         assert!(served.iter().any(|model| model == "deep"));
         assert!(served.iter().any(|model| model == "openai/gpt-6-astra"));
         assert!(served_models(&RouterConfig::default()).is_empty());
+    }
+
+    #[test]
+    fn a_picker_is_offered_auto_only_while_a_decision_model_is_ready() {
+        let mut config = pooled();
+        let offered = offered_models(&config);
+        assert!(offered.iter().all(|model| model != "auto"));
+        assert_eq!(offered.len(), 7);
+        assert_eq!(offered, served_models(&config)[1..]);
+        config.classifier = Classifier::Typesafe {
+            api_key: "apikey_1".into(),
+            model: "jev-latest".into(),
+            base_url: None,
+            max_options: None,
+            limits: Default::default(),
+        };
+        assert_eq!(offered_models(&config), served_models(&config));
+        assert_eq!(offered_models(&config)[0], "auto");
+        assert!(offered_models(&RouterConfig::default()).is_empty());
     }
 
     #[test]
