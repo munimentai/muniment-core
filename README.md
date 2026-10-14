@@ -39,7 +39,10 @@ the `PiLaunchBoundaries` and `RunAttachBoundaries` traits, and the runtime's
 `pins/pins.toml` pins the Pi release (current and rollback), one archive per
 platform with its size and SHA-256, the Pi extension packages, and the Claude
 Code version. `pins/packages.bun.lock` locks the packages. Platform names use
-`<target_os>-<target_arch>`, for example `macos-aarch64`.
+`<target_os>-<target_arch>`, for example `macos-aarch64`. A package entry's
+`patch` field names a git diff under `pins/patches/` that Bun applies through
+`patchedDependencies`, and `bump` refuses to move that package until the patch
+is removed or remade for the new version.
 
 The `muniment-pins` binary keeps the pins current:
 

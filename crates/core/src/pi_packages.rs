@@ -23,6 +23,10 @@ pub const PI_PACKAGES: [(&str, &str); muniment_pins::PACKAGE_COUNT] =
 /// writes: `BUN_BE_BUN=1 pi install --lockfile-only --omit=peer --ignore-scripts`.
 pub const PI_PACKAGES_LOCK: &str = muniment_pins::PACKAGES_LOCK;
 
+/// The local package patches. The manifest names each one in
+/// `patchedDependencies`, and Bun applies it during the frozen install.
+pub const PI_PACKAGE_PATCHES: &[muniment_pins::PackagePatch] = muniment_pins::PACKAGE_PATCHES;
+
 /// The manifest the lockfile was resolved from. A frozen install fails when
 /// its dependencies differ from the lockfile's.
 fn package_manifest() -> Vec<u8> {
@@ -30,19 +34,45 @@ fn package_manifest() -> Vec<u8> {
         .iter()
         .map(|(name, version)| ((*name).to_owned(), Value::String((*version).to_owned())))
         .collect();
-    let manifest = json!({
+    let mut manifest = json!({
         "name": "muniment-pi-packages",
         "private": true,
         "dependencies": dependencies,
     });
+    if !PI_PACKAGE_PATCHES.is_empty() {
+        let patches: Map<String, Value> = PI_PACKAGE_PATCHES
+            .iter()
+            .map(|patch| {
+                (
+                    format!("{}@{}", patch.name, patch.version),
+                    Value::String(patch.path.to_owned()),
+                )
+            })
+            .collect();
+        manifest["patchedDependencies"] = Value::Object(patches);
+    }
     serde_json::to_vec_pretty(&manifest).expect("the package manifest serializes")
 }
 
-/// The marker names the packages and the lockfile, so a new lockfile reinstalls.
+/// The marker names the packages, the lockfile and the patches, so a new
+/// lockfile or a changed patch reinstalls.
 fn install_identity() -> io::Result<Vec<u8>> {
+    identity_with(PI_PACKAGE_PATCHES)
+}
+
+fn identity_with(patches: &[muniment_pins::PackagePatch]) -> io::Result<Vec<u8>> {
     let lock = format!("{:x}", Sha256::digest(PI_PACKAGES_LOCK.as_bytes()));
+    let patches: Vec<_> = patches
+        .iter()
+        .map(|patch| {
+            (
+                patch.path,
+                format!("{:x}", Sha256::digest(patch.text.as_bytes())),
+            )
+        })
+        .collect();
     Ok(serde_json::to_vec(
-        &json!({"packages": PI_PACKAGES, "lock": lock}),
+        &json!({"packages": PI_PACKAGES, "lock": lock, "patches": patches}),
     )?)
 }
 
@@ -467,9 +497,14 @@ pub fn prepare_pi_packages(agent_directory: &Path, executable: &Path) -> io::Res
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    // The manifest and the lockfile are the runtime's. Each install replaces both.
+    // The manifest, the lockfile and the patches are the runtime's. Each install replaces them.
     fs::write(directory.join("package.json"), package_manifest())?;
     fs::write(directory.join("bun.lock"), PI_PACKAGES_LOCK)?;
+    for patch in PI_PACKAGE_PATCHES {
+        let path = directory.join(patch.path);
+        fs::create_dir_all(path.parent().expect("a patch path names a directory"))?;
+        fs::write(path, patch.text)?;
+    }
     // Resolve relative overrides before --cwd changes Bun's working directory.
     let directory = fs::canonicalize(directory)?;
     let stderr_tail = run_install(
@@ -887,6 +922,32 @@ mod tests {
     }
 
     #[test]
+    fn the_manifest_and_the_lockfile_name_each_patch_and_the_identity_covers_it() {
+        assert!(!PI_PACKAGE_PATCHES.is_empty());
+        let manifest: Value = serde_json::from_slice(&package_manifest()).unwrap();
+        let patched = manifest["patchedDependencies"].as_object().unwrap();
+        assert_eq!(patched.len(), PI_PACKAGE_PATCHES.len());
+        for patch in PI_PACKAGE_PATCHES {
+            let key = format!("{}@{}", patch.name, patch.version);
+            assert!(PI_PACKAGES.contains(&(patch.name, patch.version)));
+            assert_eq!(patched[&key], patch.path);
+            assert!(PI_PACKAGES_LOCK.contains(&format!("\"{key}\": \"{}\",", patch.path)));
+            assert!(patch.text.starts_with("diff --git "));
+        }
+        let mut changed = PI_PACKAGE_PATCHES.to_vec();
+        changed[0].text = "diff --git a/other.ts b/other.ts\n";
+        assert_ne!(
+            identity_with(&changed).unwrap(),
+            install_identity().unwrap()
+        );
+        assert_ne!(identity_with(&[]).unwrap(), install_identity().unwrap());
+        assert_eq!(
+            identity_with(PI_PACKAGE_PATCHES).unwrap(),
+            install_identity().unwrap()
+        );
+    }
+
+    #[test]
     #[cfg(unix)]
     fn each_install_writes_the_manifest_and_the_lockfile() {
         use std::os::unix::fs::PermissionsExt;
@@ -908,6 +969,12 @@ mod tests {
             fs::read_to_string(npm.join("bun.lock")).unwrap(),
             PI_PACKAGES_LOCK
         );
+        for patch in PI_PACKAGE_PATCHES {
+            assert_eq!(
+                fs::read_to_string(npm.join(patch.path)).unwrap(),
+                patch.text
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

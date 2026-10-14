@@ -57,6 +57,9 @@ pub struct AssetPin {
 pub struct PackagePin {
     pub name: String,
     pub version: String,
+    /// A local patch for this exact version, relative to `pins/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +115,9 @@ impl PinsFile {
             out.push_str("\n[[packages]]\n");
             out.push_str(&format!("name = {}\n", quote(&package.name)));
             out.push_str(&format!("version = {}\n", quote(&package.version)));
+            if let Some(patch) = &package.patch {
+                out.push_str(&format!("patch = {}\n", quote(patch)));
+            }
         }
         out.push_str("\n[claude_code]\n");
         out.push_str(&format!("version = {}\n", quote(&self.claude_code.version)));
@@ -141,12 +147,45 @@ impl PinsFile {
             .iter()
             .map(|package| (package.name.clone(), Value::String(package.version.clone())))
             .collect();
-        serde_json::to_vec_pretty(&json!({
+        let patches: Map<String, Value> = self
+            .packages
+            .iter()
+            .filter_map(|package| {
+                let patch = package.patch.as_ref()?;
+                Some((
+                    format!("{}@{}", package.name, package.version),
+                    Value::String(patch.clone()),
+                ))
+            })
+            .collect();
+        let mut manifest = json!({
             "name": MANIFEST_NAME,
             "private": true,
             "dependencies": dependencies,
-        }))
-        .expect("the package manifest serializes")
+        });
+        if !patches.is_empty() {
+            manifest["patchedDependencies"] = Value::Object(patches);
+        }
+        serde_json::to_vec_pretty(&manifest).expect("the package manifest serializes")
+    }
+
+    /// Writes the package manifest and the patches it names into `work`.
+    /// `pins` is the directory that holds `pins.toml` and its patches.
+    pub fn write_package_manifest(&self, pins: &Path, work: &Path) -> Result<()> {
+        fs::create_dir_all(work).map_err(|error| format!("{}: {error}", work.display()))?;
+        fs::write(work.join("package.json"), self.package_manifest())
+            .map_err(|error| format!("package.json: {error}"))?;
+        for patch in self
+            .packages
+            .iter()
+            .filter_map(|package| package.patch.as_ref())
+        {
+            let target = work.join(patch);
+            fs::create_dir_all(target.parent().unwrap())
+                .map_err(|error| format!("{}: {error}", target.display()))?;
+            fs::copy(pins.join(patch), &target).map_err(|error| format!("{patch}: {error}"))?;
+        }
+        Ok(())
     }
 }
 
@@ -423,6 +462,13 @@ pub fn plan(current: &PinsFile, request: &BumpRequest, http: &dyn Http) -> Resul
             None => None,
         };
         if let Some(target) = target.filter(|target| *target != package.version) {
+            if let Some(patch) = &package.patch {
+                return Err(format!(
+                    "{} {} carries the local patch {patch}, which applies to that version only. \
+                     Remove the patch from pins.toml, or remake it for {target}, before the bump.",
+                    package.name, package.version
+                ));
+            }
             change(&package.name, &package.version, &target);
             package.version = target;
             packages_changed = true;
@@ -636,12 +682,11 @@ pub fn pi_bun(pi: &Path, directory: &Path, args: &[&str]) -> Result<String> {
     Ok(text)
 }
 
-/// Resolves the package lockfile with the Pi executable's Bun.
-pub fn resolve_lock(pi: &Path, pins: &PinsFile, work: &Path) -> Result<String> {
+/// Resolves the package lockfile with the Pi executable's Bun. `directory`
+/// holds `pins.toml` and the patches it names.
+pub fn resolve_lock(pi: &Path, pins: &PinsFile, directory: &Path, work: &Path) -> Result<String> {
     let _ = fs::remove_dir_all(work);
-    fs::create_dir_all(work).map_err(|error| error.to_string())?;
-    fs::write(work.join("package.json"), pins.package_manifest())
-        .map_err(|error| error.to_string())?;
+    pins.write_package_manifest(directory, work)?;
     pi_bun(
         pi,
         work,

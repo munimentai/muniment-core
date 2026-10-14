@@ -1,6 +1,6 @@
 use muniment_pins::{
-    find_pi_asset, package_pairs, pi_asset, PiAsset, CLAUDE_CODE, PACKAGES, PACKAGES_LOCK, PI,
-    PINS_TOML,
+    find_pi_asset, package_pairs, pi_asset, PiAsset, CLAUDE_CODE, PACKAGES, PACKAGES_LOCK,
+    PACKAGE_PATCHES, PI, PINS_TOML,
 };
 
 /// Each supported platform, its release archive, and the executable inside it.
@@ -137,4 +137,38 @@ fn the_lockfile_resolves_exactly_the_pinned_packages() {
     locked.sort();
     pinned.sort();
     assert_eq!(locked, pinned);
+}
+
+#[test]
+fn the_compiled_patches_embed_the_files_the_pins_name() {
+    let file: toml::Table = toml::from_str(PINS_TOML).unwrap();
+    let named: Vec<_> = file["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|package| {
+            Some((
+                package["name"].as_str().unwrap(),
+                package["version"].as_str().unwrap(),
+                package.get("patch")?.as_str().unwrap(),
+            ))
+        })
+        .collect();
+    let compiled: Vec<_> = PACKAGE_PATCHES
+        .iter()
+        .map(|patch| (patch.name, patch.version, patch.path))
+        .collect();
+    assert_eq!(named, compiled);
+    let pins = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../pins");
+    for patch in PACKAGE_PATCHES {
+        assert_eq!(
+            patch.text,
+            std::fs::read_to_string(pins.join(patch.path)).unwrap()
+        );
+        // The lockfile records the patch, so a frozen install applies it.
+        assert!(PACKAGES_LOCK.contains(&format!(
+            "\"{}@{}\": \"{}\",",
+            patch.name, patch.version, patch.path
+        )));
+    }
 }

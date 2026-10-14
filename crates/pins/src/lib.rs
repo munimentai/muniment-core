@@ -45,6 +45,18 @@ pub struct Package {
     pub version: &'static str,
 }
 
+/// A local patch to one pinned package, kept under `pins/patches/`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackagePatch {
+    pub name: &'static str,
+    pub version: &'static str,
+    /// The patch path relative to `pins/`. The install manifest names the
+    /// same path relative to the install directory.
+    pub path: &'static str,
+    /// The patch text, a git diff against the package root.
+    pub text: &'static str,
+}
+
 /// The pinned Claude Code CLI release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaudeCode {

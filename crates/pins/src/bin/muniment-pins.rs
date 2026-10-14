@@ -152,7 +152,12 @@ fn bump(options: &Options, http: &dyn Http) -> Result<ExitCode> {
             "Resolving the package lockfile with Pi {}.",
             plan.pins.pi.version
         );
-        let lock = resolve_lock(&pi, &plan.pins, &options.cache.join("lock"))?;
+        let lock = resolve_lock(
+            &pi,
+            &plan.pins,
+            &options.root.join("pins"),
+            &options.cache.join("lock"),
+        )?;
         fs::write(options.root.join("pins/packages.bun.lock"), lock)
             .map_err(|error| format!("packages.bun.lock: {error}"))?;
     }
@@ -255,9 +260,7 @@ fn compat(options: &Options, http: &dyn Http) -> Result<ExitCode> {
     // The frozen install is the runtime's install: the lockfile must hold every package.
     let packages = work.join("packages");
     let install = (|| -> Result<String> {
-        fs::create_dir_all(&packages).map_err(|error| error.to_string())?;
-        fs::write(packages.join("package.json"), pins.package_manifest())
-            .map_err(|error| error.to_string())?;
+        pins.write_package_manifest(&root.join("pins"), &packages)?;
         fs::copy(
             root.join("pins/packages.bun.lock"),
             packages.join("bun.lock"),

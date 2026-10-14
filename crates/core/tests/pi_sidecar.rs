@@ -327,6 +327,18 @@ export default function (pi) {
         fs::read_to_string(agent.join("npm/bun.lock")).unwrap(),
         muniment_core::pi_packages::PI_PACKAGES_LOCK
     );
+    // Bun applied each local patch: the installed files hold every added line.
+    for patch in muniment_core::pi_packages::PI_PACKAGE_PATCHES {
+        let package = agent.join("npm/node_modules").join(patch.name);
+        let mut source = String::new();
+        for line in patch.text.lines() {
+            if let Some(file) = line.strip_prefix("+++ b/") {
+                source = fs::read_to_string(package.join(file)).unwrap();
+            } else if let Some(added) = line.strip_prefix('+') {
+                assert!(source.contains(added), "{} lacks {added}", patch.name);
+            }
+        }
+    }
     let settings: serde_json::Value =
         serde_json::from_slice(&fs::read(agent.join("settings.json")).unwrap()).unwrap();
     assert_eq!(

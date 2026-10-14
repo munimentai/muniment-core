@@ -334,3 +334,65 @@ fn the_package_manifest_names_exactly_the_pins() {
         assert_eq!(dependencies[&package.name], package.version.as_str());
     }
 }
+
+#[test]
+fn the_package_manifest_names_each_patch_and_the_work_directory_holds_it() {
+    let pins = PinsFile::parse(PINS_TOML).unwrap();
+    let manifest: Value = serde_json::from_slice(&pins.package_manifest()).unwrap();
+    let patched = manifest["patchedDependencies"].as_object().unwrap();
+    let patches: Vec<_> = pins
+        .packages
+        .iter()
+        .filter_map(|package| Some((package, package.patch.as_ref()?)))
+        .collect();
+    assert!(!patches.is_empty());
+    assert_eq!(patched.len(), patches.len());
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../pins");
+    let work = temporary();
+    pins.write_package_manifest(&directory, &work).unwrap();
+    assert_eq!(
+        std::fs::read(work.join("package.json")).unwrap(),
+        pins.package_manifest()
+    );
+    for (package, patch) in patches {
+        assert_eq!(
+            patched[&format!("{}@{}", package.name, package.version)],
+            patch.as_str()
+        );
+        assert_eq!(
+            std::fs::read(work.join(patch)).unwrap(),
+            std::fs::read(directory.join(patch)).unwrap()
+        );
+    }
+    std::fs::remove_dir_all(work).unwrap();
+    let unpatched: Value = serde_json::from_slice(&current().package_manifest()).unwrap();
+    assert!(unpatched.get("patchedDependencies").is_none());
+}
+
+#[test]
+fn a_bump_refuses_to_move_a_patched_package() {
+    let mut pins = current();
+    pins.packages[0].patch = Some(format!(
+        "patches/{}@{}.patch",
+        pins.packages[0].name, pins.packages[0].version
+    ));
+    let request = BumpRequest {
+        packages: vec![(pins.packages[0].name.clone(), "9.9.9".into())],
+        ..BumpRequest::default()
+    };
+    let error = plan(&pins, &request, &Recorded::registry()).unwrap_err();
+    assert!(error.contains("remake it for 9.9.9"), "{error}");
+    let request = BumpRequest {
+        all_packages: true,
+        ..BumpRequest::default()
+    };
+    assert!(plan(&pins, &request, &Recorded::registry()).is_err());
+    let request = BumpRequest {
+        packages: vec![(
+            pins.packages[0].name.clone(),
+            pins.packages[0].version.clone(),
+        )],
+        ..BumpRequest::default()
+    };
+    assert!(plan(&pins, &request, &Recorded::registry()).is_ok());
+}

@@ -41,6 +41,8 @@ struct PiAsset {
 struct Package {
     name: String,
     version: String,
+    #[serde(default)]
+    patch: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -100,11 +102,25 @@ fn validate(pins: &Pins) {
         !pins.packages.is_empty() && names.len() == pins.packages.len(),
         "pins.toml: packages must be present and unique"
     );
+    for patch in pins
+        .packages
+        .iter()
+        .filter_map(|package| package.patch.as_ref())
+    {
+        assert!(
+            patch.starts_with("patches/")
+                && patch.ends_with(".patch")
+                && !patch.contains('\\')
+                && !patch.split('/').any(|part| part.is_empty() || part == ".."),
+            "pins.toml: the patch {patch} must be a file under patches/"
+        );
+    }
 }
 
 fn main() {
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let path = manifest.join("../../pins/pins.toml");
+    let pins_directory = manifest.join("../../pins");
+    let path = pins_directory.join("pins.toml");
     println!("cargo:rerun-if-changed={}", path.display());
     let text = fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("{} must be readable: {error}", path.display()));
@@ -146,6 +162,28 @@ fn main() {
             out,
             "    Package {{ name: {:?}, version: {:?} }},",
             package.name, package.version
+        )
+        .unwrap();
+    }
+    writeln!(out, "];").unwrap();
+    writeln!(
+        out,
+        "/// The local patches Bun applies to pinned packages through `patchedDependencies`."
+    )
+    .unwrap();
+    writeln!(out, "pub const PACKAGE_PATCHES: &[PackagePatch] = &[").unwrap();
+    for package in &pins.packages {
+        let Some(patch) = &package.patch else {
+            continue;
+        };
+        let file = pins_directory.join(patch);
+        println!("cargo:rerun-if-changed={}", file.display());
+        assert!(file.is_file(), "pins.toml: {patch} is missing");
+        let file = file.to_str().expect("the patch path is UTF-8");
+        writeln!(
+            out,
+            "    PackagePatch {{ name: {:?}, version: {:?}, path: {:?}, text: include_str!({:?}) }},",
+            package.name, package.version, patch, file
         )
         .unwrap();
     }

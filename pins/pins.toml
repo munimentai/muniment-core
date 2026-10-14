@@ -89,6 +89,7 @@ executable = "pi/pi.exe"
 [[packages]]
 name = "pi-web-access"
 version = "0.40.0"
+patch = "patches/pi-web-access@0.40.0.patch"
 
 [[packages]]
 name = "pi-subagents"

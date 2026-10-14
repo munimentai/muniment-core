@@ -51,6 +51,21 @@ for (const { name, version } of pins?.packages ?? []) {
   })
 }
 
+for (const { name, version, patch } of (pins?.packages ?? []).filter(pin => pin.patch)) {
+  test(`${name} ${version} holds its local patch`, { skip: !ready }, () => {
+    const diff = readFileSync(join(env.root, 'pins', patch), 'utf8')
+    let file, source
+    for (const line of diff.split('\n')) {
+      if (line.startsWith('+++ b/')) {
+        file = line.slice('+++ b/'.length)
+        source = readFileSync(join(packageDir(name), file), 'utf8')
+      } else if (line.startsWith('+')) {
+        assert.ok(source.includes(line.slice(1)), `${file} lacks ${line.slice(1)}`)
+      }
+    }
+  })
+}
+
 test('the tools the system prompt names are registered', { skip: !ready, timeout: 120000 }, async t => {
   // `--no-extensions` also turns off Pi's built-in extensions, and codemode is one.
   const registered = await load(t, [...allExtensions(), '--extension', 'builtin:codemode'])
