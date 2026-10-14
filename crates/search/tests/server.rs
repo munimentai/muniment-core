@@ -137,6 +137,27 @@ fn every_engine_failing_answers_service_unavailable() {
 }
 
 #[test]
+fn a_replaced_metasearch_answers_later_searches_on_the_same_endpoint() {
+    let engines = Engines::default()
+        .answer(EngineId::Brave, Answer::Results(vec!["https://a.example/"]))
+        .answer(EngineId::Bing, Answer::Results(vec!["https://b.example/"]));
+    let (_dir, handle) = start(&engines);
+    let endpoint = handle.endpoint().clone();
+    handle.replace_search(Arc::new(engines.metasearch(&[EngineId::Bing])));
+    assert_eq!(handle.search().engines(), [EngineId::Bing]);
+    let (status, body) = get(
+        endpoint.port,
+        "/search?q=rust&format=json",
+        Some(&endpoint.token),
+    );
+    assert_eq!(status, 200);
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["results"][0]["url"], "https://b.example/");
+    assert!(engines.searches(EngineId::Brave).is_empty());
+    assert_eq!(handle.endpoint(), &endpoint);
+}
+
+#[test]
 fn a_stopped_server_accepts_no_more_connections() {
     let (_dir, handle) = start(&Engines::default());
     let port = handle.endpoint().port;

@@ -9,7 +9,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -87,15 +87,30 @@ fn token() -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// The metasearch a running server answers with, replaceable while it runs.
+type Shared = Arc<RwLock<Arc<Metasearch>>>;
+
 /// A started server. Dropping the handle stops the listener.
 pub struct Handle {
     endpoint: Endpoint,
     stop: Arc<AtomicBool>,
+    search: Shared,
 }
 
 impl Handle {
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
+    }
+
+    /// Answers later searches with `search`, keeping the port and token.
+    /// Searches already in flight finish with the metasearch they started on.
+    pub fn replace_search(&self, search: Arc<Metasearch>) {
+        *self.search.write().unwrap_or_else(PoisonError::into_inner) = search;
+    }
+
+    /// The metasearch later searches use.
+    pub fn search(&self) -> Arc<Metasearch> {
+        Arc::clone(&self.search.read().unwrap_or_else(PoisonError::into_inner))
     }
 
     /// Stops the accept loop. Searches already in flight finish.
@@ -122,13 +137,16 @@ pub fn start(endpoint_file: &Path, search: Arc<Metasearch>) -> io::Result<Handle
     };
     write_endpoint(endpoint_file, &endpoint)?;
     let stop = Arc::new(AtomicBool::new(false));
+    let search: Shared = Arc::new(RwLock::new(search));
     let accept_stop = Arc::clone(&stop);
+    let accept_search = Arc::clone(&search);
     let accept_token = endpoint.token.clone();
     std::thread::spawn(move || {
         while !accept_stop.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    let search = Arc::clone(&search);
+                    let search =
+                        Arc::clone(&accept_search.read().unwrap_or_else(PoisonError::into_inner));
                     let token = accept_token.clone();
                     std::thread::spawn(move || {
                         let _ = stream.set_nonblocking(false);
@@ -142,7 +160,11 @@ pub fn start(endpoint_file: &Path, search: Arc<Metasearch>) -> io::Result<Handle
             }
         }
     });
-    Ok(Handle { endpoint, stop })
+    Ok(Handle {
+        endpoint,
+        stop,
+        search,
+    })
 }
 
 /// One request's head: the method, the target and the headers.
