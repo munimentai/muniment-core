@@ -7,8 +7,8 @@
 //!
 //! - [`engines`] builds each engine's search URL, parses its page and judges
 //!   whether the engine blocked the request.
-//! - [`transport`] sends one GET: `ureq` with rustls by default, and libcurl
-//!   for Brave with the `curl` feature.
+//! - [`transport`] sends one GET: `ureq` with rustls by default, and the
+//!   system `curl` program for Brave when one is on `PATH`.
 //! - [`session`] keeps one cookie jar, referer, pace and cooldown per engine.
 //! - [`metasearch`] queries the enabled engines in parallel and merges them.
 //! - [`server`] serves `GET /search` on `127.0.0.1`.

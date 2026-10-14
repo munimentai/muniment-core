@@ -74,6 +74,9 @@ pub enum EngineStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EngineReport {
     pub engine: EngineId,
+    /// The transport the engine's request went through, when it sent one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport: Option<&'static str>,
     #[serde(flatten)]
     pub status: EngineStatus,
 }
@@ -130,24 +133,23 @@ impl Metasearch {
 
     pub fn search(&self, query: &Query) -> Outcome {
         let filters = DomainFilters::parse(&query.text);
-        let reports: Vec<(EngineId, Result<Vec<SearchResult>, EngineStatus>)> =
-            std::thread::scope(|scope| {
-                let running: Vec<_> = self
-                    .order
-                    .iter()
-                    .map(|&engine| {
-                        let filters = &filters;
-                        scope.spawn(move || (engine, self.run(engine, query, filters)))
-                    })
-                    .collect();
-                running
-                    .into_iter()
-                    .map(|thread| thread.join().expect("an engine thread"))
-                    .collect()
-            });
+        let reports: Vec<(EngineId, Run)> = std::thread::scope(|scope| {
+            let running: Vec<_> = self
+                .order
+                .iter()
+                .map(|&engine| {
+                    let filters = &filters;
+                    scope.spawn(move || (engine, self.run(engine, query, filters)))
+                })
+                .collect();
+            running
+                .into_iter()
+                .map(|thread| thread.join().expect("an engine thread"))
+                .collect()
+        });
         let mut pages = Vec::new();
         let mut engines = Vec::new();
-        for (engine, outcome) in reports {
+        for (engine, (transport, outcome)) in reports {
             let status = match outcome {
                 Ok(results) => {
                     let status = EngineStatus::Answered(results.len());
@@ -156,7 +158,11 @@ impl Metasearch {
                 }
                 Err(status) => status,
             };
-            engines.push(EngineReport { engine, status });
+            engines.push(EngineReport {
+                engine,
+                transport,
+                status,
+            });
         }
         let count = query.count.clamp(1, MAX_COUNT);
         let results = merge(pages)
@@ -167,26 +173,21 @@ impl Metasearch {
         Outcome { results, engines }
     }
 
-    fn run(
-        &self,
-        engine: EngineId,
-        query: &Query,
-        filters: &DomainFilters,
-    ) -> Result<Vec<SearchResult>, EngineStatus> {
+    fn run(&self, engine: EngineId, query: &Query, filters: &DomainFilters) -> Run {
         if query
             .time_range
             .is_some_and(|range| !engine.supports(range))
         {
-            return Err(EngineStatus::Skipped);
+            return (None, Err(EngineStatus::Skipped));
         }
         let text = filters.engine_query(engine);
         if text.is_empty() {
-            return Err(EngineStatus::Skipped);
+            return (None, Err(EngineStatus::Skipped));
         }
         let mut session = self.sessions[&engine]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        session
+        let outcome = session
             .search(&text, query.time_range)
             .map_err(|error| match error {
                 SessionError::Blocked(reason) => EngineStatus::Blocked(reason),
@@ -194,9 +195,16 @@ impl Metasearch {
                     EngineStatus::CoolingDown(remaining.as_secs())
                 }
                 SessionError::Transport(error) => EngineStatus::Failed(error.to_string()),
-            })
+            });
+        (Some(session.transport()), outcome)
     }
 }
+
+/// One engine's run: the transport it used, and its results or status.
+type Run = (
+    Option<&'static str>,
+    Result<Vec<SearchResult>, EngineStatus>,
+);
 
 /// Interleaves engine pages by rank: every engine's first result in engine
 /// order, then every second result, and so on. A URL another engine already

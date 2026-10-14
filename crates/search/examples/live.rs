@@ -31,7 +31,8 @@ fn main() {
             EngineStatus::Failed(reason) => format!("failed: {reason}"),
             EngineStatus::Skipped => "skipped".to_owned(),
         };
-        println!("{:<11} {status}", report.engine.name());
+        let transport = report.transport.unwrap_or("-");
+        println!("{:<11} {transport:<6} {status}", report.engine.name());
     }
     println!("merged: {}", outcome.results.len());
     for (rank, merged) in outcome.results.iter().enumerate() {

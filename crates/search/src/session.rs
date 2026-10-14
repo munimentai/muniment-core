@@ -82,6 +82,11 @@ impl Session {
         self.engine
     }
 
+    /// The name of the transport the session sends through.
+    pub fn transport(&self) -> &'static str {
+        self.transport.name()
+    }
+
     /// The time left on the cooldown, when the engine is resting.
     pub fn cooling(&self) -> Option<Duration> {
         self.blocked_until

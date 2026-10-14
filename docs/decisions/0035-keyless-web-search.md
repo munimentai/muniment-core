@@ -65,10 +65,16 @@ Requests go through the `Transport` trait.
 - The default is `ureq` with rustls, ring and the OS certificate verifier,
   all already in the core lock. It needs no native build tools on the Linux,
   macOS and Windows CI machines.
-- The optional `curl` feature sends Brave over the system libcurl. Brave
+- Brave goes through the system `curl` program when one is present. Brave
   answers 429 to the rustls handshake from an address it has flagged, and it
-  lets libcurl's handshake through. The feature is off by default, so no CI
-  machine needs libcurl headers.
+  lets curl's handshake through. The engine finds `curl` on `PATH` once and
+  checks that `curl --version` runs; macOS, most Linux distributions and
+  Windows 10 and later ship it. Each request runs `curl` with arguments and
+  no shell, ignores `.curlrc`, allows HTTPS only, and sends the same user
+  agent and headers as the `ureq` transport. The cookie jar and the response
+  body live in a private temporary directory per session. Without a working
+  `curl`, Brave uses `ureq`. No build links libcurl.
+- Each engine report names the transport the engine used.
 - `wreq` with a Chrome profile is the next transport. It waits for its Chrome
   profiles on crates.io, and it needs cmake and libclang on every CI machine.
 
