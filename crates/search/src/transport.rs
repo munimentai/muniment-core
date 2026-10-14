@@ -71,7 +71,7 @@ pub type TransportFactory = Arc<dyn Fn(EngineId) -> Box<dyn Transport> + Send + 
 /// runs, and `ureq` otherwise.
 pub fn default_transport(engine: EngineId) -> Box<dyn Transport> {
     if engine == EngineId::Brave {
-        if let Some(curl) = system_curl().and_then(|program| SystemCurl::new(program).ok()) {
+        if let Some(curl) = system_curl().and_then(|curl| SystemCurl::new(curl).ok()) {
             return Box::new(curl);
         }
     }
@@ -189,16 +189,25 @@ const CURL_PROGRAM: &str = "curl";
 /// What `curl -w` prints after a transfer: the status, then the final URL.
 const WRITE_OUT: &str = "%{http_code}\\n%{url_effective}";
 
+/// A curl program and whether it decodes compressed bodies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurlProgram {
+    pub path: PathBuf,
+    /// The Features line of `curl --version` lists `libz`, so `--compressed`
+    /// works.
+    pub compressed: bool,
+}
+
 /// The system `curl` program: the first one on `PATH` that answers
 /// `curl --version`. The search runs once per process.
-pub fn system_curl() -> Option<&'static Path> {
-    static FOUND: OnceLock<Option<PathBuf>> = OnceLock::new();
+pub fn system_curl() -> Option<&'static CurlProgram> {
+    static FOUND: OnceLock<Option<CurlProgram>> = OnceLock::new();
     FOUND
         .get_or_init(|| {
             let path = std::env::var_os("PATH")?;
             find_curl(&path).and_then(check_curl)
         })
-        .as_deref()
+        .as_ref()
 }
 
 /// The first absolute `PATH` entry that holds a curl program file.
@@ -210,10 +219,29 @@ fn find_curl(path: &OsStr) -> Option<PathBuf> {
 }
 
 /// `program` when it runs and reports itself as curl.
-fn check_curl(program: PathBuf) -> Option<PathBuf> {
+fn check_curl(program: PathBuf) -> Option<CurlProgram> {
     let output = curl_command(&program).arg("--version").output().ok()?;
-    let version = String::from_utf8_lossy(&output.stdout);
-    (output.status.success() && version.starts_with("curl ")).then_some(program)
+    if !output.status.success() {
+        return None;
+    }
+    let compressed = parse_version(&String::from_utf8_lossy(&output.stdout))?;
+    Some(CurlProgram {
+        path: program,
+        compressed,
+    })
+}
+
+/// Whether a `curl --version` output lists `libz` among its features, or
+/// `None` when its first line does not name curl.
+fn parse_version(version: &str) -> Option<bool> {
+    let mut lines = version.lines();
+    if !lines.next()?.starts_with("curl ") {
+        return None;
+    }
+    Some(lines.any(|line| {
+        line.strip_prefix("Features:")
+            .is_some_and(|features| features.split_whitespace().any(|feature| feature == "libz"))
+    }))
 }
 
 fn curl_command(program: &Path) -> Command {
@@ -237,20 +265,22 @@ fn curl_command(program: &Path) -> Command {
 /// removes when it drops.
 pub struct SystemCurl {
     program: PathBuf,
+    compressed: bool,
     directory: PathBuf,
     protocols: &'static str,
 }
 
 impl SystemCurl {
     /// A transport over `program` with a fresh, empty cookie jar.
-    pub fn new(program: &Path) -> std::io::Result<Self> {
+    pub fn new(curl: &CurlProgram) -> std::io::Result<Self> {
         let directory = std::env::temp_dir().join(format!(
             "muniment-search-curl-{}",
             uuid::Uuid::now_v7().simple()
         ));
         create_private_directory(&directory)?;
         Ok(SystemCurl {
-            program: program.to_owned(),
+            program: curl.path.clone(),
+            compressed: curl.compressed,
             directory,
             protocols: "=https",
         })
@@ -289,7 +319,14 @@ impl Transport for SystemCurl {
     fn get(&mut self, url: &str, referer: Option<&str>) -> Result<Response, TransportError> {
         let body_path = self.body();
         let _ = std::fs::remove_file(&body_path);
-        let arguments = curl_arguments(&self.jar(), &body_path, self.protocols, url, referer);
+        let arguments = curl_arguments(
+            &self.jar(),
+            &body_path,
+            self.protocols,
+            self.compressed,
+            url,
+            referer,
+        );
         let output = curl_command(&self.program)
             .args(&arguments)
             .output()
@@ -325,11 +362,13 @@ impl Transport for SystemCurl {
 
 /// The curl arguments for one GET. `-q` keeps a user's `.curlrc` out, and the
 /// user agent goes through `-A` so the headers keep the curl command line's
-/// order.
+/// order. Without `compressed`, curl asks for no encoding and the server
+/// sends the body as is.
 fn curl_arguments(
     jar: &Path,
     body: &Path,
     protocols: &str,
+    compressed: bool,
     url: &str,
     referer: Option<&str>,
 ) -> Vec<OsString> {
@@ -340,7 +379,6 @@ fn curl_arguments(
     let mut arguments: Vec<OsString> = [
         "-q",
         "-sS",
-        "--compressed",
         "-L",
         "--max-redirs",
         &redirects,
@@ -360,6 +398,9 @@ fn curl_arguments(
     .into_iter()
     .map(OsString::from)
     .collect();
+    if compressed {
+        arguments.insert(2, "--compressed".into());
+    }
     // A control character in a header value would start a new header line.
     if let Some(referer) = referer.filter(|referer| !referer.chars().any(char::is_control)) {
         arguments.push("-H".into());
@@ -454,6 +495,7 @@ mod tests {
             Path::new("/jar"),
             Path::new("/body"),
             "=https",
+            true,
             url,
             Some("https://search.brave.com/"),
         ));
@@ -491,12 +533,25 @@ mod tests {
             Path::new("/jar"),
             Path::new("/body"),
             "=https",
+            false,
             "https://example.com/",
             Some("https://example.com/\r\nx-injected: 1"),
         ));
         assert!(!arguments
             .iter()
             .any(|argument| argument.contains("x-injected")));
+        assert!(!arguments.iter().any(|argument| argument == "--compressed"));
+    }
+
+    #[test]
+    fn the_version_output_tells_whether_curl_decodes_compression() {
+        let with_libz = "curl 8.7.1 (x86_64-apple-darwin) libcurl/8.7.1 LibreSSL/3.3.6 zlib/1.2.12\nRelease-Date: 2024-03-27\nProtocols: http https\nFeatures: alt-svc HTTP2 HTTPS-proxy IPv6 libz SSL threadsafe\n";
+        assert_eq!(parse_version(with_libz), Some(true));
+        let without_libz = "curl 8.5.0 (x86_64-pc-linux-gnu) libcurl/8.5.0 OpenSSL/3.0.13\nProtocols: http https\nFeatures: HTTP2 HTTPS-proxy IPv6 SSL threadsafe\n";
+        assert_eq!(parse_version(without_libz), Some(false));
+        assert_eq!(parse_version("curl 8.0.0 (fake)"), Some(false));
+        assert_eq!(parse_version("wget 1.21\nFeatures: libz\n"), None);
+        assert_eq!(parse_version(""), None);
     }
 
     #[test]
@@ -543,7 +598,11 @@ mod tests {
 
     #[test]
     fn a_curl_transport_removes_its_directory_when_dropped() {
-        let transport = SystemCurl::new(Path::new(CURL_PROGRAM)).unwrap();
+        let transport = SystemCurl::new(&CurlProgram {
+            path: PathBuf::from(CURL_PROGRAM),
+            compressed: true,
+        })
+        .unwrap();
         let directory = transport.directory.clone();
         assert!(directory.is_dir());
         #[cfg(unix)]
@@ -577,7 +636,7 @@ mod tests {
         let answering = fake_curl(
             &directory,
             r#"#!/bin/sh
-if [ "$1" = "--version" ]; then echo "curl 8.0.0 (fake)"; exit 0; fi
+if [ "$1" = "--version" ]; then printf 'curl 8.0.0 (fake)\nFeatures: IPv6 libz SSL\n'; exit 0; fi
 out=""; previous=""
 for argument in "$@"; do
   if [ "$previous" = "-o" ]; then out="$argument"; fi
@@ -588,8 +647,12 @@ printf '201\nhttps://example.com/final'
 "#,
         );
         assert_eq!(find_curl(directory.as_os_str()), Some(answering.clone()));
-        assert_eq!(check_curl(answering.clone()), Some(answering.clone()));
-        let mut transport = SystemCurl::new(&answering).unwrap();
+        let curl = CurlProgram {
+            path: answering.clone(),
+            compressed: true,
+        };
+        assert_eq!(check_curl(answering), Some(curl.clone()));
+        let mut transport = SystemCurl::new(&curl).unwrap();
         assert_eq!(
             transport.get("https://example.com/", None).unwrap(),
             Response {
@@ -604,7 +667,11 @@ printf '201\nhttps://example.com/final'
             "#!/bin/sh\necho 'curl: (56) Recv failure: Connection reset by peer' >&2\nexit 56\n",
         );
         assert_eq!(check_curl(resetting.clone()), None);
-        let mut transport = SystemCurl::new(&resetting).unwrap();
+        let mut transport = SystemCurl::new(&CurlProgram {
+            path: resetting,
+            compressed: false,
+        })
+        .unwrap();
         assert!(matches!(
             transport.get("https://example.com/", None),
             Err(TransportError::ConnectionReset(_))
@@ -614,7 +681,7 @@ printf '201\nhttps://example.com/final'
 
     #[test]
     fn the_system_curl_keeps_cookies_and_reports_error_statuses_as_responses() {
-        let Some(program) = system_curl() else {
+        let Some(curl) = system_curl() else {
             return;
         };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -633,7 +700,7 @@ printf '201\nhttps://example.com/final'
             }
             seen
         });
-        let mut transport = SystemCurl::new(program).unwrap();
+        let mut transport = SystemCurl::new(curl).unwrap();
         // The loopback server speaks plain HTTP.
         transport.protocols = "=http";
         let first = transport.get(&format!("http://{address}/"), None).unwrap();
