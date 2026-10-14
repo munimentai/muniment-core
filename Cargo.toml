@@ -8,5 +8,6 @@ members = [
     "crates/pins",
     "crates/router",
     "crates/runtime",
+    "crates/search",
 ]
 resolver = "2"

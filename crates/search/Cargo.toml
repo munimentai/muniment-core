@@ -1,0 +1,27 @@
+[package]
+name = "muniment-search"
+version = "0.0.1"
+edition = "2021"
+
+# The keyless web search engine: engine parsers, paced per-engine sessions,
+# metasearch, and the loopback server that answers the SearXNG JSON format. It
+# depends on no other Muniment crate except the atomic file helper.
+
+[features]
+# Brave over the system libcurl. Off by default, so no build needs libcurl.
+curl = ["dep:curl"]
+
+[dependencies]
+base64 = "0.22"
+curl = { version = "0.4", default-features = false, optional = true }
+getrandom = "0.3"
+muniment-atomic-file = { path = "../atomic-file" }
+percent-encoding = "2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-platform-verifier = "0.7"
+scraper = "0.27"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", default-features = false, features = ["tls", "gzip", "cookies", "proxy-from-env"] }
+url = "2"
+uuid = { version = "1", features = ["v7"] }

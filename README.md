@@ -20,6 +20,7 @@ issues or pull requests.
 | `muniment-attach` | `crates/attach` | The reader and companion attach protocol and its client. |
 | `muniment-code-diff` | `crates/code-diff` | Portable code-diff values and fixtures. |
 | `muniment-atomic-file` | `crates/atomic-file` | Atomic file replacement, including the Windows retry path. |
+| `muniment-search` | `crates/search` | Keyless web search: Brave, DuckDuckGo, Wikipedia, Yahoo and Bing parsers, paced per-engine sessions, metasearch, and a loopback server that answers the SearXNG JSON format. The `curl` feature sends Brave over the system libcurl. `cargo run -p muniment-search --example live -- "query"` searches the real engines once. |
 
 `muniment-core` re-exports `muniment-models` as `muniment_core::models` and
 `muniment-router` as `muniment_core::model_router`, along with
