@@ -813,6 +813,23 @@ fn delayed_response(id: serde_json::Value, mut response: serde_json::Value, dela
     });
 }
 
+/// Panics unless `path` lies under the system temporary directory, so a test
+/// that resolves the user's real state directory fails before the stub writes
+/// fixture packages there.
+fn require_temporary(path: &Path) {
+    let temporary = std::env::temp_dir();
+    let inside = path.starts_with(&temporary)
+        || fs::canonicalize(path)
+            .ok()
+            .zip(fs::canonicalize(&temporary).ok())
+            .is_some_and(|(path, temporary)| path.starts_with(temporary));
+    assert!(
+        inside,
+        "The test stub refuses {}, which is outside the temporary directory.",
+        path.display()
+    );
+}
+
 /// Stands in for Bun's package manager: it writes each dependency the manifest
 /// names at its pinned version, plus the source lines the runtime brands.
 fn bun_install(args: Vec<String>) {
@@ -821,6 +838,7 @@ fn bun_install(args: Vec<String>) {
         .find(|pair| pair[0] == "--cwd")
         .map(|pair| Path::new(&pair[1]).to_owned())
         .expect("the install names its directory");
+    require_temporary(&directory);
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(directory.join("package.json")).unwrap()).unwrap();
     let modules = directory.join("node_modules");
