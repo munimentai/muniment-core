@@ -1282,6 +1282,8 @@ fn persist_home_locked(config_dir: &Path, home: &Path) -> Result<(), HomeError> 
             .open(&temporary)?;
         io::Write::write_all(&mut file, &contents)?;
         file.sync_all()?;
+        // Windows cannot replace a destination with a source that is still open.
+        drop(file);
         replace_file(&temporary, &destination)?;
         sync_directory(config_dir)
     })();
@@ -1369,6 +1371,22 @@ mod tests {
         drop(lock);
         assert_eq!(initializer.join().unwrap(), explicit);
         assert_eq!(super::configured_home(&config).unwrap(), Some(explicit));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn saving_home_again_replaces_the_saved_selection() {
+        let root = std::env::temp_dir().join(format!("home-resave-{}", uuid::Uuid::new_v4()));
+        let config = root.join("config");
+        let first = root.join("First");
+        let second = root.join("Second");
+        fs::create_dir(&root).unwrap();
+        super::scaffold_home(&first).unwrap();
+        super::scaffold_home(&second).unwrap();
+        super::persist_home(&config, &first).unwrap();
+        // The second save replaces the existing home.json.
+        super::persist_home(&config, &second).unwrap();
+        assert_eq!(super::configured_home(&config).unwrap(), Some(second));
         fs::remove_dir_all(root).unwrap();
     }
 

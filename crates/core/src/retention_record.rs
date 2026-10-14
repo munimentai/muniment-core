@@ -86,6 +86,8 @@ pub fn write_retention_choice(config_dir: &Path, choice: RetentionChoice) -> io:
             .open(&temporary)?;
         io::Write::write_all(&mut file, &contents)?;
         file.sync_all()?;
+        // Windows cannot replace a destination with a source that is still open.
+        drop(file);
         replace_file(&temporary, &destination)?;
         sync_directory(config_dir)
     })();
