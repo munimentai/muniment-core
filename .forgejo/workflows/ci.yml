@@ -124,7 +124,7 @@ jobs:
           cargo test --locked --package muniment-runtime-core --lib --test windows_attach_acceptor &&
           cargo test --locked --package muniment-core --lib --
           windows_task_service windows_user_diagnostics agents::tests memory_files::tests
-          pi_settings::tests"
+          pi_settings::tests home::tests retention_record::tests"
 
   # Tags and publishes the next version after every check of a main push
   # passed. It shares the pins update's group, so tags stay in order.
