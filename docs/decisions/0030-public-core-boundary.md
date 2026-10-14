@@ -25,6 +25,7 @@ A module that `muniment-core` re-exports from another workspace crate keeps its 
 | crate | muniment-pins | It pins Pi, its extension packages, and the Claude Code version. |
 | crate | muniment-router | It selects provider accounts and routes model requests. |
 | crate | muniment-runtime-core | It runs the platform-neutral runtime: attach serving, runs, schedules, the record service and the model service. |
+| crate | muniment-search | It searches the web without a key and answers the SearXNG JSON format on loopback. |
 | module | account | It defines the session, device, pairing, and entitlement values attach carries. |
 | module | agent_templates | It imports bounded public agent templates. |
 | module | agents | It stores persistent agents and their conversations. |
