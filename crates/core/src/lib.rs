@@ -65,6 +65,7 @@ pub mod run_events;
 pub mod run_preparation;
 pub mod run_start;
 pub mod runtime_diagnostics;
+pub mod search_settings;
 pub mod session_thread;
 pub mod sidecar;
 pub mod state_root;

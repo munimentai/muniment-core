@@ -111,17 +111,16 @@ pub fn prepare_pi_settings(
     executable: &Path,
 ) -> Result<(), crate::pi_launch::PiLaunchError> {
     use crate::pi_launch::PiLaunchError;
-    let directory = crate::state_root::state_directory()
-        .map(|state| crate::state_root::agent_directory(&state))
-        .ok_or_else(|| {
-            PiLaunchError::rejected(
-                "agent_directory_resolve",
-                "The state directory is unavailable.",
-            )
-        })?;
+    let state = crate::state_root::state_directory().ok_or_else(|| {
+        PiLaunchError::rejected(
+            "agent_directory_resolve",
+            "The state directory is unavailable.",
+        )
+    })?;
+    let directory = crate::state_root::agent_directory(&state);
     store_pi_settings(&directory.join("settings.json"), artifact)
         .map_err(|error| PiLaunchError::rejected("settings_write", error))?;
-    store_web_search_defaults(&directory)
+    store_web_search(&state)
         .map_err(|error| PiLaunchError::rejected("web_search_settings", error.to_string()))?;
     if let Some(cli) = cli_executable_beside_runtime() {
         store_mcp_server(&directory, &cli)
@@ -131,11 +130,18 @@ pub fn prepare_pi_settings(
         .map_err(|error| PiLaunchError::rejected("package_install", error))
 }
 
-/// Embedded searches return their sources to the conversation without a browser
-/// approval workflow. Explicit user configuration remains authoritative.
-pub fn store_web_search_defaults(agent: &Path) -> io::Result<()> {
-    let path = agent.join("web-search.json");
-    fs::create_dir_all(agent)?;
+/// Writes pi-web-access's `web-search.json` in the state directory's agent
+/// directory: the search settings record and the running search server's
+/// endpoint, and `workflow: "none"` when the user chose none, so embedded
+/// searches return their sources without a browser approval step. Every key
+/// core does not own stays as written.
+pub fn store_web_search(state: &Path) -> io::Result<()> {
+    use crate::search_settings;
+    let agent = crate::state_root::agent_directory(state);
+    let settings = search_settings::load(state)?;
+    let endpoint = search_settings::read_endpoint(&agent);
+    let path = agent.join(search_settings::WEB_SEARCH_FILE);
+    fs::create_dir_all(&agent)?;
     let lock = lock_settings(&path)?;
     let mut value: Value = match fs::read(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::other)?,
@@ -145,10 +151,14 @@ pub fn store_web_search_defaults(agent: &Path) -> io::Result<()> {
     let object = value
         .as_object_mut()
         .ok_or_else(|| io::Error::other("Invalid web search settings"))?;
-    if object.contains_key("workflow") {
+    let original = object.clone();
+    object
+        .entry("workflow")
+        .or_insert_with(|| Value::String("none".into()));
+    search_settings::render_web_search(object, &settings, endpoint.as_ref());
+    if *object == original && path.exists() {
         return Ok(());
     }
-    object.insert("workflow".into(), Value::String("none".into()));
     lock.check()?;
     crate::model_router::config::write_private(&path, &serde_json::to_vec_pretty(&value)?)
 }
@@ -429,22 +439,52 @@ mod tests {
     }
 
     #[test]
-    fn web_search_defaults_skip_the_browser_and_preserve_user_choices() {
-        let directory = temporary_directory();
-        store_web_search_defaults(&directory).unwrap();
-        let path = directory.join("web-search.json");
-        let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    fn web_search_settings_skip_the_browser_route_to_the_engine_and_keep_user_choices() {
+        let state = temporary_directory();
+        let agent = crate::state_root::agent_directory(&state);
+        store_web_search(&state).unwrap();
+        let path = agent.join("web-search.json");
+        let read = || -> Value { serde_json::from_slice(&fs::read(&path).unwrap()).unwrap() };
+        let value = read();
         assert_eq!(value["workflow"], "none");
+        // No server runs, so the built-in engine is not routed to.
+        assert_eq!(
+            value["searchRouting"]["providers"],
+            serde_json::json!(["exa"])
+        );
+        assert!(value.get("searxngBaseUrl").is_none());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
         fs::write(
             &path,
-            br#"{"workflow":"summary-review","provider":"brave"}"#,
+            br#"{"workflow":"summary-review","provider":"brave","ssrf":{"allowRanges":["198.18.0.0/15"]}}"#,
         )
         .unwrap();
-        store_web_search_defaults(&directory).unwrap();
-        let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        fs::write(
+            agent.join(crate::search_settings::ENDPOINT_FILE),
+            br#"{"port":4100,"token":"abc"}"#,
+        )
+        .unwrap();
+        store_web_search(&state).unwrap();
+        let value = read();
         assert_eq!(value["workflow"], "summary-review");
         assert_eq!(value["provider"], "brave");
-        fs::remove_dir_all(directory).unwrap();
+        assert_eq!(
+            value["ssrf"]["allowRanges"],
+            serde_json::json!(["198.18.0.0/15"])
+        );
+        assert_eq!(value["searxngBaseUrl"], "http://127.0.0.1:4100");
+        assert_eq!(value["searxngHeaders"]["Authorization"], "Bearer abc");
+        assert_eq!(
+            value["searchRouting"]["providers"],
+            serde_json::json!(["searxng", "exa"])
+        );
+        fs::remove_dir_all(state).unwrap();
     }
 
     #[test]

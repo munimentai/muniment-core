@@ -91,6 +91,7 @@ A module that `muniment-core` re-exports from another workspace crate keeps its 
 | module | run_preparation | It prepares journaled runs. |
 | module | run_start | It starts runtime runs. |
 | module | runtime_diagnostics | It writes bounded runtime diagnostics. |
+| module | search_settings | It stores the web search settings and renders them into pi-web-access's `web-search.json`. |
 | module | session_thread | It binds sessions to journal threads. |
 | module | sidecar | It supervises Pi and its RPC transport. |
 | module | state_root | It resolves the one state root every local file sits under. |
