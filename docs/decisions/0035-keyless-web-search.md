@@ -49,6 +49,28 @@ readable by its owner only. The token is 32 random bytes in hex, compared in
 constant time. pi-web-access sends it through `searxngHeaders` as
 `Authorization: Bearer <token>`. The runtime owns the server's start and stop.
 
+### Settings
+
+Core's `search_settings` record, `search-settings.json` in the state
+directory and readable by its owner only, holds the search settings:
+
+- `order`: the providers pi-web-access tries, each on or off. An entry is
+  `muniment` (this engine), `exa` (keyless without a key) or a pi-web-access
+  provider that has a key.
+- `engines`: the enabled engines.
+- `keys`: each provider's key, with the base URL or zone fields some
+  providers read. A client reads a key only as set or not and its last four
+  characters.
+
+On each Pi launch and after each change, core writes the record into
+`web-search.json`: each provider's key fields, `searxngBaseUrl` and
+`searxngHeaders` while the server runs, and `searchRouting` with the enabled
+providers in order and `muniment` as `searxng`. Every other key stays as the
+user wrote it. With no provider to route to, `webSearch.enabled` is false,
+so Pi registers no `web_search` tool. pi-web-access reads the file once per
+Pi process, so a change reaches the next launch. The engine set reaches the
+running server at once, on the same port and token.
+
 ### The loopback exemption
 
 pi-web-access sends SearXNG requests through its SSRF guard, which refuses

@@ -138,6 +138,161 @@ fn a_sign_in_step_reaches_every_attach_subscriber_and_the_host_supplies_provider
     }
 }
 
+#[test]
+fn the_runtime_runs_the_search_server_and_applies_search_settings_without_a_restart() {
+    use muniment_core::search_settings;
+    use muniment_core::serde_json::{json, Value};
+
+    // Core and the search crate name the same endpoint file and engines.
+    assert_eq!(
+        search_settings::ENDPOINT_FILE,
+        muniment_search::server::ENDPOINT_FILE
+    );
+    assert_eq!(
+        search_settings::ENGINES,
+        muniment_search::EngineId::ALL.map(|engine| engine.name())
+    );
+
+    muniment_core::chat_prompt::use_mock_keyring_for_tests();
+    let temporary = TemporaryProfile::new("models-search", false);
+    let agent = muniment_core::state_root::agent_directory(&temporary.profile);
+    let endpoint_file = agent.join(muniment_search::server::ENDPOINT_FILE);
+    let web_search = || -> Value {
+        muniment_core::serde_json::from_slice(
+            &std::fs::read(agent.join("web-search.json")).unwrap(),
+        )
+        .unwrap()
+    };
+    let state = Arc::new(
+        RuntimeAttachState::open(fixture_host(), &temporary.profile, &temporary.config).unwrap(),
+    );
+    assert!(!endpoint_file.exists());
+
+    let (commands, command_rx) = mpsc::channel();
+    let schedule = start_retention_schedule(
+        Arc::clone(&state),
+        Duration::from_secs(3600),
+        command_rx,
+        None,
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let endpoint = loop {
+        if let Some(endpoint) = muniment_search::server::read_endpoint(&endpoint_file) {
+            if agent.join("web-search.json").exists() {
+                break endpoint;
+            }
+        }
+        assert!(Instant::now() < deadline, "the search server never started");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let health = |port: u16| {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .unwrap();
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).unwrap();
+        answer
+    };
+    assert!(health(endpoint.port).starts_with("HTTP/1.1 200"));
+    let written = web_search();
+    assert_eq!(written["workflow"], "none");
+    assert_eq!(written["searxngBaseUrl"], endpoint.base_url());
+    assert_eq!(
+        written["searxngHeaders"]["Authorization"],
+        endpoint.authorization()
+    );
+    assert_eq!(
+        written["searchRouting"]["providers"],
+        json!(["searxng", "exa"])
+    );
+    assert!(written.get("ssrf").is_none());
+
+    let boundaries = state.boundaries();
+    let mut sequence = 100;
+    let mut request = |action: ModelAction, data: Value| {
+        sequence += 1;
+        let key = action
+            .mutates()
+            .then(|| Id::new(uuid_like(sequence)).unwrap());
+        boundaries.models_request(ModelRequest { action, data }, key.as_ref())
+    };
+    let settings = request(ModelAction::SearchSettings, json!({})).unwrap();
+    assert_eq!(settings["running"], true);
+    assert_eq!(
+        settings["order"],
+        json!([
+            {"id": "muniment", "enabled": true, "has_key": false},
+            {"id": "exa", "enabled": true, "has_key": false}
+        ])
+    );
+
+    let settings = request(
+        ModelAction::SearchSaveEngines,
+        json!({"engines": ["wikipedia", "bing"]}),
+    )
+    .unwrap();
+    assert_eq!(
+        settings["engines"][1],
+        json!({"id": "bing", "enabled": true})
+    );
+    assert_eq!(
+        settings["engines"][0],
+        json!({"id": "brave", "enabled": false})
+    );
+    // The running server keeps its port and token.
+    assert_eq!(
+        muniment_search::server::read_endpoint(&endpoint_file),
+        Some(endpoint.clone())
+    );
+    assert!(health(endpoint.port).starts_with("HTTP/1.1 200"));
+
+    let settings = request(
+        ModelAction::SearchSetKey,
+        json!({"provider": "tavily", "api_key": "tvly-fixture-secret-9876"}),
+    )
+    .unwrap();
+    assert!(!settings.to_string().contains("secret"), "{settings}");
+    assert_eq!(settings["keys"][0]["last4"], "9876");
+    let written = web_search();
+    assert_eq!(written["tavilyApiKey"], "tvly-fixture-secret-9876");
+    assert_eq!(
+        written["searchRouting"]["providers"],
+        json!(["searxng", "exa", "tavily"])
+    );
+
+    request(
+        ModelAction::SearchSaveOrder,
+        json!({"order": [
+            {"id": "tavily", "enabled": true},
+            {"id": "muniment", "enabled": true},
+            {"id": "exa", "enabled": false}
+        ]}),
+    )
+    .unwrap();
+    assert_eq!(
+        web_search()["searchRouting"]["providers"],
+        json!(["tavily", "searxng"])
+    );
+    assert!(request(
+        ModelAction::SearchSaveOrder,
+        json!({"order": [{"id": "kagi", "enabled": true}]})
+    )
+    .is_err());
+
+    request(ModelAction::SearchRemoveKey, json!({"provider": "tavily"})).unwrap();
+    let written = web_search();
+    assert!(written.get("tavilyApiKey").is_none());
+    assert_eq!(written["searchRouting"]["providers"], json!(["searxng"]));
+
+    commands.send(RetentionScheduleCommand::Stop).unwrap();
+    schedule.join().unwrap();
+    assert!(!endpoint_file.exists());
+    let settings = request(ModelAction::SearchSettings, json!({})).unwrap();
+    assert_eq!(settings["running"], false);
+}
+
 fn uuid_like(value: u128) -> String {
     format!("{value:032x}")
 }

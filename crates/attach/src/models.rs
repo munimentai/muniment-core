@@ -1,4 +1,5 @@
 //! The model service's action set, carried by the `models.request` operation.
+//! The service also holds the web search settings, under the `search_` actions.
 //!
 //! A `models.request` body is `{"action": <action>, "data": <object>}`. The
 //! runtime answers `{"result": <value>}`. An action that changes a setting, a
@@ -51,11 +52,16 @@ pub enum ModelAction {
     LoginStart,
     LoginAnswer,
     LoginCancel,
+    SearchSettings,
+    SearchSaveOrder,
+    SearchSaveEngines,
+    SearchSetKey,
+    SearchRemoveKey,
 }
 
 impl ModelAction {
     /// Every action, in wire order.
-    pub const ALL: [ModelAction; 32] = [
+    pub const ALL: [ModelAction; 37] = [
         Self::ProviderStatus,
         Self::StoreProviderKey,
         Self::StoreLocalProvider,
@@ -88,6 +94,11 @@ impl ModelAction {
         Self::LoginStart,
         Self::LoginAnswer,
         Self::LoginCancel,
+        Self::SearchSettings,
+        Self::SearchSaveOrder,
+        Self::SearchSaveEngines,
+        Self::SearchSetKey,
+        Self::SearchRemoveKey,
     ];
 
     /// Whether the action changes a setting, a credential or a sign-in, so its
@@ -102,6 +113,7 @@ impl ModelAction {
                 | Self::RouterTestClassifier
                 | Self::RouterTestRoute
                 | Self::ProviderScan
+                | Self::SearchSettings
         )
     }
 
@@ -159,6 +171,11 @@ impl ModelAction {
             Self::LoginStart => "login_start",
             Self::LoginAnswer => "login_answer",
             Self::LoginCancel => "login_cancel",
+            Self::SearchSettings => "search_settings",
+            Self::SearchSaveOrder => "search_save_order",
+            Self::SearchSaveEngines => "search_save_engines",
+            Self::SearchSetKey => "search_set_key",
+            Self::SearchRemoveKey => "search_remove_key",
         }
     }
 }

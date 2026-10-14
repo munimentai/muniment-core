@@ -2,7 +2,8 @@
 //! default and hidden models, the inventory, Claude Code, the model router
 //! with its accounts, routes and classifier, the local server scan and
 //! provider sign-in. It writes Pi's files and the router config under their
-//! locks, and it runs the router listener. Clients reach it through the
+//! locks, and it runs the router listener. It also holds the web search
+//! settings and runs the built-in search server. Clients reach it through the
 //! `models.request` attach operation and hear sign-in steps as `models.login`
 //! events.
 
@@ -11,6 +12,7 @@ mod pool_sign_in;
 mod providers;
 mod router;
 mod scan;
+mod search;
 mod sign_in;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -33,9 +35,11 @@ const REPLAYS: usize = 32;
 
 /// The model service of one runtime.
 pub struct ModelService {
+    state_directory: PathBuf,
     agent: PathBuf,
     engine: PiRpcEngine,
     router: router::RouterState,
+    search: search::SearchState,
     sign_ins: sign_in::SignInState,
     pool_sign_ins: pool_sign_in::PoolSignIns,
     sign_in_page: Arc<SignInPage>,
@@ -61,9 +65,11 @@ impl ModelService {
                 profile_directory.join(muniment_core::state_root::HARNESS_DIRECTORY_NAME),
             );
         Self {
+            state_directory: profile_directory.to_path_buf(),
             agent,
             engine,
             router: router::RouterState::default(),
+            search: search::SearchState::default(),
             sign_ins: sign_in::SignInState::default(),
             pool_sign_ins: pool_sign_in::PoolSignIns::default(),
             sign_in_page,
@@ -78,9 +84,16 @@ impl ModelService {
         router::restore(&self.agent, &self.router);
     }
 
-    /// Stops the router listener and any sign-in in flight.
+    /// Starts the search server with the recorded engines and writes
+    /// pi-web-access's `web-search.json`.
+    pub fn restore_search(&self) {
+        search::restore(&self.state_directory, &self.agent, &self.search);
+    }
+
+    /// Stops the router listener, the search server and any sign-in in flight.
     pub fn stop(&self) {
         self.router.stop();
+        self.search.stop(&self.agent);
         self.sign_ins.stop();
         self.pool_sign_ins.stop();
     }
@@ -322,6 +335,51 @@ impl ModelService {
                 sign_in::cancel(self);
                 Ok(Value::Null)
             }
+            ModelAction::SearchSettings => {
+                parse::<Empty>(data)?;
+                answer(search::settings(&self.state_directory, &self.search))
+            }
+            ModelAction::SearchSaveOrder => {
+                let data: SearchOrder = parse(data)?;
+                answer(search::save_order(
+                    &self.state_directory,
+                    agent,
+                    &self.search,
+                    data.order,
+                ))
+            }
+            ModelAction::SearchSaveEngines => {
+                let data: SearchEngines = parse(data)?;
+                answer(search::save_engines(
+                    &self.state_directory,
+                    agent,
+                    &self.search,
+                    data.engines,
+                ))
+            }
+            ModelAction::SearchSetKey => {
+                let data: SearchKey = parse(data)?;
+                answer(search::set_key(
+                    &self.state_directory,
+                    agent,
+                    &self.search,
+                    &data.provider,
+                    muniment_core::search_settings::ProviderKey {
+                        api_key: data.api_key,
+                        base_url: data.base_url,
+                        extra: data.extra.unwrap_or_default(),
+                    },
+                ))
+            }
+            ModelAction::SearchRemoveKey => {
+                let data: Provider = parse(data)?;
+                answer(search::remove_key(
+                    &self.state_directory,
+                    agent,
+                    &self.search,
+                    &data.provider,
+                ))
+            }
         })
     }
 }
@@ -416,6 +474,29 @@ struct ClaudeCode {
 #[serde(deny_unknown_fields)]
 struct Enabled {
     enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchOrder {
+    order: Vec<muniment_core::search_settings::OrderEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchEngines {
+    engines: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchKey {
+    provider: String,
+    api_key: String,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    extra: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Deserialize)]
