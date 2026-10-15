@@ -470,7 +470,7 @@ pub trait RunAttachBoundaries {
         self.subscribe_chat_events()
     }
     /// Reads one tool output or one applied diff that chat events leave out.
-    #[cfg(all(any(unix, target_os = "windows"), feature = "keyring"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn run_detail(
         &self,
         _request: crate::attach::desktop_service_message::RunDetailRequest,

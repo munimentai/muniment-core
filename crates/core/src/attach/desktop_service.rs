@@ -1747,7 +1747,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         self.boundaries.subscribe_chat_events_after(cursor)
     }
 
-    #[cfg(all(any(unix, target_os = "windows"), feature = "keyring"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn run_detail(
         &mut self,
         request: super::desktop_service_message::RunDetailRequest,
