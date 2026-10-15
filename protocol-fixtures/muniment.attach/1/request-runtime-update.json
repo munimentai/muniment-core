@@ -1,1 +1,1 @@
-{"protocol":"muniment.attach/1","request_id":"000000000000000000000000000000a2","operation":"runtime.update","capability":"fixture-capability","body":{"version":"0.2.0"}}
+{"protocol":"muniment.attach/1","request_id":"000000000000000000000000000000a3","operation":"runtime.update","capability":"fixture-capability","body":{"version":"0.2.0"}}
