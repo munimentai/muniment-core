@@ -167,6 +167,16 @@ impl ModelAction {
         )
     }
 
+    /// Whether the action is a choice for the next run, the model, its
+    /// thinking level or a fresh capacity reading, rather than a change to
+    /// the runtime's connections.
+    pub fn run_choice(self) -> bool {
+        matches!(
+            self,
+            Self::SetDefaultModel | Self::SetThinkingLevel | Self::RouterRefreshQuota
+        )
+    }
+
     /// How long a client waits for the answer.
     pub fn timeout(self) -> Duration {
         match self {

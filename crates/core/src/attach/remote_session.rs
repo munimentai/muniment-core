@@ -165,6 +165,8 @@ pub fn remote_rule(operation: Operation, body: &Value) -> RemoteRule {
         // Model reads are reads. A model change can store provider keys.
         Operation::ModelsRequest => match super::ModelRequest::from_body(body) {
             Some(request) if !request.action.mutates() => RemoteRule::Scope(SCOPE_THREAD_READ),
+            // Choosing the model a run uses is part of starting runs there.
+            Some(request) if request.action.run_choice() => RemoteRule::Scope(SCOPE_RUN_WRITE),
             _ => RemoteRule::Scope(SCOPE_RUNTIME_ADMIN),
         },
         Operation::RuntimeInfo
@@ -1109,6 +1111,36 @@ mod tests {
         let auth = std::fs::read_to_string(agent.join("auth.json")).unwrap();
         assert!(!auth.contains("shared-key"));
         std::fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn a_device_that_starts_runs_chooses_their_model_but_changes_no_connection() {
+        let rule = |action: &str| {
+            remote_rule(
+                Operation::ModelsRequest,
+                &json!({"action": action, "data": {}}),
+            )
+        };
+        assert_eq!(
+            rule("set_default_model"),
+            RemoteRule::Scope(SCOPE_RUN_WRITE)
+        );
+        assert_eq!(
+            rule("set_thinking_level"),
+            RemoteRule::Scope(SCOPE_RUN_WRITE)
+        );
+        assert_eq!(
+            rule("router_refresh_quota"),
+            RemoteRule::Scope(SCOPE_RUN_WRITE)
+        );
+        assert_eq!(
+            rule("store_provider_key"),
+            RemoteRule::Scope(SCOPE_RUNTIME_ADMIN)
+        );
+        assert_eq!(
+            rule("provider_inventory"),
+            RemoteRule::Scope(SCOPE_THREAD_READ)
+        );
     }
 
     #[test]
