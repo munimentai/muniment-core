@@ -38,7 +38,7 @@ pub fn onboard_workspace(
     )
 }
 
-/// Opens profile storage after the ADR 0009 instance-lock cutover gate transfers ownership.
+/// Opens profile storage after the instance-lock cutover gate transfers ownership.
 pub fn open_profile_storage(
     profile_directory: impl AsRef<Path>,
 ) -> Result<SharedStorage, ChatProfileError> {

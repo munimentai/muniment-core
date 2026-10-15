@@ -1,17 +1,13 @@
-# 0030 — Declare the public core boundary
+# Core boundary
 
-- Status: accepted
-
-## Decision
-
-The port set lives in `munimentai/muniment-core` under FSL, with its tests.
-The desktop (`munimentai/muniment`) and the factory consume it.
+This repository holds the shared core of Muniment. The desktop and other hosts build on it.
 Nothing in the port set may depend on a staying module, a staying crate, or `tauri`.
 The staying modules live in the desktop's `muniment-desktop-integration` crate.
 
 The tables cover every workspace crate and every top-level `muniment-core` module, including platform-gated and private modules.
 Module rows name the module below `muniment-core`.
 A module that `muniment-core` re-exports from another workspace crate keeps its row.
+`scripts/check-core-boundary.sh` reads the Port and Stay tables in this file.
 
 ## Port
 

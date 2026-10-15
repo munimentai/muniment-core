@@ -32,7 +32,7 @@ Desktop-only code (cloud sign-in, cloud chat grants and browser control) lives i
 the desktop. The host supplies it through the `account` and `chat_launch` values,
 the `PiLaunchBoundaries` and `RunAttachBoundaries` traits, and the runtime's
 `RuntimeHost` value.
-`docs/decisions/0030-public-core-boundary.md` lists every module and crate and
+`docs/core-boundary.md` lists every module and crate and
 `scripts/check-core-boundary.sh` enforces the boundary.
 
 ## Pins

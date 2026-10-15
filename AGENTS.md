@@ -7,8 +7,9 @@
 - The AI software factory, a headless Python service. It runs the router and
   reads `pins/pins.toml` from a tagged release.
 
-`README.md` describes each crate. `docs/decisions/` holds the decision records
-that tests and checks read.
+`README.md` describes each crate. `docs/` holds technical documentation about
+the core, such as `docs/core-boundary.md`, which the boundary check reads.
+Decision records are not kept in this repository.
 
 Forgejo `factory/muniment-core` is the record: code, issues, pull requests and
 Actions CI in `.forgejo/workflows/`. It push-mirrors to the public GitHub
@@ -22,7 +23,7 @@ The desktop-only modules `auth`, `chat_grant` and `browser_control` live in the
 desktop. No source file here may name them, and no file has an exception. The
 host supplies desktop behavior through port-owned values and traits.
 `scripts/check-core-boundary.sh` checks the inventory in
-`docs/decisions/0030-public-core-boundary.md` and every source edge.
+`docs/core-boundary.md` and every source edge.
 
 `muniment-router` and `muniment-pins` never depend on `muniment-core`.
 `muniment-core` re-exports them at the module paths callers use, such as
@@ -67,9 +68,10 @@ before you push. A green local build does not cover that code.
 
 ## Steering files
 
-This repository's steering files are `AGENTS.md`, `README.md` and
-`docs/decisions/`. They are instruction, not record: present tense, stating what
-is. No dates, ticket ids, commit shas, or pull request numbers. No history
+This repository's steering files are `AGENTS.md`, `README.md` and the files
+under `docs/`. They are instruction, not record: present tense, stating what
+is. They document the core itself, not product or business decisions. No
+dates, ticket ids, commit shas, or pull request numbers. No history
 phrases. No ledger file under any name: no open-items, build-history,
 decision-log, handoff, journal, notes, or todo file. `AGENTS.md` stays under 120
 lines. Issues track work and git holds history. `CLAUDE.md` imports this file
