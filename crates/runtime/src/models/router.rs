@@ -467,24 +467,41 @@ fn pooled_default(config: &RouterConfig, family: Option<&str>) -> Option<String>
     chosen
 }
 
-/// Names a pooled model as Pi's default where `auto` would route nothing: a
-/// saved `muniment-router/auto` default while no decision model is ready, and,
-/// with `unset`, a default never saved. The router no longer offers `auto`
-/// then, so a default left on it names a model Pi cannot find.
+/// The router models only plan refusals keep out: what the router would
+/// serve if no account's plan had refused anything, less what it serves.
+fn refused_models(config: &RouterConfig) -> Vec<String> {
+    let served = options(config);
+    let mut unrefused = config.clone();
+    unrefused.refused.clear();
+    options(&unrefused)
+        .into_iter()
+        .filter(|option| !served.iter().any(|known| known.key == option.key))
+        .map(|option| option.key)
+        .collect()
+}
+
+/// Names a pooled model as Pi's default where the saved one would route
+/// nothing: a saved `muniment-router/auto` default while no decision model is
+/// ready, a saved router model the plan of every account refused, and, with
+/// `unset`, a default never saved. The router no longer offers such a model,
+/// so a default left on it names a model Pi cannot find.
 pub(super) fn settle_default(agent: &Path, family: Option<&str>, unset: bool) {
     let Ok(config) = load(agent) else {
         return;
     };
     let ready = config.classifier.ready();
-    if !config.enabled || (ready && !unset) {
+    let refused = refused_models(&config);
+    if !config.enabled || (ready && !unset && refused.is_empty()) {
         return;
     }
     let Some(model) = pooled_default(&config, family) else {
         return;
     };
     let _ = replace_default_model(agent, config::ROUTER_PROVIDER, &model, |provider, saved| {
-        let auto = provider == Some(config::ROUTER_PROVIDER) && saved == Some(config::AUTO_MODEL);
-        (auto && !ready) || (unset && provider.is_none())
+        let routed = provider == Some(config::ROUTER_PROVIDER);
+        let auto = routed && saved == Some(config::AUTO_MODEL);
+        let gone = routed && saved.is_some_and(|saved| refused.iter().any(|key| key == saved));
+        (auto && !ready) || gone || (unset && provider.is_none())
     });
 }
 
@@ -1273,6 +1290,43 @@ mod tests {
         config::save(&agent, &config).unwrap();
         let settings = settings_with(&agent, None, &Default::default()).unwrap();
         assert_eq!(settings.served_models[0], "auto");
+        std::fs::remove_dir_all(agent).unwrap();
+    }
+
+    #[test]
+    fn a_saved_default_every_plan_refused_becomes_another_pooled_model() {
+        let config = RouterConfig {
+            enabled: true,
+            accounts: vec![subscription("s1"), subscription("s2")],
+            classifier: typesafe(),
+            ..RouterConfig::default()
+        };
+        let agent = agent_with(&config);
+        choose_default(&agent, "muniment-router", "openai/gpt-6-astra");
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut ledger = usage::Ledger::default();
+        ledger.record_refusal("s1", "gpt-6-astra", now);
+        usage::save(&agent, &ledger).unwrap();
+        // One account still offers it, so the default stays.
+        settle_default(&agent, None, false);
+        assert_eq!(saved_default(&agent), router_default("openai/gpt-6-astra"));
+        ledger.record_refusal("s2", "gpt-6-astra", now);
+        usage::save(&agent, &ledger).unwrap();
+        let settings = settings_with(&agent, None, &Default::default()).unwrap();
+        let (provider, model) = saved_default(&agent);
+        assert_eq!(provider.as_deref(), Some("muniment-router"));
+        let model = model.unwrap();
+        assert!(model.starts_with("openai/"), "{model}");
+        assert_ne!(model, "openai/gpt-6-astra");
+        assert!(settings.served_models.contains(&model));
+        assert!(!settings
+            .served_models
+            .contains(&"openai/gpt-6-astra".to_owned()));
+        // Once the refusals expire, a default the user picks stays.
+        usage::save(&agent, &usage::Ledger::default()).unwrap();
+        choose_default(&agent, "muniment-router", "openai/gpt-6-astra");
+        settle_default(&agent, None, false);
+        assert_eq!(saved_default(&agent), router_default("openai/gpt-6-astra"));
         std::fs::remove_dir_all(agent).unwrap();
     }
 

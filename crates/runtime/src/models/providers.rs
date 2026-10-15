@@ -613,6 +613,8 @@ pub(super) fn inventory(
     engine: &PiRpcEngine,
     force: bool,
 ) -> Result<ProviderInventory, String> {
+    // A saved default the router stopped offering moves before the picker reads it.
+    super::router::settle_default(agent, None, false);
     let discovery_agent = agent.to_path_buf();
     let discovery = std::thread::spawn(move || pi_models::refresh_endpoints(&discovery_agent));
     let thinking_engine = engine.clone();

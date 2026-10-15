@@ -73,16 +73,21 @@ pub fn usable(account: &Account, model: &str) -> bool {
     account.enabled && account.weight > 0 && account.credential.servable() && account.serves(model)
 }
 
+/// The usable accounts of `family` whose plan has not lately refused `model`.
+fn offering<'a>(config: &'a RouterConfig, family: &str, model: &str) -> Vec<&'a Account> {
+    config
+        .pool(family)
+        .into_iter()
+        .filter(|account| usable(account, model) && !config.refuses(&account.id, model))
+        .collect()
+}
+
 /// The accounts of `family` that balance together for `model`: its
 /// subscriptions while any of them can serve the model, else its keys. A key
 /// never balances with a subscription, so a subscription's turn never spills
 /// into API billing by rotation.
 pub fn balanced<'a>(config: &'a RouterConfig, family: &str, model: &str) -> Vec<&'a Account> {
-    let usable: Vec<&Account> = config
-        .pool(family)
-        .into_iter()
-        .filter(|account| usable(account, model))
-        .collect();
+    let usable = offering(config, family, model);
     if usable.iter().any(|account| !account.is_key()) {
         usable
             .into_iter()
@@ -97,11 +102,7 @@ pub fn balanced<'a>(config: &'a RouterConfig, family: &str, model: &str) -> Vec<
 /// that balances for it is cooling or spent. Empty while the family has no
 /// subscription for the model, because its keys then balance on their own.
 pub fn overflow<'a>(config: &'a RouterConfig, family: &str, model: &str) -> Vec<&'a Account> {
-    let usable: Vec<&Account> = config
-        .pool(family)
-        .into_iter()
-        .filter(|account| usable(account, model))
-        .collect();
+    let usable = offering(config, family, model);
     if !usable.iter().any(|account| !account.is_key()) {
         return Vec::new();
     }

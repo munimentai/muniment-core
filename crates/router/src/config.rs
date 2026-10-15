@@ -417,6 +417,11 @@ pub struct RouterConfig {
     /// Runtime-only provider catalogs. Saving settings never pins discoveries.
     #[serde(skip)]
     pub discovered_models: std::collections::BTreeMap<String, Vec<String>>,
+    /// Runtime-only: the models each account's plan lately refused, by
+    /// account id, from the usage ledger. Such an account takes no turn on
+    /// such a model.
+    #[serde(skip)]
+    pub refused: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
     /// Off keeps every turn on Pi's own provider and starts no listener.
     #[serde(default)]
     pub enabled: bool,
@@ -470,6 +475,13 @@ impl RouterConfig {
     pub fn account(&self, id: &str) -> Option<&Account> {
         self.accounts.iter().find(|account| account.id == id)
     }
+
+    /// Whether the plan of account `id` lately refused `model`.
+    pub fn refuses(&self, id: &str, model: &str) -> bool {
+        self.refused
+            .get(id)
+            .is_some_and(|models| models.contains(model))
+    }
 }
 
 /// The router record inside an agent directory.
@@ -506,6 +518,8 @@ pub fn load(agent: &Path) -> io::Result<RouterConfig> {
                     })
                 })
                 .collect();
+            config.refused =
+                super::usage::load(agent).refusals(chrono::Utc::now().timestamp_millis());
             super::policy::load_metadata(agent, &mut config);
             Ok(config)
         }
@@ -623,6 +637,36 @@ mod tests {
             renews_at_ms: None,
         };
         account
+    }
+
+    #[test]
+    fn a_loaded_record_carries_the_plan_refusals_of_the_last_day_and_saves_none() {
+        let agent =
+            std::env::temp_dir().join(format!("muniment-router-config-{}", uuid::Uuid::now_v7()));
+        let mut config = RouterConfig {
+            accounts: vec![key_account("a1", "openai"), key_account("a2", "openai")],
+            ..RouterConfig::default()
+        };
+        save(&agent, &config).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut ledger = super::super::usage::Ledger::default();
+        ledger.record_refusal("a1", "gpt-5.5", now);
+        ledger.record_refusal(
+            "a2",
+            "gpt-5.5",
+            now - super::super::usage::MODEL_REFUSAL_MS - 1,
+        );
+        super::super::usage::save(&agent, &ledger).unwrap();
+        let loaded = load(&agent).unwrap();
+        assert!(loaded.refuses("a1", "gpt-5.5"));
+        assert!(!loaded.refuses("a2", "gpt-5.5"));
+        assert!(!loaded.refuses("a1", "gpt-5.6"));
+        config.refused = loaded.refused.clone();
+        save(&agent, &config).unwrap();
+        assert!(!String::from_utf8(fs::read(config_path(&agent)).unwrap())
+            .unwrap()
+            .contains("refused"));
+        std::fs::remove_dir_all(agent).unwrap();
     }
 
     #[test]
@@ -810,6 +854,7 @@ mod tests {
             routing_models: Default::default(),
             policy: Default::default(),
             discovered_models: Default::default(),
+            refused: Default::default(),
             enabled: true,
             hidden: vec!["openai/gpt-5.5".into()],
             accounts: vec![key_account("a1", "openai"), key_account("a2", "openai")],

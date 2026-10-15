@@ -460,10 +460,16 @@ impl State {
         // to its subscriptions, even after each one has failed this turn. A key
         // joins only as overflow, and only while every subscription cools.
         let subscribed = configured.accounts.iter().any(|a| {
-            a.family == selected.family && !a.is_key() && balance::usable(a, &selected.model)
+            a.family == selected.family
+                && !a.is_key()
+                && balance::usable(a, &selected.model)
+                && !configured.refuses(&a.id, &selected.model)
         });
         let fits = |a: &config::Account| {
-            a.family == selected.family && a.serves(&selected.model) && !(subscribed && a.is_key())
+            a.family == selected.family
+                && a.serves(&selected.model)
+                && !configured.refuses(&a.id, &selected.model)
+                && !(subscribed && a.is_key())
         };
         // Keep an established service pool even if one account becomes unavailable.
         // A subscription must not silently spill into an API or gateway pool.
@@ -509,6 +515,7 @@ impl State {
             for account in config.accounts.iter().filter(|a| {
                 a.family == route.family
                     && a.serves(&route.model)
+                    && !configured.refuses(&a.id, &route.model)
                     && if subscribed && a.is_key() {
                         spill && a.overflow && a.family == selected.family
                     } else {
@@ -567,7 +574,9 @@ impl State {
     }
 
     pub(crate) fn config(&self) -> RouterConfig {
-        self.backend.config().unwrap_or_default()
+        let mut config = self.backend.config().unwrap_or_default();
+        config.refused = self.ledger().refusals((self.now_ms)());
+        config
     }
 
     fn record_success(&self, account: &str, tokens: wire::Tokens) {
@@ -585,6 +594,40 @@ impl State {
             ledger.record_error(account, &day(now), now, message, cools);
             let _ = self.backend.store.save_ledger(&ledger, account);
         }
+    }
+
+    /// Records that the plan of `account` does not offer `model`. On the
+    /// desktop, Pi's entry for the router is written again, so a model every
+    /// account refused leaves the list Pi offers.
+    fn refuse_model(&self, account: &str, model: &str) {
+        {
+            let mut ledger = self
+                .ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ledger.record_refusal(account, model, (self.now_ms)());
+            let _ = self.backend.store.save_ledger(&ledger, account);
+        }
+        let Some(agent) = &self.agent else {
+            return;
+        };
+        let settings = self.config();
+        let _ = muniment_models::pi_models::merge_discovered(agent, &[], |root| {
+            let Some(endpoint) = read_endpoint(agent) else {
+                return false;
+            };
+            let entry = |root: &serde_json::Map<String, Value>| {
+                root.get("providers")
+                    .and_then(|providers| providers.get(config::ROUTER_PROVIDER))
+                    .cloned()
+            };
+            let before = entry(root);
+            if !settings.enabled || before.is_none() {
+                return false;
+            }
+            super::pi_provider::register(root, &endpoint, &settings);
+            before != entry(root)
+        });
     }
 
     /// Keeps the account out of the pool until `until_ms`, when that is later
@@ -1159,8 +1202,20 @@ pub(crate) fn complete(
     let mut plan = match plan(&config, &state.ledger(), requested, &text, (state.now_ms)()) {
         Ok(plan) => plan,
         Err(error) => {
+            // The limits above drop the models a plan refused along with the
+            // rest, so the configured pool says whether a refusal is the reason.
+            let error = match error {
+                ResolveError::UnknownModel(_) => {
+                    match super::plan(&original, &state.ledger(), requested, "", (state.now_ms)()) {
+                        Err(refused @ ResolveError::PlanRefused { .. }) => refused,
+                        _ => error,
+                    }
+                }
+                other => other,
+            };
             let status = match error {
                 ResolveError::UnknownModel(_) => 404,
+                ResolveError::PlanRefused { .. } => 400,
                 _ => 503,
             };
             respond(
@@ -1276,6 +1331,8 @@ pub(crate) fn complete(
     let mut attempted = false;
     for route in routes {
         let mut candidates = config.clone();
+        // Attempts on this route, and how many of them its plan refused.
+        let (mut tried, mut plan_refused) = (0_u32, 0_u32);
         loop {
             let (account, delivered_route, _in_flight) = match state.reserve_delivery_in(
                 &config,
@@ -1288,6 +1345,11 @@ pub(crate) fn complete(
                 Err(error) => {
                     if matches!(error, balance::PickError::UsageLimit) {
                         state.probe(&route.model, "failed", "quota");
+                    }
+                    // Once every account refused the model on its plan, the
+                    // refusals already say why the pool is spent.
+                    if tried > 0 && plan_refused == tried {
+                        break;
                     }
                     refusals.push(format!(
                         "{}/{}: {}",
@@ -1312,6 +1374,7 @@ pub(crate) fn complete(
                     .stage(progress, "waiting-for-account", (state.now_ms)());
             }
             attempted = true;
+            tried += 1;
             // Try each account at most once for this model, even if cooldown expires.
             if let Some(candidate) = candidates.accounts.iter_mut().find(|a| a.id == account.id) {
                 candidate.enabled = false;
@@ -1616,6 +1679,19 @@ pub(crate) fn complete(
                         quota.observed_at_ms = now;
                         let _ = state.backend.store.save_quota(&account.id, &quota);
                     }
+                    if usage::model_refused(status, &detail) {
+                        // The plan of this account does not offer the model.
+                        // Another account of the family may, so the turn tries
+                        // it next, and this pair leaves the running.
+                        state.refuse_model(&account.id, &route.model);
+                        plan_refused += 1;
+                        refusals.push(format!(
+                            "The plan of {} does not offer {}.",
+                            account.label, route.model
+                        ));
+                        last_failure = (status, String::new());
+                        continue;
+                    }
                     last_failure = (status, detail);
                     refusals.push(format!("{} answered {status}.", account.label));
                     if !cools {
@@ -1640,18 +1716,21 @@ pub(crate) fn complete(
             }
         }
     }
+    let refusals = refusals.join(" ");
+    let message = [
+        "No eligible model served this turn.",
+        &last_failure.1,
+        &refusals,
+    ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join(" ");
     respond(
         stream,
         last_failure.0,
         "Router",
-        &wire::error_body(
-            &format!(
-                "No eligible model served this turn. {} {}",
-                last_failure.1,
-                refusals.join(" ")
-            ),
-            "router_error",
-        ),
+        &wire::error_body(&message, "router_error"),
     );
 }
 
@@ -3039,6 +3118,146 @@ mod tests {
         assert!(refused.cooldown_until_ms.is_some());
         assert!(refused.last_error.as_ref().unwrap().contains("slow down"));
         assert_eq!(ledger.account("a2").unwrap().requests, 1);
+    }
+
+    /// What a subscription answers for a model its plan does not offer.
+    fn plan_refusal(model: &str) -> (u16, String, bool) {
+        (
+            400,
+            json!({
+                "detail": format!(
+                    "The '{model}' model is not supported when using Codex with a ChatGPT account."
+                )
+            })
+            .to_string(),
+            false,
+        )
+    }
+
+    #[test]
+    fn a_plan_refusal_fails_over_and_keeps_that_account_off_the_model() {
+        let agent = agent_dir();
+        let (refusing, seen_refusing) = upstream(vec![
+            plan_refusal("gpt-5.6-mini"),
+            plan_refusal("gpt-5.6-mini"),
+        ]);
+        let (serving, seen_serving) = upstream(vec![
+            (200, answer("second", 10, 2), false),
+            (200, answer("again", 10, 2), false),
+        ]);
+        config::save(
+            &agent,
+            &config(vec![account("a1", &refusing), account("a2", &serving)]),
+        )
+        .unwrap();
+        let handle = start_with_clock(agent.clone(), fixed_clock).unwrap();
+        let (status, body) = call(
+            handle.endpoint(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&turn("fast", false)),
+            &handle.endpoint().token,
+        );
+        assert_eq!(status, 200, "{body}");
+        let response: Value = serde_json::from_str(&body).unwrap();
+        let routing = wire::response_routing(response["id"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            routing.fallback_causes,
+            ["The plan of a1 does not offer gpt-5.6-mini."]
+        );
+        assert_eq!(routing.account, "a2");
+        let ledger = usage::load(&agent);
+        let refused = ledger.account("a1").unwrap();
+        assert!(refused.refused_models.contains_key("gpt-5.6-mini"));
+        assert!(refused.cooldown_until_ms.is_none());
+
+        // The next turn goes straight to the account whose plan offers it.
+        let (status, body) = call(
+            handle.endpoint(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&turn("fast", false)),
+            &handle.endpoint().token,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("again"));
+        assert_eq!(seen_refusing.try_iter().count(), 1);
+        assert_eq!(seen_serving.try_iter().count(), 2);
+        std::fs::remove_dir_all(agent).unwrap();
+    }
+
+    #[test]
+    fn a_model_every_plan_refuses_names_the_model_and_leaves_the_offered_list() {
+        let agent = agent_dir();
+        let (first, seen_first) = upstream(vec![plan_refusal("gpt-5.5"), plan_refusal("gpt-5.5")]);
+        let (second, seen_second) =
+            upstream(vec![plan_refusal("gpt-5.5"), plan_refusal("gpt-5.5")]);
+        let mut a1 = account("a1", &first);
+        a1.models.push("gpt-5.5".into());
+        let mut a2 = account("a2", &second);
+        a2.models.push("gpt-5.5".into());
+        let saved = config(vec![a1, a2]);
+        config::save(&agent, &saved).unwrap();
+        let handle = start_with_clock(agent.clone(), fixed_clock).unwrap();
+        let mut models = serde_json::Map::new();
+        super::super::pi_provider::register(&mut models, handle.endpoint(), &saved);
+        std::fs::write(agent.join("models.json"), Value::Object(models).to_string()).unwrap();
+        let offered = || {
+            let models: Value =
+                serde_json::from_slice(&std::fs::read(agent.join("models.json")).unwrap()).unwrap();
+            models["providers"][config::ROUTER_PROVIDER]["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|model| model["id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(offered().contains(&"openai/gpt-5.5".to_owned()));
+
+        let (status, body) = call(
+            handle.endpoint(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&turn("openai/gpt-5.5", false)),
+            &handle.endpoint().token,
+        );
+        assert_eq!(status, 400, "{body}");
+        let message = serde_json::from_str::<Value>(&body).unwrap()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            message,
+            "No eligible model served this turn. The plan of a1 does not offer gpt-5.5. The plan of a2 does not offer gpt-5.5."
+        );
+        assert_eq!(seen_first.try_iter().count(), 1);
+        assert_eq!(seen_second.try_iter().count(), 1);
+        assert_eq!(offered(), ["fast"]);
+        let (_, listed) = call(
+            handle.endpoint(),
+            "GET",
+            "/v1/models",
+            None,
+            &handle.endpoint().token,
+        );
+        assert!(!listed.contains("gpt-5.5"), "{listed}");
+
+        // A turn that still names it fails at once, with no upstream call.
+        let (status, body) = call(
+            handle.endpoint(),
+            "POST",
+            "/v1/chat/completions",
+            Some(&turn("openai/gpt-5.5", false)),
+            &handle.endpoint().token,
+        );
+        assert_eq!(status, 400, "{body}");
+        assert!(
+            body.contains("The plan of a1 or a2 does not offer gpt-5.5."),
+            "{body}"
+        );
+        assert_eq!(seen_first.try_iter().count(), 0);
+        assert_eq!(seen_second.try_iter().count(), 0);
+        std::fs::remove_dir_all(agent).unwrap();
     }
 
     #[test]
