@@ -8,6 +8,7 @@
 
 mod pi_cli;
 mod pi_rpc;
+mod thinking;
 mod thread_context;
 
 use std::collections::BTreeMap;
@@ -21,10 +22,15 @@ use crate::sidecar::pi_chat::{ExtensionUiAnswer, ExtensionUiRequest};
 use crate::sidecar::SidecarStatus;
 
 pub use pi_cli::{
-    is_paste_prompt, parse_model_table, PiModelRow, PiSignIn, PiSignInSteps, SignInPages,
-    SignInStep,
+    is_paste_prompt, parse_model_table, parse_model_thinking, PiModelRow, PiModelThinking,
+    PiSignIn, PiSignInSteps, SignInPages, SignInStep,
 };
 pub use pi_rpc::{OpenStage, PiOpen, PiRpcEngine};
+pub use thinking::{
+    clamp_thinking_level, reasoning_thinking_levels, startup_thinking_level,
+    supported_thinking_levels, thinking_level, DEFAULT_THINKING_LEVEL,
+    DEFAULT_THINKING_LEVEL_SETTING, MODEL_THINKING_LEVELS, THINKING_LEVELS,
+};
 pub use thread_context::{CompactionPhase, CompactionState, ThreadContextSnapshot, ThreadContexts};
 
 /// One event of a turn: a reply's text, a tool's activity, a permission
@@ -34,10 +40,12 @@ pub type EngineEvent = crate::sidecar::pi_chat::PiChatEvent;
 /// An image a prompt carries.
 pub type EngineImage = crate::sidecar::pi_chat::PiImageContent;
 
-/// One prompt for the engine: its text and the images it carries.
+/// One prompt for the engine: its text, the images it carries, and how much
+/// the model thinks on it. No thinking choice leaves the conversation's level.
 pub struct Submission<'a> {
     pub message: &'a str,
     pub images: Vec<EngineImage>,
+    pub thinking: Option<Thinking<'a>>,
 }
 
 /// Why a conversation did not open. Each case after `Spawn` hands back the
@@ -122,6 +130,17 @@ pub struct Configuration<'a> {
     /// The tools the conversation may call. An engine that fixes its tools
     /// when it opens refuses a change.
     pub tools: Option<&'a [&'a str]>,
+    /// How much the model thinks on the next turn.
+    pub thinking: Option<Thinking<'a>>,
+}
+
+/// How much the model thinks on a turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Thinking<'a> {
+    /// The level the engine starts the active model at.
+    Default,
+    /// A named level, clamped to the nearest one the active model supports.
+    Level(&'a str),
 }
 
 /// What `open` answers: the process with a conversation handle, or why the

@@ -13,6 +13,13 @@
 //! changed since. `memory_pending_dismiss` takes `{"agent"?, "id"}` and
 //! answers null.
 //!
+//! `provider_inventory` names each model's `thinking_levels`, the levels it
+//! thinks at, empty for a model without reasoning, and its
+//! `thinking_default`, the level a turn runs at when it names none.
+//! `set_thinking_level` takes `{"provider", "model", "level"?}`, saves that
+//! level as the model's default and answers null. A missing level restores
+//! the engine's own default.
+//!
 //! A `models.request` body is `{"action": <action>, "data": <object>}`. The
 //! runtime answers `{"result": <value>}`. An action that changes a setting, a
 //! credential or a sign-in carries an idempotency key, and a read carries none.
@@ -38,6 +45,7 @@ pub enum ModelAction {
     ProviderInventory,
     SetDefaultModel,
     SetModelHidden,
+    SetThinkingLevel,
     DisconnectProvider,
     StoreEndpoint,
     ClaudeCodeStatus,
@@ -85,13 +93,14 @@ pub enum ModelAction {
 
 impl ModelAction {
     /// Every action, in wire order.
-    pub const ALL: [ModelAction; 49] = [
+    pub const ALL: [ModelAction; 50] = [
         Self::ProviderStatus,
         Self::StoreProviderKey,
         Self::StoreLocalProvider,
         Self::ProviderInventory,
         Self::SetDefaultModel,
         Self::SetModelHidden,
+        Self::SetThinkingLevel,
         Self::DisconnectProvider,
         Self::StoreEndpoint,
         Self::ClaudeCodeStatus,
@@ -186,6 +195,7 @@ impl ModelAction {
             Self::ProviderInventory => "provider_inventory",
             Self::SetDefaultModel => "set_default_model",
             Self::SetModelHidden => "set_model_hidden",
+            Self::SetThinkingLevel => "set_thinking_level",
             Self::DisconnectProvider => "disconnect_provider",
             Self::StoreEndpoint => "store_endpoint",
             Self::ClaudeCodeStatus => "claude_code_status",
@@ -283,6 +293,7 @@ mod tests {
         assert!(!ModelAction::MemoryPending.mutates());
         assert!(ModelAction::MemoryPendingApply.mutates());
         assert!(ModelAction::MemoryPendingDismiss.mutates());
+        assert!(ModelAction::SetThinkingLevel.mutates());
         assert_eq!(
             ModelRequest::from_body(
                 &serde_json::json!({"action": "memory_pending_apply", "data": {"id": "x"}})

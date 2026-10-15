@@ -64,6 +64,8 @@ pub struct RunStartRequest {
     pub workspace: Option<String>,
     pub provenance: Option<Provenance>,
     pub thread_id: Option<String>,
+    /// The thinking level the run asks for. None runs the model at its default.
+    pub thinking_level: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -86,6 +88,7 @@ pub struct AttachResumeAccepted {
 pub struct RunStartLaunch {
     pub run_id: String,
     pub prompt: String,
+    pub thinking_level: Option<String>,
     pub tokens: TokenSet,
     pub grant: ChatGrant,
     pub cancelled: Arc<AtomicBool>,
@@ -103,6 +106,7 @@ pub trait RunAttachBoundaries {
         _text: String,
         _files: Vec<SelectedFile>,
         _thread_id: Option<String>,
+        _thinking_level: Option<String>,
     ) -> Result<AttachPromptAccepted, RunStartError> {
         Err(RunStartError::InvalidRequest(
             "This prompt cannot be accepted.".into(),
@@ -644,6 +648,7 @@ pub fn prepare_desktop_run(
             let failed_launch = RunStartLaunch {
                 run_id: run_id.clone(),
                 prompt,
+                thinking_level: request.thinking_level,
                 tokens,
                 grant,
                 cancelled,
@@ -665,6 +670,7 @@ pub fn prepare_desktop_run(
         let failed_launch = RunStartLaunch {
             run_id: run_id.clone(),
             prompt,
+            thinking_level: request.thinking_level,
             tokens,
             grant,
             cancelled,
@@ -683,6 +689,7 @@ pub fn prepare_desktop_run(
             let failed_launch = RunStartLaunch {
                 run_id: run_id.clone(),
                 prompt,
+                thinking_level: request.thinking_level,
                 tokens,
                 grant,
                 cancelled,
@@ -706,6 +713,7 @@ pub fn prepare_desktop_run(
     let launch = RunStartLaunch {
         run_id,
         prompt,
+        thinking_level: request.thinking_level,
         tokens,
         grant,
         cancelled,
@@ -925,6 +933,7 @@ mod tests {
             workspace: None,
             provenance: None,
             thread_id: None,
+            thinking_level: None,
         }
     }
 

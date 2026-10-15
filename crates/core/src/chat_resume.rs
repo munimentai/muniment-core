@@ -92,6 +92,7 @@ pub fn run_resume<S: ChatEventSink + PiLaunchBoundaries>(launch: ResumeLaunch<S>
         Arc::clone(&launch.memory_runtime),
         launch.run_id.clone(),
         RESUME_PROMPT.into(),
+        None,
         launch.tokens.access_token,
         launch.tokens.subject,
         launch.grant,

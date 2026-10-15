@@ -15,7 +15,7 @@ use crate::chat_resume::ResumeContext;
 use crate::code_diff_effect::apply_code_diff_approval;
 use crate::code_diff_journal::{load_applied_code_diffs, CodeDiffPermissionAnswer};
 use crate::engine::{
-    AgentEngine, CompactionOutcome, OpenError, OpenStage, PiOpen, PiRpcEngine, Submission,
+    AgentEngine, CompactionOutcome, OpenError, OpenStage, PiOpen, PiRpcEngine, Submission, Thinking,
 };
 use crate::journal::pi_translation::{model_stream_delta_payload, tool_journal_entry};
 use crate::journal::reducer::ChatProjector;
@@ -326,6 +326,7 @@ pub fn coordinate(
     memory_runtime: Arc<ApplicationMemoryRuntime>,
     run_id: String,
     prompt: String,
+    thinking_level: Option<String>,
     access_token: String,
     subject: Option<String>,
     grant: ChatGrant,
@@ -345,6 +346,7 @@ pub fn coordinate(
         memory_runtime,
         run_id,
         prompt,
+        thinking_level,
         None,
         access_token,
         subject,
@@ -390,6 +392,7 @@ pub fn coordinate_compaction(
         memory_runtime,
         run_id,
         String::new(),
+        None,
         Some(CompactionAttempt {
             instructions,
             outcome: Some(outcome),
@@ -437,6 +440,7 @@ fn coordinate_work(
     memory_runtime: Arc<ApplicationMemoryRuntime>,
     run_id: String,
     prompt: String,
+    thinking_level: Option<String>,
     mut compaction: Option<CompactionAttempt>,
     mut access_token: String,
     subject: Option<String>,
@@ -997,6 +1001,11 @@ fn coordinate_work(
         }
         (adapter, Vec::new())
     } else {
+        // An absent level runs the model at the level Pi starts it at, even
+        // when the thread's saved conversation restored another one.
+        let thinking = thinking_level
+            .as_deref()
+            .map_or(Thinking::Default, Thinking::Level);
         let result = coordinate_prepared_prompt(
             &app,
             &journal,
@@ -1013,6 +1022,7 @@ fn coordinate_work(
                         Submission {
                             message: prepared_prompt.message,
                             images: prepared_prompt.images,
+                            thinking: Some(thinking),
                         },
                         &mut |adapter, event| {
                             answer_thread_title(

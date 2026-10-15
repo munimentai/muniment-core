@@ -665,6 +665,29 @@ impl PiRunAdapter {
         prompt: &str,
         images: Vec<PiImageContent>,
         timeout: Duration,
+        consume: impl FnMut(&Self, &PiChatEvent) -> bool,
+    ) -> Result<(Self, PiChatEvent), String> {
+        Self::start_prepared(
+            run_id,
+            transport,
+            prompt,
+            images,
+            timeout,
+            |_, _| {},
+            consume,
+        )
+    }
+
+    /// Starts a prompt after `prepare` sets the conversation up for it.
+    /// `prepare` runs inside the first event bound and receives its deadline,
+    /// so a slow setup leaves the prompt less time instead of more.
+    pub fn start_prepared(
+        run_id: impl Into<String>,
+        transport: &PiRpcTransport,
+        prompt: &str,
+        images: Vec<PiImageContent>,
+        timeout: Duration,
+        prepare: impl FnOnce(&PiRpcTransport, Instant) + Send,
         mut consume: impl FnMut(&Self, &PiChatEvent) -> bool,
     ) -> Result<(Self, PiChatEvent), String> {
         let run_id = run_id.into();
@@ -682,6 +705,7 @@ impl PiRunAdapter {
         let response = std::thread::scope(|scope| {
             let (sender, response) = mpsc::channel();
             scope.spawn(move || {
+                prepare(transport, deadline);
                 let result = transport.call(
                     PromptCommand::with_images(prompt, images).into_value(),
                     timeout.min(deadline.saturating_duration_since(Instant::now())),

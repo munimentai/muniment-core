@@ -1,6 +1,6 @@
-//! The Pi runs the adapter makes outside a conversation: the model list, a
-//! one-reply model probe and a provider sign-in. Only this adapter starts Pi
-//! and reads its frames.
+//! The Pi runs the adapter makes outside a conversation: the model list, the
+//! thinking levels of each model, a one-reply model probe and a provider
+//! sign-in. Only this adapter starts Pi and reads its frames.
 
 use std::io::{BufRead, BufReader, Lines, Write};
 use std::path::{Path, PathBuf};
@@ -15,6 +15,7 @@ use crate::sidecar::pi_install::{acquire_pi, resolve_current_for, PI_SELECTED_AR
 const LOGIN_EXTENSION: &str = include_str!("muniment_login.mjs");
 const LOGIN_EXTENSION_FILE: &str = "muniment-login.mjs";
 const LIST_MODELS_TIMEOUT: Duration = Duration::from_secs(30);
+const MODEL_LIST_REQUEST: &str = "muniment-model-thinking";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const SIGN_IN_START_ERROR: &str = "The sign-in could not start. Try again.";
 
@@ -27,6 +28,14 @@ pub struct PiModelRow {
     pub max_out: String,
     pub thinking: bool,
     pub images: bool,
+}
+
+/// The thinking levels one model supports, as Pi's model objects report them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PiModelThinking {
+    pub provider: String,
+    pub id: String,
+    pub levels: Vec<&'static str>,
 }
 
 /// What a sign-in's pages say: the HTML Pi's callback server answers with
@@ -102,6 +111,57 @@ impl PiRpcEngine {
         run_with_timeout(command, LIST_MODELS_TIMEOUT)
             .filter(|output| output.status.success())
             .map(|output| parse_model_table(&String::from_utf8_lossy(&output.stdout)))
+            .unwrap_or_default()
+    }
+
+    /// The thinking levels of every model Pi can serve, from the model objects
+    /// its RPC mode answers. Pi runs without extensions, so a model an
+    /// extension registers is absent. An absent Pi, a failure or a timeout
+    /// answers an empty list.
+    pub fn list_model_thinking(&self) -> Vec<PiModelThinking> {
+        let (Some(executable), Some(agent)) = (self.executable(), self.agent_directory.as_deref())
+        else {
+            return Vec::new();
+        };
+        let mut command = self.cli(&executable, agent);
+        command
+            .args([
+                "--mode",
+                "rpc",
+                "--no-session",
+                "--no-extensions",
+                "--no-skills",
+                "--no-context-files",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let Ok(mut child) = command.spawn() else {
+            return Vec::new();
+        };
+        let (stdin, stdout) = (child.stdin.take(), child.stdout.take());
+        let models = stdin.zip(stdout).and_then(|(mut stdin, stdout)| {
+            let request = json!({ "id": MODEL_LIST_REQUEST, "type": "get_available_models" });
+            writeln!(stdin, "{request}").ok()?;
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let answer = BufReader::new(stdout)
+                    .lines()
+                    .map_while(Result::ok)
+                    .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+                    .find(|frame| {
+                        frame.get("id").and_then(Value::as_str) == Some(MODEL_LIST_REQUEST)
+                    });
+                let _ = sender.send(answer);
+            });
+            let answer = receiver.recv_timeout(LIST_MODELS_TIMEOUT).ok().flatten();
+            drop(stdin);
+            answer
+        });
+        let _ = child.kill();
+        let _ = child.wait();
+        models
+            .map(|frame| parse_model_thinking(&frame))
             .unwrap_or_default()
     }
 
@@ -297,6 +357,27 @@ pub fn parse_model_table(output: &str) -> Vec<PiModelRow> {
     rows
 }
 
+/// Reads Pi's `get_available_models` answer: each model's provider, id and
+/// the thinking levels it supports. A refusal answers an empty list.
+pub fn parse_model_thinking(frame: &Value) -> Vec<PiModelThinking> {
+    if frame.get("success").and_then(Value::as_bool) != Some(true) {
+        return Vec::new();
+    }
+    frame
+        .pointer("/data/models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            Some(PiModelThinking {
+                provider: model.get("provider")?.as_str()?.to_owned(),
+                id: model.get("id")?.as_str()?.to_owned(),
+                levels: super::supported_thinking_levels(model),
+            })
+        })
+        .collect()
+}
+
 fn run_with_timeout(mut command: Command, timeout: Duration) -> Option<std::process::Output> {
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -331,6 +412,36 @@ mod tests {
             parse_model_table("No models available. Use /login to log into a provider.\n")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn the_model_answer_names_each_models_thinking_levels() {
+        let frame = json!({
+            "id": MODEL_LIST_REQUEST, "type": "response", "command": "get_available_models",
+            "success": true, "data": {"models": [
+                {"provider": "ollama", "id": "llama3.2:3b", "reasoning": false},
+                {"provider": "openai", "id": "gpt-5.5", "reasoning": true,
+                 "thinkingLevelMap": {"off": "none", "minimal": null, "xhigh": "xhigh"}},
+                {"provider": "broken"}
+            ]}
+        });
+        assert_eq!(
+            parse_model_thinking(&frame),
+            [
+                PiModelThinking {
+                    provider: "ollama".into(),
+                    id: "llama3.2:3b".into(),
+                    levels: vec!["off"],
+                },
+                PiModelThinking {
+                    provider: "openai".into(),
+                    id: "gpt-5.5".into(),
+                    levels: vec!["off", "low", "medium", "high", "xhigh"],
+                },
+            ]
+        );
+        let refused = json!({"id": MODEL_LIST_REQUEST, "type": "response", "success": false});
+        assert!(parse_model_thinking(&refused).is_empty());
     }
 
     #[test]
@@ -396,6 +507,7 @@ mod tests {
             .with_harness_root(root.join("harness"));
         assert_eq!(engine.executable(), None);
         assert!(engine.list_models().is_empty());
+        assert!(engine.list_model_thinking().is_empty());
         assert!(!engine.model_answers("ollama", "llama3.2:3b"));
     }
 }

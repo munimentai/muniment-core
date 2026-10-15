@@ -116,7 +116,7 @@ impl RuntimeAttachState {
                     .transpose()?;
                 state.runs.insert(agent.id.clone(), run.clone());
                 agents::persist_state(profile, state)?;
-                match boundaries.submit_run(&workspace, "Carry out your saved agent instructions. Return the result and links to any files you create.".into(), Vec::new(), Some(thread)) {
+                match boundaries.submit_run(&workspace, "Carry out your saved agent instructions. Return the result and links to any files you create.".into(), Vec::new(), Some(thread), None) {
                     Ok(accepted) => { run.run_id = Some(accepted.run_id); }
                     Err(error) => { run.status = "failed".into(); run.error = Some(error.into_message()); }
                 }

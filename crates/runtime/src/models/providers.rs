@@ -10,7 +10,10 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use muniment_core::engine::{PiModelRow, PiRpcEngine};
+use muniment_core::engine::{
+    clamp_thinking_level, reasoning_thinking_levels, startup_thinking_level, thinking_level,
+    PiModelRow, PiModelThinking, PiRpcEngine, MODEL_THINKING_LEVELS,
+};
 use muniment_core::model_router::config::ROUTER_PROVIDER;
 use muniment_core::models::pi_models::{
     self, decision_models, read_record as read_models_record, saved_endpoint_key, valid_identifier,
@@ -47,6 +50,11 @@ pub(super) struct InventoryModel {
     max_out: String,
     thinking: bool,
     images: bool,
+    /// The thinking levels the model runs at, empty for a model without reasoning.
+    thinking_levels: Vec<&'static str>,
+    /// The level a turn runs at when it names none: the model's saved level,
+    /// clamped to the ones it supports. None for a model without reasoning.
+    thinking_default: Option<&'static str>,
 }
 
 impl From<&PiModelRow> for InventoryModel {
@@ -57,7 +65,36 @@ impl From<&PiModelRow> for InventoryModel {
             max_out: row.max_out.clone(),
             thinking: row.thinking,
             images: row.images,
+            thinking_levels: Vec::new(),
+            thinking_default: None,
         }
+    }
+}
+
+impl InventoryModel {
+    /// Fills in the thinking levels from Pi's model objects, or from the
+    /// reasoning flag of a model they do not name, and the default level.
+    fn settle_thinking(
+        &mut self,
+        provider: &str,
+        thinking: &[PiModelThinking],
+        settings: &serde_json::Map<String, serde_json::Value>,
+    ) {
+        let levels = match thinking
+            .iter()
+            .find(|model| model.provider == provider && model.id == self.id)
+        {
+            Some(model) if model.levels != ["off"] => model.levels.clone(),
+            Some(_) => Vec::new(),
+            None => reasoning_thinking_levels(self.thinking),
+        };
+        self.thinking_default = (!levels.is_empty()).then(|| {
+            clamp_thinking_level(
+                startup_thinking_level(settings, provider, &self.id),
+                &levels,
+            )
+        });
+        self.thinking_levels = levels;
     }
 }
 
@@ -578,18 +615,25 @@ pub(super) fn inventory(
 ) -> Result<ProviderInventory, String> {
     let discovery_agent = agent.to_path_buf();
     let discovery = std::thread::spawn(move || pi_models::refresh_endpoints(&discovery_agent));
+    let thinking_engine = engine.clone();
+    let thinking = std::thread::spawn(move || thinking_engine.list_model_thinking());
     let mut models = engine.list_models();
     let provider_changed = refresh_provider_models(agent, &models, force).unwrap_or(false);
     if discovery.join().ok().and_then(Result::ok) == Some(true) || provider_changed {
         models = engine.list_models();
     }
     super::router::settle_default(agent, None, false);
-    let mut inventory = provider_inventory(agent, &models)?;
+    let thinking = thinking.join().unwrap_or_default();
+    let mut inventory = provider_inventory(agent, &models, &thinking)?;
     adopt_shown_default(agent, &mut inventory);
     Ok(inventory)
 }
 
-fn provider_inventory(agent: &Path, models: &[PiModelRow]) -> Result<ProviderInventory, String> {
+fn provider_inventory(
+    agent: &Path,
+    models: &[PiModelRow],
+    thinking: &[PiModelThinking],
+) -> Result<ProviderInventory, String> {
     let auth = read_json_store(&pi_auth_file(agent))?.unwrap_or_default();
     let models_file = read_json_store(&pi_models_file(agent))?.unwrap_or_default();
     let settings = read_json_store(&pi_settings_file(&pi_models_file(agent)))?.unwrap_or_default();
@@ -648,6 +692,8 @@ fn provider_inventory(agent: &Path, models: &[PiModelRow]) -> Result<ProviderInv
                         max_out: String::new(),
                         thinking: false,
                         images: false,
+                        thinking_levels: Vec::new(),
+                        thinking_default: None,
                     })
                     .collect(),
                 decision_models: decision_models(&record, provider),
@@ -676,6 +722,11 @@ fn provider_inventory(agent: &Path, models: &[PiModelRow]) -> Result<ProviderInv
             } else {
                 known.models.push(model);
             }
+        }
+    }
+    for provider in &mut providers {
+        for model in &mut provider.models {
+            model.settle_thinking(&provider.id, thinking, &settings);
         }
     }
     Ok(ProviderInventory {
@@ -777,6 +828,56 @@ pub(super) fn replace_default_model(
     lock.check()?;
     pi_models::write_json(&settings_file, &settings)?;
     Ok(true)
+}
+
+/// Saves the level Pi starts `provider/model` at, which is the level a turn
+/// on that model runs at when it names none. No level removes the model's own
+/// level, so Pi's default applies again.
+pub(super) fn set_thinking_level(
+    agent: &Path,
+    provider: &str,
+    model: &str,
+    level: Option<&str>,
+) -> Result<(), String> {
+    if !valid_identifier(provider, 128) || !valid_identifier(model, 512) {
+        return Err("Choose a provider and a model.".into());
+    }
+    let level = level
+        .map(|level| {
+            thinking_level(level)
+                .ok_or_else(|| "Choose a thinking level the model offers.".to_string())
+        })
+        .transpose()?;
+    save_thinking_level(agent, &format!("{provider}/{model}"), level)
+        .map_err(|_| SAVE_SETTINGS_ERROR.to_string())
+}
+
+fn save_thinking_level(agent: &Path, key: &str, level: Option<&str>) -> std::io::Result<()> {
+    let settings_file = pi_settings_file(&pi_models_file(agent));
+    fs::create_dir_all(agent)?;
+    let lock = muniment_core::pi_settings::lock_settings(&settings_file)?;
+    let mut settings = pi_models::read_json(&settings_file)?;
+    let mut levels = settings
+        .get(MODEL_THINKING_LEVELS)
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    match level {
+        Some(level) => {
+            levels.insert(key.to_owned(), level.into());
+        }
+        None => {
+            levels.remove(key);
+        }
+    }
+    if levels.is_empty() {
+        settings.remove(MODEL_THINKING_LEVELS);
+    } else {
+        settings.insert(MODEL_THINKING_LEVELS.into(), levels.into());
+    }
+    merge_pi_settings(&mut settings, PI_SELECTED_ARTIFACT);
+    lock.check()?;
+    pi_models::write_json(&settings_file, &settings)
 }
 
 /// Whether Pi's settings name no default model yet.
@@ -1092,7 +1193,7 @@ google        gemini-3-pro         1M    64K    yes  yes\n";
             row("openai-codex", "gpt-5.5", "400K"),
             row("openai-codex", "gpt-5.6-luna", "400K"),
         ];
-        let mut inventory = provider_inventory(&agent, &models).unwrap();
+        let mut inventory = provider_inventory(&agent, &models, &[]).unwrap();
         assert_eq!(inventory.default_model, None);
         adopt_shown_default(&agent, &mut inventory);
         assert_eq!(inventory.default_provider.as_deref(), Some("openai-codex"));
@@ -1104,7 +1205,7 @@ google        gemini-3-pro         1M    64K    yes  yes\n";
         assert_eq!(settings["defaultModel"], "gpt-5.6-luna");
 
         // A shown saved default stays.
-        let mut again = provider_inventory(&agent, &models).unwrap();
+        let mut again = provider_inventory(&agent, &models, &[]).unwrap();
         adopt_shown_default(&agent, &mut again);
         assert_eq!(again.default_model.as_deref(), Some("gpt-5.6-luna"));
     }
@@ -1115,7 +1216,7 @@ google        gemini-3-pro         1M    64K    yes  yes\n";
         fs::write(agent.join("models.json"), serde_json::json!({
             "providers": {"ollama": {"baseUrl": "http://localhost:11434/v1", "models": [{"id": "local-model"}]}}
         }).to_string()).unwrap();
-        let mut inventory = provider_inventory(&agent, &[]).unwrap();
+        let mut inventory = provider_inventory(&agent, &[], &[]).unwrap();
         adopt_shown_default(&agent, &mut inventory);
         assert_eq!(inventory.default_provider.as_deref(), Some("ollama"));
         assert_eq!(inventory.default_model.as_deref(), Some("local-model"));
@@ -1129,7 +1230,7 @@ google        gemini-3-pro         1M    64K    yes  yes\n";
             thinking: true,
             images: true,
         };
-        let inventory = provider_inventory(&agent, &[detailed]).unwrap();
+        let inventory = provider_inventory(&agent, &[detailed], &[]).unwrap();
         assert_eq!(inventory.providers[0].models.len(), 1);
         assert_eq!(inventory.providers[0].models[0].context, "128K");
         assert!(inventory.providers[0].models[0].images);
@@ -1142,11 +1243,11 @@ google        gemini-3-pro         1M    64K    yes  yes\n";
             "providers": {"llama": {"baseUrl": "http://localhost:8080/v1", "models": [{"id": "qwen3"}]}}
         }).to_string()).unwrap();
         store_decision_models(&agent, "llama", &["kev-4b".to_owned()]).unwrap();
-        let inventory = provider_inventory(&agent, &[]).unwrap();
+        let inventory = provider_inventory(&agent, &[], &[]).unwrap();
         assert_eq!(inventory.providers[0].decision_models, ["kev-4b"]);
         assert_eq!(inventory.providers[0].models.len(), 1);
         store_decision_models(&agent, "llama", &[]).unwrap();
-        let inventory = provider_inventory(&agent, &[]).unwrap();
+        let inventory = provider_inventory(&agent, &[], &[]).unwrap();
         assert!(inventory.providers[0].decision_models.is_empty());
     }
 
@@ -1193,7 +1294,7 @@ google        gemini-3-pro         1M    64K    yes  yes\n";
             row("anthropic", "claude-sonnet-5", "1M"),
             row("unknown", "x", "1"),
         ];
-        let inventory = provider_inventory(&agent, &models).unwrap();
+        let inventory = provider_inventory(&agent, &models, &[]).unwrap();
         let ids: Vec<(&str, &str)> = inventory
             .providers
             .iter()
@@ -1228,6 +1329,93 @@ google        gemini-3-pro         1M    64K    yes  yes\n";
         assert_eq!(inventory.default_provider.as_deref(), Some("ollama"));
         assert_eq!(inventory.default_model.as_deref(), Some("llama3.2:3b"));
         assert_eq!(inventory.hidden, vec!["anthropic/claude-haiku-4-5"]);
+        fs::remove_dir_all(agent).unwrap();
+    }
+
+    #[test]
+    fn each_model_names_its_thinking_levels_and_the_level_a_turn_runs_at() {
+        let agent = temporary_directory();
+        fs::write(
+            agent.join("auth.json"),
+            r#"{"openai":{"type":"api_key","key":"k"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            agent.join("settings.json"),
+            r#"{"defaultThinkingLevel":"max","modelThinkingLevels":{"openai/mapped":"medium"}}"#,
+        )
+        .unwrap();
+        let mut plain = row("openai", "plain", "128K");
+        plain.thinking = false;
+        let models = vec![
+            row("openai", "ladder", "128K"),
+            row("openai", "mapped", "128K"),
+            plain,
+            row("openai", "flagged", "128K"),
+        ];
+        let thinking = vec![
+            PiModelThinking {
+                provider: "openai".into(),
+                id: "mapped".into(),
+                levels: vec!["low", "high", "xhigh"],
+            },
+            PiModelThinking {
+                provider: "openai".into(),
+                id: "flagged".into(),
+                levels: vec!["off"],
+            },
+        ];
+        let inventory = provider_inventory(&agent, &models, &thinking).unwrap();
+        let model = |id: &str| {
+            inventory.providers[0]
+                .models
+                .iter()
+                .find(|model| model.id == id)
+                .unwrap()
+        };
+        // A model Pi's objects do not name runs the reasoning ladder, and the
+        // default level clamps to its top.
+        assert_eq!(
+            model("ladder").thinking_levels,
+            ["off", "minimal", "low", "medium", "high"]
+        );
+        assert_eq!(model("ladder").thinking_default, Some("high"));
+        // The model's saved level clamps up to the nearest one it supports.
+        assert_eq!(model("mapped").thinking_levels, ["low", "high", "xhigh"]);
+        assert_eq!(model("mapped").thinking_default, Some("high"));
+        for id in ["plain", "flagged"] {
+            assert!(model(id).thinking_levels.is_empty(), "{id}");
+            assert_eq!(model(id).thinking_default, None, "{id}");
+        }
+        fs::remove_dir_all(agent).unwrap();
+    }
+
+    #[test]
+    fn a_saved_thinking_level_becomes_the_models_startup_level_and_clears() {
+        let agent = temporary_directory();
+        fs::write(
+            agent.join("settings.json"),
+            r#"{"defaultModel":"gpt","modelThinkingLevels":{"other/model":"low"}}"#,
+        )
+        .unwrap();
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&fs::read_to_string(agent.join("settings.json")).unwrap()).unwrap()
+        };
+        set_thinking_level(&agent, "openai", "gpt", Some("xhigh")).unwrap();
+        assert_eq!(read()["modelThinkingLevels"]["openai/gpt"], "xhigh");
+        assert_eq!(read()["modelThinkingLevels"]["other/model"], "low");
+        assert_eq!(read()["defaultModel"], "gpt");
+        assert_eq!(
+            set_thinking_level(&agent, "openai", "gpt", Some("loud")).unwrap_err(),
+            "Choose a thinking level the model offers."
+        );
+        assert_eq!(
+            set_thinking_level(&agent, "", "gpt", Some("low")).unwrap_err(),
+            "Choose a provider and a model."
+        );
+        set_thinking_level(&agent, "openai", "gpt", None).unwrap();
+        set_thinking_level(&agent, "other", "model", None).unwrap();
+        assert!(read().get("modelThinkingLevels").is_none());
         fs::remove_dir_all(agent).unwrap();
     }
 

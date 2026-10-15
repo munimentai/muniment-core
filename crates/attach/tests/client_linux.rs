@@ -1014,19 +1014,24 @@ fn desktop_run_submit_matches_the_fixture_and_validates_the_result() {
     let worker = thread::spawn(move || {
         complete_desktop_client_handshake(&mut server);
         let mut keys = BTreeSet::new();
-        for thread_id in [None, Some("01900000-0000-7000-8000-000000000002")] {
+        for (thread_id, thinking_level) in [
+            (None, None),
+            (Some("01900000-0000-7000-8000-000000000002"), Some("high")),
+        ] {
             let request = read_client_value(&mut server);
             let request_id = request["request_id"].as_str().unwrap().to_owned();
             let key = request["idempotency_key"].as_str().unwrap().to_owned();
             assert_eq!(request["operation"], "run.submit");
-            assert_eq!(
-                request["body"],
-                serde_json::json!({
-                    "text": "Summarize the selected file.",
-                    "files": ["/work/repo/src/main.rs"],
-                    "thread_id": thread_id
-                })
-            );
+            let mut body = serde_json::json!({
+                "text": "Summarize the selected file.",
+                "files": ["/work/repo/src/main.rs"],
+                "thread_id": thread_id
+            });
+            // A run without a level sends the body the fixture holds.
+            if let Some(level) = thinking_level {
+                body["thinking_level"] = level.into();
+            }
+            assert_eq!(request["body"], body);
             assert_ne!(request_id, key);
             assert!(keys.insert(key));
             server
@@ -1055,7 +1060,7 @@ fn desktop_run_submit_matches_the_fixture_and_validates_the_result() {
     let files = ["/work/repo/src/main.rs".to_owned()];
     let mut client = handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap();
     let accepted = client
-        .run_submit("Summarize the selected file.", &files, None)
+        .run_submit("Summarize the selected file.", &files, None, None)
         .unwrap();
     assert_eq!(accepted.attachments[0].display_name, "main.rs");
     client
@@ -1063,6 +1068,7 @@ fn desktop_run_submit_matches_the_fixture_and_validates_the_result() {
             "Summarize the selected file.",
             &files,
             Some("01900000-0000-7000-8000-000000000002"),
+            Some("high"),
         )
         .unwrap();
     worker.join().unwrap();
@@ -1094,7 +1100,12 @@ fn desktop_run_submit_rejects_invalid_results() {
         });
         let mut client = handshake_desktop_client_stream(client, "0.0.1", SHORT).unwrap();
         assert_eq!(
-            client.run_submit("prompt", &[], Some("01900000-0000-7000-8000-000000000002")),
+            client.run_submit(
+                "prompt",
+                &[],
+                Some("01900000-0000-7000-8000-000000000002"),
+                None
+            ),
             Err(ClientError::UnexpectedMessage)
         );
         worker.join().unwrap();

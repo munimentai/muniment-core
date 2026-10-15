@@ -1694,6 +1694,8 @@ pub(super) fn dispatch_request<S: ThreadListService>(
             text: String,
             files: Vec<String>,
             thread_id: Option<String>,
+            #[serde(default)]
+            thinking_level: Option<String>,
         }
         let body: Body = serde_json::from_value(request.body).map_err(|_| {
             ProtocolError::invalid_request_with_reason("The run request body is invalid.")
@@ -1714,6 +1716,12 @@ pub(super) fn dispatch_request<S: ThreadListService>(
             .is_some_and(|value| super::Id::new(value.clone()).is_err())
         {
             Some("The thread ID is invalid.")
+        } else if body
+            .thinking_level
+            .as_deref()
+            .is_some_and(|level| crate::engine::thinking_level(level).is_none())
+        {
+            Some("Choose a thinking level the model offers.")
         } else {
             None
         };
@@ -1732,6 +1740,7 @@ pub(super) fn dispatch_request<S: ThreadListService>(
                 text: body.text,
                 files: body.files,
                 thread_id: body.thread_id,
+                thinking_level: body.thinking_level,
             },
             &request.request_id,
             idempotency_key,

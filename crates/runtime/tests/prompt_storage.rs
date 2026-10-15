@@ -161,7 +161,7 @@ fn attach_submit_sends_without_a_default_keychain() {
     let boundaries = state.boundaries().with_pi_artifact(descriptor);
     let events = boundaries.subscribe_chat_events().unwrap();
     let accepted = boundaries
-        .submit_run("local", "Send this prompt".into(), Vec::new(), None)
+        .submit_run("local", "Send this prompt".into(), Vec::new(), None, None)
         .unwrap();
     assert!(!accepted.run_id.is_empty());
     assert_eq!(accepted.committed_seq, 1);

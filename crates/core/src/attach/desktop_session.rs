@@ -1218,6 +1218,14 @@ mod tests {
                 "The thread ID is invalid.",
             ),
             (
+                serde_json::json!({"text": "hello", "files": [], "thinking_level": "high"}),
+                "Conversation history is unavailable.",
+            ),
+            (
+                serde_json::json!({"text": "hello", "files": [], "thinking_level": "loud"}),
+                "Choose a thinking level the model offers.",
+            ),
+            (
                 serde_json::json!({"text": 0, "files": []}),
                 "The run request body is invalid.",
             ),

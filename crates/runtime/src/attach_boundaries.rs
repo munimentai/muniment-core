@@ -563,6 +563,7 @@ impl RunStartBoundaries for RuntimeAttachBoundaries {
                 Arc::clone(&memory_runtime),
                 launch.run_id.clone(),
                 launch.prompt,
+                launch.thinking_level,
                 launch.tokens.access_token,
                 launch.tokens.subject,
                 launch.grant,
@@ -651,6 +652,7 @@ impl RunAttachBoundaries for RuntimeAttachBoundaries {
         text: String,
         files: Vec<SelectedFile>,
         thread_id: Option<String>,
+        thinking_level: Option<String>,
     ) -> Result<AttachPromptAccepted, RunStartError> {
         let prompt = text.trim().to_owned();
         if prompt.is_empty() {
@@ -696,7 +698,7 @@ impl RunAttachBoundaries for RuntimeAttachBoundaries {
         let contexts = self.contexts.clone();
         let context_thread = accepted.thread_id.clone();
         std::thread::spawn(move || {
-            service::drive_prompt(launch);
+            service::drive_prompt(launch.with_thinking_level(thinking_level));
             contexts.invalidate(&context_thread);
         });
         Ok(AttachPromptAccepted {

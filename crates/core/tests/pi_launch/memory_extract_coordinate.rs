@@ -100,6 +100,7 @@ fn reply(
         Arc::clone(memory),
         run.clone(),
         PROMPT.into(),
+        None,
         String::new(),
         Some("owner".into()),
         ChatGrant::local(),

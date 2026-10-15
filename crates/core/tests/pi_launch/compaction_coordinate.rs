@@ -135,6 +135,7 @@ fn a_manual_compaction_runs_in_its_thread_and_the_usage_read_answers_its_estimat
         memory(&root),
         first.clone(),
         "Reply briefly.".into(),
+        None,
         String::new(),
         Some("owner".into()),
         ChatGrant::local(),

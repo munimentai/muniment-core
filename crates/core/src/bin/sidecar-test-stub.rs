@@ -64,6 +64,7 @@ fn main() {
         }
         Some("pi-chat-queue") => pi_chat_queue(),
         Some("pi-chat-capture") => pi_chat_capture(args.next().unwrap()),
+        Some("pi-thinking") => pi_thinking(args.next().unwrap(), args.next().unwrap()),
         Some("pi-chat-extension-ui") => pi_chat_extension_ui(args.next().unwrap()),
         Some("pi-chat-late-response") => pi_chat_late_response(args.next().unwrap()),
         Some("pi-session-deferred") => {
@@ -231,6 +232,9 @@ fn pi_resume(args: Vec<String>) {
         })
         .unwrap();
     let mut compacted = false;
+    // A reasoning stub model starts at medium and takes each level it is sent.
+    let reasoning = std::env::var_os("PI_RESUME_STUB_REASONING").is_some();
+    let mut thinking_level = if reasoning { "medium" } else { "off" }.to_owned();
     for line in io::stdin().lock().lines() {
         let request: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
         match request["type"].as_str().unwrap() {
@@ -240,10 +244,26 @@ fn pi_resume(args: Vec<String>) {
                     "type":"response", "command":"get_state", "success":true,
                     "id":request["id"], "data":{
                         "sessionFile":session_file,
-                        "model":{"provider":"stub","id":"stub-model","contextWindow":200000}
+                        "model":{"provider":"stub","id":"stub-model","contextWindow":200000,"reasoning":reasoning},
+                        "thinkingLevel":thinking_level
                     }
                 })
             ),
+            "set_thinking_level" => {
+                if let Ok(path) = std::env::var("PI_RESUME_STUB_REQUESTS") {
+                    let mut requests = fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .unwrap();
+                    writeln!(requests, "{request}").unwrap();
+                }
+                thinking_level = request["level"].as_str().unwrap().to_owned();
+                println!(
+                    "{}",
+                    serde_json::json!({"type":"response", "command":"set_thinking_level", "success":true, "id":request["id"]})
+                );
+            }
             "get_session_stats" => println!(
                 "{}",
                 serde_json::json!({
@@ -556,6 +576,39 @@ fn pi_chat_capture(output: String) {
                 "type":"response", "command":command, "success":true, "id":request["id"]
             })
         );
+        io::stdout().flush().unwrap();
+    }
+}
+
+/// Answers `get_state` with the model and level in `state`, and appends each
+/// `set_thinking_level` command to `output` before it takes the new level.
+fn pi_thinking(output: String, state: String) {
+    let state: serde_json::Value = serde_json::from_str(&state).unwrap();
+    let mut level = state["thinkingLevel"].clone();
+    for line in io::stdin().lock().lines() {
+        let line = line.unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let command = request["type"].as_str().unwrap();
+        let response = match command {
+            "get_state" => serde_json::json!({
+                "type":"response", "command":command, "success":true, "id":request["id"],
+                "data":{"model":state["model"], "thinkingLevel":level}
+            }),
+            "set_thinking_level" => {
+                let mut capture = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&output)
+                    .unwrap();
+                writeln!(capture, "{line}").unwrap();
+                level = request["level"].clone();
+                serde_json::json!({"type":"response", "command":command, "success":true, "id":request["id"]})
+            }
+            _ => serde_json::json!({
+                "type":"response", "command":command, "success":false, "id":request["id"]
+            }),
+        };
+        println!("{response}");
         io::stdout().flush().unwrap();
     }
 }

@@ -131,6 +131,7 @@ fn terminal_gateway_denials_fail_the_run_without_a_receipt_or_secret_journal_ent
             )),
             run_id.clone(),
             "Reply briefly.".into(),
+            None,
             "native-secret".into(),
             Some("owner".into()),
             ChatGrant {

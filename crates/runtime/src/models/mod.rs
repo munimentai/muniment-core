@@ -222,6 +222,15 @@ impl ModelService {
                     data.hidden,
                 ))
             }
+            ModelAction::SetThinkingLevel => {
+                let data: ThinkingLevel = parse(data)?;
+                answer(providers::set_thinking_level(
+                    agent,
+                    &data.provider,
+                    &data.model,
+                    data.level.as_deref(),
+                ))
+            }
             ModelAction::DisconnectProvider => {
                 let data: Provider = parse(data)?;
                 answer(providers::disconnect_provider(agent, &data.provider))
@@ -518,6 +527,15 @@ struct HiddenModel {
     provider: String,
     model: String,
     hidden: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThinkingLevel {
+    provider: String,
+    model: String,
+    #[serde(default)]
+    level: Option<String>,
 }
 
 #[derive(Deserialize)]

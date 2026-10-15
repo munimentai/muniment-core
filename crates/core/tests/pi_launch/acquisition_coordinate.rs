@@ -230,6 +230,7 @@ fn coordinate_acquires_from_the_profile_once_without_an_environment_root() {
                 )),
                 run_id.clone(),
                 "Reply briefly.".into(),
+                None,
                 String::new(),
                 None,
                 ChatGrant::local(),

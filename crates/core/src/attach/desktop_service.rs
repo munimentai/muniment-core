@@ -1245,6 +1245,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
                         workspace: Some(workspace.to_owned()),
                         provenance: Some(provenance),
                         thread_id: request.thread_id,
+                        thinking_level: None,
                     },
                 )
                 .map_err(|error| error.protocol_error())?;
@@ -1405,12 +1406,15 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         idempotency_key: &Id,
         companion: CompanionProvenance,
     ) -> Result<RunSubmitAccepted, ProtocolError> {
-        let canonical_input = json!({
+        let mut canonical_input = json!({
             "workspace": workspace,
             "text": &request.text,
             "files": &request.files,
             "thread_id": &request.thread_id,
         });
+        if let Some(level) = &request.thinking_level {
+            canonical_input["thinking_level"] = json!(level);
+        }
         let ledger_request = AttachRequest {
             protocol: Protocol,
             request_id: request_id.clone(),
@@ -1439,6 +1443,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
                             })
                             .collect(),
                         request.thread_id,
+                        request.thinking_level,
                     )
                     .map_err(|error| error.desktop_protocol_error())?;
                 Ok(CommittedResult {
@@ -2158,6 +2163,7 @@ mod tests {
             _text: String,
             files: Vec<SelectedFile>,
             thread_id: Option<String>,
+            _thinking_level: Option<String>,
         ) -> Result<crate::run_start::AttachPromptAccepted, RunStartError> {
             self.submit_calls.fetch_add(1, Ordering::SeqCst);
             Ok(crate::run_start::AttachPromptAccepted {
@@ -2829,6 +2835,7 @@ mod tests {
             text: "hello".into(),
             files: vec!["main.rs".into()],
             thread_id: None,
+            thinking_level: None,
         };
 
         let first = service
@@ -2856,20 +2863,23 @@ mod tests {
         assert_eq!(replay.accepted_at, first.accepted_at);
         assert_eq!(service.boundaries.submit_calls.load(Ordering::SeqCst), 1);
 
-        let conflict = service
-            .submit_run(
-                "workspace-a",
-                RunSubmitRequest {
-                    text: "changed".into(),
-                    files: vec!["main.rs".into()],
-                    thread_id: None,
-                },
-                &request_id,
-                &key,
-                test_companion_provenance(),
-            )
-            .unwrap_err();
-        assert_eq!(conflict.code(), ErrorCode::IdempotencyConflict);
+        for (text, thinking_level) in [("changed", None), ("hello", Some("high".to_owned()))] {
+            let conflict = service
+                .submit_run(
+                    "workspace-a",
+                    RunSubmitRequest {
+                        text: text.into(),
+                        files: vec!["main.rs".into()],
+                        thread_id: None,
+                        thinking_level,
+                    },
+                    &request_id,
+                    &key,
+                    test_companion_provenance(),
+                )
+                .unwrap_err();
+            assert_eq!(conflict.code(), ErrorCode::IdempotencyConflict);
+        }
         assert_eq!(service.boundaries.submit_calls.load(Ordering::SeqCst), 1);
     }
 

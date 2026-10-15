@@ -257,6 +257,7 @@ mod stdin_deadline {
             )),
             RUN_ID.into(),
             "x".repeat(128 * 1024),
+            None,
             String::new(),
             None,
             ChatGrant::local(),

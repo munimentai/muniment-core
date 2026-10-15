@@ -1,5 +1,6 @@
 //! The engine adapter for the Pi coding agent in RPC mode.
 
+use crate::runtime_eprintln as eprintln;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -8,8 +9,9 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Map, Value};
 
 use super::{
-    AgentEngine, CompactionSettings, Configuration, ContextUsage, EngineEvent, OpenError, Opened,
-    Submission,
+    clamp_thinking_level, startup_thinking_level, supported_thinking_levels, AgentEngine,
+    CompactionSettings, Configuration, ContextUsage, EngineEvent, OpenError, Opened, Submission,
+    Thinking,
 };
 use crate::active_run::ChatDelivery;
 use crate::pi_execution::{PiRuntime, RPC_TIMEOUT};
@@ -164,6 +166,64 @@ impl PiRpcEngine {
         })
     }
 
+    /// Sends Pi the level a turn runs at, only when it differs from the
+    /// level the conversation runs at now. Each read and command waits until
+    /// `deadline` at most.
+    fn apply_thinking(
+        &self,
+        transport: &PiRpcTransport,
+        thinking: Thinking<'_>,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let wait = || READ_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()));
+        let state = read_within(transport, "get_state", wait())?;
+        let current = state.get("thinkingLevel").and_then(Value::as_str);
+        let Some(level) = self.thinking_level_for(&state, thinking)? else {
+            return Ok(());
+        };
+        if current == Some(level) {
+            return Ok(());
+        }
+        let response = transport.call(
+            json!({"type": "set_thinking_level", "level": level}),
+            wait(),
+        )?;
+        require_success(&response, "set_thinking_level")
+    }
+
+    /// The level the active model in a `get_state` answer runs a turn at:
+    /// the choice, or the level Pi starts the model at, clamped to the levels
+    /// the model supports. A state with no model, or a model without
+    /// reasoning, answers none, because Pi runs it without thinking.
+    fn thinking_level_for(
+        &self,
+        state: &Value,
+        thinking: Thinking<'_>,
+    ) -> Result<Option<&'static str>, String> {
+        let Some(model) = state.get("model").filter(|model| model.is_object()) else {
+            return Ok(None);
+        };
+        if model.get("reasoning").and_then(Value::as_bool) != Some(true) {
+            return Ok(None);
+        }
+        let available = supported_thinking_levels(model);
+        let level = match thinking {
+            Thinking::Level(level) => clamp_thinking_level(level, &available),
+            Thinking::Default => {
+                let settings = self.read_settings()?;
+                let provider = model.get("provider").and_then(Value::as_str);
+                let id = model.get("id").and_then(Value::as_str);
+                let wanted = provider
+                    .zip(id)
+                    .map_or(super::DEFAULT_THINKING_LEVEL, |(provider, id)| {
+                        startup_thinking_level(&settings, provider, id)
+                    });
+                clamp_thinking_level(wanted, &available)
+            }
+        };
+        Ok(Some(level))
+    }
+
     /// Answers whether the model's window is a known value. A model that
     /// `models.json` defines without a `contextWindow` runs on Pi's default
     /// window. Any other model is in Pi's built-in catalog.
@@ -234,7 +294,17 @@ fn compaction_settings_for(
 
 /// Sends one Pi command and answers its `data` when Pi reports success.
 fn read(transport: &PiRpcTransport, command: &str) -> Result<Value, String> {
-    let response = transport.call(json!({"type": command}), READ_TIMEOUT)?;
+    read_within(transport, command, READ_TIMEOUT)
+}
+
+/// Sends one Pi command, waits `timeout` at most, and answers its `data`
+/// when Pi reports success.
+fn read_within(
+    transport: &PiRpcTransport,
+    command: &str,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let response = transport.call(json!({"type": command}), timeout)?;
     if response.get("type").and_then(Value::as_str) != Some("response")
         || response.get("command").and_then(Value::as_str) != Some(command)
         || response.get("success").and_then(Value::as_bool) != Some(true)
@@ -303,12 +373,22 @@ impl AgentEngine for PiRpcEngine {
         submission: Submission<'_>,
         intercept: &mut dyn FnMut(&PiRunAdapter, &EngineEvent) -> bool,
     ) -> Result<PiRunAdapter, String> {
-        PiRunAdapter::start_with_images_and_handler(
+        let thinking = submission.thinking;
+        PiRunAdapter::start_prepared(
             run_id,
             conversation,
             submission.message,
             submission.images,
             RPC_TIMEOUT,
+            |transport, deadline| {
+                let Some(thinking) = thinking else {
+                    return;
+                };
+                // A level Pi does not take leaves the turn at the level it runs at now.
+                if let Err(error) = self.apply_thinking(transport, thinking, deadline) {
+                    eprintln!("muniment-runtime: run_id={run_id} thinking_level error={error:?}");
+                }
+            },
             |turn, event| intercept(turn, event),
         )
         .map(|(turn, _)| turn)
@@ -421,6 +501,9 @@ impl AgentEngine for PiRpcEngine {
                 READ_TIMEOUT,
             )?;
             require_success(&response, "set_auto_compaction")?;
+        }
+        if let Some(thinking) = configuration.thinking {
+            self.apply_thinking(conversation, thinking, Instant::now() + READ_TIMEOUT)?;
         }
         Ok(())
     }

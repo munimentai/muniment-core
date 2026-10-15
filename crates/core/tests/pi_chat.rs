@@ -948,3 +948,97 @@ fn router_progress_notifications_are_typed_and_ignore_other_messages() {
         );
     }
 }
+
+fn thinking_supervisor(
+    capture: &std::path::Path,
+    state: serde_json::Value,
+) -> (SidecarSupervisor, PiRpcWiring) {
+    let mut config = SidecarConfig::new(env!("CARGO_BIN_EXE_sidecar-test-stub"));
+    config.args = vec![
+        "pi-thinking".into(),
+        capture.to_string_lossy().into_owned(),
+        state.to_string(),
+    ];
+    config.health_interval = Duration::from_secs(60);
+    let wiring = PiRpcWiring::new();
+    let supervisor =
+        SidecarSupervisor::spawn(config, wiring.readiness_probe(Duration::from_millis(100)))
+            .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while supervisor.status() != SidecarStatus::Healthy && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(supervisor.status(), SidecarStatus::Healthy);
+    (supervisor, wiring)
+}
+
+fn sent_levels(capture: &std::path::Path) -> Vec<String> {
+    fs::read_to_string(capture)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| {
+            let command: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(command["type"], "set_thinking_level");
+            command["level"].as_str().unwrap().to_owned()
+        })
+        .collect()
+}
+
+#[test]
+fn the_engine_sends_a_clamped_thinking_level_only_when_it_changes() {
+    use muniment_core::engine::{AgentEngine, Configuration, PiRpcEngine, Thinking};
+    let temp = TempDir::new();
+    let agent = temp.path().join("agent");
+    fs::create_dir_all(&agent).unwrap();
+    fs::write(
+        agent.join("settings.json"),
+        r#"{"modelThinkingLevels":{"openai/gpt":"low"}}"#,
+    )
+    .unwrap();
+    let engine = PiRpcEngine::new(None).with_agent_directory(&agent);
+    let configure = |transport, thinking| {
+        engine
+            .configure(
+                transport,
+                &Configuration {
+                    thinking: Some(thinking),
+                    ..Configuration::default()
+                },
+            )
+            .unwrap()
+    };
+
+    let capture = temp.path().join("reasoning.jsonl");
+    let (mut supervisor, wiring) = thinking_supervisor(
+        &capture,
+        json!({
+            "model": {"provider": "openai", "id": "gpt", "reasoning": true,
+                      "thinkingLevelMap": {"minimal": null, "xhigh": "xhigh"}},
+            "thinkingLevel": "medium"
+        }),
+    );
+    let transport = wiring.transport().unwrap();
+    // The model has no max level, so the request clamps down to xhigh.
+    configure(&transport, Thinking::Level("max"));
+    // Pi already runs xhigh, so nothing is sent.
+    configure(&transport, Thinking::Level("xhigh"));
+    // No level restores the model's saved startup level.
+    configure(&transport, Thinking::Default);
+    configure(&transport, Thinking::Default);
+    // The model has no minimal level, so the request clamps up to low.
+    configure(&transport, Thinking::Level("minimal"));
+    assert_eq!(sent_levels(&capture), ["xhigh", "low"]);
+    supervisor.shutdown().unwrap();
+
+    let capture = temp.path().join("plain.jsonl");
+    let (mut supervisor, wiring) = thinking_supervisor(
+        &capture,
+        json!({"model": {"provider": "ollama", "id": "small"}}),
+    );
+    let transport = wiring.transport().unwrap();
+    // A model without reasoning runs without thinking, so Pi hears nothing.
+    configure(&transport, Thinking::Level("high"));
+    configure(&transport, Thinking::Default);
+    assert!(sent_levels(&capture).is_empty());
+    supervisor.shutdown().unwrap();
+}

@@ -56,6 +56,8 @@ pub struct PromptLaunch {
     run_id: String,
     thread_id: String,
     prompt: String,
+    /// The thinking level the prompt asks for. None runs the model at its default.
+    thinking_level: Option<String>,
     access_token: String,
     subject: Option<String>,
     grant: ChatGrant,
@@ -374,6 +376,7 @@ fn accept_run(
         run_id,
         thread_id,
         prompt,
+        thinking_level: None,
         access_token,
         subject,
         grant,
@@ -388,6 +391,14 @@ fn accept_run(
         compaction,
     };
     Ok((acceptance, launch))
+}
+
+impl PromptLaunch {
+    /// Runs the prompt at a thinking level. None runs the model at its default.
+    pub fn with_thinking_level(mut self, thinking_level: Option<String>) -> Self {
+        self.thinking_level = thinking_level;
+        self
+    }
 }
 
 /// Drives an accepted prompt to completion.
@@ -408,6 +419,7 @@ pub fn drive_prompt(launch: PromptLaunch) {
         launch.memory_runtime.clone(),
         launch.run_id.clone(),
         launch.prompt,
+        launch.thinking_level,
         launch.access_token,
         launch.subject,
         launch.grant,

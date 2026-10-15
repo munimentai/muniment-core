@@ -22,6 +22,8 @@ pub struct RunSubmitRequest {
     pub text: String,
     pub files: Vec<String>,
     pub thread_id: Option<String>,
+    /// The thinking level the run asks for. None runs the model at its default.
+    pub thinking_level: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
