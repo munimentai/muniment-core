@@ -1,5 +1,5 @@
 //! Typed access to `pins/pins.toml`: the Pi release, its extension packages,
-//! and the Claude Code CLI version that the desktop and the factory share.
+//! and the Claude Code CLI version that the desktop and headless hosts share.
 //!
 //! The build script compiles the file into constants, so every value is
 //! available in const contexts and a malformed file fails the build.

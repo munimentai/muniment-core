@@ -21,7 +21,7 @@ pub const CLAUDE_CODE_NPM: &str = "@anthropic-ai/claude-code";
 /// The package manifest name the lockfile is resolved from. The runtime install uses the same name.
 pub const MANIFEST_NAME: &str = "muniment-pi-packages";
 
-const HEADER: &str = "# Pinned runtime dependencies shared by the desktop and the factory.\n\
+const HEADER: &str = "# Pinned runtime dependencies shared by the desktop and headless hosts.\n\
 # The muniment-pins crate compiles this file into typed constants.\n";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
