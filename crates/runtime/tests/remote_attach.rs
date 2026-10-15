@@ -67,6 +67,19 @@ fn a_paired_device_reads_the_runtime_and_the_owner_route_shares_remote_access() 
         .request(Operation::ThreadList, None, json!({"limit": 10}))
         .unwrap();
     assert!(page.body["threads"].is_array());
+    // A headless runtime runs in local mode and answers its threads without
+    // a sign-in, as `muniment-server` sets up.
+    std::fs::write(
+        temporary
+            .config
+            .join(muniment_core::local_mode::LOCAL_MODE_MARKER),
+        "1",
+    )
+    .unwrap();
+    let summaries = client
+        .request(Operation::ThreadSummaries, None, json!({"limit": 10}))
+        .unwrap();
+    assert!(summaries.body["summaries"].is_array());
     assert!(client.list_remote_devices().is_err());
     assert_eq!(
         client.last_request_error().map(|error| error.code()),

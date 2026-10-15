@@ -116,6 +116,12 @@ fn serve() -> Result<(), String> {
             let _ = stop.send(());
         }
     });
+    // A headless runtime has no account anyone signs in to, so it serves its
+    // threads and runs in local mode.
+    let marker = state.join(muniment_core::local_mode::LOCAL_MODE_MARKER);
+    if !marker.is_file() {
+        std::fs::write(&marker, "1").map_err(|error| format!("local mode marker: {error}"))?;
+    }
     let directories = RuntimeDirectories {
         profile: state.clone(),
         config: state.clone(),
