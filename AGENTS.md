@@ -4,17 +4,16 @@
 
 - The Muniment desktop (`munimentai/muniment`), a Tauri app. It depends on tagged
   releases of this repository through a git dependency.
-- The AI software factory, a headless Python service. It runs the router and
-  reads `pins/pins.toml` from a tagged release.
+- Headless hosts that run the router server (`muniment-router serve`) and
+  read `pins/pins.toml` from a tagged release.
 
 `README.md` describes each crate. `docs/` holds technical documentation about
 the core, such as `docs/core-boundary.md`, which the boundary check reads.
 Decision records are not kept in this repository.
 
-Forgejo `factory/muniment-core` is the record: code, issues, pull requests and
-Actions CI in `.forgejo/workflows/`. It push-mirrors to the public GitHub
-`munimentai/muniment-core`, which hosts the releases. Only the mirror pushes code to
-GitHub, and no work goes to GitHub issues.
+CI runs the workflows in `.forgejo/workflows/`. The public GitHub repository
+`munimentai/muniment-core` is a read-only mirror that hosts the releases. Do not
+push code or open issues there.
 
 ## Boundary
 

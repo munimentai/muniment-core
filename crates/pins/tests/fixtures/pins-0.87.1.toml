@@ -1,4 +1,4 @@
-# Pinned runtime dependencies shared by the desktop and the factory.
+# Pinned runtime dependencies shared by the desktop and headless hosts.
 # The muniment-pins crate compiles this file into typed constants.
 
 [pi]

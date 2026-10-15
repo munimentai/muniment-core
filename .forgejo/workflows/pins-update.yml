@@ -1,7 +1,7 @@
 name: Pins update
 
 # Bumps the pins that pass the compatibility suite, checks the bumped tree on
-# Linux and on a pve01 macOS VM, then pushes the bump to main and tags the
+# Linux and on a desktop-ci macOS VM, then pushes the bump to main and tags the
 # release itself. Pushes made with the job token start no other workflow, so
 # this workflow runs every check that CI and the release would run. Blocked
 # pins get Forgejo issues. A dry run runs every check and stops before the
@@ -30,9 +30,8 @@ env:
 
 jobs:
   update:
-    # `homelab` keeps the job off the .106 image-smoke runner, which also
-    # carries `self-hosted`.
-    runs-on: [self-hosted, homelab]
+    # CI_LINUX_RUNNER keeps the job off the image-smoke runner.
+    runs-on: ${{ vars.CI_LINUX_RUNNER }}
     timeout-minutes: 360
     # It shares the release job's group, so tags stay in order.
     concurrency:
@@ -41,21 +40,26 @@ jobs:
     steps:
       # A branch workflow can ask for any secret, so the first step admits
       # only main of this repository before a later step reads one.
-      - name: Admit only main of factory/muniment-core
+      - name: Admit only main of the release repository
         env:
           REPOSITORY: ${{ github.repository }}
           EVENT: ${{ github.event_name }}
           REF: ${{ github.ref }}
           ACTOR: ${{ github.actor }}
+          RELEASE_REPOSITORY: ${{ vars.CI_REPOSITORY }}
+          RELEASE_ACTORS: ${{ vars.CI_RELEASE_ACTORS }}
         run: |
-          case "$REPOSITORY|$REF|$EVENT|$ACTOR" in
-            "factory/muniment-core|refs/heads/main|schedule|"*) ;;
-            "factory/muniment-core|refs/heads/main|workflow_dispatch|mikeydiamonds") ;;
-            *)
-              echo '::error::The pins update runs only on schedule or from an owner dispatch of main in factory/muniment-core.' >&2
-              exit 1
-              ;;
-          esac
+          admitted=false
+          if [ -n "$RELEASE_REPOSITORY" ] && [ "$REPOSITORY" = "$RELEASE_REPOSITORY" ] && [ "$REF" = refs/heads/main ]; then
+            case "$EVENT" in
+              schedule) admitted=true ;;
+              workflow_dispatch) if [ -n "$ACTOR" ] && [[ " $RELEASE_ACTORS " == *" $ACTOR "* ]]; then admitted=true; fi ;;
+            esac
+          fi
+          if [ "$admitted" != true ]; then
+            echo '::error::The pins update runs only on schedule or from a CI_RELEASE_ACTORS dispatch of main in the CI_REPOSITORY repository.' >&2
+            exit 1
+          fi
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -104,6 +108,7 @@ jobs:
           REPO_TOKEN: ${{ github.token }}
           SERVER_URL: ${{ github.server_url }}
           REPOSITORY: ${{ github.repository }}
+          DESKTOP_CI_HOST: ${{ vars.DESKTOP_CI_HOST }}
           DESKTOP_CI_KNOWN_HOSTS: ${{ vars.DESKTOP_CI_KNOWN_HOSTS }}
           BUILD_TIMEOUT: "7200"
         run: |

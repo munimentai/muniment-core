@@ -3,7 +3,7 @@ name = "muniment-router"
 version = "0.0.1"
 edition = "2021"
 
-# The multi-account model router shared by the desktop and the factory. It
+# The multi-account model router shared by the desktop and headless hosts. It
 # depends on no other Muniment crate except the models, the pins and the atomic
 # file helper, so a headless host can embed it without the desktop runtime.
 

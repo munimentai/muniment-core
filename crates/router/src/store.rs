@@ -1,7 +1,7 @@
 //! Where the router keeps its state, and where it reads account secrets.
 //!
 //! A [`RouterStore`] holds the accounts, the usage ledger, the quota
-//! snapshots, the policy sessions, and the factory's run records and
+//! snapshots, the policy sessions, and the server's run records and
 //! outcomes. A [`SecretSource`] holds each account's credential. The desktop
 //! keeps both in the agent directory, in the files the router has always
 //! written: [`FileStore`] and [`FileSecrets`]. A server host keeps account
@@ -21,7 +21,7 @@ use super::quota::{self, Quota, QuotaStore};
 use super::usage::{self, Ledger};
 use super::wire::Tokens;
 
-/// One factory run: what its token is bound to, and what it has spent.
+/// One server run: what its token is bound to, and what it has spent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunRecord {
     pub run_id: String,

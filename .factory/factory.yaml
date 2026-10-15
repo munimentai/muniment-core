@@ -75,7 +75,7 @@ gates:
   ci:
     provider: forgejo
     # Empty: every reported check counts. The macOS and Windows jobs wait for
-    # a pve01 desktop-ci VM slot, which the desktop shares.
+    # a desktop-ci VM slot, which the desktop shares.
     required: []
     timeout_s: 14400
 
