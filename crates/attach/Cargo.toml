@@ -20,3 +20,8 @@ serde_json = "1"
 sha2 = "0.10"
 url = "2"
 uuid = "1"
+
+# Pairs with or reconnects to a runtime over the remote route, for smoke tests.
+[[example]]
+name = "remote-smoke"
+required-features = ["client"]

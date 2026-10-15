@@ -137,6 +137,42 @@ listener is off until the host binds it.
   to `RemoteAccess::update_requests`. The host's updater applies it.
 - The client side is `pair_with_link`, `connect_remote_runtime` and
   `RemoteRuntimeRecord`, which saves the credential to an owner-only file.
+  `cargo run -p muniment-attach --features client --example remote-smoke --
+  <link-or-record> [--record <path>]` pairs or reconnects once and prints the
+  runtime's info and its thread count.
+
+`RuntimeAttachState::start_remote_route` opens remote access and serves the
+remote route as `<state root>/remote/settings.json` directs:
+`{"version":1,"enabled":false,"listen":null,"endpoints":[]}` by default. A
+null `listen` binds port 7443 on every interface. Empty `endpoints` let the
+runtime list its own non-loopback interface addresses with the bound port,
+IPv4 first, at most eight. Each listed endpoint carries a `kind`:
+`configured`, `loopback`, `lan` (RFC 1918 or IPv6 unique local), `overlay`
+(100.64.0.0/10 and fd7a:115c:a1e0::/48, which private overlay networks
+assign) or `public`. Windows lists no interfaces, so a link there names
+configured endpoints. A save starts, stops or rebinds the listener without a
+restart. The serving listener publishes its address and endpoints in
+`<state root>/remote/listener.json` for commands in other processes.
+
+The local owner route, and never the remote route or a companion, also
+answers:
+
+- `remote.settings` with `{}`: `{"settings": {"enabled", "listen",
+  "endpoints"}, "overridden", "runtime_id", "runtime_name",
+  "certificate_sha256", "listening", "endpoints": [{"endpoint", "kind"}],
+  "error"}`. `listening` is the bound address or null, and `error` says why
+  the listener is not serving.
+- `remote.settings_save` with `{"enabled": true, "listen": "0.0.0.0:7443" or
+  null, "endpoints": ["host:port"]}`, answered like `remote.settings`.
+- `remote.pairing_create`, `remote.device_list`, `remote.device_revoke`,
+  `runtime.info` and `runtime.update`, as a `runtime.admin` device sends them.
+
+A local desktop session's welcome carries the same `runtime_id`,
+`runtime_name`, `runtime_version` and `install_kind` once the host opened
+remote access. Its chat-event subscription (`run.chat_events`) also carries
+`runtime.update_requested` events with the body `{"version",
+"requested_at", "requested_by"}`, so the desktop runs its updater. A remote
+device never receives them.
 
 ## Router server
 
@@ -227,14 +263,56 @@ upper-cased, with each character other than an ASCII letter or digit written
 as `_`. The reader's `ai.muniment.reader` secret `stripe` is
 `MUNIMENT_SECRET_AI_MUNIMENT_READER_STRIPE`.
 
+`serve` starts the remote route. These variables override the stored remote
+access settings without changing them: `MUNIMENT_REMOTE_ACCESS` (`on` or
+`off`), `MUNIMENT_REMOTE_LISTEN` (an IP address and port, such as
+`0.0.0.0:7443`) and `MUNIMENT_REMOTE_ENDPOINTS` (a comma list of `host:port`
+the links name). `install_kind` is `server`, or `container` when
+`MUNIMENT_INSTALL_KIND=container`. At start `serve` logs the runtime id, the
+certificate fingerprint and the listen address.
+
+These commands work on the state directory while `serve` runs in another
+process, such as over SSH or `docker exec`:
+
+- `muniment-server pair [--scopes thread.read,run.write] [--json]` prints a
+  one-time pairing link that names the endpoints the serving listener
+  published. `--json` prints `{"link", "expires_at", "scopes", "endpoints",
+  "fingerprint", "runtime_id", "runtime_name"}`.
+- `muniment-server devices [--json]` lists the paired devices.
+- `muniment-server revoke <device-id>` revokes one. Its live sessions close
+  within a second.
+- `muniment-server info [--json]` prints the runtime id, name, version,
+  install kind, certificate fingerprint, remote access state and any update
+  request.
+
 `deploy/runtime/Containerfile` builds a non-root image with the server, the
 pinned Pi for the image's architecture and the pinned packages. State lives in
-the `/data` volume, and the health check runs `muniment-server health`:
+the `/data` volume, and the health check runs `muniment-server health`. The
+image sets `MUNIMENT_INSTALL_KIND=container` and `MUNIMENT_REMOTE_ACCESS=on`
+and exposes port 7443. Set `MUNIMENT_REMOTE_ENDPOINTS` to the address clients
+reach:
 
 ```sh
 docker build -f deploy/runtime/Containerfile -t muniment-runtime .
-docker run -d --name muniment -v muniment-data:/data muniment-runtime
+docker run -d --name muniment -p 7443:7443 \
+  -e MUNIMENT_REMOTE_ENDPOINTS=runtime.example.net:7443 \
+  -v muniment-data:/data muniment-runtime
+docker exec muniment muniment-server pair
 ```
+
+A `runtime.update` request writes `/data/remote/runtime-update.json`
+(`<state root>/remote/runtime-update.json` outside the image), owner-only:
+
+```json
+{"version":"0.2.0","requested_at":"2026-01-01T00:00:00Z","requested_by":"<device id or local>"}
+```
+
+`version` starts with a digit and holds letters, digits, `.`, `-` and `+`.
+A container host's updater reads the file, pulls that version's image,
+recreates the container on the same volume and deletes the file.
+`deploy/runtime/smoke.sh <image>` builds the `remote-smoke` target of the
+same file, pairs it with the runtime, reconnects across a restart and checks
+that a revoked device is refused.
 
 ## Development
 

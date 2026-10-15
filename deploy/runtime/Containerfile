@@ -13,6 +13,16 @@
 #
 # Secrets live in /data/credentials. A MUNIMENT_SECRET_<SERVICE>_<NAME>
 # variable overrides one.
+#
+# Remote access is on: the runtime serves the remote attach route over TLS on
+# port 7443. MUNIMENT_REMOTE_ENDPOINTS names the host:port clients reach,
+# since the container's own addresses are rarely reachable from them:
+#
+#   docker run -d -p 7443:7443 -e MUNIMENT_REMOTE_ENDPOINTS=runtime.example.net:7443 \
+#       -v muniment-data:/data muniment-runtime
+#   docker exec <container> muniment-server pair
+#
+# The remote-smoke target builds the client deploy/runtime/smoke.sh pairs with.
 
 ARG RUST_IMAGE=rust:1-slim-bookworm
 ARG RUNTIME_IMAGE=debian:bookworm-slim
@@ -32,6 +42,13 @@ RUN MUNIMENT_STATE_DIR=/data MUNIMENT_PI_ROOT=/opt/muniment/harness HOME=/data \
     && ln -s "$(cat /opt/muniment/pi-path)" /opt/muniment/bin/pi \
     && rm -rf /opt/muniment/pi-path /data/.bun \
     && /opt/muniment/bin/pi --version
+
+FROM build AS remote-smoke-build
+RUN cargo build --release --locked -p muniment-attach --features client --example remote-smoke
+
+FROM ${RUNTIME_IMAGE} AS remote-smoke
+COPY --from=remote-smoke-build /src/target/release/examples/remote-smoke /usr/local/bin/remote-smoke
+ENTRYPOINT ["/usr/local/bin/remote-smoke"]
 
 FROM ${RUNTIME_IMAGE}
 # Pi's tools run shell commands, git and curl. tini reaps the processes they
@@ -54,8 +71,11 @@ RUN ln -s /opt/muniment/bin/muniment-server /usr/local/bin/muniment-server \
 USER 65532:65532
 ENV HOME=/data \
     MUNIMENT_STATE_DIR=/data \
-    MUNIMENT_PI_ROOT=/opt/muniment/harness
+    MUNIMENT_PI_ROOT=/opt/muniment/harness \
+    MUNIMENT_INSTALL_KIND=container \
+    MUNIMENT_REMOTE_ACCESS=on
 VOLUME ["/data"]
+EXPOSE 7443
 STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD ["/usr/local/bin/muniment-server", "health"]
