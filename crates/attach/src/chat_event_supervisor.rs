@@ -16,17 +16,20 @@ pub fn serve_chat_events_with<S>(
 ) where
     S: ChatEventSupervisorStop,
 {
+    // Each reconnect resumes after the newest chat event already delivered.
+    let mut cursor = None;
     loop {
         if stop.stopped() {
             return;
         }
 
         if let Some(mut client) = connect() {
-            if client.subscribe_chat_events().is_ok() {
+            if client.subscribe_chat_events_after(cursor).is_ok() {
                 observe(true);
                 while let Ok(event) = client.read_subscription_event() {
                     deliver(event);
                 }
+                cursor = client.chat_cursor().or(cursor);
                 observe(false);
             }
         }
@@ -56,6 +59,7 @@ mod tests {
         reads: VecDeque<u8>,
         events: Vec<Value>,
         writes: usize,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
     }
 
     impl FixtureStream {
@@ -64,6 +68,7 @@ mod tests {
                 reads: VecDeque::new(),
                 events,
                 writes: 0,
+                requests: Default::default(),
             }
         }
 
@@ -99,6 +104,7 @@ mod tests {
                 2 => {
                     let length = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
                     let request: Value = serde_json::from_slice(&bytes[4..4 + length]).unwrap();
+                    self.requests.lock().unwrap().push(request["body"].clone());
                     self.queue(&Response {
                         protocol: Protocol,
                         request_id: Id::new(request["request_id"].as_str().unwrap()).unwrap(),
@@ -138,12 +144,16 @@ mod tests {
     }
 
     fn client(events: Vec<Value>) -> crate::DesktopClient {
-        handshake_desktop_client(
-            Box::new(FixtureStream::new(events)),
-            "0.0.1",
-            Duration::from_secs(1),
-        )
-        .unwrap()
+        recorded_client(events, Default::default())
+    }
+
+    fn recorded_client(
+        events: Vec<Value>,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    ) -> crate::DesktopClient {
+        let mut stream = FixtureStream::new(events);
+        stream.requests = requests;
+        handshake_desktop_client(Box::new(stream), "0.0.1", Duration::from_secs(1)).unwrap()
     }
 
     struct StopAfterRetries {
@@ -228,6 +238,34 @@ mod tests {
             ]
         );
         assert!(clients.is_empty());
+    }
+
+    #[test]
+    fn a_reconnect_resumes_after_the_newest_delivered_event() {
+        let stop = StopAfterRetries::new(3);
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut clients = VecDeque::from([
+            recorded_client(vec![json!({"seq": 7}), json!({"seq": 9})], requests.clone()),
+            recorded_client(vec![json!({"text": "no position"})], requests.clone()),
+            recorded_client(Vec::new(), requests.clone()),
+        ]);
+
+        serve_chat_events_with(
+            || clients.pop_front(),
+            &stop,
+            Duration::ZERO,
+            |_| {},
+            |_| {},
+        );
+
+        assert_eq!(
+            *requests.lock().unwrap(),
+            [
+                json!({"snapshot_chunks": true}),
+                json!({"cursor": 9, "snapshot_chunks": true}),
+                json!({"cursor": 9, "snapshot_chunks": true}),
+            ]
+        );
     }
 
     #[test]

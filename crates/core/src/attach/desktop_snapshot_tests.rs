@@ -141,6 +141,27 @@ impl ThreadListService for Service {
             .map(crate::run_events::ChatEventSubscription::detached)
             .ok_or_else(ProtocolError::invalid_request)
     }
+    /// Holds the stream after position 7 alone.
+    fn subscribe_chat_events_after(
+        &mut self,
+        cursor: Option<u64>,
+    ) -> Result<crate::run_events::ChatEventSubscription, ProtocolError> {
+        if cursor.is_some_and(|cursor| cursor != 7) {
+            return Err(ProtocolError::invalid_cursor());
+        }
+        self.subscribe_chat_events()
+    }
+    fn run_detail(
+        &mut self,
+        request: super::super::desktop_service_message::RunDetailRequest,
+    ) -> Result<Value, ProtocolError> {
+        Ok(json!({
+            "kind": request.kind,
+            "text": format!("{} {}", request.run_id, request.effect_id),
+            "bytes": 3,
+            "truncated": false,
+        }))
+    }
     fn models_request(
         &mut self,
         request: ModelRequest,
@@ -376,6 +397,7 @@ fn chat_snapshot_frames_keep_every_tool_and_the_terminal_phase() {
         applied_diffs: vec![],
         pending_permission: None,
         delta: None,
+        seq: None,
     };
     let expected = serde_json::to_value(&event).unwrap();
     assert!(matches!(
@@ -479,6 +501,7 @@ fn the_chat_subscription_carries_sign_in_steps_beside_chat_events() {
         applied_diffs: vec![],
         pending_permission: None,
         delta: None,
+        seq: None,
     };
     let expected = serde_json::to_value(&event).unwrap();
     chat_sender.send(event).unwrap();
@@ -487,5 +510,46 @@ fn the_chat_subscription_carries_sign_in_steps_beside_chat_events() {
         SubscriptionEvent::Chat(expected)
     );
     drop(chat_sender);
+    assert_eq!(worker.join().unwrap().0, Ok(()));
+}
+
+#[test]
+fn a_chat_subscription_carries_its_cursor_and_run_detail_reaches_the_service() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let (mut client, worker) = connect_with_events(json!({}), Some(receiver));
+    assert_eq!(
+        client.run_detail(RUN, "tool-1", "tool_output").unwrap(),
+        json!({"kind": "tool_output", "text": format!("{RUN} tool-1"), "bytes": 3, "truncated": false})
+    );
+    for body in [
+        json!({"run_id": RUN, "effect_id": "tool-1", "kind": "input"}),
+        json!({"run_id": RUN, "effect_id": "", "kind": "code_diff"}),
+        json!({"run_id": "run-1", "effect_id": "tool-1", "kind": "code_diff"}),
+        json!({"run_id": RUN, "effect_id": "tool-1", "kind": "code_diff", "extra": true}),
+    ] {
+        assert!(client.request(Operation::RunDetail, None, body).is_err());
+        assert_eq!(
+            client.last_request_error().unwrap().code(),
+            muniment_attach::ErrorCode::InvalidRequest
+        );
+    }
+    assert!(client.subscribe_chat_events_after(Some(99)).is_err());
+    assert_eq!(
+        client.last_request_error().unwrap().code(),
+        muniment_attach::ErrorCode::InvalidCursor
+    );
+    client.subscribe_chat_events_after(Some(7)).unwrap();
+    assert_eq!(client.chat_cursor(), Some(7));
+    let mut event = crate::run_events::chat_event(
+        RUN,
+        crate::journal::reducer::ChatProjection::default(),
+        None,
+        Vec::new(),
+    );
+    event.seq = Some(8);
+    sender.send(event).unwrap();
+    assert_eq!(client.read_chat_event().unwrap()["seq"], 8);
+    assert_eq!(client.chat_cursor(), Some(8));
+    drop(sender);
     assert_eq!(worker.join().unwrap().0, Ok(()));
 }

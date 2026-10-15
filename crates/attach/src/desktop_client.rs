@@ -43,6 +43,8 @@ pub struct DesktopClient {
     summary: AuthorizationSummary,
     authorized_at: Instant,
     chat_subscription_id: Option<Id>,
+    /// The `seq` of the newest chat event this client read.
+    chat_cursor: Option<u64>,
     io_timeout: Duration,
     last_request_error: Option<crate::ProtocolError>,
 }
@@ -501,13 +503,41 @@ impl DesktopClient {
     }
 
     pub fn subscribe_chat_events(&mut self) -> Result<String, ClientError> {
+        self.subscribe_chat_events_after(None)
+    }
+
+    /// Subscribes to chat events after `cursor`, the [`Self::chat_cursor`] of
+    /// an earlier subscription. The runtime first sends the events this
+    /// client missed within its replay budget, or past it the whole state of
+    /// each run that changed. A runtime that takes no cursor subscribes from
+    /// now.
+    pub fn subscribe_chat_events_after(
+        &mut self,
+        cursor: Option<u64>,
+    ) -> Result<String, ClientError> {
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Subscription {
             subscription_id: String,
         }
 
-        let response = self.snapshot_request(Operation::RunChatEvents, serde_json::json!({}))?;
+        let response = match cursor {
+            Some(cursor) => {
+                let body = serde_json::json!({"cursor": cursor});
+                match self.snapshot_request(Operation::RunChatEvents, body) {
+                    Err(_)
+                        if self.last_request_error().is_some_and(|error| {
+                            error.code() == crate::ErrorCode::InvalidRequest
+                        }) =>
+                    {
+                        self.snapshot_request(Operation::RunChatEvents, serde_json::json!({}))?
+                    }
+                    response => response?,
+                }
+            }
+            None => self.snapshot_request(Operation::RunChatEvents, serde_json::json!({}))?,
+        };
+        self.chat_cursor = cursor;
         let subscription: Subscription =
             serde_json::from_value(response.body).map_err(|_| ClientError::UnexpectedMessage)?;
         let subscription_id =
@@ -515,6 +545,12 @@ impl DesktopClient {
         let result = subscription_id.as_str().to_owned();
         self.chat_subscription_id = Some(subscription_id);
         Ok(result)
+    }
+
+    /// The `seq` of the newest chat event this client read, which a later
+    /// subscription passes to resume after it.
+    pub fn chat_cursor(&self) -> Option<u64> {
+        self.chat_cursor
     }
 
     /// Reads the next chat event, passing over the sign-in steps the same
@@ -582,6 +618,9 @@ impl DesktopClient {
                 return Ok(SubscriptionEvent::ModelsLogin(event.body));
             }
             if let Some(body) = snapshot.push(event.body).map_err(map_frame_error)? {
+                if let Some(seq) = body.get("seq").and_then(Value::as_u64) {
+                    self.chat_cursor = Some(self.chat_cursor.map_or(seq, |cursor| cursor.max(seq)));
+                }
                 return Ok(SubscriptionEvent::Chat(body));
             }
             // The first chunk ends the idle wait. Bound the remaining snapshot I/O.
@@ -657,6 +696,34 @@ impl DesktopClient {
             serde_json::json!({"company_id": company_id}),
             &["company"],
         )
+    }
+
+    /// Reads one body that chat events leave out: the output of the tool
+    /// `effect_id` ran (`kind` `tool_output`) or the diff it applied
+    /// (`code_diff`).
+    pub fn run_detail(
+        &mut self,
+        run_id: &str,
+        effect_id: &str,
+        kind: &str,
+    ) -> Result<Value, ClientError> {
+        if Id::new(run_id).is_err()
+            || effect_id.is_empty()
+            || effect_id.len() > MAX_TEXT_LENGTH
+            || !matches!(kind, "tool_output" | "code_diff")
+        {
+            return Err(ClientError::UnexpectedMessage);
+        }
+        let body = self.request_body(
+            Operation::RunDetail,
+            None,
+            serde_json::json!({"run_id": run_id, "effect_id": effect_id, "kind": kind}),
+            &["kind"],
+        )?;
+        if body["kind"] != kind {
+            return Err(ClientError::UnexpectedMessage);
+        }
+        Ok(body)
     }
 
     /// Reads one thread's context usage, whether a read runs, and its last
@@ -861,6 +928,7 @@ pub(crate) fn desktop_client_for_test(
         },
         authorized_at: Instant::now(),
         chat_subscription_id: None,
+        chat_cursor: None,
         io_timeout,
         last_request_error: None,
     }
@@ -941,6 +1009,7 @@ pub fn handshake_desktop_client(
         },
         authorized_at: Instant::now(),
         chat_subscription_id: None,
+        chat_cursor: None,
         io_timeout,
         last_request_error: None,
     })

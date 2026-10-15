@@ -577,6 +577,23 @@ pub trait ThreadListService {
         Err(ProtocolError::unsupported_operation())
     }
 
+    /// Subscribes to chat events after the stream position `cursor`. A
+    /// service without a replayable stream subscribes from now.
+    fn subscribe_chat_events_after(
+        &mut self,
+        _cursor: Option<u64>,
+    ) -> Result<crate::run_events::ChatEventSubscription, ProtocolError> {
+        self.subscribe_chat_events()
+    }
+
+    /// Reads one tool output or one applied diff that chat events leave out.
+    fn run_detail(
+        &mut self,
+        _request: super::desktop_service_message::RunDetailRequest,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
     /// Runs one model service action. A mutating action carries its key.
     fn models_request(
         &mut self,

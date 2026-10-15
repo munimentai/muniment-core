@@ -13,8 +13,7 @@ use crate::code_diff_journal::{load_applied_code_diffs_cached, load_pending_code
 use crate::journal::reducer::ChatProjector;
 use crate::journal::{EventEnvelope, EventPayload};
 use crate::run_events::{
-    chat_event, event_envelope, subscription_generation, text_delta, ChatEventSink, ChatStorage,
-    SharedStorage,
+    chat_event, event_envelope, text_delta, ChatEventSink, ChatStorage, SharedStorage,
 };
 
 /// The longest a text delta waits for its commit and delivery.
@@ -110,8 +109,7 @@ impl HeldDeltas {
                 return Err(());
             }
             *seq = committed + envelopes.len() as u64;
-            let generation = subscription_generation();
-            match text_delta(projector, &joined(&envelopes), text_start, generation) {
+            match text_delta(projector, &joined(&envelopes), text_start) {
                 Some(event) => event,
                 None => {
                     let projection = projector.projection().map_err(|_| ())?;
@@ -131,7 +129,7 @@ impl HeldDeltas {
                         projection.applied_diffs.clone(),
                         &mut projector.code_diffs,
                     );
-                    projector.delivery.delivered_snapshot(generation);
+                    projector.delivery.delivered_snapshot();
                     chat_event(run_id, projection, code_diff, applied_diffs)
                 }
             }

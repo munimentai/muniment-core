@@ -40,6 +40,15 @@ pub struct RunResumeRequest {
     pub run_id: String,
 }
 
+/// Names one body a chat event leaves out: a tool's output or an applied
+/// diff, by the effect that produced it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunDetailRequest {
+    pub run_id: String,
+    pub effect_id: String,
+    pub kind: crate::chat_view::RunDetailKind,
+}
+
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct RunResumeAccepted {
     pub run_id: String,

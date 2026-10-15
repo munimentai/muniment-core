@@ -73,7 +73,7 @@ pub use service::{
 };
 pub use sink::{
     RuntimeChatEventBroadcast, RuntimeChatEventSink, RuntimeChatEventTarget,
-    CHAT_EVENT_SUBSCRIBER_QUEUE_CAPACITY,
+    CHAT_EVENT_SUBSCRIBER_QUEUE_CAPACITY, CHAT_REPLAY_MAX_BYTES, CHAT_REPLAY_MAX_EVENTS,
 };
 #[cfg(target_os = "windows")]
 pub use windows_attach_loop::WindowsAttachAcceptor;

@@ -167,6 +167,16 @@ impl DesktopClientHolder {
         })
     }
 
+    /// Reads one tool output or one applied diff that chat events leave out.
+    pub fn run_detail(
+        &self,
+        run_id: &str,
+        effect_id: &str,
+        kind: &str,
+    ) -> Result<Value, ClientError> {
+        self.with_client(|client| client.run_detail(run_id, effect_id, kind))
+    }
+
     pub fn list_companions(&self) -> Result<Value, ClientError> {
         self.with_client(DesktopClient::list_companions)
     }

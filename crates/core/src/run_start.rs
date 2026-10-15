@@ -459,6 +459,24 @@ pub trait RunAttachBoundaries {
     ) -> Result<crate::run_events::ChatEventSubscription, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
+    /// Subscribes to chat events after the stream position `cursor`: the
+    /// missed events while the stream still holds them, else the whole state
+    /// of each run that changed.
+    #[cfg(any(unix, target_os = "windows"))]
+    fn subscribe_chat_events_after(
+        &self,
+        _cursor: Option<u64>,
+    ) -> Result<crate::run_events::ChatEventSubscription, ProtocolError> {
+        self.subscribe_chat_events()
+    }
+    /// Reads one tool output or one applied diff that chat events leave out.
+    #[cfg(all(any(unix, target_os = "windows"), feature = "keyring"))]
+    fn run_detail(
+        &self,
+        _request: crate::attach::desktop_service_message::RunDetailRequest,
+    ) -> Result<crate::thread_history::RunDetail, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
     /// Runs one model service action and answers its result. A mutating
     /// action carries its idempotency key, and a repeat of the key answers the
     /// first result.

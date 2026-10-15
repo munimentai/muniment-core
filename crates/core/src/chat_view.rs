@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use muniment_code_diff::CodeDiff;
+use muniment_code_diff::{CodeDiff, DiffLineKind, DiffStatus};
 use serde::{Deserialize, Serialize};
 
 use crate::journal::reducer::{
@@ -16,6 +16,11 @@ pub struct SelectedFile {
     pub path: PathBuf,
 }
 
+/// The longest tool output a chat event or history entry carries, in UTF-8
+/// bytes. A whole state repeats every tool of its run, so the body stays in
+/// the journal and `run.detail` answers it on demand.
+pub const TOOL_OUTPUT_PREVIEW_BYTES: usize = 1024;
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatToolActivity {
@@ -25,8 +30,15 @@ pub struct ChatToolActivity {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<String>,
+    /// The start of the output, at most [`TOOL_OUTPUT_PREVIEW_BYTES`] bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
+    /// The whole output's length in UTF-8 bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_bytes: Option<usize>,
+    /// Set when `output` holds only the start of the output.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub output_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -43,6 +55,9 @@ pub struct ChatPendingPermission {
     pub diff: Option<CodeDiff>,
 }
 
+/// An applied code diff as a chat event carries it: the record and, while
+/// the stored diff verifies, its per-file counts. `run.detail` answers the
+/// diff itself.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatAppliedDiff {
@@ -51,17 +66,68 @@ pub struct ChatAppliedDiff {
     pub diff_sha256: String,
     pub write_plan_sha256: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub diff: Option<CodeDiff>,
+    pub summary: Option<ChatDiffSummary>,
 }
 
 impl ChatAppliedDiff {
-    pub fn from_projected(record: ProjectedAppliedDiff, diff: Option<CodeDiff>) -> Self {
+    pub fn from_projected(record: ProjectedAppliedDiff, diff: Option<&CodeDiff>) -> Self {
         Self {
             effect_id: record.effect_id,
             code_diff_id: record.code_diff_id,
             diff_sha256: record.diff_sha256,
             write_plan_sha256: record.write_plan_sha256,
-            diff,
+            summary: diff.map(ChatDiffSummary::of),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatDiffSummary {
+    pub files: Vec<ChatDiffFileSummary>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatDiffFileSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_path: Option<String>,
+    pub status: DiffStatus,
+    pub binary: bool,
+    pub additions: usize,
+    pub deletions: usize,
+}
+
+impl ChatDiffSummary {
+    pub fn of(diff: &CodeDiff) -> Self {
+        Self {
+            files: diff
+                .files
+                .iter()
+                .map(|file| {
+                    let (additions, deletions) = file
+                        .hunks
+                        .iter()
+                        .flat_map(|hunk| &hunk.lines)
+                        .fold((0, 0), |(additions, deletions), line| match line.kind {
+                            DiffLineKind::Addition => (additions + 1, deletions),
+                            DiffLineKind::Deletion => (additions, deletions + 1),
+                            DiffLineKind::Context => (additions, deletions),
+                        });
+                    ChatDiffFileSummary {
+                        old_path: file.old_path.clone(),
+                        new_path: file.new_path.clone(),
+                        status: file.status,
+                        binary: file.binary,
+                        additions,
+                        deletions,
+                    }
+                })
+                .collect(),
+            truncated: diff.truncated,
         }
     }
 }
@@ -109,7 +175,15 @@ pub fn chat_tool_activity(activity: &[ToolActivity]) -> Vec<ChatToolActivity> {
             text_offset: activity.text_offset,
             effect_id: activity.effect_id.clone(),
             input: activity.input.clone(),
-            output: activity.output.clone(),
+            output: activity
+                .output
+                .as_deref()
+                .map(|output| utf8_prefix(output, TOOL_OUTPUT_PREVIEW_BYTES).to_owned()),
+            output_bytes: activity.output.as_ref().map(String::len),
+            output_truncated: activity
+                .output
+                .as_ref()
+                .is_some_and(|output| output.len() > TOOL_OUTPUT_PREVIEW_BYTES),
             started_at: activity.started_at.clone(),
             finished_at: activity.finished_at.clone(),
             display_name: activity.display_name.clone(),
@@ -121,6 +195,29 @@ pub fn chat_tool_activity(activity: &[ToolActivity]) -> Vec<ChatToolActivity> {
             .into(),
         })
         .collect()
+}
+
+/// What one `run.detail` request reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunDetailKind {
+    /// The output a tool returned.
+    ToolOutput,
+    /// The diff an applied code-diff effect wrote.
+    CodeDiff,
+}
+
+/// The longest prefix of `text` that fits `max_bytes` and ends on a character
+/// boundary.
+pub fn utf8_prefix(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// Keeps the recorded cause separate from assistant text.

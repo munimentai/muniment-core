@@ -1,10 +1,11 @@
 //! Dormant runtime chat event delivery boundaries.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use muniment_core::attach::SignedWorkspaceApproval;
 use muniment_core::chat_launch::{ChatGrant, FetchGrantError, FetchReceiptError};
@@ -19,6 +20,26 @@ use muniment_core::sidecar::pi_install::{PiArtifactDescriptor, PI_SELECTED_ARTIF
 use crate::host::{ChatGrantService, NoCloud, RuntimeHost};
 
 pub const CHAT_EVENT_SUBSCRIBER_QUEUE_CAPACITY: usize = 256;
+
+/// The most events a resuming subscriber replays. A longer gap gets the
+/// whole state of each run that changed instead.
+pub const CHAT_REPLAY_MAX_EVENTS: usize = 128;
+
+/// The most serialized event bytes a resuming subscriber replays.
+pub const CHAT_REPLAY_MAX_BYTES: usize = 1024 * 1024;
+
+/// How many runs keep their whole state for a subscriber that attaches or
+/// resumes past the replay budget. The least recently changed run goes first.
+const CHAT_RUN_STATES: usize = 32;
+
+/// The phases of a run the runtime still drives. A new subscriber gets the
+/// whole state of each run in one of them.
+const LIVE_PHASES: [&str; 4] = [
+    "acquiring-pi",
+    "thinking",
+    "streaming",
+    "pending-permission",
+];
 
 /// How long a streaming text event may reuse the last read of the local-mode
 /// marker. Every other phase reads the marker, so a run's start, gates and end
@@ -37,7 +58,7 @@ pub struct RuntimeChatEventBroadcast {
 struct RuntimeChatEventBroadcastShared {
     next_id: AtomicU64,
     full_queue_drops: AtomicU64,
-    subscribers: Mutex<Vec<RuntimeChatEventSubscriber>>,
+    stream: Mutex<ChatEventStream>,
     local_mode: Mutex<Option<(PathBuf, bool, Instant)>>,
     #[cfg(target_os = "linux")]
     delivery_failures: Mutex<std::collections::BTreeMap<(String, String), ChatEvent>>,
@@ -47,6 +68,167 @@ struct RuntimeChatEventSubscriber {
     id: u64,
     capacity: usize,
     sender: SyncSender<ChatEvent>,
+}
+
+/// The subscribers and what a later subscriber needs to catch up: the newest
+/// events within the replay budget and the whole state of recent runs. Each
+/// entry keeps the workspace whose gate it passed, or none for a device-wide
+/// event, so a subscriber reads only what the gate allows when it subscribes.
+struct ChatEventStream {
+    subscribers: Vec<RuntimeChatEventSubscriber>,
+    /// The position of the newest event.
+    seq: u64,
+    replay: VecDeque<StreamEntry>,
+    replay_bytes: usize,
+    runs: BTreeMap<String, (ChatEvent, String)>,
+}
+
+struct StreamEntry {
+    event: ChatEvent,
+    workspace: Option<String>,
+    bytes: usize,
+}
+
+impl Default for ChatEventStream {
+    fn default() -> Self {
+        Self {
+            subscribers: Vec::new(),
+            seq: stream_origin(),
+            replay: VecDeque::new(),
+            replay_bytes: 0,
+            runs: BTreeMap::new(),
+        }
+    }
+}
+
+/// Starts a stream's positions at the clock in microseconds, so the cursor
+/// of an earlier runtime falls before this stream's first event.
+fn stream_origin() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX / 2)
+        })
+}
+
+impl ChatEventStream {
+    fn record(&mut self, event: &ChatEvent, workspace: Option<&str>, keeps_state: bool) {
+        let bytes =
+            muniment_core::serde_json::to_vec(event).map_or(usize::MAX, |bytes| bytes.len());
+        self.replay.push_back(StreamEntry {
+            event: event.clone(),
+            workspace: workspace.map(str::to_owned),
+            bytes,
+        });
+        self.replay_bytes = self.replay_bytes.saturating_add(bytes);
+        while self.replay.len() > CHAT_REPLAY_MAX_EVENTS
+            || self.replay_bytes > CHAT_REPLAY_MAX_BYTES
+        {
+            let Some(evicted) = self.replay.pop_front() else {
+                break;
+            };
+            self.replay_bytes = self.replay_bytes.saturating_sub(evicted.bytes);
+        }
+        if let (true, Some(workspace)) = (keeps_state, workspace) {
+            self.update_run(event, workspace);
+        }
+    }
+
+    /// Folds one event into its run's whole state. A delta that does not
+    /// extend the kept text drops the state, and the run's next whole event
+    /// starts it again.
+    fn update_run(&mut self, event: &ChatEvent, workspace: &str) {
+        match &event.delta {
+            None => {
+                self.runs
+                    .insert(event.run_id.clone(), (event.clone(), workspace.to_owned()));
+            }
+            Some(delta) => {
+                let extended = self.runs.get_mut(&event.run_id).and_then(|(state, _)| {
+                    let end = utf16_byte_offset(&state.text, delta.text_start)?;
+                    state.text.truncate(end);
+                    state.text.push_str(&event.text);
+                    state.phase.clone_from(&event.phase);
+                    state.routing_stage = None;
+                    state.seq = event.seq;
+                    Some(())
+                });
+                if extended.is_none() {
+                    self.runs.remove(&event.run_id);
+                }
+            }
+        }
+        while self.runs.len() > CHAT_RUN_STATES {
+            let Some(oldest) = self
+                .runs
+                .iter()
+                .min_by_key(|(_, (state, _))| state.seq)
+                .map(|(run_id, _)| run_id.clone())
+            else {
+                break;
+            };
+            self.runs.remove(&oldest);
+        }
+    }
+
+    /// What a subscriber reads before live events. A cursor this stream still
+    /// holds the events after gets those events. A cursor before the replay
+    /// budget gets the whole state of each run that changed after it. No
+    /// cursor, or one this stream never reached, gets the whole state of each
+    /// live run. Each whole state carries the stream's current position.
+    fn catch_up(&self, cursor: Option<u64>, allowed: Option<&str>) -> Vec<ChatEvent> {
+        let readable =
+            |workspace: Option<&str>| workspace.is_none_or(|workspace| allowed == Some(workspace));
+        let replayable = |cursor: u64| {
+            cursor == self.seq
+                || self
+                    .replay
+                    .front()
+                    .is_some_and(|entry| entry.event.seq.is_some_and(|seq| seq <= cursor + 1))
+        };
+        match cursor.filter(|&cursor| cursor <= self.seq) {
+            Some(cursor) if replayable(cursor) => self
+                .replay
+                .iter()
+                .filter(|entry| {
+                    entry.event.seq.is_some_and(|seq| seq > cursor)
+                        && readable(entry.workspace.as_deref())
+                })
+                .map(|entry| entry.event.clone())
+                .collect(),
+            cursor => {
+                let mut states: Vec<_> = self
+                    .runs
+                    .values()
+                    .filter(|(state, workspace)| {
+                        readable(Some(workspace))
+                            && match cursor {
+                                Some(cursor) => state.seq.is_some_and(|seq| seq > cursor),
+                                None => LIVE_PHASES.contains(&state.phase.as_str()),
+                            }
+                    })
+                    .map(|(state, _)| state.clone())
+                    .collect();
+                states.sort_by_key(|state| state.seq);
+                for state in &mut states {
+                    state.seq = Some(self.seq);
+                }
+                states
+            }
+        }
+    }
+}
+
+/// The byte index in `text` of the UTF-16 offset `units`, or none past its end.
+fn utf16_byte_offset(text: &str, units: usize) -> Option<usize> {
+    let mut counted = 0;
+    for (index, character) in text.char_indices() {
+        if counted >= units {
+            return (counted == units).then_some(index);
+        }
+        counted += character.len_utf16();
+    }
+    (counted == units).then_some(text.len())
 }
 
 impl RuntimeChatEventBroadcast {
@@ -69,12 +251,15 @@ impl RuntimeChatEventBroadcast {
     }
 
     fn allows_workspace_with(&self, workspace: &str, streaming: bool) -> bool {
+        self.allowed_workspace(streaming).as_deref() == Some(workspace)
+    }
+
+    /// The one workspace whose run events subscribers may read now.
+    fn allowed_workspace(&self, streaming: bool) -> Option<String> {
         if self.local_mode(streaming) {
-            return workspace == "local";
+            return Some("local".into());
         }
-        self.approval
-            .approval()
-            .is_some_and(|approval| approval.workspace == workspace)
+        self.approval.approval().map(|approval| approval.workspace)
     }
 
     /// Reads the local-mode marker. A streaming event reuses a read younger
@@ -111,20 +296,38 @@ impl RuntimeChatEventBroadcast {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         failures.insert((workspace.clone(), event.run_id.clone()), event.clone());
-        self.deliver(&workspace, event);
+        self.deliver_with(&workspace, event, false);
     }
 
+    /// Subscribes from now. The subscriber first gets the whole state of each
+    /// live run.
     pub fn subscribe(&self) -> ChatEventSubscription {
+        self.subscribe_after(None)
+    }
+
+    /// Subscribes after the stream position `cursor`, the `seq` of the last
+    /// event the subscriber applied. It first gets the events it missed while
+    /// they fit the replay budget, else the whole state of each run that
+    /// changed. Live events follow with no gap, because both happen under the
+    /// lock that every delivery takes.
+    pub fn subscribe_after(&self, cursor: Option<u64>) -> ChatEventSubscription {
         #[cfg(target_os = "linux")]
         let failures = self
             .shared
             .delivery_failures
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let allowed = self.allowed_workspace(false);
+        let mut stream = self
+            .shared
+            .stream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let catch_up = stream.catch_up(cursor, allowed.as_deref());
         #[cfg(target_os = "linux")]
-        let capacity = CHAT_EVENT_SUBSCRIBER_QUEUE_CAPACITY.max(failures.len());
+        let capacity = CHAT_EVENT_SUBSCRIBER_QUEUE_CAPACITY.max(failures.len() + catch_up.len());
         #[cfg(not(target_os = "linux"))]
-        let capacity = CHAT_EVENT_SUBSCRIBER_QUEUE_CAPACITY;
+        let capacity = CHAT_EVENT_SUBSCRIBER_QUEUE_CAPACITY.max(catch_up.len());
         let (sender, receiver) = mpsc::sync_channel(capacity);
         #[cfg(target_os = "linux")]
         for ((workspace, _), failure) in failures.iter() {
@@ -132,16 +335,16 @@ impl RuntimeChatEventBroadcast {
                 let _ = sender.try_send(failure.clone());
             }
         }
+        for event in catch_up {
+            let _ = sender.try_send(event);
+        }
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
-        self.shared
-            .subscribers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(RuntimeChatEventSubscriber {
-                id,
-                capacity,
-                sender,
-            });
+        stream.subscribers.push(RuntimeChatEventSubscriber {
+            id,
+            capacity,
+            sender,
+        });
+        drop(stream);
         let shared = Arc::downgrade(&self.shared);
         ChatEventSubscription::new(receiver, move || remove_subscriber(&shared, id))
     }
@@ -149,9 +352,10 @@ impl RuntimeChatEventBroadcast {
     #[doc(hidden)]
     pub fn subscriber_count(&self) -> usize {
         self.shared
-            .subscribers
+            .stream
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .subscribers
             .len()
     }
 
@@ -162,36 +366,47 @@ impl RuntimeChatEventBroadcast {
     }
 
     fn deliver(&self, workspace: &str, event: ChatEvent) {
+        self.deliver_with(workspace, event, true);
+    }
+
+    /// Delivers one run event. `keeps_state` folds it into the run's whole
+    /// state, which a notice outside the run's projection must not replace.
+    fn deliver_with(&self, workspace: &str, event: ChatEvent, keeps_state: bool) {
         if !self.allows_workspace_with(workspace, event.phase == "streaming") {
             return;
         }
-        self.fan_out(event);
+        self.fan_out(event, Some(workspace), keeps_state);
     }
 
     /// Sends a device-wide event, such as the sign-in link, to every live
     /// subscriber. The workspace gate guards run events, and this event names
     /// no run.
     pub(crate) fn announce(&self, event: ChatEvent) {
-        self.fan_out(event);
+        self.fan_out(event, None, false);
     }
 
-    fn fan_out(&self, event: ChatEvent) {
+    fn fan_out(&self, mut event: ChatEvent, workspace: Option<&str>, keeps_state: bool) {
         let mut full_queue_drops = Vec::new();
-        self.shared
-            .subscribers
+        let mut stream = self
+            .shared
+            .stream
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(
-                |subscriber| match subscriber.sender.try_send(event.clone()) {
-                    Ok(()) => true,
-                    Err(TrySendError::Full(_)) => {
-                        full_queue_drops.push((subscriber.id, subscriber.capacity));
-                        false
-                    }
-                    // A disconnected receiver is the ordinary close of a client connection.
-                    Err(TrySendError::Disconnected(_)) => false,
-                },
-            );
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        stream.seq += 1;
+        event.seq = Some(stream.seq);
+        stream.record(&event, workspace, keeps_state);
+        stream.subscribers.retain(
+            |subscriber| match subscriber.sender.try_send(event.clone()) {
+                Ok(()) => true,
+                Err(TrySendError::Full(_)) => {
+                    full_queue_drops.push((subscriber.id, subscriber.capacity));
+                    false
+                }
+                // A disconnected receiver is the ordinary close of a client connection.
+                Err(TrySendError::Disconnected(_)) => false,
+            },
+        );
+        drop(stream);
         self.shared
             .full_queue_drops
             .fetch_add(full_queue_drops.len() as u64, Ordering::Relaxed);
@@ -210,9 +425,10 @@ fn remove_subscriber(shared: &Weak<RuntimeChatEventBroadcastShared>, id: u64) {
         return;
     };
     shared
-        .subscribers
+        .stream
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .subscribers
         .retain(|subscriber| subscriber.id != id);
 }
 
@@ -435,6 +651,7 @@ mod tests {
             applied_diffs: Vec::new(),
             pending_permission: None,
             delta: None,
+            seq: None,
         }
     }
 

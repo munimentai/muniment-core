@@ -3,10 +3,12 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use muniment_core::cas::LocalCas;
 use muniment_core::journal::{EventEnvelope, EventPayload, Provenance, RunJournal};
 use muniment_core::thread_history::{
-    chat_thread_open_page, chat_thread_open_page_without_prompts, load_page_prompts,
-    HistoryRuntime, ThreadHistoryError,
+    chat_thread_open_page, chat_thread_open_page_without_prompts, load_page_prompts, run_detail,
+    HistoryRuntime, RunDetail, RunDetailError, RunDetailKind, ThreadHistoryError,
+    RUN_DETAIL_MAX_BYTES,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -173,4 +175,90 @@ fn a_page_without_prompts_reads_them_after_the_journal() {
     assert_eq!(page.entries[0].prompt.as_deref(), Some("Plan the week."));
 
     std::fs::remove_file(path).unwrap();
+}
+
+fn tool_event(run_id: &str, run_seq: u64, event_type: &str, payload: Value) -> EventEnvelope {
+    let mut event = started_event(run_id, "owner");
+    event.run_seq = run_seq;
+    event.event_type = event_type.into();
+    event.payload = EventPayload::Inline {
+        payload_json: payload,
+    };
+    event
+}
+
+#[test]
+fn run_detail_answers_a_tool_output_within_its_byte_cap() {
+    let path = journal_file();
+    let cas_root = std::env::temp_dir().join(format!("muniment-run-detail-{}", Uuid::new_v4()));
+    let cas = LocalCas::open(&cas_root).unwrap();
+    let mut journal = RunJournal::open_with_busy_timeout(&path, Duration::from_secs(60)).unwrap();
+    let run_id = Uuid::now_v7().to_string();
+    journal
+        .append_new_run("workspace", &started_event(&run_id, "owner"))
+        .unwrap();
+    // Quotes and control characters escape to more bytes than they take.
+    let long = "line \"one\"\t\u{1}\n".repeat(RUN_DETAIL_MAX_BYTES / 8);
+    let events = [
+        ("tool.effect.started", json!({"effect_id": "short"})),
+        (
+            "tool.effect.completed",
+            json!({"effect_id": "short", "output": "two files"}),
+        ),
+        ("tool.effect.started", json!({"effect_id": "long"})),
+        (
+            "tool.effect.failed",
+            json!({"effect_id": "long", "output": long}),
+        ),
+    ];
+    for (index, (event_type, payload)) in events.into_iter().enumerate() {
+        let seq = index as u64 + 2;
+        journal
+            .append(seq - 1, &tool_event(&run_id, seq, event_type, payload))
+            .unwrap();
+    }
+
+    let read = |journal: &mut RunJournal, subject, effect_id| {
+        run_detail(
+            journal,
+            &cas,
+            subject,
+            &run_id,
+            effect_id,
+            RunDetailKind::ToolOutput,
+        )
+    };
+    assert_eq!(
+        read(&mut journal, Some("owner"), "short"),
+        Ok(RunDetail::ToolOutput {
+            text: "two files".into(),
+            bytes: 9,
+            truncated: false,
+        })
+    );
+    let Ok(RunDetail::ToolOutput {
+        text,
+        bytes,
+        truncated,
+    }) = read(&mut journal, Some("owner"), "long")
+    else {
+        panic!("the long output must answer");
+    };
+    assert!(truncated);
+    assert_eq!(bytes, long.len());
+    assert!(long.starts_with(&text));
+    let answer = serde_json::to_vec(&json!({"kind": "tool_output", "text": text})).unwrap();
+    assert!(answer.len() <= RUN_DETAIL_MAX_BYTES + 64);
+    assert_eq!(
+        read(&mut journal, Some("owner"), "missing"),
+        Err(RunDetailError::NotFound)
+    );
+    assert_eq!(
+        read(&mut journal, Some("other"), "short"),
+        Err(RunDetailError::RunNotOwned)
+    );
+
+    drop(journal);
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_dir_all(cas_root).ok();
 }

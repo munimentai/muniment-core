@@ -580,6 +580,7 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         ("context-settings", Operation::ContextSettings),
         ("context-settings-save", Operation::ContextSettingsSave),
         ("models-request", Operation::ModelsRequest),
+        ("run-detail", Operation::RunDetail),
     ];
     for (index, (name, operation)) in operations.into_iter().enumerate() {
         let body = request_body(operation);
@@ -897,6 +898,11 @@ fn request_body(operation: Operation) -> serde_json::Value {
             json!({"run_id": "00000000000000000000000000000191", "after_run_seq": 7})
         }
         Operation::RunChatEvents => json!({}),
+        Operation::RunDetail => json!({
+            "run_id": "00000000000000000000000000000191",
+            "effect_id": "tool-1",
+            "kind": "tool_output"
+        }),
         Operation::RunCursorAck => {
             json!({"subscription_id": "00000000000000000000000000000190", "through_run_seq": 7})
         }
@@ -1163,6 +1169,7 @@ mod tests {
             Operation::RunPermissionAnswer,
             Operation::RunStream,
             Operation::RunChatEvents,
+            Operation::RunDetail,
             Operation::RunCursorAck,
             Operation::RunSteer,
             Operation::RunFollowUp,
@@ -1235,7 +1242,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            105,
+            106,
             "every canonical fixture must be inventoried"
         );
     }

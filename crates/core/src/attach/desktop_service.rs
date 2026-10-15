@@ -1740,6 +1740,23 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
     }
 
     #[cfg(any(unix, target_os = "windows"))]
+    fn subscribe_chat_events_after(
+        &mut self,
+        cursor: Option<u64>,
+    ) -> Result<crate::run_events::ChatEventSubscription, ProtocolError> {
+        self.boundaries.subscribe_chat_events_after(cursor)
+    }
+
+    #[cfg(all(any(unix, target_os = "windows"), feature = "keyring"))]
+    fn run_detail(
+        &mut self,
+        request: super::desktop_service_message::RunDetailRequest,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        serde_json::to_value(self.boundaries.run_detail(request)?)
+            .map_err(|_| ProtocolError::persistence_failed())
+    }
+
+    #[cfg(any(unix, target_os = "windows"))]
     fn models_request(
         &mut self,
         request: super::ModelRequest,

@@ -503,35 +503,39 @@ impl CodeDiffCache {
         cas: &LocalCas,
         run_id: &str,
         reference: CodeDiffReference<'_>,
-    ) -> Option<CodeDiff> {
-        if let Some(verified) = self.verified.get(reference.effect_id) {
-            if verified.code_diff_id == reference.code_diff_id
-                && verified.diff_sha256 == reference.diff_sha256
-                && verified.write_plan_sha256 == reference.write_plan_sha256
-            {
-                return Some(verified.diff.clone());
-            }
+    ) -> Option<&CodeDiff> {
+        let cached = self
+            .verified
+            .get(reference.effect_id)
+            .is_some_and(|verified| {
+                verified.code_diff_id == reference.code_diff_id
+                    && verified.diff_sha256 == reference.diff_sha256
+                    && verified.write_plan_sha256 == reference.write_plan_sha256
+            });
+        if !cached {
+            let diff =
+                load_code_diff_proposal_with_references(journal, cas, run_id, reference.effect_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|(_, diff, diff_hash, plan_hash)| {
+                        (diff.id == reference.code_diff_id
+                            && diff_hash.to_string() == reference.diff_sha256
+                            && plan_hash.to_string() == reference.write_plan_sha256)
+                            .then_some(diff)
+                    })?;
+            self.verified.insert(
+                reference.effect_id.to_owned(),
+                VerifiedCodeDiff {
+                    code_diff_id: reference.code_diff_id.to_owned(),
+                    diff_sha256: reference.diff_sha256.to_owned(),
+                    write_plan_sha256: reference.write_plan_sha256.to_owned(),
+                    diff,
+                },
+            );
         }
-        let diff =
-            load_code_diff_proposal_with_references(journal, cas, run_id, reference.effect_id)
-                .ok()
-                .flatten()
-                .and_then(|(_, diff, diff_hash, plan_hash)| {
-                    (diff.id == reference.code_diff_id
-                        && diff_hash.to_string() == reference.diff_sha256
-                        && plan_hash.to_string() == reference.write_plan_sha256)
-                        .then_some(diff)
-                })?;
-        self.verified.insert(
-            reference.effect_id.to_owned(),
-            VerifiedCodeDiff {
-                code_diff_id: reference.code_diff_id.to_owned(),
-                diff_sha256: reference.diff_sha256.to_owned(),
-                write_plan_sha256: reference.write_plan_sha256.to_owned(),
-                diff: diff.clone(),
-            },
-        );
-        Some(diff)
+        self.verified
+            .get(reference.effect_id)
+            .map(|verified| &verified.diff)
     }
 }
 
@@ -556,17 +560,41 @@ pub fn load_pending_code_diff_cached(
     else {
         return None;
     };
-    cache.load(
-        journal,
-        cas,
-        run_id,
-        CodeDiffReference {
-            effect_id,
-            code_diff_id,
-            diff_sha256,
-            write_plan_sha256,
-        },
-    )
+    cache
+        .load(
+            journal,
+            cas,
+            run_id,
+            CodeDiffReference {
+                effect_id,
+                code_diff_id,
+                diff_sha256,
+                write_plan_sha256,
+            },
+        )
+        .cloned()
+}
+
+/// Loads the verified diff of one applied code-diff record.
+pub fn load_applied_code_diff(
+    journal: &mut RunJournal,
+    cas: &LocalCas,
+    run_id: &str,
+    record: &ProjectedAppliedDiff,
+) -> Option<CodeDiff> {
+    CodeDiffCache::default()
+        .load(
+            journal,
+            cas,
+            run_id,
+            CodeDiffReference {
+                effect_id: &record.effect_id,
+                code_diff_id: &record.code_diff_id,
+                diff_sha256: &record.diff_sha256,
+                write_plan_sha256: &record.write_plan_sha256,
+            },
+        )
+        .cloned()
 }
 
 /// Loads verified diffs for applied code-diff records through a run's cache

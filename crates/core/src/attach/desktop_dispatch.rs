@@ -787,10 +787,13 @@ pub(super) fn dispatch_request<S: ThreadListService>(
         struct Body {
             #[serde(default)]
             snapshot_chunks: bool,
+            /// The `seq` of the last chat event the client applied.
+            #[serde(default)]
+            cursor: Option<u64>,
         }
         let body: Body =
             serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
-        let receiver = service.subscribe_chat_events()?;
+        let receiver = service.subscribe_chat_events_after(body.cursor)?;
         // A runtime without a model service still serves chat events.
         let model_events = service.subscribe_model_events().ok();
         let mut subscription_random = [0u8; 16];
@@ -807,6 +810,27 @@ pub(super) fn dispatch_request<S: ThreadListService>(
         return Ok(response_only(serde_json::json!({
             "subscription_id": subscription_id,
         })));
+    }
+    if request.operation == Operation::RunDetail {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            run_id: String,
+            effect_id: String,
+            kind: crate::chat_view::RunDetailKind,
+        }
+        let body: Body =
+            serde_json::from_value(request.body).map_err(|_| ProtocolError::invalid_request())?;
+        super::Id::new(body.run_id.clone()).map_err(|_| ProtocolError::invalid_request())?;
+        if body.effect_id.is_empty() || body.effect_id.len() > MAX_TEXT_LENGTH {
+            return Err(ProtocolError::invalid_request().into());
+        }
+        let detail = service.run_detail(super::desktop_service_message::RunDetailRequest {
+            run_id: body.run_id,
+            effect_id: body.effect_id,
+            kind: body.kind,
+        })?;
+        return bounded_response(detail);
     }
     if matches!(
         request.operation,

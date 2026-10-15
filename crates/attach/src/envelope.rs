@@ -335,6 +335,9 @@ pub enum Operation {
     RunStream,
     #[serde(rename = "run.chat_events")]
     RunChatEvents,
+    /// Reads one tool output or one applied diff that chat events leave out.
+    #[serde(rename = "run.detail")]
+    RunDetail,
     #[serde(rename = "run.cursor_ack")]
     RunCursorAck,
     #[serde(rename = "run.steer")]
@@ -452,6 +455,7 @@ impl Operation {
             Self::RunPermissionAnswer => "run.permission_answer",
             Self::RunStream => "run.stream",
             Self::RunChatEvents => "run.chat_events",
+            Self::RunDetail => "run.detail",
             Self::RunCursorAck => "run.cursor_ack",
             Self::RunSteer => "run.steer",
             Self::RunFollowUp => "run.follow_up",

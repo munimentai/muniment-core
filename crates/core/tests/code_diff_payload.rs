@@ -13,7 +13,9 @@ use muniment_core::code_diff_journal::{
 use muniment_core::journal::reducer::{ChatProjector, PermissionGate, PermissionRequest};
 use muniment_core::journal::{EventEnvelope, EventPayload, Provenance, RunJournal};
 use muniment_core::run_events::chat_event;
-use muniment_core::thread_history::project_history_entry;
+use muniment_core::thread_history::{
+    project_history_entry, run_detail, RunDetail, RunDetailError, RunDetailKind,
+};
 use muniment_core::write_plan::WritePlan;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -48,7 +50,9 @@ impl Fixture {
         let mut journal = RunJournal::open(root.join("journal.sqlite3")).unwrap();
         let run_id = Uuid::now_v7().to_string();
         let effect_id = Uuid::now_v7().to_string();
-        journal.append(0, &started_event(&run_id)).unwrap();
+        journal
+            .append_new_run("local", &started_event(&run_id))
+            .unwrap();
         let diff = CodeDiff {
             schema_version: 1,
             id: "proposal-1".into(),
@@ -288,11 +292,24 @@ fn applied_approval_reopens_with_the_applied_diff_record() {
         "codeDiffId": code_diff_id,
         "diffSha256": diff_sha256,
         "writePlanSha256": write_plan_sha256,
-        "diff": fixture.diff,
+        "summary": {"files": [], "truncated": false},
     }]);
 
     assert_eq!(live["appliedDiffs"], expected);
     assert_eq!(history["appliedDiffs"], expected);
+    assert_eq!(
+        run_detail(
+            &mut fixture.journal,
+            &fixture.cas,
+            None,
+            &fixture.run_id,
+            effect_id,
+            RunDetailKind::CodeDiff,
+        ),
+        Ok(RunDetail::CodeDiff {
+            diff: fixture.diff.clone()
+        })
+    );
 }
 
 #[test]
@@ -355,7 +372,19 @@ fn missing_applied_diff_object_keeps_both_payload_records_without_a_diff() {
         assert_eq!(payload["appliedDiffs"].as_array().unwrap().len(), 1);
         assert_eq!(payload["appliedDiffs"][0]["codeDiffId"], *code_diff_id);
         assert!(payload["appliedDiffs"][0].get("diff").is_none());
+        assert!(payload["appliedDiffs"][0].get("summary").is_none());
     }
+    assert_eq!(
+        run_detail(
+            &mut fixture.journal,
+            &fixture.cas,
+            None,
+            &fixture.run_id,
+            effect_id,
+            RunDetailKind::CodeDiff,
+        ),
+        Err(RunDetailError::NotFound)
+    );
 }
 
 #[test]

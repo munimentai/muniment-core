@@ -395,6 +395,7 @@ fn companion_scope(operation: Operation) -> Option<Option<&'static str>> {
         | Operation::ReaderObjects
         | Operation::ReaderConnect
         | Operation::RunChatEvents
+        | Operation::RunDetail
         | Operation::RunSubmit
         | Operation::RunResume
         | Operation::RunSteer

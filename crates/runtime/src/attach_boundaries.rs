@@ -52,7 +52,7 @@ use muniment_core::memory_runtime::ApplicationMemoryRuntime;
 #[cfg(any(unix, target_os = "windows"))]
 use muniment_core::permission_gate::ChatPermissionAnswer;
 use muniment_core::pi_execution::PiRuntime;
-use muniment_core::run_events::SharedStorage;
+use muniment_core::run_events::{ChatStorage, SharedStorage};
 use muniment_core::run_preparation::{
     append_prepared_run_persistence_failure, prepare_opened_run_with_prompt_storage,
     OpenSelectedFile, SessionThreadStart,
@@ -1497,6 +1497,7 @@ impl RunAttachBoundaries for RuntimeAttachBoundaries {
                 applied_diffs: Vec::new(),
                 pending_permission: None,
                 delta: None,
+                seq: None,
             },
         );
     }
@@ -1505,6 +1506,42 @@ impl RunAttachBoundaries for RuntimeAttachBoundaries {
         &self,
     ) -> Result<muniment_core::run_events::ChatEventSubscription, ProtocolError> {
         Ok(self.chat_events.subscribe())
+    }
+
+    fn subscribe_chat_events_after(
+        &self,
+        cursor: Option<u64>,
+    ) -> Result<muniment_core::run_events::ChatEventSubscription, ProtocolError> {
+        Ok(self.chat_events.subscribe_after(cursor))
+    }
+
+    fn run_detail(
+        &self,
+        request: muniment_core::attach::desktop_service_message::RunDetailRequest,
+    ) -> Result<muniment_core::thread_history::RunDetail, ProtocolError> {
+        use muniment_core::thread_history::{run_detail, RunDetailError};
+        let subject = self
+            .fresh_tokens()
+            .map_err(|error| error.protocol_error())?
+            .subject;
+        let mut storage = self.storage.lock().map_err(|error| {
+            persistence_error("lock", error.to_string()).desktop_protocol_error()
+        })?;
+        let ChatStorage { journal, cas } = &mut *storage;
+        run_detail(
+            journal,
+            cas,
+            subject.as_deref(),
+            &request.run_id,
+            &request.effect_id,
+            request.kind,
+        )
+        .map_err(|error| match error {
+            RunDetailError::RunNotOwned | RunDetailError::NotFound => {
+                ProtocolError::thread_not_found()
+            }
+            error => ProtocolError::persistence_failed_with_reason(format!("{error:?}")),
+        })
     }
 
     fn models_request(
@@ -1597,6 +1634,7 @@ fn sign_in_link_event(url: &str) -> muniment_core::run_events::ChatEvent {
         applied_diffs: Vec::new(),
         pending_permission: None,
         delta: None,
+        seq: None,
     }
 }
 
