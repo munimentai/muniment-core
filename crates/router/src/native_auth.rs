@@ -802,6 +802,17 @@ pub fn refresh_account_in(
     now_ms: i64,
     timeout: Duration,
 ) -> Result<super::config::Account, String> {
+    refresh_account_within(backend, id, now_ms, 0, timeout)
+}
+
+/// [`refresh_account_in`] for a token inside `margin_ms` and a minute of dying.
+pub fn refresh_account_within(
+    backend: &super::store::Backend,
+    id: &str,
+    now_ms: i64,
+    margin_ms: i64,
+    timeout: Duration,
+) -> Result<super::config::Account, String> {
     static REFRESH: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _held = REFRESH.lock().unwrap_or_else(|error| error.into_inner());
     let config = backend
@@ -813,7 +824,9 @@ pub fn refresh_account_in(
         .find(|account| account.id == id)
         .cloned()
         .ok_or("The account was removed.")?;
-    if let Some(result) = refresh_if_expiring(&account.credential, now_ms, timeout) {
+    if let Some(result) =
+        refresh_if_expiring_within(&account.credential, now_ms, margin_ms, timeout)
+    {
         let original = account.credential.clone();
         let fresh = result?;
         account.credential = backend.secrets.swap(id, &original, &fresh)?;
@@ -829,6 +842,17 @@ pub fn refresh_if_expiring(
     now_ms: i64,
     timeout: Duration,
 ) -> Option<Result<Credential, String>> {
+    refresh_if_expiring_within(credential, now_ms, 0, timeout)
+}
+
+/// [`refresh_if_expiring`] for a token inside `margin_ms` and a minute of
+/// dying, so a token handed to another machine still has that long to live.
+pub fn refresh_if_expiring_within(
+    credential: &Credential,
+    now_ms: i64,
+    margin_ms: i64,
+    timeout: Duration,
+) -> Option<Result<Credential, String>> {
     let Credential::Subscription {
         provider,
         refresh: Some(refresh),
@@ -841,7 +865,7 @@ pub fn refresh_if_expiring(
     else {
         return None;
     };
-    if !credential.expired(now_ms) {
+    if !credential.expired(now_ms + margin_ms) {
         return None;
     }
     let refreshed = match provider.as_str() {

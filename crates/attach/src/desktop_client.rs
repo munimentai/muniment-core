@@ -1038,6 +1038,30 @@ impl DesktopClient {
         )
     }
 
+    /// Replaces the model connections this device shares with the runtime. An
+    /// empty bundle stops sharing. Answers the Pi providers the runtime took,
+    /// its router account count and the providers it kept its own entry for.
+    pub fn share_models(&mut self, bundle: Value) -> Result<Value, ClientError> {
+        self.request_body(
+            Operation::ModelsShare,
+            None,
+            bundle,
+            &["pi", "router", "kept"],
+        )
+    }
+
+    /// Reads the model connections this computer's runtime shares, secrets
+    /// included. The local owner route only.
+    pub fn shared_models_bundle(&mut self) -> Result<Value, ClientError> {
+        Ok(self.request_body(
+            Operation::ModelsShareBundle,
+            None,
+            serde_json::json!({}),
+            &["bundle"],
+        )?["bundle"]
+            .take())
+    }
+
     /// Asks the runtime's host to update the runtime to `version`.
     pub fn request_runtime_update(&mut self, version: &str) -> Result<Value, ClientError> {
         self.request_body(

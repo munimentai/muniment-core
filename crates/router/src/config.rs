@@ -14,6 +14,8 @@ use super::family::{family, Family};
 
 /// The router's record in the agent directory.
 pub const CONFIG_FILE: &str = "muniment-router.json";
+/// The id prefix of an account a paired device shares with this runtime.
+pub const SHARED_ACCOUNT_PREFIX: &str = "shared:";
 /// The record of decision-model assistance, beside the router record.
 pub const ASSIST_FILE: &str = "muniment-assist.json";
 /// The Pi provider id the router answers as.

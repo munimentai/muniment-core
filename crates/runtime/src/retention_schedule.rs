@@ -26,6 +26,12 @@ pub fn start_retention_schedule(
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         state.models().restore_router();
+        let models = Arc::downgrade(state.models());
+        muniment_core::shared_models::set_on_change(move || {
+            if let Some(models) = models.upgrade() {
+                models.apply_router();
+            }
+        });
         state.models().restore_search();
         apply_recorded_retention(&state, checked.as_ref());
         let mut retention_checked_at = std::time::Instant::now();

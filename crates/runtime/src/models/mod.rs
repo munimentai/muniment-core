@@ -87,6 +87,14 @@ impl ModelService {
         router::restore(&self.agent, &self.router);
     }
 
+    /// Starts or stops the router listener to match its record, as after a
+    /// paired device changes the connections it shares.
+    pub fn apply_router(&self) {
+        if let Ok(config) = router::load(&self.agent) {
+            let _ = router::apply(&self.agent, &self.router, &config);
+        }
+    }
+
     /// Starts the search server with the recorded engines and writes
     /// pi-web-access's `web-search.json`.
     pub fn restore_search(&self) {

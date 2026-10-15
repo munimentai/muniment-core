@@ -559,6 +559,7 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
                 runtime_name: "Build box".into(),
                 runtime_version: "0.0.1".into(),
                 install_kind: Some(crate::InstallKind::Container),
+                form_factor: Some(crate::FormFactor::Server),
             }),
         },
     )?;
@@ -646,6 +647,8 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         ("runtime-update", Operation::RuntimeUpdate),
         ("remote-settings", Operation::RemoteSettings),
         ("remote-settings-save", Operation::RemoteSettingsSave),
+        ("models-share", Operation::ModelsShare),
+        ("models-share-bundle", Operation::ModelsShareBundle),
     ];
     for (index, (name, operation)) in operations.into_iter().enumerate() {
         let body = request_body(operation);
@@ -1032,6 +1035,11 @@ fn request_body(operation: Operation) -> serde_json::Value {
         }
         Operation::RuntimeInfo => json!({}),
         Operation::RuntimeUpdate => json!({"version": "0.2.0"}),
+        Operation::ModelsShare => json!({
+            "pi": {"openai": {"type": "api_key", "key": "fixture-key"}},
+            "router": []
+        }),
+        Operation::ModelsShareBundle => json!({}),
         Operation::RemoteSettings => json!({}),
         Operation::RemoteSettingsSave => json!({
             "enabled": true,
@@ -1285,6 +1293,8 @@ mod tests {
             Operation::RemoteDeviceRevoke,
             Operation::RuntimeInfo,
             Operation::RuntimeUpdate,
+            Operation::ModelsShare,
+            Operation::ModelsShareBundle,
             Operation::RemoteSettings,
             Operation::RemoteSettingsSave,
         ];
@@ -1341,7 +1351,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            117,
+            119,
             "every canonical fixture must be inventoried"
         );
     }

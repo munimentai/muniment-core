@@ -190,8 +190,40 @@ impl InstallKind {
     }
 }
 
+/// The shape of the computer a runtime runs on, which picks the icon a
+/// paired device draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FormFactor {
+    Laptop,
+    AllInOne,
+    Desktop,
+    Server,
+}
+
+impl FormFactor {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Laptop => "laptop",
+            Self::AllInOne => "all_in_one",
+            Self::Desktop => "desktop",
+            Self::Server => "server",
+        }
+    }
+
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "laptop" => Some(Self::Laptop),
+            "all_in_one" => Some(Self::AllInOne),
+            "desktop" => Some(Self::Desktop),
+            "server" => Some(Self::Server),
+            _ => None,
+        }
+    }
+}
+
 /// What a runtime says about itself in `welcome` and `runtime.info`. An
-/// install kind a later version adds reads as `None`.
+/// install kind or form factor a later version adds reads as `None`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RuntimeInfo {
     pub runtime_id: String,
@@ -199,6 +231,8 @@ pub struct RuntimeInfo {
     pub runtime_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_kind: Option<InstallKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form_factor: Option<FormFactor>,
 }
 
 impl RuntimeInfo {
@@ -209,6 +243,7 @@ impl RuntimeInfo {
         runtime_name: Option<String>,
         runtime_version: Option<String>,
         install_kind: Option<&serde_json::Value>,
+        form_factor: Option<&serde_json::Value>,
     ) -> Option<Self> {
         let runtime_id = runtime_id.filter(|id| Id::new(id.as_str()).is_ok())?;
         let runtime_name = runtime_name.filter(|name| is_valid_display_name(name))?;
@@ -221,6 +256,9 @@ impl RuntimeInfo {
             install_kind: install_kind
                 .and_then(serde_json::Value::as_str)
                 .and_then(InstallKind::from_wire),
+            form_factor: form_factor
+                .and_then(serde_json::Value::as_str)
+                .and_then(FormFactor::from_wire),
         })
     }
 }
@@ -234,6 +272,8 @@ impl<'de> Deserialize<'de> for RuntimeInfo {
             runtime_version: Option<String>,
             #[serde(default)]
             install_kind: Option<serde_json::Value>,
+            #[serde(default)]
+            form_factor: Option<serde_json::Value>,
         }
         let fields = Fields::deserialize(deserializer)?;
         Self::from_fields(
@@ -241,6 +281,7 @@ impl<'de> Deserialize<'de> for RuntimeInfo {
             fields.runtime_name,
             fields.runtime_version,
             fields.install_kind.as_ref(),
+            fields.form_factor.as_ref(),
         )
         .ok_or_else(|| de::Error::custom("invalid runtime info"))
     }

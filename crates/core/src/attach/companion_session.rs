@@ -415,6 +415,8 @@ fn companion_scope(operation: Operation) -> Option<Option<&'static str>> {
         | Operation::RemoteDeviceRevoke
         | Operation::RuntimeInfo
         | Operation::RuntimeUpdate
+        | Operation::ModelsShare
+        | Operation::ModelsShareBundle
         | Operation::RemoteSettings
         | Operation::RemoteSettingsSave => None,
     }

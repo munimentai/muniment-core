@@ -118,7 +118,8 @@ listener is off until the host binds it.
   with the device's name, scopes and times. The client sends it as
   `authorized_client_id` and `authorized_client_credential` on later
   connections. `welcome` carries `runtime_id`, `runtime_name`,
-  `runtime_version` and `install_kind`.
+  `runtime_version`, `install_kind` and, when the hardware says,
+  `form_factor`: `laptop`, `all_in_one`, `desktop` or `server`.
 - `RuntimeAttachState::serve_remote_listener` or `run_remote_listener` serves
   the route: TLS 1.3 only, a connection cap, handshake and first-frame
   deadlines, a 16 KiB first frame, and a growing hold on a peer address after
@@ -133,6 +134,16 @@ listener is off until the host binds it.
   operations except workspace onboarding, migration control, approval
   presentation, same-machine companions, and the host's cloud account and
   phone pairing. Reader connections and model changes need `runtime.admin`.
+  A refusal for a missing scope names what the device lacks.
+- `models.share` replaces the model connections the calling device shares
+  and needs `run.write`. The runtime writes the device's Pi entries beside its
+  own in `auth.json`, keeps its own entry for a provider it already has, adds
+  the device's router accounts as `shared:<device>:<id>`, and records each in
+  `<state root>/agent/muniment-shared.json`. A sign-in whose provider rotates
+  refresh tokens arrives without one, so only the sharing machine refreshes
+  it. Revoking the device removes what it shared. `models.share_bundle`, on
+  the local owner route only, answers this runtime's own connections, each
+  rotating sign-in refreshed when it has under 30 minutes left.
   The route refuses requests that name a file on the runtime's machine: the
   `csv` reader source, and `run.submit` with `files`.
 - Revoking a device closes its live sessions. `runtime.update` takes a

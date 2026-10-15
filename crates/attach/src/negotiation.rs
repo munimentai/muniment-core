@@ -164,6 +164,8 @@ impl<'de> Deserialize<'de> for Welcome {
             runtime_version: Option<String>,
             #[serde(default)]
             install_kind: Option<serde_json::Value>,
+            #[serde(default)]
+            form_factor: Option<serde_json::Value>,
             #[serde(flatten)]
             extra: BTreeMap<String, serde_json::Value>,
         }
@@ -203,6 +205,7 @@ impl<'de> Deserialize<'de> for Welcome {
                 fields.runtime_name,
                 fields.runtime_version,
                 fields.install_kind.as_ref(),
+                fields.form_factor.as_ref(),
             ),
         })
     }

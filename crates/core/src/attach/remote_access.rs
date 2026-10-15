@@ -19,7 +19,7 @@ use muniment_attach::{
     default_pairing_scopes, is_lowercase_hex, is_valid_display_name, is_valid_endpoint,
     CertificateFingerprint, Id, InstallKind, Operation, PairingLink, ProtocolError, Request,
     RuntimeInfo, DEVICE_SECRET_HEX_LENGTH, MAX_PAIRING_ENDPOINTS, PAIRING_SECRET_HEX_LENGTH,
-    REMOTE_SCOPES, SCOPE_RUNTIME_ADMIN, SCOPE_RUNTIME_UPDATE,
+    REMOTE_SCOPES, SCOPE_RUNTIME_ADMIN, SCOPE_RUNTIME_UPDATE, SCOPE_RUN_WRITE,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -38,6 +38,9 @@ const ACCESS_FILE: &str = "access.json";
 const LOCK_FILE: &str = "access.lock";
 const UPDATE_FILE: &str = "runtime-update.json";
 const MAX_VERSION_LENGTH: usize = 64;
+
+/// The `requested_by` of the owner's local desktop route.
+pub(super) const LOCAL_OWNER: &str = "local";
 
 /// What a runtime host says about itself when it opens remote access.
 #[derive(Clone, Debug)]
@@ -228,13 +231,14 @@ impl RemoteAccess {
         Ok(access)
     }
 
-    /// The runtime's id, display name, version and install kind.
+    /// The runtime's id, display name, version, install kind and form factor.
     pub fn runtime_info(&self) -> RuntimeInfo {
         RuntimeInfo {
             runtime_id: self.inner.identity.runtime_id.clone(),
             runtime_name: self.inner.identity.runtime_name.clone(),
             runtime_version: self.inner.runtime_version.clone(),
             install_kind: Some(self.inner.install_kind),
+            form_factor: crate::form_factor::detect(),
         }
     }
 
@@ -251,6 +255,17 @@ impl RemoteAccess {
         }
         *lock(&self.inner.endpoints) = endpoints;
         Ok(())
+    }
+
+    /// The agent directory beside this one, which holds Pi's `auth.json` and
+    /// the router record.
+    pub(super) fn agent_directory(&self) -> PathBuf {
+        let state = self
+            .inner
+            .directory
+            .parent()
+            .unwrap_or(&self.inner.directory);
+        crate::state_root::agent_directory(state)
     }
 
     /// The directory that holds the identity, the store and the settings.
@@ -370,6 +385,12 @@ impl RemoteAccess {
             store.devices.len() != before
         })?;
         lock(&self.inner.revoked).insert(device_id.to_owned());
+        // The model connections the device shared leave with it.
+        if let Err(error) = crate::shared_models::drop_device(&self.agent_directory(), device_id) {
+            crate::runtime_eprintln!(
+                "muniment-runtime: shared connections of device_id={device_id} stayed: {error}"
+            );
+        }
         if removed {
             crate::runtime_eprintln!(
                 "muniment-runtime: remote device revoked device_id={device_id}"
@@ -666,6 +687,42 @@ pub(super) fn dispatch_remote_operation(
             let request = access.request_update(&body.version, requested_by)?;
             Ok(json!({"version": request.version, "requested_at": request.requested_at}))
         }
+        Operation::ModelsShare => {
+            if requested_by == LOCAL_OWNER {
+                return Err(ProtocolError::invalid_request_with_reason(
+                    "This computer cannot share model connections with itself.",
+                ));
+            }
+            if !granted.contains(SCOPE_RUN_WRITE) && !granted.contains(SCOPE_RUNTIME_ADMIN) {
+                return Err(ProtocolError::unauthorized_with_reason(
+                    super::remote_session::missing_scope_reason(SCOPE_RUN_WRITE),
+                ));
+            }
+            let bundle: crate::shared_models::Bundle = serde_json::from_value(body.clone())
+                .map_err(|_| ProtocolError::invalid_request())?;
+            let name = access
+                .list_devices()?
+                .into_iter()
+                .find(|device| device.device_id == requested_by)
+                .map(|device| device.name)
+                .unwrap_or_default();
+            let applied =
+                crate::shared_models::apply(&access.agent_directory(), requested_by, &name, bundle)
+                    .map_err(ProtocolError::invalid_request_with_reason)?;
+            Ok(json!({"pi": applied.pi, "router": applied.router, "kept": applied.kept}))
+        }
+        Operation::ModelsShareBundle => {
+            if requested_by != LOCAL_OWNER {
+                return Err(ProtocolError::unsupported_operation());
+            }
+            empty_body(body)?;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_millis() as i64);
+            let bundle = crate::shared_models::bundle(&access.agent_directory(), now_ms)
+                .map_err(ProtocolError::invalid_request_with_reason)?;
+            Ok(json!({"bundle": bundle}))
+        }
         _ => Err(ProtocolError::unsupported_operation()),
     }
 }
@@ -679,6 +736,8 @@ pub(super) fn is_remote_access_operation(operation: Operation) -> bool {
             | Operation::RemoteDeviceList
             | Operation::RemoteDeviceRevoke
             | Operation::RuntimeUpdate
+            | Operation::ModelsShare
+            | Operation::ModelsShareBundle
     )
 }
 

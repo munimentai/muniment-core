@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use muniment_attach::{
     decode_frame, encode_frame, reconnect_welcome, DeviceCredential, Event, EventName,
     FirstMessage, Id, NegotiationError, Operation, ProtocolError, RemoteClientAuthorizedGrant,
-    Request, VersionRange, MAX_FRAME_LENGTH, SCOPE_RUNTIME_ADMIN, SCOPE_RUN_WRITE,
-    SCOPE_THREAD_READ,
+    Request, VersionRange, MAX_FRAME_LENGTH, SCOPE_RUNTIME_ADMIN, SCOPE_RUNTIME_UPDATE,
+    SCOPE_RUN_WRITE, SCOPE_THREAD_READ,
 };
 use serde_json::Value;
 
@@ -34,6 +34,20 @@ const REMOTE_PROTOCOL: VersionRange = VersionRange { min: 1, max: 1 };
 /// How often a live session rereads the store for a revocation made by
 /// another process. A revocation in this process closes it on its next turn.
 const DEVICE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// What a paired device reads when its pairing lacks the scope a request needs.
+pub(super) fn missing_scope_reason(scope: &str) -> &'static str {
+    match scope {
+        SCOPE_RUNTIME_ADMIN => {
+            "This device can use this machine but cannot change its settings. Pair it again with admin access to change them."
+        }
+        SCOPE_RUN_WRITE => {
+            "This device can read this machine's threads but cannot start runs. Pair it again with run access."
+        }
+        SCOPE_RUNTIME_UPDATE => "This device cannot update this machine. Pair it again with update access.",
+        _ => "This device cannot read this machine's threads. Pair it again.",
+    }
+}
 
 /// How the remote route admits one operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -157,7 +171,9 @@ pub fn remote_rule(operation: Operation, body: &Value) -> RemoteRule {
         | Operation::RemotePairingCreate
         | Operation::RemoteDeviceList
         | Operation::RemoteDeviceRevoke
-        | Operation::RuntimeUpdate => RemoteRule::RemoteAccess,
+        | Operation::RuntimeUpdate
+        | Operation::ModelsShare => RemoteRule::RemoteAccess,
+        Operation::ModelsShareBundle => RemoteRule::Excluded,
     }
 }
 
@@ -474,9 +490,9 @@ impl<H: ThreadListService> DesktopSessionService for RemoteSession<'_, H> {
             RemoteRule::Refused(reason) => {
                 Err(refuse(ProtocolError::invalid_request_with_reason(reason)))
             }
-            RemoteRule::Scope(scope) if !self.scopes.contains(scope) => {
-                Err(refuse(ProtocolError::unauthorized()))
-            }
+            RemoteRule::Scope(scope) if !self.scopes.contains(scope) => Err(refuse(
+                ProtocolError::unauthorized_with_reason(missing_scope_reason(scope)),
+            )),
             RemoteRule::RemoteAccess => {
                 dispatch_remote_operation(&self.access, &request, &self.scopes, &self.device_id)
                     .map(|body| DesktopDispatchResult {
@@ -1052,5 +1068,52 @@ mod tests {
         let admin: BTreeSet<String> = [SCOPE_RUNTIME_ADMIN.to_owned()].into();
         assert!(revoke(&other, &admin).is_ok());
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_device_with_the_run_scope_shares_connections_and_its_revoke_removes_them() {
+        use crate::attach::remote_access::dispatch_remote_operation;
+        let state =
+            std::env::temp_dir().join(format!("muniment-remote-share-{}", uuid::Uuid::now_v7()));
+        let directory = state.join("remote");
+        let access = access(&directory);
+        let agent = crate::state_root::agent_directory(&state);
+        let device = uuid::Uuid::now_v7().to_string();
+        let bundle =
+            json!({"pi": {"openai": {"type": "api_key", "key": "shared-key"}}, "router": []});
+        let share = |granted: &[&str], by: &str| {
+            let granted: BTreeSet<String> = granted.iter().map(|name| (*name).to_owned()).collect();
+            dispatch_remote_operation(
+                &access,
+                &request(Operation::ModelsShare, bundle.clone()),
+                &granted,
+                by,
+            )
+        };
+        let refused = share(&[SCOPE_THREAD_READ], &device).unwrap_err();
+        assert_eq!(refused.code(), muniment_attach::ErrorCode::Unauthorized);
+        assert!(share(&[SCOPE_RUNTIME_ADMIN], "local").is_err());
+        let answer = share(&[SCOPE_THREAD_READ, SCOPE_RUN_WRITE], &device).unwrap();
+        assert_eq!(answer["pi"], json!(["openai"]));
+        let auth = std::fs::read_to_string(agent.join("auth.json")).unwrap();
+        assert!(auth.contains("shared-key"));
+        // A paired device never reads this computer's bundle.
+        let bundle_read = dispatch_remote_operation(
+            &access,
+            &request(Operation::ModelsShareBundle, json!({})),
+            &[SCOPE_RUNTIME_ADMIN.to_owned()].into(),
+            &device,
+        );
+        assert!(bundle_read.is_err());
+        access.revoke_device(&device).unwrap();
+        let auth = std::fs::read_to_string(agent.join("auth.json")).unwrap();
+        assert!(!auth.contains("shared-key"));
+        std::fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn a_missing_scope_names_what_the_device_lacks() {
+        assert!(missing_scope_reason(SCOPE_RUNTIME_ADMIN).contains("cannot change its settings"));
+        assert!(missing_scope_reason(SCOPE_RUN_WRITE).contains("cannot start runs"));
     }
 }

@@ -35,6 +35,10 @@ const BODY_LIMIT: usize = 32 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const READ_TIMEOUT: Duration = Duration::from_secs(600);
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
+/// What a turn reads when the sign-in another machine shares has lapsed.
+const SHARED_EXPIRED: &str =
+    "This shared sign-in expired. Open Muniment on the computer that shares it.";
+
 /// How long a token refresh may take before the turn moves on.
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(12);
 /// How long a request waits for its thread's request in flight before it gets
@@ -1315,6 +1319,16 @@ pub(crate) fn complete(
             // A token inside a minute of dying is traded for a fresh one first, and
             // the pool keeps the fresh one, so this turn and the ones behind it go
             // out on a live token. A refused refresh is the account refused.
+            // A shared sign-in comes without its refresh token, so the machine
+            // that shares it renews it. Once it lapses, the next account serves.
+            if account.id.starts_with(super::config::SHARED_ACCOUNT_PREFIX)
+                && account.credential.expired((state.now_ms)())
+            {
+                let message = SHARED_EXPIRED.to_string();
+                state.record_error(&account.id, &message, true);
+                refusals.push(message);
+                continue;
+            }
             let account = match native_auth::refresh_account_in(
                 &state.backend,
                 &account.id,

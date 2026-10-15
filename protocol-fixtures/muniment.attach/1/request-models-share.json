@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"000000000000000000000000000000a6","operation":"models.share","capability":"fixture-capability","body":{"pi":{"openai":{"key":"fixture-key","type":"api_key"}},"router":[]}}

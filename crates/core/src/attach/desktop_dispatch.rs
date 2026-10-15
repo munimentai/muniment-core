@@ -622,7 +622,7 @@ pub(super) fn dispatch_request<S: ThreadListService>(
             &access,
             &request,
             &super::remote_access::all_scopes(),
-            "local",
+            super::remote_access::LOCAL_OWNER,
         )?);
     }
     request.validate_idempotency_key()?;

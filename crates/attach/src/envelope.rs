@@ -391,6 +391,14 @@ pub enum Operation {
     /// Records a requested runtime version for the host's updater to apply.
     #[serde(rename = "runtime.update")]
     RuntimeUpdate,
+    /// Replaces the model connections the calling device shares with the
+    /// runtime. A paired device with the run scope only.
+    #[serde(rename = "models.share")]
+    ModelsShare,
+    /// Reads the model connections this runtime shares with the machines it
+    /// is paired with, secrets included. The local owner route only.
+    #[serde(rename = "models.share_bundle")]
+    ModelsShareBundle,
     /// Reads the remote access settings with the listener's live state. The
     /// local owner route only.
     #[serde(rename = "remote.settings")]
@@ -503,6 +511,8 @@ impl Operation {
             Self::RemoteDeviceRevoke => "remote.device_revoke",
             Self::RuntimeInfo => "runtime.info",
             Self::RuntimeUpdate => "runtime.update",
+            Self::ModelsShare => "models.share",
+            Self::ModelsShareBundle => "models.share_bundle",
             Self::RemoteSettings => "remote.settings",
             Self::RemoteSettingsSave => "remote.settings_save",
         }
