@@ -3,11 +3,13 @@
 //! with its accounts, routes and classifier, the local server scan and
 //! provider sign-in. It writes Pi's files and the router config under their
 //! locks, and it runs the router listener. It also holds the web search
-//! settings and runs the built-in search server. Clients reach it through the
+//! settings and runs the built-in search server, and it reads and writes the
+//! memory profile, facts and recall settings. Clients reach it through the
 //! `models.request` attach operation and hear sign-in steps as `models.login`
 //! events.
 
 mod connections;
+mod memory;
 mod pool_sign_in;
 mod providers;
 mod router;
@@ -380,6 +382,56 @@ impl ModelService {
                     &data.provider,
                 ))
             }
+            ModelAction::MemoryProfileRead => {
+                parse::<Empty>(data)?;
+                answer(muniment_core::memory_files::profile_read(
+                    &self.state_directory,
+                ))
+            }
+            ModelAction::MemoryProfileSave => {
+                let data: MemoryProfile = parse(data)?;
+                muniment_core::memory_files::profile_save(&self.state_directory, &data.content)
+                    .map(|()| Value::Null)
+            }
+            ModelAction::MemoryFacts => answer(memory::facts(&self.state_directory, parse(data)?)),
+            ModelAction::MemoryDeletedFacts => {
+                answer(memory::deleted_facts(&self.state_directory, parse(data)?))
+            }
+            ModelAction::MemoryFactSave => {
+                let data: MemoryFact = parse(data)?;
+                answer(memory::fact_save(
+                    &self.state_directory,
+                    memory::Scope { agent: data.agent },
+                    data.fact,
+                ))
+            }
+            ModelAction::MemoryFactDelete => {
+                let data: MemoryFactId = parse(data)?;
+                memory::fact_delete(
+                    &self.state_directory,
+                    memory::Scope { agent: data.agent },
+                    &data.id,
+                )
+            }
+            ModelAction::MemoryFactRestore => {
+                let data: MemoryFactId = parse(data)?;
+                memory::fact_restore(
+                    &self.state_directory,
+                    memory::Scope { agent: data.agent },
+                    &data.id,
+                )
+            }
+            ModelAction::MemoryRecallSettings => {
+                parse::<Empty>(data)?;
+                memory::recall_settings(&self.state_directory)
+            }
+            ModelAction::MemoryRecallSettingsSave => {
+                let data: MemoryRecall = parse(data)?;
+                answer(memory::recall_settings_save(
+                    &self.state_directory,
+                    data.settings,
+                ))
+            }
         })
     }
 }
@@ -497,6 +549,34 @@ struct SearchKey {
     base_url: Option<String>,
     #[serde(default)]
     extra: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryProfile {
+    content: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryFact {
+    #[serde(default)]
+    agent: Option<String>,
+    fact: muniment_core::memory_files::Fact,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryFactId {
+    #[serde(default)]
+    agent: Option<String>,
+    id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryRecall {
+    settings: muniment_core::memory_files::RecallSettings,
 }
 
 #[derive(Deserialize)]
@@ -690,6 +770,112 @@ mod tests {
             );
         }
         assert_eq!(service.subscribers.lock().unwrap().len(), 2);
+        std::fs::remove_dir_all(profile).unwrap();
+    }
+
+    #[test]
+    fn memory_actions_serve_settings_and_mark_their_facts_as_the_users() {
+        let (service, profile) = service();
+        let home = profile.join("Home");
+        muniment_core::home::confirm_home(&profile, &home).unwrap();
+        let key = || Id::new(uuid::Uuid::now_v7().simple().to_string()).unwrap();
+        let run = |action, data: Value, keyed: bool| {
+            service.request(request(action, data), keyed.then(key).as_ref())
+        };
+        assert_eq!(
+            run(
+                ModelAction::MemoryRecallSettings,
+                serde_json::json!({}),
+                false
+            )
+            .unwrap(),
+            Value::Null
+        );
+        let settings = serde_json::json!({"learn": false, "use": true, "ask": true});
+        assert_eq!(
+            run(
+                ModelAction::MemoryRecallSettingsSave,
+                serde_json::json!({"settings": settings}),
+                true
+            )
+            .unwrap(),
+            settings
+        );
+        assert_eq!(
+            run(
+                ModelAction::MemoryRecallSettings,
+                serde_json::json!({}),
+                false
+            )
+            .unwrap(),
+            settings
+        );
+        run(
+            ModelAction::MemoryProfileSave,
+            serde_json::json!({"content": "Call me Sam."}),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            run(ModelAction::MemoryProfileRead, serde_json::json!({}), false).unwrap(),
+            "Call me Sam."
+        );
+        let saved = run(
+            ModelAction::MemoryFactSave,
+            serde_json::json!({"fact": {"id": "", "title": "Tone", "content": "Use short answers.", "source": "Added in settings", "trust": "external"}}),
+            true,
+        )
+        .unwrap();
+        assert_eq!(saved["trust"], "user");
+        let id = saved["id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            run(ModelAction::MemoryFacts, serde_json::json!({}), false).unwrap()[0]["id"],
+            id.as_str()
+        );
+        run(
+            ModelAction::MemoryFactDelete,
+            serde_json::json!({"id": id}),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            run(ModelAction::MemoryFacts, serde_json::json!({}), false).unwrap(),
+            serde_json::json!([])
+        );
+        assert_eq!(
+            run(
+                ModelAction::MemoryDeletedFacts,
+                serde_json::json!({}),
+                false
+            )
+            .unwrap()[0]["id"],
+            id.as_str()
+        );
+        run(
+            ModelAction::MemoryFactRestore,
+            serde_json::json!({"id": id}),
+            true,
+        )
+        .unwrap();
+        assert!(home.join(format!("memory/facts/{id}.md")).is_file());
+        assert!(reason(
+            &run(
+                ModelAction::MemoryFacts,
+                serde_json::json!({"agent": "missing"}),
+                false
+            )
+            .unwrap_err()
+        )
+        .is_some());
+        assert!(reason(
+            &run(
+                ModelAction::MemoryFacts,
+                serde_json::json!({"other": 1}),
+                false
+            )
+            .unwrap_err()
+        )
+        .is_none());
         std::fs::remove_dir_all(profile).unwrap();
     }
 }

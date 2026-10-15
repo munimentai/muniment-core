@@ -1,5 +1,7 @@
 //! The model service's action set, carried by the `models.request` operation.
-//! The service also holds the web search settings, under the `search_` actions.
+//! The service also holds the web search settings, under the `search_` actions,
+//! and the profile, facts and recall settings of memory, under the `memory_`
+//! actions.
 //!
 //! A `models.request` body is `{"action": <action>, "data": <object>}`. The
 //! runtime answers `{"result": <value>}`. An action that changes a setting, a
@@ -57,11 +59,20 @@ pub enum ModelAction {
     SearchSaveEngines,
     SearchSetKey,
     SearchRemoveKey,
+    MemoryProfileRead,
+    MemoryProfileSave,
+    MemoryFacts,
+    MemoryDeletedFacts,
+    MemoryFactSave,
+    MemoryFactDelete,
+    MemoryFactRestore,
+    MemoryRecallSettings,
+    MemoryRecallSettingsSave,
 }
 
 impl ModelAction {
     /// Every action, in wire order.
-    pub const ALL: [ModelAction; 37] = [
+    pub const ALL: [ModelAction; 46] = [
         Self::ProviderStatus,
         Self::StoreProviderKey,
         Self::StoreLocalProvider,
@@ -99,6 +110,15 @@ impl ModelAction {
         Self::SearchSaveEngines,
         Self::SearchSetKey,
         Self::SearchRemoveKey,
+        Self::MemoryProfileRead,
+        Self::MemoryProfileSave,
+        Self::MemoryFacts,
+        Self::MemoryDeletedFacts,
+        Self::MemoryFactSave,
+        Self::MemoryFactDelete,
+        Self::MemoryFactRestore,
+        Self::MemoryRecallSettings,
+        Self::MemoryRecallSettingsSave,
     ];
 
     /// Whether the action changes a setting, a credential or a sign-in, so its
@@ -114,6 +134,10 @@ impl ModelAction {
                 | Self::RouterTestRoute
                 | Self::ProviderScan
                 | Self::SearchSettings
+                | Self::MemoryProfileRead
+                | Self::MemoryFacts
+                | Self::MemoryDeletedFacts
+                | Self::MemoryRecallSettings
         )
     }
 
@@ -176,6 +200,15 @@ impl ModelAction {
             Self::SearchSaveEngines => "search_save_engines",
             Self::SearchSetKey => "search_set_key",
             Self::SearchRemoveKey => "search_remove_key",
+            Self::MemoryProfileRead => "memory_profile_read",
+            Self::MemoryProfileSave => "memory_profile_save",
+            Self::MemoryFacts => "memory_facts",
+            Self::MemoryDeletedFacts => "memory_deleted_facts",
+            Self::MemoryFactSave => "memory_fact_save",
+            Self::MemoryFactDelete => "memory_fact_delete",
+            Self::MemoryFactRestore => "memory_fact_restore",
+            Self::MemoryRecallSettings => "memory_recall_settings",
+            Self::MemoryRecallSettingsSave => "memory_recall_settings_save",
         }
     }
 }
