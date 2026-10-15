@@ -1,0 +1,63 @@
+# The headless Muniment runtime: `muniment-server` built from this checkout,
+# the pinned Pi for the image's architecture and its pinned extension
+# packages, run as a non-root user with state in the /data volume.
+#
+#   docker build -f deploy/runtime/Containerfile -t muniment-runtime .
+#   docker run -d -v muniment-data:/data muniment-runtime
+#
+# `muniment-server prepare` installs Pi through the runtime's own installer,
+# which checks the archive's size and SHA-256 against pins/pins.toml, and
+# installs the packages from pins/packages.bun.lock. The packages land in
+# /data, and Docker copies them into a new named volume on its first mount. A
+# bind mount starts empty, and the runtime installs them on the first run.
+#
+# Secrets live in /data/credentials. A MUNIMENT_SECRET_<SERVICE>_<NAME>
+# variable overrides one.
+
+ARG RUST_IMAGE=rust:1-slim-bookworm
+ARG RUNTIME_IMAGE=debian:bookworm-slim
+
+FROM ${RUST_IMAGE} AS build
+WORKDIR /src
+COPY . .
+# The speech runtime libraries sit beside the binary, where its rpath looks.
+RUN cargo build --release --locked -p muniment-server --bin muniment-server \
+    && strip target/release/muniment-server \
+    && mkdir -p /opt/muniment/bin \
+    && cp target/release/muniment-server target/release/*.so* /opt/muniment/bin/
+# Pi and the packages install at the paths the image runs them from. The
+# packages are hard links into Bun's cache, so removing the cache keeps them.
+RUN MUNIMENT_STATE_DIR=/data MUNIMENT_PI_ROOT=/opt/muniment/harness HOME=/data \
+        /opt/muniment/bin/muniment-server prepare > /opt/muniment/pi-path \
+    && ln -s "$(cat /opt/muniment/pi-path)" /opt/muniment/bin/pi \
+    && rm -rf /opt/muniment/pi-path /data/.bun \
+    && /opt/muniment/bin/pi --version
+
+FROM ${RUNTIME_IMAGE}
+# Pi's tools run shell commands, git and curl. tini reaps the processes they
+# leave behind and passes SIGTERM to the server.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl git tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 65532 muniment \
+    && useradd --uid 65532 --gid 65532 --home-dir /data --no-create-home \
+        --shell /usr/sbin/nologin muniment
+COPY --from=build /opt/muniment/bin /opt/muniment/bin
+# The runtime sets the Pi executable owner-only each time it resolves it, so
+# the runtime user owns the installed Pi.
+COPY --from=build --chown=65532:65532 /opt/muniment/harness /opt/muniment/harness
+COPY --from=build --chown=65532:65532 /data /data
+# A new named volume takes the mode of /data, and the state root is owner-only.
+RUN ln -s /opt/muniment/bin/muniment-server /usr/local/bin/muniment-server \
+    && ln -s /opt/muniment/bin/pi /usr/local/bin/pi \
+    && chmod 0700 /data
+USER 65532:65532
+ENV HOME=/data \
+    MUNIMENT_STATE_DIR=/data \
+    MUNIMENT_PI_ROOT=/opt/muniment/harness
+VOLUME ["/data"]
+STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD ["/usr/local/bin/muniment-server", "health"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/muniment-server"]
+CMD ["serve"]

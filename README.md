@@ -186,6 +186,15 @@ upper-cased, with each character other than an ASCII letter or digit written
 as `_`. The reader's `ai.muniment.reader` secret `stripe` is
 `MUNIMENT_SECRET_AI_MUNIMENT_READER_STRIPE`.
 
+`deploy/runtime/Containerfile` builds a non-root image with the server, the
+pinned Pi for the image's architecture and the pinned packages. State lives in
+the `/data` volume, and the health check runs `muniment-server health`:
+
+```sh
+docker build -f deploy/runtime/Containerfile -t muniment-runtime .
+docker run -d --name muniment -v muniment-data:/data muniment-runtime
+```
+
 ## Development
 
 ```sh
