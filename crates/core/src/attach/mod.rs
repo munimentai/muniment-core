@@ -51,7 +51,9 @@ mod quiesce;
 mod remote_access;
 mod remote_identity;
 mod remote_listener;
+mod remote_route;
 mod remote_session;
+mod remote_settings;
 mod runtime_activity;
 #[cfg(unix)]
 mod termination;
@@ -138,9 +140,17 @@ pub use remote_listener::{
     run_remote_listener, FailureBackoff, FailureBackoffPolicy, RemoteListener,
     RemoteListenerConfig, RemoteListenerError, RemoteStream,
 };
+pub use remote_route::{
+    InterfaceSource, RemoteRoute, RemoteRouteOptions, RemoteRouteStatus, RemoteServe,
+};
 pub use remote_session::{
     admit_remote_client, remote_rule, serve_remote_client, AdmittedRemoteClient,
     RemoteAdmissionError, RemoteRule,
+};
+pub use remote_settings::{
+    advertised_endpoints, interface_addresses, load_remote_settings, read_listener_status,
+    save_remote_settings, AdvertisedEndpoint, EndpointKind, RemoteAccessSettings,
+    RemoteListenerStatus, RemoteSettingsOverrides, DEFAULT_REMOTE_PORT,
 };
 pub use runtime_activity::*;
 #[cfg(unix)]

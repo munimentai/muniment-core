@@ -10,9 +10,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use muniment_attach::{
-    decode_frame, encode_frame, reconnect_welcome, DeviceCredential, Event, FirstMessage, Id,
-    NegotiationError, Operation, ProtocolError, RemoteClientAuthorizedGrant, Request, VersionRange,
-    MAX_FRAME_LENGTH, SCOPE_RUNTIME_ADMIN, SCOPE_RUN_WRITE, SCOPE_THREAD_READ,
+    decode_frame, encode_frame, reconnect_welcome, DeviceCredential, Event, EventName,
+    FirstMessage, Id, NegotiationError, Operation, ProtocolError, RemoteClientAuthorizedGrant,
+    Request, VersionRange, MAX_FRAME_LENGTH, SCOPE_RUNTIME_ADMIN, SCOPE_RUN_WRITE,
+    SCOPE_THREAD_READ,
 };
 use serde_json::Value;
 
@@ -67,7 +68,11 @@ pub fn remote_rule(operation: Operation, body: &Value) -> RemoteRule {
         | Operation::SessionSignOut
         | Operation::PairingChallenge
         | Operation::PairingStatus
-        | Operation::PairingRevoke => RemoteRule::Excluded,
+        | Operation::PairingRevoke
+        // The listener's own settings: a remote client could turn off the
+        // route it speaks over or move it.
+        | Operation::RemoteSettings
+        | Operation::RemoteSettingsSave => RemoteRule::Excluded,
         Operation::RequestCancel => RemoteRule::AnyScope,
         Operation::ThreadList
         | Operation::ThreadOpen
@@ -413,11 +418,15 @@ impl<H: ThreadListService> DesktopSessionService for RemoteSession<'_, H> {
         state: &mut Self::State,
         wait: Duration,
     ) -> Result<(Vec<Event>, bool), AttachSessionError> {
-        let drained = DesktopSessionService::drain_chat_events(self.service, state, wait)?;
-        if !drained.0.is_empty() {
+        let (mut events, closed) =
+            DesktopSessionService::drain_chat_events(self.service, state, wait)?;
+        // Update requests reach the owner's local desktop, whose host runs
+        // the updater, and never a remote device.
+        events.retain(|event| event.event != EventName::RuntimeUpdateRequested);
+        if !events.is_empty() {
             self.touch();
         }
-        Ok(drained)
+        Ok((events, closed))
     }
 
     fn dispatch_request(
@@ -469,6 +478,49 @@ mod tests {
     impl ThreadListService for Owner {
         fn remote_access(&self) -> Option<RemoteAccess> {
             Some(self.0.clone())
+        }
+    }
+
+    /// The owner's service with the remote route and a chat-event stream.
+    struct RoutedOwner {
+        route: std::sync::Arc<crate::attach::RemoteRoute>,
+        _chat: std::sync::mpsc::Sender<crate::run_events::ChatEvent>,
+        chat: Option<std::sync::mpsc::Receiver<crate::run_events::ChatEvent>>,
+    }
+
+    impl RoutedOwner {
+        fn new(access: RemoteAccess) -> Self {
+            let serve: crate::attach::RemoteServe =
+                std::sync::Arc::new(|_, _, _| Ok::<(), crate::attach::RemoteListenerError>(()));
+            let (sender, receiver) = std::sync::mpsc::channel();
+            Self {
+                route: std::sync::Arc::new(crate::attach::RemoteRoute::new(
+                    access,
+                    crate::attach::RemoteSettingsOverrides::default(),
+                    serve,
+                )),
+                _chat: sender,
+                chat: Some(receiver),
+            }
+        }
+    }
+
+    impl ThreadListService for RoutedOwner {
+        fn remote_access(&self) -> Option<RemoteAccess> {
+            Some(self.route.access().clone())
+        }
+
+        fn remote_route(&self) -> Option<std::sync::Arc<crate::attach::RemoteRoute>> {
+            Some(std::sync::Arc::clone(&self.route))
+        }
+
+        fn subscribe_chat_events(
+            &mut self,
+        ) -> Result<crate::run_events::ChatEventSubscription, ProtocolError> {
+            self.chat
+                .take()
+                .map(crate::run_events::ChatEventSubscription::detached)
+                .ok_or_else(ProtocolError::invalid_request)
         }
     }
 
@@ -586,6 +638,143 @@ mod tests {
                 .code(),
             muniment_attach::ErrorCode::UnsupportedOperation
         );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn remote_settings_are_served_on_the_local_owner_route_only() {
+        let directory =
+            std::env::temp_dir().join(format!("muniment-remote-settings-{}", uuid::Uuid::now_v7()));
+        let access = access(&directory);
+        let mut owner = RoutedOwner::new(access.clone());
+        let read = dispatch(&mut owner, request(Operation::RemoteSettings, json!({}))).unwrap();
+        assert_eq!(read["settings"]["enabled"], false);
+        assert_eq!(read["runtime_id"], access.runtime_info().runtime_id);
+        assert_eq!(
+            read["certificate_sha256"],
+            access.certificate_fingerprint().to_hex()
+        );
+        let saved = dispatch(
+            &mut owner,
+            request(
+                Operation::RemoteSettingsSave,
+                json!({"enabled": true, "listen": "127.0.0.1:0", "endpoints": ["198.51.100.2:7443"]}),
+            ),
+        )
+        .unwrap();
+        assert_eq!(saved["settings"]["enabled"], true);
+        assert_eq!(saved["settings"]["listen"], "127.0.0.1:0");
+        assert!(saved["listening"].is_string());
+        assert_eq!(
+            saved["endpoints"],
+            json!([{"endpoint": "198.51.100.2:7443", "kind": "configured"}])
+        );
+        for body in [
+            json!({"enabled": true, "extra": 1}),
+            json!({"enabled": true, "listen": "not an address"}),
+            json!({"listen": null}),
+        ] {
+            assert_eq!(
+                dispatch(&mut owner, request(Operation::RemoteSettingsSave, body))
+                    .unwrap_err()
+                    .code(),
+                muniment_attach::ErrorCode::InvalidRequest
+            );
+        }
+        assert_eq!(
+            dispatch(&mut Plain, request(Operation::RemoteSettings, json!({})))
+                .unwrap_err()
+                .code(),
+            muniment_attach::ErrorCode::UnsupportedOperation
+        );
+
+        // A paired admin device reaches neither operation.
+        for operation in [Operation::RemoteSettings, Operation::RemoteSettingsSave] {
+            assert_eq!(remote_rule(operation, &json!({})), RemoteRule::Excluded);
+        }
+        let mut session = RemoteSession {
+            service: &mut owner,
+            access: access.clone(),
+            device_id: uuid::Uuid::now_v7().to_string(),
+            scopes: crate::attach::remote_access::all_scopes(),
+            expires: Instant::now() + Duration::from_secs(60),
+            idle: Duration::from_secs(60),
+            last_activity: Instant::now(),
+            next_device_check: Instant::now() + Duration::from_secs(60),
+        };
+        for (operation, body) in [
+            (Operation::RemoteSettings, json!({})),
+            (
+                Operation::RemoteSettingsSave,
+                json!({"enabled": false, "listen": null, "endpoints": []}),
+            ),
+        ] {
+            assert_eq!(
+                dispatch(&mut session, request(operation, body))
+                    .unwrap_err()
+                    .code(),
+                muniment_attach::ErrorCode::UnsupportedOperation
+            );
+        }
+        assert_eq!(
+            owner.route.status().settings.listen,
+            Some("127.0.0.1:0".parse().unwrap())
+        );
+        owner.route.stop();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn an_update_request_reaches_the_local_owner_subscription_and_no_remote_device() {
+        let directory =
+            std::env::temp_dir().join(format!("muniment-remote-update-{}", uuid::Uuid::now_v7()));
+        let access = access(&directory);
+        let mut owner = RoutedOwner::new(access.clone());
+        let mut state = owner.new_session_state();
+        owner
+            .dispatch_request(
+                request(Operation::RunChatEvents, json!({})),
+                "",
+                provenance(),
+                &mut state,
+            )
+            .map_err(|failure| failure.error)
+            .unwrap();
+        access.request_update("2.1.0", "local").unwrap();
+        let (events, _) = owner
+            .drain_chat_events(&mut state, Duration::from_millis(10))
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, EventName::RuntimeUpdateRequested);
+        assert_eq!(events[0].body["version"], "2.1.0");
+        assert_eq!(events[0].body["requested_by"], "local");
+
+        let mut remote_owner = RoutedOwner::new(access.clone());
+        let mut session = RemoteSession {
+            service: &mut remote_owner,
+            access: access.clone(),
+            device_id: uuid::Uuid::now_v7().to_string(),
+            scopes: crate::attach::remote_access::all_scopes(),
+            expires: Instant::now() + Duration::from_secs(60),
+            idle: Duration::from_secs(60),
+            last_activity: Instant::now(),
+            next_device_check: Instant::now() + Duration::from_secs(60),
+        };
+        let mut remote_state = session.new_session_state();
+        session
+            .dispatch_request(
+                request(Operation::RunChatEvents, json!({})),
+                "",
+                provenance(),
+                &mut remote_state,
+            )
+            .map_err(|failure| failure.error)
+            .unwrap();
+        access.request_update("2.2.0", "local").unwrap();
+        let (events, _) = session
+            .drain_chat_events(&mut remote_state, Duration::from_millis(10))
+            .unwrap();
+        assert!(events.is_empty());
         std::fs::remove_dir_all(directory).unwrap();
     }
 

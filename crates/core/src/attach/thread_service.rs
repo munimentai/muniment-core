@@ -93,6 +93,13 @@ pub trait ThreadListService {
         None
     }
 
+    /// The runtime's remote listener and its settings, which only the
+    /// owner's local desktop route reads and changes. `None` answers those
+    /// operations as unsupported.
+    fn remote_route(&self) -> Option<std::sync::Arc<super::RemoteRoute>> {
+        None
+    }
+
     fn reconnect_approval(&self) -> Option<Approval> {
         None
     }

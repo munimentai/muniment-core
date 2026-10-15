@@ -31,6 +31,9 @@ pub enum SubscriptionEvent {
     Chat(Value),
     /// One step of a provider sign-in, the `local-mode-login` payload.
     ModelsLogin(Value),
+    /// A client asked the host to update the runtime: `version`,
+    /// `requested_at` and `requested_by`. The local owner route only.
+    RuntimeUpdateRequested(Value),
 }
 
 /// A connection-bound client for the peer-authorized desktop session.
@@ -647,7 +650,12 @@ impl DesktopClient {
                 return Err(ClientError::CapabilityRevoked);
             }
             if &event.subscription_id != subscription_id
-                || !matches!(event.event, EventName::ChatEvent | EventName::ModelsLogin)
+                || !matches!(
+                    event.event,
+                    EventName::ChatEvent
+                        | EventName::ModelsLogin
+                        | EventName::RuntimeUpdateRequested
+                )
                 || event.run_id.is_some()
                 || event.run_seq.is_some()
             {
@@ -658,6 +666,12 @@ impl DesktopClient {
                     return Err(ClientError::UnexpectedMessage);
                 }
                 return Ok(SubscriptionEvent::ModelsLogin(event.body));
+            }
+            if event.event == EventName::RuntimeUpdateRequested {
+                if !event.body["version"].is_string() {
+                    return Err(ClientError::UnexpectedMessage);
+                }
+                return Ok(SubscriptionEvent::RuntimeUpdateRequested(event.body));
             }
             if let Some(body) = snapshot.push(event.body).map_err(map_frame_error)? {
                 if let Some(seq) = body.get("seq").and_then(Value::as_u64) {
@@ -993,6 +1007,35 @@ impl DesktopClient {
         )?["revoked"]
             .as_bool()
             .ok_or(ClientError::UnexpectedMessage)
+    }
+
+    /// Reads the remote access settings, the runtime's id and certificate
+    /// fingerprint, and the listener's live address and endpoints.
+    pub fn remote_settings(&mut self) -> Result<Value, ClientError> {
+        self.request_body(
+            Operation::RemoteSettings,
+            None,
+            serde_json::json!({}),
+            &["settings", "runtime_id", "certificate_sha256", "endpoints"],
+        )
+    }
+
+    /// Saves the remote access settings. The runtime starts or stops its
+    /// listener to match and answers as `remote_settings` does. `listen`
+    /// `None` keeps the default address and an empty `endpoints` lets the
+    /// runtime list its own.
+    pub fn save_remote_settings(
+        &mut self,
+        enabled: bool,
+        listen: Option<&str>,
+        endpoints: &[String],
+    ) -> Result<Value, ClientError> {
+        self.request_body(
+            Operation::RemoteSettingsSave,
+            None,
+            serde_json::json!({"enabled": enabled, "listen": listen, "endpoints": endpoints}),
+            &["settings", "runtime_id", "certificate_sha256", "endpoints"],
+        )
     }
 
     /// Asks the runtime's host to update the runtime to `version`.

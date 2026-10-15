@@ -34,5 +34,6 @@ pub fn compose_attach_service(
         client_identity: None,
         drain_state: muniment_core::attach::DrainState::new(),
         remote_access: None,
+        remote_route: None,
     })
 }

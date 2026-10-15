@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use muniment_core::attach::ApprovalCoordinator;
 use muniment_core::attach::{
     CompanionRegistry, DesktopAttachService, DrainState, ProtocolError, RemoteAccess,
-    RemoteAccessOpenError, RemoteAccessOptions, RemoteListener, RemoteListenerError,
-    RuntimeActivityRegistry, SignedWorkspaceApproval,
+    RemoteAccessOpenError, RemoteAccessOptions, RemoteListener, RemoteListenerError, RemoteRoute,
+    RemoteRouteOptions, RemoteServe, RuntimeActivityRegistry, SignedWorkspaceApproval,
 };
 use muniment_core::memory_runtime::ApplicationMemoryRuntime;
 use muniment_core::pi_execution::PiRuntime;
@@ -43,6 +43,7 @@ pub struct RuntimeAttachState {
     chat_events: RuntimeChatEventBroadcast,
     models: Arc<ModelService>,
     remote_access: Mutex<Option<RemoteAccess>>,
+    remote_route: Mutex<Option<Arc<RemoteRoute>>>,
 }
 
 impl RuntimeAttachState {
@@ -102,6 +103,7 @@ impl RuntimeAttachState {
             chat_events: RuntimeChatEventBroadcast::new(approval),
             models,
             remote_access: Mutex::new(None),
+            remote_route: Mutex::new(None),
         })
     }
 
@@ -144,22 +146,71 @@ impl RuntimeAttachState {
         )?;
         service.drain_state = self.drain_state.clone();
         service.remote_access = self.remote_access();
+        service.remote_route = self.remote_route();
         Ok(service)
     }
 
     /// Opens remote access under `<state root>/remote` and shares it with
     /// every attach service composed after this call, so the owner's local
-    /// desktop route can pair and revoke devices.
+    /// desktop route can pair and revoke devices. Later local desktop
+    /// welcomes carry the runtime's identity.
     pub fn open_remote_access(
         &self,
         options: RemoteAccessOptions,
     ) -> Result<RemoteAccess, RemoteAccessOpenError> {
         let access = RemoteAccess::open(self.profile_directory.join("remote"), options)?;
+        access.announce_on_local_route();
         *self
             .remote_access
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(access.clone());
         Ok(access)
+    }
+
+    /// Opens remote access and starts the remote listener as the stored
+    /// settings and the host's overrides direct. The owner's local desktop
+    /// route then reads and saves the settings, and a save starts, stops or
+    /// rebinds the listener. The host calls `stop_remote_route` before it
+    /// exits.
+    pub fn start_remote_route(
+        self: &Arc<Self>,
+        options: RemoteRouteOptions,
+    ) -> Result<Arc<RemoteRoute>, RemoteAccessOpenError> {
+        let access = self.open_remote_access(options.access)?;
+        let state = Arc::downgrade(self);
+        let serve: RemoteServe = Arc::new(move |listener, access, stop| match state.upgrade() {
+            Some(state) => state.serve_remote_listener(listener, access, stop),
+            None => Ok(()),
+        });
+        // A route started earlier releases its port before the new one binds.
+        self.stop_remote_route();
+        let route = Arc::new(RemoteRoute::new(access, options.overrides, serve));
+        route.apply();
+        *self
+            .remote_route
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&route));
+        Ok(route)
+    }
+
+    /// The remote route the host started, if any.
+    pub fn remote_route(&self) -> Option<Arc<RemoteRoute>> {
+        self.remote_route
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Stops the remote listener and forgets the route.
+    pub fn stop_remote_route(&self) {
+        let route = self
+            .remote_route
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(route) = route {
+            route.stop();
+        }
     }
 
     /// The remote access the host opened, if any.

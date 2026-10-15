@@ -30,7 +30,8 @@ fn serves_the_endpoint_until_stop_and_refuses_a_second_runtime() {
     let (stop_tx, stop_rx) = mpsc::channel();
 
     thread::scope(|scope| {
-        let runtime = scope.spawn(|| run_runtime(RuntimeHost::default(), &directories, stop_rx));
+        let runtime =
+            scope.spawn(|| run_runtime(RuntimeHost::default(), &directories, None, stop_rx));
         let deadline = Instant::now() + Duration::from_secs(5);
         while !endpoint.exists() {
             assert!(Instant::now() < deadline, "the runtime binds its endpoint");
@@ -39,7 +40,7 @@ fn serves_the_endpoint_until_stop_and_refuses_a_second_runtime() {
 
         let (_second_stop, second_stop_rx) = mpsc::channel();
         assert_eq!(
-            run_runtime(RuntimeHost::default(), &directories, second_stop_rx),
+            run_runtime(RuntimeHost::default(), &directories, None, second_stop_rx),
             Err(RunRuntimeError::Listener(AttachListenerError::InstanceLock))
         );
 

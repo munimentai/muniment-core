@@ -82,7 +82,7 @@ pub fn admit_desktop_client_over_stream_with_frame<S: DeadlineStream + ?Sized>(
     approval: Option<&Approval>,
     deadline: Instant,
 ) -> Result<AdmittedDesktopClient, DesktopClientAdmissionError> {
-    let negotiated = negotiate_first_frame(stream, frame, runtime_version, deadline)?;
+    let negotiated = negotiate_first_frame(stream, frame, runtime_version, true, deadline)?;
     let mut workspace_scopes = BTreeMap::new();
     if let Some(approval) = approval.as_ref() {
         workspace_scopes.insert(approval.workspace.clone(), approval.scopes.clone());
@@ -127,7 +127,7 @@ pub fn admit_approval_presenter_over_stream_with_frame<S: DeadlineStream + ?Size
     runtime_version: &str,
     deadline: Instant,
 ) -> Result<AdmittedDesktopClient, DesktopClientAdmissionError> {
-    let negotiated = negotiate_first_frame(stream, frame, runtime_version, deadline)?;
+    let negotiated = negotiate_first_frame(stream, frame, runtime_version, false, deadline)?;
     let grant = PeerAuthorizedGrant {
         capability: negotiated.capability.clone(),
         expires_at: MAX_CAPABILITY_LIFETIME.as_secs(),
@@ -157,11 +157,13 @@ struct NegotiatedAdmission {
 }
 
 /// Reads the hello, negotiates the version, writes the welcome and mints the
-/// capability. The caller writes the grant that fits the route.
+/// capability. The caller writes the grant that fits the route. A desktop
+/// client's welcome carries the runtime identity the host announced.
 fn negotiate_first_frame<S: DeadlineStream + ?Sized>(
     stream: &mut S,
     frame: &[u8],
     runtime_version: &str,
+    announce_runtime: bool,
     deadline: Instant,
 ) -> Result<NegotiatedAdmission, DesktopClientAdmissionError> {
     if frame.len() >= 4
@@ -199,7 +201,10 @@ fn negotiate_first_frame<S: DeadlineStream + ?Sized>(
 
     let mut nonce = [0_u8; 16];
     getrandom::fill(&mut nonce).map_err(|_| DesktopClientAdmissionError::Randomness)?;
-    let welcome = reconnect_welcome(selected, runtime_version, hex(&nonce), "");
+    let mut welcome = reconnect_welcome(selected, runtime_version, hex(&nonce), "");
+    if announce_runtime {
+        welcome.runtime = super::remote_access::local_runtime_info();
+    }
     write_all_before(
         stream,
         &encode_frame(&welcome).map_err(|_| DesktopClientAdmissionError::MalformedFrame)?,

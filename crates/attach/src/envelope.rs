@@ -391,6 +391,14 @@ pub enum Operation {
     /// Records a requested runtime version for the host's updater to apply.
     #[serde(rename = "runtime.update")]
     RuntimeUpdate,
+    /// Reads the remote access settings with the listener's live state. The
+    /// local owner route only.
+    #[serde(rename = "remote.settings")]
+    RemoteSettings,
+    /// Saves the remote access settings and starts or stops the listener to
+    /// match. The local owner route only.
+    #[serde(rename = "remote.settings_save")]
+    RemoteSettingsSave,
 }
 
 impl Operation {
@@ -495,6 +503,8 @@ impl Operation {
             Self::RemoteDeviceRevoke => "remote.device_revoke",
             Self::RuntimeInfo => "runtime.info",
             Self::RuntimeUpdate => "runtime.update",
+            Self::RemoteSettings => "remote.settings",
+            Self::RemoteSettingsSave => "remote.settings_save",
         }
     }
 }
@@ -523,6 +533,10 @@ pub enum EventName {
     /// chat-event subscription.
     #[serde(rename = "models.login")]
     ModelsLogin,
+    /// A client asked the host to update the runtime, on the local owner's
+    /// chat-event subscription.
+    #[serde(rename = "runtime.update_requested")]
+    RuntimeUpdateRequested,
     #[serde(untagged)]
     Unknown(BoundedEventName),
 }

@@ -156,6 +156,8 @@ pub struct DesktopAttachService<B, I = IdempotencyStore> {
     pub drain_state: crate::attach::DrainState,
     /// The runtime's remote access, when the host serves the remote route.
     pub remote_access: Option<crate::attach::RemoteAccess>,
+    /// The runtime's remote listener, when the host lets its settings drive it.
+    pub remote_route: Option<std::sync::Arc<crate::attach::RemoteRoute>>,
 }
 
 #[cfg(any(unix, target_os = "windows"))]
@@ -286,6 +288,10 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
 
     fn remote_access(&self) -> Option<crate::attach::RemoteAccess> {
         self.remote_access.clone()
+    }
+
+    fn remote_route(&self) -> Option<std::sync::Arc<crate::attach::RemoteRoute>> {
+        self.remote_route.clone()
     }
 
     #[cfg(target_os = "linux")]
@@ -2717,6 +2723,7 @@ mod tests {
             client_identity: Some("default".into()),
             drain_state: crate::attach::DrainState::new(),
             remote_access: None,
+            remote_route: None,
         };
         let result = service.start_run(
             "workspace-a",
@@ -2758,6 +2765,7 @@ mod tests {
             client_identity: Some("default".into()),
             drain_state: crate::attach::DrainState::new(),
             remote_access: None,
+            remote_route: None,
         };
         let key = Id::new("018f0000-0000-7000-8000-000000000002").unwrap();
         let companion = CompanionProvenance {
@@ -2854,6 +2862,7 @@ mod tests {
             client_identity: Some("default".into()),
             drain_state: crate::attach::DrainState::new(),
             remote_access: None,
+            remote_route: None,
         };
         let request_id = Id::new("018f0000-0000-7000-8000-000000000001").unwrap();
         let key = Id::new("018f0000-0000-7000-8000-000000000002").unwrap();
@@ -2922,6 +2931,7 @@ mod tests {
             client_identity: Some("default".into()),
             drain_state: crate::attach::DrainState::new(),
             remote_access: None,
+            remote_route: None,
         };
         let request_id = Id::new("018f0000-0000-7000-8000-000000000001").unwrap();
         let key = Id::new("018f0000-0000-7000-8000-000000000002").unwrap();
@@ -3031,6 +3041,7 @@ mod tests {
             client_identity: Some("default".into()),
             drain_state: crate::attach::DrainState::new(),
             remote_access: None,
+            remote_route: None,
         }
     }
 
@@ -3439,6 +3450,7 @@ mod tests {
             client_identity: Some("default".into()),
             drain_state: crate::attach::DrainState::new(),
             remote_access: None,
+            remote_route: None,
         };
         let run_id = "0190a100-0000-7000-8000-000000000001";
         let key = "018f0000-0000-7000-8000-000000000002";
@@ -3488,6 +3500,7 @@ mod tests {
                 client_identity: Some("default".into()),
                 drain_state: crate::attach::DrainState::new(),
                 remote_access: None,
+                remote_route: None,
             };
             assert!(cancel_request(
                 &mut service,
@@ -3562,6 +3575,7 @@ mod tests {
                 client_identity: Some("default".into()),
                 drain_state: crate::attach::DrainState::new(),
                 remote_access: None,
+                remote_route: None,
             },
             thread_id,
             first_run_id,
@@ -3750,6 +3764,7 @@ mod tests {
             client_identity: Some("default".into()),
             drain_state: crate::attach::DrainState::new(),
             remote_access: None,
+            remote_route: None,
         };
 
         let first = service
@@ -3883,6 +3898,7 @@ mod tests {
             client_identity: Some("default".into()),
             drain_state: crate::attach::DrainState::new(),
             remote_access: None,
+            remote_route: None,
         };
         first_connection
             .onboard_workspace(
@@ -3909,6 +3925,7 @@ mod tests {
             client_identity: Some("default".into()),
             drain_state: crate::attach::DrainState::new(),
             remote_access: None,
+            remote_route: None,
         };
         second_connection
             .onboard_workspace(
@@ -3952,6 +3969,7 @@ mod tests {
             client_identity: Some("client-b".into()),
             drain_state: crate::attach::DrainState::new(),
             remote_access: None,
+            remote_route: None,
         };
         // Grants are bound to the authorizing client: a second identity cannot
         // borrow another client's onboarded workspaces. `authorized_workspace`
@@ -4037,6 +4055,7 @@ mod tests {
             client_identity: Some("default".into()),
             drain_state: crate::attach::DrainState::new(),
             remote_access: None,
+            remote_route: None,
         };
         let second_memory_authorized = third_connection
             .authorized_workspace("workspace-b", &second_memory.to_string_lossy())
@@ -4397,6 +4416,7 @@ mod tests {
             client_identity: Some("default".into()),
             drain_state: crate::attach::DrainState::new(),
             remote_access: None,
+            remote_route: None,
         };
         let result = service.start_run(
             "workspace-b",
@@ -4470,6 +4490,7 @@ mod tests {
             client_identity: Some("default".into()),
             drain_state: crate::attach::DrainState::new(),
             remote_access: None,
+            remote_route: None,
         };
         let result = service.start_run(
             "workspace-a",
@@ -4579,6 +4600,7 @@ mod tests {
             client_identity: None,
             drain_state: crate::attach::DrainState::new(),
             remote_access: None,
+            remote_route: None,
         };
 
         let mut client = make_service();
@@ -4675,6 +4697,7 @@ mod tests {
             client_identity: None,
             drain_state: crate::attach::DrainState::new(),
             remote_access: None,
+            remote_route: None,
         };
 
         let mut initial = make_service(HashMap::new());
@@ -4804,6 +4827,7 @@ mod tests {
             client_identity: None,
             drain_state: crate::attach::DrainState::new(),
             remote_access: None,
+            remote_route: None,
         };
         // A credential stored before approvals named their subject reconnects
         // only through a fresh visible approval.
@@ -4831,6 +4855,7 @@ mod tests {
             client_identity: None,
             drain_state: crate::attach::DrainState::new(),
             remote_access: None,
+            remote_route: None,
         };
         assert!(restarted
             .authorize_client(identity, Some(&credential), "", "changed", "9.9.9")
@@ -4965,6 +4990,7 @@ mod approval_subject_tests {
             client_identity: None,
             drain_state: crate::attach::DrainState::new(),
             remote_access: None,
+            remote_route: None,
         }
     }
 

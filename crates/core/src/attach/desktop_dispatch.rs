@@ -132,6 +132,9 @@ pub(super) struct ActiveChatSubscription {
     /// The model service's sign-in steps, sent as `models.login` events on
     /// the same subscription.
     model_events: Option<std::sync::mpsc::Receiver<serde_json::Value>>,
+    /// Runtime update requests, sent as `runtime.update_requested` events on
+    /// the same subscription.
+    update_events: Option<std::sync::mpsc::Receiver<super::RuntimeUpdateRequest>>,
 }
 
 pub(super) struct DesktopSessionState {
@@ -182,9 +185,11 @@ impl<S: ThreadListService> DesktopSessionService for S {
             .as_mut()
             .map_or(Ok((Vec::new(), false)), |subscription| {
                 let mut events = drain_model_events(subscription);
+                events.extend(drain_update_events(subscription));
                 let (chat, closed) = drain_chat_events(subscription, wait)?;
                 events.extend(chat);
                 events.extend(drain_model_events(subscription));
+                events.extend(drain_update_events(subscription));
                 Ok((events, closed))
             })
     }
@@ -232,6 +237,30 @@ fn drain_model_events(subscription: &mut ActiveChatSubscription) -> Vec<Event> {
             }),
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => subscription.model_events = None,
+        }
+    }
+    events
+}
+
+/// Takes the runtime update requests already queued.
+fn drain_update_events(subscription: &mut ActiveChatSubscription) -> Vec<Event> {
+    let mut events = Vec::new();
+    while let Some(receiver) = subscription.update_events.as_ref() {
+        match receiver.try_recv() {
+            Ok(request) => {
+                if let Ok(body) = serde_json::to_value(request) {
+                    events.push(Event {
+                        protocol: Protocol,
+                        subscription_id: subscription.subscription_id.clone(),
+                        event: EventName::RuntimeUpdateRequested,
+                        run_id: None,
+                        run_seq: None,
+                        body,
+                    });
+                }
+            }
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => subscription.update_events = None,
         }
     }
     events
@@ -561,11 +590,34 @@ pub(super) fn dispatch_request<S: ThreadListService>(
             ProtocolError::unsupported_operation().into()
         });
     }
+    if matches!(
+        request.operation,
+        Operation::RemoteSettings | Operation::RemoteSettingsSave
+    ) {
+        request.validate_idempotency_key()?;
+        let route = service
+            .remote_route()
+            .ok_or_else(ProtocolError::unsupported_operation)?;
+        if request.operation == Operation::RemoteSettingsSave {
+            let settings: super::RemoteAccessSettings = serde_json::from_value(request.body)
+                .map_err(|_| ProtocolError::invalid_request())?;
+            route.save(settings)?;
+        } else if request.body != serde_json::json!({}) {
+            return Err(ProtocolError::invalid_request().into());
+        }
+        return bounded_response(route.describe());
+    }
     if super::remote_access::is_remote_access_operation(request.operation) {
         // The desktop route is the runtime owner, who holds every scope.
         let access = service
             .remote_access()
             .ok_or_else(ProtocolError::unsupported_operation)?;
+        if request.operation == Operation::RemotePairingCreate {
+            // A link names the interface addresses the machine has now.
+            if let Some(route) = service.remote_route() {
+                route.status();
+            }
+        }
         return bounded_response(super::remote_access::dispatch_remote_operation(
             &access,
             &request,
@@ -808,6 +860,9 @@ pub(super) fn dispatch_request<S: ThreadListService>(
         let receiver = service.subscribe_chat_events_after(body.cursor)?;
         // A runtime without a model service still serves chat events.
         let model_events = service.subscribe_model_events().ok();
+        let update_events = service
+            .remote_access()
+            .map(|access| access.update_requests());
         let mut subscription_random = [0u8; 16];
         getrandom::fill(&mut subscription_random)
             .map_err(|_| ProtocolError::persistence_failed())?;
@@ -818,6 +873,7 @@ pub(super) fn dispatch_request<S: ThreadListService>(
             subscription_id: subscription_id.clone(),
             receiver,
             model_events,
+            update_events,
         });
         return Ok(response_only(serde_json::json!({
             "subscription_id": subscription_id,

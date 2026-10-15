@@ -143,6 +143,17 @@ struct StoredPairing {
 
 type Clock = dyn Fn() -> DateTime<Utc> + Send + Sync;
 
+/// The identity the local desktop route announces. One runtime serves per
+/// process, and the local admission runs before any per-connection service
+/// exists, so the identity is process-wide.
+static LOCAL_RUNTIME_INFO: Mutex<Option<RuntimeInfo>> = Mutex::new(None);
+
+/// The runtime identity a local desktop welcome carries, once a host
+/// announced one.
+pub(super) fn local_runtime_info() -> Option<RuntimeInfo> {
+    lock(&LOCAL_RUNTIME_INFO).clone()
+}
+
 /// The remote attach state one runtime shares between its listener and its
 /// local owner: identity, pairing links, paired devices and update requests.
 #[derive(Clone)]
@@ -232,11 +243,25 @@ impl RemoteAccess {
         self.inner.identity.fingerprint
     }
 
-    /// Sets the `host:port` endpoints pairing links name by default.
+    /// Sets the `host:port` endpoints pairing links name by default. An
+    /// empty list leaves a link to name its own.
     pub fn set_advertised_endpoints(&self, endpoints: Vec<String>) -> Result<(), ProtocolError> {
-        validate_endpoints(&endpoints)?;
+        if !endpoints.is_empty() {
+            validate_endpoints(&endpoints)?;
+        }
         *lock(&self.inner.endpoints) = endpoints;
         Ok(())
+    }
+
+    /// The directory that holds the identity, the store and the settings.
+    pub(super) fn directory(&self) -> &Path {
+        &self.inner.directory
+    }
+
+    /// Announces this runtime's id, name, version and install kind in the
+    /// welcome of every later local desktop session in this process.
+    pub fn announce_on_local_route(&self) {
+        *lock(&LOCAL_RUNTIME_INFO) = Some(self.runtime_info());
     }
 
     pub fn advertised_endpoints(&self) -> Vec<String> {

@@ -644,6 +644,8 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         ("remote-device-revoke", Operation::RemoteDeviceRevoke),
         ("runtime-info", Operation::RuntimeInfo),
         ("runtime-update", Operation::RuntimeUpdate),
+        ("remote-settings", Operation::RemoteSettings),
+        ("remote-settings-save", Operation::RemoteSettingsSave),
     ];
     for (index, (name, operation)) in operations.into_iter().enumerate() {
         let body = request_body(operation);
@@ -820,6 +822,10 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         ),
         ("chat-event", EventName::ChatEvent),
         ("models-login", EventName::ModelsLogin),
+        (
+            "runtime-update-requested",
+            EventName::RuntimeUpdateRequested,
+        ),
     ];
     for (index, (name, event)) in events.into_iter().enumerate() {
         let body = event_body(&event);
@@ -829,6 +835,7 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
                 | EventName::ArtifactComplete
                 | EventName::ChatEvent
                 | EventName::ModelsLogin
+                | EventName::RuntimeUpdateRequested
         );
         insert(
             &mut fixtures,
@@ -1025,6 +1032,12 @@ fn request_body(operation: Operation) -> serde_json::Value {
         }
         Operation::RuntimeInfo => json!({}),
         Operation::RuntimeUpdate => json!({"version": "0.2.0"}),
+        Operation::RemoteSettings => json!({}),
+        Operation::RemoteSettingsSave => json!({
+            "enabled": true,
+            "listen": "0.0.0.0:7443",
+            "endpoints": ["192.0.2.20:7443"]
+        }),
     }
 }
 
@@ -1131,6 +1144,11 @@ fn event_body(event: &EventName) -> serde_json::Value {
             "title": "Choose a sign-in method",
             "options": ["Browser", "Device code"],
             "provider": "openai-codex"
+        }),
+        EventName::RuntimeUpdateRequested => json!({
+            "version": "0.2.0",
+            "requested_at": "2026-01-01T00:00:00Z",
+            "requested_by": "018f0000-0000-7000-8000-000000000096"
         }),
         EventName::Unknown(name) => json!({"name": name.as_str(), "optional": true}),
     }
@@ -1267,6 +1285,8 @@ mod tests {
             Operation::RemoteDeviceRevoke,
             Operation::RuntimeInfo,
             Operation::RuntimeUpdate,
+            Operation::RemoteSettings,
+            Operation::RemoteSettingsSave,
         ];
         for operation in operations {
             let name = operation.as_str().replace(['.', '_'], "-");
@@ -1315,12 +1335,13 @@ mod tests {
             "event-stream-closed-slow-consumer.json",
             "event-unknown.json",
             "event-models-login.json",
+            "event-runtime-update-requested.json",
         ] {
             assert!(fixtures.contains_key(name));
         }
         assert_eq!(
             fixtures.len(),
-            114,
+            117,
             "every canonical fixture must be inventoried"
         );
     }

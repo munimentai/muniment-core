@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use muniment_core::attach::linux::{AttachFilesystem, AttachTransport};
+use muniment_core::attach::RemoteRouteOptions;
 
 use crate::host::RuntimeHost;
 use crate::retention_schedule::{start_retention_schedule, RetentionScheduleCommand};
@@ -28,6 +29,8 @@ pub struct RuntimeDirectories {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunRuntimeError {
     State,
+    /// The remote access identity or store under the state root could not open.
+    RemoteAccess,
     Listener(AttachListenerError),
 }
 
@@ -35,6 +38,7 @@ impl fmt::Display for RunRuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::State => formatter.write_str("runtime attach state could not be opened"),
+            Self::RemoteAccess => formatter.write_str("remote access could not be opened"),
             Self::Listener(error) => error.fmt(formatter),
         }
     }
@@ -44,10 +48,13 @@ impl std::error::Error for RunRuntimeError {}
 
 /// Opens the runtime state for `host` and serves attach connections until
 /// `stop` fires or its sender drops. The runtime owns the endpoint's instance
-/// lock before its retention and agent schedules start, so one runtime runs them.
+/// lock before its retention and agent schedules start, so one runtime runs
+/// them. With `remote`, it also serves the remote route as the remote access
+/// settings direct.
 pub fn run_runtime(
     host: RuntimeHost,
     directories: &RuntimeDirectories,
+    remote: Option<RemoteRouteOptions>,
     stop: Receiver<()>,
 ) -> Result<(), RunRuntimeError> {
     let state = Arc::new(
@@ -61,6 +68,11 @@ pub fn run_runtime(
         .map_err(|_| RunRuntimeError::Listener(AttachListenerError::InstanceLock))?;
     let transport = AttachTransport::bind(&filesystem)
         .map_err(|_| RunRuntimeError::Listener(AttachListenerError::Bind))?;
+    if let Some(remote) = remote {
+        state
+            .start_remote_route(remote)
+            .map_err(|_| RunRuntimeError::RemoteAccess)?;
+    }
     let (commands, command_rx) = mpsc::channel();
     let retention =
         start_retention_schedule(Arc::clone(&state), RETENTION_INTERVAL, command_rx, None);
@@ -74,6 +86,7 @@ pub fn run_runtime(
         stop,
     )
     .map_err(RunRuntimeError::Listener);
+    state.stop_remote_route();
     let _ = commands.send(RetentionScheduleCommand::Stop);
     retention.join().expect("retention schedule does not panic");
     result

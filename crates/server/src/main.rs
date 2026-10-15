@@ -88,7 +88,7 @@ fn serve() -> Result<(), String> {
         config: state.clone(),
         endpoint,
     };
-    run_runtime(host::headless_host(&state), &directories, stopped)
+    run_runtime(host::headless_host(&state), &directories, None, stopped)
         .map_err(|error| error.to_string())?;
     eprintln!("muniment-server: stopped");
     Ok(())
