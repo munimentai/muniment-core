@@ -9,6 +9,8 @@ use muniment_runtime_core::host::{
 };
 use muniment_runtime_core::RuntimeHost;
 
+use crate::remote::RUNTIME_VERSION;
+
 /// The reader sidecar's file name beside the server.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const READER_NAME: &str = "muniment-reader";
@@ -33,7 +35,7 @@ pub fn headless_host(state: &Path) -> RuntimeHost {
             .ok()
             .as_deref()
             .and_then(reader_beside),
-        runtime_version: env!("CARGO_PKG_VERSION"),
+        runtime_version: RUNTIME_VERSION,
         provider_clients: Default::default(),
         sign_in_page: Arc::new(plain_sign_in_page),
     }
@@ -162,7 +164,7 @@ mod tests {
         let state = temporary_directory("host");
         let host = headless_host(&state);
         assert!(host.expected_desktop_executable.is_none());
-        assert_eq!(host.runtime_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(host.runtime_version, RUNTIME_VERSION);
         host.credentials
             .write("test.server", "key", "sk_1")
             .unwrap();

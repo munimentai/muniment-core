@@ -65,7 +65,7 @@ fn main() -> ExitCode {
             Ok(())
         }
         "--version" => {
-            println!("{}", env!("CARGO_PKG_VERSION"));
+            println!("{}", remote::RUNTIME_VERSION);
             Ok(())
         }
         other => Err(format!("unknown command {other}\n{USAGE}")),
@@ -100,7 +100,7 @@ fn serve() -> Result<(), String> {
     let remote = remote::route_options()?;
     eprintln!(
         "muniment-server: started version={} state_directory={} endpoint={}",
-        env!("CARGO_PKG_VERSION"),
+        remote::RUNTIME_VERSION,
         state.display(),
         host::endpoint_path(&endpoint)?.display()
     );

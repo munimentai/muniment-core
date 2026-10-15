@@ -28,6 +28,8 @@ ARG RUST_IMAGE=rust:1-slim-bookworm
 ARG RUNTIME_IMAGE=debian:bookworm-slim
 
 FROM ${RUST_IMAGE} AS build
+# The release the runtime announces to paired devices, such as 1.13.1.
+ARG MUNIMENT_RUNTIME_VERSION=
 WORKDIR /src
 COPY . .
 # The speech runtime libraries sit beside the binary, where its rpath looks.

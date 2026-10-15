@@ -63,6 +63,7 @@ if [ ${#targets[@]} -eq 0 ]; then
 fi
 
 docker build -f "$context/deploy/runtime/Containerfile" \
+  --build-arg "MUNIMENT_RUNTIME_VERSION=$version" \
   --label "org.opencontainers.image.version=$version" \
   --label "org.opencontainers.image.revision=$revision" \
   -t "$local_image" "$context"

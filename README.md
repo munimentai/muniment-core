@@ -127,8 +127,8 @@ listener is off until the host binds it.
   `runtime.admin`. A link grants `thread.read`, `run.write` and
   `runtime.update` unless its creator names others, and a client can ask for
   fewer, never more. Only the local owner and `runtime.admin` devices create
-  links, list devices and revoke them, and a device delegates only scopes it
-  holds. `runtime.update` or `runtime.admin` sends `runtime.update`.
+  links, list devices and revoke other devices, and a device delegates only
+  scopes it holds. Any device may revoke itself. `runtime.update` or `runtime.admin` sends `runtime.update`.
 - `remote_rule` names what a remote client may send: the desktop client
   operations except workspace onboarding, migration control, approval
   presentation, same-machine companions, and the host's cloud account and
@@ -277,8 +277,12 @@ access settings without changing them: `MUNIMENT_REMOTE_ACCESS` (`on` or
 `off`), `MUNIMENT_REMOTE_LISTEN` (an IP address and port, such as
 `0.0.0.0:7443`), `MUNIMENT_REMOTE_ENDPOINTS` (a comma list of `host:port`
 the links name) and `MUNIMENT_REMOTE_ALLOW_PUBLIC` (`on` or `off`). `install_kind` is `server`, or `container` when
-`MUNIMENT_INSTALL_KIND=container`. At start `serve` logs the runtime id, the
-certificate fingerprint and the listen address.
+`MUNIMENT_INSTALL_KIND=container`. `MUNIMENT_REMOTE_NAME` sets the name links
+and paired devices show, which defaults to `Muniment runtime`. The runtime
+announces the release it was built from: a build sets
+`MUNIMENT_RUNTIME_VERSION`, and a build without it announces the crate
+version. At start `serve` logs the runtime id, the certificate fingerprint and
+the listen address.
 
 These commands work on the state directory while `serve` runs in another
 process, such as over SSH or `docker exec`:
@@ -303,9 +307,11 @@ as a LAN or tailnet address rather than every host interface, and set
 `MUNIMENT_REMOTE_ENDPOINTS` to it:
 
 ```sh
-docker build -f deploy/runtime/Containerfile -t muniment-runtime .
+docker build -f deploy/runtime/Containerfile \
+  --build-arg MUNIMENT_RUNTIME_VERSION=1.13.1 -t muniment-runtime .
 docker run -d --name muniment -p 192.0.2.20:7443:7443 \
   -e MUNIMENT_REMOTE_ENDPOINTS=runtime.example.net:7443 \
+  -e MUNIMENT_REMOTE_NAME="Build box" \
   -v muniment-data:/data muniment-runtime
 docker exec muniment muniment-server pair
 ```

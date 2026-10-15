@@ -635,7 +635,6 @@ pub(super) fn dispatch_remote_operation(
             Ok(json!({"devices": access.list_devices()?}))
         }
         Operation::RemoteDeviceRevoke => {
-            admin()?;
             #[derive(serde::Deserialize)]
             #[serde(deny_unknown_fields)]
             struct Body {
@@ -643,6 +642,11 @@ pub(super) fn dispatch_remote_operation(
             }
             let body: Body = serde_json::from_value(body.clone())
                 .map_err(|_| ProtocolError::invalid_request())?;
+            // Any device may give up its own access. Revoking another device
+            // takes the admin scope.
+            if body.device_id != requested_by {
+                admin()?;
+            }
             Ok(json!({"revoked": access.revoke_device(&body.device_id)?}))
         }
         Operation::RuntimeUpdate => {

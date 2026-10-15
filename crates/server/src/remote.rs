@@ -23,6 +23,15 @@ const LISTEN_VARIABLE: &str = "MUNIMENT_REMOTE_LISTEN";
 const ENDPOINTS_VARIABLE: &str = "MUNIMENT_REMOTE_ENDPOINTS";
 const PUBLIC_VARIABLE: &str = "MUNIMENT_REMOTE_ALLOW_PUBLIC";
 const INSTALL_KIND_VARIABLE: &str = "MUNIMENT_INSTALL_KIND";
+/// The name pairing links and paired devices show for this runtime.
+const NAME_VARIABLE: &str = "MUNIMENT_REMOTE_NAME";
+
+/// The release this build announces: `MUNIMENT_RUNTIME_VERSION` at build
+/// time, which a release image sets from its tag, or the crate version.
+pub const RUNTIME_VERSION: &str = match option_env!("MUNIMENT_RUNTIME_VERSION") {
+    Some(version) if !version.is_empty() => version,
+    _ => env!("CARGO_PKG_VERSION"),
+};
 
 /// The remote access directory under `state`.
 pub fn remote_directory(state: &Path) -> PathBuf {
@@ -109,8 +118,8 @@ fn env(name: &str) -> Option<String> {
 /// What the server says about itself to remote clients.
 pub fn access_options() -> Result<RemoteAccessOptions, String> {
     Ok(RemoteAccessOptions {
-        runtime_name: None,
-        runtime_version: env!("CARGO_PKG_VERSION").into(),
+        runtime_name: env(NAME_VARIABLE).filter(|name| !name.trim().is_empty()),
+        runtime_version: RUNTIME_VERSION.into(),
         install_kind: install_kind()?,
     })
 }

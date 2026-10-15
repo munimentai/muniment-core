@@ -1006,4 +1006,39 @@ mod tests {
             .is_err());
         std::fs::remove_dir_all(directory).unwrap();
     }
+
+    #[test]
+    fn a_device_revokes_itself_without_the_admin_scope_but_not_another() {
+        use crate::attach::remote_access::dispatch_remote_operation;
+        let directory =
+            std::env::temp_dir().join(format!("muniment-remote-rev-{}", uuid::Uuid::now_v7()));
+        let access = access(&directory);
+        let reader: BTreeSet<String> = [SCOPE_THREAD_READ, SCOPE_RUN_WRITE]
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        let me = uuid::Uuid::now_v7().to_string();
+        let other = uuid::Uuid::now_v7().to_string();
+        let revoke = |device_id: &str, granted: &BTreeSet<String>| {
+            dispatch_remote_operation(
+                &access,
+                &request(
+                    Operation::RemoteDeviceRevoke,
+                    json!({"device_id": device_id}),
+                ),
+                granted,
+                &me,
+            )
+        };
+        assert_eq!(
+            revoke(&other, &reader).unwrap_err().code(),
+            muniment_attach::ErrorCode::Unauthorized
+        );
+        assert!(revoke(&me, &reader).is_ok());
+        assert!(access.revoked_here(&me));
+        assert!(!access.revoked_here(&other));
+        let admin: BTreeSet<String> = [SCOPE_RUNTIME_ADMIN.to_owned()].into();
+        assert!(revoke(&other, &admin).is_ok());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }
