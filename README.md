@@ -300,6 +300,21 @@ docker run -d --name muniment -p 7443:7443 \
 docker exec muniment muniment-server pair
 ```
 
+Each release publishes the image for linux/amd64 as
+`ghcr.io/munimentai/muniment-runtime:<version>` and `:latest`:
+
+```sh
+docker run -d --name muniment -p 7443:7443 \
+  -e MUNIMENT_REMOTE_ENDPOINTS=runtime.example.net:7443 \
+  -v muniment-data:/data ghcr.io/munimentai/muniment-runtime:latest
+```
+
+The CI `runtime-image-publish` job runs `deploy/runtime/publish.sh` after the
+release job tags a version. It pushes to each image repository in the
+`RUNTIME_IMAGE_REPOSITORIES` variable (a space list) and logs in with the
+`RUNTIME_IMAGE_LOGINS` secret, one `<registry> <user> <password>` line per
+registry. A repository whose registry has no login is skipped with a warning.
+
 A `runtime.update` request writes `/data/remote/runtime-update.json`
 (`<state root>/remote/runtime-update.json` outside the image), owner-only:
 

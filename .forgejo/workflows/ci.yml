@@ -188,3 +188,50 @@ jobs:
           python3 -B scripts/release.py --revision "$GITHUB_SHA"
           echo "The release token can publish to $(gh api repos/munimentai/muniment-core --jq 'select(.permissions.push) | .full_name')."
           echo "The newest GitHub release is $(gh release view --repo munimentai/muniment-core --json tagName --jq .tagName)."
+
+  # Builds the runtime image of the version the release job tagged and pushes
+  # it to each repository in RUNTIME_IMAGE_REPOSITORIES. A main push that cut
+  # no release publishes nothing.
+  runtime-image-publish:
+    needs: [release]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: [self-hosted, image-smoke]
+    timeout-minutes: 90
+    steps:
+      - name: Admit only main of the release repository
+        env:
+          REPOSITORY: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          ACTOR: ${{ github.actor }}
+          RELEASE_REPOSITORY: ${{ vars.CI_REPOSITORY }}
+          RELEASE_ACTORS: ${{ vars.CI_RELEASE_ACTORS }}
+          PUSH_ACTORS: ${{ vars.CI_PUSH_ACTORS }}
+        run: |
+          actors=
+          case "$EVENT" in
+            push) actors=$PUSH_ACTORS ;;
+            workflow_dispatch) actors=$RELEASE_ACTORS ;;
+          esac
+          if [ -z "$RELEASE_REPOSITORY" ] || [ "$REPOSITORY" != "$RELEASE_REPOSITORY" ] || [ "$REF" != refs/heads/main ] || [ -z "$ACTOR" ] || [[ " $actors " != *" $ACTOR "* ]]; then
+            echo '::error::The release runs only for a CI_PUSH_ACTORS push or a CI_RELEASE_ACTORS dispatch of main in the CI_REPOSITORY repository.' >&2
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Publish the runtime image
+        env:
+          RUNTIME_IMAGE_REPOSITORIES: ${{ vars.RUNTIME_IMAGE_REPOSITORIES }}
+          RUNTIME_IMAGE_LOGINS: ${{ secrets.RUNTIME_IMAGE_LOGINS }}
+        run: |
+          tag=$(git tag --points-at "$GITHUB_SHA" --list 'v*' | sort -V | tail -n 1)
+          if [ -z "$tag" ]; then
+            echo "No release tag names $GITHUB_SHA, so no image is published."
+            exit 0
+          fi
+          if [ -z "$RUNTIME_IMAGE_REPOSITORIES" ]; then
+            echo "RUNTIME_IMAGE_REPOSITORIES is unset, so no image is published."
+            exit 0
+          fi
+          deploy/runtime/publish.sh "$tag" "$GITHUB_SHA"
