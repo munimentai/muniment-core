@@ -1619,6 +1619,35 @@ fn coordinate_work(
             }
         }
     }
+    if compaction.is_none()
+        && matches!(
+            projector.status(),
+            Some(crate::journal::reducer::RunStatus::Completed)
+        )
+    {
+        // A resumed run carries a continuation note, so its user prompt
+        // comes from the prompt store.
+        let messages = if resume.is_none() {
+            vec![prompt]
+        } else {
+            stored_prompt(&run_id, subject.as_deref())
+        };
+        memory_runtime.extract_after_run(&run_id, messages);
+    }
+}
+
+#[cfg(feature = "keyring")]
+fn stored_prompt(run_id: &str, subject: Option<&str>) -> Vec<String> {
+    crate::chat_prompt::load_prompt(run_id, subject)
+        .ok()
+        .flatten()
+        .into_iter()
+        .collect()
+}
+
+#[cfg(not(feature = "keyring"))]
+fn stored_prompt(_run_id: &str, _subject: Option<&str>) -> Vec<String> {
+    Vec::new()
 }
 
 fn answer_thread_title(

@@ -462,39 +462,54 @@ fn ask_pool(call: PoolCall<'_>, state: &str, now_ms: i64, timeout: Duration) -> 
             { "role": "user", "content": clip(state) },
         ],
     });
+    // A call the upstream refused or never answered spent nothing the ledger
+    // can count, and naming the account here would record a served turn on
+    // an account that just refused one.
+    let Ok(answered) = complete_on(account, &body, model, timeout) else {
+        return empty;
+    };
+    Asked {
+        answer: completion_text(&answered).and_then(parse_pooled_answer),
+        spent_on: Some(account.id.clone()),
+        spent: super::wire::tokens(&answered),
+    }
+}
+
+/// One chat completion on one pooled account: `body` is a chat request, and
+/// the answer is the chat completion the upstream sent, in the router's chat
+/// wire whatever the account's own protocol.
+pub fn complete_on(
+    account: &super::config::Account,
+    body: &Value,
+    model: &str,
+    timeout: Duration,
+) -> Result<Value, String> {
     let agent = crate::http::agent_builder()
         .redirects(0)
         .timeout(timeout)
         .build();
-    let Ok(prepared) = super::transport::prepare(account, &body, model) else {
-        return empty;
-    };
+    let prepared = super::transport::prepare(account, body, model)?;
     let mut call = agent
         .post(&prepared.url)
         .set("content-type", "application/json");
     for (name, value) in &prepared.headers {
         call = call.set(name, value);
     }
-    let answered = call
+    let response = call
         .send_json(&prepared.body)
-        .ok()
-        .and_then(|response| super::transport::collect(response, prepared.protocol, model).ok());
-    // A call the upstream refused or never answered spent nothing the ledger
-    // can count, and naming the account here would record a served turn on
-    // an account that just refused one.
-    let Some(answered) = answered else {
-        return empty;
-    };
-    Asked {
-        answer: answered
-            .get("choices")
-            .and_then(Value::as_array)
-            .and_then(|choices| choices.first())
-            .and_then(|choice| choice.get("message")?.get("content")?.as_str())
-            .and_then(parse_pooled_answer),
-        spent_on: Some(account.id.clone()),
-        spent: super::wire::tokens(&answered),
-    }
+        .map_err(|_| "The model did not answer.".to_owned())?;
+    super::transport::collect(response, prepared.protocol, model)
+}
+
+/// The text of a chat completion's first choice.
+pub fn completion_text(completion: &Value) -> Option<&str> {
+    completion
+        .get("choices")?
+        .as_array()?
+        .first()?
+        .get("message")?
+        .get("content")?
+        .as_str()
 }
 
 /// The choice and confidence a small model wrote, out of the JSON it answered

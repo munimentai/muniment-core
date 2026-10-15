@@ -74,10 +74,17 @@ impl RuntimeAttachState {
         ));
 
         Ok(Self {
-            memory_runtime: Arc::new(ApplicationMemoryRuntime::new(
-                config_directory.clone(),
-                profile_directory.join("memory"),
-            )),
+            memory_runtime: Arc::new(
+                ApplicationMemoryRuntime::new(
+                    config_directory.clone(),
+                    profile_directory.join("memory"),
+                )
+                .with_extraction_model(
+                    muniment_core::memory_extract::router_model(
+                        muniment_core::state_root::agent_directory(&profile_directory),
+                    ),
+                ),
+            ),
             profile_directory,
             config_directory,
             storage,

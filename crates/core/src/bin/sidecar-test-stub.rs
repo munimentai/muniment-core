@@ -339,6 +339,14 @@ fn pi_resume(args: Vec<String>) {
                             "title": "muniment:chat-grant", "prefill": denial
                         })
                     );
+                } else if let Ok(fact) = std::env::var("PI_RESUME_STUB_MEMORY_SAVE") {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "type":"extension_ui_request", "id":"memory-save-1", "method":"editor",
+                            "title":"muniment:memory-save", "prefill":fact
+                        })
+                    );
                 } else if let Ok(query) = std::env::var("PI_RESUME_STUB_MEMORY_QUERY") {
                     println!(
                         "{}",
@@ -369,7 +377,15 @@ fn pi_resume(args: Vec<String>) {
                             })
                         );
                     }
-                    println!("{}", serde_json::json!({"type":"agent_end"}));
+                    match std::env::var("PI_RESUME_STUB_STOP_REASON") {
+                        Ok(reason) => println!(
+                            "{}",
+                            serde_json::json!({"type":"agent_end", "messages":[
+                                {"role":"assistant", "stopReason":reason}
+                            ]})
+                        ),
+                        Err(_) => println!("{}", serde_json::json!({"type":"agent_end"})),
+                    }
                 }
             }
             command @ ("steer" | "follow_up") => {

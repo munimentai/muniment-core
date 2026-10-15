@@ -38,6 +38,7 @@ pub mod journal;
 pub mod kokoro;
 pub mod launch_facts;
 pub mod local_mode;
+pub mod memory_extract;
 pub mod memory_failure;
 pub mod memory_files;
 pub mod memory_index;

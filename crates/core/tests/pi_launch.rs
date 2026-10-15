@@ -11,6 +11,8 @@ mod acquisition_coordinate;
 mod compaction_coordinate;
 #[path = "pi_launch/gateway_coordinate.rs"]
 mod gateway_coordinate;
+#[path = "pi_launch/memory_extract_coordinate.rs"]
+mod memory_extract_coordinate;
 use muniment_core::pi_launch::{
     pi_launch_config, pi_launch_config_for_executable, PiLaunchBoundaries, PiLaunchError,
     DECISIONS_EXTENSION, DECISIONS_EXTENSION_FILE, EXCLUDED_TOOLS, IDENTITY_EXTENSION,

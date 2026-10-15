@@ -341,6 +341,47 @@ impl MemoryIndex {
         })
     }
 
+    /// The saved fact files that share the most terms with `text`, best
+    /// first. Any one term matches, so a long message still finds facts.
+    pub fn related_facts(
+        &self,
+        text: &str,
+        limit: usize,
+        timeout: Duration,
+    ) -> Result<Vec<String>, MemoryIndexError> {
+        let mut terms: Vec<String> = Vec::new();
+        for term in text.split(|character: char| !character.is_alphanumeric()) {
+            let term = term.to_lowercase();
+            if term.chars().count() >= 3 && !terms.contains(&term) && terms.len() < MAX_QUERY_TERMS
+            {
+                terms.push(term);
+            }
+        }
+        if terms.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let expression = terms
+            .iter()
+            .map(|term| format!("\"{term}\""))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let deadline = Instant::now() + timeout;
+        self.refreshed_cache(deadline, |connection, _| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT path FROM memory_fts WHERE memory_fts MATCH ?1 \
+                     AND path LIKE 'memory/facts/%' ORDER BY bm25(memory_fts), path LIMIT ?2",
+                )
+                .map_err(|error| sqlite_error(error, deadline))?;
+            let rows = statement
+                .query_map(params![expression, limit as i64], |row| row.get(0))
+                .map_err(|error| sqlite_error(error, deadline))?;
+            rows.collect::<Result<Vec<String>, _>>()
+                .map_err(|error| sqlite_error(error, deadline))
+        })
+        .map_err(|error| normalize_timeout(error, deadline))
+    }
+
     pub fn reindex(&self) -> Result<ReindexReport, MemoryIndexError> {
         self.reindex_with_deadline(Instant::now() + DEFAULT_BUILD_TIMEOUT)
     }
