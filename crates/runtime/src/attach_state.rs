@@ -54,6 +54,13 @@ impl RuntimeAttachState {
         let config_directory = config_directory.as_ref().to_path_buf();
         let storage = open_profile_storage_as(&profile_directory, host.runtime_version)
             .map_err(|_| ProtocolError::persistence_failed())?;
+        // Session folders from older versions take their thread titles here,
+        // so the runtime stays the only process that opens the journal.
+        if let Err(error) = muniment_core::projects::migrate_session_names(&profile_directory) {
+            muniment_core::runtime_eprintln!(
+                "muniment-runtime: session_names outcome=failed error={error}"
+            );
+        }
         let companion_registry = open_companion_registry(&profile_directory)?;
         let drain_state = DrainState::new();
         let runtime_activity = RuntimeActivityRegistry::with_drain_state(&drain_state);
