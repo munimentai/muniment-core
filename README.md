@@ -1,11 +1,10 @@
 # muniment-core
 
-The shared Rust core of Muniment. The Muniment desktop and the Muniment AI
-software factory build on the same crates, so local runtime behavior, model
-routing and runtime pins match in both.
+The shared Rust core of Muniment. The Muniment desktop and headless router
+hosts build on the same crates, so local runtime behavior, model routing and
+runtime pins match in both.
 
-This GitHub repository is a read-only mirror of the private Forgejo repository
-where development, issues and CI happen. It hosts the releases. It takes no
+This GitHub repository is a read-only mirror. It hosts the releases. It takes no
 issues or pull requests.
 
 ## Crates
@@ -72,7 +71,7 @@ on Linux, then runs the suite and the workspace tests on macOS and the CI checks
 on Linux against the bumped tree. When all of them pass, it rebases the bump
 onto `main`, pushes it with a `feat:` or `fix:` message, and tags the release
 with `pins.toml` and `packages.bun.lock` attached. A pin that fails gets one
-`Pin update blocked: <component> <version>` Forgejo issue and stays at its version.
+`Pin update blocked: <component> <version>` issue and stays at its version.
 
 ## Consumers
 
@@ -89,8 +88,8 @@ Antigravity sign-in registers its client at startup with
 Without a client, Antigravity sign-in and token refresh answer a configuration
 error and every other provider keeps working.
 
-The factory builds the router binaries from a release tag and reads the pins
-from the release asset:
+A headless host builds the router binaries from a release tag and reads the
+pins from the release asset:
 
 ```sh
 cargo install --git https://github.com/munimentai/muniment-core --tag v0.1.0 --features server muniment-router
@@ -99,7 +98,8 @@ gh release download v0.1.0 --repo munimentai/muniment-core --pattern pins.toml
 
 ## Router server
 
-`muniment-router serve` runs the router for the factory. It builds only with
+`muniment-router serve` runs the router as a network server for headless agent
+runs. It builds only with
 the `server` feature, so the desktop never compiles Postgres, OpenBao or the
 run-token code. `deploy/router/Containerfile` builds a non-root image whose
 health check runs `muniment-router health`.
