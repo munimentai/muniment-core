@@ -561,6 +561,18 @@ pub(super) fn dispatch_request<S: ThreadListService>(
             ProtocolError::unsupported_operation().into()
         });
     }
+    if super::remote_access::is_remote_access_operation(request.operation) {
+        // The desktop route is the runtime owner, who holds every scope.
+        let access = service
+            .remote_access()
+            .ok_or_else(ProtocolError::unsupported_operation)?;
+        return bounded_response(super::remote_access::dispatch_remote_operation(
+            &access,
+            &request,
+            &super::remote_access::all_scopes(),
+            "local",
+        )?);
+    }
     request.validate_idempotency_key()?;
     if request.operation == Operation::ModelsRequest {
         let model_request = super::ModelRequest::from_body(&request.body)

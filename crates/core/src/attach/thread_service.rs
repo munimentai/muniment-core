@@ -86,6 +86,13 @@ pub trait ThreadListService {
 
     fn bind_authorized_client(&mut self, _client_identity: &str) {}
 
+    /// The runtime's remote access, which the owner's desktop route uses to
+    /// pair and revoke remote devices. `None` answers those operations as
+    /// unsupported.
+    fn remote_access(&self) -> Option<super::RemoteAccess> {
+        None
+    }
+
     fn reconnect_approval(&self) -> Option<Approval> {
         None
     }

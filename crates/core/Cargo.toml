@@ -8,7 +8,9 @@ edition = "2021"
 # and runs on the shared CI runner without a GUI toolchain. TLS is
 # feature-gated for the same reason: the tests speak plain HTTP to
 # in-process stubs, so the standalone crate never compiles a TLS stack;
-# hosts enable `tls` to reach HTTPS endpoints.
+# hosts enable `tls` to reach HTTPS endpoints. The remote attach listener
+# serves TLS with its own pinned certificate and needs no OS verifier, so its
+# rustls and certificate generation build without the feature.
 
 [features]
 # Desktop and runtime HTTPS use the OS certificate verifier.
@@ -28,6 +30,8 @@ image = { version = "0.25", default-features = false, features = ["gif", "jpeg",
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native"], optional = true }
 libloading = "0.7"
 quick-xml = "0.41"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 muniment-attach = { path = "../attach", features = ["client"] }
 muniment-code-diff = { path = "../code-diff" }
 muniment-atomic-file = { path = "../atomic-file" }

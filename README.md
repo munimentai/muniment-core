@@ -17,7 +17,7 @@ issues or pull requests.
 | `muniment-runtime-core` | `crates/runtime` | The platform-neutral runtime: attach serving and its accept loops, runs, retention and agent schedules, the company record and reader service, the model service that runs the model router and the web search server and writes provider settings, web search settings and credentials, and `run_runtime`, the entry a host without OS service registration runs. The host supplies cloud accounts, chat grants, credential storage, provider OAuth clients, the sign-in page and its executables through `RuntimeHost`. The default `keyring` feature adds the keychain credential store and keychain prompt history. |
 | `muniment-server` | `crates/server` | The headless runtime host: the `muniment-server` binary runs the runtime with no cloud account, no keychain and no OS service registration, for a container or a server. |
 | `muniment-pins` | `crates/pins` | Typed constants compiled from `pins/pins.toml`, plus the embedded package lockfile. |
-| `muniment-attach` | `crates/attach` | The reader and companion attach protocol and its client. |
+| `muniment-attach` | `crates/attach` | The reader and companion attach protocol and its client, with the pinned TLS transport, pairing links and device credentials of the remote route. |
 | `muniment-code-diff` | `crates/code-diff` | Portable code-diff values and fixtures. |
 | `muniment-atomic-file` | `crates/atomic-file` | Atomic file replacement, including the Windows retry path. |
 | `muniment-search` | `crates/search` | Keyless web search: Brave, DuckDuckGo, Wikipedia, Yahoo and Bing parsers, paced per-engine sessions, metasearch, and a loopback server that answers the SearXNG JSON format. Brave uses the system `curl` program when one is present. `cargo run -p muniment-search --example live -- "query"` searches the real engines once. |
@@ -96,6 +96,47 @@ pins from the release asset:
 cargo install --git https://github.com/munimentai/muniment-core --tag v0.1.0 --features server muniment-router
 gh release download v0.1.0 --repo munimentai/muniment-core --pattern pins.toml
 ```
+
+## Remote attach
+
+A runtime can serve `muniment.attach/1` over TLS to clients on other machines,
+such as over a LAN, a private overlay network or an SSH forward. Pairing needs no account. The
+listener is off until the host binds it.
+
+- `RemoteAccess::open(<state root>/remote, options)` creates, on first use, an
+  ECDSA P-256 key, a self-signed certificate, a runtime id and a display name,
+  all owner-only. Clients pin the certificate's SHA-256. The identity is never
+  replaced: a missing key or certificate fails the open.
+  `RuntimeAttachState::open_remote_access` opens it under the state root and
+  shares it with the local desktop route.
+- `RemoteAccess::create_pairing_link` answers
+  `muniment://pair?v=1&id=…&name=…&fp=…&host=…#<secret>`. The secret is 128
+  random bits in the fragment, works once, expires after ten minutes, and is
+  stored only as its SHA-256. At most 16 links wait at once.
+- Redeeming a link, through the optional `pairing` field of `hello`, issues a
+  device credential: an id and a 256-bit secret, stored only as its SHA-256
+  with the device's name, scopes and times. The client sends it as
+  `authorized_client_id` and `authorized_client_credential` on later
+  connections. `welcome` carries `runtime_id`, `runtime_name`,
+  `runtime_version` and `install_kind`.
+- `RuntimeAttachState::serve_remote_listener` or `run_remote_listener` serves
+  the route: TLS 1.3 only, a connection cap, handshake and first-frame
+  deadlines, a 16 KiB first frame, and a growing hold on a peer address after
+  repeated refusals.
+- Scopes are `thread.read`, `run.write` and `runtime.admin`. A link grants
+  `thread.read` and `run.write` unless its creator names others, and a client
+  can ask for fewer, never more. Only the local owner and `runtime.admin`
+  devices create links, list devices, revoke them and send `runtime.update`,
+  and a device delegates only scopes it holds.
+- `remote_rule` names what a remote client may send: the desktop client
+  operations except workspace onboarding, migration control, approval
+  presentation, same-machine companions, and the host's cloud account and
+  phone pairing. Reader connections and model changes need `runtime.admin`.
+- Revoking a device closes its live sessions. `runtime.update` records the
+  requested version in `<state root>/remote/runtime-update.json` and sends it
+  to `RemoteAccess::update_requests`. The host's updater applies it.
+- The client side is `pair_with_link`, `connect_remote_runtime` and
+  `RemoteRuntimeRecord`, which saves the credential to an owner-only file.
 
 ## Router server
 

@@ -48,6 +48,10 @@ mod presenter_admission;
 #[cfg(any(unix, target_os = "windows"))]
 mod presenter_session;
 mod quiesce;
+mod remote_access;
+mod remote_identity;
+mod remote_listener;
+mod remote_session;
 mod runtime_activity;
 #[cfg(unix)]
 mod termination;
@@ -124,6 +128,20 @@ pub use presenter_admission::*;
 #[cfg(any(unix, target_os = "windows"))]
 pub use presenter_session::*;
 pub use quiesce::*;
+pub use remote_access::{
+    CreatedPairingLink, PairedDevice, PairingLinkRequest, RemoteAccess, RemoteAccessOpenError,
+    RemoteAccessOptions, RuntimeUpdateRequest, MAX_OUTSTANDING_PAIRINGS, MAX_PAIRED_DEVICES,
+    PAIRING_LINK_LIFETIME,
+};
+pub use remote_identity::DEFAULT_RUNTIME_NAME;
+pub use remote_listener::{
+    run_remote_listener, FailureBackoff, FailureBackoffPolicy, RemoteListener,
+    RemoteListenerConfig, RemoteListenerError, RemoteStream,
+};
+pub use remote_session::{
+    admit_remote_client, remote_rule, serve_remote_client, AdmittedRemoteClient,
+    RemoteAdmissionError, RemoteRule,
+};
 pub use runtime_activity::*;
 #[cfg(unix)]
 pub use termination::*;

@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex};
 #[cfg(any(unix, target_os = "windows"))]
 use muniment_core::attach::ApprovalCoordinator;
 use muniment_core::attach::{
-    CompanionRegistry, DesktopAttachService, DrainState, ProtocolError, RuntimeActivityRegistry,
-    SignedWorkspaceApproval,
+    CompanionRegistry, DesktopAttachService, DrainState, ProtocolError, RemoteAccess,
+    RemoteAccessOpenError, RemoteAccessOptions, RemoteListener, RemoteListenerError,
+    RuntimeActivityRegistry, SignedWorkspaceApproval,
 };
 use muniment_core::memory_runtime::ApplicationMemoryRuntime;
 use muniment_core::pi_execution::PiRuntime;
@@ -41,6 +42,7 @@ pub struct RuntimeAttachState {
     sign_in_running: Arc<AtomicBool>,
     chat_events: RuntimeChatEventBroadcast,
     models: Arc<ModelService>,
+    remote_access: Mutex<Option<RemoteAccess>>,
 }
 
 impl RuntimeAttachState {
@@ -99,6 +101,7 @@ impl RuntimeAttachState {
             sign_in_running: Arc::new(AtomicBool::new(false)),
             chat_events: RuntimeChatEventBroadcast::new(approval),
             models,
+            remote_access: Mutex::new(None),
         })
     }
 
@@ -140,7 +143,49 @@ impl RuntimeAttachState {
             &self.config_directory,
         )?;
         service.drain_state = self.drain_state.clone();
+        service.remote_access = self.remote_access();
         Ok(service)
+    }
+
+    /// Opens remote access under `<state root>/remote` and shares it with
+    /// every attach service composed after this call, so the owner's local
+    /// desktop route can pair and revoke devices.
+    pub fn open_remote_access(
+        &self,
+        options: RemoteAccessOptions,
+    ) -> Result<RemoteAccess, RemoteAccessOpenError> {
+        let access = RemoteAccess::open(self.profile_directory.join("remote"), options)?;
+        *self
+            .remote_access
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(access.clone());
+        Ok(access)
+    }
+
+    /// The remote access the host opened, if any.
+    pub fn remote_access(&self) -> Option<RemoteAccess> {
+        self.remote_access
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Serves the remote attach route on `listener` with this state until
+    /// `stop` fires. The host opens remote access first and binds the
+    /// listener only when its configuration names a listen address.
+    pub fn serve_remote_listener(
+        self: &Arc<Self>,
+        listener: RemoteListener,
+        access: RemoteAccess,
+        stop: std::sync::mpsc::Receiver<()>,
+    ) -> Result<(), RemoteListenerError> {
+        let state = Arc::clone(self);
+        listener.serve(
+            access,
+            self.approval.clone(),
+            move || state.attach_service(),
+            stop,
+        )
     }
 
     /// Builds listener inputs that share the runtime attach state.
