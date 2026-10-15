@@ -639,6 +639,7 @@ mod tests {
         let checked = check(
             &answer(serde_json::json!([
                 {"op": "rename", "id": ID, "title": "x", "content": "y"},
+                {"op": "remember", "title": "Drink", "content": "Prefers coffee."},
                 {"op": "update", "id": OTHER, "title": "Home town", "content": "Lives in Porto."},
                 {"op": "delete", "id": "01900000-0000-7000-8000-0000000000cc"},
                 {"op": "add", "title": "T".repeat(61), "content": "Prefers tea."},
@@ -668,7 +669,7 @@ mod tests {
                 }),
             }]
         );
-        assert_eq!(checked.dropped, 11);
+        assert_eq!(checked.dropped, 12);
         assert_eq!(checked.duplicates, 2);
     }
 

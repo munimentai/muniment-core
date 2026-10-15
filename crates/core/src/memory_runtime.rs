@@ -1183,6 +1183,44 @@ console.log(JSON.stringify([await run(['Save']), await run(["Don't save"]), awai
     }
 
     #[test]
+    fn the_after_run_pass_skips_short_runs_and_runs_with_learning_off() {
+        for (learn, message, expected) in [
+            (true, "Thanks, that works.", 0),
+            (false, "I am a pediatric nurse and I work night shifts.", 0),
+            (true, "I am a pediatric nurse and I work night shifts.", 1),
+        ] {
+            let (root, _) = recall_runtime(Some(RecallSettings {
+                learn,
+                use_memories: true,
+                ask: false,
+            }));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&calls);
+            let config = root.join("private");
+            let runtime = ApplicationMemoryRuntime::new(config.clone(), config.join("memory"))
+                .with_extraction_model(Arc::new(move |_, _| {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Ok(r#"{"actions":[]}"#.into())
+                }));
+            runtime
+                .open_session(
+                    "session",
+                    "01900000-0000-7000-8000-000000000001",
+                    capability(),
+                )
+                .unwrap();
+            runtime.extract_after_run("session", vec![message.into()]);
+            runtime.close_session("session");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !runtime.extraction_idle() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), expected, "{learn} {message}");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn a_session_rejects_unreadable_recall_settings() {
         let (root, runtime) = recall_runtime(None);
         fs::write(runtime.config_directory().join("memory-recall.json"), "{").unwrap();
