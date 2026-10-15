@@ -32,6 +32,11 @@ pub struct RemoteAccessSettings {
     /// its own interface addresses.
     #[serde(default)]
     pub endpoints: Vec<String>,
+    /// Whether peers on public addresses may connect. Off, the listener
+    /// admits loopback, private LAN and overlay peers only, and links name no
+    /// public address of their own accord.
+    #[serde(default)]
+    pub allow_public: bool,
 }
 
 impl RemoteAccessSettings {
@@ -77,6 +82,8 @@ struct SettingsFile {
     enabled: bool,
     listen: Option<SocketAddr>,
     endpoints: Vec<String>,
+    #[serde(default)]
+    allow_public: bool,
 }
 
 /// Reads the stored settings. A missing file reads as remote access off.
@@ -89,6 +96,7 @@ pub fn load_remote_settings(directory: &Path) -> io::Result<RemoteAccessSettings
         enabled: file.enabled,
         listen: file.listen,
         endpoints: file.endpoints,
+        allow_public: file.allow_public,
     };
     if file.version != 1 || settings.validate().is_err() {
         return Err(io::ErrorKind::InvalidData.into());
@@ -103,6 +111,7 @@ pub fn save_remote_settings(directory: &Path, settings: &RemoteAccessSettings) -
         enabled: settings.enabled,
         listen: settings.listen,
         endpoints: settings.endpoints.clone(),
+        allow_public: settings.allow_public,
     })
     .map_err(io::Error::other)?;
     write_private(&directory.join(SETTINGS_FILE), &bytes)
@@ -115,6 +124,7 @@ pub struct RemoteSettingsOverrides {
     pub enabled: Option<bool>,
     pub listen: Option<SocketAddr>,
     pub endpoints: Option<Vec<String>>,
+    pub allow_public: Option<bool>,
 }
 
 impl RemoteSettingsOverrides {
@@ -132,6 +142,9 @@ impl RemoteSettingsOverrides {
         }
         if let Some(endpoints) = &self.endpoints {
             settings.endpoints = endpoints.clone();
+        }
+        if let Some(allow_public) = self.allow_public {
+            settings.allow_public = allow_public;
         }
         settings
     }
@@ -165,11 +178,13 @@ pub struct AdvertisedEndpoint {
 /// The endpoints pairing links name for a listener bound to `bound`.
 /// Configured endpoints win. Otherwise an unspecified address lists each
 /// usable interface address with the bound port, IPv4 before IPv6, and an
-/// IPv4 listener lists IPv4 addresses only. At most eight are kept.
+/// IPv4 listener lists IPv4 addresses only. Public addresses are listed only
+/// when `allow_public` is set. At most eight are kept.
 pub fn advertised_endpoints(
     configured: &[String],
     bound: SocketAddr,
     interfaces: &[IpAddr],
+    allow_public: bool,
 ) -> Vec<AdvertisedEndpoint> {
     if !configured.is_empty() {
         return configured
@@ -201,6 +216,7 @@ pub fn advertised_endpoints(
             v4 => *v4,
         };
         if is_advertisable(address)
+            && (allow_public || classify(address) != EndpointKind::Public)
             && (dual_stack || address.is_ipv4())
             && !addresses.contains(&address)
         {
@@ -236,6 +252,20 @@ fn is_advertisable(address: IpAddr) -> bool {
                 || (v6.segments()[0] & 0xffc0) == 0xfe80)
         }
     }
+}
+
+/// Whether a peer at `address` reaches this machine from the public
+/// internet: not loopback, link-local, private LAN or an overlay network.
+pub fn is_public_peer(address: IpAddr) -> bool {
+    let address = match address {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(address, IpAddr::V4),
+        v4 => v4,
+    };
+    let local = match address {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xffc0) == 0xfe80,
+    };
+    !local && classify(address) == EndpointKind::Public
 }
 
 fn classify(address: IpAddr) -> EndpointKind {
@@ -368,6 +398,7 @@ mod tests {
             enabled: true,
             listen: Some("127.0.0.1:7444".parse().unwrap()),
             endpoints: vec!["runtime.example.net:7444".into()],
+            allow_public: false,
         };
         save_remote_settings(&directory, &settings).unwrap();
         assert_eq!(load_remote_settings(&directory).unwrap(), settings);
@@ -405,11 +436,13 @@ mod tests {
             enabled: false,
             listen: None,
             endpoints: vec!["198.51.100.1:7443".into()],
+            allow_public: false,
         };
         let overrides = RemoteSettingsOverrides {
             enabled: Some(true),
             listen: Some("[::]:9443".parse().unwrap()),
             endpoints: None,
+            allow_public: Some(true),
         };
         let applied = overrides.apply(stored.clone());
         assert!(applied.enabled);
@@ -449,7 +482,7 @@ mod tests {
             ip("::ffff:192.0.2.10"),
             ip("192.0.2.10"),
         ];
-        let listed = advertised_endpoints(&[], "[::]:7443".parse().unwrap(), &interfaces);
+        let listed = advertised_endpoints(&[], "[::]:7443".parse().unwrap(), &interfaces, true);
         let pairs: Vec<(&str, EndpointKind)> = listed
             .iter()
             .map(|endpoint| (endpoint.endpoint.as_str(), endpoint.kind))
@@ -470,11 +503,68 @@ mod tests {
             .iter()
             .all(|endpoint| is_valid_endpoint(&endpoint.endpoint)));
 
-        let ipv4_only = advertised_endpoints(&[], "0.0.0.0:9000".parse().unwrap(), &interfaces);
+        let ipv4_only =
+            advertised_endpoints(&[], "0.0.0.0:9000".parse().unwrap(), &interfaces, true);
         assert_eq!(ipv4_only.len(), 3);
         assert!(ipv4_only.iter().all(
             |endpoint| endpoint.endpoint.ends_with(":9000") && !endpoint.endpoint.contains('[')
         ));
+
+        // Without public access, links name the private and overlay addresses only.
+        let private_only =
+            advertised_endpoints(&[], "[::]:7443".parse().unwrap(), &interfaces, false);
+        assert!(private_only
+            .iter()
+            .all(|endpoint| endpoint.kind != EndpointKind::Public));
+        assert_eq!(private_only.len(), 4);
+    }
+
+    #[test]
+    fn public_peers_are_told_apart_from_private_ones() {
+        // Private IPv4 hosts are built from octets, so the repository holds
+        // no private-network literal.
+        let lan = [
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+            IpAddr::V4(Ipv4Addr::new(172, 16, 4, 4)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 9)),
+            IpAddr::V6(Ipv4Addr::new(192, 168, 1, 9).to_ipv6_mapped()),
+        ];
+        for private in lan {
+            assert!(!is_public_peer(private), "{private}");
+        }
+        for private in [
+            "127.0.0.1",
+            "::1",
+            "100.64.1.1",
+            "169.254.0.7",
+            "fe80::1",
+            "fd00::7",
+            "fd7a:115c:a1e0::5",
+        ] {
+            assert!(!is_public_peer(ip(private)), "{private}");
+        }
+        for public in ["192.0.2.10", "8.8.8.8", "2001:db8::9", "::ffff:8.8.8.8"] {
+            assert!(is_public_peer(ip(public)), "{public}");
+        }
+    }
+
+    #[test]
+    fn allow_public_round_trips_and_older_files_read_as_off() {
+        let directory = directory("allow-public");
+        let settings = RemoteAccessSettings {
+            enabled: true,
+            allow_public: true,
+            ..RemoteAccessSettings::default()
+        };
+        save_remote_settings(&directory, &settings).unwrap();
+        assert_eq!(load_remote_settings(&directory).unwrap(), settings);
+        write_private(
+            &directory.join(SETTINGS_FILE),
+            br#"{"version":1,"enabled":true,"listen":null,"endpoints":[]}"#,
+        )
+        .unwrap();
+        assert!(!load_remote_settings(&directory).unwrap().allow_public);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -484,7 +574,8 @@ mod tests {
             advertised_endpoints(
                 &configured,
                 "[::]:7443".parse().unwrap(),
-                &[ip("192.0.2.1")]
+                &[ip("192.0.2.1")],
+                false
             ),
             vec![AdvertisedEndpoint {
                 endpoint: "runtime.example.net:7443".into(),
@@ -492,7 +583,12 @@ mod tests {
             }]
         );
         assert_eq!(
-            advertised_endpoints(&[], "127.0.0.1:5000".parse().unwrap(), &[ip("192.0.2.1")]),
+            advertised_endpoints(
+                &[],
+                "127.0.0.1:5000".parse().unwrap(),
+                &[ip("192.0.2.1")],
+                false
+            ),
             vec![AdvertisedEndpoint {
                 endpoint: "127.0.0.1:5000".into(),
                 kind: EndpointKind::Loopback,
@@ -502,10 +598,10 @@ mod tests {
             .map(|host| IpAddr::V4(Ipv4Addr::new(198, 51, 100, host)))
             .collect();
         assert_eq!(
-            advertised_endpoints(&[], "0.0.0.0:7443".parse().unwrap(), &many).len(),
+            advertised_endpoints(&[], "0.0.0.0:7443".parse().unwrap(), &many, true).len(),
             MAX_PAIRING_ENDPOINTS
         );
-        assert!(advertised_endpoints(&[], "0.0.0.0:7443".parse().unwrap(), &[]).is_empty());
+        assert!(advertised_endpoints(&[], "0.0.0.0:7443".parse().unwrap(), &[], true).is_empty());
     }
 
     #[test]

@@ -47,7 +47,16 @@ pub enum RemoteRule {
     Scope(&'static str),
     /// Remote access handles it and checks the admin scope where it needs it.
     RemoteAccess,
+    /// The request names a file on the runtime's own machine, which a
+    /// remote device never reads. The reason tells its user why.
+    Refused(&'static str),
 }
+
+/// The reader source that opens a file on the runtime's machine by path.
+const FILE_READER_SOURCE: &str = "csv";
+const HOST_FILE_REASON: &str = "A paired device cannot read files on the runtime's computer.";
+const HOST_ATTACHMENT_REASON: &str =
+    "A paired device cannot attach files to a thread on another computer yet.";
 
 /// The remote allow list. The match is exhaustive, so a new operation stays
 /// off the remote route until it is classified here.
@@ -92,10 +101,28 @@ pub fn remote_rule(operation: Operation, body: &Value) -> RemoteRule {
         | Operation::RecordQuery
         | Operation::RecordEntity
         | Operation::RecordReport
-        | Operation::ReaderDescribe
         | Operation::ReaderQueue
-        | Operation::ReaderObjects
         | Operation::ContextSettings => RemoteRule::Scope(SCOPE_THREAD_READ),
+        // A file reader takes a path on the runtime's machine, such as its
+        // credential files. Network sources read through stored secrets.
+        Operation::ReaderDescribe | Operation::ReaderObjects
+            if body.get("source").and_then(Value::as_str) == Some(FILE_READER_SOURCE) =>
+        {
+            RemoteRule::Refused(HOST_FILE_REASON)
+        }
+        Operation::ReaderDescribe | Operation::ReaderObjects => {
+            RemoteRule::Scope(SCOPE_THREAD_READ)
+        }
+        // Attached files are paths the runtime reads from its own disk, so a
+        // remote request carries none.
+        Operation::RunSubmit
+            if body
+                .get("files")
+                .and_then(Value::as_array)
+                .is_some_and(|files| !files.is_empty()) =>
+        {
+            RemoteRule::Refused(HOST_ATTACHMENT_REASON)
+        }
         Operation::HomeEnsure
         | Operation::ThreadCreate
         | Operation::ThreadRename
@@ -444,6 +471,9 @@ impl<H: ThreadListService> DesktopSessionService for RemoteSession<'_, H> {
         self.touch();
         match remote_rule(request.operation, &request.body) {
             RemoteRule::Excluded => Err(refuse(ProtocolError::unsupported_operation())),
+            RemoteRule::Refused(reason) => {
+                Err(refuse(ProtocolError::invalid_request_with_reason(reason)))
+            }
             RemoteRule::Scope(scope) if !self.scopes.contains(scope) => {
                 Err(refuse(ProtocolError::unauthorized()))
             }
@@ -857,6 +887,123 @@ mod tests {
         session.last_activity = Instant::now();
         session.expires = Instant::now();
         assert!(session.check_authority().is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn host_files_stay_off_the_remote_route() {
+        let refused = |operation, body: Value| {
+            matches!(remote_rule(operation, &body), RemoteRule::Refused(_))
+        };
+        assert!(refused(
+            Operation::ReaderDescribe,
+            json!({"source": "csv", "object": "/data/credentials/a/b"})
+        ));
+        assert!(refused(Operation::ReaderObjects, json!({"source": "csv"})));
+        assert_eq!(
+            remote_rule(
+                Operation::ReaderDescribe,
+                &json!({"source": "stripe", "object": "customers"})
+            ),
+            RemoteRule::Scope(SCOPE_THREAD_READ)
+        );
+        assert!(refused(
+            Operation::RunSubmit,
+            json!({"text": "read this", "files": ["/etc/hosts"], "thread_id": null})
+        ));
+        assert_eq!(
+            remote_rule(
+                Operation::RunSubmit,
+                &json!({"text": "hello", "files": [], "thread_id": null})
+            ),
+            RemoteRule::Scope(SCOPE_RUN_WRITE)
+        );
+
+        let directory =
+            std::env::temp_dir().join(format!("muniment-remote-files-{}", uuid::Uuid::now_v7()));
+        let access = access(&directory);
+        let mut owner = Owner(access.clone());
+        let mut session = RemoteSession {
+            service: &mut owner,
+            access,
+            device_id: uuid::Uuid::now_v7().to_string(),
+            scopes: crate::attach::remote_access::all_scopes(),
+            expires: Instant::now() + Duration::from_secs(60),
+            idle: Duration::from_secs(60),
+            last_activity: Instant::now(),
+            next_device_check: Instant::now() + Duration::from_secs(60),
+        };
+        let mut state = session.new_session_state();
+        let answer = session.dispatch_request(
+            request(
+                Operation::ReaderDescribe,
+                json!({"source": "csv", "object": "/etc/hosts"}),
+            ),
+            "",
+            provenance(),
+            &mut state,
+        );
+        let Err(failure) = answer else {
+            panic!("A host file read must be refused.");
+        };
+        assert_eq!(
+            failure.error.code(),
+            muniment_attach::ErrorCode::InvalidRequest
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn an_update_needs_the_update_scope_and_a_newer_version() {
+        use crate::attach::remote_access::dispatch_remote_operation;
+        let directory =
+            std::env::temp_dir().join(format!("muniment-remote-upd-{}", uuid::Uuid::now_v7()));
+        let access = access(&directory);
+        let scopes = |names: &[&str]| -> BTreeSet<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        };
+        let update = |version: &str, granted: &BTreeSet<String>| {
+            dispatch_remote_operation(
+                &access,
+                &request(Operation::RuntimeUpdate, json!({"version": version})),
+                granted,
+                "device",
+            )
+        };
+        assert!(muniment_attach::default_pairing_scopes()
+            .contains(muniment_attach::SCOPE_RUNTIME_UPDATE));
+        assert!(!muniment_attach::default_pairing_scopes().contains(SCOPE_RUNTIME_ADMIN));
+        assert_eq!(
+            update("2.1.0", &scopes(&[SCOPE_THREAD_READ, SCOPE_RUN_WRITE]))
+                .unwrap_err()
+                .code(),
+            muniment_attach::ErrorCode::Unauthorized
+        );
+        let updater = scopes(&[muniment_attach::SCOPE_RUNTIME_UPDATE]);
+        assert_eq!(update("2.1.0", &updater).unwrap()["version"], "2.1.0");
+        // The runtime announces 2.0.0, so the same or an older version is refused.
+        for version in ["2.0.0", "1.9.9", "2.0.0-beta.1"] {
+            assert_eq!(
+                update(version, &updater).unwrap_err().code(),
+                muniment_attach::ErrorCode::InvalidRequest,
+                "{version}"
+            );
+        }
+        assert!(update("2.0.1", &scopes(&[SCOPE_RUNTIME_ADMIN])).is_ok());
+        // A release follows its own pre-releases.
+        let candidate = RemoteAccess::open(
+            directory.join("candidate"),
+            RemoteAccessOptions {
+                runtime_name: None,
+                runtime_version: "2.1.0-rc.1".into(),
+                install_kind: InstallKind::Server,
+            },
+        )
+        .unwrap();
+        assert!(candidate.request_update("2.1.0", "device").is_ok());
+        assert!(candidate
+            .request_update("2.1.0-rc.2+build.5", "device")
+            .is_err());
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

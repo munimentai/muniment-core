@@ -48,6 +48,10 @@ impl Default for RestartPolicy {
     }
 }
 
+/// The prefix of the variables a runtime host reads secrets from. A sidecar
+/// never inherits one, so the agent and the tools it runs cannot read them.
+pub const SECRET_VARIABLE_PREFIX: &str = "MUNIMENT_SECRET_";
+
 #[derive(Debug, Clone)]
 pub struct SidecarConfig {
     pub program: String,
@@ -557,6 +561,14 @@ fn spawn_child(
     }
     for name in &config.env_remove {
         command.env_remove(name);
+    }
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with(SECRET_VARIABLE_PREFIX))
+        {
+            command.env_remove(&name);
+        }
     }
     let mut child = command
         .stdin(Stdio::piped())

@@ -20,6 +20,7 @@ use super::deadline_io::{read_exact_before, DeadlineStream, ReadableWait};
 use super::desktop_admission::write_protocol_error;
 use super::remote_access::RemoteAccess;
 use super::remote_session::{admit_remote_client, serve_remote_client, RemoteAdmissionError};
+use super::remote_settings::is_public_peer;
 use super::thread_service::ThreadListService;
 use super::{ProtocolError, SignedWorkspaceApproval};
 
@@ -40,6 +41,9 @@ pub struct RemoteListenerConfig {
     /// The bound on the first frame after the handshake.
     pub first_frame_timeout: Duration,
     pub backoff: FailureBackoffPolicy,
+    /// Whether peers on public addresses may connect. Off, only loopback,
+    /// private LAN and overlay peers reach the handshake.
+    pub allow_public: bool,
 }
 
 impl RemoteListenerConfig {
@@ -50,6 +54,7 @@ impl RemoteListenerConfig {
             handshake_timeout: Duration::from_secs(10),
             first_frame_timeout: Duration::from_secs(5),
             backoff: FailureBackoffPolicy::default(),
+            allow_public: false,
         }
     }
 }
@@ -312,6 +317,12 @@ impl RemoteListener {
                     continue;
                 }
             };
+            if !shared.config.allow_public && is_public_peer(peer.ip()) {
+                crate::runtime_eprintln!(
+                    "muniment-runtime: remote attach refused peer={peer} reason=public address"
+                );
+                continue;
+            }
             if !shared.backoff.allows(peer.ip(), Instant::now()) {
                 crate::runtime_eprintln!(
                     "muniment-runtime: remote attach refused peer={peer} reason=backoff"

@@ -1331,3 +1331,27 @@ fn missing_project_directory_does_not_fall_back_to_the_parent_directory() {
         }
     }
 }
+
+#[test]
+fn sidecar_never_inherits_secret_overrides() {
+    // The runtime reads secret overrides from its own environment, and the
+    // agent it supervises must not see them.
+    std::env::set_var("MUNIMENT_SECRET_SIDECAR_TEST_KEY", "not for the agent");
+    let names = temp_marker("secret-env");
+    let _ = std::fs::remove_file(&names);
+    let mut cfg = config(&["env-names", names.to_str().unwrap()]);
+    cfg.env.insert("SIDECAR_KEPT".into(), "1".into());
+    let supervisor = SidecarSupervisor::spawn(cfg, |_| Ok(ProbeOutcome::Ready)).unwrap();
+    let deadline = Instant::now() + STUB_RESPONSE_DEADLINE;
+    while !names.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    std::env::remove_var("MUNIMENT_SECRET_SIDECAR_TEST_KEY");
+    let listed = std::fs::read_to_string(&names).unwrap();
+    drop(supervisor);
+    let _ = std::fs::remove_file(&names);
+    assert!(listed.lines().any(|name| name == "SIDECAR_KEPT"));
+    assert!(!listed
+        .lines()
+        .any(|name| name.starts_with(muniment_core::sidecar::SECRET_VARIABLE_PREFIX)));
+}

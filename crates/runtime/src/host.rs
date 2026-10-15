@@ -268,7 +268,7 @@ impl CredentialStore for KeyringCredentialStore {
 pub const CREDENTIALS_DIRECTORY_NAME: &str = "credentials";
 
 /// The prefix of the environment variables that override stored secrets.
-pub const CREDENTIAL_VARIABLE_PREFIX: &str = "MUNIMENT_SECRET_";
+pub const CREDENTIAL_VARIABLE_PREFIX: &str = muniment_core::sidecar::SECRET_VARIABLE_PREFIX;
 
 /// Secrets in owner-only files, with read-only overrides from the environment,
 /// for a host without a keychain.

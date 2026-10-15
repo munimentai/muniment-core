@@ -17,8 +17,8 @@ use muniment_core::attach::{
     CertificateFingerprint, ClientError, ErrorCode, FailureBackoffPolicy, Id, InstallKind,
     Operation, PairingLink, PairingLinkRequest, ProtocolError, RemoteAccess, RemoteAccessOptions,
     RemoteClientOptions, RemoteConnectError, RemoteListener, RemoteListenerConfig,
-    RemoteRuntimeRecord, SignedWorkspaceApproval, SCOPE_RUNTIME_ADMIN, SCOPE_RUN_WRITE,
-    SCOPE_THREAD_READ,
+    RemoteRuntimeRecord, SignedWorkspaceApproval, SCOPE_RUNTIME_ADMIN, SCOPE_RUNTIME_UPDATE,
+    SCOPE_RUN_WRITE, SCOPE_THREAD_READ,
 };
 use serde_json::{json, Value};
 
@@ -200,7 +200,10 @@ fn pairing_issues_a_credential_and_the_welcome_names_the_runtime() {
     assert_eq!(info.install_kind, Some(InstallKind::Container));
     assert_eq!(client.runtime_version(), "9.8.7");
     assert_eq!(record.runtime_id.as_str(), info.runtime_id);
-    assert_eq!(record.scopes, scopes(&[SCOPE_THREAD_READ, SCOPE_RUN_WRITE]));
+    assert_eq!(
+        record.scopes,
+        scopes(&[SCOPE_THREAD_READ, SCOPE_RUN_WRITE, SCOPE_RUNTIME_UPDATE])
+    );
     assert_eq!(client.remote_scopes(), Some(&record.scopes));
 
     let devices = runtime.access.list_devices().unwrap();
@@ -514,14 +517,17 @@ fn an_admin_update_request_is_recorded_for_the_host() {
     let (mut admin, record) = pair_with_link(&link, &options(None)).unwrap();
     assert!(admin.request_runtime_update("1.2.x;rm").is_err());
     assert_eq!(error_code(&admin), Some(ErrorCode::InvalidRequest));
-    let answer = admin.request_runtime_update("1.3.0").unwrap();
-    assert_eq!(answer["version"], "1.3.0");
+    // The runtime runs 9.8.7, so an older version is refused.
+    assert!(admin.request_runtime_update("1.3.0").is_err());
+    assert_eq!(error_code(&admin), Some(ErrorCode::InvalidRequest));
+    let answer = admin.request_runtime_update("9.9.0").unwrap();
+    assert_eq!(answer["version"], "9.9.0");
     let request = requests.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!(request.version, "1.3.0");
+    assert_eq!(request.version, "9.9.0");
     assert_eq!(request.requested_by, record.credential.device_id.as_str());
     assert_eq!(runtime.access.requested_update(), Some(request));
     let info = admin.read_runtime_info().unwrap();
-    assert_eq!(info["update_request"]["version"], "1.3.0");
+    assert_eq!(info["update_request"]["version"], "9.9.0");
     assert_eq!(
         info["certificate_sha256"],
         runtime.access.certificate_fingerprint().to_hex()

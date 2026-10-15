@@ -148,9 +148,9 @@ pub use remote_session::{
     RemoteAdmissionError, RemoteRule,
 };
 pub use remote_settings::{
-    advertised_endpoints, interface_addresses, load_remote_settings, read_listener_status,
-    save_remote_settings, AdvertisedEndpoint, EndpointKind, RemoteAccessSettings,
-    RemoteListenerStatus, RemoteSettingsOverrides, DEFAULT_REMOTE_PORT,
+    advertised_endpoints, interface_addresses, is_public_peer, load_remote_settings,
+    read_listener_status, save_remote_settings, AdvertisedEndpoint, EndpointKind,
+    RemoteAccessSettings, RemoteListenerStatus, RemoteSettingsOverrides, DEFAULT_REMOTE_PORT,
 };
 pub use runtime_activity::*;
 #[cfg(unix)]

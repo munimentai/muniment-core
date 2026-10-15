@@ -19,5 +19,5 @@ pub use pi::{
 };
 pub use supervisor::{
     ProbeOutcome, RestartPolicy, SidecarConfig, SidecarEvent, SidecarEventCause, SidecarStatus,
-    SidecarSupervisor,
+    SidecarSupervisor, SECRET_VARIABLE_PREFIX,
 };

@@ -74,6 +74,7 @@ struct RouteState {
 
 struct Running {
     requested: Option<SocketAddr>,
+    allow_public: bool,
     bound: SocketAddr,
     stop: Sender<()>,
     thread: JoinHandle<()>,
@@ -125,11 +126,10 @@ impl RemoteRoute {
             }
         }
         let desired = state.effective.enabled.then_some(state.effective.listen);
-        if state
-            .running
-            .as_ref()
-            .is_some_and(|running| Some(running.requested) != desired)
-        {
+        if state.running.as_ref().is_some_and(|running| {
+            Some(running.requested) != desired
+                || running.allow_public != state.effective.allow_public
+        }) {
             stop_running(&mut state);
         }
         if let (Some(requested), None) = (desired, state.running.as_ref()) {
@@ -189,7 +189,9 @@ impl RemoteRoute {
     ) -> Result<Running, String> {
         let mut failure = None;
         for address in settings.listen_candidates() {
-            let listener = match RemoteListener::bind(RemoteListenerConfig::new(address)) {
+            let mut config = RemoteListenerConfig::new(address);
+            config.allow_public = settings.allow_public;
+            let listener = match RemoteListener::bind(config) {
                 Ok(listener) => listener,
                 Err(error) => {
                     crate::runtime_eprintln!(
@@ -220,6 +222,7 @@ impl RemoteRoute {
             );
             return Ok(Running {
                 requested,
+                allow_public: settings.allow_public,
                 bound,
                 stop,
                 thread,
@@ -238,6 +241,7 @@ impl RemoteRoute {
                     &state.effective.endpoints,
                     running.bound,
                     &(self.interfaces)(),
+                    state.effective.allow_public,
                 );
                 let listed = endpoints
                     .iter()
@@ -362,6 +366,7 @@ mod tests {
             enabled: true,
             listen: Some(listen.parse().unwrap()),
             endpoints: endpoints.iter().map(|e| (*e).to_owned()).collect(),
+            allow_public: false,
         }
     }
 
@@ -420,10 +425,20 @@ mod tests {
         let status = route.save(on("127.0.0.1:0", &[])).unwrap();
         assert_eq!(status.listening, Some(first));
 
-        // A new address rebinds and the interface list names the endpoints.
+        // A new address rebinds. The interface list holds a public address
+        // alone, which links name only once public access is on.
         let status = route.save(on("0.0.0.0:0", &[])).unwrap();
+        let private_only = status.listening.unwrap();
+        assert_ne!(private_only.port(), first.port());
+        assert!(status.endpoints.is_empty());
+        let status = route
+            .save(RemoteAccessSettings {
+                allow_public: true,
+                ..on("0.0.0.0:0", &[])
+            })
+            .unwrap();
         let second = status.listening.unwrap();
-        assert_ne!(second.port(), first.port());
+        assert_ne!(second.port(), private_only.port());
         assert_eq!(
             status.endpoints,
             vec![AdvertisedEndpoint {
@@ -436,7 +451,10 @@ mod tests {
 
         // Configured endpoints replace the interface list.
         let status = route
-            .save(on("0.0.0.0:0", &["runtime.example.net:7443"]))
+            .save(RemoteAccessSettings {
+                allow_public: true,
+                ..on("0.0.0.0:0", &["runtime.example.net:7443"])
+            })
             .unwrap();
         assert_eq!(status.listening, Some(second));
         assert_eq!(
@@ -473,6 +491,7 @@ mod tests {
             enabled: Some(true),
             listen: Some("127.0.0.1:0".parse().unwrap()),
             endpoints: Some(vec!["198.51.100.4:7443".into()]),
+            allow_public: None,
         });
         let status = route.apply();
         assert!(!status.settings.enabled);

@@ -18,7 +18,7 @@
 # port 7443. MUNIMENT_REMOTE_ENDPOINTS names the host:port clients reach,
 # since the container's own addresses are rarely reachable from them:
 #
-#   docker run -d -p 7443:7443 -e MUNIMENT_REMOTE_ENDPOINTS=runtime.example.net:7443 \
+#   docker run -d -p 192.0.2.20:7443:7443 -e MUNIMENT_REMOTE_ENDPOINTS=runtime.example.net:7443 \
 #       -v muniment-data:/data muniment-runtime
 #   docker exec <container> muniment-server pair
 #

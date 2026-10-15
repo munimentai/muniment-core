@@ -21,6 +21,7 @@ const REMOTE_DIRECTORY_NAME: &str = "remote";
 const ACCESS_VARIABLE: &str = "MUNIMENT_REMOTE_ACCESS";
 const LISTEN_VARIABLE: &str = "MUNIMENT_REMOTE_LISTEN";
 const ENDPOINTS_VARIABLE: &str = "MUNIMENT_REMOTE_ENDPOINTS";
+const PUBLIC_VARIABLE: &str = "MUNIMENT_REMOTE_ALLOW_PUBLIC";
 const INSTALL_KIND_VARIABLE: &str = "MUNIMENT_INSTALL_KIND";
 
 /// The remote access directory under `state`.
@@ -44,14 +45,27 @@ fn install_kind_from(value: Option<&str>) -> Result<InstallKind, String> {
 }
 
 /// The overrides `MUNIMENT_REMOTE_ACCESS` (`on` or `off`),
-/// `MUNIMENT_REMOTE_LISTEN` (`address:port`) and `MUNIMENT_REMOTE_ENDPOINTS`
-/// (a comma list of `host:port`) set.
+/// `MUNIMENT_REMOTE_LISTEN` (`address:port`), `MUNIMENT_REMOTE_ENDPOINTS`
+/// (a comma list of `host:port`) and `MUNIMENT_REMOTE_ALLOW_PUBLIC` (`on` or
+/// `off`) set.
 pub fn overrides_from_env() -> Result<RemoteSettingsOverrides, String> {
-    overrides_from(
+    let mut overrides = overrides_from(
         env(ACCESS_VARIABLE).as_deref(),
         env(LISTEN_VARIABLE).as_deref(),
         env(ENDPOINTS_VARIABLE).as_deref(),
-    )
+    )?;
+    overrides.allow_public = switch(PUBLIC_VARIABLE, env(PUBLIC_VARIABLE).as_deref())?;
+    Ok(overrides)
+}
+
+/// An `on` or `off` variable. Unset or empty keeps the stored value.
+fn switch(name: &str, value: Option<&str>) -> Result<Option<bool>, String> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some("on" | "true" | "1") => Ok(Some(true)),
+        Some("off" | "false" | "0") => Ok(Some(false)),
+        Some(other) => Err(format!("{name} must be on or off, not {other}")),
+    }
 }
 
 fn overrides_from(
@@ -59,12 +73,7 @@ fn overrides_from(
     listen: Option<&str>,
     endpoints: Option<&str>,
 ) -> Result<RemoteSettingsOverrides, String> {
-    let enabled = match access.map(str::trim) {
-        None | Some("") => None,
-        Some("on" | "true" | "1") => Some(true),
-        Some("off" | "false" | "0") => Some(false),
-        Some(other) => return Err(format!("{ACCESS_VARIABLE} must be on or off, not {other}")),
-    };
+    let enabled = switch(ACCESS_VARIABLE, access)?;
     let listen = match listen.map(str::trim).filter(|value| !value.is_empty()) {
         None => None,
         Some(value) => Some(value.parse::<SocketAddr>().map_err(|_| {
@@ -89,6 +98,7 @@ fn overrides_from(
         enabled,
         listen,
         endpoints: (!endpoints.is_empty()).then_some(endpoints),
+        allow_public: None,
     })
 }
 
@@ -171,12 +181,15 @@ fn link_endpoints(state: &Path) -> Result<Vec<String>, String> {
         .first()
         .copied()
         .ok_or("remote access has no listen address")?;
-    Ok(
-        advertised_endpoints(&settings.endpoints, bound, &interface_addresses())
-            .into_iter()
-            .map(|endpoint| endpoint.endpoint)
-            .collect(),
+    Ok(advertised_endpoints(
+        &settings.endpoints,
+        bound,
+        &interface_addresses(),
+        settings.allow_public,
     )
+    .into_iter()
+    .map(|endpoint| endpoint.endpoint)
+    .collect())
 }
 
 /// `pair [--scopes s1,s2] [--json]`: prints a one-time pairing link.
@@ -393,6 +406,7 @@ mod tests {
                     "127.0.0.1:7443".into(),
                     "runtime.example.net:7443".into()
                 ]),
+                allow_public: None,
             })
         );
         assert_eq!(
@@ -410,6 +424,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         assert!(overrides_from(None, None, Some(&nine)).is_err());
+        assert_eq!(switch(PUBLIC_VARIABLE, Some("on")), Ok(Some(true)));
+        assert_eq!(switch(PUBLIC_VARIABLE, Some(" ")), Ok(None));
+        assert!(switch(PUBLIC_VARIABLE, Some("public")).is_err());
     }
 
     #[test]

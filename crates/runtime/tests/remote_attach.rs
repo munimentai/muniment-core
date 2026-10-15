@@ -115,6 +115,7 @@ fn the_runtime_starts_and_stops_its_remote_listener_as_its_settings_change() {
             enabled: true,
             listen: Some("127.0.0.1:0".parse().unwrap()),
             endpoints: Vec::new(),
+            allow_public: false,
         })
         .unwrap();
     let address = status.listening.unwrap();

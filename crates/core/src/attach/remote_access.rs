@@ -19,7 +19,7 @@ use muniment_attach::{
     default_pairing_scopes, is_lowercase_hex, is_valid_display_name, is_valid_endpoint,
     CertificateFingerprint, Id, InstallKind, Operation, PairingLink, ProtocolError, Request,
     RuntimeInfo, DEVICE_SECRET_HEX_LENGTH, MAX_PAIRING_ENDPOINTS, PAIRING_SECRET_HEX_LENGTH,
-    REMOTE_SCOPES, SCOPE_RUNTIME_ADMIN,
+    REMOTE_SCOPES, SCOPE_RUNTIME_ADMIN, SCOPE_RUNTIME_UPDATE,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -388,6 +388,14 @@ impl RemoteAccess {
         if !is_valid_version(version) {
             return Err(ProtocolError::invalid_request());
         }
+        // A request names a newer release. The host's updater still checks
+        // the release's signature, so a device can ask but never pick a
+        // build or an older version.
+        if !is_newer_version(version, &self.inner.runtime_version) {
+            return Err(ProtocolError::invalid_request_with_reason(
+                "The runtime already runs this version or a newer one.",
+            ));
+        }
         let request = RuntimeUpdateRequest {
             version: version.to_owned(),
             requested_at: timestamp((self.inner.clock)()),
@@ -638,7 +646,9 @@ pub(super) fn dispatch_remote_operation(
             Ok(json!({"revoked": access.revoke_device(&body.device_id)?}))
         }
         Operation::RuntimeUpdate => {
-            admin()?;
+            if !granted.contains(SCOPE_RUNTIME_UPDATE) && !granted.contains(SCOPE_RUNTIME_ADMIN) {
+                return Err(ProtocolError::unauthorized());
+            }
             #[derive(serde::Deserialize)]
             #[serde(deny_unknown_fields)]
             struct Body {
@@ -699,6 +709,35 @@ fn is_valid_version(version: &str) -> bool {
         && version
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+}
+
+/// The numeric `major.minor.patch` of a version, and whether it carries a
+/// pre-release suffix. A build suffix after `+` is ignored.
+fn release_numbers(version: &str) -> Option<([u64; 3], bool)> {
+    let version = version.split('+').next()?;
+    let (core, pre_release) = match version.split_once('-') {
+        Some((core, _)) => (core, true),
+        None => (version, false),
+    };
+    let mut parts = core.split('.');
+    let mut numbers = [0_u64; 3];
+    for number in &mut numbers {
+        *number = parts.next()?.parse().ok()?;
+    }
+    parts.next().is_none().then_some((numbers, pre_release))
+}
+
+/// Whether `requested` is a later release than `current`, where a release
+/// follows its own pre-releases. A version that does not parse is never
+/// newer.
+fn is_newer_version(requested: &str, current: &str) -> bool {
+    match (release_numbers(requested), release_numbers(current)) {
+        (Some((requested, requested_pre)), Some((current, current_pre))) => {
+            requested > current || (requested == current && current_pre && !requested_pre)
+        }
+        (Some(_), None) => true,
+        _ => false,
+    }
 }
 
 fn load_store(directory: &Path) -> Result<AccessFile, ProtocolError> {

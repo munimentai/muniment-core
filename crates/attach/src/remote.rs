@@ -18,15 +18,28 @@ use crate::Id;
 pub const SCOPE_THREAD_READ: &str = "thread.read";
 /// Starts and steers runs and changes threads, companies and records.
 pub const SCOPE_RUN_WRITE: &str = "run.write";
+/// Asks the runtime to update to a newer version. The runtime's own updater
+/// decides what it installs.
+pub const SCOPE_RUNTIME_UPDATE: &str = "runtime.update";
 /// Pairs and revokes devices, changes model accounts and requests updates.
 pub const SCOPE_RUNTIME_ADMIN: &str = "runtime.admin";
 /// Every scope a remote device can hold.
-pub const REMOTE_SCOPES: [&str; 3] = [SCOPE_THREAD_READ, SCOPE_RUN_WRITE, SCOPE_RUNTIME_ADMIN];
+pub const REMOTE_SCOPES: [&str; 4] = [
+    SCOPE_THREAD_READ,
+    SCOPE_RUN_WRITE,
+    SCOPE_RUNTIME_UPDATE,
+    SCOPE_RUNTIME_ADMIN,
+];
 
-/// The scopes a pairing link grants when its creator names none. Pairing
-/// management stays out unless the creator delegates it.
+/// The scopes a pairing link grants when its creator names none. Updates
+/// stay automatic, and pairing management stays out unless the creator
+/// delegates it.
 pub fn default_pairing_scopes() -> BTreeSet<String> {
-    BTreeSet::from([SCOPE_THREAD_READ.to_owned(), SCOPE_RUN_WRITE.to_owned()])
+    BTreeSet::from([
+        SCOPE_THREAD_READ.to_owned(),
+        SCOPE_RUN_WRITE.to_owned(),
+        SCOPE_RUNTIME_UPDATE.to_owned(),
+    ])
 }
 
 /// The URI scheme of a pairing link.

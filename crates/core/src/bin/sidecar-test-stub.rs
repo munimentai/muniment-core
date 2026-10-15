@@ -165,6 +165,13 @@ fn main() {
             fs::write(args.next().unwrap(), std::process::id().to_string()).unwrap();
             echo();
         }
+        Some("env-names") => {
+            let names: Vec<String> = std::env::vars_os()
+                .map(|(name, _)| name.to_string_lossy().into_owned())
+                .collect();
+            fs::write(args.next().unwrap(), names.join("\n")).unwrap();
+            echo();
+        }
         Some("hang") => {
             fs::write(args.next().unwrap(), std::process::id().to_string()).unwrap();
             loop {

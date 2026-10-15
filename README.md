@@ -123,18 +123,23 @@ listener is off until the host binds it.
   the route: TLS 1.3 only, a connection cap, handshake and first-frame
   deadlines, a 16 KiB first frame, and a growing hold on a peer address after
   repeated refusals.
-- Scopes are `thread.read`, `run.write` and `runtime.admin`. A link grants
-  `thread.read` and `run.write` unless its creator names others, and a client
-  can ask for fewer, never more. Only the local owner and `runtime.admin`
-  devices create links, list devices, revoke them and send `runtime.update`,
-  and a device delegates only scopes it holds.
+- Scopes are `thread.read`, `run.write`, `runtime.update` and
+  `runtime.admin`. A link grants `thread.read`, `run.write` and
+  `runtime.update` unless its creator names others, and a client can ask for
+  fewer, never more. Only the local owner and `runtime.admin` devices create
+  links, list devices and revoke them, and a device delegates only scopes it
+  holds. `runtime.update` or `runtime.admin` sends `runtime.update`.
 - `remote_rule` names what a remote client may send: the desktop client
   operations except workspace onboarding, migration control, approval
   presentation, same-machine companions, and the host's cloud account and
   phone pairing. Reader connections and model changes need `runtime.admin`.
-- Revoking a device closes its live sessions. `runtime.update` records the
-  requested version in `<state root>/remote/runtime-update.json` and sends it
-  to `RemoteAccess::update_requests`. The host's updater applies it.
+  The route refuses requests that name a file on the runtime's machine: the
+  `csv` reader source, and `run.submit` with `files`.
+- Revoking a device closes its live sessions. `runtime.update` takes a
+  version newer than the one the runtime announces, records it in
+  `<state root>/remote/runtime-update.json` and sends it to
+  `RemoteAccess::update_requests`. The host's updater applies it only from
+  its own signed releases.
 - The client side is `pair_with_link`, `connect_remote_runtime` and
   `RemoteRuntimeRecord`, which saves the credential to an owner-only file.
   `cargo run -p muniment-attach --features client --example remote-smoke --
@@ -143,10 +148,13 @@ listener is off until the host binds it.
 
 `RuntimeAttachState::start_remote_route` opens remote access and serves the
 remote route as `<state root>/remote/settings.json` directs:
-`{"version":1,"enabled":false,"listen":null,"endpoints":[]}` by default. A
-null `listen` binds port 7443 on every interface. Empty `endpoints` let the
-runtime list its own non-loopback interface addresses with the bound port,
-IPv4 first, at most eight. Each listed endpoint carries a `kind`:
+`{"version":1,"enabled":false,"listen":null,"endpoints":[],"allow_public":false}`
+by default. A null `listen` binds port 7443 on every interface. Unless
+`allow_public` is true, the listener closes a connection from a public
+address before the handshake, and only loopback, private LAN, link-local and
+overlay peers reach it. Empty `endpoints` let the runtime list its own
+non-loopback interface addresses with the bound port, IPv4 first, at most
+eight, and public addresses only when `allow_public` is true. Each listed endpoint carries a `kind`:
 `configured`, `loopback`, `lan` (RFC 1918 or IPv6 unique local), `overlay`
 (100.64.0.0/10 and fd7a:115c:a1e0::/48, which private overlay networks
 assign) or `public`. Windows lists no interfaces, so a link there names
@@ -158,12 +166,13 @@ The local owner route, and never the remote route or a companion, also
 answers:
 
 - `remote.settings` with `{}`: `{"settings": {"enabled", "listen",
-  "endpoints"}, "overridden", "runtime_id", "runtime_name",
+  "endpoints", "allow_public"}, "overridden", "runtime_id", "runtime_name",
   "certificate_sha256", "listening", "endpoints": [{"endpoint", "kind"}],
   "error"}`. `listening` is the bound address or null, and `error` says why
   the listener is not serving.
 - `remote.settings_save` with `{"enabled": true, "listen": "0.0.0.0:7443" or
-  null, "endpoints": ["host:port"]}`, answered like `remote.settings`.
+  null, "endpoints": ["host:port"], "allow_public": false}`, answered like
+  `remote.settings`.
 - `remote.pairing_create`, `remote.device_list`, `remote.device_revoke`,
   `runtime.info` and `runtime.update`, as a `runtime.admin` device sends them.
 
@@ -266,8 +275,8 @@ as `_`. The reader's `ai.muniment.reader` secret `stripe` is
 `serve` starts the remote route. These variables override the stored remote
 access settings without changing them: `MUNIMENT_REMOTE_ACCESS` (`on` or
 `off`), `MUNIMENT_REMOTE_LISTEN` (an IP address and port, such as
-`0.0.0.0:7443`) and `MUNIMENT_REMOTE_ENDPOINTS` (a comma list of `host:port`
-the links name). `install_kind` is `server`, or `container` when
+`0.0.0.0:7443`), `MUNIMENT_REMOTE_ENDPOINTS` (a comma list of `host:port`
+the links name) and `MUNIMENT_REMOTE_ALLOW_PUBLIC` (`on` or `off`). `install_kind` is `server`, or `container` when
 `MUNIMENT_INSTALL_KIND=container`. At start `serve` logs the runtime id, the
 certificate fingerprint and the listen address.
 
@@ -289,12 +298,13 @@ process, such as over SSH or `docker exec`:
 pinned Pi for the image's architecture and the pinned packages. State lives in
 the `/data` volume, and the health check runs `muniment-server health`. The
 image sets `MUNIMENT_INSTALL_KIND=container` and `MUNIMENT_REMOTE_ACCESS=on`
-and exposes port 7443. Set `MUNIMENT_REMOTE_ENDPOINTS` to the address clients
-reach:
+and exposes port 7443. Publish the port on the address clients reach, such
+as a LAN or tailnet address rather than every host interface, and set
+`MUNIMENT_REMOTE_ENDPOINTS` to it:
 
 ```sh
 docker build -f deploy/runtime/Containerfile -t muniment-runtime .
-docker run -d --name muniment -p 7443:7443 \
+docker run -d --name muniment -p 192.0.2.20:7443:7443 \
   -e MUNIMENT_REMOTE_ENDPOINTS=runtime.example.net:7443 \
   -v muniment-data:/data muniment-runtime
 docker exec muniment muniment-server pair
@@ -304,7 +314,7 @@ Each release publishes the image for linux/amd64 as
 `ghcr.io/munimentai/muniment-runtime:<version>` and `:latest`:
 
 ```sh
-docker run -d --name muniment -p 7443:7443 \
+docker run -d --name muniment -p 192.0.2.20:7443:7443 \
   -e MUNIMENT_REMOTE_ENDPOINTS=runtime.example.net:7443 \
   -v muniment-data:/data ghcr.io/munimentai/muniment-runtime:latest
 ```
