@@ -1636,18 +1636,12 @@ fn coordinate_work(
     }
 }
 
-#[cfg(feature = "keyring")]
 fn stored_prompt(run_id: &str, subject: Option<&str>) -> Vec<String> {
     crate::chat_prompt::load_prompt(run_id, subject)
         .ok()
         .flatten()
         .into_iter()
         .collect()
-}
-
-#[cfg(not(feature = "keyring"))]
-fn stored_prompt(_run_id: &str, _subject: Option<&str>) -> Vec<String> {
-    Vec::new()
 }
 
 fn answer_thread_title(

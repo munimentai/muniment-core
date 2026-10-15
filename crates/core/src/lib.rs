@@ -16,7 +16,6 @@ pub mod cas;
 pub mod chat_coordinate;
 pub mod chat_launch;
 pub mod chat_profile;
-#[cfg(feature = "keyring")]
 pub mod chat_prompt;
 pub mod chat_resume;
 pub mod chat_view;
@@ -70,7 +69,6 @@ pub mod search_settings;
 pub mod session_thread;
 pub mod sidecar;
 pub mod state_root;
-#[cfg(feature = "keyring")]
 pub mod thread_history;
 pub mod thread_ownership;
 #[cfg(unix)]

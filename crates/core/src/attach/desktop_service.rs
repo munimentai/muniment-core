@@ -1020,7 +1020,7 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
         self.boundaries.recheck_retention()
     }
 
-    #[cfg(all(any(unix, target_os = "windows"), feature = "keyring"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn thread_history(
         &mut self,
         request: ThreadOpenRequest,

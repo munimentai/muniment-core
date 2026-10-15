@@ -11,7 +11,7 @@ use common::{fixture_grant, TemporaryProfile};
 
 #[test]
 fn memory_session_failure_ends_the_prepared_run() {
-    muniment_core::chat_prompt::use_mock_keyring_for_tests();
+    common::use_test_prompt_store();
     let temporary_profile = TemporaryProfile::new("preparation-failure", false);
     let profile = temporary_profile.profile.clone();
     let config = temporary_profile.config.clone();

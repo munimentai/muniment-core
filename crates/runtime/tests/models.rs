@@ -40,7 +40,7 @@ fn router_entry(agent: &std::path::Path) -> Option<String> {
 
 #[test]
 fn the_runtime_starts_the_router_its_record_turns_on_and_stops_it_with_the_schedule() {
-    muniment_core::chat_prompt::use_mock_keyring_for_tests();
+    common::use_test_prompt_store();
     let temporary = TemporaryProfile::new("models-router", false);
     let agent = muniment_core::state_root::agent_directory(&temporary.profile);
     config::save(
@@ -108,7 +108,7 @@ fn the_runtime_starts_the_router_its_record_turns_on_and_stops_it_with_the_sched
 
 #[test]
 fn a_sign_in_step_reaches_every_attach_subscriber_and_the_host_supplies_provider_clients() {
-    muniment_core::chat_prompt::use_mock_keyring_for_tests();
+    common::use_test_prompt_store();
     let temporary = TemporaryProfile::new("models-events", false);
     let state =
         RuntimeAttachState::open(fixture_host(), &temporary.profile, &temporary.config).unwrap();
@@ -153,7 +153,7 @@ fn the_runtime_runs_the_search_server_and_applies_search_settings_without_a_rest
         muniment_search::EngineId::ALL.map(|engine| engine.name())
     );
 
-    muniment_core::chat_prompt::use_mock_keyring_for_tests();
+    common::use_test_prompt_store();
     let temporary = TemporaryProfile::new("models-search", false);
     let agent = muniment_core::state_root::agent_directory(&temporary.profile);
     let endpoint_file = agent.join(muniment_search::server::ENDPOINT_FILE);

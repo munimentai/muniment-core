@@ -87,7 +87,7 @@ fn permission_answer_reports_rejection_and_timeout() {
 #[test]
 fn a_queued_permission_answer_reaches_a_live_runtime_run() {
     let _environment = ENVIRONMENT.lock().unwrap();
-    muniment_core::chat_prompt::use_mock_keyring_for_tests();
+    common::use_test_prompt_store();
     let temporary_profile = TemporaryProfile::new("permission", true);
     let temporary_root = temporary_profile.root.clone();
     let profile = temporary_profile.profile.clone();

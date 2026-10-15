@@ -1,3 +1,5 @@
+// This test injects a prompt delete failure into the mock keyring.
+#![cfg(feature = "keyring")]
 use muniment_core::chat_prompt::{
     fail_next_mock_prompt_delete_for_tests, load_prompt, store_prompt, use_mock_keyring_for_tests,
 };

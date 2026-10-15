@@ -1,20 +1,25 @@
-use keyring::Entry;
-use std::any::Any;
-use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::RwLock;
+#[cfg(feature = "keyring")]
+use std::{
+    any::Any,
+    collections::HashMap,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::{Arc, Mutex},
+};
 
-const PROMPT_SERVICE: &str = "ai.muniment.desktop.chat";
 const PROMPT_USER: &str = "protected-prompts";
+#[cfg(feature = "keyring")]
 static FAIL_NEXT_MOCK_DELETE: AtomicBool = AtomicBool::new(false);
 static LOCAL_PROMPT_ROOT: RwLock<Option<PathBuf>> = RwLock::new(None);
 
 /// Local mode keeps each prompt in an owner-only file beside the journal, so a
 /// shell with no cloud session never opens the keychain. The runtime installs
-/// its state root once, and the local-mode marker there selects the store.
+/// its state root once, and the local-mode marker there selects the store. A
+/// build without the `keyring` feature has no keychain, so it keeps every
+/// prompt in the file store whether or not the marker is present.
 pub fn install_local_prompt_store(config_directory: PathBuf) {
     *LOCAL_PROMPT_ROOT
         .write()
@@ -29,7 +34,7 @@ fn local_prompt_directory() -> Option<PathBuf> {
 }
 
 fn local_prompt_directory_under(config_directory: &Path) -> Option<PathBuf> {
-    crate::local_mode::is_local_mode(config_directory)
+    (!cfg!(feature = "keyring") || crate::local_mode::is_local_mode(config_directory))
         .then(|| config_directory.join("muniment").join("prompts"))
 }
 
@@ -84,10 +89,84 @@ fn delete_local_prompt(directory: &Path, user: &str) -> io::Result<()> {
     }
 }
 
-fn file_failure(error: io::Error) -> keyring::Error {
+/// The prompt store's failure: the keyring's error, which also carries a file
+/// store failure, or the file system's error in a build without the keyring.
+#[cfg(feature = "keyring")]
+pub type PromptStoreError = keyring::Error;
+#[cfg(not(feature = "keyring"))]
+pub type PromptStoreError = io::Error;
+
+#[cfg(feature = "keyring")]
+fn file_failure(error: io::Error) -> PromptStoreError {
     keyring::Error::PlatformFailure(Box::new(error))
 }
 
+#[cfg(not(feature = "keyring"))]
+fn file_failure(error: io::Error) -> PromptStoreError {
+    error
+}
+
+/// The system keyring, used when no file store is selected.
+#[cfg(feature = "keyring")]
+mod keychain {
+    use super::ChatPromptError;
+    use keyring::Entry;
+
+    const PROMPT_SERVICE: &str = "ai.muniment.desktop.chat";
+
+    fn entry(user: &str) -> Result<Entry, ChatPromptError> {
+        Entry::new(PROMPT_SERVICE, user).map_err(ChatPromptError::Entry)
+    }
+
+    pub(super) fn store(user: &str, prompt: &str) -> Result<(), ChatPromptError> {
+        entry(user)?
+            .set_password(prompt)
+            .map_err(ChatPromptError::Store)
+    }
+
+    pub(super) fn load(user: &str) -> Result<Option<String>, ChatPromptError> {
+        match entry(user)?.get_password() {
+            Ok(prompt) => Ok(Some(prompt)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(ChatPromptError::Load(error)),
+        }
+    }
+
+    pub(super) fn delete(user: &str) -> Result<(), ChatPromptError> {
+        match entry(user)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(ChatPromptError::Delete(error)),
+        }
+    }
+}
+
+/// A build without the keyring has only the file store, so a process that
+/// installed no state root has no prompt store at all.
+#[cfg(not(feature = "keyring"))]
+mod keychain {
+    use super::ChatPromptError;
+
+    fn unavailable() -> ChatPromptError {
+        ChatPromptError::Entry(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no prompt store directory is installed",
+        ))
+    }
+
+    pub(super) fn store(_user: &str, _prompt: &str) -> Result<(), ChatPromptError> {
+        Err(unavailable())
+    }
+
+    pub(super) fn load(_user: &str) -> Result<Option<String>, ChatPromptError> {
+        Err(unavailable())
+    }
+
+    pub(super) fn delete(_user: &str) -> Result<(), ChatPromptError> {
+        Err(unavailable())
+    }
+}
+
+#[cfg(feature = "keyring")]
 #[doc(hidden)]
 pub fn use_mock_keyring_for_tests() {
     type Secrets = Arc<Mutex<HashMap<(String, String), Vec<u8>>>>;
@@ -159,6 +238,7 @@ pub fn use_mock_keyring_for_tests() {
     ))));
 }
 
+#[cfg(feature = "keyring")]
 #[doc(hidden)]
 pub fn use_refused_keyring_for_tests(
     code: i32,
@@ -234,6 +314,7 @@ pub fn use_refused_keyring_for_tests(
     }));
 }
 
+#[cfg(feature = "keyring")]
 #[doc(hidden)]
 pub fn fail_next_mock_prompt_delete_for_tests() {
     FAIL_NEXT_MOCK_DELETE.store(true, Ordering::SeqCst);
@@ -241,10 +322,10 @@ pub fn fail_next_mock_prompt_delete_for_tests() {
 
 #[derive(Debug)]
 pub enum ChatPromptError {
-    Entry(keyring::Error),
-    Store(keyring::Error),
-    Load(keyring::Error),
-    Delete(keyring::Error),
+    Entry(PromptStoreError),
+    Store(PromptStoreError),
+    Load(PromptStoreError),
+    Delete(PromptStoreError),
 }
 
 pub fn prompt_user(subject: Option<&str>, run_id: &str) -> String {
@@ -264,8 +345,7 @@ pub fn store_prompt(
         return store_local_prompt(&directory, &user, prompt)
             .map_err(|error| ChatPromptError::Store(file_failure(error)));
     }
-    let entry = Entry::new(PROMPT_SERVICE, &user).map_err(ChatPromptError::Entry)?;
-    entry.set_password(prompt).map_err(ChatPromptError::Store)
+    keychain::store(&user, prompt)
 }
 
 pub fn load_prompt(run_id: &str, subject: Option<&str>) -> Result<Option<String>, ChatPromptError> {
@@ -274,12 +354,7 @@ pub fn load_prompt(run_id: &str, subject: Option<&str>) -> Result<Option<String>
         return load_local_prompt(&directory, &user)
             .map_err(|error| ChatPromptError::Load(file_failure(error)));
     }
-    let entry = Entry::new(PROMPT_SERVICE, &user).map_err(ChatPromptError::Entry)?;
-    match entry.get_password() {
-        Ok(prompt) => Ok(Some(prompt)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(error) => Err(ChatPromptError::Load(error)),
-    }
+    keychain::load(&user)
 }
 
 pub fn delete_prompt(run_id: &str, subject: Option<&str>) -> Result<(), ChatPromptError> {
@@ -288,11 +363,7 @@ pub fn delete_prompt(run_id: &str, subject: Option<&str>) -> Result<(), ChatProm
         return delete_local_prompt(&directory, &user)
             .map_err(|error| ChatPromptError::Delete(file_failure(error)));
     }
-    let entry = Entry::new(PROMPT_SERVICE, &user).map_err(ChatPromptError::Entry)?;
-    match entry.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(error) => Err(ChatPromptError::Delete(error)),
-    }
+    keychain::delete(&user)
 }
 
 #[cfg(test)]
@@ -309,11 +380,24 @@ mod local_store_tests {
         root
     }
 
+    #[cfg(feature = "keyring")]
     #[test]
     fn the_marker_selects_the_file_store_under_the_state_root() {
         let root = temporary_root("marker");
         assert_eq!(local_prompt_directory_under(&root), None);
         fs::write(root.join(crate::local_mode::LOCAL_MODE_MARKER), "1").unwrap();
+        assert_eq!(
+            local_prompt_directory_under(&root),
+            Some(root.join("muniment").join("prompts"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(feature = "keyring"))]
+    #[test]
+    fn a_build_without_the_keyring_keeps_prompts_in_files_without_the_marker() {
+        let root = temporary_root("no-keyring");
+        assert!(!crate::local_mode::is_local_mode(&root));
         assert_eq!(
             local_prompt_directory_under(&root),
             Some(root.join("muniment").join("prompts"))

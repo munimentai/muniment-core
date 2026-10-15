@@ -15,7 +15,7 @@ static ENVIRONMENT: Mutex<()> = Mutex::new(());
 #[test]
 fn cancelling_a_live_run_sends_abort_to_pi() {
     let _environment = ENVIRONMENT.lock().unwrap();
-    muniment_core::chat_prompt::use_mock_keyring_for_tests();
+    common::use_test_prompt_store();
     let temporary_profile = TemporaryProfile::new("cancel", true);
     let temporary_root = temporary_profile.root.clone();
     let profile = temporary_profile.profile.clone();

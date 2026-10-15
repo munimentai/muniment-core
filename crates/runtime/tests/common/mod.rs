@@ -26,6 +26,20 @@ pub fn isolate_state_directory() {
     }
 }
 
+/// Keeps prompt history in the mock keyring, or, in a build without the
+/// keyring, in files under the test process's state directory.
+pub fn use_test_prompt_store() {
+    #[cfg(feature = "keyring")]
+    muniment_core::chat_prompt::use_mock_keyring_for_tests();
+    #[cfg(not(feature = "keyring"))]
+    {
+        isolate_state_directory();
+        muniment_core::chat_prompt::install_local_prompt_store(
+            muniment_core::state_root::state_directory().expect("the state directory is set"),
+        );
+    }
+}
+
 pub struct TemporaryProfile {
     pub root: PathBuf,
     pub profile: PathBuf,

@@ -44,7 +44,7 @@ A module that `muniment-core` re-exports from another workspace crate keeps its 
 | module | chat_coordinate | It coordinates runs and permission policy. |
 | module | chat_launch | It defines the launch value a run starts Pi with and answers gateway requests. |
 | module | chat_profile | It opens profile storage without a window. |
-| module | chat_prompt | It protects prompts through the system keyring. |
+| module | chat_prompt | It protects prompts through the system keyring, or in owner-only files without it. |
 | module | chat_resume | It resumes journaled runs. |
 | module | chat_view | It defines serializable run projections, not entitlement UI. |
 | module | code_diff | It exposes the portable code-diff contract. |

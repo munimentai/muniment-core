@@ -61,7 +61,7 @@ fn attach_provenance() -> Provenance {
 
 #[test]
 fn creates_a_thread_for_a_run_and_rejects_invalid_inputs_without_events() {
-    muniment_core::chat_prompt::use_mock_keyring_for_tests();
+    common::use_test_prompt_store();
     let temporary_profile = TemporaryProfile::new("thread-create", false);
     let profile = temporary_profile.profile.clone();
     let storage = open_profile_storage(&profile).unwrap();
@@ -127,7 +127,7 @@ fn creates_a_thread_for_a_run_and_rejects_invalid_inputs_without_events() {
 
 #[test]
 fn thread_history_uses_runtime_ownership_for_an_open_effect() {
-    muniment_core::chat_prompt::use_mock_keyring_for_tests();
+    common::use_test_prompt_store();
     let temporary = TemporaryProfile::new("thread-live-effect", false);
     let storage = open_profile_storage(&temporary.profile).unwrap();
     let run_id = "01900000-0000-7000-8000-000000000009";
@@ -182,7 +182,7 @@ fn thread_history_uses_runtime_ownership_for_an_open_effect() {
 
 #[test]
 fn lists_threads_and_opens_the_selected_thread() {
-    muniment_core::chat_prompt::use_mock_keyring_for_tests();
+    common::use_test_prompt_store();
     let temporary_profile = TemporaryProfile::new("threads-list", false);
     let profile = temporary_profile.profile.clone();
     let storage = open_profile_storage(&profile).unwrap();

@@ -25,7 +25,7 @@ fn queued_message_reaches_a_live_runtime_run(
     command: &str,
 ) {
     let _environment = ENVIRONMENT.lock().unwrap();
-    muniment_core::chat_prompt::use_mock_keyring_for_tests();
+    common::use_test_prompt_store();
     let temporary_profile = TemporaryProfile::new(test_name, true);
     let temporary_root = temporary_profile.root.clone();
     let profile = temporary_profile.profile.clone();

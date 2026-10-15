@@ -15,7 +15,7 @@ fn queued_agent_runs_once_in_its_project_and_records_completion() {
         "1",
     )
     .unwrap();
-    muniment_core::chat_prompt::use_mock_keyring_for_tests();
+    common::use_test_prompt_store();
     let artifact = common::stage_pi_stub(profile);
     let arguments = temporary.root.join("arguments.txt");
     std::env::set_var("PI_RESUME_STUB_ARGS", &arguments);

@@ -1,3 +1,5 @@
+// These tests drive the mock and refusing keyrings.
+#![cfg(feature = "keyring")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 

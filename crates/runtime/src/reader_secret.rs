@@ -33,11 +33,16 @@ pub fn write(store: &dyn CredentialStore, source: &str, secret: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::KeyringCredentialStore;
+    use crate::host::FileCredentialStore;
 
     #[test]
     fn the_environment_stands_in_for_the_keychain() {
-        let store = KeyringCredentialStore;
+        let root = std::env::temp_dir().join(format!(
+            "muniment-reader-secret-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let store = FileCredentialStore::new(&root);
         std::env::set_var("MUNIMENT_READER_SECRET_TESTSRC", "");
         assert_eq!(read(&store, "testsrc"), None);
         write(&store, "testsrc", "sk_1").unwrap();
@@ -45,5 +50,6 @@ mod tests {
         write(&store, "testsrc", "").unwrap();
         assert_eq!(read(&store, "testsrc"), None);
         std::env::remove_var("MUNIMENT_READER_SECRET_TESTSRC");
+        assert!(!root.exists());
     }
 }

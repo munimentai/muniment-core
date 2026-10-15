@@ -43,7 +43,7 @@ fn reason(error: muniment_core::attach::ProtocolError) -> String {
 
 #[test]
 fn a_thread_reports_its_context_and_compacts_through_the_runtime() {
-    muniment_core::chat_prompt::use_mock_keyring_for_tests();
+    common::use_test_prompt_store();
     let temporary_profile = TemporaryProfile::new("context", true);
     let temporary_root = temporary_profile.root.clone();
     let profile = temporary_profile.profile.clone();

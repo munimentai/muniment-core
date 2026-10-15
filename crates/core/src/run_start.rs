@@ -384,7 +384,7 @@ pub trait RunAttachBoundaries {
     fn recheck_retention(&self) -> Result<(), ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }
-    #[cfg(all(any(unix, target_os = "windows"), feature = "keyring"))]
+    #[cfg(any(unix, target_os = "windows"))]
     fn thread_history(
         &self,
         _request: ThreadOpenRequest,
