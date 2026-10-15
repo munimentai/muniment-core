@@ -4,7 +4,8 @@
 //! provider sign-in. It writes Pi's files and the router config under their
 //! locks, and it runs the router listener. It also holds the web search
 //! settings and runs the built-in search server, and it reads and writes the
-//! memory profile, facts and recall settings. Clients reach it through the
+//! memory profile, facts, recall settings and the memory changes kept for
+//! review. Clients reach it through the
 //! `models.request` attach operation and hear sign-in steps as `models.login`
 //! events.
 
@@ -431,6 +432,25 @@ impl ModelService {
                     &self.state_directory,
                     data.settings,
                 ))
+            }
+            ModelAction::MemoryPending => {
+                answer(memory::pending(&self.state_directory, parse(data)?))
+            }
+            ModelAction::MemoryPendingApply => {
+                let data: MemoryFactId = parse(data)?;
+                memory::pending_apply(
+                    &self.state_directory,
+                    memory::Scope { agent: data.agent },
+                    &data.id,
+                )
+            }
+            ModelAction::MemoryPendingDismiss => {
+                let data: MemoryFactId = parse(data)?;
+                memory::pending_dismiss(
+                    &self.state_directory,
+                    memory::Scope { agent: data.agent },
+                    &data.id,
+                )
             }
         })
     }
@@ -876,6 +896,152 @@ mod tests {
             .unwrap_err()
         )
         .is_none());
+        std::fs::remove_dir_all(profile).unwrap();
+    }
+
+    #[test]
+    fn pending_memory_actions_list_apply_and_dismiss_proposed_changes() {
+        use muniment_core::memory_files::{
+            self, ChangeOp, Fact, PendingChange, ProposedFact, Trust,
+        };
+        let (service, profile) = service();
+        let home = profile.join("Home");
+        muniment_core::home::confirm_home(&profile, &home).unwrap();
+        let key = || Id::new(uuid::Uuid::now_v7().simple().to_string()).unwrap();
+        let run = |action, data: Value, keyed: bool| {
+            service.request(request(action, data), keyed.then(key).as_ref())
+        };
+        let editor = memory_files::fact_save_in(
+            &profile,
+            &home,
+            Fact {
+                id: String::new(),
+                title: "Editor".into(),
+                content: "Uses Helix.".into(),
+                source: "Added in settings".into(),
+                trust: Trust::User,
+            },
+        )
+        .unwrap();
+        let change = |id: &str, op, after: Option<(&str, &str)>| PendingChange {
+            id: id.into(),
+            op,
+            fact_id: (op != ChangeOp::Add).then(|| editor.id.clone()),
+            before: (op != ChangeOp::Add).then(|| editor.clone()),
+            after: after.map(|(title, content)| ProposedFact {
+                title: title.into(),
+                content: content.into(),
+            }),
+            source: "extracted thread:t run:r".into(),
+            created: "2026-01-01T00:00:00.000Z".into(),
+        };
+        memory_files::pending_stage(
+            &profile,
+            vec![
+                change("add-1", ChangeOp::Add, Some(("Pets", "Has a dog."))),
+                change("update-1", ChangeOp::Update, Some(("Editor", "Uses Zed."))),
+                change("delete-1", ChangeOp::Delete, None),
+            ],
+        )
+        .unwrap();
+
+        let listed = run(ModelAction::MemoryPending, serde_json::json!({}), false).unwrap();
+        assert_eq!(listed.as_array().unwrap().len(), 3);
+        assert_eq!(listed[0]["id"], "delete-1");
+        assert_eq!(listed[0]["after"], Value::Null);
+        assert_eq!(listed[1]["op"], "update");
+        assert_eq!(listed[1]["fact_id"], editor.id.as_str());
+        assert_eq!(listed[1]["before"]["content"], "Uses Helix.");
+        assert_eq!(
+            listed[1]["after"],
+            serde_json::json!({"title": "Editor", "content": "Uses Zed."})
+        );
+        assert_eq!(listed[2]["fact_id"], Value::Null);
+        assert_eq!(listed[2]["before"], Value::Null);
+        assert_eq!(listed[2]["source"], "extracted thread:t run:r");
+        assert_eq!(listed[2]["created"], "2026-01-01T00:00:00.000Z");
+        let fields: Vec<&String> = listed[0].as_object().unwrap().keys().collect();
+        assert_eq!(
+            fields,
+            ["after", "before", "created", "fact_id", "id", "op", "source"]
+        );
+        // A retried apply answers the first result and writes nothing more.
+        let apply_key = key();
+        let added = service
+            .request(
+                request(
+                    ModelAction::MemoryPendingApply,
+                    serde_json::json!({"id": "add-1"}),
+                ),
+                Some(&apply_key),
+            )
+            .unwrap();
+        let retried = service
+            .request(
+                request(
+                    ModelAction::MemoryPendingApply,
+                    serde_json::json!({"id": "add-1"}),
+                ),
+                Some(&apply_key),
+            )
+            .unwrap();
+        assert_eq!(retried, added);
+        assert_eq!(memory_files::facts_in(&home).unwrap().len(), 2);
+        assert_eq!(added["title"], "Pets");
+        assert_eq!(added["trust"], "conversation");
+        let updated = run(
+            ModelAction::MemoryPendingApply,
+            serde_json::json!({"id": "update-1"}),
+            true,
+        )
+        .unwrap();
+        assert_eq!(updated["id"], editor.id.as_str());
+        assert_eq!(updated["content"], "Uses Zed.");
+        // The update changed the fact the delete proposal saw.
+        let refused = run(
+            ModelAction::MemoryPendingApply,
+            serde_json::json!({"id": "delete-1"}),
+            true,
+        )
+        .unwrap_err();
+        assert!(reason(&refused).unwrap().contains("changed"));
+        assert_eq!(
+            run(ModelAction::MemoryPending, serde_json::json!({}), false).unwrap(),
+            serde_json::json!([])
+        );
+
+        memory_files::pending_stage(&profile, vec![change("delete-2", ChangeOp::Delete, None)])
+            .unwrap();
+        assert_eq!(
+            run(
+                ModelAction::MemoryPendingDismiss,
+                serde_json::json!({"id": "delete-2"}),
+                true
+            )
+            .unwrap(),
+            Value::Null
+        );
+        assert!(reason(
+            &run(
+                ModelAction::MemoryPendingDismiss,
+                serde_json::json!({"id": "delete-2"}),
+                true
+            )
+            .unwrap_err()
+        )
+        .is_some());
+        assert!(home
+            .join(format!("memory/facts/{}.md", editor.id))
+            .is_file());
+        assert!(reason(
+            &run(
+                ModelAction::MemoryPending,
+                serde_json::json!({"agent": "missing"}),
+                false
+            )
+            .unwrap_err()
+        )
+        .is_some());
         std::fs::remove_dir_all(profile).unwrap();
     }
 }

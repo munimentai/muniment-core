@@ -1,12 +1,13 @@
-//! Memory: the profile, the facts of the user or of one agent, deleted facts
-//! and the recall settings. Settings edits are the user's own, so a fact saved
-//! here is a user fact whatever trust the client sent.
+//! Memory: the profile, the facts of the user or of one agent, deleted facts,
+//! the recall settings and the changes the after-run pass keeps for review.
+//! Settings edits are the user's own, so a fact saved here is a user fact
+//! whatever trust the client sent.
 
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use muniment_core::memory_files::{self, Fact, RecallSettings, Trust};
+use muniment_core::memory_files::{self, Fact, PendingChange, RecallSettings, Trust};
 use muniment_core::serde_json::{self, Value};
 
 /// The facts an action reads or changes: the user's, or one agent's.
@@ -61,4 +62,21 @@ pub(super) fn recall_settings_save(
     settings: RecallSettings,
 ) -> Result<RecallSettings, String> {
     memory_files::recall_settings_save(profile, settings).map(|()| settings)
+}
+
+/// The changes the after-run memory pass keeps for review, newest first.
+pub(super) fn pending(profile: &Path, scope: Scope) -> Result<Vec<PendingChange>, String> {
+    memory_files::pending_changes(&roots(profile, &scope)?.1)
+}
+
+/// Applies a kept change: the fact an add or update wrote, or null for a delete.
+pub(super) fn pending_apply(profile: &Path, scope: Scope, id: &str) -> Result<Value, String> {
+    let (home, private) = roots(profile, &scope)?;
+    memory_files::pending_apply(&private, &home, id)
+        .map(|fact| serde_json::to_value(fact).unwrap_or(Value::Null))
+}
+
+pub(super) fn pending_dismiss(profile: &Path, scope: Scope, id: &str) -> Result<Value, String> {
+    let (_, private) = roots(profile, &scope)?;
+    memory_files::pending_dismiss(&private, id).map(|()| Value::Null)
 }

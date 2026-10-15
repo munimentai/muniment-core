@@ -3,6 +3,16 @@
 //! and the profile, facts and recall settings of memory, under the `memory_`
 //! actions.
 //!
+//! The pass that learns facts after each finished run can keep changes for
+//! the user to review. `memory_pending` takes `{"agent"?}` and answers
+//! `[{"id", "op": "add"|"update"|"delete", "fact_id", "before", "after":
+//! {"title", "content"}|null, "source", "created"}]`, newest first, where
+//! `before` is the target fact as it was. `memory_pending_apply` takes
+//! `{"agent"?, "id"}` and answers the fact an add or update wrote, or null
+//! for a delete. It refuses, and removes the proposal, when the target fact
+//! changed since. `memory_pending_dismiss` takes `{"agent"?, "id"}` and
+//! answers null.
+//!
 //! A `models.request` body is `{"action": <action>, "data": <object>}`. The
 //! runtime answers `{"result": <value>}`. An action that changes a setting, a
 //! credential or a sign-in carries an idempotency key, and a read carries none.
@@ -68,11 +78,14 @@ pub enum ModelAction {
     MemoryFactRestore,
     MemoryRecallSettings,
     MemoryRecallSettingsSave,
+    MemoryPending,
+    MemoryPendingApply,
+    MemoryPendingDismiss,
 }
 
 impl ModelAction {
     /// Every action, in wire order.
-    pub const ALL: [ModelAction; 46] = [
+    pub const ALL: [ModelAction; 49] = [
         Self::ProviderStatus,
         Self::StoreProviderKey,
         Self::StoreLocalProvider,
@@ -119,6 +132,9 @@ impl ModelAction {
         Self::MemoryFactRestore,
         Self::MemoryRecallSettings,
         Self::MemoryRecallSettingsSave,
+        Self::MemoryPending,
+        Self::MemoryPendingApply,
+        Self::MemoryPendingDismiss,
     ];
 
     /// Whether the action changes a setting, a credential or a sign-in, so its
@@ -138,6 +154,7 @@ impl ModelAction {
                 | Self::MemoryFacts
                 | Self::MemoryDeletedFacts
                 | Self::MemoryRecallSettings
+                | Self::MemoryPending
         )
     }
 
@@ -209,6 +226,9 @@ impl ModelAction {
             Self::MemoryFactRestore => "memory_fact_restore",
             Self::MemoryRecallSettings => "memory_recall_settings",
             Self::MemoryRecallSettingsSave => "memory_recall_settings_save",
+            Self::MemoryPending => "memory_pending",
+            Self::MemoryPendingApply => "memory_pending_apply",
+            Self::MemoryPendingDismiss => "memory_pending_dismiss",
         }
     }
 }
@@ -260,6 +280,17 @@ mod tests {
         let read = ModelRequest::from_body(&serde_json::json!({"action": "router_settings"}));
         assert_eq!(read.unwrap().data, serde_json::json!({}));
         assert!(!ModelAction::RouterSettings.mutates());
+        assert!(!ModelAction::MemoryPending.mutates());
+        assert!(ModelAction::MemoryPendingApply.mutates());
+        assert!(ModelAction::MemoryPendingDismiss.mutates());
+        assert_eq!(
+            ModelRequest::from_body(
+                &serde_json::json!({"action": "memory_pending_apply", "data": {"id": "x"}})
+            )
+            .unwrap()
+            .action,
+            ModelAction::MemoryPendingApply
+        );
         for body in [
             serde_json::json!({"action": "nothing"}),
             serde_json::json!({"action": "router_settings", "data": []}),
