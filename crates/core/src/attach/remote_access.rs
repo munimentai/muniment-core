@@ -413,12 +413,15 @@ impl RemoteAccess {
         Ok(request)
     }
 
-    /// The last recorded update request, if the host has not cleared it.
+    /// The last recorded update request, if the host has not cleared it. A
+    /// request this runtime's version already meets counts as none, such as
+    /// one the host applied before it restarted.
     pub fn requested_update(&self) -> Option<RuntimeUpdateRequest> {
         read_private(&self.inner.directory.join(UPDATE_FILE))
             .ok()
             .flatten()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .and_then(|bytes| serde_json::from_slice::<RuntimeUpdateRequest>(&bytes).ok())
+            .filter(|request| is_newer_version(&request.version, &self.inner.runtime_version))
     }
 
     /// Clears the recorded request after the host applies or refuses it.

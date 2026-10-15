@@ -1004,6 +1004,18 @@ mod tests {
         assert!(candidate
             .request_update("2.1.0-rc.2+build.5", "device")
             .is_err());
+        drop(candidate);
+        // After the update the saved request no longer counts.
+        let updated = RemoteAccess::open(
+            directory.join("candidate"),
+            RemoteAccessOptions {
+                runtime_name: None,
+                runtime_version: "2.1.0".into(),
+                install_kind: InstallKind::Server,
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.requested_update(), None);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
