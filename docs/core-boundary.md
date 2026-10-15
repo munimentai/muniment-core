@@ -63,6 +63,7 @@ A module that `muniment-core` re-exports from another workspace crate keeps its 
 | module | kokoro | It owns on-device read-aloud. |
 | module | launch_facts | It states the facts of a launch to the model: its model, earlier models, host, shell and working directory. |
 | module | local_mode | It reads the local-mode marker without an account. |
+| module | memory_extract | It proposes memory changes from a finished run. |
 | module | memory_failure | It defines memory-search failures. |
 | module | memory_index | It indexes local memory. |
 | module | memory_runtime | It coordinates memory sessions. |
