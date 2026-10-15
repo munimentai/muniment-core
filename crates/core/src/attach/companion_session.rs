@@ -409,7 +409,12 @@ fn companion_scope(operation: Operation) -> Option<Option<&'static str>> {
         | Operation::ThreadCompact
         | Operation::ContextSettings
         | Operation::ContextSettingsSave
-        | Operation::ModelsRequest => None,
+        | Operation::ModelsRequest
+        | Operation::RemotePairingCreate
+        | Operation::RemoteDeviceList
+        | Operation::RemoteDeviceRevoke
+        | Operation::RuntimeInfo
+        | Operation::RuntimeUpdate => None,
     }
 }
 

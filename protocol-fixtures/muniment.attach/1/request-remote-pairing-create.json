@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"0000000000000000000000000000009e","operation":"remote.pairing_create","capability":"fixture-capability","body":{"endpoints":["192.0.2.20:7443"],"scopes":["thread.read"]}}

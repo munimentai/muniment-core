@@ -321,6 +321,7 @@ pub fn handshake_approval_presenter(
         authorized_client_id: Id::new(fresh_request_id()?.as_str())
             .map_err(|_| ClientError::UnexpectedMessage)?,
         authorized_client_credential: None,
+        pairing: None,
     };
     let bytes = encode_frame(&hello).map_err(map_frame_error)?;
     write_all_before(&mut *stream, &bytes, deadline(io_timeout))?;

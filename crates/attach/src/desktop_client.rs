@@ -9,8 +9,8 @@ use crate::protocol_helpers::{
 };
 use crate::{
     encode_frame, Authorization, Client, DesktopClientAuthorizedGrant, Envelope, EventName, Hello,
-    Id, ModelAction, Operation, Protocol, Request, Response, SnapshotAssembly, VersionRange,
-    Welcome, MAX_TEXT_LENGTH, PROTOCOL,
+    Id, ModelAction, Operation, PairingLink, Protocol, Request, Response, RuntimeInfo,
+    SnapshotAssembly, VersionRange, Welcome, MAX_TEXT_LENGTH, PROTOCOL,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -47,6 +47,8 @@ pub struct DesktopClient {
     chat_cursor: Option<u64>,
     io_timeout: Duration,
     last_request_error: Option<crate::ProtocolError>,
+    runtime: Option<RuntimeInfo>,
+    scopes: Option<BTreeSet<String>>,
 }
 
 impl std::fmt::Debug for DesktopClient {
@@ -74,6 +76,46 @@ impl DesktopClient {
 
     pub fn authorization_summary(&self) -> AuthorizationSummary {
         self.summary.clone()
+    }
+
+    /// The runtime's id, name, version and install kind from its welcome,
+    /// when the runtime sent them.
+    pub fn runtime_info(&self) -> Option<&RuntimeInfo> {
+        self.runtime.as_ref()
+    }
+
+    /// The scopes a remote runtime granted this device. A local session
+    /// answers `None`.
+    pub fn remote_scopes(&self) -> Option<&BTreeSet<String>> {
+        self.scopes.as_ref()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn admitted(
+        stream: Box<dyn ClientStream + Send>,
+        welcome: Welcome,
+        profile_id: String,
+        workspace_scopes: BTreeMap<String, BTreeSet<String>>,
+        capability: String,
+        summary: AuthorizationSummary,
+        scopes: Option<BTreeSet<String>>,
+        io_timeout: Duration,
+    ) -> Self {
+        Self {
+            stream,
+            runtime_version: welcome.desktop_version,
+            profile_id,
+            workspace_scopes,
+            capability,
+            summary,
+            authorized_at: Instant::now(),
+            chat_subscription_id: None,
+            chat_cursor: None,
+            io_timeout,
+            last_request_error: None,
+            runtime: welcome.runtime,
+            scopes,
+        }
     }
 
     /// Returns the protocol error from the most recent wire request, if it failed.
@@ -894,6 +936,75 @@ impl DesktopClient {
         Ok(body)
     }
 
+    /// Reads the runtime's identity and any recorded update request.
+    pub fn read_runtime_info(&mut self) -> Result<Value, ClientError> {
+        self.request_body(
+            Operation::RuntimeInfo,
+            None,
+            serde_json::json!({}),
+            &["runtime_id", "runtime_name", "runtime_version"],
+        )
+    }
+
+    /// Creates a one-time pairing link. `scopes` narrows the default scopes
+    /// and `endpoints` replaces the runtime's advertised addresses.
+    pub fn create_pairing_link(
+        &mut self,
+        scopes: Option<&BTreeSet<String>>,
+        endpoints: Option<&[String]>,
+    ) -> Result<PairingLink, ClientError> {
+        let mut body = serde_json::json!({});
+        if let Some(scopes) = scopes {
+            body["scopes"] = serde_json::json!(scopes);
+        }
+        if let Some(endpoints) = endpoints {
+            body["endpoints"] = serde_json::json!(endpoints);
+        }
+        let body = self.request_body(
+            Operation::RemotePairingCreate,
+            None,
+            body,
+            &["link", "expires_at", "scopes"],
+        )?;
+        body["link"]
+            .as_str()
+            .and_then(|link| PairingLink::parse(link).ok())
+            .ok_or(ClientError::UnexpectedMessage)
+    }
+
+    /// Lists the paired remote devices.
+    pub fn list_remote_devices(&mut self) -> Result<Value, ClientError> {
+        self.request_body(
+            Operation::RemoteDeviceList,
+            None,
+            serde_json::json!({}),
+            &["devices"],
+        )
+    }
+
+    /// Revokes one paired device and answers whether it was paired.
+    pub fn revoke_remote_device(&mut self, device_id: &str) -> Result<bool, ClientError> {
+        Id::new(device_id).map_err(|_| ClientError::UnexpectedMessage)?;
+        self.request_body(
+            Operation::RemoteDeviceRevoke,
+            None,
+            serde_json::json!({"device_id": device_id}),
+            &["revoked"],
+        )?["revoked"]
+            .as_bool()
+            .ok_or(ClientError::UnexpectedMessage)
+    }
+
+    /// Asks the runtime's host to update the runtime to `version`.
+    pub fn request_runtime_update(&mut self, version: &str) -> Result<Value, ClientError> {
+        self.request_body(
+            Operation::RuntimeUpdate,
+            None,
+            serde_json::json!({"version": version}),
+            &["version", "requested_at"],
+        )
+    }
+
     fn request_body(
         &mut self,
         operation: Operation,
@@ -931,6 +1042,8 @@ pub(crate) fn desktop_client_for_test(
         chat_cursor: None,
         io_timeout,
         last_request_error: None,
+        runtime: None,
+        scopes: None,
     }
 }
 
@@ -965,6 +1078,7 @@ pub fn handshake_desktop_client(
         authorized_client_id: Id::new(fresh_request_id()?.as_str())
             .map_err(|_| ClientError::UnexpectedMessage)?,
         authorized_client_credential: None,
+        pairing: None,
     };
     let bytes = encode_frame(&hello).map_err(map_frame_error)?;
     write_all_before(stream.as_mut(), &bytes, deadline(io_timeout))?;
@@ -997,22 +1111,19 @@ pub fn handshake_desktop_client(
     {
         return Err(ClientError::UnexpectedMessage);
     }
-    Ok(DesktopClient {
+    Ok(DesktopClient::admitted(
         stream,
-        runtime_version: welcome.desktop_version,
-        profile_id: authorized.profile_id,
-        workspace_scopes: authorized.workspace_scopes,
-        capability: authorized.capability,
-        summary: AuthorizationSummary {
+        welcome,
+        authorized.profile_id,
+        authorized.workspace_scopes,
+        authorized.capability,
+        AuthorizationSummary {
             expires_in_seconds: authorized.expires_at,
             idle_timeout_seconds: authorized.idle_timeout_seconds,
         },
-        authorized_at: Instant::now(),
-        chat_subscription_id: None,
-        chat_cursor: None,
+        None,
         io_timeout,
-        last_request_error: None,
-    })
+    ))
 }
 
 #[cfg(all(test, unix))]

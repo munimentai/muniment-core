@@ -166,6 +166,7 @@ fn start_session(
                 client_nonce: "client-nonce".into(),
                 authorized_client_id: Id::new("018f0000-0000-7000-8000-000000000001").unwrap(),
                 authorized_client_credential: Some(credential.to_owned()),
+                pairing: None,
             })
             .unwrap(),
         )

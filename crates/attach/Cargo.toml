@@ -5,13 +5,18 @@ edition = "2021"
 
 [features]
 default = []
-client = []
+# The client also carries the TLS transport, pinned to one runtime
+# certificate, that the remote attach route and its clients share.
+client = ["dep:rustls"]
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
 getrandom = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+url = "2"
 uuid = "1"

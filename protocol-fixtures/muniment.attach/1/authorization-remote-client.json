@@ -1,0 +1,1 @@
+{"profile_id":"desktop-owner","capability":"fixture-capability","expires_at":28800,"idle_timeout_seconds":900,"workspace_scopes":{},"scopes":["thread.read"],"device_credential":{"device_id":"018f0000-0000-7000-8000-000000000096","secret":"fixture-device-secret"}}

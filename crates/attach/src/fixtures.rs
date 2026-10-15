@@ -450,6 +450,7 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
             client_nonce: "fixture-client-nonce".into(),
             authorized_client_id: Id::new("018f0000-0000-7000-8000-000000000099").unwrap(),
             authorized_client_credential: None,
+            pairing: None,
         },
     )?;
     insert(
@@ -465,6 +466,7 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
             client_nonce: "fixture-client-nonce".into(),
             authorized_client_id: Id::new("018f0000-0000-7000-8000-000000000097").unwrap(),
             authorized_client_credential: None,
+            pairing: None,
         },
     )?;
     insert(
@@ -477,6 +479,7 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
             authorization: Authorization::PairingRequired,
             approval_challenge: "fixture-challenge".into(),
             handoff_nonce: None,
+            runtime: None,
         },
     )?;
     insert(
@@ -489,6 +492,7 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
             authorization: Authorization::PairingRequired,
             approval_challenge: "fixture-challenge".into(),
             handoff_nonce: Some("fixture-handoff-nonce".into()),
+            runtime: None,
         },
     )?;
     insert(
@@ -518,6 +522,60 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
             )]
             .into_iter()
             .collect(),
+        },
+    )?;
+    insert(
+        &mut fixtures,
+        "negotiation-hello-remote-pairing.json",
+        &Hello {
+            protocol: Protocol,
+            client: Client {
+                kind: "desktop-client".into(),
+                version: "0.0.1".into(),
+            },
+            supported: VersionRange { min: 1, max: 1 },
+            client_nonce: "fixture-client-nonce".into(),
+            authorized_client_id: Id::new("018f0000-0000-7000-8000-000000000095").unwrap(),
+            authorized_client_credential: None,
+            pairing: Some(crate::PairingRedemption {
+                secret: "fixture-pairing-secret".into(),
+                device_name: Some("Laptop".into()),
+                scopes: Some(BTreeSet::from(["thread.read".into()])),
+            }),
+        },
+    )?;
+    insert(
+        &mut fixtures,
+        "negotiation-welcome-remote.json",
+        &Welcome {
+            selected: 1,
+            desktop_version: "0.0.1".into(),
+            server_nonce: "fixture-server-nonce".into(),
+            authorization: Authorization::Authorized,
+            approval_challenge: String::new(),
+            handoff_nonce: None,
+            runtime: Some(crate::RuntimeInfo {
+                runtime_id: "018f0000-0000-7000-8000-000000000094".into(),
+                runtime_name: "Build box".into(),
+                runtime_version: "0.0.1".into(),
+                install_kind: Some(crate::InstallKind::Container),
+            }),
+        },
+    )?;
+    insert(
+        &mut fixtures,
+        "authorization-remote-client.json",
+        &crate::RemoteClientAuthorizedGrant {
+            profile_id: "desktop-owner".into(),
+            capability: "fixture-capability".into(),
+            expires_at: 28_800,
+            idle_timeout_seconds: 900,
+            workspace_scopes: BTreeMap::new(),
+            scopes: BTreeSet::from(["thread.read".into()]),
+            device_credential: Some(crate::DeviceCredential {
+                device_id: Id::new("018f0000-0000-7000-8000-000000000096").unwrap(),
+                secret: "fixture-device-secret".into(),
+            }),
         },
     )?;
 
@@ -581,6 +639,11 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         ("context-settings-save", Operation::ContextSettingsSave),
         ("models-request", Operation::ModelsRequest),
         ("run-detail", Operation::RunDetail),
+        ("remote-pairing-create", Operation::RemotePairingCreate),
+        ("remote-device-list", Operation::RemoteDeviceList),
+        ("remote-device-revoke", Operation::RemoteDeviceRevoke),
+        ("runtime-info", Operation::RuntimeInfo),
+        ("runtime-update", Operation::RuntimeUpdate),
     ];
     for (index, (name, operation)) in operations.into_iter().enumerate() {
         let body = request_body(operation);
@@ -952,6 +1015,16 @@ fn request_body(operation: Operation) -> serde_json::Value {
             "action": "router_set_enabled",
             "data": {"enabled": true}
         }),
+        Operation::RemotePairingCreate => json!({
+            "scopes": ["thread.read"],
+            "endpoints": ["192.0.2.20:7443"]
+        }),
+        Operation::RemoteDeviceList => json!({}),
+        Operation::RemoteDeviceRevoke => {
+            json!({"device_id": "018f0000-0000-7000-8000-000000000096"})
+        }
+        Operation::RuntimeInfo => json!({}),
+        Operation::RuntimeUpdate => json!({"version": "0.2.0"}),
     }
 }
 
@@ -1189,6 +1262,11 @@ mod tests {
             Operation::ContextSettings,
             Operation::ContextSettingsSave,
             Operation::ModelsRequest,
+            Operation::RemotePairingCreate,
+            Operation::RemoteDeviceList,
+            Operation::RemoteDeviceRevoke,
+            Operation::RuntimeInfo,
+            Operation::RuntimeUpdate,
         ];
         for operation in operations {
             let name = operation.as_str().replace(['.', '_'], "-");
@@ -1242,7 +1320,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            106,
+            114,
             "every canonical fixture must be inventoried"
         );
     }

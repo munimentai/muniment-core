@@ -59,7 +59,12 @@ mod negotiation;
 mod presenter_client;
 #[cfg(feature = "client")]
 mod protocol_helpers;
+mod remote;
+#[cfg(feature = "client")]
+mod remote_client;
 mod snapshot;
+#[cfg(feature = "client")]
+mod tls_stream;
 mod workspace;
 
 #[cfg(feature = "client")]
@@ -85,5 +90,10 @@ pub use presenter_client::{
     handshake_approval_presenter, serve_approval_presenter_with, ApprovalPresenterClient,
     ApprovalPresenterStopHandle, ApprovalPresenterSupervisorStop,
 };
+pub use remote::*;
+#[cfg(feature = "client")]
+pub use remote_client::*;
 pub use snapshot::{snapshot_chunks, SnapshotAssembly};
+#[cfg(feature = "client")]
+pub use tls_stream::{TlsReadable, TlsStream};
 pub use workspace::*;

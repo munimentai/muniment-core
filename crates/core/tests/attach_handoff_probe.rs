@@ -51,6 +51,7 @@ fn welcome() -> Welcome {
         authorization: Authorization::Authorized,
         approval_challenge: "challenge".into(),
         handoff_nonce: Some("handoff-nonce".into()),
+        runtime: None,
     }
 }
 

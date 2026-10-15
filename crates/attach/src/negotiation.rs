@@ -5,7 +5,9 @@ use std::{
 
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{ErrorAction, Id, Protocol, ProtocolError, VersionRange};
+use crate::{
+    DeviceCredential, ErrorAction, Id, Protocol, ProtocolError, RuntimeInfo, VersionRange,
+};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Client {
@@ -22,6 +24,31 @@ pub struct Hello {
     pub authorized_client_id: Id,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorized_client_credential: Option<String>,
+    /// A pairing secret a remote client redeems once for a device credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pairing: Option<PairingRedemption>,
+}
+
+/// The one-time secret from a pairing link, with the device name and the
+/// scopes the client asks for. Requested scopes narrow the link's scopes and
+/// never widen them.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingRedemption {
+    pub secret: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<BTreeSet<String>>,
+}
+
+impl fmt::Debug for PairingRedemption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PairingRedemption")
+            .field("secret", &"[REDACTED]")
+            .field("device_name", &self.device_name)
+            .field("scopes", &self.scopes)
+            .finish()
+    }
 }
 
 impl fmt::Debug for Hello {
@@ -46,6 +73,8 @@ impl<'de> Deserialize<'de> for Hello {
             authorized_client_id: Id,
             #[serde(default)]
             authorized_client_credential: Option<String>,
+            #[serde(default)]
+            pairing: Option<PairingRedemption>,
             #[serde(flatten)]
             extra: BTreeMap<String, serde_json::Value>,
         }
@@ -82,6 +111,7 @@ impl<'de> Deserialize<'de> for Hello {
             client_nonce: fields.client_nonce,
             authorized_client_id: fields.authorized_client_id,
             authorized_client_credential: fields.authorized_client_credential,
+            pairing: fields.pairing,
         })
     }
 }
@@ -102,6 +132,10 @@ pub struct Welcome {
     pub approval_challenge: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_nonce: Option<String>,
+    /// The runtime's id, name, version and install kind, as flat optional
+    /// fields. The remote route always sends them.
+    #[serde(flatten)]
+    pub runtime: Option<RuntimeInfo>,
 }
 
 impl Welcome {
@@ -122,6 +156,14 @@ impl<'de> Deserialize<'de> for Welcome {
             approval_challenge: String,
             #[serde(default)]
             handoff_nonce: Option<String>,
+            #[serde(default)]
+            runtime_id: Option<String>,
+            #[serde(default)]
+            runtime_name: Option<String>,
+            #[serde(default)]
+            runtime_version: Option<String>,
+            #[serde(default)]
+            install_kind: Option<serde_json::Value>,
             #[serde(flatten)]
             extra: BTreeMap<String, serde_json::Value>,
         }
@@ -156,6 +198,12 @@ impl<'de> Deserialize<'de> for Welcome {
             authorization: fields.authorization,
             approval_challenge: fields.approval_challenge,
             handoff_nonce: fields.handoff_nonce,
+            runtime: RuntimeInfo::from_fields(
+                fields.runtime_id,
+                fields.runtime_name,
+                fields.runtime_version,
+                fields.install_kind.as_ref(),
+            ),
         })
     }
 }
@@ -169,6 +217,35 @@ impl fmt::Debug for Welcome {
             .field("authorization", &self.authorization)
             .field("approval_challenge", &"[REDACTED]")
             .field("handoff_nonce", &"[REDACTED]")
+            .field("runtime", &self.runtime)
+            .finish()
+    }
+}
+
+/// The connection-bound grant for an admitted remote client. It carries the
+/// desktop client grant's fields, the device's scopes, and, right after a
+/// pairing redemption, the device credential the client keeps.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteClientAuthorizedGrant {
+    pub profile_id: String,
+    pub capability: String,
+    pub expires_at: u64,
+    pub idle_timeout_seconds: u64,
+    pub workspace_scopes: BTreeMap<String, BTreeSet<String>>,
+    pub scopes: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_credential: Option<DeviceCredential>,
+}
+
+impl fmt::Debug for RemoteClientAuthorizedGrant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RemoteClientAuthorizedGrant")
+            .field("capability", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .field("idle_timeout_seconds", &self.idle_timeout_seconds)
+            .field("workspace_scopes", &self.workspace_scopes)
+            .field("scopes", &self.scopes)
+            .field("device_credential", &self.device_credential)
             .finish()
     }
 }
@@ -413,6 +490,7 @@ pub fn welcome(
         authorization: Authorization::PairingRequired,
         approval_challenge: approval_challenge.into(),
         handoff_nonce: None,
+        runtime: None,
     }
 }
 
@@ -429,6 +507,7 @@ pub fn reconnect_welcome(
         authorization: Authorization::Authorized,
         approval_challenge: approval_challenge.into(),
         handoff_nonce: None,
+        runtime: None,
     }
 }
 

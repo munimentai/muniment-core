@@ -1,0 +1,1 @@
+{"protocol":"muniment.attach/1","request_id":"000000000000000000000000000000a0","operation":"remote.device_revoke","capability":"fixture-capability","body":{"device_id":"018f0000-0000-7000-8000-000000000096"}}

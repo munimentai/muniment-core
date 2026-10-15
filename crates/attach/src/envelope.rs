@@ -376,6 +376,21 @@ pub enum Operation {
     ContextSettingsSave,
     #[serde(rename = "models.request")]
     ModelsRequest,
+    /// Creates a one-time pairing link for a remote client.
+    #[serde(rename = "remote.pairing_create")]
+    RemotePairingCreate,
+    /// Lists the paired remote devices.
+    #[serde(rename = "remote.device_list")]
+    RemoteDeviceList,
+    /// Revokes one paired remote device and closes its live sessions.
+    #[serde(rename = "remote.device_revoke")]
+    RemoteDeviceRevoke,
+    /// Reads the runtime's identity, version and install kind.
+    #[serde(rename = "runtime.info")]
+    RuntimeInfo,
+    /// Records a requested runtime version for the host's updater to apply.
+    #[serde(rename = "runtime.update")]
+    RuntimeUpdate,
 }
 
 impl Operation {
@@ -475,6 +490,11 @@ impl Operation {
             Self::ContextSettings => "context.settings",
             Self::ContextSettingsSave => "context.settings_save",
             Self::ModelsRequest => "models.request",
+            Self::RemotePairingCreate => "remote.pairing_create",
+            Self::RemoteDeviceList => "remote.device_list",
+            Self::RemoteDeviceRevoke => "remote.device_revoke",
+            Self::RuntimeInfo => "runtime.info",
+            Self::RuntimeUpdate => "runtime.update",
         }
     }
 }

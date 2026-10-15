@@ -188,6 +188,7 @@ fn hello_with_claims(
         client_nonce: "client-nonce".into(),
         authorized_client_id: Id::new(client_id).unwrap(),
         authorized_client_credential: credential.map(str::to_owned),
+        pairing: None,
     })
     .unwrap()
 }

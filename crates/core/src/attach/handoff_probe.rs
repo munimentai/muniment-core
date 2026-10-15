@@ -145,6 +145,7 @@ pub fn read_handoff_probe_welcome(
         client_nonce: mint_probe_nonce()?,
         authorized_client_id: Id::new(PROBE_CLIENT_ID).expect("probe client ID is valid"),
         authorized_client_credential: None,
+        pairing: None,
     };
     let frame = encode_frame(&hello).map_err(|_| HandoffProbeError::WriteFailed)?;
     write_all_before(&mut stream, &frame, deadline).map_err(map_write_error)?;
@@ -233,6 +234,7 @@ mod tests {
             authorization: Authorization::Authorized,
             approval_challenge: "challenge".into(),
             handoff_nonce: handoff_nonce.map(str::to_owned),
+            runtime: None,
         }
     }
 

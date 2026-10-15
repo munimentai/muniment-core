@@ -266,6 +266,7 @@ fn desktop_client_lists_threads_without_a_presenter() {
                     client_nonce: "client-nonce".into(),
                     authorized_client_id: Id::new("018f0000-0000-7000-8000-000000000124").unwrap(),
                     authorized_client_credential: None,
+                    pairing: None,
                 })
                 .unwrap(),
             )
@@ -703,6 +704,7 @@ fn the_listener_announces_the_host_runtime_version() {
                     client_nonce: "client-nonce".into(),
                     authorized_client_id: Id::new("018f0000-0000-7000-8000-000000000126").unwrap(),
                     authorized_client_credential: None,
+                    pairing: None,
                 })
                 .unwrap(),
             )
