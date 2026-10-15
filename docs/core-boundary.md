@@ -31,6 +31,7 @@ A module that `muniment-core` re-exports from another workspace crate keeps its 
 | module | model_router | It selects local provider accounts and routes model requests. |
 | module | projects | It scopes threads and generated files to project folders. |
 | module | extend | It manages local extensions and per-chat capability snapshots. |
+| module | form_factor | It reads the shape of the computer a runtime runs on. |
 | module | creations | It stores local agent and artifact creation contracts. |
 | module | project_context | It provides project context to the local harness. |
 | module | workspace_names | It resolves stable names for local workspace folders. |
@@ -91,6 +92,7 @@ A module that `muniment-core` re-exports from another workspace crate keeps its 
 | module | runtime_diagnostics | It writes bounded runtime diagnostics. |
 | module | search_settings | It stores the web search settings and renders them into pi-web-access's `web-search.json`. |
 | module | session_thread | It binds sessions to journal threads. |
+| module | shared_models | It shares model connections between paired machines and with the account's model vault. |
 | module | sidecar | It supervises Pi and its RPC transport. |
 | module | state_root | It resolves the one state root every local file sits under. |
 | module | thread_history | It reads journal-backed thread history. |
