@@ -19,7 +19,7 @@ def run_script(**overrides):
         SOURCE_SHA="0123456789abcdef0123456789abcdef01234567",
         REPO_TOKEN="token",
         SERVER_URL="https://forgejo.invalid",
-        REPOSITORY="factory/muniment-core",
+        REPOSITORY="example/muniment-core",
         RUNNER_TEMP="/nonexistent",
     )
     env.update(overrides)

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run a command on a fresh macOS or Windows VM on pve01 through
+# Run a command on a fresh macOS or Windows VM on the desktop-ci host through
 # `sudo desktop-ci`, and exit with its status.
 # Usage: .forgejo/desktop-ci.sh <macos|windows|linux> <command>
 #
