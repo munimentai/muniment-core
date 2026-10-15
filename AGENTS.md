@@ -4,8 +4,9 @@
 
 - The Muniment desktop (`munimentai/muniment`), a Tauri app. It depends on tagged
   releases of this repository through a git dependency.
-- Headless hosts that run the router server (`muniment-router serve`) and
-  read `pins/pins.toml` from a tagged release.
+- Headless hosts that run the router server (`muniment-router serve`) or the
+  runtime server (`muniment-server serve`) and read `pins/pins.toml` from a
+  tagged release.
 
 `README.md` describes each crate. `docs/` holds technical documentation about
 the core, such as `docs/core-boundary.md`, which the boundary check reads.

@@ -15,6 +15,7 @@ issues or pull requests.
 | `muniment-models` | `crates/models` | Provider and model knowledge as data: the provider registry, local server kinds and their scan, provider and endpoint model discovery, context windows, the model catalog, and Pi's `models.json`. |
 | `muniment-router` | `crates/router` | The multi-account model router: account pools, routing policy, the loopback OpenAI-compatible server, the `muniment-router` server binary (`server` feature) and the `muniment-router-shadow` binary. |
 | `muniment-runtime-core` | `crates/runtime` | The platform-neutral runtime: attach serving and its accept loops, runs, retention and agent schedules, the company record and reader service, the model service that runs the model router and the web search server and writes provider settings, web search settings and credentials, and `run_runtime`, the entry a host without OS service registration runs. The host supplies cloud accounts, chat grants, credential storage, provider OAuth clients, the sign-in page and its executables through `RuntimeHost`. The default `keyring` feature adds the keychain credential store and keychain prompt history. |
+| `muniment-server` | `crates/server` | The headless runtime host: the `muniment-server` binary runs the runtime with no cloud account, no keychain and no OS service registration, for a container or a server. |
 | `muniment-pins` | `crates/pins` | Typed constants compiled from `pins/pins.toml`, plus the embedded package lockfile. |
 | `muniment-attach` | `crates/attach` | The reader and companion attach protocol and its client. |
 | `muniment-code-diff` | `crates/code-diff` | Portable code-diff values and fixtures. |
@@ -161,6 +162,29 @@ The catalog (`crates/models/catalog.toml`) is a list of `[[model]]` tables with
 `output` in US dollars per million tokens, `context` (`400K`, `1M`),
 `strengths` and `limits`. A file that fails the check keeps the last good
 catalog in force.
+
+## Runtime server
+
+`muniment-server serve` runs the runtime headless on Linux and stops cleanly on
+SIGTERM or SIGINT. It builds `muniment-runtime-core` without its `keyring`
+feature, so it never opens a keychain: prompt history lives in files under the
+state root and secrets live in `FileCredentialStore`. State lives in the
+directory `MUNIMENT_STATE_DIR` names, or `~/.muniment`. The attach endpoint
+sits under `XDG_RUNTIME_DIR`, or under `run` in the state root when that is
+unset. One instance holds the endpoint's instance lock.
+
+`muniment-server health` exits 0 when the runtime's attach endpoint answers a
+handshake. `muniment-server prepare` installs the pinned Pi into the directory
+`MUNIMENT_PI_ROOT` names, or `harness` in the state root, checking the
+archive's size and SHA-256 against the pins, then installs the pinned extension
+packages and prints the Pi executable's path.
+
+A secret named `name` of service `service` lives in
+`<state>/credentials/<service>/<name>` with mode 0600. The variable
+`MUNIMENT_SECRET_<SERVICE>_<NAME>` overrides it: the service and the name
+upper-cased, with each character other than an ASCII letter or digit written
+as `_`. The reader's `ai.muniment.reader` secret `stripe` is
+`MUNIMENT_SECRET_AI_MUNIMENT_READER_STRIPE`.
 
 ## Development
 

@@ -1,0 +1,24 @@
+[package]
+name = "muniment-server"
+version = "0.0.1"
+edition = "2021"
+build = "build.rs"
+
+# The headless runtime host: `muniment-server` runs the platform-neutral
+# runtime with no cloud account, no keychain and no OS service registration,
+# for a container or a server. It keeps secrets in files under the state root
+# and reads overrides from the environment.
+
+[features]
+default = ["tls"]
+# HTTPS to model providers and to the pinned Pi release.
+tls = ["muniment-core/tls"]
+
+[dependencies]
+muniment-core = { path = "../core" }
+# Without its `keyring` feature the runtime never opens the system keyring.
+muniment-runtime-core = { path = "../runtime", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The serve test signals the server it started.
+libc = "0.2"

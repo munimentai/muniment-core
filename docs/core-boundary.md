@@ -21,6 +21,7 @@ A module that `muniment-core` re-exports from another workspace crate keeps its 
 | crate | muniment-pins | It pins Pi, its extension packages, and the Claude Code version. |
 | crate | muniment-router | It selects provider accounts and routes model requests. |
 | crate | muniment-runtime-core | It runs the platform-neutral runtime: attach serving, runs, schedules, the record service and the model service. |
+| crate | muniment-server | It runs the runtime headless, with no keychain and no OS service registration. |
 | crate | muniment-search | It searches the web without a key and answers the SearXNG JSON format on loopback. |
 | module | account | It defines the session, device, pairing, and entitlement values attach carries. |
 | module | agent_templates | It imports bounded public agent templates. |
@@ -129,6 +130,7 @@ Its defaults answer that the cloud is unavailable, so a host without cloud accou
 `process_reader` reads Linux process identities for attach peers and for the desktop's browser control.
 `muniment-runtime-core` takes the host's cloud account, chat grants, credential store, provider OAuth clients, sign-in page and executable paths as one `RuntimeHost` value.
 Its defaults answer that the cloud is unavailable, and the host binary registers the runtime with the OS service manager.
+`muniment-server` is the host with no keychain and no service manager. It builds `muniment-runtime-core` without its `keyring` feature and keeps secrets in `FileCredentialStore`.
 
 ## Check
 
@@ -136,6 +138,7 @@ Its defaults answer that the cloud is unavailable, and the host binary registers
 It rejects a staying module declared in `muniment-core` and a core default feature.
 It checks every port crate with Cargo's all-target dependency tree, including build and test dependencies.
 It rejects the shell, Tauri packages, and other staying crates.
+It rejects the `keyring` crate in `muniment-server`'s tree, so the headless runtime never opens a keychain.
 It tests each port crate without default features.
 The core test enables `keyring` to include prompt and thread-history tests.
 CI runs this check on every push and pull request.

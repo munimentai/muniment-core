@@ -1415,6 +1415,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "muniment-server"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "muniment-core",
+ "muniment-runtime-core",
+]
+
+[[package]]
 name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

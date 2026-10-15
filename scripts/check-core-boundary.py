@@ -22,6 +22,9 @@ INCLUDE_EXCEPTIONS = {
     "crates/pins/src/lib.rs",
 }
 
+# The headless runtime host runs where no keychain exists.
+KEYRING_FREE = frozenset({"muniment-server"})
+
 
 def require(condition, message):
     if not condition:
@@ -203,6 +206,9 @@ def main():
             "cargo", "tree", *args, "--target", "all", "--edges", "normal,build,dev",
             "--prefix", "none", "--format", "{p}|{f}"], text=True)
         check_tree(tree, tables["Stay"]["crate"], name)
+        if name in KEYRING_FREE:
+            names = {line.split()[0] for line in tree.splitlines() if line.strip()}
+            require("keyring" not in names, f"{name} depends on the keyring crate.")
         command = ["cargo", "test", *args]
         if name == CORE:
             # Match the core CI lane so stub child processes get CPU time.

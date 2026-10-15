@@ -9,5 +9,6 @@ members = [
     "crates/router",
     "crates/runtime",
     "crates/search",
+    "crates/server",
 ]
 resolver = "2"
