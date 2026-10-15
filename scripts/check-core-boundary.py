@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enforce ADR 0030 without a GUI toolchain."""
+"""Enforce the core boundary in docs/core-boundary.md without a GUI toolchain."""
 
 import json
 from pathlib import Path
@@ -7,7 +7,7 @@ import re
 import subprocess
 import sys
 
-ADR = Path("docs/decisions/0030-public-core-boundary.md")
+BOUNDARY = Path("docs/core-boundary.md")
 MANIFEST = "Cargo.toml"
 CORE = "muniment-core"
 
@@ -153,7 +153,7 @@ def check_tree(text, staying_crates, package):
 
 def check_inventory(tables, packages, lib):
     require(tables["Port"]["crate"] == set(packages),
-            "The ADR must list every workspace crate as a port crate.")
+            "The boundary doc must list every workspace crate as a port crate.")
     require(not tables["Stay"]["crate"] & set(packages),
             "A staying crate must not be a workspace crate.")
     modules = set()
@@ -175,14 +175,14 @@ def check_inventory(tables, packages, lib):
     staying = tables["Stay"]["module"] & modules
     require(not staying, f"Desktop-only modules must not be core modules: {sorted(staying)}")
     require(tables["Port"]["module"] == modules,
-            "The ADR must list every core module as a port module.")
+            "The boundary doc must list every core module as a port module.")
     require(not packages[CORE]["features"].get("default"),
             "The core crate must have no default features.")
 
 
 def main():
     require(len(sys.argv) == 1, "The core boundary check accepts no arguments.")
-    tables = inventory(ADR.read_text())
+    tables = inventory(BOUNDARY.read_text())
     metadata = json.loads(subprocess.check_output([
         "cargo", "metadata", "--manifest-path", MANIFEST,
         "--locked", "--no-deps", "--format-version", "1"], text=True))

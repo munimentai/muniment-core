@@ -24,7 +24,7 @@ risk_paths:
   - "scripts/pins/**"
   - "scripts/check-core-boundary.*"
   - "deploy/**"
-  - "docs/decisions/**"
+  - "docs/core-boundary.md"
   - "crates/pins/**"
   - "crates/router/src/server.rs"
   - "crates/router/src/store.rs"

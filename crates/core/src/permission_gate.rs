@@ -1,9 +1,9 @@
 //! Permission gate coordination for a chat run.
 //!
 //! A Pi extension-UI request opens a gate. The gate stays open until an answer
-//! arrives for its id and matches its dialog shape. ADR 0012 phase one makes
-//! this state runtime-service state, so the rules live here rather than in the
-//! desktop shell.
+//! arrives for its id and matches its dialog shape. This state is
+//! runtime-service state, so the rules live here rather than in the desktop
+//! shell.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

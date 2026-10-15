@@ -141,7 +141,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn descriptor_matches_adr_0015_exactly() {
+    fn descriptor_pins_the_kokoro_artifacts() {
         assert_eq!(KOKORO_V1.artifacts.len(), 2);
         assert_eq!(KOKORO_ARTIFACTS[0].filename, "kokoro-v1.0.int8.onnx");
         assert_eq!(KOKORO_ARTIFACTS[0].byte_size, 92_361_271);

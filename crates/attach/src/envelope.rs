@@ -91,7 +91,7 @@ impl fmt::Debug for Request {
 }
 
 impl Request {
-    /// Enforces the operation-level idempotency policy from ADR 0009. A
+    /// Enforces the operation-level idempotency policy. A
     /// `models.request` takes its policy from its action.
     pub fn validate_idempotency_key(&self) -> Result<(), ProtocolError> {
         let required = if self.operation == Operation::ModelsRequest {

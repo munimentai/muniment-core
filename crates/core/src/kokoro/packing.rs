@@ -246,7 +246,7 @@ pub fn pack_initial_ranges(
     Ok(ranges)
 }
 
-/// Repairs short initial ranges with ADR 0015's single left-to-right pass.
+/// Repairs short initial ranges with a single left-to-right pass.
 ///
 /// `count_tokens` must return the exact Kokoro token count for the supplied
 /// source slice. The function performs no I/O and never uses source length as
