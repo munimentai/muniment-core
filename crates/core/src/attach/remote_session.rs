@@ -77,6 +77,7 @@ pub fn remote_rule(operation: Operation, body: &Value) -> RemoteRule {
         | Operation::RunOpen
         | Operation::RunStream
         | Operation::RunChatEvents
+        | Operation::RunDetail
         | Operation::RunCursorAck
         | Operation::ArtifactFetch
         | Operation::ArtifactWindow
