@@ -740,6 +740,14 @@ impl ChatProjector {
         self.text_utf16_len
     }
 
+    /// The names of the tools this run has started, in order.
+    pub fn tool_names(&self) -> impl Iterator<Item = &str> {
+        self.chat
+            .tool_activity
+            .iter()
+            .map(|activity| activity.display_name.as_deref().unwrap_or_default())
+    }
+
     /// The run status after the last applied event.
     pub fn status(&self) -> Option<&RunStatus> {
         self.reducer.state.as_ref().map(|state| &state.status)

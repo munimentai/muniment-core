@@ -239,14 +239,26 @@ impl ApplicationMemoryRuntime {
         if name != "memory-search" || !self.recall(session).use_memories {
             return Err(MemoryIndexError::InvalidToolArguments);
         }
-        let session = self
+        let index = self
             .session(session)
             .ok_or(MemoryIndexError::InvalidToolArguments)?;
-        let result = session
+        let result = index
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .call(arguments);
+        if let (Ok(found), Some((home, private))) = (&result, self.memory_root(session)) {
+            // A failed count leaves the search result intact.
+            let _ = crate::memory_files::note_recalled(&private, &home, &found.recall.files);
+        }
         result
+    }
+
+    fn memory_root(&self, session: &str) -> Option<(PathBuf, PathBuf)> {
+        self.memory_roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session)
+            .cloned()
     }
 
     /// Exposes the same agent catalog used by the desktop, scoped to an open chat run.
@@ -436,6 +448,7 @@ impl ApplicationMemoryRuntime {
         &self,
         session: &str,
         arguments: &str,
+        trust: crate::memory_files::Trust,
     ) -> Result<crate::memory_files::Fact, String> {
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -475,6 +488,7 @@ impl ApplicationMemoryRuntime {
                 title: capture.title,
                 content: capture.content,
                 source: format!("thread:{thread} run:{session}"),
+                trust,
             },
         )?;
         self.build_session(session);
@@ -645,6 +659,7 @@ mod tests {
             .capture_fact(
                 "one",
                 r#"{"title":"Cobalt preference","content":"Use cobalt in reports."}"#,
+                crate::memory_files::Trust::Conversation,
             )
             .unwrap();
         assert!(crate::memory_files::facts(&config).unwrap().is_empty());
@@ -730,6 +745,7 @@ mod tests {
             .capture_fact(
                 "run-one",
                 r#"{"title":"Style","content":"Use concise answers."}"#,
+                crate::memory_files::Trust::External,
             )
             .unwrap();
         let facts = crate::memory_files::facts(&config).unwrap();
@@ -737,6 +753,7 @@ mod tests {
             facts[0].source,
             "thread:01900000-0000-7000-8000-000000000001 run:run-one"
         );
+        assert_eq!(facts[0].trust, crate::memory_files::Trust::External);
         let recall = runtime
             .dispatch_tool_call("run-one", "memory-search", br#"{"query":"concise"}"#)
             .unwrap();
@@ -977,7 +994,8 @@ console.log(JSON.stringify([await run(['Save']), await run(["Don't save"]), awai
         assert!(runtime
             .capture_fact(
                 "session",
-                r#"{"title":"Tone","content":"Use short answers."}"#
+                r#"{"title":"Tone","content":"Use short answers."}"#,
+                crate::memory_files::Trust::Conversation,
             )
             .is_err());
         assert!(crate::memory_files::facts(runtime.config_directory())

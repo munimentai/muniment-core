@@ -1798,7 +1798,10 @@ fn coordinate_memory_search(
                 let result = prefill
                     .as_deref()
                     .ok_or_else(|| "The memory arguments are missing.".to_owned())
-                    .and_then(|arguments| memory_runtime.capture_fact(run_id, arguments));
+                    .and_then(|arguments| {
+                        let trust = crate::memory_files::Trust::after_tools(projector.tool_names());
+                        memory_runtime.capture_fact(run_id, arguments, trust)
+                    });
                 let value = match result {
                     Ok(fact) => json!({"saved": true, "fact": fact}),
                     Err(error) => json!({"error": error}),

@@ -17,6 +17,62 @@ pub struct Fact {
     pub title: String,
     pub content: String,
     pub source: String,
+    #[serde(default)]
+    pub trust: Trust,
+}
+
+/// Where a fact came from when it was written. Only user and conversation
+/// facts reach a chat without a search, so text from outside the
+/// conversation cannot steer later chats on its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Trust {
+    /// Written or edited by the user in Settings.
+    #[default]
+    User,
+    /// Saved by the model before any tool returned outside content in its run.
+    Conversation,
+    /// Saved by the model after a tool returned web, file, shell or
+    /// integration content in its run, or saved before trust was recorded.
+    External,
+}
+
+impl Trust {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Conversation => "conversation",
+            Self::External => "external",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "user" => Some(Self::User),
+            "conversation" => Some(Self::Conversation),
+            "external" => Some(Self::External),
+            _ => None,
+        }
+    }
+
+    /// The trust of a fact the model saves after the named tools ran. Memory
+    /// search reads the user's own Home, and the other tools return no
+    /// outside content.
+    pub fn after_tools<'a>(tools: impl IntoIterator<Item = &'a str>) -> Self {
+        let internal = |tool: &str| {
+            tool.starts_with("memory-")
+                || tool.starts_with("agent-")
+                || matches!(
+                    tool,
+                    "ask_user_question" | "creation-plan" | "artifact-publish" | "write" | "edit"
+                )
+        };
+        if tools.into_iter().all(internal) {
+            Self::Conversation
+        } else {
+            Self::External
+        }
+    }
 }
 
 fn lock(profile: &Path) -> Result<fs::File, String> {
@@ -188,20 +244,33 @@ fn list_at(home: &Path, relative: &str) -> Result<Vec<Fact>, String> {
         let (heading, body) = text
             .split_once("\n\n")
             .ok_or("The memory format is invalid.")?;
-        let (source, content) = body
+        let (header, content) = body
             .split_once("\n\n")
             .ok_or("The memory format is invalid.")?;
+        let (source, trust) = match header.split_once('\n') {
+            Some((source, trust)) => (
+                source,
+                trust
+                    .strip_prefix("Trust: ")
+                    .and_then(Trust::parse)
+                    .ok_or("The memory format is invalid.")?,
+            ),
+            None => (header, Trust::External),
+        };
         result.push(Fact {
             id: id.into(),
             title: heading.strip_prefix("# ").unwrap_or(heading).into(),
             source: source.strip_prefix("Source: ").unwrap_or(source).into(),
             content: content.trim_end().into(),
+            trust,
         });
     }
     result.sort_by(|a, b| a.title.cmp(&b.title));
     Ok(result)
 }
-pub fn fact_save(profile: &Path, fact: Fact) -> Result<Fact, String> {
+/// Saves a fact the user wrote or edited in Settings.
+pub fn fact_save(profile: &Path, mut fact: Fact) -> Result<Fact, String> {
+    fact.trust = Trust::User;
     fact_save_in(profile, &home(profile)?, fact)
 }
 pub fn facts_in(home: &Path) -> Result<Vec<Fact>, String> {
@@ -237,12 +306,102 @@ pub fn fact_save_in(profile: &Path, home: &Path, mut fact: Fact) -> Result<Fact,
         home,
         &fact_path(&fact.id)?,
         &format!(
-            "# {}\n\nSource: {}\n\n{}\n",
-            fact.title, fact.source, fact.content
+            "# {}\n\nSource: {}\nTrust: {}\n\n{}\n",
+            fact.title,
+            fact.source,
+            fact.trust.as_str(),
+            fact.content
         ),
     )?;
     Ok(fact)
 }
+const USAGE_FILE: &str = "memory-usage.json";
+const MAX_USAGE: u64 = 256 * 1024;
+
+fn usage(private: &Path) -> std::collections::BTreeMap<String, u64> {
+    let path = private.join(USAGE_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(m) if m.is_file() && m.len() <= MAX_USAGE => fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default(),
+        _ => Default::default(),
+    }
+}
+
+/// Counts each fact a memory search returned. The counts rank the facts that
+/// open every chat, and they cover only facts that still exist.
+pub fn note_recalled(private: &Path, home: &Path, files: &[String]) -> Result<(), String> {
+    let recalled: Vec<&str> = files
+        .iter()
+        .filter_map(|file| file.strip_prefix("memory/facts/")?.strip_suffix(".md"))
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+        .collect();
+    if recalled.is_empty() {
+        return Ok(());
+    }
+    let _guard = WRITE.lock().map_err(|_| "Memory is busy.")?;
+    let _file_lock = lock(private)?;
+    let mut counts = usage(private);
+    for id in recalled {
+        *counts.entry(id.to_owned()).or_default() += 1;
+    }
+    counts.retain(|id, _| home.join(format!("memory/facts/{id}.md")).is_file());
+    let path = private.join(USAGE_FILE);
+    if path.is_symlink() {
+        return Err("Memory usage cannot be saved.".into());
+    }
+    let temp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        fs::write(
+            &temp,
+            serde_json::to_vec(&counts).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        crate::atomic_file::replace(&temp, &path).map_err(|e| e.to_string())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temp);
+    }
+    result.map_err(|_| "Memory usage cannot be saved.".into())
+}
+
+/// The user and conversation facts that open a chat, most recalled first and
+/// then newest first, as whole facts within `budget` bytes. External facts
+/// stay reachable through memory search only.
+pub fn core_memory(home: &Path, private: &Path, budget: usize) -> Result<String, String> {
+    let counts = usage(private);
+    let modified = |id: &str| {
+        fs::metadata(home.join(format!("memory/facts/{id}.md")))
+            .and_then(|m| m.modified())
+            .ok()
+    };
+    let mut ranked: Vec<_> = facts_in(home)?
+        .into_iter()
+        .filter(|fact| fact.trust != Trust::External)
+        .map(|fact| {
+            let count = counts.get(&fact.id).copied().unwrap_or_default();
+            (count, modified(&fact.id), fact)
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    let mut text = String::new();
+    for (_, _, fact) in ranked {
+        let line = format!(
+            "- {}: {}\n",
+            fact.title,
+            fact.content
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        if text.len() + line.len() <= budget {
+            text.push_str(&line);
+        }
+    }
+    Ok(text)
+}
+
 pub fn fact_delete(profile: &Path, id: &str) -> Result<(), String> {
     fact_delete_in(profile, &home(profile)?, id)
 }
@@ -436,6 +595,7 @@ mod tests {
             title: "Preferred language".into(),
             content: "Use English.".into(),
             source: "thread:abc".into(),
+            trust: Trust::External,
         };
         let saved = fact_save(&profile, input.clone()).unwrap();
         assert_eq!(saved.id, fact_save(&profile, input).unwrap().id);
@@ -448,5 +608,95 @@ mod tests {
         assert_eq!(facts(&profile).unwrap().len(), 1);
         assert!(deleted_facts(&profile).unwrap().is_empty());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn facts_keep_their_trust_and_settings_saves_are_user_facts() {
+        let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        fs::create_dir_all(&root).unwrap();
+        let profile = root.join("private");
+        let home = root.join("muniment");
+        crate::home::confirm_home(&profile, &home).unwrap();
+        let fact = |content: &str, trust| Fact {
+            id: String::new(),
+            title: "Tone".into(),
+            content: content.into(),
+            source: "thread:abc run:one".into(),
+            trust,
+        };
+        let saved = fact_save_in(
+            &profile,
+            &home,
+            fact("Use short answers.", Trust::Conversation),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(home.join(format!("memory/facts/{}.md", saved.id))).unwrap(),
+            "# Tone\n\nSource: thread:abc run:one\nTrust: conversation\n\nUse short answers.\n"
+        );
+        let edited = fact_save(
+            &profile,
+            Fact {
+                id: saved.id.clone(),
+                ..fact("Use very short answers.", Trust::External)
+            },
+        )
+        .unwrap();
+        assert_eq!(edited.trust, Trust::User);
+        assert_eq!(facts(&profile).unwrap()[0].trust, Trust::User);
+
+        let legacy = uuid::Uuid::new_v4();
+        fs::write(
+            home.join(format!("memory/facts/{legacy}.md")),
+            "# Old\n\nSource: thread:abc run:zero\n\nAn older fact.\n",
+        )
+        .unwrap();
+        let listed = facts(&profile).unwrap();
+        let old = listed.iter().find(|f| f.id == legacy.to_string()).unwrap();
+        assert_eq!(
+            (old.source.as_str(), old.trust),
+            ("thread:abc run:zero", Trust::External)
+        );
+
+        fs::write(
+            home.join(format!("memory/facts/{legacy}.md")),
+            "# Old\n\nSource: thread:abc\nTrust: admin\n\nAn older fact.\n",
+        )
+        .unwrap();
+        assert_eq!(
+            facts(&profile).unwrap_err(),
+            "The memory format is invalid."
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn trust_follows_the_tools_that_ran_before_the_save() {
+        assert_eq!(Trust::after_tools([]), Trust::Conversation);
+        assert_eq!(
+            Trust::after_tools([
+                "ask_user_question",
+                "memory-search",
+                "memory-save",
+                "agent-read",
+                "write"
+            ]),
+            Trust::Conversation
+        );
+        for tool in [
+            "web_search",
+            "fetch_content",
+            "browser",
+            "bash",
+            "read",
+            "mcp__record__sql",
+            "",
+        ] {
+            assert_eq!(
+                Trust::after_tools(["memory-search", tool]),
+                Trust::External,
+                "{tool}"
+            );
+        }
     }
 }
