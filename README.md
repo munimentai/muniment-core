@@ -134,8 +134,8 @@ listener is off until the host binds it.
   operations except workspace onboarding, migration control, approval
   presentation, same-machine companions, and the host's cloud account and
   phone pairing. Reader connections and model changes need `runtime.admin`,
-  except the choices a run makes, its model, thinking level and a capacity
-  reading, which `run.write` covers.
+  except the choices a run makes, its model, thinking level, the models the
+  picker hides and a capacity reading, which `run.write` covers.
   A refusal for a missing scope names what the device lacks.
 - `models.share` replaces the model connections the calling device shares
   and needs `run.write`. The runtime writes the device's Pi entries beside its

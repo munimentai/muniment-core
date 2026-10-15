@@ -1134,6 +1134,10 @@ mod tests {
             RemoteRule::Scope(SCOPE_RUN_WRITE)
         );
         assert_eq!(
+            rule("router_set_hidden"),
+            RemoteRule::Scope(SCOPE_RUN_WRITE)
+        );
+        assert_eq!(
             rule("store_provider_key"),
             RemoteRule::Scope(SCOPE_RUNTIME_ADMIN)
         );
