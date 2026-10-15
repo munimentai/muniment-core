@@ -5,7 +5,7 @@
 //! failures, and it names the last failure so a user can see why an account
 //! stopped taking its share.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -24,6 +24,9 @@ pub const MAX_COOLDOWN_MS: i64 = 15 * 60 * 1000;
 pub const RECENT_HALF_LIFE_MS: i64 = 10 * 60 * 1000;
 /// The longest cooldown an upstream's own reset time may set.
 pub const MAX_RETRY_AFTER_MS: i64 = 24 * 60 * 60 * 1000;
+/// How long a model an account's plan refused stays out of that account's
+/// running. Plans change, so the model is tried again after this.
+pub const MODEL_REFUSAL_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// One day of one account's work.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +67,11 @@ pub struct AccountUsage {
     pub recent_milli: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recent_at_ms: Option<i64>,
+    /// Each model the account's plan refused, with the Unix milliseconds of
+    /// the latest refusal. The account takes no turn on the model for
+    /// [`MODEL_REFUSAL_MS`] after it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub refused_models: BTreeMap<String, i64>,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -161,6 +169,33 @@ impl Ledger {
         trim(&mut usage.days);
     }
 
+    /// Records that the plan of account `id` does not offer `model`. Records
+    /// past [`MODEL_REFUSAL_MS`] are dropped on the way.
+    pub fn record_refusal(&mut self, id: &str, model: &str, now_ms: i64) {
+        let usage = self.accounts.entry(id.to_owned()).or_default();
+        usage
+            .refused_models
+            .retain(|_, at| now_ms.saturating_sub(*at) < MODEL_REFUSAL_MS);
+        usage.refused_models.insert(model.to_owned(), now_ms);
+    }
+
+    /// The models each account's plan refused within [`MODEL_REFUSAL_MS`] of
+    /// `now_ms`, by account id.
+    pub fn refusals(&self, now_ms: i64) -> BTreeMap<String, BTreeSet<String>> {
+        self.accounts
+            .iter()
+            .filter_map(|(id, usage)| {
+                let models: BTreeSet<String> = usage
+                    .refused_models
+                    .iter()
+                    .filter(|(_, at)| now_ms.saturating_sub(**at) < MODEL_REFUSAL_MS)
+                    .map(|(model, _)| model.clone())
+                    .collect();
+                (!models.is_empty()).then(|| (id.clone(), models))
+            })
+            .collect()
+    }
+
     /// Drops the record of an account the user removed.
     pub fn forget(&mut self, id: &str) {
         self.accounts.remove(id);
@@ -181,6 +216,57 @@ pub fn cooldown_ms(strikes: u32) -> i64 {
 /// balancer should pass it over: rate limits, auth failures and quota.
 pub fn status_cools(status: u16) -> bool {
     matches!(status, 401 | 402 | 403 | 429) || status >= 500
+}
+
+/// Whether an upstream error answer says the account's plan does not offer
+/// the model it was asked for, as opposed to a fault in the request. Only a
+/// 400 or 404 whose message names the model as what is missing or
+/// unsupported counts, so a refused parameter or input never does.
+pub fn model_refused(status: u16, body: &str) -> bool {
+    if !matches!(status, 400 | 404) {
+        return false;
+    }
+    let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let error = parsed.get("error").unwrap_or(&serde_json::Value::Null);
+    let text = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_ascii_lowercase)
+    };
+    let code = text(error.get("code")).unwrap_or_default();
+    let kind = text(error.get("type")).unwrap_or_default();
+    if matches!(code.as_str(), "model_not_found" | "model_not_supported") {
+        return true;
+    }
+    let message = text(parsed.get("detail"))
+        .or_else(|| text(error.get("message")))
+        .or_else(|| text(Some(error)))
+        .or_else(|| text(parsed.get("message")))
+        .unwrap_or_else(|| body.to_ascii_lowercase());
+    if kind == "not_found_error" && message.starts_with("model:") {
+        return true;
+    }
+    if message.contains("parameter") {
+        return false;
+    }
+    if message.contains("unsupported model") {
+        return true;
+    }
+    // The model comes first and the refusal follows in the same sentence:
+    // "The 'x' model is not supported", "The model `x` does not exist".
+    message.split(". ").any(|sentence| {
+        sentence.find("model").is_some_and(|at| {
+            let rest = &sentence[at..];
+            [
+                " not supported",
+                " not available",
+                " does not exist",
+                " not found",
+            ]
+            .iter()
+            .any(|refusal| rest.contains(refusal))
+        })
+    })
 }
 
 /// The moment a `retry-after` value lets the account back in: a count of
@@ -288,6 +374,89 @@ mod tests {
         assert_eq!(usage.last_error, None);
         assert_eq!(usage.errors, 2);
         assert_eq!(usage.days["2026-09-17"].errors, 2);
+    }
+
+    #[test]
+    fn a_plan_that_does_not_offer_the_model_reads_as_a_model_refusal() {
+        for (status, body) in [
+            (
+                400,
+                r#"{"detail":"The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account."}"#,
+            ),
+            (
+                400,
+                r#"{"detail":"The 'gpt-5.3-codex-spark' model is not supported when using Codex with a ChatGPT account."}"#,
+            ),
+            (
+                404,
+                r#"{"error":{"message":"The model `gpt-9` does not exist or you do not have access to it.","type":"invalid_request_error","code":"model_not_found"}}"#,
+            ),
+            (
+                404,
+                r#"{"type":"error","error":{"type":"not_found_error","message":"model: claude-opus-9"}}"#,
+            ),
+            (400, r#"{"detail":"Unsupported model"}"#),
+            (
+                400,
+                r#"{"error":{"message":"This model is not available on your plan."}}"#,
+            ),
+        ] {
+            assert!(model_refused(status, body), "{status} {body}");
+        }
+    }
+
+    #[test]
+    fn a_refused_request_or_a_refused_account_is_no_model_refusal() {
+        for (status, body) in [
+            (
+                400,
+                r#"{"error":{"message":"Unsupported parameter: 'max_tokens' is not supported with this model."}}"#,
+            ),
+            (
+                400,
+                r#"{"error":{"message":"Image input is not supported for this model."}}"#,
+            ),
+            (400, r#"{"error":"no such model"}"#),
+            (404, "model unavailable"),
+            (
+                429,
+                r#"{"detail":"The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account."}"#,
+            ),
+            (
+                401,
+                r#"{"error":{"code":"model_not_found","message":"The model does not exist."}}"#,
+            ),
+        ] {
+            assert!(!model_refused(status, body), "{status} {body}");
+        }
+    }
+
+    #[test]
+    fn a_model_refusal_holds_for_a_day_and_for_that_account_alone() {
+        let mut ledger = Ledger::default();
+        ledger.record_refusal("a1", "gpt-5.5", 1_000);
+        let refusals = ledger.refusals(1_000 + MODEL_REFUSAL_MS - 1);
+        assert_eq!(refusals.len(), 1);
+        assert!(refusals["a1"].contains("gpt-5.5"));
+        assert!(ledger.refusals(1_000 + MODEL_REFUSAL_MS).is_empty());
+        // A refusal neither cools the account nor counts as an error.
+        let usage = ledger.account("a1").unwrap();
+        assert_eq!(usage.cooldown_until_ms, None);
+        assert_eq!(usage.errors, 0);
+        // A later refusal drops the expired record.
+        ledger.record_refusal("a1", "gpt-5.3-codex-spark", 1_000 + MODEL_REFUSAL_MS);
+        let models: Vec<_> = ledger
+            .account("a1")
+            .unwrap()
+            .refused_models
+            .keys()
+            .collect();
+        assert_eq!(models, ["gpt-5.3-codex-spark"]);
+        // The record survives a save and a load.
+        let back: Ledger = serde_json::from_slice(&serde_json::to_vec(&ledger).unwrap()).unwrap();
+        assert_eq!(back, ledger);
+        ledger.forget("a1");
+        assert!(ledger.refusals(1_000 + MODEL_REFUSAL_MS).is_empty());
     }
 
     #[test]

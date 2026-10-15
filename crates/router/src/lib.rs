@@ -65,6 +65,12 @@ pub enum ResolveError {
     NoRoute,
     /// A pool could not answer.
     Pool(balance::PickError),
+    /// The request named a model the plan of every account that lists it
+    /// lately refused. Carries the model and those accounts' labels.
+    PlanRefused {
+        model: String,
+        accounts: Vec<String>,
+    },
 }
 
 impl ResolveError {
@@ -77,6 +83,10 @@ impl ResolveError {
                 "No model is in the running. Add an account in Settings → Models.".into()
             }
             Self::Pool(error) => error.message(),
+            Self::PlanRefused { model, accounts } => format!(
+                "The plan of {} does not offer {model}. Choose another model.",
+                accounts.join(" or ")
+            ),
         }
     }
 }
@@ -102,7 +112,8 @@ pub fn options(config: &RouterConfig) -> Vec<Route> {
         .collect()
 }
 
-/// Every model an enabled account serves, the hidden ones too.
+/// Every model an enabled account serves, the hidden ones too, less the
+/// models every such account's plan lately refused.
 pub fn all_options(config: &RouterConfig) -> Vec<Route> {
     let mut options: Vec<Route> = Vec::new();
     for account in config
@@ -127,7 +138,9 @@ pub fn all_options(config: &RouterConfig) -> Vec<Route> {
         };
         for model in models {
             let key = format!("{}/{}", account.family, model);
-            if options.iter().any(|known| known.key == key) {
+            // A model this account's plan refused stays in the running only
+            // through another account that has not refused it.
+            if config.refuses(&account.id, &model) || options.iter().any(|known| known.key == key) {
                 continue;
             }
             // A model the catalog does not describe still runs. Its id is all
@@ -279,7 +292,26 @@ pub fn plan(
         ));
     }
     // The router serves what it lists and nothing else, so a pair no account
-    // serves is not found rather than found and then unservable.
+    // serves is not found rather than found and then unservable. A pair only
+    // refusals keep out says so.
+    let mut unrefused = config.clone();
+    unrefused.refused.clear();
+    if let Some(option) = self::options(&unrefused)
+        .into_iter()
+        .find(|option| option.key == requested)
+    {
+        let accounts = config
+            .accounts
+            .iter()
+            .filter(|account| account.family == option.family)
+            .filter(|account| config.refuses(&account.id, &option.model))
+            .map(|account| account.label.clone())
+            .collect();
+        return Err(ResolveError::PlanRefused {
+            model: option.model,
+            accounts,
+        });
+    }
     Err(ResolveError::UnknownModel(requested.to_owned()))
 }
 
@@ -355,6 +387,7 @@ mod tests {
             routing_models: Default::default(),
             policy: Default::default(),
             discovered_models: Default::default(),
+            refused: Default::default(),
             enabled: true,
             hidden: Vec::new(),
             accounts: vec![
@@ -443,6 +476,56 @@ mod tests {
         assert_eq!(running.len(), all.len() - 1);
         assert!(running.iter().all(|option| option.key != first.key));
         assert_eq!(all_options(&config), all);
+    }
+
+    #[test]
+    fn a_model_leaves_the_running_once_every_account_plan_refused_it() {
+        let mut config = pooled();
+        let refuse = |config: &mut RouterConfig, id: &str| {
+            config
+                .refused
+                .entry(id.into())
+                .or_default()
+                .insert("gpt-6-astra".into());
+        };
+        refuse(&mut config, "o1");
+        // The other account still serves it, on its own.
+        assert!(served_models(&config).contains(&"openai/gpt-6-astra".to_owned()));
+        assert_eq!(
+            balance::balanced(&config, "openai", "gpt-6-astra")
+                .iter()
+                .map(|account| account.id.as_str())
+                .collect::<Vec<_>>(),
+            ["o2"]
+        );
+        refuse(&mut config, "o2");
+        assert!(all_options(&config)
+            .iter()
+            .all(|option| option.key != "openai/gpt-6-astra"));
+        assert!(!offered_models(&config).contains(&"openai/gpt-6-astra".to_owned()));
+        assert_eq!(
+            plan(&config, &Ledger::default(), "openai/gpt-6-astra", "", 1_000),
+            Err(ResolveError::PlanRefused {
+                model: "gpt-6-astra".into(),
+                accounts: vec!["openai o1".into(), "openai o2".into()],
+            })
+        );
+        assert_eq!(
+            ResolveError::PlanRefused {
+                model: "gpt-6-astra".into(),
+                accounts: vec!["work".into()],
+            }
+            .message(),
+            "The plan of work does not offer gpt-6-astra. Choose another model."
+        );
+        // A model no account lists is still unknown.
+        assert_eq!(
+            plan(&config, &Ledger::default(), "openai/gpt-0", "", 1_000),
+            Err(ResolveError::UnknownModel("openai/gpt-0".into()))
+        );
+        // A new account of the family brings the model back.
+        config.accounts.push(account("o3", "openai"));
+        assert!(served_models(&config).contains(&"openai/gpt-6-astra".to_owned()));
     }
 
     #[test]
