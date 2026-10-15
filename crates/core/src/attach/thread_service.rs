@@ -138,6 +138,12 @@ pub trait ThreadListService {
         Err(ProtocolError::unsupported_operation())
     }
 
+    /// The cloud API and the signed-in account's bearer token, for the model
+    /// vault.
+    fn cloud_session(&mut self) -> Result<crate::shared_models::CloudSession, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+
     fn list_devices(&mut self) -> Result<crate::account::NativeDeviceList, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }

@@ -1062,6 +1062,13 @@ impl DesktopClient {
             .take())
     }
 
+    /// Runs one model vault action on this computer's runtime: `upload`,
+    /// `release`, or `machine_token` with the machine's identity. The local
+    /// owner route only.
+    pub fn model_vault(&mut self, body: Value) -> Result<Value, ClientError> {
+        self.request_body(Operation::ModelsVault, None, body, &[])
+    }
+
     /// Asks the runtime's host to update the runtime to `version`.
     pub fn request_runtime_update(&mut self, version: &str) -> Result<Value, ClientError> {
         self.request_body(

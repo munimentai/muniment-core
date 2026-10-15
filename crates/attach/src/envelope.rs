@@ -399,6 +399,10 @@ pub enum Operation {
     /// is paired with, secrets included. The local owner route only.
     #[serde(rename = "models.share_bundle")]
     ModelsShareBundle,
+    /// Uploads to, releases or issues machine tokens for the account's model
+    /// vault. The local owner route only.
+    #[serde(rename = "models.vault")]
+    ModelsVault,
     /// Reads the remote access settings with the listener's live state. The
     /// local owner route only.
     #[serde(rename = "remote.settings")]
@@ -513,6 +517,7 @@ impl Operation {
             Self::RuntimeUpdate => "runtime.update",
             Self::ModelsShare => "models.share",
             Self::ModelsShareBundle => "models.share_bundle",
+            Self::ModelsVault => "models.vault",
             Self::RemoteSettings => "remote.settings",
             Self::RemoteSettingsSave => "remote.settings_save",
         }

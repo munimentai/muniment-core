@@ -87,6 +87,12 @@ impl ModelService {
         router::restore(&self.agent, &self.router);
     }
 
+    /// The agent directory: Pi's `auth.json`, its `models.json` and the
+    /// router record.
+    pub fn agent_directory(&self) -> &Path {
+        &self.agent
+    }
+
     /// Starts or stops the router listener to match its record, as after a
     /// paired device changes the connections it shares.
     pub fn apply_router(&self) {

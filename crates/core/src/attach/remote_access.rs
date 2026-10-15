@@ -706,9 +706,19 @@ pub(super) fn dispatch_remote_operation(
                 .find(|device| device.device_id == requested_by)
                 .map(|device| device.name)
                 .unwrap_or_default();
-            let applied =
-                crate::shared_models::apply(&access.agent_directory(), requested_by, &name, bundle)
-                    .map_err(ProtocolError::invalid_request_with_reason)?;
+            let linked = bundle.cloud.is_some();
+            let agent = access.agent_directory();
+            let applied = crate::shared_models::apply(&agent, requested_by, &name, bundle)
+                .map_err(ProtocolError::invalid_request_with_reason)?;
+            // A machine pointed at the vault reads its leases at once.
+            if linked {
+                std::thread::spawn(move || {
+                    if let Err(error) = crate::shared_models::refresh_vault_leases(&agent, || None)
+                    {
+                        crate::runtime_eprintln!("muniment-runtime: model vault leases: {error}");
+                    }
+                });
+            }
             Ok(json!({"pi": applied.pi, "router": applied.router, "kept": applied.kept}))
         }
         Operation::ModelsShareBundle => {
@@ -724,6 +734,46 @@ pub(super) fn dispatch_remote_operation(
             Ok(json!({"bundle": bundle}))
         }
         _ => Err(ProtocolError::unsupported_operation()),
+    }
+}
+
+/// Runs one model vault action for the owner's local route: `upload` hands
+/// this computer's connections to the vault, `release` takes them back, and
+/// `machine_token` issues the token one paired machine reads the vault with.
+pub(super) fn model_vault(
+    access: &RemoteAccess,
+    session: &crate::shared_models::CloudSession,
+    body: &Value,
+) -> Result<Value, ProtocolError> {
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+    enum Action {
+        Upload,
+        Release,
+        MachineToken { machine: Value },
+    }
+    let action: Action =
+        serde_json::from_value(body.clone()).map_err(|_| ProtocolError::invalid_request())?;
+    let agent = access.agent_directory();
+    let refuse = ProtocolError::invalid_request_with_reason;
+    match action {
+        Action::Upload => {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_millis() as i64);
+            let stored =
+                crate::shared_models::upload_to_vault(&agent, session, now_ms).map_err(refuse)?;
+            Ok(json!({"connections": stored}))
+        }
+        Action::Release => {
+            crate::shared_models::release_vault(&agent, session).map_err(refuse)?;
+            Ok(json!({"released": true}))
+        }
+        Action::MachineToken { machine } => {
+            let link =
+                crate::shared_models::vault_machine_token(session, &machine).map_err(refuse)?;
+            Ok(json!({"cloud": link}))
+        }
     }
 }
 

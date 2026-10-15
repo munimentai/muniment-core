@@ -1029,6 +1029,12 @@ impl RunAttachBoundaries for RuntimeAttachBoundaries {
         muniment_core::attach::account_approval_subject(&snapshot.org_id, &snapshot.user_id)
     }
 
+    fn cloud_session(&self) -> Result<muniment_core::shared_models::CloudSession, ProtocolError> {
+        crate::host::cloud_session(&self.host, &self.runtime_activity).ok_or_else(|| {
+            ProtocolError::invalid_request_with_reason("Sign in to MuniCloud first.")
+        })
+    }
+
     fn list_devices(&self) -> Result<muniment_core::account::NativeDeviceList, ProtocolError> {
         let access_token = self
             .fresh_tokens()

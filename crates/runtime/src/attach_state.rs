@@ -267,6 +267,12 @@ impl RuntimeAttachState {
     }
 
     /// Returns the activity registry an activation reads before a refresh.
+    /// The cloud API and the signed-in account's bearer token, when the host
+    /// has a cloud and someone is signed in.
+    pub fn cloud_session(&self) -> Option<muniment_core::shared_models::CloudSession> {
+        crate::host::cloud_session(&self.host, &self.runtime_activity)
+    }
+
     pub fn runtime_activity(&self) -> RuntimeActivityRegistry {
         self.runtime_activity.clone()
     }

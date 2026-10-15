@@ -144,6 +144,13 @@ listener is off until the host binds it.
   it. Revoking the device removes what it shared. `models.share_bundle`, on
   the local owner route only, answers this runtime's own connections, each
   rotating sign-in refreshed when it has under 30 minutes left.
+- With a MuniCloud account, `models.vault` on the local owner route uploads
+  this computer's connections to the account's model vault, releases them
+  back, or issues a machine token for one paired machine. The vault then
+  holds each rotating refresh token alone. A `models.share` bundle may carry
+  `cloud`, the vault's base URL and a machine token, and the runtime then
+  fetches the vault's leases at once and every five minutes, under the device
+  `municloud`. The computer that uploaded fetches them with its own session.
   The route refuses requests that name a file on the runtime's machine: the
   `csv` reader source, and `run.submit` with `files`.
 - Revoking a device closes its live sessions. `runtime.update` takes a

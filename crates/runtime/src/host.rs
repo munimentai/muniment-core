@@ -167,6 +167,12 @@ pub trait AccountService: Send + Sync {
         Err(ProtocolError::unsupported_operation())
     }
 
+    /// The base URL of the cloud API this host signs in to, or none for a
+    /// host without a cloud account.
+    fn cloud_api_base(&self) -> Option<String> {
+        None
+    }
+
     /// Lists the account's native installations.
     fn list_devices(&self, access_token: &str) -> Result<NativeDeviceList, ProtocolError> {
         let _ = access_token;
@@ -228,6 +234,22 @@ pub trait ChatGrantService: Send + Sync {
         let _ = (grant, access_token, run_id);
         Err(FetchReceiptError)
     }
+}
+
+/// The cloud API and the signed-in account's bearer token, or none when the
+/// host has no cloud or no one is signed in.
+pub fn cloud_session(
+    host: &RuntimeHost,
+    runtime_activity: &RuntimeActivityRegistry,
+) -> Option<muniment_core::shared_models::CloudSession> {
+    let base_url = host.account.cloud_api_base()?;
+    let bearer = host
+        .account
+        .session(runtime_activity)
+        .ok()?
+        .tokens?
+        .access_token;
+    (!bearer.is_empty()).then_some(muniment_core::shared_models::CloudSession { base_url, bearer })
 }
 
 /// A host with no cloud account.

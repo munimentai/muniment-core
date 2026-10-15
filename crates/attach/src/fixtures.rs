@@ -649,6 +649,7 @@ fn fixture_bytes() -> io::Result<BTreeMap<String, Vec<u8>>> {
         ("remote-settings-save", Operation::RemoteSettingsSave),
         ("models-share", Operation::ModelsShare),
         ("models-share-bundle", Operation::ModelsShareBundle),
+        ("models-vault", Operation::ModelsVault),
     ];
     for (index, (name, operation)) in operations.into_iter().enumerate() {
         let body = request_body(operation);
@@ -1040,6 +1041,7 @@ fn request_body(operation: Operation) -> serde_json::Value {
             "router": []
         }),
         Operation::ModelsShareBundle => json!({}),
+        Operation::ModelsVault => json!({"action": "upload"}),
         Operation::RemoteSettings => json!({}),
         Operation::RemoteSettingsSave => json!({
             "enabled": true,
@@ -1295,6 +1297,7 @@ mod tests {
             Operation::RuntimeUpdate,
             Operation::ModelsShare,
             Operation::ModelsShareBundle,
+            Operation::ModelsVault,
             Operation::RemoteSettings,
             Operation::RemoteSettingsSave,
         ];
@@ -1351,7 +1354,7 @@ mod tests {
         }
         assert_eq!(
             fixtures.len(),
-            119,
+            120,
             "every canonical fixture must be inventoried"
         );
     }

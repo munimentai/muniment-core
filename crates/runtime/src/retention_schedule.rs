@@ -13,6 +13,27 @@ pub enum RetentionScheduleCommand {
     Stop,
 }
 
+/// How often a runtime asks the model vault for fresh leases.
+const VAULT_LEASE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Keeps the model vault's leases fresh while the runtime runs: at once, then
+/// every five minutes. A runtime that reads no vault makes no call.
+fn start_vault_leases(state: std::sync::Weak<RuntimeAttachState>) {
+    std::thread::spawn(move || loop {
+        let Some(live) = state.upgrade() else {
+            return;
+        };
+        let agent = live.models().agent_directory().to_path_buf();
+        if let Err(error) =
+            muniment_core::shared_models::refresh_vault_leases(&agent, || live.cloud_session())
+        {
+            eprintln!("model_vault: {error}");
+        }
+        drop(live);
+        std::thread::sleep(VAULT_LEASE_INTERVAL);
+    });
+}
+
 /// Applies the recorded retention choice at start and every `interval`, and
 /// checks agent schedules between, until a stop arrives. `checked` hears each
 /// retention pass. The schedule starts once the runtime owns its endpoint, so
@@ -33,6 +54,7 @@ pub fn start_retention_schedule(
             }
         });
         state.models().restore_search();
+        start_vault_leases(Arc::downgrade(&state));
         apply_recorded_retention(&state, checked.as_ref());
         let mut retention_checked_at = std::time::Instant::now();
         loop {

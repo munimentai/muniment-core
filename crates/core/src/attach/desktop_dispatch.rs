@@ -625,6 +625,17 @@ pub(super) fn dispatch_request<S: ThreadListService>(
             super::remote_access::LOCAL_OWNER,
         )?);
     }
+    if request.operation == Operation::ModelsVault {
+        let access = service
+            .remote_access()
+            .ok_or_else(ProtocolError::unsupported_operation)?;
+        let session = service.cloud_session()?;
+        return bounded_response(super::remote_access::model_vault(
+            &access,
+            &session,
+            &request.body,
+        )?);
+    }
     request.validate_idempotency_key()?;
     if request.operation == Operation::ModelsRequest {
         let model_request = super::ModelRequest::from_body(&request.body)

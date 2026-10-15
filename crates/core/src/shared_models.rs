@@ -11,6 +11,12 @@
 //! only the sharing machine refreshes, and it sends a fresh access token
 //! before the old one runs out. A sign-in whose refresh token does not
 //! rotate, and an API key, travel whole.
+//!
+//! With MuniCloud, the account's model vault holds the connections instead.
+//! The sharing desktop uploads them, the vault becomes the one holder of each
+//! rotating refresh token, and every machine, the desktop among them, keeps
+//! the vault's leases under the reserved device [`CLOUD_DEVICE`]. A paired
+//! machine reaches the vault with the machine token the desktop sends it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -36,6 +42,12 @@ const COPYABLE_PROVIDERS: &[&str] = &[
     "google-antigravity",
     "google-gemini-cli",
 ];
+/// The providers whose sign-ins the model vault renews itself.
+const CLOUD_RENEWED_PROVIDERS: &[&str] = &["anthropic", "openai-codex", "xai"];
+/// The device id under which a runtime keeps what the model vault leases it.
+pub const CLOUD_DEVICE: &str = "municloud";
+/// The model vault contract revision.
+pub const VAULT_CONTRACT: &str = "muniment.model-vault/1";
 const MAX_ENTRIES: usize = 64;
 const MAX_LABEL_CHARS: usize = 120;
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -49,11 +61,47 @@ pub struct Bundle {
     pub pi: Map<String, Value>,
     #[serde(default)]
     pub router: Vec<Account>,
+    /// The model vault this machine fetches leases from, as a machine token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud: Option<CloudLink>,
+}
+
+/// Where a machine fetches the model vault's leases, and its machine token.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudLink {
+    pub base_url: String,
+    pub token: String,
+}
+
+impl std::fmt::Debug for CloudLink {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CloudLink")
+            .field("base_url", &self.base_url)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The cloud API and the bearer token that reaches the model vault.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CloudSession {
+    pub base_url: String,
+    pub bearer: String,
+}
+
+impl std::fmt::Debug for CloudSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CloudSession")
+            .field("base_url", &self.base_url)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Bundle {
     pub fn is_empty(&self) -> bool {
-        self.pi.is_empty() && self.router.is_empty()
+        self.pi.is_empty() && self.router.is_empty() && self.cloud.is_none()
     }
 }
 
@@ -87,6 +135,23 @@ struct DeviceShare {
     /// Whether this device's accounts turned the receiver's router on.
     #[serde(default)]
     enabled_router: bool,
+    /// The model vault this device pointed the receiver at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cloud: Option<CloudLink>,
+    /// On [`CLOUD_DEVICE`] alone: this computer uploaded its connections and
+    /// reaches the vault with its own account session.
+    #[serde(default)]
+    native: bool,
+}
+
+impl DeviceShare {
+    fn holds_anything(&self) -> bool {
+        !self.pi.is_empty()
+            || !self.router.is_empty()
+            || self.enabled_router
+            || self.cloud.is_some()
+            || self.native
+    }
 }
 
 type Hook = Arc<dyn Fn() + Send + Sync>;
@@ -118,12 +183,13 @@ pub fn apply(
     device_name: &str,
     bundle: Bundle,
 ) -> Result<Applied, String> {
-    let (pi, router) = validate(device_id, device_name, bundle)?;
+    let (pi, router, cloud) = validate(device_id, device_name, bundle)?;
     let record_path = agent.join(RECORD_FILE);
     std::fs::create_dir_all(agent).map_err(|_| SAVE_ERROR.to_string())?;
-    let _record_lock = pi_models::lock(&record_path).map_err(|_| SAVE_ERROR.to_string())?;
+    let record_lock = pi_models::lock(&record_path).map_err(|_| SAVE_ERROR.to_string())?;
     let mut record = read_record(&record_path)?;
     let mut share = record.devices.remove(device_id).unwrap_or_default();
+    share.cloud = cloud;
     let applied_pi;
     let kept;
     {
@@ -179,10 +245,21 @@ pub fn apply(
             config::save(agent, &settings).map_err(|_| SAVE_ERROR.to_string())?;
         }
     }
-    if !share.pi.is_empty() || !share.router.is_empty() || share.enabled_router {
+    if share.holds_anything() {
         record.devices.insert(device_id.to_owned(), share);
     }
+    // Leases outlive no link: once no device points here at the vault, and
+    // this computer holds no vault of its own, what the vault leased goes.
+    let orphaned = !record.devices.values().any(|other| other.cloud.is_some())
+        && record
+            .devices
+            .get(CLOUD_DEVICE)
+            .is_some_and(|leased| !leased.native);
     write_record(&record_path, &record)?;
+    drop(record_lock);
+    if orphaned && device_id != CLOUD_DEVICE {
+        apply(agent, CLOUD_DEVICE, "", Bundle::default())?;
+    }
     changed();
     Ok(Applied {
         pi: applied_pi,
@@ -207,14 +284,17 @@ pub fn drop_device(agent: &Path, device_id: &str) -> Result<bool, String> {
 
 /// Checks a bundle and names each router account for this device. Answers the
 /// Pi entries and the router accounts to write.
-fn validate(
-    device_id: &str,
-    device_name: &str,
-    bundle: Bundle,
-) -> Result<(Map<String, Value>, Vec<Account>), String> {
+type Validated = (Map<String, Value>, Vec<Account>, Option<CloudLink>);
+
+fn validate(device_id: &str, device_name: &str, bundle: Bundle) -> Result<Validated, String> {
     const INVALID: &str = "The shared connections are not valid.";
     if bundle.pi.len() > MAX_ENTRIES || bundle.router.len() > MAX_ENTRIES {
         return Err(INVALID.into());
+    }
+    if let Some(link) = &bundle.cloud {
+        if device_id == CLOUD_DEVICE || !valid_link(link) {
+            return Err(INVALID.into());
+        }
     }
     let mut pi = Map::new();
     for (provider, entry) in bundle.pi {
@@ -280,7 +360,23 @@ fn validate(
         account.label = label.chars().take(MAX_LABEL_CHARS).collect();
         router.push(account);
     }
-    Ok((pi, router))
+    Ok((pi, router, bundle.cloud))
+}
+
+/// A link names an HTTPS API, or HTTP on loopback for a local cloud, and a
+/// machine token.
+fn valid_link(link: &CloudLink) -> bool {
+    let token = link.token.strip_prefix("mvt_").unwrap_or_default();
+    let token_ok = token.len() == 64
+        && token
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+    let url_ok = url::Url::parse(&link.base_url).is_ok_and(|url| match url.scheme() {
+        "https" => url.host().is_some(),
+        "http" => constraints::loopback(&link.base_url),
+        _ => false,
+    });
+    token_ok && url_ok
 }
 
 /// The bundle this machine shares: its own Pi entries and router accounts,
@@ -288,6 +384,23 @@ fn validate(
 /// [`LEASE_MARGIN_MS`] left. Connections other devices share here stay out,
 /// so a bundle never passes another machine's connections along.
 pub fn bundle(agent: &Path, now_ms: i64) -> Result<Bundle, String> {
+    collect(agent, now_ms, Audience::Peer)
+}
+
+/// The bundle this computer uploads to the model vault: its own connections
+/// with the refresh token of each sign-in the vault renews or may copy, and
+/// the sign-ins the vault already holds, without theirs.
+pub fn vault_bundle(agent: &Path, now_ms: i64) -> Result<Bundle, String> {
+    collect(agent, now_ms, Audience::Vault)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Audience {
+    Peer,
+    Vault,
+}
+
+fn collect(agent: &Path, now_ms: i64, audience: Audience) -> Result<Bundle, String> {
     const READ_ERROR: &str =
         "This computer cannot read its model connections. Check folder access.";
     let record = {
@@ -295,11 +408,25 @@ pub fn bundle(agent: &Path, now_ms: i64) -> Result<Bundle, String> {
         let _record_lock = pi_models::lock(&record_path).map_err(|_| READ_ERROR.to_string())?;
         read_record(&record_path)?
     };
+    // The vault already holds what it leases this computer, so the upload
+    // names those connections to keep them.
+    let keep_vault = |device: &str| audience == Audience::Vault && device == CLOUD_DEVICE;
     let received: BTreeMap<&str, &str> = record
         .devices
-        .values()
-        .flat_map(|share| share.pi.iter().map(|(p, d)| (p.as_str(), d.as_str())))
+        .iter()
+        .filter(|(device, _)| !keep_vault(device))
+        .flat_map(|(_, share)| share.pi.iter().map(|(p, d)| (p.as_str(), d.as_str())))
         .collect();
+    let vault_accounts: BTreeSet<&str> = record
+        .devices
+        .get(CLOUD_DEVICE)
+        .filter(|_| audience == Audience::Vault)
+        .map(|share| share.router.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    let renewed = |provider: &str| {
+        COPYABLE_PROVIDERS.contains(&provider)
+            || (audience == Audience::Vault && CLOUD_RENEWED_PROVIDERS.contains(&provider))
+    };
     let auth_path = agent.join("auth.json");
     let auth = pi_models::read_json(&auth_path).map_err(|_| READ_ERROR.to_string())?;
     let mut pi = Map::new();
@@ -320,7 +447,7 @@ pub fn bundle(agent: &Path, now_ms: i64) -> Result<Bundle, String> {
                 }
             }
             Some("oauth") => {
-                if COPYABLE_PROVIDERS.contains(&provider.as_str()) {
+                if renewed(provider) {
                     pi.insert(provider.clone(), entry.clone());
                     continue;
                 }
@@ -340,7 +467,14 @@ pub fn bundle(agent: &Path, now_ms: i64) -> Result<Bundle, String> {
     let settings = config::load(agent).map_err(|_| READ_ERROR.to_string())?;
     let backend = Backend::files(agent);
     let mut router = Vec::new();
-    for account in settings.accounts {
+    for mut account in settings.accounts {
+        if vault_accounts.contains(account.id.as_str()) {
+            // A sign-in the vault holds goes back under its own id.
+            let prefix = format!("{SHARED_ACCOUNT_PREFIX}{CLOUD_DEVICE}:");
+            account.id = account.id.trim_start_matches(&prefix).to_owned();
+            router.push(account);
+            continue;
+        }
         if account.id.starts_with(SHARED_ACCOUNT_PREFIX)
             || !account.enabled
             || account
@@ -351,9 +485,7 @@ pub fn bundle(agent: &Path, now_ms: i64) -> Result<Bundle, String> {
             continue;
         }
         let mut account = match &account.credential {
-            Credential::Subscription { provider, .. }
-                if !COPYABLE_PROVIDERS.contains(&provider.as_str()) =>
-            {
+            Credential::Subscription { provider, .. } if !renewed(provider) => {
                 let fresh = native_auth::refresh_account_within(
                     &backend,
                     &account.id,
@@ -373,13 +505,303 @@ pub fn bundle(agent: &Path, now_ms: i64) -> Result<Bundle, String> {
             provider, refresh, ..
         } = &mut account.credential
         {
-            if !COPYABLE_PROVIDERS.contains(&provider.as_str()) {
+            if !renewed(provider) {
                 *refresh = None;
             }
         }
         router.push(account);
     }
-    Ok(Bundle { pi, router })
+    Ok(Bundle {
+        pi,
+        router,
+        cloud: None,
+    })
+}
+
+/// Hands this computer's connections to the model vault. The vault answers
+/// the sign-ins whose refresh tokens it now holds, and this computer drops
+/// those refresh tokens and keeps each such sign-in as a vault lease from then
+/// on. Answers how many connections the vault stores.
+pub fn upload_to_vault(agent: &Path, session: &CloudSession, now_ms: i64) -> Result<usize, String> {
+    let bundle = vault_bundle(agent, now_ms)?;
+    let answer = vault_call(
+        session,
+        "PUT",
+        "/v1/model-vault",
+        serde_json::json!({"contract_version": VAULT_CONTRACT, "bundle": bundle}),
+    )?;
+    let held: Vec<String> = answer["held"]
+        .as_array()
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    adopt(agent, &held)?;
+    Ok(answer["connections"].as_u64().unwrap_or_default() as usize)
+}
+
+/// Takes this computer's connections back from the model vault, refresh
+/// tokens included, and deletes the vault and every machine token.
+pub fn release_vault(agent: &Path, session: &CloudSession) -> Result<(), String> {
+    let answer = vault_call(
+        session,
+        "DELETE",
+        "/v1/model-vault",
+        serde_json::json!({"contract_version": VAULT_CONTRACT}),
+    );
+    let bundle: Bundle = match answer {
+        Ok(answer) => serde_json::from_value(answer["bundle"].clone())
+            .map_err(|_| VAULT_ANSWER.to_string())?,
+        Err(VaultError::Empty) => Bundle::default(),
+        Err(error) => return Err(error.to_string()),
+    };
+    restore(agent, bundle)
+}
+
+/// Issues the token one paired machine reads the vault with. The cloud
+/// counts the machine toward the account's pairing limit.
+pub fn vault_machine_token(session: &CloudSession, machine: &Value) -> Result<CloudLink, String> {
+    let mut request = machine.clone();
+    request["contract_version"] = VAULT_CONTRACT.into();
+    let answer = vault_call(session, "POST", "/v1/model-vault/machine-tokens", request)?;
+    let token = answer["token"].as_str().ok_or(VAULT_ANSWER)?.to_owned();
+    let link = CloudLink {
+        base_url: session.base_url.clone(),
+        token,
+    };
+    if !valid_link(&link) {
+        return Err(VAULT_ANSWER.into());
+    }
+    Ok(link)
+}
+
+/// Fetches the model vault's leases and keeps them as [`CLOUD_DEVICE`]'s
+/// connections. A machine reads the vault with the token a device sent, and
+/// the computer that uploaded reads it with `native`, its own session. Answers
+/// whether this runtime reads a vault at all.
+pub fn refresh_vault_leases(
+    agent: &Path,
+    native: impl FnOnce() -> Option<CloudSession>,
+) -> Result<bool, String> {
+    let record = {
+        let record_path = agent.join(RECORD_FILE);
+        let _record_lock = pi_models::lock(&record_path).map_err(|_| SAVE_ERROR.to_string())?;
+        read_record(&record_path)?
+    };
+    let session = if record
+        .devices
+        .get(CLOUD_DEVICE)
+        .is_some_and(|share| share.native)
+    {
+        native()
+    } else {
+        record
+            .devices
+            .values()
+            .find_map(|share| share.cloud.clone())
+            .map(|link| CloudSession {
+                base_url: link.base_url,
+                bearer: link.token,
+            })
+    };
+    let Some(session) = session else {
+        return Ok(record.devices.contains_key(CLOUD_DEVICE));
+    };
+    let answer = vault_call(
+        &session,
+        "POST",
+        "/v1/model-vault/leases",
+        serde_json::json!({"contract_version": VAULT_CONTRACT}),
+    );
+    let bundle: Bundle = match answer {
+        Ok(answer) => serde_json::from_value(answer["bundle"].clone())
+            .map_err(|_| VAULT_ANSWER.to_string())?,
+        Err(VaultError::Empty) => Bundle::default(),
+        Err(error) => return Err(error.to_string()),
+    };
+    apply(
+        agent,
+        CLOUD_DEVICE,
+        "",
+        Bundle {
+            cloud: None,
+            ..bundle
+        },
+    )?;
+    Ok(true)
+}
+
+/// Marks the sign-ins the vault now holds as its leases: each drops its
+/// refresh token, and a router account moves under [`CLOUD_DEVICE`]'s id.
+fn adopt(agent: &Path, held: &[String]) -> Result<(), String> {
+    let record_path = agent.join(RECORD_FILE);
+    let record_lock = pi_models::lock(&record_path).map_err(|_| SAVE_ERROR.to_string())?;
+    let mut record = read_record(&record_path)?;
+    let mut share = record.devices.remove(CLOUD_DEVICE).unwrap_or_default();
+    share.native = true;
+    let others: BTreeSet<String> = record
+        .devices
+        .values()
+        .flat_map(|other| other.pi.keys().cloned())
+        .collect();
+    {
+        let auth_path = agent.join("auth.json");
+        let _auth_lock = pi_models::lock(&auth_path).map_err(|_| SAVE_ERROR.to_string())?;
+        let mut auth = pi_models::read_json(&auth_path).map_err(|_| SAVE_ERROR.to_string())?;
+        for provider in held.iter().filter_map(|name| name.strip_prefix("pi:")) {
+            if others.contains(provider) || share.pi.contains_key(provider) {
+                continue;
+            }
+            let Some(entry) = auth.get_mut(provider).and_then(Value::as_object_mut) else {
+                continue;
+            };
+            entry.remove("refresh");
+            let digest = entry_digest(&Value::Object(entry.clone()));
+            share.pi.insert(provider.to_owned(), digest);
+        }
+        pi_models::write_json(&auth_path, &auth).map_err(|_| SAVE_ERROR.to_string())?;
+    }
+    {
+        let config_path = config::config_path(agent);
+        let _router_lock = pi_models::lock(&config_path).map_err(|_| SAVE_ERROR.to_string())?;
+        let mut settings = config::load(agent).map_err(|_| SAVE_ERROR.to_string())?;
+        let mut moved = false;
+        for id in held.iter().filter_map(|name| name.strip_prefix("router:")) {
+            let Some(account) = settings
+                .accounts
+                .iter_mut()
+                .find(|account| account.id == id)
+            else {
+                continue;
+            };
+            account.id = format!("{SHARED_ACCOUNT_PREFIX}{CLOUD_DEVICE}:{id}");
+            if let Credential::Subscription { refresh, .. } = &mut account.credential {
+                *refresh = None;
+            }
+            share.router.push(account.id.clone());
+            moved = true;
+        }
+        if moved {
+            config::save(agent, &settings).map_err(|_| SAVE_ERROR.to_string())?;
+        }
+    }
+    record.devices.insert(CLOUD_DEVICE.to_owned(), share);
+    write_record(&record_path, &record)?;
+    drop(record_lock);
+    changed();
+    Ok(())
+}
+
+/// Writes back what the vault released as this computer's own connections,
+/// in place of its leases.
+fn restore(agent: &Path, bundle: Bundle) -> Result<(), String> {
+    apply(agent, CLOUD_DEVICE, "", Bundle::default())?;
+    let record_path = agent.join(RECORD_FILE);
+    let record_lock = pi_models::lock(&record_path).map_err(|_| SAVE_ERROR.to_string())?;
+    let mut record = read_record(&record_path)?;
+    record.devices.remove(CLOUD_DEVICE);
+    {
+        let auth_path = agent.join("auth.json");
+        let _auth_lock = pi_models::lock(&auth_path).map_err(|_| SAVE_ERROR.to_string())?;
+        let mut auth = pi_models::read_json(&auth_path).map_err(|_| SAVE_ERROR.to_string())?;
+        for (provider, entry) in bundle.pi {
+            if is_identifier(&provider) && entry.is_object() && !auth.contains_key(&provider) {
+                auth.insert(provider, entry);
+            }
+        }
+        pi_models::write_json(&auth_path, &auth).map_err(|_| SAVE_ERROR.to_string())?;
+    }
+    {
+        let config_path = config::config_path(agent);
+        let _router_lock = pi_models::lock(&config_path).map_err(|_| SAVE_ERROR.to_string())?;
+        let mut settings = config::load(agent).map_err(|_| SAVE_ERROR.to_string())?;
+        let mut added = false;
+        for account in bundle.router {
+            if is_identifier(&account.id)
+                && !settings.accounts.iter().any(|own| own.id == account.id)
+            {
+                settings.accounts.push(account);
+                added = true;
+            }
+        }
+        if added {
+            config::save(agent, &settings).map_err(|_| SAVE_ERROR.to_string())?;
+        }
+    }
+    write_record(&record_path, &record)?;
+    drop(record_lock);
+    changed();
+    Ok(())
+}
+
+const VAULT_ANSWER: &str = "MuniCloud answered in a way this version cannot read. Update Muniment.";
+const VAULT_TIMEOUT: Duration = Duration::from_secs(20);
+
+#[derive(Debug)]
+enum VaultError {
+    Empty,
+    Refused(String),
+}
+
+impl std::fmt::Display for VaultError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("MuniCloud holds no shared connections."),
+            Self::Refused(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl From<VaultError> for String {
+    fn from(error: VaultError) -> Self {
+        error.to_string()
+    }
+}
+
+/// One call to the model vault. A refusal reads as the line the cloud sends.
+fn vault_call(
+    session: &CloudSession,
+    method: &str,
+    path: &str,
+    body: Value,
+) -> Result<Value, VaultError> {
+    let url = format!("{}{path}", session.base_url.trim_end_matches('/'));
+    let agent = ureq::AgentBuilder::new().timeout(VAULT_TIMEOUT).build();
+    let answer = agent
+        .request(method, &url)
+        .set("authorization", &format!("Bearer {}", session.bearer))
+        .set("accept", "application/json")
+        .send_json(body);
+    let response = match answer {
+        Ok(response) => response,
+        Err(ureq::Error::Status(status, response)) => {
+            let body: Value = response.into_json().unwrap_or(Value::Null);
+            if status == 404 && body["error"]["code"] == "model_vault_empty" {
+                return Err(VaultError::Empty);
+            }
+            let message = body["error"]["message"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("MuniCloud answered {status}. Try again later."));
+            return Err(VaultError::Refused(message));
+        }
+        Err(_) => {
+            return Err(VaultError::Refused(
+                "MuniCloud is unreachable. Check the connection, then try again.".into(),
+            ))
+        }
+    };
+    let answer: Value = response
+        .into_json()
+        .map_err(|_| VaultError::Refused(VAULT_ANSWER.into()))?;
+    if answer["contract_version"] != VAULT_CONTRACT {
+        return Err(VaultError::Refused(VAULT_ANSWER.into()));
+    }
+    Ok(answer)
 }
 
 /// A Pi sign-in with a fresh access token when it has less than the lease
@@ -545,6 +967,7 @@ mod tests {
             Bundle {
                 pi,
                 router: Vec::new(),
+                cloud: None,
             },
         )
         .unwrap();
@@ -579,6 +1002,7 @@ mod tests {
             Bundle {
                 pi,
                 router: Vec::new(),
+                cloud: None,
             },
         )
         .unwrap();
@@ -597,6 +1021,7 @@ mod tests {
             Bundle {
                 pi: next,
                 router: Vec::new(),
+                cloud: None,
             },
         )
         .unwrap();
@@ -618,6 +1043,7 @@ mod tests {
             Bundle {
                 pi: first,
                 router: Vec::new(),
+                cloud: None,
             },
         )
         .unwrap();
@@ -630,6 +1056,7 @@ mod tests {
             Bundle {
                 pi: second,
                 router: Vec::new(),
+                cloud: None,
             },
         )
         .unwrap();
@@ -662,6 +1089,7 @@ mod tests {
             Bundle {
                 pi: Map::new(),
                 router,
+                cloud: None,
             },
         )
         .unwrap();
@@ -697,6 +1125,7 @@ mod tests {
                     "one",
                     Credential::ApiKey { key: "k".into() },
                 )],
+                cloud: None,
             },
         )
         .unwrap();
@@ -729,7 +1158,8 @@ mod tests {
             "Laptop",
             Bundle {
                 pi,
-                router: Vec::new()
+                router: Vec::new(),
+                cloud: None,
             }
         )
         .is_err());
@@ -741,10 +1171,162 @@ mod tests {
             "Laptop",
             Bundle {
                 pi: empty_key,
-                router: Vec::new()
+                router: Vec::new(),
+                cloud: None,
             }
         )
         .is_err());
         assert!(!dir.as_path().join("auth.json").exists());
+    }
+
+    /// Answers each `METHOD /path` with its JSON until the test ends.
+    fn vault_stub(routes: Vec<(&'static str, Value)>) -> String {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let (mut head, mut line, mut length) = (String::new(), String::new(), 0);
+                reader.read_line(&mut head).unwrap();
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                let mut data = vec![0; length];
+                reader.read_exact(&mut data).unwrap();
+                let route = head.split(' ').take(2).collect::<Vec<_>>().join(" ");
+                let body = routes
+                    .iter()
+                    .find(|(known, _)| *known == route)
+                    .map(|(_, body)| body.to_string())
+                    .unwrap_or_default();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        url
+    }
+
+    #[test]
+    fn the_vault_holds_a_rotating_sign_in_and_gives_it_back_on_release() {
+        let dir = temp_dir();
+        let agent = dir.as_path();
+        let mut own = Map::new();
+        own.insert("openai-codex".into(), oauth_entry("a1"));
+        own.insert("openai".into(), key_entry("k"));
+        pi_models::write_json(&agent.join("auth.json"), &own).unwrap();
+        let leased =
+            serde_json::json!({"type":"oauth","access":"a2","expires":9_999_999_999_999_i64});
+        let released = serde_json::json!({"type":"oauth","access":"a3","refresh":"r9","expires":9_999_999_999_999_i64});
+        let base = vault_stub(vec![
+            (
+                "PUT /v1/model-vault",
+                serde_json::json!({"contract_version":VAULT_CONTRACT,"connections":2,"held":["pi:openai-codex"]}),
+            ),
+            (
+                "POST /v1/model-vault/leases",
+                serde_json::json!({"contract_version":VAULT_CONTRACT,"bundle":{"pi":{"openai-codex":leased,"openai":key_entry("k")},"router":[]},"expires_at":null}),
+            ),
+            (
+                "DELETE /v1/model-vault",
+                serde_json::json!({"contract_version":VAULT_CONTRACT,"bundle":{"pi":{"openai-codex":released,"openai":key_entry("k")},"router":[]}}),
+            ),
+        ]);
+        let session = CloudSession {
+            base_url: base,
+            bearer: "native".into(),
+        };
+
+        // The upload sends the refresh token, then this computer drops it.
+        let sent = vault_bundle(agent, 0).unwrap();
+        assert_eq!(sent.pi["openai-codex"]["refresh"], "r-secret");
+        assert_eq!(upload_to_vault(agent, &session, 0).unwrap(), 2);
+        assert!(auth(agent)["openai-codex"].get("refresh").is_none());
+
+        // Leases replace the held sign-in and leave this computer's key alone.
+        assert!(refresh_vault_leases(agent, || Some(session.clone())).unwrap());
+        let written = auth(agent);
+        assert_eq!(written["openai-codex"]["access"], "a2");
+        assert_eq!(written["openai"]["key"], "k");
+        // A later upload names the held sign-in so the vault keeps it.
+        assert!(vault_bundle(agent, 0)
+            .unwrap()
+            .pi
+            .contains_key("openai-codex"));
+        // A paired machine never receives the vault's sign-in from this computer.
+        assert!(!bundle(agent, 0).unwrap().pi.contains_key("openai-codex"));
+
+        release_vault(agent, &session).unwrap();
+        let written = auth(agent);
+        assert_eq!(written["openai-codex"]["refresh"], "r9");
+        assert!(
+            !agent.join(RECORD_FILE).exists()
+                || !std::fs::read_to_string(agent.join(RECORD_FILE))
+                    .unwrap()
+                    .contains(CLOUD_DEVICE)
+        );
+    }
+
+    #[test]
+    fn a_machine_reads_the_vault_while_a_device_points_it_there() {
+        let dir = temp_dir();
+        let agent = dir.as_path();
+        let base = vault_stub(vec![(
+            "POST /v1/model-vault/leases",
+            serde_json::json!({"contract_version":VAULT_CONTRACT,"bundle":{"pi":{"openai":key_entry("vault-key")},"router":[]},"expires_at":null}),
+        )]);
+        let link = CloudLink {
+            base_url: base,
+            token: format!("mvt_{}", "a".repeat(64)),
+        };
+        apply(
+            agent,
+            "device-a",
+            "Laptop",
+            Bundle {
+                cloud: Some(link),
+                ..Bundle::default()
+            },
+        )
+        .unwrap();
+        assert!(refresh_vault_leases(agent, || None).unwrap());
+        assert_eq!(auth(agent)["openai"]["key"], "vault-key");
+        // Without the link, the leases go too.
+        apply(agent, "device-a", "Laptop", Bundle::default()).unwrap();
+        assert!(!auth(agent).contains_key("openai"));
+        assert!(!refresh_vault_leases(agent, || None).unwrap());
+    }
+
+    #[test]
+    fn a_link_must_name_https_and_a_machine_token() {
+        let token = format!("mvt_{}", "0".repeat(64));
+        assert!(valid_link(&CloudLink {
+            base_url: "https://api.example.com".into(),
+            token: token.clone()
+        }));
+        assert!(valid_link(&CloudLink {
+            base_url: "http://127.0.0.1:8787".into(),
+            token: token.clone()
+        }));
+        assert!(!valid_link(&CloudLink {
+            base_url: "http://api.example.com".into(),
+            token: token.clone()
+        }));
+        assert!(!valid_link(&CloudLink {
+            base_url: "https://api.example.com".into(),
+            token: "mvt_short".into()
+        }));
     }
 }

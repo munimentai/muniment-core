@@ -164,6 +164,10 @@ pub trait RunAttachBoundaries {
         None
     }
     #[cfg(any(unix, target_os = "windows"))]
+    fn cloud_session(&self) -> Result<crate::shared_models::CloudSession, ProtocolError> {
+        Err(ProtocolError::unsupported_operation())
+    }
+    #[cfg(any(unix, target_os = "windows"))]
     fn list_devices(&self) -> Result<crate::account::NativeDeviceList, ProtocolError> {
         Err(ProtocolError::unsupported_operation())
     }

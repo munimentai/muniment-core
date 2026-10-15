@@ -173,7 +173,7 @@ pub fn remote_rule(operation: Operation, body: &Value) -> RemoteRule {
         | Operation::RemoteDeviceRevoke
         | Operation::RuntimeUpdate
         | Operation::ModelsShare => RemoteRule::RemoteAccess,
-        Operation::ModelsShareBundle => RemoteRule::Excluded,
+        Operation::ModelsShareBundle | Operation::ModelsVault => RemoteRule::Excluded,
     }
 }
 

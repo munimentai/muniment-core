@@ -874,6 +874,11 @@ impl<B: RunStartBoundaries + RunAttachBoundaries, I: RunStartIdempotency> Thread
     }
 
     #[cfg(any(unix, target_os = "windows"))]
+    fn cloud_session(&mut self) -> Result<crate::shared_models::CloudSession, ProtocolError> {
+        self.boundaries.cloud_session()
+    }
+
+    #[cfg(any(unix, target_os = "windows"))]
     fn list_devices(&mut self) -> Result<crate::account::NativeDeviceList, ProtocolError> {
         self.boundaries.list_devices()
     }
