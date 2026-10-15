@@ -8,11 +8,11 @@ use muniment_runtime_core::{
 };
 
 mod common;
-use common::{local_grant, stage_pi_stub, TemporaryProfile};
+use common::{local_grant, stage_pi_stub, use_test_prompt_store, TemporaryProfile};
 
 #[test]
 fn a_prompt_sets_its_thinking_level_before_pi_hears_it_and_only_when_it_changes() {
-    muniment_core::chat_prompt::use_mock_keyring_for_tests();
+    use_test_prompt_store();
     let temporary = TemporaryProfile::new("thinking-level", true);
     let descriptor = stage_pi_stub(&temporary.root);
     let state = muniment_core::state_root::state_directory().unwrap();
