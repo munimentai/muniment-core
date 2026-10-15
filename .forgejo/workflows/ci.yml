@@ -70,6 +70,18 @@ jobs:
       - if: always()
         run: docker image rm "muniment-router:ci-${{ github.run_id }}" || true
 
+  # The runtime image builds the server and installs the pinned Pi and its
+  # packages, then serves once, stops and starts again on its volume.
+  runtime-image:
+    runs-on: [self-hosted, image-smoke]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f deploy/runtime/Containerfile -t "muniment-runtime:ci-${{ github.run_id }}" .
+      - run: deploy/runtime/smoke.sh "muniment-runtime:ci-${{ github.run_id }}"
+      - if: always()
+        run: docker image rm "muniment-runtime:ci-${{ github.run_id }}" || true
+
   # The workspace tests on a desktop-ci macOS VM. The VM is x86_64, whose linker
   # signs nothing unless asked, and the attach tests check the test binary's
   # own code signature. The flag gives each binary the ad-hoc signature that
@@ -129,7 +141,7 @@ jobs:
   # Tags and publishes the next version after every check of a main push
   # passed. It shares the pins update's group, so tags stay in order.
   release:
-    needs: [checks, router-server, router-image, macos, windows]
+    needs: [checks, router-server, router-image, runtime-image, macos, windows]
     if: github.ref == 'refs/heads/main'
     runs-on: ${{ vars.CI_LINUX_RUNNER }}
     timeout-minutes: 30
