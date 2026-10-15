@@ -1200,7 +1200,10 @@ console.log(JSON.stringify([await run(['Save']), await run(["Don't save"]), awai
             let runtime = ApplicationMemoryRuntime::new(config.clone(), config.join("memory"))
                 .with_extraction_model(Arc::new(move |_, _| {
                     counted.fetch_add(1, Ordering::SeqCst);
-                    Ok(r#"{"actions":[]}"#.into())
+                    Ok(crate::memory_extract::Answer {
+                        text: r#"{"actions":[]}"#.into(),
+                        via: "router",
+                    })
                 }));
             runtime
                 .open_session(

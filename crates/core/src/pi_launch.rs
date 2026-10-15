@@ -35,7 +35,7 @@ Rules:
 - Be concise. Show file paths clearly when you work with files.
 - When something fails, state what happened and the next step.";
 
-const LOCAL_MODE_ENV_REMOVE: &[&str] = &[
+pub(crate) const LOCAL_MODE_ENV_REMOVE: &[&str] = &[
     "AI_GATEWAY_API_KEY",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_OAUTH_TOKEN",

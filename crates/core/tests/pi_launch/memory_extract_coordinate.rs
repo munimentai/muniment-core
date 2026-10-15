@@ -161,10 +161,13 @@ fn only_a_completed_run_without_a_saved_fact_learns_after_it_ends() {
         ApplicationMemoryRuntime::new(config.clone(), root.join("memory-cache"))
             .with_extraction_model(Arc::new(move |_, user| {
                 seen.lock().unwrap().push(user.to_owned());
-                Ok(serde_json::json!({"actions": [
-                    {"op": "add", "title": "Work", "content": "Works night shifts as a pediatric nurse."}
-                ]})
-                .to_string())
+                Ok(muniment_core::memory_extract::Answer {
+                    text: serde_json::json!({"actions": [
+                        {"op": "add", "title": "Work", "content": "Works night shifts as a pediatric nurse."}
+                    ]})
+                    .to_string(),
+                    via: "router",
+                })
             })),
     );
     let storage = Arc::new(Mutex::new(ChatStorage {

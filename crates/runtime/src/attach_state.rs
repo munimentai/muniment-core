@@ -80,9 +80,7 @@ impl RuntimeAttachState {
                     profile_directory.join("memory"),
                 )
                 .with_extraction_model(
-                    muniment_core::memory_extract::router_model(
-                        muniment_core::state_root::agent_directory(&profile_directory),
-                    ),
+                    muniment_core::memory_extract::extraction_model(profile_directory.clone()),
                 ),
             ),
             profile_directory,

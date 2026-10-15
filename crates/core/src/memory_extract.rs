@@ -61,8 +61,15 @@ const LEDGER_CAP: usize = 1000;
 const MAX_LEDGER_FILE: u64 = 512 * 1024;
 
 /// A one-shot model call: the system prompt and the user message in, the
-/// reply text out.
-pub type Model = Arc<dyn Fn(&str, &str) -> Result<String, String> + Send + Sync>;
+/// reply out.
+pub type Model = Arc<dyn Fn(&str, &str) -> Result<Answer, String> + Send + Sync>;
+
+/// The model's reply text and the path that served it, `router` or `pi`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Answer {
+    pub text: String,
+    pub via: &'static str,
+}
 
 /// One finished run waiting for the pass.
 #[derive(Clone, Debug)]
@@ -462,8 +469,9 @@ pub fn run(job: &Job, model: Option<&Model>) {
             return;
         }
     };
-    let Some(checked) = check(&answer, &related, &existing) else {
-        log("dropped", " reason=malformed", &job.run);
+    let via = answer.via;
+    let Some(checked) = check(&answer.text, &related, &existing) else {
+        log("dropped", &format!(" reason=malformed via={via}"), &job.run);
         return;
     };
     let source = format!("extracted thread:{} run:{}", job.thread, job.run);
@@ -498,7 +506,7 @@ pub fn run(job: &Job, model: Option<&Model>) {
     }
     let staged_count = staged.len();
     if memory_files::pending_stage(&job.private, staged).is_err() {
-        log("failed", " reason=stage", &job.run);
+        log("failed", &format!(" reason=stage via={via}"), &job.run);
         return;
     }
     let outcome = if added + updated + deleted > 0 {
@@ -511,7 +519,7 @@ pub fn run(job: &Job, model: Option<&Model>) {
     log(
         outcome,
         &format!(
-            " added={added} updated={updated} deleted={deleted} staged={staged_count} dropped={dropped} duplicates={}",
+            " via={via} added={added} updated={updated} deleted={deleted} staged={staged_count} dropped={dropped} duplicates={}",
             checked.duplicates
         ),
         &job.run,
@@ -527,16 +535,63 @@ pub fn long_enough(messages: &[String]) -> bool {
         >= MIN_INPUT_CHARACTERS
 }
 
-/// The model the pass asks: the cheapest model the router's accounts serve,
-/// by catalog price, through the account pool with a hard timeout. A model
-/// with no catalog price never counts as cheap.
-pub fn router_model(agent: PathBuf) -> Model {
-    Arc::new(move |system, user| router_complete(&agent, system, user))
+/// The model the pass asks. The router answers first, with the cheapest
+/// model its accounts serve by catalog price; a model with no catalog price
+/// never counts as cheap. When no router account can take the call, Pi
+/// answers with the user's own Pi sign-in, see [`pi_complete`]. Pi is not
+/// asked after a router call was sent and failed, so one run never pays twice.
+pub fn extraction_model(profile: PathBuf) -> Model {
+    let agent = crate::state_root::agent_directory(&profile);
+    Arc::new(move |system, user| {
+        answer_in_order(
+            || router_complete(&agent, system, user),
+            || {
+                let executable = crate::sidecar::pi_install::resolve_current_for(
+                    &pi_install_root(&profile),
+                    crate::sidecar::pi_install::PI_SELECTED_ARTIFACT,
+                )
+                .map_err(|_| "The agent runtime is not installed.")?;
+                pi_complete(&executable, &agent, system, user, MODEL_TIMEOUT)
+            },
+        )
+    })
 }
 
-fn router_complete(agent: &Path, system: &str, user: &str) -> Result<String, String> {
+/// The folder that holds Pi's installed revisions, as a chat launch finds it.
+fn pi_install_root(profile: &Path) -> PathBuf {
+    std::env::var_os("MUNIMENT_PI_ROOT")
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::chat_profile::ChatProfile::new(profile).pi_install_root())
+}
+
+/// Why the router gave no answer.
+#[derive(Debug, PartialEq, Eq)]
+enum Unanswered {
+    /// No router account can take the call, so nothing was sent.
+    NoAccount,
+    /// An account took the call and the call failed.
+    Failed,
+}
+
+/// The router first, then Pi only when the router has no account for the call.
+fn answer_in_order(
+    router: impl FnOnce() -> Result<String, Unanswered>,
+    pi: impl FnOnce() -> Result<String, String>,
+) -> Result<Answer, String> {
+    match router() {
+        Ok(text) => Ok(Answer {
+            text,
+            via: "router",
+        }),
+        Err(Unanswered::Failed) => Err("The router call failed.".into()),
+        Err(Unanswered::NoAccount) => pi().map(|text| Answer { text, via: "pi" }),
+    }
+}
+
+fn router_complete(agent: &Path, system: &str, user: &str) -> Result<String, Unanswered> {
     use crate::model_router::{balance, classify, config, model_catalog, native_auth, usage, wire};
-    let router = config::load(agent).map_err(|_| "The model settings cannot be read.")?;
+    let router = config::load(agent).map_err(|_| Unanswered::NoAccount)?;
     let route = crate::model_router::options(&router)
         .into_iter()
         .filter_map(|route| {
@@ -545,7 +600,7 @@ fn router_complete(agent: &Path, system: &str, user: &str) -> Result<String, Str
         })
         .min_by(|(left, _), (right, _)| left.0.total_cmp(&right.0).then(left.1.total_cmp(&right.1)))
         .map(|(_, route)| route)
-        .ok_or("No connected model can learn memories.")?;
+        .ok_or(Unanswered::NoAccount)?;
     let now = chrono::Utc::now();
     let now_ms = now.timestamp_millis();
     let mut account = balance::pick(
@@ -555,10 +610,11 @@ fn router_complete(agent: &Path, system: &str, user: &str) -> Result<String, Str
         &route.model,
         now_ms,
     )
-    .map_err(|error| error.message())?
+    .map_err(|_| Unanswered::NoAccount)?
     .clone();
     if account.credential.expired(now_ms) {
-        account = native_auth::refresh_account(agent, &account.id, now_ms, MODEL_TIMEOUT)?;
+        account = native_auth::refresh_account(agent, &account.id, now_ms, MODEL_TIMEOUT)
+            .map_err(|_| Unanswered::NoAccount)?;
     }
     let body = serde_json::json!({
         "model": route.model,
@@ -569,7 +625,8 @@ fn router_complete(agent: &Path, system: &str, user: &str) -> Result<String, Str
             {"role": "user", "content": user},
         ],
     });
-    let answered = classify::complete_on(&account, &body, &route.model, MODEL_TIMEOUT)?;
+    let answered = classify::complete_on(&account, &body, &route.model, MODEL_TIMEOUT)
+        .map_err(|_| Unanswered::Failed)?;
     if let Some(tokens) = wire::tokens(&answered) {
         let mut ledger = usage::load(agent);
         ledger.record_success(
@@ -583,7 +640,224 @@ fn router_complete(agent: &Path, system: &str, user: &str) -> Result<String, Str
     }
     classify::completion_text(&answered)
         .map(str::to_owned)
-        .ok_or_else(|| "The model sent no text.".into())
+        .ok_or(Unanswered::Failed)
+}
+
+/// The flags every Pi call of the pass carries: no tools, no extensions (so
+/// no memory extension calls the pass again), no MCP servers, skills, prompt
+/// templates, themes or context files, no project-local files, no network
+/// start-up work and no saved session.
+const PI_ISOLATION: [&str; 10] = [
+    "--no-session",
+    "--no-tools",
+    "--no-extensions",
+    "--no-mcp",
+    "--no-skills",
+    "--no-prompt-templates",
+    "--no-themes",
+    "--no-context-files",
+    "--no-approve",
+    "--offline",
+];
+/// The most bytes of Pi output the pass reads.
+const MAX_PI_OUTPUT: u64 = 256 * 1024;
+/// Words in a model id that mark a small model of its provider.
+const SMALL_MODEL_WORDS: [&str; 8] = [
+    "mini", "nano", "haiku", "flash", "lite", "luna", "small", "tiny",
+];
+
+/// Asks Pi once in print mode with the user's own Pi sign-in, through the
+/// agent directory a chat uses. Pi reads, refreshes and locks its own
+/// credentials; the pass never reads them. The user message goes in on
+/// stdin, so it never shows in a process list. One deadline covers the
+/// model list and the call, and a process past it is killed.
+fn pi_complete(
+    executable: &Path,
+    agent: &Path,
+    system: &str,
+    user: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    let deadline = std::time::Instant::now() + timeout;
+    let listing = pi_output(executable, agent, &["--list-models"], None, deadline)?;
+    let models = pi_models(&listing);
+    let default = crate::launch_facts::read_local_default_model(agent);
+    let (provider, model) =
+        pi_choice(&models, default.as_deref()).ok_or("Pi has no signed-in model.")?;
+    let answer = pi_output(
+        executable,
+        agent,
+        &[
+            "--print",
+            "--thinking",
+            "off",
+            "--provider",
+            provider,
+            "--model",
+            model,
+            "--system-prompt",
+            system,
+        ],
+        Some(user),
+        deadline,
+    )?;
+    let answer = answer.trim();
+    if answer.is_empty() {
+        return Err("Pi sent no text.".into());
+    }
+    Ok(answer.to_owned())
+}
+
+/// The provider and model of each row of `pi --list-models`, without the
+/// router's own provider. Output without the table header lists nothing.
+fn pi_models(listing: &str) -> Vec<(String, String)> {
+    let mut lines = listing.lines();
+    let header = lines
+        .next()
+        .map(|line| line.split_whitespace().take(2).collect::<Vec<_>>());
+    if header.as_deref() != Some(&["provider", "model"][..]) {
+        return Vec::new();
+    }
+    lines
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some((fields.next()?.to_owned(), fields.next()?.to_owned()))
+        })
+        .filter(|(provider, _)| provider != crate::model_router::config::ROUTER_PROVIDER)
+        .collect()
+}
+
+/// The model Pi answers with: the cheapest by catalog price; with no priced
+/// model, the first whose id names a small model; then the default model in
+/// Pi's settings when Pi lists it; then the first listed.
+fn pi_choice<'a>(
+    models: &'a [(String, String)],
+    default: Option<&str>,
+) -> Option<(&'a str, &'a str)> {
+    use crate::model_router::{family, model_catalog};
+    let priced = models
+        .iter()
+        .filter_map(|(provider, model)| {
+            let family =
+                family::family_for_pi_provider(provider).or_else(|| family::family(provider))?;
+            let entry = model_catalog::entry(family.id, model)?;
+            Some(((entry.price, entry.output), (provider, model)))
+        })
+        .min_by(|(left, _), (right, _)| left.0.total_cmp(&right.0).then(left.1.total_cmp(&right.1)))
+        .map(|(_, pair)| pair);
+    let small = || {
+        models
+            .iter()
+            .map(|(provider, model)| (provider, model))
+            .find(|(_, model)| {
+                model
+                    .split(['-', '.', ':', '_', '/'])
+                    .any(|word| SMALL_MODEL_WORDS.contains(&word))
+            })
+    };
+    let named = || {
+        let (provider, model) = default?.split_once('/')?;
+        models
+            .iter()
+            .map(|(provider, model)| (provider, model))
+            .find(|pair| pair.0 == provider && pair.1 == model)
+    };
+    priced
+        .or_else(small)
+        .or_else(named)
+        .or_else(|| models.first().map(|(provider, model)| (provider, model)))
+        .map(|(provider, model)| (provider.as_str(), model.as_str()))
+}
+
+/// Runs Pi with the pass's isolation flags in an empty working folder and
+/// returns its stdout. A nonzero exit, too much output or the deadline is an
+/// error; Pi's stderr is dropped unread, since it can echo the prompt.
+fn pi_output(
+    executable: &Path,
+    agent: &Path,
+    args: &[&str],
+    input: Option<&str>,
+    deadline: std::time::Instant,
+) -> Result<String, String> {
+    let directory = std::env::temp_dir().join(format!("muniment-extract-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&directory).map_err(|_| "No working folder for Pi.")?;
+    let output = pi_output_in(&directory, executable, agent, args, input, deadline);
+    let _ = std::fs::remove_dir_all(&directory);
+    output
+}
+
+fn pi_output_in(
+    directory: &Path,
+    executable: &Path,
+    agent: &Path,
+    args: &[&str],
+    input: Option<&str>,
+    deadline: std::time::Instant,
+) -> Result<String, String> {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+    let mut command = Command::new(executable);
+    command
+        .args(PI_ISOLATION)
+        .args(args)
+        .current_dir(directory)
+        .env("PI_CODING_AGENT_DIR", agent)
+        .env("PI_OFFLINE", "1")
+        .env_remove("BUN_BE_BUN")
+        .env_remove("PI_CODING_AGENT_SESSION_DIR")
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    // Pi answers from the sign-ins a local chat sees, not from keys in the
+    // runtime's environment.
+    for name in crate::pi_launch::LOCAL_MODE_ENV_REMOVE {
+        command.env_remove(name);
+    }
+    let mut child = command.spawn().map_err(|_| "Pi cannot start.")?;
+    if let (Some(mut stdin), Some(input)) = (child.stdin.take(), input) {
+        let input = input.to_owned();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(input.as_bytes());
+        });
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    if let Some(mut stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = (&mut stdout)
+                .take(MAX_PI_OUTPUT + 1)
+                .read_to_end(&mut bytes);
+            let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+            let _ = sender.send(bytes);
+        });
+    }
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("Pi did not answer in time.".into());
+            }
+        }
+    };
+    let bytes = receiver
+        .recv_timeout(Duration::from_secs(1))
+        .map_err(|_| "Pi output did not close.")?;
+    if !status.success() {
+        return Err("Pi failed.".into());
+    }
+    if bytes.len() as u64 > MAX_PI_OUTPUT {
+        return Err("Pi sent too much text.".into());
+    }
+    String::from_utf8(bytes).map_err(|_| "Pi sent text that is not UTF-8.".into())
 }
 
 #[cfg(test)]
@@ -604,6 +878,13 @@ mod tests {
 
     const ID: &str = "01900000-0000-7000-8000-0000000000aa";
     const OTHER: &str = "01900000-0000-7000-8000-0000000000bb";
+
+    fn routed(text: String) -> Answer {
+        Answer {
+            text,
+            via: "router",
+        }
+    }
 
     fn answer(actions: serde_json::Value) -> String {
         serde_json::json!({ "actions": actions }).to_string()
@@ -796,11 +1077,11 @@ mod tests {
                     .map(|fact| fact["id"].clone())
                     .unwrap()
             };
-            Ok(answer(serde_json::json!([
+            Ok(routed(answer(serde_json::json!([
                 {"op": "add", "title": "Pets", "content": "Has a dog named Juno."},
                 {"op": "update", "id": id("Editor"), "title": "Editor", "content": "Uses Zed for editing."},
                 {"op": "delete", "id": id("Town")},
-            ])))
+            ]))))
         })
     }
 
@@ -962,7 +1243,7 @@ mod tests {
             Ok("Sure! {\"actions\":[{\"op\":\"add\",\"title\":\"Pets\",\"content\":\"Has a dog.\"}]}".to_owned()),
             Err("timed out".to_owned()),
         ] {
-            let model: Model = Arc::new(move |_, _| reply.clone());
+            let model: Model = Arc::new(move |_, _| reply.clone().map(routed));
             run(&fixture.job(false), Some(&model));
             assert_eq!(memory_files::facts_in(&fixture.home).unwrap(), before);
         }
@@ -972,7 +1253,7 @@ mod tests {
         let counted = Arc::clone(&calls);
         let model: Model = Arc::new(move |_, _| {
             *counted.lock().unwrap() += 1;
-            Ok(answer(serde_json::json!([])))
+            Ok(routed(answer(serde_json::json!([]))))
         });
         let extractor = Arc::new(Extractor::default());
         for _ in 0..3 {
@@ -1007,7 +1288,7 @@ mod tests {
         let seen = Arc::clone(&calls);
         let model: Model = Arc::new(move |_, user| {
             seen.lock().unwrap().push(user.to_owned());
-            Ok(answer(serde_json::json!([])))
+            Ok(routed(answer(serde_json::json!([]))))
         });
         let extractor = Arc::new(Extractor::default());
         extractor.submit(Some(model), fixture.job(false));
@@ -1019,5 +1300,330 @@ mod tests {
         let ledger = ledger_read(&fixture.private);
         assert!(ledger.iter().all(|entry| entry.state == State::Done));
         assert_eq!(ledger.len(), 2);
+    }
+
+    #[test]
+    fn the_router_answers_first_and_pi_only_when_no_router_account_can() {
+        let pi_calls = std::cell::Cell::new(0);
+        fn pi<'a>(
+            calls: &'a std::cell::Cell<usize>,
+            reply: Result<&'static str, &'static str>,
+        ) -> impl FnOnce() -> Result<String, String> + 'a {
+            move || {
+                calls.set(calls.get() + 1);
+                reply.map(str::to_owned).map_err(str::to_owned)
+            }
+        }
+        let routed = answer_in_order(|| Ok("from router".into()), pi(&pi_calls, Ok("from pi")));
+        assert_eq!(
+            routed,
+            Ok(Answer {
+                text: "from router".into(),
+                via: "router"
+            })
+        );
+        assert_eq!(pi_calls.get(), 0);
+        let fallback = answer_in_order(|| Err(Unanswered::NoAccount), pi(&pi_calls, Ok("from pi")));
+        assert_eq!(
+            fallback,
+            Ok(Answer {
+                text: "from pi".into(),
+                via: "pi"
+            })
+        );
+        assert_eq!(pi_calls.get(), 1);
+        assert!(answer_in_order(
+            || Err(Unanswered::NoAccount),
+            pi(&pi_calls, Err("no model"))
+        )
+        .is_err());
+        assert_eq!(pi_calls.get(), 2);
+        assert!(answer_in_order(|| Err(Unanswered::Failed), pi(&pi_calls, Ok("from pi"))).is_err());
+        assert_eq!(pi_calls.get(), 2);
+    }
+
+    #[test]
+    fn pi_lists_its_signed_in_models_without_the_router() {
+        let listing = "provider          model             context  max-out  thinking  images\n\
+            anthropic         claude-opus-5     1M       128K     yes       yes\n\
+            muniment-router   gpt-5.6-luna      400K     128K     yes       yes\n\
+            github-copilot    gpt-4o-mini       128K     16.4K    no        yes\n";
+        assert_eq!(
+            pi_models(listing),
+            [
+                ("anthropic".to_owned(), "claude-opus-5".to_owned()),
+                ("github-copilot".to_owned(), "gpt-4o-mini".to_owned()),
+            ]
+        );
+        assert!(pi_models("No models available. Use /login to log into a provider.\n").is_empty());
+        assert!(pi_models("").is_empty());
+    }
+
+    #[test]
+    fn pi_answers_with_the_cheapest_priced_then_a_small_then_the_default_model() {
+        let pairs = |rows: &[(&str, &str)]| -> Vec<(String, String)> {
+            rows.iter()
+                .map(|(provider, model)| ((*provider).to_owned(), (*model).to_owned()))
+                .collect()
+        };
+        let priced = pairs(&[
+            ("anthropic", "claude-opus-5"),
+            ("github-copilot", "gpt-4o-mini"),
+            ("anthropic", "claude-haiku-4-5"),
+            ("openai-codex", "gpt-5.6-terra"),
+        ]);
+        assert_eq!(
+            pi_choice(&priced, Some("anthropic/claude-opus-5")),
+            Some(("anthropic", "claude-haiku-4-5"))
+        );
+        let unpriced = pairs(&[
+            ("vertex", "gemini-3.1-pro"),
+            ("github-copilot", "gpt-4o-mini"),
+        ]);
+        assert_eq!(
+            pi_choice(&unpriced, Some("vertex/gemini-3.1-pro")),
+            Some(("github-copilot", "gpt-4o-mini"))
+        );
+        let plain = pairs(&[("ollama", "qwen3:8b"), ("custom", "house-model")]);
+        assert_eq!(
+            pi_choice(&plain, Some("custom/house-model")),
+            Some(("custom", "house-model"))
+        );
+        assert_eq!(
+            pi_choice(&plain, Some("custom/missing")),
+            Some(("ollama", "qwen3:8b"))
+        );
+        assert_eq!(pi_choice(&[], Some("custom/house-model")), None);
+    }
+
+    /// A temporary folder with an agent directory and a fake Pi that records
+    /// each call's arguments, environment and stdin under `calls/`.
+    #[cfg(unix)]
+    struct FakePi {
+        root: PathBuf,
+        agent: PathBuf,
+        executable: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl FakePi {
+        fn new(listing: &str, answer: &str, exit: i32) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let root =
+                std::env::temp_dir().join(format!("muniment-extract-pi-{}", uuid::Uuid::now_v7()));
+            let agent = root.join("agent");
+            fs::create_dir_all(root.join("calls")).unwrap();
+            fs::create_dir_all(&agent).unwrap();
+            fs::write(root.join("listing"), listing).unwrap();
+            fs::write(root.join("answer"), answer).unwrap();
+            let executable = root.join("pi");
+            fs::write(
+                &executable,
+                format!(
+                    "#!/bin/sh\n\
+                     root='{root}'\n\
+                     record=\"$root/calls/$$\"\n\
+                     printf '%s\\0' \"$@\" > \"$record.args\"\n\
+                     printf '%s\\0' \"$PI_CODING_AGENT_DIR\" \"$PI_OFFLINE\" \"$(pwd)\" > \"$record.env\"\n\
+                     for arg in \"$@\"; do\n\
+                       if [ \"$arg\" = --list-models ]; then cat \"$root/listing\"; exit 0; fi\n\
+                     done\n\
+                     cat > \"$record.stdin\"\n\
+                     cat \"$root/answer\"\n\
+                     exit {exit}\n",
+                    root = root.display(),
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+            Self {
+                root,
+                agent,
+                executable,
+            }
+        }
+
+        /// Each recorded call: its arguments, its environment and its stdin.
+        fn calls(&self) -> Vec<(Vec<String>, Vec<String>, Option<String>)> {
+            let split = |path: PathBuf| -> Vec<String> {
+                fs::read_to_string(path)
+                    .unwrap()
+                    .split_terminator('\0')
+                    .map(str::to_owned)
+                    .collect()
+            };
+            let mut calls: Vec<_> = fs::read_dir(self.root.join("calls"))
+                .unwrap()
+                .filter_map(|entry| {
+                    let path = entry.unwrap().path();
+                    let stem = path.to_str()?.strip_suffix(".args")?.to_owned();
+                    Some((
+                        split(path),
+                        split(PathBuf::from(format!("{stem}.env"))),
+                        fs::read_to_string(format!("{stem}.stdin")).ok(),
+                    ))
+                })
+                .collect();
+            calls.sort_by_key(|(args, _, _)| !args.contains(&"--list-models".to_owned()));
+            calls
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakePi {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(unix)]
+    const LISTING: &str = "provider        model             context  max-out  thinking  images\n\
+        anthropic       claude-opus-5     1M       128K     yes       yes\n\
+        anthropic       claude-haiku-4-5  200K     64K      yes       yes\n";
+
+    #[test]
+    #[cfg(unix)]
+    fn pi_answers_once_with_no_tools_extensions_or_session_and_reads_the_message_on_stdin() {
+        let pi = FakePi::new(LISTING, "  {\"actions\":[]}\n", 0);
+        let user = "{\"user_messages\":[\"I prefer short answers.\"],\"existing_facts\":[]}";
+        let answer = pi_complete(
+            &pi.executable,
+            &pi.agent,
+            SYSTEM_PROMPT,
+            user,
+            Duration::from_secs(20),
+        );
+        assert_eq!(answer.as_deref(), Ok("{\"actions\":[]}"));
+        let calls = pi.calls();
+        assert_eq!(calls.len(), 2);
+        for (args, env, _) in &calls {
+            for flag in [
+                "--no-session",
+                "--no-tools",
+                "--no-extensions",
+                "--no-mcp",
+                "--no-skills",
+                "--no-prompt-templates",
+                "--no-context-files",
+                "--no-approve",
+                "--offline",
+            ] {
+                assert!(args.iter().any(|arg| arg == flag), "{flag} missing");
+            }
+            assert!(!args
+                .iter()
+                .any(|arg| arg == "--extension" || arg == "-e" || arg.starts_with("--session")));
+            assert!(!args.iter().any(|arg| arg.contains("short answers")));
+            assert_eq!(env[0], pi.agent.to_str().unwrap());
+            assert_eq!(env[1], "1");
+            assert!(!Path::new(&env[2]).exists());
+        }
+        let (list, _, list_stdin) = &calls[0];
+        assert!(list.contains(&"--list-models".to_owned()));
+        assert_eq!(list_stdin, &None);
+        let (call, _, stdin) = &calls[1];
+        let after = |flag: &str| {
+            let at = call.iter().position(|arg| arg == flag).unwrap();
+            call[at + 1].as_str()
+        };
+        assert!(call.contains(&"--print".to_owned()));
+        assert_eq!(after("--provider"), "anthropic");
+        assert_eq!(after("--model"), "claude-haiku-4-5");
+        assert_eq!(after("--thinking"), "off");
+        assert_eq!(after("--system-prompt"), SYSTEM_PROMPT);
+        assert_eq!(stdin.as_deref(), Some(user));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn with_no_router_account_pi_answers_and_with_neither_the_call_fails() {
+        let pi = FakePi::new(LISTING, "{\"actions\":[]}", 0);
+        let answer = answer_in_order(
+            || router_complete(&pi.agent, SYSTEM_PROMPT, "{}"),
+            || {
+                pi_complete(
+                    &pi.executable,
+                    &pi.agent,
+                    SYSTEM_PROMPT,
+                    "{}",
+                    Duration::from_secs(20),
+                )
+            },
+        );
+        assert_eq!(answer.map(|answer| answer.via), Ok("pi"));
+        let signed_out = FakePi::new(
+            "No models available. Use /login to log into a provider.\n",
+            "{\"actions\":[]}",
+            0,
+        );
+        let answer = answer_in_order(
+            || router_complete(&signed_out.agent, SYSTEM_PROMPT, "{}"),
+            || {
+                pi_complete(
+                    &signed_out.executable,
+                    &signed_out.agent,
+                    SYSTEM_PROMPT,
+                    "{}",
+                    Duration::from_secs(20),
+                )
+            },
+        );
+        assert!(answer.is_err());
+        assert_eq!(signed_out.calls().len(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_failed_pi_answer_is_an_error() {
+        let pi = FakePi::new(LISTING, "{\"actions\":[]}", 1);
+        assert!(pi_complete(
+            &pi.executable,
+            &pi.agent,
+            SYSTEM_PROMPT,
+            "{}",
+            Duration::from_secs(20)
+        )
+        .is_err());
+        let empty = FakePi::new(LISTING, " \n", 0);
+        assert!(pi_complete(
+            &empty.executable,
+            &empty.agent,
+            SYSTEM_PROMPT,
+            "{}",
+            Duration::from_secs(20)
+        )
+        .is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pi_past_the_deadline_is_killed() {
+        use std::os::unix::fs::PermissionsExt;
+        let pi = FakePi::new(LISTING, "", 0);
+        let pid = pi.root.join("pid");
+        fs::write(
+            &pi.executable,
+            format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n", pid.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&pi.executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        let answer = pi_complete(
+            &pi.executable,
+            &pi.agent,
+            SYSTEM_PROMPT,
+            "{}",
+            Duration::from_secs(3),
+        );
+        assert_eq!(answer, Err("Pi did not answer in time.".into()));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let pid = fs::read_to_string(&pid).unwrap();
+        let alive = std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive);
     }
 }
