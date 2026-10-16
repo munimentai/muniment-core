@@ -730,7 +730,7 @@ pub(super) fn dispatch_request<S: ThreadListService>(
                     });
                 }
             };
-            let chunk_sha256 = format!("{:x}", Sha256::digest(&data));
+            let chunk_sha256 = hex::encode(Sha256::digest(&data));
             let admission = registries
                 .artifact_transfers
                 .get_mut(&transfer_id)

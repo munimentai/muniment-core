@@ -5,8 +5,6 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use sha2::{Digest, Sha256};
-
 use crate::model_install::{
     install_model, AvailableSpace, InstallCancellation, InstallLock, ModelInstallError,
 };
@@ -393,10 +391,10 @@ fn verify_archive_for(path: &Path, descriptor: PiArtifactDescriptor) -> Result<(
     if !metadata.file_type().is_file() || metadata.len() != descriptor.byte_size {
         return Err(PiInstallError::WrongSize);
     }
-    let mut file = File::open(path).map_err(|_| PiInstallError::Persistence)?;
-    let mut hash = Sha256::new();
-    std::io::copy(&mut file, &mut hash).map_err(|_| PiInstallError::Persistence)?;
-    if format!("{:x}", hash.finalize()) != descriptor.sha256 {
+    let file = File::open(path).map_err(|_| PiInstallError::Persistence)?;
+    let digest =
+        crate::model_artifact::sha256_reader(file).map_err(|_| PiInstallError::Persistence)?;
+    if digest != descriptor.sha256 {
         return Err(PiInstallError::DigestMismatch);
     }
     Ok(())

@@ -304,7 +304,7 @@ pub fn digest_file(path: &Path) -> Result<(u64, String)> {
         size += count as u64;
         hasher.update(&buffer[..count]);
     }
-    Ok((size, format!("{:x}", hasher.finalize())))
+    Ok((size, hex::encode(hasher.finalize())))
 }
 
 pub fn latest_pi(http: &dyn Http) -> Result<String> {

@@ -3,7 +3,7 @@
 use super::summaries::{title_from, MAX_PAGE_SIZE};
 use super::{EventEnvelope, JournalError, RunJournal, ThreadEventEnvelope};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;

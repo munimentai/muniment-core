@@ -625,7 +625,7 @@ fn reject_unsafe_metadata(value: &str) -> Result<(), OnboardingHomeWritePlanErro
 }
 
 fn short_digest(value: &[u8]) -> String {
-    let digest = format!("{:x}", Sha256::digest(value));
+    let digest = hex::encode(Sha256::digest(value));
     digest[..12].to_owned()
 }
 

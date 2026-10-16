@@ -22,21 +22,22 @@ required-features = ["server"]
 name = "muniment-router-shadow"
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
-getrandom = "0.3"
-hmac = { version = "0.12", optional = true }
+getrandom = "0.4"
+hex = "0.4"
+hmac = { version = "0.13", optional = true }
 muniment-atomic-file = { path = "../atomic-file" }
 muniment-models = { path = "../models" }
 muniment-pins = { path = "../pins" }
 postgres = { version = "0.19", features = ["with-serde_json-1"], optional = true }
-rusqlite = { version = "0.32", features = ["bundled", "hooks", "limits"] }
+rusqlite = { version = "0.40", features = ["bundled", "fallible_uint", "hooks", "limits"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 rustls-platform-verifier = { version = "0.7", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
-sha2 = "0.10"
-signal-hook = { version = "0.3", default-features = false, optional = true }
+sha2 = "0.11"
+signal-hook = { version = "0.4", default-features = false, optional = true }
 toml = "1"
 ureq = { version = "2", default-features = false, features = ["json"] }
 url = "2"

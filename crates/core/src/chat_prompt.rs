@@ -40,7 +40,10 @@ fn local_prompt_directory_under(config_directory: &Path) -> Option<PathBuf> {
 
 fn local_prompt_path(directory: &Path, user: &str) -> PathBuf {
     use sha2::{Digest, Sha256};
-    directory.join(format!("{:x}.txt", Sha256::digest(user.as_bytes())))
+    directory.join(format!(
+        "{}.txt",
+        hex::encode(Sha256::digest(user.as_bytes()))
+    ))
 }
 
 fn store_local_prompt(directory: &Path, user: &str, prompt: &str) -> io::Result<()> {

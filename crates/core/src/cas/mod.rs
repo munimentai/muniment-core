@@ -140,7 +140,7 @@ impl LocalCas {
             file.sync_all()?;
             drop(file);
 
-            let hash = ContentHash(format!("{:x}", hasher.finalize()));
+            let hash = ContentHash(hex::encode(hasher.finalize()));
             let destination = self.object_path(&hash);
             fs::create_dir_all(destination.parent().expect("object path has a parent"))?;
 
@@ -173,7 +173,7 @@ impl LocalCas {
         let bytes = self
             .get(hash)?
             .ok_or_else(|| CasError::NotFound(hash.clone()))?;
-        let actual = ContentHash(format!("{:x}", Sha256::digest(&bytes)));
+        let actual = ContentHash(hex::encode(Sha256::digest(&bytes)));
         if actual != *hash {
             return Err(CasError::Corrupt {
                 expected: hash.clone(),
@@ -280,7 +280,7 @@ impl LocalCas {
             }
             hasher.update(&buffer[..count]);
         }
-        let actual = ContentHash(format!("{:x}", hasher.finalize()));
+        let actual = ContentHash(hex::encode(hasher.finalize()));
         if actual == *hash {
             Ok(())
         } else {

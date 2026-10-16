@@ -7,7 +7,7 @@ fn id(n: u128) -> Id {
 }
 
 fn hash(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn transfer(total: u64, chunk_bytes: u64, chunk_count: u64) -> ArtifactTransfer {

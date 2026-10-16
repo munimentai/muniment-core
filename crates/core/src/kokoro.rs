@@ -130,7 +130,7 @@ pub(crate) fn verify_kokoro_artifact(
         }
         digest.update(&buffer[..count]);
     }
-    if format!("{:x}", digest.finalize()) != descriptor.sha256 {
+    if hex::encode(digest.finalize()) != descriptor.sha256 {
         return Err(KokoroVerificationError::DigestMismatch);
     }
     Ok(())

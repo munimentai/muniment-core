@@ -263,7 +263,7 @@ fn write_object(
             .map_err(ExportError::Writer)?;
         remaining -= count as u64;
     }
-    let actual = ContentHash::from_str(&format!("{:x}", hasher.finalize()))
+    let actual = ContentHash::from_str(&hex::encode(hasher.finalize()))
         .expect("SHA-256 always produces a canonical hash");
     if actual != *hash {
         return Err(ExportError::Cas(CasError::Corrupt {

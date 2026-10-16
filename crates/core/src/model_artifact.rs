@@ -5,7 +5,7 @@ pub mod install;
 pub mod lifecycle;
 
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{self, BufReader, Read};
 
 use sha2::{Digest, Sha256};
 
@@ -77,8 +77,20 @@ pub fn verify_model_artifact(
     Ok(())
 }
 
-fn hash_reader(mut reader: impl Read) -> Result<String, ModelVerificationError> {
+fn hash_reader(reader: impl Read) -> Result<String, ModelVerificationError> {
+    sha256_reader(reader).map_err(|_| ModelVerificationError::Unreadable)
+}
+
+/// The lowercase hex SHA-256 of everything `reader` yields.
+pub(crate) fn sha256_reader(mut reader: impl Read) -> io::Result<String> {
     let mut hasher = Sha256::new();
-    std::io::copy(&mut reader, &mut hasher).map_err(|_| ModelVerificationError::Unreadable)?;
-    Ok(format!("{:x}", hasher.finalize()))
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(hex::encode(hasher.finalize())),
+            Ok(read) => hasher.update(&buffer[..read]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
 }

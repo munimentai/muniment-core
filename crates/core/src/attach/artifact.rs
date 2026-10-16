@@ -244,7 +244,7 @@ impl ArtifactTransfer {
             .checked_sub(offset)
             .map(|remaining| remaining.min(self.metadata.chunk_bytes));
         let data_length = u64::try_from(data.len()).ok();
-        let actual_hash = format!("{:x}", Sha256::digest(data));
+        let actual_hash = hex::encode(Sha256::digest(data));
         if artifact_id != &self.metadata.artifact_id
             || Some(chunk_index) != next
             || chunk_index >= self.metadata.chunk_count

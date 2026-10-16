@@ -68,7 +68,7 @@ fn windows_attach_pipe_prefix(sid: &str) -> Result<String, WindowsPipePathError>
     }
 
     let digest = Sha256::digest(sid.to_ascii_uppercase().as_bytes());
-    let mut user_hash = format!("{digest:x}");
+    let mut user_hash = hex::encode(digest);
     user_hash.truncate(32);
     Ok(format!("{PIPE_PREFIX}{user_hash}-"))
 }

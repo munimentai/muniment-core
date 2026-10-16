@@ -79,7 +79,7 @@ fn current() -> PinsFile {
 
 fn sha256(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn temporary() -> PathBuf {
@@ -337,34 +337,33 @@ fn the_package_manifest_names_exactly_the_pins() {
 
 #[test]
 fn the_package_manifest_names_each_patch_and_the_work_directory_holds_it() {
-    let pins = PinsFile::parse(PINS_TOML).unwrap();
+    let mut pins = current();
+    let patch = format!(
+        "patches/{}@{}.patch",
+        pins.packages[0].name, pins.packages[0].version
+    );
+    pins.packages[0].patch = Some(patch.clone());
     let manifest: Value = serde_json::from_slice(&pins.package_manifest()).unwrap();
     let patched = manifest["patchedDependencies"].as_object().unwrap();
-    let patches: Vec<_> = pins
-        .packages
-        .iter()
-        .filter_map(|package| Some((package, package.patch.as_ref()?)))
-        .collect();
-    assert!(!patches.is_empty());
-    assert_eq!(patched.len(), patches.len());
-    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../pins");
-    let work = temporary();
+    assert_eq!(patched.len(), 1);
+    assert_eq!(
+        patched[&format!("{}@{}", pins.packages[0].name, pins.packages[0].version)],
+        patch.as_str()
+    );
+    let directory = temporary();
+    let work = directory.join("work");
+    std::fs::create_dir_all(directory.join("patches")).unwrap();
+    std::fs::write(directory.join(&patch), "diff --git a/index.ts b/index.ts\n").unwrap();
     pins.write_package_manifest(&directory, &work).unwrap();
     assert_eq!(
         std::fs::read(work.join("package.json")).unwrap(),
         pins.package_manifest()
     );
-    for (package, patch) in patches {
-        assert_eq!(
-            patched[&format!("{}@{}", package.name, package.version)],
-            patch.as_str()
-        );
-        assert_eq!(
-            std::fs::read(work.join(patch)).unwrap(),
-            std::fs::read(directory.join(patch)).unwrap()
-        );
-    }
-    std::fs::remove_dir_all(work).unwrap();
+    assert_eq!(
+        std::fs::read(work.join(&patch)).unwrap(),
+        std::fs::read(directory.join(&patch)).unwrap()
+    );
+    std::fs::remove_dir_all(directory).unwrap();
     let unpatched: Value = serde_json::from_slice(&current().package_manifest()).unwrap();
     assert!(unpatched.get("patchedDependencies").is_none());
 }

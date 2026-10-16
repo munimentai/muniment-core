@@ -1896,7 +1896,7 @@ fn record_subscription_probe(
         "subscription": subscription,
         "finished": decoder.finished,
         "tools": decoder.tools.len(),
-        "reply_sha256": format!("{:x}", Sha256::digest(decoder.text.trim().as_bytes())),
+        "reply_sha256": hex::encode(Sha256::digest(decoder.text.trim().as_bytes())),
     });
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
