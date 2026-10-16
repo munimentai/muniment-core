@@ -204,7 +204,7 @@ def main():
             args += ["--features", "keyring"]
         tree = subprocess.check_output([
             "cargo", "tree", *args, "--target", "all", "--edges", "normal,build,dev",
-            "--prefix", "none", "--format", "{p}|{f}"], text=True)
+            "--prefix", "none", "--format", "{p}|{f}", "--color", "never"], text=True)
         check_tree(tree, tables["Stay"]["crate"], name)
         if name in KEYRING_FREE:
             names = {line.split()[0] for line in tree.splitlines() if line.strip()}
