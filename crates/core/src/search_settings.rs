@@ -71,7 +71,7 @@ const fn with_base_url(
 }
 
 /// Every provider a key adds, by its pi-web-access routing id, with the
-/// field names pi-web-access 0.40 reads. Parallel MCP shares Parallel's key,
+/// field names pi-web-access 0.41 reads. Parallel MCP shares Parallel's key,
 /// so only `parallel` is listed.
 pub const KEYED_PROVIDERS: &[KeyedProvider] = &[
     with_base_url("exa", "exaApiKey", "exaBaseUrl"),

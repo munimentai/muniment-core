@@ -923,24 +923,34 @@ mod tests {
 
     #[test]
     fn the_manifest_and_the_lockfile_name_each_patch_and_the_identity_covers_it() {
-        assert!(!PI_PACKAGE_PATCHES.is_empty());
         let manifest: Value = serde_json::from_slice(&package_manifest()).unwrap();
-        let patched = manifest["patchedDependencies"].as_object().unwrap();
-        assert_eq!(patched.len(), PI_PACKAGE_PATCHES.len());
+        if PI_PACKAGE_PATCHES.is_empty() {
+            assert!(manifest.get("patchedDependencies").is_none());
+            assert!(!PI_PACKAGES_LOCK.contains("\"patchedDependencies\""));
+        } else {
+            let patched = manifest["patchedDependencies"].as_object().unwrap();
+            assert_eq!(patched.len(), PI_PACKAGE_PATCHES.len());
+        }
         for patch in PI_PACKAGE_PATCHES {
             let key = format!("{}@{}", patch.name, patch.version);
             assert!(PI_PACKAGES.contains(&(patch.name, patch.version)));
-            assert_eq!(patched[&key], patch.path);
+            assert_eq!(manifest["patchedDependencies"][&key], patch.path);
             assert!(PI_PACKAGES_LOCK.contains(&format!("\"{key}\": \"{}\",", patch.path)));
             assert!(patch.text.starts_with("diff --git "));
         }
+        let (name, version) = PI_PACKAGES[0];
+        let other = muniment_pins::PackagePatch {
+            name,
+            version,
+            path: "patches/other.patch",
+            text: "diff --git a/other.ts b/other.ts\n",
+        };
         let mut changed = PI_PACKAGE_PATCHES.to_vec();
-        changed[0].text = "diff --git a/other.ts b/other.ts\n";
+        changed.push(other);
         assert_ne!(
             identity_with(&changed).unwrap(),
             install_identity().unwrap()
         );
-        assert_ne!(identity_with(&[]).unwrap(), install_identity().unwrap());
         assert_eq!(
             identity_with(PI_PACKAGE_PATCHES).unwrap(),
             install_identity().unwrap()
