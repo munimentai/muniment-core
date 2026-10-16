@@ -191,7 +191,11 @@ pub fn preview_export_zip(archive_path: &Path) -> Result<PreviewManifest, Previe
 
         // Normalize (and safety-check) every member's path, including
         // directories, so a traversal entry is rejected regardless of type.
-        let name = normalize_entry_name(member.name())?;
+        let name = normalize_entry_name(
+            &member
+                .name()
+                .map_err(|_| PreviewErrorKind::InvalidArchive)?,
+        )?;
 
         if member.is_symlink() {
             return Err(PreviewErrorKind::Symlink);
@@ -291,7 +295,11 @@ pub fn extract_selected_zip_entries(
         if member.encrypted() {
             return Err(PreviewErrorKind::Encrypted);
         }
-        let name = normalize_entry_name(member.name())?;
+        let name = normalize_entry_name(
+            &member
+                .name()
+                .map_err(|_| PreviewErrorKind::InvalidArchive)?,
+        )?;
         if member.is_symlink() {
             return Err(PreviewErrorKind::Symlink);
         }
@@ -580,7 +588,7 @@ mod tests {
         let mut body = String::new();
         member.read_to_string(&mut body).unwrap();
 
-        assert_eq!(member.name(), "original.txt");
+        assert_eq!(member.name().unwrap(), "original.txt");
         assert_eq!(body, "opened file");
         assert_eq!(
             open_validated_archive(&path).map(|_| ()),

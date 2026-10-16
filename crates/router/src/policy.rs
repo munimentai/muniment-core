@@ -220,7 +220,7 @@ fn estimate(text: &str) -> u64 {
     ascii.div_ceil(3) + text.chars().filter(|c| !c.is_ascii()).count() as u64
 }
 pub fn digest(value: &str) -> String {
-    format!("{:x}", Sha256::digest(value.as_bytes()))
+    hex::encode(Sha256::digest(value.as_bytes()))
 }
 impl Features {
     pub fn read(request: &Value) -> Self {

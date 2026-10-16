@@ -1077,7 +1077,7 @@ mod tests {
 
     #[test]
     fn fixture_hashes_are_intentional() {
-        assert_eq!(format!("{:x}", Sha256::digest(b"ab")), ARTIFACTS[0].sha256);
-        assert_eq!(format!("{:x}", Sha256::digest(b"cd")), ARTIFACTS[1].sha256);
+        assert_eq!(hex::encode(Sha256::digest(b"ab")), ARTIFACTS[0].sha256);
+        assert_eq!(hex::encode(Sha256::digest(b"cd")), ARTIFACTS[1].sha256);
     }
 }

@@ -61,13 +61,13 @@ fn install_identity() -> io::Result<Vec<u8>> {
 }
 
 fn identity_with(patches: &[muniment_pins::PackagePatch]) -> io::Result<Vec<u8>> {
-    let lock = format!("{:x}", Sha256::digest(PI_PACKAGES_LOCK.as_bytes()));
+    let lock = hex::encode(Sha256::digest(PI_PACKAGES_LOCK.as_bytes()));
     let patches: Vec<_> = patches
         .iter()
         .map(|patch| {
             (
                 patch.path,
-                format!("{:x}", Sha256::digest(patch.text.as_bytes())),
+                hex::encode(Sha256::digest(patch.text.as_bytes())),
             )
         })
         .collect();

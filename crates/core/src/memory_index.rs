@@ -453,7 +453,7 @@ impl MemoryIndex {
             fs::create_dir_all(parent)?
         }
         let mut connection = Connection::open(&self.database)?;
-        connection.progress_handler(100, Some(move || Instant::now() >= deadline));
+        connection.progress_handler(100, Some(move || Instant::now() >= deadline))?;
         // MEMORY keeps the rollback journal in RAM rather than discarding it. A
         // reindex that stops at its deadline then rolls back instead of leaving
         // half of its rows behind. A crash can still damage the file, and
@@ -809,7 +809,7 @@ fn scan_home_with_hook(
         let Ok(content) = String::from_utf8(bytes) else {
             continue;
         };
-        let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+        let hash = hex::encode(Sha256::digest(content.as_bytes()));
         documents.insert(
             relative,
             Document {
@@ -969,7 +969,7 @@ fn compute_source_state(connection: &Connection) -> Result<String, rusqlite::Err
         digest.update([0]);
         digest.update(hash.as_bytes());
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(hex::encode(digest.finalize()))
 }
 
 fn stored_source_state(connection: &Connection) -> Result<String, rusqlite::Error> {
@@ -1348,7 +1348,7 @@ mod tests {
             .unwrap();
         let path = "memory/legacy.md";
         let content = "legacy heliotrope fact";
-        let content_hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+        let content_hash = hex::encode(Sha256::digest(content.as_bytes()));
         connection
             .execute(
                 "INSERT INTO memory_files(path, content_hash) VALUES (?1, ?2)",
@@ -1375,7 +1375,7 @@ mod tests {
         assert_eq!(result.recall.files, [path]);
         assert_eq!(
             result.recall.source_file_state,
-            format!("{:x}", expected.finalize())
+            hex::encode(expected.finalize())
         );
     }
 

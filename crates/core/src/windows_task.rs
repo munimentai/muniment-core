@@ -364,26 +364,26 @@ pub fn parse_observed_registration(
         match reader.read_event().map_err(|_| Error::MalformedXml)? {
             Event::Start(element) => {
                 if path.is_empty() {
-                    if saw_root || element.local_name().as_ref() != b"Task" {
+                    if saw_root || element.local_name().as_ref() != "Task" {
                         return Err(Error::MissingTaskRoot);
                     }
                     saw_root = true;
                 } else if root_closed {
                     return Err(Error::MalformedXml);
                 }
-                path.push(element.local_name().as_ref().to_vec());
+                path.push(element.local_name().as_ref().as_bytes().to_vec());
                 start_observed_element(&path, &mut exec_count, &mut active_field, &values)?;
             }
             Event::Empty(element) => {
                 if path.is_empty() {
-                    if saw_root || element.local_name().as_ref() != b"Task" {
+                    if saw_root || element.local_name().as_ref() != "Task" {
                         return Err(Error::MissingTaskRoot);
                     }
                     saw_root = true;
                 } else if root_closed {
                     return Err(Error::MalformedXml);
                 }
-                path.push(element.local_name().as_ref().to_vec());
+                path.push(element.local_name().as_ref().as_bytes().to_vec());
                 start_observed_element(&path, &mut exec_count, &mut active_field, &values)?;
                 finish_observed_element(&path, &mut active_field, &mut values);
                 path.pop();
@@ -393,12 +393,12 @@ pub fn parse_observed_registration(
             }
             Event::Text(text) => {
                 if let Some((_, value)) = &mut active_field {
-                    value.push_str(&text.decode().map_err(|_| Error::MalformedXml)?);
+                    value.push_str(&text);
                 }
             }
             Event::GeneralRef(reference) => {
                 if let Some((_, value)) = &mut active_field {
-                    let reference = reference.decode().map_err(|_| Error::MalformedXml)?;
+                    let reference: &str = &reference;
                     let escaped = format!("&{reference};");
                     value.push_str(
                         &quick_xml::escape::unescape(&escaped).map_err(|_| Error::MalformedXml)?,
@@ -407,7 +407,7 @@ pub fn parse_observed_registration(
             }
             Event::CData(text) => {
                 if let Some((_, value)) = &mut active_field {
-                    value.push_str(&text.decode().map_err(|_| Error::MalformedXml)?);
+                    value.push_str(&text);
                 }
             }
             Event::End(_) => {

@@ -72,14 +72,14 @@ impl SqlTool {
             (Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 10),
             (Limit::SQLITE_LIMIT_TRIGGER_DEPTH, 10),
         ] {
-            connection.set_limit(limit, value);
+            connection.set_limit(limit, value)?;
         }
         // SAFETY: sqlite3_hard_heap_limit64 takes one integer and touches no
         // pointer. It sets a process-wide ceiling and answers the prior one.
         unsafe {
             rusqlite::ffi::sqlite3_hard_heap_limit64(HEAP_LIMIT_BYTES);
         }
-        connection.authorizer(Some(authorize));
+        connection.authorizer(Some(authorize))?;
         let deadline: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
         let watched = Arc::clone(&deadline);
         connection.progress_handler(
@@ -90,7 +90,7 @@ impl SqlTool {
                     .map(|deadline| deadline.is_some_and(|deadline| Instant::now() > deadline))
                     .unwrap_or(true)
             }),
-        );
+        )?;
         let audit = Connection::open(audit)?;
         audit.pragma_update(None, "journal_mode", "WAL")?;
         audit.execute_batch(

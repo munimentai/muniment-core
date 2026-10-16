@@ -298,7 +298,7 @@ pub fn verify_code_diff_permission_answer(
 }
 
 fn encoded_sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 /// Opens a permission gate bound to a stored proposal pair.

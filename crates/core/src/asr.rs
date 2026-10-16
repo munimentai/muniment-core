@@ -25,8 +25,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use sha2::{Digest, Sha256};
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AsrArtifactDescriptor {
     pub filename: &'static str,
@@ -737,10 +735,8 @@ fn forget_verified(path: &Path) {
 fn hash_reader(mut reader: impl Read) -> Result<String, AsrModelSetVerificationError> {
     #[cfg(test)]
     tests::HASHES.with(|count| count.set(count.get() + 1));
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut reader, &mut hasher)
-        .map_err(|_| AsrModelSetVerificationError::Unreadable)?;
-    Ok(format!("{:x}", hasher.finalize()))
+    crate::model_artifact::sha256_reader(&mut reader)
+        .map_err(|_| AsrModelSetVerificationError::Unreadable)
 }
 
 #[cfg(test)]

@@ -27,4 +27,4 @@ uuid = { version = "1", features = ["v4", "v7"] }
 
 [dev-dependencies]
 # The journal tests drop tables to build missing-table fixtures.
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
