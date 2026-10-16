@@ -526,6 +526,131 @@ fn the_publisher_registers_seals_applies_and_receipts() {
     std::fs::remove_dir_all(profile).unwrap();
 }
 
+fn gate_event(phase: &str, text: &str, gate_id: &str) -> ChatEvent {
+    let mut event = run_event(phase, text);
+    event.pending_permission = Some(ChatPendingPermission {
+        gate_id: gate_id.into(),
+        request: PermissionRequest::Confirm {
+            title: "Run tests".into(),
+            message: String::new(),
+            timeout: None,
+        },
+        diff: None,
+    });
+    event
+}
+
+#[test]
+fn a_gate_closes_before_later_text_and_after_a_run_s_last_text() {
+    let keys = keys();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let account = Arc::new(FakeAccount {
+        api_base: format!("http://{}", listener.local_addr().unwrap()),
+        keys: Mutex::new(Some(keys.clone())),
+    });
+    let runtime = Arc::new(FakeRuntime::default());
+    let profile = temporary_state("gate-order");
+    let publisher = RelayPublisher::start_with_timing(
+        account,
+        runtime.clone(),
+        relay_state_path(&profile),
+        timing(),
+    );
+    let mut relay = StubRelay::accept(&listener);
+    runtime.emit(run_event("streaming", "Hi"));
+    relay.next("session.register");
+    relay.next_event(&keys);
+    relay.next_event(&keys);
+    runtime.emit(gate_event("pending-permission", "Hi", "gate_local_0001"));
+    let (header, _) = relay.next_event(&keys);
+    assert_eq!(header.phase, Phase::WaitingForPermission);
+
+    // The desktop answered the gate, and the run goes on with more text.
+    runtime.emit(run_event("streaming", "Hi there"));
+    let (header, OpenedEvent { content, .. }) = relay.next_event(&keys);
+    assert_eq!((header.phase, header.permission), (Phase::Running, None));
+    assert!(matches!(content, EventContent::PermissionResolved { .. }));
+    let (_, OpenedEvent { content, .. }) = relay.next_event(&keys);
+    assert_eq!(
+        content,
+        EventContent::AssistantDelta {
+            text: " there".into()
+        }
+    );
+
+    // A run stopped at its gate sends its last text, then closes the gate.
+    runtime.emit(gate_event(
+        "pending-permission",
+        "Hi there",
+        "gate_local_0002",
+    ));
+    relay.next_event(&keys);
+    runtime.emit(gate_event("cancelled", "Hi there!", "gate_local_0002"));
+    let (header, OpenedEvent { content, .. }) = relay.next_event(&keys);
+    assert_eq!(header.phase, Phase::WaitingForPermission);
+    assert_eq!(content, EventContent::AssistantDelta { text: "!".into() });
+    let (header, OpenedEvent { content, .. }) = relay.next_event(&keys);
+    assert_eq!((header.phase, header.permission), (Phase::Cancelled, None));
+    assert_eq!(
+        content,
+        EventContent::PermissionResolved {
+            gate_id: "gate_local_0002".into(),
+            decision: GateDecision::Cancelled
+        }
+    );
+    let (header, OpenedEvent { content, .. }) = relay.next_event(&keys);
+    assert_eq!(header.phase, Phase::Cancelled);
+    assert_eq!(content, EventContent::RunStatus { detail: None });
+    publisher.stop();
+    std::fs::remove_dir_all(profile).unwrap();
+}
+
+#[test]
+fn a_pair_the_cloud_no_longer_holds_ends_the_connection() {
+    let keys = keys();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let account = Arc::new(FakeAccount {
+        api_base: format!("http://{}", listener.local_addr().unwrap()),
+        keys: Mutex::new(Some(keys.clone())),
+    });
+    let runtime = Arc::new(FakeRuntime::default());
+    let profile = temporary_state("pair-unavailable");
+    // A slow pair check leaves the relay's refusal as the only way out.
+    let publisher = RelayPublisher::start_with_timing(
+        account.clone(),
+        runtime.clone(),
+        relay_state_path(&profile),
+        RelayTiming {
+            pair_check: Duration::from_secs(60),
+            ..timing()
+        },
+    );
+    let mut relay = StubRelay::accept(&listener);
+    runtime.emit(run_event("streaming", "Hello"));
+    let register = relay.next("session.register");
+    let event = relay.next("session.event");
+    *account.keys.lock().unwrap() = None;
+    relay.send(json!({
+        "protocol": RELAY_PROTOCOL, "type": "protocol.error", "message_id": event["message_id"],
+        "session_id": register["session_id"], "connection_id": "con_desktop_0001",
+        "device_id": "11111111-1111-4111-8111-111111111111",
+        "actor": {"user_id": "usr_synthetic_0001", "device_id": "11111111-1111-4111-8111-111111111111", "role": "desktop"},
+        "sequence": 0, "timestamp": "2026-07-10T16:00:01.000Z", "payload": {"code": "pair_unavailable"},
+    }));
+    let closed = loop {
+        match relay.socket.read() {
+            Ok(Message::Close(_)) | Err(_) => break true,
+            Ok(_) => continue,
+        }
+    };
+    assert!(closed);
+    listener.set_nonblocking(true).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(listener.accept().is_err(), "no reconnect without keys");
+    publisher.stop();
+    std::fs::remove_dir_all(profile).unwrap();
+}
+
 #[test]
 fn a_publisher_without_keys_never_connects() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
