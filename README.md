@@ -227,7 +227,9 @@ their plaintext headers.
   and permission asks as sealed events. It opens the phone's sealed stop,
   steer, follow-up and permission answers, checks their header binding,
   counter and expiry, applies them through the runtime's own operations and
-  answers with a receipt or a failure.
+  answers with a receipt or a failure. When the cloud answers that the pair
+  is unavailable, it closes the connection and asks the account for the pair
+  again before it reconnects.
 - The runtime starts the publisher with its schedules when the host has a
   cloud. A host whose account answers no relay keys, such as
   `muniment-server`, opens no connection. The pair's counters and replay

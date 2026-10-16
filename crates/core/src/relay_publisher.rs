@@ -394,7 +394,13 @@ impl Publisher {
             match link.socket.read() {
                 Ok(Message::Text(text)) => {
                     heard = Instant::now();
-                    self.inbound(&mut link, text.as_str())?;
+                    if self.inbound(&mut link, text.as_str())? {
+                        // The cloud no longer holds this pair, so the next
+                        // look at the account confirms it and erases the keys.
+                        let _ = link.socket.close(None);
+                        let _ = link.socket.flush();
+                        return Ok(Ended::PairChanged);
+                    }
                 }
                 Ok(Message::Close(_)) => return Ok(Ended::Closed),
                 Ok(_) => heard = Instant::now(),
@@ -444,13 +450,15 @@ impl Publisher {
         }
     }
 
-    fn inbound(&mut self, link: &mut Link, text: &str) -> Result<(), String> {
+    /// Handles one relay message. It answers true when the cloud no longer
+    /// holds the pair.
+    fn inbound(&mut self, link: &mut Link, text: &str) -> Result<bool, String> {
         let Ok(message) = serde_json::from_str::<Value>(text) else {
-            return Ok(());
+            return Ok(false);
         };
         if message["protocol"] != RELAY_PROTOCOL {
             // The cloud's own `heartbeat` and `entitlement.refresh` events.
-            return Ok(());
+            return Ok(false);
         }
         match message["type"].as_str().unwrap_or_default() {
             "control.heartbeat" if message["payload"]["kind"] == "ping" => {
@@ -459,18 +467,19 @@ impl Publisher {
                     "control.heartbeat",
                     None,
                     json!({"kind": "pong", "nonce": nonce}),
-                )
+                )?;
             }
             "command.interrupt" | "command.steer" | "command.follow_up" | "permission.answer" => {
-                self.command(link, &message)
+                self.command(link, &message)?;
             }
             "protocol.error" => {
                 let code = message["payload"]["code"].as_str().unwrap_or("unknown");
                 crate::runtime_eprintln!("muniment-runtime: relay refused a message: {code}");
-                Ok(())
+                return Ok(code == "pair_unavailable");
             }
-            _ => Ok(()),
+            _ => {}
         }
+        Ok(false)
     }
 
     fn command(&mut self, link: &mut Link, message: &Value) -> Result<(), String> {
@@ -662,6 +671,18 @@ impl Publisher {
             }
             return Ok(());
         }
+        let current_gate = event
+            .pending_permission
+            .as_ref()
+            .filter(|_| !phase.terminal());
+        let gate_changed =
+            run.gate.as_ref().map(|gate| &gate.local_id) != current_gate.map(|gate| &gate.gate_id);
+        // A gate that closed while the run goes on closes before the text that
+        // follows it. A run that ended sends its last text with the gate still
+        // open, then closes the gate in its terminal phase.
+        if gate_changed && !phase.terminal() {
+            resolve_gate(link, run, phase, now, runtime.as_ref(), &event.run_id)?;
+        }
         if let Some(appended) = event.text.strip_prefix(run.text.as_str()) {
             contents.extend(deltas(appended));
         }
@@ -678,51 +699,20 @@ impl Publisher {
         for content in contents {
             link.event(run, None, content)?;
         }
-        let current_gate = event
-            .pending_permission
-            .as_ref()
-            .filter(|_| !phase.terminal());
-        let gate_changed =
-            run.gate.as_ref().map(|gate| &gate.local_id) != current_gate.map(|gate| &gate.gate_id);
-        if gate_changed {
-            if let Some(gate) = run.gate.take() {
-                let decision = run
-                    .answered
-                    .get(&gate.relay_id)
-                    .map(|decision| match decision {
-                        AnswerDecision::Allow => GateDecision::Allow,
-                        AnswerDecision::Deny => GateDecision::Deny,
-                    })
-                    .or_else(|| runtime.gate_decision(&event.run_id, &gate.local_id))
-                    .unwrap_or(if phase.terminal() {
-                        GateDecision::Cancelled
-                    } else if now >= gate.expires {
-                        GateDecision::Expired
-                    } else {
-                        GateDecision::Allow
-                    });
-                run.phase = phase;
-                link.event(
-                    run,
-                    Some(phase),
-                    EventContent::PermissionResolved {
-                        gate_id: gate.relay_id,
-                        decision,
-                    },
-                )?;
-            }
-            if let Some(pending) = current_gate {
-                let gate = open_gate(pending, now);
-                let ask = EventContent::PermissionAsk {
-                    gate_id: gate.relay_id.clone(),
-                    kind: gate_kind(&gate.request).to_owned(),
-                    summary: gate_summary(&gate.request),
-                    request_digest: gate.digest.clone(),
-                };
-                run.gate = Some(gate);
-                run.phase = Phase::WaitingForPermission;
-                link.event(run, Some(Phase::WaitingForPermission), ask)?;
-            }
+        if gate_changed && phase.terminal() {
+            resolve_gate(link, run, phase, now, runtime.as_ref(), &event.run_id)?;
+        }
+        if let (true, Some(pending)) = (gate_changed, current_gate) {
+            let gate = open_gate(pending, now);
+            let ask = EventContent::PermissionAsk {
+                gate_id: gate.relay_id.clone(),
+                kind: gate_kind(&gate.request).to_owned(),
+                summary: gate_summary(&gate.request),
+                request_digest: gate.digest.clone(),
+            };
+            run.gate = Some(gate);
+            run.phase = Phase::WaitingForPermission;
+            link.event(run, Some(Phase::WaitingForPermission), ask)?;
         }
         if phase.terminal() {
             let detail = event
@@ -876,6 +866,45 @@ impl fmt::Display for PublishError {
             Self::Crypto(error) => write!(formatter, "{error}"),
         }
     }
+}
+
+/// Closes the run's open gate, if any, with the phone's decision, the
+/// decision the runtime journaled, or how the gate ended.
+fn resolve_gate(
+    link: &mut Link,
+    run: &mut RunRelay,
+    phase: Phase,
+    now: DateTime<Utc>,
+    runtime: &dyn RelayRuntime,
+    local_run: &str,
+) -> Result<(), String> {
+    let Some(gate) = run.gate.take() else {
+        return Ok(());
+    };
+    let decision = run
+        .answered
+        .get(&gate.relay_id)
+        .map(|decision| match decision {
+            AnswerDecision::Allow => GateDecision::Allow,
+            AnswerDecision::Deny => GateDecision::Deny,
+        })
+        .or_else(|| runtime.gate_decision(local_run, &gate.local_id))
+        .unwrap_or(if phase.terminal() {
+            GateDecision::Cancelled
+        } else if now >= gate.expires {
+            GateDecision::Expired
+        } else {
+            GateDecision::Allow
+        });
+    run.phase = phase;
+    link.event(
+        run,
+        Some(phase),
+        EventContent::PermissionResolved {
+            gate_id: gate.relay_id,
+            decision,
+        },
+    )
 }
 
 /// The header phase of a run event, or none for an event outside a run's
