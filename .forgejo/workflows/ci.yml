@@ -23,9 +23,9 @@ jobs:
     env:
       CARGO_TARGET_DIR: /root/.cache/muniment-core/checks
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The memory runtime tests load an ES module extension without a package.json.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - run: bash .forgejo/rust-toolchain.sh rustfmt clippy
@@ -48,7 +48,7 @@ jobs:
     env:
       CARGO_TARGET_DIR: /root/.cache/muniment-core/router-server
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: bash .forgejo/rust-toolchain.sh clippy
       # OpenBao integration runs only when MUNIMENT_ROUTER_TEST_OPENBAO_ADDR is
       # set. The OpenBao client tests run against a stand-in server always.
@@ -65,7 +65,7 @@ jobs:
     runs-on: [self-hosted, image-smoke]
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: docker build -f deploy/router/Containerfile -t "muniment-router:ci-${{ github.run_id }}" .
       - if: always()
         run: docker image rm "muniment-router:ci-${{ github.run_id }}" || true
@@ -76,7 +76,7 @@ jobs:
     runs-on: [self-hosted, image-smoke]
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: docker build -f deploy/runtime/Containerfile -t "muniment-runtime:ci-${{ github.run_id }}" .
       - run: deploy/runtime/smoke.sh "muniment-runtime:ci-${{ github.run_id }}"
       - if: always()
@@ -90,7 +90,7 @@ jobs:
     runs-on: ${{ vars.CI_LINUX_RUNNER }}
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Test on macOS through desktop-ci
         env:
           REF: ${{ github.ref_name }}
@@ -112,7 +112,7 @@ jobs:
     runs-on: ${{ vars.CI_LINUX_RUNNER }}
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check and test on Windows through desktop-ci
         env:
           REF: ${{ github.ref_name }}
@@ -170,7 +170,7 @@ jobs:
             echo '::error::The release runs only for a CI_PUSH_ACTORS push or a CI_RELEASE_ACTORS dispatch of main in the CI_REPOSITORY repository.' >&2
             exit 1
           fi
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Tag and publish the next version
@@ -217,7 +217,7 @@ jobs:
             echo '::error::The release runs only for a CI_PUSH_ACTORS push or a CI_RELEASE_ACTORS dispatch of main in the CI_REPOSITORY repository.' >&2
             exit 1
           fi
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Publish the runtime image

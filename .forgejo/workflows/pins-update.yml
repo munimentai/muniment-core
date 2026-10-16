@@ -60,10 +60,10 @@ jobs:
             echo '::error::The pins update runs only on schedule or from a CI_RELEASE_ACTORS dispatch of main in the CI_REPOSITORY repository.' >&2
             exit 1
           fi
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - run: bash .forgejo/rust-toolchain.sh rustfmt clippy
