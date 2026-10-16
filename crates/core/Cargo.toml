@@ -31,6 +31,7 @@ keyring = { version = "3", default-features = false, features = ["apple-native",
 libloading = "0.7"
 quick-xml = "0.41"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 muniment-attach = { path = "../attach", features = ["client"] }
 muniment-code-diff = { path = "../code-diff" }
@@ -50,9 +51,12 @@ sherpa-onnx = { version = "=1.13.2", default-features = false, features = ["shar
 sherpa-onnx-sys = { version = "=1.13.2", default-features = false, features = ["shared"] }
 subtle = "2.6"
 tar = "0.4"
+tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 ureq = { version = "2", default-features = false, features = ["json"] }
 url = "2"
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
+zeroize = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]

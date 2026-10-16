@@ -29,6 +29,8 @@ mod reader_mapping;
 mod reader_secret;
 mod reader_sidecar;
 #[cfg(any(unix, target_os = "windows"))]
+mod relay;
+#[cfg(any(unix, target_os = "windows"))]
 mod retention_schedule;
 pub mod service;
 mod sink;

@@ -128,12 +128,26 @@ pub struct PairingChallengeView {
     pub qr_svg: String,
 }
 
+/// Whether the paired phone can open this desktop's relay sessions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteControlState {
+    /// Both directional keys of the pair are stored.
+    #[default]
+    Ready,
+    /// The pair carries no relay keys this desktop holds, or a command failed
+    /// to authenticate. The owner revokes the pair and pairs again.
+    PairAgain,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorizedPhone {
     pub pair_id: PairId,
     pub mobile_device_id: Uuid,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub remote_control: RemoteControlState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

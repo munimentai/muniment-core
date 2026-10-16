@@ -273,6 +273,23 @@ impl RuntimeAttachState {
         crate::host::cloud_session(&self.host, &self.runtime_activity)
     }
 
+    /// Starts the session relay publisher when the host has a cloud. It
+    /// publishes the runs this runtime's own windows see.
+    pub(crate) fn start_relay_publisher(
+        &self,
+    ) -> Option<muniment_core::relay_publisher::RelayPublisher> {
+        crate::relay::start(
+            &self.host,
+            self.runtime_activity.clone(),
+            self.profile_directory.clone(),
+            Arc::clone(&self.active),
+            self.chat_events
+                .clone()
+                .with_config_directory(self.config_directory.clone()),
+            Arc::clone(&self.storage),
+        )
+    }
+
     pub fn runtime_activity(&self) -> RuntimeActivityRegistry {
         self.runtime_activity.clone()
     }
