@@ -12,8 +12,9 @@ pub fn agent() -> ureq::Agent {
     agent_builder().build()
 }
 
+/// The shared TLS client configuration: ring and the OS certificate verifier.
 #[cfg(feature = "tls")]
-fn tls_config() -> std::sync::Arc<rustls::ClientConfig> {
+pub fn tls_config() -> std::sync::Arc<rustls::ClientConfig> {
     use rustls_platform_verifier::BuilderVerifierExt;
     use std::sync::{Arc, OnceLock};
 

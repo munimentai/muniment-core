@@ -84,6 +84,8 @@ A module that `muniment-core` re-exports from another workspace crate keeps its 
 | module | process_reader | It reads Linux process identities for attach peer checks. |
 | module | provider_models | It discovers and caches models from configured providers. |
 | module | record | It owns the company record: the SQLite graph, the catalogue and the write path. |
+| module | relay_encryption | It seals session relay content end to end between a desktop and its paired phone. |
+| module | relay_publisher | It publishes live runs to the paired phone through the cloud relay and applies the phone's commands. |
 | module | retention_record | It records retention choices. |
 | module | router_classifier | It classifies routes locally without cloud metadata. |
 | module | run_events | It appends and projects run events. |

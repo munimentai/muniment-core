@@ -14,7 +14,7 @@ issues or pull requests.
 | `muniment-core` | `crates/core` | Local runtime logic and storage contracts: the run journal, Pi sidecar supervision and install, memory, projects, attach server, on-device speech and voice. |
 | `muniment-models` | `crates/models` | Provider and model knowledge as data: the provider registry, local server kinds and their scan, provider and endpoint model discovery, context windows, the model catalog, and Pi's `models.json`. |
 | `muniment-router` | `crates/router` | The multi-account model router: account pools, routing policy, the loopback OpenAI-compatible server, the `muniment-router` server binary (`server` feature) and the `muniment-router-shadow` binary. |
-| `muniment-runtime-core` | `crates/runtime` | The platform-neutral runtime: attach serving and its accept loops, runs, retention and agent schedules, the company record and reader service, the model service that runs the model router and the web search server and writes provider settings, web search settings and credentials, and `run_runtime`, the entry a host without OS service registration runs. The host supplies cloud accounts, chat grants, credential storage, provider OAuth clients, the sign-in page and its executables through `RuntimeHost`. The default `keyring` feature adds the keychain credential store and keychain prompt history. |
+| `muniment-runtime-core` | `crates/runtime` | The platform-neutral runtime: attach serving and its accept loops, runs, retention and agent schedules, the company record and reader service, the model service that runs the model router and the web search server and writes provider settings, web search settings and credentials, and `run_runtime`, the entry a host without OS service registration runs. The host supplies cloud accounts, chat grants, credential storage, provider OAuth clients, the sign-in page and its executables through `RuntimeHost`. A host with a cloud account and a paired phone also gets the session relay publisher. The default `keyring` feature adds the keychain credential store and keychain prompt history. |
 | `muniment-server` | `crates/server` | The headless runtime host: the `muniment-server` binary runs the runtime with no cloud account, no keychain and no OS service registration, for a container or a server. |
 | `muniment-pins` | `crates/pins` | Typed constants compiled from `pins/pins.toml`, plus the embedded package lockfile. |
 | `muniment-attach` | `crates/attach` | The reader and companion attach protocol and its client, with the pinned TLS transport, pairing links and device credentials of the remote route. |
@@ -202,6 +202,37 @@ remote access. Its chat-event subscription (`run.chat_events`) also carries
 `runtime.update_requested` events with the body `{"version",
 "requested_at", "requested_by"}`, so the desktop runs its updater. A remote
 device never receives them.
+
+## Phone relay
+
+A desktop host with a cloud account relays its live runs to the one phone
+paired with it, end to end encrypted under `muniment.relay-encryption/1`.
+The cloud orders, stores and forwards the sealed payloads and reads only
+their plaintext headers.
+
+- `muniment_core::relay_encryption` holds the contract: the X25519 agreement
+  of pairing revision 2, the phone's HMAC-SHA256 proof over the pairing
+  transcript, HKDF-SHA256 for the desktop-to-phone and phone-to-desktop keys,
+  AES-256-GCM sealing with a random 12-byte nonce and the canonical header as
+  associated data, the per-direction counter and the 64-message command
+  replay window. Its tests reproduce every vector of the contract's
+  conformance package, kept at
+  `protocol-fixtures/muniment.relay-encryption/1/relay-encryption-v1.json`.
+- `muniment_core::relay_publisher` is the desktop side of
+  `muniment.session-relay/1`. While the host's `AccountService` answers relay
+  keys and a signed-in session, it keeps one WebSocket to the cloud's
+  `/v1/events` with the native access token, waits for `connection.ready`,
+  answers heartbeats and reconnects with backoff. It registers each live run
+  as a relay session and publishes assistant text, tool activity, run status
+  and permission asks as sealed events. It opens the phone's sealed stop,
+  steer, follow-up and permission answers, checks their header binding,
+  counter and expiry, applies them through the runtime's own operations and
+  answers with a receipt or a failure.
+- The runtime starts the publisher with its schedules when the host has a
+  cloud. A host whose account answers no relay keys, such as
+  `muniment-server`, opens no connection. The pair's counters and replay
+  window live in `remote-control-relay.json` under the profile, and the host
+  keeps the keys.
 
 ## Router server
 

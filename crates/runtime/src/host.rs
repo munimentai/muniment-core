@@ -18,6 +18,7 @@ use muniment_core::chat_launch::{ChatGrant, FetchGrantError, FetchReceiptError};
 #[cfg(feature = "keyring")]
 use muniment_core::keyring::Entry;
 use muniment_core::model_router::native_auth::ProviderClients;
+use muniment_core::relay_encryption::RelayKeys;
 use muniment_core::sidecar::pi_chat::Receipt;
 
 /// The values and services one runtime process runs with.
@@ -207,6 +208,14 @@ pub trait AccountService: Send + Sync {
     ) -> Result<PairingRevokeView, ProtocolError> {
         let _ = (access_token, pair_id, profile_directory);
         Err(ProtocolError::unsupported_operation())
+    }
+
+    /// The relay keys of the phone pair stored under the profile, read
+    /// without a network call, or none. A host that answers keys gets a
+    /// relay publisher while an account is signed in.
+    fn relay_keys(&self, profile_directory: &Path) -> Option<RelayKeys> {
+        let _ = profile_directory;
+        None
     }
 }
 

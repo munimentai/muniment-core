@@ -60,6 +60,8 @@ pub mod pi_settings;
 #[cfg(target_os = "linux")]
 pub mod process_reader;
 pub mod record;
+pub mod relay_encryption;
+pub mod relay_publisher;
 pub mod retention_record;
 pub mod router_classifier;
 pub mod run_events;

@@ -37,8 +37,9 @@ fn start_vault_leases(state: std::sync::Weak<RuntimeAttachState>) {
 /// Applies the recorded retention choice at start and every `interval`, and
 /// checks agent schedules between, until a stop arrives. `checked` hears each
 /// retention pass. The schedule starts once the runtime owns its endpoint, so
-/// it also starts the model router its record turns on and the web search
-/// server, and stops both when it ends.
+/// it also starts the model router its record turns on, the web search server
+/// and, for a host with a cloud, the session relay publisher, and stops them
+/// when it ends.
 pub fn start_retention_schedule(
     state: Arc<RuntimeAttachState>,
     interval: Duration,
@@ -55,6 +56,7 @@ pub fn start_retention_schedule(
         });
         state.models().restore_search();
         start_vault_leases(Arc::downgrade(&state));
+        let relay = state.start_relay_publisher();
         apply_recorded_retention(&state, checked.as_ref());
         let mut retention_checked_at = std::time::Instant::now();
         loop {
@@ -64,6 +66,9 @@ pub fn start_retention_schedule(
             match commands.recv_timeout(interval.min(Duration::from_secs(15))) {
                 Ok(RetentionScheduleCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                     state.models().stop();
+                    if let Some(relay) = relay {
+                        relay.stop();
+                    }
                     break;
                 }
                 Ok(RetentionScheduleCommand::Recheck) => {
